@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "plugins": {
+    "planning-with-files@planning-with-files": [
+      {
+        "scope": "user",
+        "installPath": "/Users/ovalenzuela/.claude/plugins/cache/planning-with-files/planning-with-files/2.0.0",
+        "version": "2.0.0",
+        "installedAt": "2026-01-14T01:39:23.880Z",
+        "lastUpdated": "2026-01-14T01:39:23.880Z",
+        "gitCommitSha": "a01b24e4b6a5c5d3ca42ea478f37aadd6f81345a"
+      }
+    ],
+    "frontend-design@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "/Users/ovalenzuela/.claude/plugins/cache/claude-plugins-official/frontend-design/2cd88e7947b7",
+        "version": "2cd88e7947b7",
+        "installedAt": "2026-01-27T06:23:26.107Z",
+        "lastUpdated": "2026-02-08T00:36:44.472Z",
+        "gitCommitSha": "e30768372b4150ca1bc0839d93283e8edc30d60d"
+      }
+    ]
+  }
+}

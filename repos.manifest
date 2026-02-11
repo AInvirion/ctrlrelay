@@ -1,0 +1,48 @@
+# Dev Sync - Repository Manifest
+# Format: FOLDER/REPO | BRANCH | GIT_REMOTE
+# Lines starting with # are ignored
+# To skip a repo, comment it out
+
+AINVIRION/agent-generator | main | git@github.com:AInvirion/agent-generator.git
+AINVIRION/AgentForza | main | git@github.com:AInvirion/AgentForza.git
+AINVIRION/AgentJunior | main | git@github.com:AInvirion/AgentJunior.git
+AINVIRION/ainvirion-oss-template | main | git@github.com:AInvirion/ainvirion-oss-template.git
+AINVIRION/ainvirion-private-template | main | git@github.com:AInvirion/ainvirion-private-template.git
+AINVIRION/AIWebCrawler | main | git@github.com:AInvirion/AIWebCrawler.git
+AINVIRION/cliquey | main | git@github.com:AInvirion/cliquey.git
+AINVIRION/Legal | main | git@github.com:AInvirion/Legal.git
+AINVIRION/Product-Ideas | main | git@github.com:AInvirion/Product-Ideas.git
+AINVIRION/TORtopus | main | git@github.com:AInvirion/TORtopus.git
+AINVIRION/youtube-transcriber | main | git@github.com:AInvirion/youtube-transcriber.git
+RESEARCH/agentic-ai-github-actions | main | git@github.com:oscarvalenzuelab/agentic-ai-github-actions.git
+RESEARCH/autonomous-oss-compliance | main | git@github.com:oscarvalenzuelab/autonomous-oss-compliance.git
+RESEARCH/botsniffer | main | git@github.com:oscarvalenzuelab/botsniffer.git
+RESEARCH/ccda | main | git@github.com:SemClone/ccda.git
+RESEARCH/DNSMeshProtocol | main | git@github.com:oscarvalenzuelab/DNSMeshProtocol.git
+RESEARCH/GPGNotes | main | git@github.com:oscarvalenzuelab/GPGNotes.git
+RESEARCH/mathspygame_com | main | git@github.com:oscarvalenzuelab/mathspygame_com.git
+RESEARCH/open_agentic_framework | main | git@github.com:oscarvalenzuelab/open_agentic_framework.git
+RESEARCH/ossa_scanner | main | git@github.com:oscarvalenzuelab/ossa_scanner.git
+RESEARCH/semantic-copycat-sbomer | main | git@github.com:oscarvalenzuelab/semantic-copycat-sbomer.git
+RESEARCH/Verified-Intent-Development | main | git@github.com:SemClone/Verified-Intent-Development.git
+SEMCL.ONE/binarysniffer | main | git@github.com:SemClone/binarysniffer.git
+SEMCL.ONE/ccda-cli | main | git@github.com:SemClone/ccda-cli.git
+SEMCL.ONE/community | main | git@github.com:SemClone/community.git
+SEMCL.ONE/kenos-orchestrator | main | git@github.com:SemClone/kenos-orchestrator.git
+SEMCL.ONE/mcp-semclone | main | git@github.com:SemClone/mcp-semclone.git
+SEMCL.ONE/ospac | main | git@github.com:SemClone/ospac.git
+SEMCL.ONE/osslili | main | git@github.com:SemClone/osslili.git
+SEMCL.ONE/ossnotices | main | git@github.com:SemClone/ossnotices.git
+SEMCL.ONE/ossval | main | git@github.com:SemClone/ossval.git
+SEMCL.ONE/purl2notices | main | git@github.com:SemClone/purl2notices.git
+SEMCL.ONE/purl2src | main | git@github.com:SemClone/purl2src.git
+SEMCL.ONE/semantic-copycat | main | git@github.com:SemClone/semantic-copycat.git
+SEMCL.ONE/semcl.one | main | git@github.com:SemClone/semcl.one.git
+SEMCL.ONE/semclone-oss-template | main | git@github.com:SemClone/semclone-oss-template.git
+SEMCL.ONE/semclone-private-template | main | git@github.com:SemClone/semclone-private-template.git
+SEMCL.ONE/src2purl | main | git@github.com:SemClone/src2purl.git
+SEMCL.ONE/status | main | git@github.com:SemClone/status.git
+SEMCL.ONE/tanu-discovery | main | git@github.com:SemClone/tanu-discovery.git
+SEMCL.ONE/upmex | main | git@github.com:SemClone/upmex.git
+SEMCL.ONE/vulnq | main | git@github.com:SemClone/vulnq.git
+WEB/oscarvalenzuelab.github.io | master | git@github.com:oscarvalenzuelab/oscarvalenzuelab.github.io.git

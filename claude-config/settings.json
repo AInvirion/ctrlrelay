@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "includeCoAuthoredBy": false,
+  "enabledPlugins": {
+    "planning-with-files@planning-with-files": true,
+    "frontend-design@claude-plugins-official": true
+  },
+  "feedbackSurveyState": {
+    "lastShownTime": 1754023319360
+  }
+}

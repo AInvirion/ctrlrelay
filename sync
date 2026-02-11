@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Quick entry point — run from anywhere
+# Usage: ./sync repos | ./sync status | ./sync export | ./sync import | ./sync setup
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)/scripts"
+
+case "${1:-help}" in
+    repos)    shift; bash "$SCRIPT_DIR/sync-repos.sh" "$@" ;;
+    status)   bash "$SCRIPT_DIR/sync-repos.sh" --status ;;
+    export)   bash "$SCRIPT_DIR/sync-claude.sh" export ;;
+    import)   shift; bash "$SCRIPT_DIR/sync-claude.sh" import "$@" ;;
+    setup)    bash "$SCRIPT_DIR/setup-device.sh" ;;
+    manifest) bash "$SCRIPT_DIR/update-manifest.sh" ;;
+    help|*)
+        echo "dev-sync — Multi-device development environment sync"
+        echo ""
+        echo "Usage: ./sync <command> [options]"
+        echo ""
+        echo "Commands:"
+        echo "  repos     Clone missing repos, pull existing ones"
+        echo "  status    Show status of all repos (dirty, ahead/behind)"
+        echo "  export    Export Claude Code config to this repo"
+        echo "  import    Import Claude Code config to this device"
+        echo "  setup     Full device bootstrap (first time on new device)"
+        echo "  manifest  Re-scan ~/Projects and update repos.manifest"
+        echo ""
+        echo "Examples:"
+        echo "  ./sync repos                    # Sync all repos"
+        echo "  ./sync repos -f SEMCL           # Sync only SEMCL.ONE repos"
+        echo "  ./sync repos -n                 # Dry run"
+        echo "  ./sync status                   # Check what's dirty/behind"
+        echo "  ./sync export && git add -A && git commit -m 'sync config'"
+        ;;
+esac
