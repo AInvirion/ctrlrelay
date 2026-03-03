@@ -24,7 +24,7 @@ RESEARCH/mathspygame_com | main | git@github.com:oscarvalenzuelab/mathspygame_co
 RESEARCH/open_agentic_framework | main | git@github.com:oscarvalenzuelab/open_agentic_framework.git
 RESEARCH/ossa_scanner | main | git@github.com:oscarvalenzuelab/ossa_scanner.git
 RESEARCH/semantic-copycat-sbomer | main | git@github.com:oscarvalenzuelab/semantic-copycat-sbomer.git
-RESEARCH/Verified-Intent-Development | main | git@github.com:SemClone/Verified-Intent-Development.git
+RESEARCH/Verified-Intent-Development | master | git@github.com:SemClone/Verified-Intent-Development.git
 SEMCL.ONE/binarysniffer | main | git@github.com:SemClone/binarysniffer.git
 SEMCL.ONE/ccda-cli | main | git@github.com:SemClone/ccda-cli.git
 SEMCL.ONE/community | main | git@github.com:SemClone/community.git
