@@ -1,59 +1,122 @@
 # dev-sync
 
-Multi-device development environment sync toolkit. Clone, pull, and keep all your repositories and Claude Code configuration in sync across macOS, ChromeOS, Termux (Android), and Linux.
+Multi-device development environment sync. Keeps repos, Claude Code config, and team-shared settings in sync across machines.
 
-## Quick Start
+## Quick start
 
 ```bash
-# First time on a new device
+# First time on a new device:
 ./sync setup
 
-# Day-to-day usage
-./sync repos            # Clone missing repos, pull existing ones
-./sync status           # Check what's dirty/ahead/behind
+# Sync all repos:
+./sync repos
+
+# Export your Claude Code config:
+./sync export
+
+# Import Claude Code config on another device:
+./sync import
 ```
 
 ## Commands
 
 | Command | Description |
-|---------|-------------|
-| `./sync repos` | Clone missing repos and pull latest changes |
+|---|---|
+| `./sync repos` | Clone missing repos, pull existing ones |
+| `./sync repos -f SEMCL` | Sync only repos matching a filter |
+| `./sync repos -n` | Dry run (show what would happen) |
 | `./sync status` | Show status of all repos (dirty, ahead/behind) |
 | `./sync export` | Export Claude Code config to this repo |
+| `./sync export -n` | Dry run export |
 | `./sync import` | Import Claude Code config to this device |
-| `./sync setup` | Full device bootstrap (first time on new device) |
+| `./sync import -n` | Dry run import |
+| `./sync import --no-plugins` | Import without plugin reinstall hints |
+| `./sync team-export` | Export shareable team config |
+| `./sync team-import` | Import shared team config |
+| `./sync setup` | Full device bootstrap (first time) |
 | `./sync manifest` | Re-scan ~/Projects and update repos.manifest |
 
-## Options for `./sync repos`
+## Claude Code config sync
+
+### Personal sync (`export` / `import`)
+
+Syncs everything between your own devices:
+
+- **Settings** — `settings.json`, `settings.local.json`
+- **Keybindings** — `keybindings.json`
+- **Plugins** — `plugins/installed_plugins.json` (manifest only; plugins need manual reinstall)
+- **Skills** — `skills/` directory
+- **Rules** — `rules/` directory
+- **MCP servers** — extracted from `~/.claude.json` (no secret redaction)
+- **Project memory** — all `MEMORY.md` files from project dirs
+
+Paths are automatically adjusted between devices (e.g. different home directories).
+
+### Team sync (`team-export` / `team-import`)
+
+Shares config that's useful for teammates without touching personal settings:
+
+- **Skills** — custom Claude Code skills
+- **Rules** — custom Claude Code rules
+- **Plugins** — plugin manifest (import shows `claude /install-plugin` commands)
+- **MCP servers** — server definitions with secrets redacted (`<REDACTED>`)
+
+Does NOT touch: settings, keybindings, memory, or any personal config.
+
+```bash
+# Export team config (run once, commit + push):
+./sync team-export
+
+# Teammates import after pulling:
+./sync team-import
+```
+
+**MCP server notes:**
+- Servers already in your config are skipped (no clobbering)
+- Servers with `<REDACTED>` env values are skipped; fill them in manually in `~/.claude.json`
+
+## Typical workflow
+
+```bash
+# On your main machine — export and push:
+./sync export
+cd dev-sync && git add -A && git commit -m "sync config" && git push
+
+# On another machine — pull and import:
+cd dev-sync && git pull
+./sync import
+
+# Share config with team:
+./sync team-export
+git add -A && git commit -m "update team config" && git push
+```
+
+## Directory structure
 
 ```
--n, --dry-run     Show what would be done without doing it
--f, --filter STR  Only process repos matching STR (e.g. 'SEMCL')
--j, --jobs N      Parallel jobs (default: 4)
--s, --status      Show status of all repos
+dev-sync/
+├── sync                    # Entry point script
+├── repos.manifest          # List of repos to sync
+├── scripts/
+│   ├── sync-claude.sh      # Claude Code config sync
+│   ├── sync-repos.sh       # Repo cloning/pulling
+│   ├── setup-device.sh     # First-time device setup
+│   └── update-manifest.sh  # Manifest regeneration
+└── claude-config/          # Synced config (git-tracked)
+    ├── .home-path          # Source home path for path adjustment
+    ├── .last-export        # Export metadata
+    ├── settings.json
+    ├── settings.local.json
+    ├── keybindings.json
+    ├── mcp-servers.json
+    ├── plugins/
+    ├── skills/
+    ├── rules/
+    ├── memory/
+    └── team/               # Shareable subset
+        ├── README.md
+        ├── plugins/
+        ├── skills/
+        ├── rules/
+        └── mcp-servers.json
 ```
-
-## How It Works
-
-- **repos.manifest** — Lists all repositories with their org folder, branch, and git remote. Edit directly or regenerate with `./sync manifest`.
-- **scripts/sync-repos.sh** — Clones missing repos and fast-forward pulls existing ones. Skips repos with uncommitted changes (fetch only).
-- **scripts/sync-claude.sh** — Exports/imports Claude Code settings, plugins, and project memory files. Adjusts home directory paths automatically on import.
-- **scripts/setup-device.sh** — Detects the platform, installs prerequisites, syncs repos, and imports Claude config in one step.
-- **claude-config/** — Synced Claude Code configuration (settings, plugin manifest, project memory).
-
-## Supported Platforms
-
-- **macOS** — Assumes dev tools are installed
-- **ChromeOS** — Linux container with auto nvm/Node.js setup
-- **Termux (Android)** — Installs packages via `pkg`
-- **Linux** — Assumes git and Node.js are available
-
-## Adding New Repos
-
-Either edit `repos.manifest` directly:
-
-```
-ORG/repo-name | main | git@github.com:Org/repo-name.git
-```
-
-Or clone the repo into `~/Projects/ORG/repo-name` and run `./sync manifest` to auto-detect it.

@@ -1,0 +1,21 @@
+{
+  "playwright": {
+    "command": "npx",
+    "args": [
+      "@playwright/mcp@latest"
+    ]
+  },
+  "dev_manager": {
+    "command": "npx",
+    "args": [
+      "dev-manager-mcp",
+      "stdio"
+    ]
+  },
+  "chrome_devtools": {
+    "command": "npx",
+    "args": [
+      "chrome-devtools-mcp@latest"
+    ]
+  }
+}
