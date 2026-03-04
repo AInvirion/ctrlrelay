@@ -14,16 +14,7 @@ AINVIRION/Legal | main | git@github.com:AInvirion/Legal.git
 AINVIRION/Product-Ideas | main | git@github.com:AInvirion/Product-Ideas.git
 AINVIRION/TORtopus | main | git@github.com:AInvirion/TORtopus.git
 AINVIRION/youtube-transcriber | main | git@github.com:AInvirion/youtube-transcriber.git
-RESEARCH/agentic-ai-github-actions | main | git@github.com:oscarvalenzuelab/agentic-ai-github-actions.git
-RESEARCH/autonomous-oss-compliance | main | git@github.com:oscarvalenzuelab/autonomous-oss-compliance.git
-RESEARCH/botsniffer | main | git@github.com:oscarvalenzuelab/botsniffer.git
 RESEARCH/ccda | main | git@github.com:SemClone/ccda.git
-RESEARCH/DNSMeshProtocol | main | git@github.com:oscarvalenzuelab/DNSMeshProtocol.git
-RESEARCH/GPGNotes | main | git@github.com:oscarvalenzuelab/GPGNotes.git
-RESEARCH/mathspygame_com | main | git@github.com:oscarvalenzuelab/mathspygame_com.git
-RESEARCH/open_agentic_framework | main | git@github.com:oscarvalenzuelab/open_agentic_framework.git
-RESEARCH/ossa_scanner | main | git@github.com:oscarvalenzuelab/ossa_scanner.git
-RESEARCH/semantic-copycat-sbomer | main | git@github.com:oscarvalenzuelab/semantic-copycat-sbomer.git
 RESEARCH/Verified-Intent-Development | master | git@github.com:SemClone/Verified-Intent-Development.git
 SEMCL.ONE/binarysniffer | main | git@github.com:SemClone/binarysniffer.git
 SEMCL.ONE/ccda-cli | main | git@github.com:SemClone/ccda-cli.git
@@ -45,4 +36,3 @@ SEMCL.ONE/status | main | git@github.com:SemClone/status.git
 SEMCL.ONE/tanu-discovery | main | git@github.com:SemClone/tanu-discovery.git
 SEMCL.ONE/upmex | main | git@github.com:SemClone/upmex.git
 SEMCL.ONE/vulnq | main | git@github.com:SemClone/vulnq.git
-WEB/oscarvalenzuelab.github.io | master | git@github.com:oscarvalenzuelab/oscarvalenzuelab.github.io.git
