@@ -458,8 +458,16 @@ do_team_export() {
     # Export skills and rules
     export_recursive_dirs "$team_dir" "${SYNC_RECURSIVE_DIRS[@]}"
 
-    # Export plugin manifest
-    export_single_files "$team_dir" "${SYNC_DIRS[@]}"
+    # Export plugin manifest (with paths sanitized)
+    if [[ -f "$CLAUDE_DIR/plugins/installed_plugins.json" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            ok "(dry-run) would copy plugins/installed_plugins.json (paths sanitized)"
+        else
+            mkdir -p "$team_dir/plugins"
+            sed "s|$HOME|~|g" "$CLAUDE_DIR/plugins/installed_plugins.json" > "$team_dir/plugins/installed_plugins.json"
+            ok "plugins/installed_plugins.json"
+        fi
+    fi
 
     # Export MCP servers (with secrets redacted)
     export_mcp_servers "$team_dir/mcp-servers.json" true
