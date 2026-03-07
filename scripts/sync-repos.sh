@@ -36,6 +36,7 @@ DRY_RUN=false
 FILTER=""
 JOBS=4
 STATUS_ONLY=false
+PULL_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -43,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         -f|--filter) FILTER="$2"; shift 2 ;;
         -j|--jobs) JOBS="$2"; shift 2 ;;
         -s|--status) STATUS_ONLY=true; shift ;;
+        -p|--pull-only) PULL_ONLY=true; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
@@ -117,6 +119,9 @@ sync_repo() {
             err "$path — fetch failed"
             ((failed++)) || true
         fi
+    elif [[ "$PULL_ONLY" == true ]]; then
+        warn "$path — not cloned, skipping (pull-only mode)"
+        ((skipped++)) || true
     else
         log "Cloning $path..."
         if [[ "$DRY_RUN" == true ]]; then

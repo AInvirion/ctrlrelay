@@ -13,9 +13,10 @@ AINVIRION/cliquey | main | git@github.com:AInvirion/cliquey.git
 AINVIRION/Legal | main | git@github.com:AInvirion/Legal.git
 AINVIRION/Product-Ideas | main | git@github.com:AInvirion/Product-Ideas.git
 AINVIRION/TORtopus | main | git@github.com:AInvirion/TORtopus.git
+AINVIRION/ainvirion_com | main | git@github.com:AInvirion/ainvirion_com.git
 AINVIRION/youtube-transcriber | main | git@github.com:AInvirion/youtube-transcriber.git
 RESEARCH/ccda | main | git@github.com:SemClone/ccda.git
-RESEARCH/Verified-Intent-Development | master | git@github.com:SemClone/Verified-Intent-Development.git
+RESEARCH/Verified-Intent-Development | master | git@github.com:AInvirion/Verified-Intent-Development.git
 SEMCL.ONE/binarysniffer | main | git@github.com:SemClone/binarysniffer.git
 SEMCL.ONE/ccda-cli | main | git@github.com:SemClone/ccda-cli.git
 SEMCL.ONE/community | main | git@github.com:SemClone/community.git

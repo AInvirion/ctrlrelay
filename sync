@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Quick entry point — run from anywhere
-# Usage: ./sync repos | ./sync status | ./sync export | ./sync import | ./sync team-export | ./sync team-import | ./sync setup
+# Usage: ./sync repos | ./sync pull | ./sync status | ./sync export | ./sync import | ./sync team-export | ./sync team-import | ./sync setup
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)/scripts"
 
 case "${1:-help}" in
     repos)    shift; bash "$SCRIPT_DIR/sync-repos.sh" "$@" ;;
+    pull)     shift; bash "$SCRIPT_DIR/sync-repos.sh" --pull-only "$@" ;;
     status)   bash "$SCRIPT_DIR/sync-repos.sh" --status ;;
     export)      shift; bash "$SCRIPT_DIR/sync-claude.sh" export "$@" ;;
     import)      shift; bash "$SCRIPT_DIR/sync-claude.sh" import "$@" ;;
@@ -20,6 +21,7 @@ case "${1:-help}" in
         echo ""
         echo "Commands:"
         echo "  repos          Clone missing repos, pull existing ones"
+        echo "  pull           Pull latest changes on all cloned repos (skip missing)"
         echo "  status         Show status of all repos (dirty, ahead/behind)"
         echo "  export         Export Claude Code config to this repo"
         echo "  import         Import Claude Code config to this device"
@@ -32,6 +34,8 @@ case "${1:-help}" in
         echo "  -n, --dry-run  Show what would be done"
         echo ""
         echo "Examples:"
+        echo "  ./sync pull                     # Pull all cloned repos"
+        echo "  ./sync pull -f SEMCL            # Pull only SEMCL.ONE repos"
         echo "  ./sync repos                    # Sync all repos"
         echo "  ./sync repos -f SEMCL           # Sync only SEMCL.ONE repos"
         echo "  ./sync repos -n                 # Dry run"
