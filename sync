@@ -14,6 +14,10 @@ case "${1:-help}" in
     team-import) shift; bash "$SCRIPT_DIR/sync-claude.sh" team-import "$@" ;;
     setup)    bash "$SCRIPT_DIR/setup-device.sh" ;;
     manifest) bash "$SCRIPT_DIR/update-manifest.sh" ;;
+    # Codex sync commands
+    codex-export)  shift; bash "$SCRIPT_DIR/sync-codex.sh" export "$@" ;;
+    codex-import)  shift; bash "$SCRIPT_DIR/sync-codex.sh" import "$@" ;;
+    codex-install) shift; bash "$SCRIPT_DIR/sync-codex.sh" install "$@" ;;
     help|*)
         echo "dev-sync — Multi-device development environment sync"
         echo ""
@@ -30,6 +34,11 @@ case "${1:-help}" in
         echo "  setup          Full device bootstrap (first time on new device)"
         echo "  manifest       Re-scan ~/Projects and update repos.manifest"
         echo ""
+        echo "Codex Commands:"
+        echo "  codex-export   Export Codex config to this repo"
+        echo "  codex-import   Import Codex config to this device"
+        echo "  codex-install  Install Codex skills (AGENTS.md files)"
+        echo ""
         echo "Options (for export/import commands):"
         echo "  -n, --dry-run  Show what would be done"
         echo ""
@@ -44,5 +53,7 @@ case "${1:-help}" in
         echo "  ./sync export -n                # Dry run export"
         echo "  ./sync team-export              # Export shareable team config"
         echo "  ./sync team-import -n           # Preview team import"
+        echo "  ./sync codex-install            # Install Codex skills"
+        echo "  ./sync codex-install --copy     # Copy instead of symlink"
         ;;
 esac

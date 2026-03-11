@@ -1,6 +1,6 @@
 # dev-sync
 
-Multi-device development environment sync. Keeps repos, Claude Code config, and team-shared settings in sync across machines.
+Multi-device development environment sync. Keeps repos, Claude Code config, Codex config, and team-shared settings in sync across machines.
 
 ## Quick start
 
@@ -35,6 +35,10 @@ Multi-device development environment sync. Keeps repos, Claude Code config, and 
 | `./sync team-import` | Import shared team config |
 | `./sync setup` | Full device bootstrap (first time) |
 | `./sync manifest` | Re-scan ~/Projects and update repos.manifest |
+| `./sync codex-export` | Export Codex config to this repo |
+| `./sync codex-import` | Import Codex config to this device |
+| `./sync codex-install` | Install Codex skills (AGENTS.md files) |
+| `./sync codex-install --copy` | Install skills as copies instead of symlinks |
 
 ## Claude Code config sync
 
@@ -75,6 +79,56 @@ Does NOT touch: settings, keybindings, memory, or any personal config.
 - Servers already in your config are skipped (no clobbering)
 - Servers with `<REDACTED>` env values are skipped; fill them in manually in `~/.claude.json`
 
+## Codex config sync
+
+Syncs OpenAI Codex CLI configuration and skills between devices.
+
+### Skills
+
+Codex skills are AGENTS.md instruction files for specialized code review tasks:
+
+| Skill | Purpose |
+|-------|---------|
+| `code-review` | General code review (correctness, readability, maintainability) |
+| `security-review` | Security analysis (STRIDE, injection, auth, data exposure) |
+| `duplicate-code` | Find copy-paste code and suggest DRY refactoring |
+| `dead-code` | Detect unused functions, unreachable code, orphan files |
+| `vid-verification` | Risk scoring and verification checklists |
+
+### Installation
+
+```bash
+# Install skills to ~/.codex/instructions/ (symlinked):
+./sync codex-install
+
+# Or use copies instead of symlinks:
+./sync codex-install --copy
+```
+
+### Usage with Codex
+
+```bash
+cd ~/Projects/some-project
+codex "review this code"
+codex "security audit src/"
+codex "find dead code"
+codex "check for duplicates"
+codex "VID check this change"
+```
+
+### Syncing to other devices
+
+```bash
+# On this machine:
+./sync codex-export
+git add -A && git commit -m "sync codex config" && git push
+
+# On other machines:
+git pull
+./sync codex-import
+./sync codex-install
+```
+
 ## Typical workflow
 
 ```bash
@@ -99,24 +153,34 @@ dev-sync/
 ├── repos.manifest          # List of repos to sync
 ├── scripts/
 │   ├── sync-claude.sh      # Claude Code config sync
+│   ├── sync-codex.sh       # Codex config sync
 │   ├── sync-repos.sh       # Repo cloning/pulling
 │   ├── setup-device.sh     # First-time device setup
 │   └── update-manifest.sh  # Manifest regeneration
-└── claude-config/          # Synced config (git-tracked)
-    ├── .home-path          # Source home path for path adjustment
-    ├── .last-export        # Export metadata
-    ├── settings.json
-    ├── settings.local.json
-    ├── keybindings.json
-    ├── mcp-servers.json
-    ├── plugins/
-    ├── skills/
-    ├── rules/
-    ├── memory/
-    └── team/               # Shareable subset
-        ├── README.md
-        ├── plugins/
-        ├── skills/
-        ├── rules/
-        └── mcp-servers.json
+├── claude-config/          # Claude Code config (git-tracked)
+│   ├── .home-path          # Source home path for path adjustment
+│   ├── .last-export        # Export metadata
+│   ├── settings.json
+│   ├── settings.local.json
+│   ├── keybindings.json
+│   ├── mcp-servers.json
+│   ├── plugins/
+│   ├── skills/
+│   ├── rules/
+│   ├── memory/
+│   └── team/               # Shareable subset
+│       ├── README.md
+│       ├── plugins/
+│       ├── skills/
+│       ├── rules/
+│       └── mcp-servers.json
+└── codex-config/           # Codex config (git-tracked)
+    ├── AGENTS.md           # Master instructions
+    ├── config.toml         # Codex settings (exported)
+    └── skills/             # Review skills (AGENTS.md format)
+        ├── code-review/
+        ├── security-review/
+        ├── duplicate-code/
+        ├── dead-code/
+        └── vid-verification/
 ```
