@@ -440,7 +440,36 @@ for name in data.get('plugins', {}):
     fi
 
     echo ""
+
+    # Install MCP servers from mcp-servers/
+    install_mcp_servers
+
     log "Import complete. Restart Claude Code to apply changes."
+}
+
+# --- MCP Server Installation ---
+
+install_mcp_servers() {
+    local mcp_dir="$SCRIPT_DIR/../mcp-servers"
+
+    if [[ ! -d "$mcp_dir" ]]; then
+        return
+    fi
+
+    log "Installing MCP servers..."
+
+    for server_dir in "$mcp_dir"/*/; do
+        if [[ -f "$server_dir/install.sh" ]]; then
+            local server_name
+            server_name=$(basename "$server_dir")
+            if [[ "$DRY_RUN" == true ]]; then
+                ok "(dry-run) would install MCP server: $server_name"
+            else
+                log "Installing $server_name..."
+                bash "$server_dir/install.sh" 2>&1 | sed 's/^/  /'
+            fi
+        fi
+    done
 }
 
 # --- Team export/import ---

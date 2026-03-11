@@ -14,50 +14,50 @@
     "frontend-design@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "~/.claude/plugins/cache/claude-plugins-official/frontend-design/205b6e0b3036",
-        "version": "205b6e0b3036",
+        "installPath": "~/.claude/plugins/cache/claude-plugins-official/frontend-design/bd041495bd2a",
+        "version": "bd041495bd2a",
         "installedAt": "2026-01-27T06:23:26.107Z",
-        "lastUpdated": "2026-03-04T07:03:19.233Z",
+        "lastUpdated": "2026-03-11T02:15:56.757Z",
         "gitCommitSha": "e30768372b4150ca1bc0839d93283e8edc30d60d"
       }
     ],
     "superpowers@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "~/.claude/plugins/cache/claude-plugins-official/superpowers/4.3.1",
-        "version": "4.3.1",
+        "installPath": "~/.claude/plugins/cache/claude-plugins-official/superpowers/5.0.1",
+        "version": "5.0.1",
         "installedAt": "2026-03-04T07:21:44.075Z",
-        "lastUpdated": "2026-03-04T07:21:44.075Z",
+        "lastUpdated": "2026-03-11T03:30:50.593Z",
         "gitCommitSha": "e4a2375cb705ca5800f0833528ce36a3faf9017a"
       }
     ],
     "context7@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "~/.claude/plugins/cache/claude-plugins-official/context7/205b6e0b3036",
-        "version": "205b6e0b3036",
+        "installPath": "~/.claude/plugins/cache/claude-plugins-official/context7/bd041495bd2a",
+        "version": "bd041495bd2a",
         "installedAt": "2026-03-04T07:23:14.996Z",
-        "lastUpdated": "2026-03-04T07:23:14.996Z",
+        "lastUpdated": "2026-03-11T02:15:56.755Z",
         "gitCommitSha": "205b6e0b30366a969412d9aab7b99bea99d58db1"
       }
     ],
     "code-review@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "~/.claude/plugins/cache/claude-plugins-official/code-review/205b6e0b3036",
-        "version": "205b6e0b3036",
+        "installPath": "~/.claude/plugins/cache/claude-plugins-official/code-review/bd041495bd2a",
+        "version": "bd041495bd2a",
         "installedAt": "2026-03-04T07:23:21.765Z",
-        "lastUpdated": "2026-03-04T07:23:21.765Z",
+        "lastUpdated": "2026-03-11T02:15:56.756Z",
         "gitCommitSha": "205b6e0b30366a969412d9aab7b99bea99d58db1"
       }
     ],
     "playwright@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "~/.claude/plugins/cache/claude-plugins-official/playwright/205b6e0b3036",
-        "version": "205b6e0b3036",
+        "installPath": "~/.claude/plugins/cache/claude-plugins-official/playwright/bd041495bd2a",
+        "version": "bd041495bd2a",
         "installedAt": "2026-03-04T07:24:02.062Z",
-        "lastUpdated": "2026-03-04T07:24:02.062Z",
+        "lastUpdated": "2026-03-11T02:15:56.756Z",
         "gitCommitSha": "205b6e0b30366a969412d9aab7b99bea99d58db1"
       }
     ]

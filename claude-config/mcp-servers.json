@@ -17,5 +17,11 @@
     "args": [
       "chrome-devtools-mcp@latest"
     ]
+  },
+  "codex-reviewer": {
+    "command": "node",
+    "args": [
+      "/Users/ovalenzuela/Projects/dev-sync/mcp-servers/codex-reviewer/index.js"
+    ]
   }
 }

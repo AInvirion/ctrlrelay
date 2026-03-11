@@ -12,5 +12,6 @@
   "skipDangerousModePermissionPrompt": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754023319360
-  }
+  },
+  "model": "claude-opus-4-5-20251101"
 }
