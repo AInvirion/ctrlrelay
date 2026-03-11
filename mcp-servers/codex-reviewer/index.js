@@ -6,22 +6,31 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { spawn } from "child_process";
-import { promisify } from "util";
+import { spawn, execSync } from "child_process";
+import { writeFileSync, unlinkSync } from "fs";
 
 // Execute codex and return output
 async function runCodex(prompt, options = {}) {
   const { cwd = process.cwd(), timeout = 300000 } = options;
 
   return new Promise((resolve, reject) => {
-    const args = ["exec", prompt];
+    // Write prompt to temp file to avoid shell escaping issues
+    const tempFile = `/tmp/codex-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`;
+    writeFileSync(tempFile, prompt);
 
-    const proc = spawn("codex", args, {
+    // Use shell to read prompt from file
+    const shellCmd = `codex exec "$(cat ${tempFile})"`;
+
+    const proc = spawn("bash", ["-c", shellCmd], {
       cwd,
-      shell: true,
       timeout,
-      env: { ...process.env, FORCE_COLOR: "0" },
+      env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1", TERM: "dumb" },
     });
+
+    // Cleanup temp file when done
+    const cleanup = () => {
+      try { unlinkSync(tempFile); } catch (e) {}
+    };
 
     let stdout = "";
     let stderr = "";
@@ -35,6 +44,7 @@ async function runCodex(prompt, options = {}) {
     });
 
     proc.on("close", (code) => {
+      cleanup();
       if (code === 0) {
         resolve({ success: true, output: stdout, stderr });
       } else {
@@ -48,6 +58,7 @@ async function runCodex(prompt, options = {}) {
     });
 
     proc.on("error", (err) => {
+      cleanup();
       reject(new Error(`Failed to run codex: ${err.message}`));
     });
   });
