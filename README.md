@@ -129,6 +129,52 @@ git pull
 ./sync codex-install
 ```
 
+## Claude + Codex Integration
+
+The `codex-reviewer` MCP server enables Claude Code to invoke Codex for automated code review loops.
+
+### Installation
+
+```bash
+cd mcp-servers/codex-reviewer
+./install.sh
+# Restart Claude Code
+```
+
+### Available Tools (in Claude Code)
+
+| Tool | Purpose |
+|------|---------|
+| `codex_review` | General code review |
+| `codex_security_review` | Security-focused review |
+| `codex_find_duplicates` | Find copy-paste code |
+| `codex_find_dead_code` | Find unused code |
+| `codex_verify_fixes` | Verify issues are fixed |
+| `codex_test_coverage` | Analyze test gaps |
+| `codex_dependency_audit` | Audit dependencies |
+| `codex_performance_review` | Performance issues |
+| `codex_prompt` | Custom Codex prompt |
+
+### The Review Loop
+
+```
+Claude implements → Codex reviews → Claude fixes → Codex verifies → repeat until clean
+```
+
+Usage in Claude Code:
+```
+> Implement user authentication, then run the codex review loop
+> QA this with codex
+> Get codex to review src/
+```
+
+Claude will:
+1. Call Codex review tools
+2. Parse findings (BLOCKING, CONCERNS, SUGGESTIONS)
+3. Fix BLOCKING issues
+4. Call `codex_verify_fixes`
+5. Loop until all issues resolved
+
 ## Typical workflow
 
 ```bash
@@ -174,13 +220,18 @@ dev-sync/
 │       ├── skills/
 │       ├── rules/
 │       └── mcp-servers.json
-└── codex-config/           # Codex config (git-tracked)
-    ├── AGENTS.md           # Master instructions
-    ├── config.toml         # Codex settings (exported)
-    └── skills/             # Review skills (AGENTS.md format)
-        ├── code-review/
-        ├── security-review/
-        ├── duplicate-code/
-        ├── dead-code/
-        └── vid-verification/
+├── codex-config/           # Codex config (git-tracked)
+│   ├── AGENTS.md           # Master instructions
+│   ├── config.toml         # Codex settings (exported)
+│   └── skills/             # Review skills (AGENTS.md format)
+│       ├── code-review/
+│       ├── security-review/
+│       ├── duplicate-code/
+│       ├── dead-code/
+│       └── vid-verification/
+└── mcp-servers/            # MCP servers for tool integration
+    └── codex-reviewer/     # Codex as MCP tools for Claude
+        ├── index.js        # MCP server implementation
+        ├── package.json
+        └── install.sh      # Installation script
 ```
