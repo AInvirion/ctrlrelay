@@ -10,13 +10,15 @@ AINVIRION/ainvirion-oss-template | main | git@github.com:AInvirion/ainvirion-oss
 AINVIRION/ainvirion-private-template | main | git@github.com:AInvirion/ainvirion-private-template.git
 AINVIRION/AIWebCrawler | main | git@github.com:AInvirion/AIWebCrawler.git
 AINVIRION/cliquey | main | git@github.com:AInvirion/cliquey.git
-AINVIRION/GPTProductValidator | main | git@github.com:AInvirion/GPTProductValidator.git
+AINVIRION/Product-Calibration | main | git@github.com:AInvirion/Product-Calibration.git
+AINVIRION/support | main | git@github.com:AInvirion/support.git
 AINVIRION/Legal | main | git@github.com:AInvirion/Legal.git
 AINVIRION/Product-Ideas | main | git@github.com:AInvirion/Product-Ideas.git
 AINVIRION/TORtopus | main | git@github.com:AInvirion/TORtopus.git
 AINVIRION/ainvirion_com | main | git@github.com:AInvirion/ainvirion_com.git
 AINVIRION/youtube-transcriber | main | git@github.com:AInvirion/youtube-transcriber.git
 RESEARCH/ccda | main | git@github.com:SemClone/ccda.git
+RESEARCH/code-review-assistant | main | git@github.com:oscarvalenzuelab/code-review-assistant.git
 RESEARCH/Verified-Intent-Development | master | git@github.com:AInvirion/Verified-Intent-Development.git
 SEMCL.ONE/binarysniffer | main | git@github.com:SemClone/binarysniffer.git
 SEMCL.ONE/ccda-cli | main | git@github.com:SemClone/ccda-cli.git
@@ -38,3 +40,6 @@ SEMCL.ONE/status | main | git@github.com:SemClone/status.git
 SEMCL.ONE/tanu-discovery | main | git@github.com:SemClone/tanu-discovery.git
 SEMCL.ONE/upmex | main | git@github.com:SemClone/upmex.git
 SEMCL.ONE/vulnq | main | git@github.com:SemClone/vulnq.git
+PERSONAL/agentic-ai-github-actions | main | git@github.com:oscarvalenzuelab/agentic-ai-github-actions.git
+PERSONAL/open_agentic_framework | main | git@github.com:oscarvalenzuelab/open_agentic_framework.git
+PERSONAL/openagenticframework.com | main | git@github.com:oscarvalenzuelab/openagenticframework.com.git
