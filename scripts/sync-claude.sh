@@ -28,16 +28,21 @@ usage() {
     echo "Commands:"
     echo "  export         Copy Claude config from this device into the sync repo"
     echo "  import         Apply Claude config from the sync repo to this device"
+    echo "  install        Install skills, rules, and settings (symlink or copy)"
     echo "  team-export    Export shareable config (skills, rules, plugins, MCP) to team/ dir"
     echo "  team-import    Import shared team config (skills, rules, plugins, MCP only)"
     echo ""
     echo "Options:"
     echo "  -n, --dry-run    Show what would be done"
+    echo "  --copy           Use copy instead of symlink for install"
     echo "  --no-plugins     Skip plugin reinstallation on import"
     echo "  -h, --help       Show this help"
     echo ""
     echo "Personal export/import syncs everything: settings, plugins, memory,"
     echo "skills, rules, keybindings, and MCP servers."
+    echo ""
+    echo "Install creates symlinks from ~/.claude/ to the sync repo, so skills"
+    echo "and configs stay up to date when you pull. Use --copy to copy instead."
     echo ""
     echo "Team export/import only syncs shareable items: skills, rules, plugins,"
     echo "and MCP server definitions (with secrets redacted)."
@@ -49,10 +54,12 @@ usage() {
 COMMAND="$1"; shift
 DRY_RUN=false
 NO_PLUGINS=false
+USE_COPY=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         -n|--dry-run) DRY_RUN=true; shift ;;
+        --copy) USE_COPY=true; shift ;;
         --no-plugins) NO_PLUGINS=true; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1"; usage ;;
@@ -590,11 +597,146 @@ for name in data.get('plugins', {}):
     log "Team import complete. Restart Claude Code to apply changes."
 }
 
+# --- Install skills, rules, and settings ---
+
+do_install() {
+    log "Installing Claude skills, rules, and settings"
+    log "Source: $SYNC_DIR"
+    log "Target: $CLAUDE_DIR"
+    echo ""
+
+    if [[ ! -d "$SYNC_DIR" ]]; then
+        err "sync dir not found at $SYNC_DIR"
+        echo "Run 'export' on another device first, then pull this repo."
+        exit 1
+    fi
+
+    local old_home
+    old_home="$(get_export_home "$SYNC_DIR")"
+
+    # --- Install skills ---
+    if [[ -d "$SYNC_DIR/skills" ]]; then
+        mkdir -p "$CLAUDE_DIR/skills"
+
+        local skill_count=0
+        for skill_dir in "$SYNC_DIR/skills"/*/; do
+            [[ -d "$skill_dir" ]] || continue
+            local skill_name
+            skill_name=$(basename "$skill_dir")
+            local target="$CLAUDE_DIR/skills/$skill_name"
+
+            if [[ "$DRY_RUN" == true ]]; then
+                if [[ "$USE_COPY" == true ]]; then
+                    ok "(dry-run) would copy skill $skill_name"
+                else
+                    ok "(dry-run) would symlink skill $skill_name"
+                fi
+            else
+                # Remove existing (stale symlink or old copy)
+                rm -rf "$target"
+
+                if [[ "$USE_COPY" == true ]]; then
+                    cp -r "$skill_dir" "$target"
+                    ok "$skill_name (copied)"
+                else
+                    ln -sf "$(realpath "$skill_dir")" "$target"
+                    ok "$skill_name (symlinked)"
+                fi
+            fi
+            skill_count=$((skill_count + 1))
+        done
+        log "Skills: $skill_count installed"
+    else
+        warn "No skills/ directory found in sync repo"
+    fi
+
+    echo ""
+
+    # --- Install rules ---
+    if [[ -d "$SYNC_DIR/rules" ]]; then
+        mkdir -p "$CLAUDE_DIR/rules"
+
+        local rule_count=0
+        while IFS= read -r rule_file; do
+            local rel="${rule_file#$SYNC_DIR/rules/}"
+            local target="$CLAUDE_DIR/rules/$rel"
+
+            if [[ "$DRY_RUN" == true ]]; then
+                if [[ "$USE_COPY" == true ]]; then
+                    ok "(dry-run) would copy rule $rel"
+                else
+                    ok "(dry-run) would symlink rule $rel"
+                fi
+            else
+                mkdir -p "$(dirname "$target")"
+                rm -f "$target"
+
+                if [[ "$USE_COPY" == true ]]; then
+                    cp "$rule_file" "$target"
+                    ok "$rel (copied)"
+                else
+                    ln -sf "$(realpath "$rule_file")" "$target"
+                    ok "$rel (symlinked)"
+                fi
+            fi
+            rule_count=$((rule_count + 1))
+        done < <(find "$SYNC_DIR/rules" -type f 2>/dev/null)
+        log "Rules: $rule_count installed"
+    else
+        warn "No rules/ directory found in sync repo"
+    fi
+
+    echo ""
+
+    # --- Install settings and keybindings ---
+    for f in "${SYNC_FILES[@]}"; do
+        if [[ -f "$SYNC_DIR/$f" ]]; then
+            local target="$CLAUDE_DIR/$f"
+            if [[ "$DRY_RUN" == true ]]; then
+                if [[ "$USE_COPY" == true ]]; then
+                    ok "(dry-run) would copy $f"
+                else
+                    ok "(dry-run) would symlink $f"
+                fi
+            else
+                rm -f "$target"
+
+                if [[ "$USE_COPY" == true ]]; then
+                    # Copy with path adjustment
+                    if [[ "$f" == "keybindings.json" ]]; then
+                        cp "$SYNC_DIR/$f" "$target"
+                    else
+                        adjust_paths "$SYNC_DIR/$f" "$target" "$old_home"
+                    fi
+                    ok "$f (copied)"
+                else
+                    ln -sf "$(realpath "$SYNC_DIR/$f")" "$target"
+                    ok "$f (symlinked)"
+                fi
+            fi
+        fi
+    done
+
+    echo ""
+
+    # --- Install MCP servers ---
+    install_mcp_servers
+
+    echo ""
+    if [[ "$USE_COPY" == true ]]; then
+        log "Install complete (copied). Restart Claude Code to apply changes."
+    else
+        log "Install complete (symlinked). Changes sync automatically on pull."
+        log "Restart Claude Code to apply changes."
+    fi
+}
+
 # --- Main ---
 
 case "$COMMAND" in
     export)      do_export ;;
     import)      do_import ;;
+    install)     do_install ;;
     team-export) do_team_export ;;
     team-import) do_team_import ;;
     *) echo "Unknown command: $COMMAND"; usage ;;
