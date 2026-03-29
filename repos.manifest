@@ -1,9 +1,8 @@
 # Dev Sync - Repository Manifest
-# Format: FOLDER/REPO | BRANCH | GIT_REMOTE
+# Format: FOLDER/REPO | BRANCH | GIT_REMOTE  (supports nested: FOLDER/SUBFOLDER/REPO)
 # Lines starting with # are ignored
 # To skip a repo, comment it out
 
-AINVIRION/agent-generator | main | git@github.com:AInvirion/agent-generator.git
 AINVIRION/AgentForza | main | git@github.com:AInvirion/AgentForza.git
 AINVIRION/AgentJunior | main | git@github.com:AInvirion/AgentJunior.git
 AINVIRION/ainvirion-oss-template | main | git@github.com:AInvirion/ainvirion-oss-template.git
@@ -18,9 +17,15 @@ AINVIRION/Product-Ideas | main | git@github.com:AInvirion/Product-Ideas.git
 AINVIRION/TORtopus | main | git@github.com:AInvirion/TORtopus.git
 AINVIRION/ainvirion_com | main | git@github.com:AInvirion/ainvirion_com.git
 AINVIRION/youtube-transcriber | main | git@github.com:AInvirion/youtube-transcriber.git
+AINVIRION/idea2slides | main | git@github.com:AInvirion/idea2slides.git
+AINVIRION/LLMEOEngine | main | git@github.com:AInvirion/LLMEOEngine.git
+AINVIRION/AIProxyGuard/proxydocker | main | git@github.com:AInvirion/aiproxyguard.git
+AINVIRION/AIProxyGuard/cloud | main | git@github.com:AInvirion/aiproxyguard-cloud.git
+AINVIRION/AIProxyGuard/signatures | main | git@github.com:AInvirion/aiproxyguard-signatures.git
 RESEARCH/ccda | main | git@github.com:SemClone/ccda.git
 RESEARCH/code-review-assistant | main | git@github.com:oscarvalenzuelab/code-review-assistant.git
 RESEARCH/Verified-Intent-Development | master | git@github.com:AInvirion/Verified-Intent-Development.git
+RESEARCH/botsniffer | main | git@github.com:oscarvalenzuelab/botsniffer.git
 SEMCL.ONE/binarysniffer | main | git@github.com:SemClone/binarysniffer.git
 SEMCL.ONE/ccda-cli | main | git@github.com:SemClone/ccda-cli.git
 SEMCL.ONE/community | main | git@github.com:SemClone/community.git
@@ -41,6 +46,8 @@ SEMCL.ONE/status | main | git@github.com:SemClone/status.git
 SEMCL.ONE/tanu-discovery | main | git@github.com:SemClone/tanu-discovery.git
 SEMCL.ONE/upmex | main | git@github.com:SemClone/upmex.git
 SEMCL.ONE/vulnq | main | git@github.com:SemClone/vulnq.git
+SEMCL.ONE/AIModelSniffer/aisniff-client | main | git@github.com:SemClone/aisniff-client.git
+SEMCL.ONE/AIModelSniffer/aisniff-server | main | git@github.com:SemClone/aisniff-server.git
 PERSONAL/agentic-ai-github-actions | main | git@github.com:oscarvalenzuelab/agentic-ai-github-actions.git
 PERSONAL/open_agentic_framework | main | git@github.com:oscarvalenzuelab/open_agentic_framework.git
 PERSONAL/openagenticframework.com | main | git@github.com:oscarvalenzuelab/openagenticframework.com.git

@@ -14,7 +14,7 @@ AHEAD=()
 BEHIND=()
 CLEAN=0
 
-# Find all git repos (max 2 levels deep to match ORG/REPO structure)
+# Find all git repos (max 3 levels deep to match ORG/REPO and ORG/SUBFOLDER/REPO)
 while IFS= read -r gitdir; do
   REPO_DIR=$(dirname "$gitdir")
   REPO_NAME="${REPO_DIR#$BASE_DIR/}"
@@ -51,7 +51,7 @@ while IFS= read -r gitdir; do
     CLEAN=$((CLEAN + 1))
   fi
 
-done < <(find "$BASE_DIR" -maxdepth 3 -name ".git" -type d 2>/dev/null | sort)
+done < <(find "$BASE_DIR" -maxdepth 4 -name ".git" -type d 2>/dev/null | sort)
 
 # Output results
 echo "=== DIRTY REPOS (uncommitted changes) ==="

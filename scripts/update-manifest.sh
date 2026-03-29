@@ -46,7 +46,7 @@ while IFS= read -r gitdir; do
 
     echo "$rel_path | $default_branch | $remote" >> "$TMPFILE"
     ((count++)) || true
-done < <(find "$PROJECTS_DIR" -maxdepth 3 -name ".git" -type d 2>/dev/null | sort)
+done < <(find "$PROJECTS_DIR" -maxdepth 4 -name ".git" -type d 2>/dev/null | sort)
 
 # Show diff if manifest exists
 if [[ -f "$MANIFEST" ]]; then
