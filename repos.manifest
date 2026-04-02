@@ -46,8 +46,8 @@ SEMCL.ONE/status | main | git@github.com:SemClone/status.git
 SEMCL.ONE/tanu-discovery | main | git@github.com:SemClone/tanu-discovery.git
 SEMCL.ONE/upmex | main | git@github.com:SemClone/upmex.git
 SEMCL.ONE/vulnq | main | git@github.com:SemClone/vulnq.git
-SEMCL.ONE/AIModelSniffer/aisniff-client | main | git@github.com:SemClone/aisniff-client.git
-SEMCL.ONE/AIModelSniffer/aisniff-server | main | git@github.com:SemClone/aisniff-server.git
+SCANOSS/AIModelSniffer/aisniff-client | main | git@github.com:SemClone/aisniff-client.git
+SCANOSS/AIModelSniffer/aisniff-server | main | git@github.com:SemClone/aisniff-server.git
 PERSONAL/agentic-ai-github-actions | main | git@github.com:oscarvalenzuelab/agentic-ai-github-actions.git
 PERSONAL/open_agentic_framework | main | git@github.com:oscarvalenzuelab/open_agentic_framework.git
 PERSONAL/openagenticframework.com | main | git@github.com:oscarvalenzuelab/openagenticframework.com.git
