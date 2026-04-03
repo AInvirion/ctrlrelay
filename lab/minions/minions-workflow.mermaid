@@ -1,0 +1,124 @@
+flowchart TD
+    Start([User invokes minions]) --> HandoffCheck{".minions-handoff.json\nexists?"}
+
+    HandoffCheck -->|Yes| Restart{"User said 'restart'?"}
+    HandoffCheck -->|No| ScopeDecision
+
+    Restart -->|No: auto-resume| HandoffLoad
+    Restart -->|"Yes: delete handoff"| ScopeDecision
+
+    ScopeDecision{User provided\nspecific context?} -->|Yes| FocusedScope[Scope: user-specified area]
+    ScopeDecision -->|No| FullScope[Scope: entire codebase]
+    FocusedScope --> P0
+    FullScope --> P0
+
+    subgraph P0 ["Phase 0 — Setup, Profile & Intent"]
+        P0_1[Step 1: Build PROJECT_PROFILE\nREADME + manifests + dir structure]
+        P0_2[Step 2: Discover repo conventions\nCONTRIBUTING.md / CLAUDE.md]
+        P0_3[Step 3: Detect linter/formatter tools]
+        P0_4[Step 4: Create GH labels\nreference/labels.md]
+        P0_5[Step 5: Locate VID-SPEC.md\nor run VID skill to generate it]
+        P0_6[Step 6: Compile context\nPROJECT_PROFILE + VID_SPEC_PATH\n+ REPO_CONVENTIONS]
+        P0_1 --> P0_2 --> P0_3 --> P0_4 --> P0_5 --> P0_6
+    end
+
+    P0 --> P1
+
+    subgraph P1 ["Phase 1 — Parallel Audit (opus/high)"]
+        direction LR
+        FindingsDir["Create .minions-findings/"]
+        A1["Logic Auditor\n→ writes logic.md\n+ VID spec traceability"]
+        A2["Security Auditor\n→ writes security.md\n+ VID spec traceability"]
+        A3["UX Auditor\n→ writes ux.md\n+ frontend-design skill\n+ VID spec traceability"]
+        FindingsDir --> A1 & A2 & A3
+    end
+
+    P1 -->|"Orchestrator receives:\n3 one-liners only"| P2
+
+    subgraph P2 ["Phase 2 — Triage (sonnet/medium, delegated)"]
+        Triager["Triager agent reads\n.minions-findings/*.md"]
+        Dedup[Deduplicate + calibrate severity\nagainst profile AND intent]
+        WriteApproved["Writes approved-full.md\nto disk"]
+        ReturnTable["Returns compact table\nto orchestrator"]
+        Triager --> Dedup --> WriteApproved --> ReturnTable
+    end
+
+    P2 -->|"Orchestrator receives:\ncompact table only"| UserApproval1{User approves\nfindings?}
+    UserApproval1 -->|No| Abort([Abort or re-scope])
+    UserApproval1 -->|Yes| P3
+
+    subgraph P3 ["Phase 3 — Create Issues (sonnet/medium, delegated)"]
+        MilestoneCheck["Step 1: Check repo milestones\ngh api milestones"]
+        Dedup["Step 2: Deduplicate against\nexisting open/closed issues\n(title, file, root cause)"]
+        IssueCreator["Step 3: Create GH issues\nwith full context + VID spec traceability\n+ milestone assignment\n(skip exact duplicates,\ncross-ref partial overlaps)"]
+        AddendumProtocol["Step 4: Record addendum protocol\nfor implementers"]
+        ReturnMap["Returns ID → issue # → milestone\n+ skipped duplicates"]
+        Cleanup["Delete .minions-findings/"]
+        MilestoneCheck --> Dedup --> IssueCreator --> AddendumProtocol --> ReturnMap --> Cleanup
+    end
+
+    P3 -->|"Orchestrator receives:\nmapping table only.\nGitHub is now source of truth."| P4
+
+    subgraph P4 ["Phase 4 — Auto-Calculate Batches & Group by File"]
+        QueryGH["Query: gh issue list --json\nnumber,title,labels,body"]
+        AutoCalc["Auto-calculate:\nbatch count = min(clusters, 8)\nsubagents = 5 + 2x batches"]
+        GroupBatch["Group by file → Batches A, B, C...\nNo file overlap between batches"]
+        QueryGH --> AutoCalc --> GroupBatch
+    end
+
+    P4 --> UserApproval2{User approves\nbatches & subagent\ncalculation?}
+    UserApproval2 -->|No| P4
+    UserApproval2 -->|Yes| P4_5
+
+    subgraph P4_5 ["Phase 4.5 — Context Handoff"]
+        WriteHandoff["Write .minions-handoff.json\nproject_profile + intent +\nconventions + batches +\nissue_map + milestones"]
+        InstructUser["Instruct user:\n'Start new session and say:\nminions: execute from handoff'"]
+        WriteHandoff --> InstructUser
+    end
+
+    P4_5 --> SessionBreak([Planning session ends\nClean context boundary])
+
+    HandoffLoad["Read .minions-handoff.json\nValidate batches + issues"] --> P5
+
+    subgraph P5 ["Phase 5 — Parallel Implementation (sonnet/medium)"]
+        direction TB
+        Batch_N["Per batch (parallel worktrees):\n1. gh issue view N for each issue\n2. UX batches: write tests BEFORE fix\n3. Fix one issue at a time\n4. Atomic commits, readable code\n5. Only final commit: Fixes #N\n6. Add addendum comments if new\n   context discovered\n7. Apply good-practices when refactoring"]
+    end
+
+    P5 --> P6
+
+    subgraph P6 ["Phase 6 — Draft PR + Review Loop"]
+        DraftPR[Push branch → gh pr create --draft]
+        Review["Dispatch reviewer (opus/high)\n+ verify UX tests if UX batch\n+ verify good-practices applied"]
+        Verdict{Reviewer verdict}
+        Fix[Implementer fixes in same branch]
+        CircuitBreaker{Round > 3?}
+        Ready[gh pr ready]
+        Escalate[Escalate to user]
+
+        DraftPR --> Review --> Verdict
+        Verdict -->|CLEAN| Ready
+        Verdict -->|NEEDS FIXES| CircuitBreaker
+        CircuitBreaker -->|No| Fix --> Review
+        CircuitBreaker -->|Yes| Escalate
+    end
+
+    P6 --> P7[Phase 7 — Sequential Merge\nMerge PR → pull main\nOne at a time]
+    P7 --> P8
+
+    subgraph P8 ["Phase 8 — Post-merge Verification"]
+        VerifyProfile["Verify based on PROJECT_PROFILE:"]
+        VLint[Linter/formatter]
+        VTest["Test suite\n(including new UX tests)"]
+        VWeb["Web app → server + page loads"]
+        VAPI["API → endpoint checks"]
+        VCLI["CLI → command output"]
+        VLib["Library → export resolution"]
+        VerifyProfile --> VLint & VTest & VWeb & VAPI & VCLI & VLib
+    end
+
+    P8 --> VerifyOK{All checks pass?}
+    VerifyOK -->|Yes| P9["Phase 9 — Cleanup\nRemove worktrees & branches\nDelete .minions-handoff.json\nVerify all issues closed"]
+    VerifyOK -->|No| FollowUp[Create follow-up fix branch\n→ back to Phase 6 loop]
+    FollowUp --> P6
+    P9 --> Done([Complete])
