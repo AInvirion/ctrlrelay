@@ -25,6 +25,10 @@ AINVIRION/Product-Telemetry/ptelemetry-python-sdk | main | git@github.com:AInvir
 AINVIRION/AIProxyGuard/proxydocker | main | git@github.com:AInvirion/aiproxyguard.git
 AINVIRION/AIProxyGuard/cloud | main | git@github.com:AInvirion/aiproxyguard-cloud.git
 AINVIRION/AIProxyGuard/signatures | main | git@github.com:AInvirion/aiproxyguard-signatures.git
+AINVIRION/AIProxyGuard/prompt-injection-benchmark | main | git@github.com:AInvirion/prompt-injection-benchmark.git
+AINVIRION/AIProxyGuard/aiproxyguard-npm-sdk | main | git@github.com:AInvirion/aiproxyguard-npm-sdk.git
+AINVIRION/AIProxyGuard/aiproxyguard-python-sdk | main | git@github.com:AInvirion/aiproxyguard-python-sdk.git
+AINVIRION/AIProxyGuard/aiproxyguard-promptest | main | git@github.com:AInvirion/aiproxyguard-promptest.git
 RESEARCH/ccda | main | git@github.com:SemClone/ccda.git
 RESEARCH/code-review-assistant | main | git@github.com:oscarvalenzuelab/code-review-assistant.git
 RESEARCH/Verified-Intent-Development | master | git@github.com:AInvirion/Verified-Intent-Development.git
