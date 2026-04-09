@@ -19,6 +19,9 @@ AINVIRION/ainvirion_com | main | git@github.com:AInvirion/ainvirion_com.git
 AINVIRION/youtube-transcriber | main | git@github.com:AInvirion/youtube-transcriber.git
 AINVIRION/idea2slides | main | git@github.com:AInvirion/idea2slides.git
 AINVIRION/LLMEOEngine | main | git@github.com:AInvirion/LLMEOEngine.git
+AINVIRION/Product-Telemetry/Portal | main | git@github.com:AInvirion/Product-Telemetry.git
+AINVIRION/Product-Telemetry/ptelemetry-npm-sdk | main | git@github.com:AInvirion/ptelemetry-npm-sdk.git
+AINVIRION/Product-Telemetry/ptelemetry-python-sdk | main | git@github.com:AInvirion/ptelemetry-python-sdk.git
 AINVIRION/AIProxyGuard/proxydocker | main | git@github.com:AInvirion/aiproxyguard.git
 AINVIRION/AIProxyGuard/cloud | main | git@github.com:AInvirion/aiproxyguard-cloud.git
 AINVIRION/AIProxyGuard/signatures | main | git@github.com:AInvirion/aiproxyguard-signatures.git
