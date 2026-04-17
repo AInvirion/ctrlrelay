@@ -2,7 +2,10 @@
 
 **Date:** 2026-04-17  
 **Status:** Approved  
-**Approach:** Minimal Viable Orchestrator (MVO) with PyPI-ready package structure
+**Approach:** Minimal Viable Orchestrator (MVO) with PyPI-ready package structure  
+**Base spec:** `docs/dev-sync-orchestrator-spec.md` — this document is a delta, not standalone
+
+> **Note:** This design extends the base spec with PyPI packaging, cross-platform support, and refined abstractions. For full behavioral details (pipeline flows, scheduling jobs, complete SQLite schema, security model), refer to the base spec. This document only overrides or adds to what's there.
 
 ## Overview
 
@@ -82,6 +85,13 @@ dev-sync daemon status
 
 The contract between orchestrator and skills. Skills write state to `$DEV_SYNC_STATE_FILE`.
 
+### Atomic Write Rules
+
+1. **Write to temp, then rename:** `checkpoint.*` helpers write to `$DEV_SYNC_STATE_FILE.tmp`, then `os.rename()` to final path
+2. **One checkpoint per session:** Only the final state matters; overwrites are allowed
+3. **Orchestrator deletes on read:** After parsing, orchestrator removes the state file to prevent re-reads on restart
+4. **Truncation protection:** Orchestrator validates JSON is complete before acting; incomplete file = FAILED
+
 ### State File Schema
 
 ```json
@@ -113,8 +123,10 @@ The contract between orchestrator and skills. Skills write state to `$DEV_SYNC_S
 
 ### Skill Helper Library
 
+Public API re-exported from package root (`src/dev_sync/__init__.py`):
+
 ```python
-from dev_sync.checkpoint import checkpoint
+from dev_sync import checkpoint  # Re-exported from dev_sync.core.checkpoint
 
 checkpoint.done(summary="Merged 3 PRs", outputs={"merged_prs": [1,2,3]})
 
@@ -133,6 +145,17 @@ checkpoint.failed(error="gh CLI returned 404", recoverable=False)
 | `DONE` | Log summary, release lock, push event to dashboard |
 | `BLOCKED_NEEDS_INPUT` | Forward question to transport, wait, resume with `claude --resume <session_id>` |
 | `FAILED` | Alert via transport, release lock, mark session failed |
+
+### Cancellation & Timeout Flow
+
+When `/cancel <session_id>` is received or session timeout expires:
+
+1. **Kill process:** `SIGTERM` to `claude -p` subprocess, wait 5s, then `SIGKILL` if needed
+2. **Update state:** Session status → `cancelled` or `timeout`
+3. **Release lock:** Remove from `repo_locks` table
+4. **Cleanup worktree:** Keep worktree for inspection; add to cleanup queue (reaped after 24h)
+5. **Notify:** Push `session_cancelled` or `session_timeout` event to dashboard
+6. **Clear pending:** Remove from `telegram_pending` table if waiting for input
 
 ## 3. Skill Audit Tool
 
@@ -172,6 +195,7 @@ timezone: "America/Santiago"
 paths:
   state_db: "~/.dev-sync/state.db"
   worktrees: "~/.dev-sync/worktrees"
+  bare_repos: "~/.dev-sync/repos"    # Bare clones for worktree creation
   contexts: "~/dev-sync/contexts"
   skills: "~/dev-sync/claude-config/skills"
 
@@ -233,6 +257,10 @@ class DashboardConfigProvider(ConfigProvider):
 
 Path: `~/.dev-sync/state.db`
 
+> **Full schema:** See base spec section 4.6. This section shows the tables this design adds or modifies.
+
+**Additional tables from base spec (not repeated here):** `github_cursor`, `telegram_pending`
+
 ```sql
 CREATE TABLE sessions (
   id TEXT PRIMARY KEY,
@@ -280,16 +308,33 @@ Six policies per repo, each can be `auto`, `ask`, or `never`:
 
 ### Policy API
 
+**Decision vocabulary (canonical):** `approve`, `reject`, `skip`, `timeout`
+
 ```python
+class PolicyDecision(Enum):
+    APPROVE = "approve"   # Proceed with action
+    REJECT = "reject"     # Don't proceed, mark as rejected
+    SKIP = "skip"         # Don't proceed, leave for manual handling
+    TIMEOUT = "timeout"   # No response within deadline
+
 class AutomationPolicy:
     async def evaluate(
         self,
         repo: str,
         operation: str,
         context: dict,
-    ) -> PolicyDecision:  # PROCEED | WAIT | SKIP
+    ) -> PolicyDecision:
+        """
+        Returns immediately for 'auto' (APPROVE) or 'never' (SKIP) policies.
+        For 'ask' policies, sends to transport and returns APPROVE/REJECT/SKIP/TIMEOUT.
+        """
 
-    async def await_decision(self, decision_id: str, timeout: int) -> bool
+    async def await_decision(
+        self, 
+        decision_id: str, 
+        timeout: int = 3600
+    ) -> PolicyDecision:
+        """Wait for user response. Returns TIMEOUT if no response."""
 ```
 
 ### Telegram Format for `ask`
@@ -304,6 +349,8 @@ CI: ✅ green
 
 Reply: ✅ approve | ❌ reject | ⏸️ skip
 ```
+
+User response is normalized to `PolicyDecision` enum.
 
 ## 7. Telegram Bridge
 
@@ -323,11 +370,25 @@ Configurable via `transport.telegram.socket_path` in `orchestrator.yaml`.
 
 ### Socket Protocol
 
+**Framing:** Newline-delimited JSON (one JSON object per line, `\n` terminated)
+
+**Permissions:** Socket created with mode `0600` (owner only). Bridge validates peer UID matches owner.
+
 ```json
+// Orchestrator → Bridge
 {"op": "send", "request_id": "r-001", "text": "Secops complete"}
-{"op": "ask", "request_id": "r-002", "question": "Approve?", "options": ["approve", "reject"]}
-{"op": "answer", "request_id": "r-002", "answer": "approve"}
+{"op": "ask", "request_id": "r-002", "question": "Approve?", "options": ["approve", "reject", "skip"]}
+
+// Bridge → Orchestrator
+{"op": "ack", "request_id": "r-001", "status": "sent"}
+{"op": "ack", "request_id": "r-002", "status": "pending"}
+{"op": "answer", "request_id": "r-002", "answer": "approve", "answered_at": "2026-04-17T12:00:00Z"}
+{"op": "error", "request_id": "r-003", "error": "telegram_api_error", "message": "..."}
 ```
+
+**Retry:** Orchestrator retries failed sends 3x with exponential backoff. After 3 failures, logs locally and continues.
+
+**Liveness:** Orchestrator sends `{"op": "ping"}` every 30s; bridge responds `{"op": "pong"}`. No pong in 60s = bridge considered dead.
 
 ### Transport Abstraction
 
@@ -416,10 +477,10 @@ FastAPI app on DigitalOcean App Platform.
 - **Phase 0:** `pip install -e .` works, `dev-sync config validate` passes
 - **Phase 1:** `dev-sync skills audit` produces compliance report
 - **Phase 2:** `dev-sync bridge test` delivers message to phone
-- **Phase 3:** Secops runs on 2-3 repos, events on dashboard
+- **Phase 3:** Secops runs on 2-3 repos, events logged locally (dashboard client queues if server unavailable)
 - **Phase 4:** Self-assign issue, get PR notification
 - **Phase 5:** Start daemon, wake up to secops summary
-- **Phase 6:** Dashboard shows live status
+- **Phase 6:** Dashboard shows live status, queued events drain
 - **Phase 7:** `pip install dev-sync` from PyPI works
 
 ## 10. What NOT to Do
