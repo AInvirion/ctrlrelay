@@ -19,6 +19,8 @@ from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
 from dev_sync.core.github import GitHubCLI
 from dev_sync.core.state import StateDB
 from dev_sync.core.worktree import WorktreeManager
+from dev_sync.core.poller import IssuePoller
+from dev_sync.core.pr_watcher import PRWatcher
 
 __all__ = [
     "CheckpointError",
@@ -28,6 +30,8 @@ __all__ = [
     "Config",
     "ConfigError",
     "GitHubCLI",
+    "IssuePoller",
+    "PRWatcher",
     "RepoConfig",
     "SessionResult",
     "StateDB",
