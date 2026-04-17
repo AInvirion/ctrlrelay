@@ -85,6 +85,36 @@ class WorktreeManager:
 
         return worktree_path
 
+    async def create_worktree_with_new_branch(
+        self,
+        repo: str,
+        session_id: str,
+        new_branch: str,
+        base_branch: str | None = None,
+    ) -> Path:
+        """Create a worktree with a new branch."""
+        bare_path = self._get_bare_repo_path(repo)
+        worktree_path = self._get_worktree_path(repo, session_id)
+
+        if worktree_path.exists():
+            raise WorktreeError(f"Worktree already exists: {worktree_path}")
+
+        if base_branch is None:
+            base_branch = await self.get_default_branch(repo)
+
+        await self._run_git(
+            "worktree", "add",
+            "-b", new_branch,
+            str(worktree_path),
+            base_branch,
+            cwd=bare_path,
+        )
+        return worktree_path
+
+    async def push_branch(self, worktree_path: Path, branch: str) -> None:
+        """Push a branch to origin."""
+        await self._run_git("push", "-u", "origin", branch, cwd=worktree_path)
+
     async def ensure_bare_repo(self, repo: str) -> Path:
         """Ensure bare repo exists, cloning if needed."""
         bare_path = self._get_bare_repo_path(repo)
