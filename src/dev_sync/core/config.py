@@ -55,7 +55,9 @@ class TelegramConfig(BaseModel):
 
     bot_token_env: str = "DEV_SYNC_TELEGRAM_TOKEN"
     chat_id: int = 0
-    socket_path: Path = Field(default_factory=lambda: Path("~/.dev-sync/dev-sync.sock").expanduser())
+    socket_path: Path = Field(
+        default_factory=lambda: Path("~/.dev-sync/dev-sync.sock").expanduser()
+    )
 
     @field_validator("socket_path", mode="before")
     @classmethod

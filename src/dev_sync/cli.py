@@ -7,7 +7,7 @@ from rich.console import Console
 from rich.table import Table
 
 from dev_sync import __version__
-from dev_sync.core.config import Config, ConfigError, load_config
+from dev_sync.core.config import ConfigError, load_config
 
 app = typer.Typer(
     name="dev-sync",

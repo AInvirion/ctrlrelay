@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from dev_sync.core.state import StateDB
 
 
@@ -29,7 +27,10 @@ class TestStateDBInit:
         ).fetchall()
         table_names = {row[0] for row in tables}
 
-        expected = {"sessions", "repo_locks", "github_cursor", "telegram_pending", "automation_decisions"}
+        expected = {
+            "sessions", "repo_locks", "github_cursor",
+            "telegram_pending", "automation_decisions",
+        }
         assert expected.issubset(table_names)
 
         db.close()

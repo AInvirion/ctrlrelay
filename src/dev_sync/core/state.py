@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,

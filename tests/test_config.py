@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from dev_sync.core.config import Config, load_config, ConfigError
+from dev_sync.core.config import Config, ConfigError, load_config
 
 
 class TestConfigLoading:
