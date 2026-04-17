@@ -2,3 +2,17 @@
 *.swo
 .DS_Store
 node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.coverage
+
+# IDE
+.idea/
+.vscode/
+
+# Claude worktrees
+.claude/worktrees/
+
