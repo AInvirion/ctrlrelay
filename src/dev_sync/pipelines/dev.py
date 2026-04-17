@@ -189,9 +189,13 @@ async def run_dev_issue(
 
         # Record session
         state_db.execute(
-            """INSERT INTO sessions (id, pipeline, repo, worktree_path, status, started_at, issue_number)
+            """INSERT INTO sessions
+               (id, pipeline, repo, worktree_path, status, started_at, issue_number)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, "dev", repo, str(worktree_path), "running", int(time.time()), issue_number),
+            (
+                session_id, "dev", repo, str(worktree_path),
+                "running", int(time.time()), issue_number,
+            ),
         )
         state_db.commit()
 
@@ -222,7 +226,10 @@ async def run_dev_issue(
                 repo=repo,
                 message=result.summary,
                 session_id=session_id,
-                details={"issue_number": issue_number, "pr_number": result.outputs.get("pr_number")},
+                details={
+                    "issue_number": issue_number,
+                    "pr_number": result.outputs.get("pr_number"),
+                },
             ))
 
         # Send notification via transport
