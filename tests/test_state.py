@@ -56,9 +56,20 @@ class TestRepoLocks:
         """Should release lock so it can be re-acquired."""
         db = StateDB(tmp_path / "state.db")
         db.acquire_lock("owner/repo", "session-123")
-        db.release_lock("owner/repo")
+        released = db.release_lock("owner/repo", "session-123")
+        assert released is True
         result = db.acquire_lock("owner/repo", "session-456")
         assert result is True
+        db.close()
+
+    def test_release_lock_wrong_session(self, tmp_path: Path) -> None:
+        """Should not release lock if session doesn't match."""
+        db = StateDB(tmp_path / "state.db")
+        db.acquire_lock("owner/repo", "session-123")
+        released = db.release_lock("owner/repo", "session-456")
+        assert released is False
+        holder = db.get_lock_holder("owner/repo")
+        assert holder == "session-123"
         db.close()
 
     def test_get_lock_holder(self, tmp_path: Path) -> None:

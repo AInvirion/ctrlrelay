@@ -183,6 +183,8 @@ def load_config(path: Path | str) -> Config:
     try:
         with open(path) as f:
             data = yaml.safe_load(f)
+    except OSError as e:
+        raise ConfigError(f"Failed to read config file: {e}") from e
     except yaml.YAMLError as e:
         raise ConfigError(f"Failed to parse YAML: {e}") from e
 

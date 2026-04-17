@@ -124,14 +124,24 @@ class StateDB:
         except sqlite3.IntegrityError:
             return False
 
-    def release_lock(self, repo: str) -> None:
+    def release_lock(self, repo: str, session_id: str) -> bool:
         """Release a lock on a repository.
+
+        Only releases if the lock is held by the specified session.
 
         Args:
             repo: Repository name to unlock.
+            session_id: Session ID that should own the lock.
+
+        Returns:
+            True if lock was released, False if not held by this session.
         """
-        self._conn.execute("DELETE FROM repo_locks WHERE repo = ?", (repo,))
+        cursor = self._conn.execute(
+            "DELETE FROM repo_locks WHERE repo = ? AND session_id = ?",
+            (repo, session_id),
+        )
         self._conn.commit()
+        return cursor.rowcount > 0
 
     def get_lock_holder(self, repo: str) -> str | None:
         """Get the session ID holding a lock.
