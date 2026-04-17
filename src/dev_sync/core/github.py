@@ -104,3 +104,89 @@ class GitHubCLI:
             c.get("status") == "completed" and c.get("conclusion") == "success"
             for c in checks
         )
+
+    async def list_assigned_issues(
+        self,
+        repo: str,
+        assignee: str,
+        state: str = "open",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List issues assigned to a user."""
+        output = await self._run_gh(
+            "issue", "list",
+            "--repo", repo,
+            "--assignee", assignee,
+            "--state", state,
+            "--limit", str(limit),
+            "--json", "number,title,state,body,labels,assignees,createdAt,updatedAt",
+        )
+        return json.loads(output) if output.strip() else []
+
+    async def get_issue(
+        self,
+        repo: str,
+        issue_number: int,
+    ) -> dict[str, Any]:
+        """Get a single issue by number."""
+        output = await self._run_gh(
+            "issue", "view",
+            str(issue_number),
+            "--repo", repo,
+            "--json", "number,title,state,body,labels,assignees,author,createdAt,updatedAt,comments",
+        )
+        return json.loads(output)
+
+    async def create_pr(
+        self,
+        repo: str,
+        title: str,
+        body: str,
+        head: str,
+        base: str = "main",
+    ) -> dict[str, Any]:
+        """Create a pull request."""
+        output = await self._run_gh(
+            "pr", "create",
+            "--repo", repo,
+            "--title", title,
+            "--body", body,
+            "--head", head,
+            "--base", base,
+            "--json", "number,title,url,state",
+        )
+        return json.loads(output)
+
+    async def get_pr_state(
+        self,
+        repo: str,
+        pr_number: int,
+    ) -> dict[str, Any]:
+        """Get PR state including merge status."""
+        output = await self._run_gh(
+            "pr", "view",
+            str(pr_number),
+            "--repo", repo,
+            "--json", "number,state,mergeable,mergeStateStatus,title,url,headRefName,baseRefName",
+        )
+        return json.loads(output)
+
+    async def close_issue(
+        self,
+        repo: str,
+        issue_number: int,
+        comment: str | None = None,
+    ) -> None:
+        """Close an issue with an optional comment."""
+        if comment is not None:
+            await self._run_gh(
+                "issue", "comment",
+                str(issue_number),
+                "--repo", repo,
+                "--body", comment,
+            )
+        await self._run_gh(
+            "issue", "close",
+            str(issue_number),
+            "--repo", repo,
+        )
