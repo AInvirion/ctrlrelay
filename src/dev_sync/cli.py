@@ -105,6 +105,105 @@ def config_repos(
     console.print(table)
 
 
+# Skills subcommand group
+skills_app = typer.Typer(help="Skill management commands.")
+app.add_typer(skills_app, name="skills")
+
+
+@skills_app.command("audit")
+def skills_audit(
+    skills_path: str = typer.Option(
+        None,
+        "--path",
+        "-p",
+        help="Path to skills directory (default: from config)",
+    ),
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+) -> None:
+    """Audit skills for orchestrator readiness."""
+    from dev_sync.core.audit import audit_all, format_report
+
+    # Get skills path from config if not provided
+    if skills_path is None:
+        try:
+            config = load_config(config_path)
+            skills_dir = config.paths.skills
+        except ConfigError as e:
+            console.print(f"[red]Error loading config:[/red] {e}")
+            console.print("Use --path to specify skills directory directly.")
+            raise typer.Exit(1)
+    else:
+        skills_dir = Path(skills_path).expanduser()
+
+    if not skills_dir.exists():
+        console.print(f"[red]Skills directory not found:[/red] {skills_dir}")
+        raise typer.Exit(1)
+
+    console.print(f"Auditing skills in: {skills_dir}\n")
+
+    audits = audit_all(skills_dir)
+
+    if not audits:
+        console.print("[yellow]No skills found.[/yellow]")
+        return
+
+    report = format_report(audits)
+    console.print(report)
+
+    # Exit with error if any skills not ready
+    if not all(a.passed for a in audits):
+        raise typer.Exit(1)
+
+
+@skills_app.command("list")
+def skills_list(
+    skills_path: str = typer.Option(
+        None,
+        "--path",
+        "-p",
+        help="Path to skills directory (default: from config)",
+    ),
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+) -> None:
+    """List available skills."""
+    from dev_sync.core.audit import discover_skills
+
+    if skills_path is None:
+        try:
+            config = load_config(config_path)
+            skills_dir = config.paths.skills
+        except ConfigError as e:
+            console.print(f"[red]Error loading config:[/red] {e}")
+            raise typer.Exit(1)
+    else:
+        skills_dir = Path(skills_path).expanduser()
+
+    skills = discover_skills(skills_dir)
+
+    if not skills:
+        console.print("[yellow]No skills found.[/yellow]")
+        return
+
+    table = Table(title="Available Skills")
+    table.add_column("Name", style="cyan")
+    table.add_column("Path", style="dim")
+
+    for skill in skills:
+        table.add_row(skill.name, str(skill.path))
+
+    console.print(table)
+
+
 @app.command("status")
 def status(
     config_path: str = typer.Option(
