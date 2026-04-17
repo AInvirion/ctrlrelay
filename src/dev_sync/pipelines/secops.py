@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,3 +106,100 @@ Use checkpoint.failed() if something goes wrong."""
             summary="Failed",
             error=result.state.error,
         )
+
+
+async def run_secops_all(
+    repos: list[Any],
+    dispatcher: ClaudeDispatcher,
+    github: GitHubCLI,
+    worktree: WorktreeManager,
+    dashboard: DashboardClient | None,
+    state_db: StateDB,
+    transport: Transport | None,
+    contexts_dir: Path,
+) -> list[PipelineResult]:
+    """Run secops pipeline on all configured repos."""
+    results = []
+
+    pipeline = SecopsPipeline(
+        dispatcher=dispatcher,
+        github=github,
+        worktree=worktree,
+        dashboard=dashboard,
+        state_db=state_db,
+        transport=transport,
+    )
+
+    for repo_config in repos:
+        repo = repo_config.name
+        session_id = f"secops-{repo.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
+
+        if not state_db.acquire_lock(repo, session_id):
+            results.append(PipelineResult(
+                success=False,
+                session_id=session_id,
+                summary=f"Could not acquire lock for {repo}",
+                error="Repository locked by another session",
+            ))
+            continue
+
+        try:
+            await worktree.ensure_bare_repo(repo)
+            worktree_path = await worktree.create_worktree(repo, session_id)
+
+            context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
+            if context_path.exists():
+                worktree.symlink_context(worktree_path, context_path)
+
+            state_file = worktree_path / ".dev-sync" / "state.json"
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+
+            ctx = PipelineContext(
+                session_id=session_id,
+                repo=repo,
+                worktree_path=worktree_path,
+                context_path=context_path,
+                state_file=state_file,
+            )
+
+            state_db.execute(
+                """INSERT INTO sessions (id, pipeline, repo, worktree_path, status, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (session_id, "secops", repo, str(worktree_path), "running", int(time.time())),
+            )
+            state_db.commit()
+
+            result = await pipeline.run(ctx)
+            results.append(result)
+
+            status = "done" if result.success else ("blocked" if result.blocked else "failed")
+            state_db.execute(
+                "UPDATE sessions SET status = ?, summary = ?, ended_at = ? WHERE id = ?",
+                (status, result.summary, int(time.time()), session_id),
+            )
+            state_db.commit()
+
+            if dashboard and result.success:
+                await dashboard.push_event(EventPayload(
+                    level="info",
+                    pipeline="secops",
+                    repo=repo,
+                    message=result.summary,
+                    session_id=session_id,
+                ))
+
+            worktree.remove_context_symlink(worktree_path)
+            await worktree.remove_worktree(repo, session_id)
+
+        except Exception as e:
+            results.append(PipelineResult(
+                success=False,
+                session_id=session_id,
+                summary=f"Error processing {repo}",
+                error=str(e),
+            ))
+
+        finally:
+            state_db.release_lock(repo, session_id)
+
+    return results
