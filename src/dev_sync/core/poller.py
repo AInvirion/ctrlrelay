@@ -91,3 +91,4 @@ class IssuePoller:
         after a crash where work was already started).
         """
         self.seen_issues.setdefault(repo, set()).add(issue_number)
+        self._save_state()
