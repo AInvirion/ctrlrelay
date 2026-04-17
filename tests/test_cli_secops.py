@@ -1,9 +1,6 @@
 """Tests for secops CLI commands."""
 
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 from typer.testing import CliRunner
 
 runner = CliRunner()

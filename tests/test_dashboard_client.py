@@ -68,12 +68,18 @@ class TestDashboardClient:
     @pytest.mark.asyncio
     async def test_drain_queue_sends_queued_events(self, tmp_path: Path) -> None:
         """Should send queued events when connection restored."""
-        from dev_sync.dashboard.client import DashboardClient, EventPayload
+        from dev_sync.dashboard.client import DashboardClient
 
         queue_file = tmp_path / "event_queue.json"
         queue_file.write_text(json.dumps([
-            {"level": "info", "pipeline": "secops", "repo": "r1", "message": "m1", "timestamp": "t1", "details": {}},
-            {"level": "info", "pipeline": "secops", "repo": "r2", "message": "m2", "timestamp": "t2", "details": {}},
+            {
+                "level": "info", "pipeline": "secops", "repo": "r1",
+                "message": "m1", "timestamp": "t1", "details": {}
+            },
+            {
+                "level": "info", "pipeline": "secops", "repo": "r2",
+                "message": "m2", "timestamp": "t2", "details": {}
+            },
         ]))
 
         client = DashboardClient(

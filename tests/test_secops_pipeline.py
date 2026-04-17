@@ -1,7 +1,7 @@
 """Tests for secops pipeline."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -114,9 +114,8 @@ class TestSecopsPipeline:
     async def test_run_all_processes_multiple_repos(self, tmp_path: Path) -> None:
         """Should run secops on all configured repos."""
         from dev_sync.core.checkpoint import CheckpointStatus
-        from dev_sync.core.config import RepoConfig
         from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.secops import SecopsPipeline, run_secops_all
+        from dev_sync.pipelines.secops import run_secops_all
 
         mock_dispatcher = AsyncMock()
         mock_state = MagicMock()

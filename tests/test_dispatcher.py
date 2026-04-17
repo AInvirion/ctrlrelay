@@ -1,7 +1,6 @@
 """Tests for Claude dispatcher."""
 
 import json
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,7 +11,7 @@ class TestClaudeDispatcher:
     @pytest.mark.asyncio
     async def test_spawn_session_sets_env_vars(self, tmp_path: Path) -> None:
         """Should set DEV_SYNC env vars for checkpoint protocol."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
+        from dev_sync.core.dispatcher import ClaudeDispatcher
 
         dispatcher = ClaudeDispatcher(claude_binary="claude")
 
@@ -30,7 +29,7 @@ class TestClaudeDispatcher:
                 "summary": "Test completed",
             }))
 
-            result = await dispatcher.spawn_session(
+            await dispatcher.spawn_session(
                 session_id="test-123",
                 prompt="Test prompt",
                 working_dir=tmp_path,

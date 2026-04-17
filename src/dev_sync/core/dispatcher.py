@@ -6,7 +6,6 @@ import asyncio
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
 

@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 
 class TestPipelineProtocol:
     def test_pipeline_context_has_required_fields(self) -> None:

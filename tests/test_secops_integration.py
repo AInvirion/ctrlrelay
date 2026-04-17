@@ -1,7 +1,6 @@
 """Integration tests for secops pipeline."""
 
 import json
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -52,8 +51,8 @@ class TestSecopsIntegration:
                 "outputs": {"merged_prs": [101, 102]},
             }))
 
-            from dev_sync.core.dispatcher import SessionResult
             from dev_sync.core.checkpoint import read_checkpoint
+            from dev_sync.core.dispatcher import SessionResult
             return SessionResult(
                 session_id=kwargs["session_id"],
                 exit_code=0,

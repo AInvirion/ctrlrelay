@@ -14,7 +14,7 @@ from dev_sync.core.github import GitHubCLI
 from dev_sync.core.state import StateDB
 from dev_sync.core.worktree import WorktreeManager
 from dev_sync.dashboard.client import DashboardClient, EventPayload
-from dev_sync.pipelines.base import Pipeline, PipelineContext, PipelineResult
+from dev_sync.pipelines.base import PipelineContext, PipelineResult
 from dev_sync.transports.base import Transport
 
 
