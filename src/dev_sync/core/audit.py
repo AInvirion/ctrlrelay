@@ -195,3 +195,58 @@ def audit_all(skills_dir: Path) -> list[SkillAudit]:
     """
     skills = discover_skills(skills_dir)
     return [audit_skill(skill) for skill in skills]
+
+
+def format_report(audits: list[SkillAudit]) -> str:
+    """Format audit results as markdown report.
+
+    Args:
+        audits: List of skill audit results.
+
+    Returns:
+        Markdown formatted report.
+    """
+    lines = [
+        "## Skill Audit Report",
+        "",
+        "| Skill | Checkpoint | Headless | Context | Attribution | Status |",
+        "|-------|------------|----------|---------|-------------|--------|",
+    ]
+
+    for audit in audits:
+        def icon(check: AuditCheck) -> str:
+            result = audit.results.get(check)
+            if result is None:
+                return "➖"
+            return "✅" if result.passed else "❌"
+
+        lines.append(
+            f"| {audit.name} "
+            f"| {icon(AuditCheck.CHECKPOINT)} "
+            f"| {icon(AuditCheck.HEADLESS)} "
+            f"| {icon(AuditCheck.CONTEXT_PATH)} "
+            f"| {icon(AuditCheck.ATTRIBUTION)} "
+            f"| {audit.status} |"
+        )
+
+    # Summary
+    ready = sum(1 for a in audits if a.passed)
+    total = len(audits)
+    lines.extend([
+        "",
+        f"**Summary:** {ready}/{total} skills ready for orchestrator",
+    ])
+
+    # Details for failed checks
+    failed_audits = [a for a in audits if not a.passed]
+    if failed_audits:
+        lines.extend(["", "### Issues", ""])
+        for audit in failed_audits:
+            lines.append(f"**{audit.name}:**")
+            for check, result in audit.results.items():
+                if not result.passed:
+                    fixable = " (auto-fixable)" if result.auto_fixable else ""
+                    lines.append(f"- {check.value}: {result.reason}{fixable}")
+            lines.append("")
+
+    return "\n".join(lines)

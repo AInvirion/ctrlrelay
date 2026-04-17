@@ -213,3 +213,45 @@ class TestAuditFunctions:
         by_name = {r.name: r for r in results}
         assert by_name["skill-one"].results[AuditCheck.CHECKPOINT].passed is True
         assert by_name["skill-two"].results[AuditCheck.CHECKPOINT].passed is False
+
+
+class TestAuditReport:
+    def test_format_report(self) -> None:
+        """format_report should generate markdown table."""
+        from dev_sync.core.audit import (
+            AuditCheck,
+            AuditResult,
+            SkillAudit,
+            format_report,
+        )
+
+        audits = [
+            SkillAudit(
+                name="skill-one",
+                path=Path("/skills/one"),
+                results={
+                    AuditCheck.CHECKPOINT: AuditResult(passed=True),
+                    AuditCheck.HEADLESS: AuditResult(passed=True),
+                    AuditCheck.CONTEXT_PATH: AuditResult(passed=True),
+                    AuditCheck.ATTRIBUTION: AuditResult(passed=True),
+                },
+            ),
+            SkillAudit(
+                name="skill-two",
+                path=Path("/skills/two"),
+                results={
+                    AuditCheck.CHECKPOINT: AuditResult(passed=False, reason="Missing"),
+                    AuditCheck.HEADLESS: AuditResult(passed=True),
+                    AuditCheck.CONTEXT_PATH: AuditResult(passed=False, reason="Hardcoded"),
+                    AuditCheck.ATTRIBUTION: AuditResult(passed=True),
+                },
+            ),
+        ]
+
+        report = format_report(audits)
+        assert "## Skill Audit Report" in report
+        assert "skill-one" in report
+        assert "skill-two" in report
+        assert "READY" in report
+        assert "NOT READY" in report
+        assert "| Skill |" in report
