@@ -133,3 +133,39 @@ class TestTransportError:
         from dev_sync.transports.base import TransportError
 
         assert issubclass(TransportError, Exception)
+
+
+class TestGetTransport:
+    def test_get_file_mock_transport(self, tmp_path) -> None:
+        """Should return FileMockTransport for file_mock type."""
+        from dev_sync.core.config import FileMockConfig, TransportConfig, TransportType
+        from dev_sync.transports import get_transport
+
+        config = TransportConfig(
+            type=TransportType.FILE_MOCK,
+            file_mock=FileMockConfig(
+                inbox=tmp_path / "inbox.txt",
+                outbox=tmp_path / "outbox.txt",
+            ),
+        )
+        (tmp_path / "inbox.txt").touch()
+        (tmp_path / "outbox.txt").touch()
+
+        transport = get_transport(config)
+        assert transport.__class__.__name__ == "FileMockTransport"
+
+    def test_get_socket_transport(self, tmp_path) -> None:
+        """Should return SocketTransport for telegram type."""
+        from dev_sync.core.config import TelegramConfig, TransportConfig, TransportType
+        from dev_sync.transports import get_transport
+
+        config = TransportConfig(
+            type=TransportType.TELEGRAM,
+            telegram=TelegramConfig(
+                chat_id=123,
+                socket_path=tmp_path / "test.sock",
+            ),
+        )
+
+        transport = get_transport(config)
+        assert transport.__class__.__name__ == "SocketTransport"
