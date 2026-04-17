@@ -678,7 +678,7 @@ def poller_start(
     interval: int = typer.Option(
         300,
         "--interval",
-        "-n",
+        "-i",
         help="Polling interval in seconds",
     ),
 ) -> None:
