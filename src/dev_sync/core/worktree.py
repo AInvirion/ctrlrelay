@@ -54,11 +54,17 @@ class WorktreeManager:
         repo_name = repo.replace("/", "-")
         return self.worktrees_dir / f"{repo_name}-{session_id}"
 
+    async def get_default_branch(self, repo: str) -> str:
+        """Get the default branch for a repo from bare clone."""
+        bare_path = self._get_bare_repo_path(repo)
+        output = await self._run_git("symbolic-ref", "HEAD", cwd=bare_path)
+        return output.strip().replace("refs/heads/", "")
+
     async def create_worktree(
         self,
         repo: str,
         session_id: str,
-        branch: str = "main",
+        branch: str | None = None,
     ) -> Path:
         """Create a worktree for a session."""
         bare_path = self._get_bare_repo_path(repo)
@@ -66,6 +72,9 @@ class WorktreeManager:
 
         if worktree_path.exists():
             raise WorktreeError(f"Worktree already exists: {worktree_path}")
+
+        if branch is None:
+            branch = await self.get_default_branch(repo)
 
         await self._run_git(
             "worktree", "add",
@@ -102,6 +111,18 @@ class WorktreeManager:
         if bare_path.exists():
             await self._run_git("worktree", "prune", cwd=bare_path)
 
+    def _get_gitdir(self, worktree_path: Path) -> Path:
+        """Get the real gitdir for a worktree.
+
+        In linked worktrees, .git is a file pointing to the actual gitdir.
+        """
+        dot_git = worktree_path / ".git"
+        if dot_git.is_file():
+            content = dot_git.read_text().strip()
+            if content.startswith("gitdir: "):
+                return Path(content[8:])
+        return dot_git
+
     def symlink_context(
         self,
         worktree_path: Path,
@@ -115,7 +136,8 @@ class WorktreeManager:
 
         target.symlink_to(context_path.resolve())
 
-        exclude_file = worktree_path / ".git" / "info" / "exclude"
+        gitdir = self._get_gitdir(worktree_path)
+        exclude_file = gitdir / "info" / "exclude"
         if exclude_file.exists():
             content = exclude_file.read_text()
             if "CLAUDE.md" not in content:

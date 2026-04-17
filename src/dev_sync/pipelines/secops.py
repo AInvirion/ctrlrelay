@@ -192,6 +192,11 @@ async def run_secops_all(
             await worktree.remove_worktree(repo, session_id)
 
         except Exception as e:
+            state_db.execute(
+                "UPDATE sessions SET status = ?, summary = ?, ended_at = ? WHERE id = ?",
+                ("failed", f"Error: {e}", int(time.time()), session_id),
+            )
+            state_db.commit()
             results.append(PipelineResult(
                 success=False,
                 session_id=session_id,

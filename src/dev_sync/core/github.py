@@ -57,9 +57,10 @@ class GitHubCLI:
         repo: str,
         state: str = "open",
     ) -> list[dict[str, Any]]:
-        """List Dependabot security alerts."""
+        """List Dependabot security alerts with pagination."""
         output = await self._run_gh(
             "api",
+            "--paginate",
             f"/repos/{repo}/dependabot/alerts",
             "--jq", f'[.[] | select(.state == "{state}")]',
         )
