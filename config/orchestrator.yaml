@@ -32,7 +32,13 @@ dashboard:
   url: "https://dev-sync-dashboard.example.com"
   auth_token_env: "DEV_SYNC_DASHBOARD_TOKEN"
 
-repos: []
+repos:
+  - name: "anthropics/claude-code"
+    local_path: "~/Projects/claude-code"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
   # Example repo configuration:
   # - name: "owner/repo"
   #   local_path: "~/Projects/repo"

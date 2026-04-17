@@ -778,8 +778,9 @@ def poller_start(
 
         async def handle_issue(repo: str, issue: dict) -> None:
             issue_number = issue["number"]
+            title = issue.get("title", "")
             console.print(
-                f"[green]New issue detected:[/green] #{issue_number} in {repo} — {issue.get('title', '')}"
+                f"[green]New issue detected:[/green] #{issue_number} in {repo} — {title}"
             )
             # Find matching repo config
             repo_configs = [r for r in config.repos if r.name == repo]

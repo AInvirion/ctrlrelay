@@ -133,7 +133,8 @@ class GitHubCLI:
             "issue", "view",
             str(issue_number),
             "--repo", repo,
-            "--json", "number,title,state,body,labels,assignees,author,createdAt,updatedAt,comments",
+            "--json",
+            "number,title,state,body,labels,assignees,author,createdAt,updatedAt,comments",
         )
         return json.loads(output)
 
