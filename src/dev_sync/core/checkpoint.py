@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
@@ -43,3 +46,76 @@ class CheckpointState(BaseModel):
         if self.status == CheckpointStatus.FAILED and not self.error:
             raise ValueError("error is required when status is FAILED")
         return self
+
+
+class CheckpointError(Exception):
+    """Raised when checkpoint operations fail."""
+
+
+def _get_state_file() -> Path:
+    """Get state file path from environment."""
+    path = os.environ.get("DEV_SYNC_STATE_FILE")
+    if not path:
+        raise CheckpointError("DEV_SYNC_STATE_FILE environment variable not set")
+    return Path(path)
+
+
+def _get_session_id() -> str:
+    """Get session ID from environment."""
+    session_id = os.environ.get("DEV_SYNC_SESSION_ID")
+    if not session_id:
+        raise CheckpointError("DEV_SYNC_SESSION_ID environment variable not set")
+    return session_id
+
+
+def _write_checkpoint(state: CheckpointState) -> None:
+    """Write checkpoint state atomically."""
+    state_file = _get_state_file()
+    temp_file = state_file.with_suffix(".json.tmp")
+
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write to temp file first
+    temp_file.write_text(state.model_dump_json(indent=2))
+
+    # Atomic rename
+    temp_file.rename(state_file)
+
+
+def done(summary: str, outputs: dict[str, Any] | None = None) -> None:
+    """Report successful completion."""
+    # Check state file first so error message is consistent
+    _get_state_file()
+    state = CheckpointState(
+        status=CheckpointStatus.DONE,
+        session_id=_get_session_id(),
+        summary=summary,
+        outputs=outputs or {},
+    )
+    _write_checkpoint(state)
+
+
+def blocked(question: str, context: dict[str, Any] | None = None) -> None:
+    """Report blocked on human input."""
+    # Check state file first so error message is consistent
+    _get_state_file()
+    state = CheckpointState(
+        status=CheckpointStatus.BLOCKED_NEEDS_INPUT,
+        session_id=_get_session_id(),
+        question=question,
+        question_context=context,
+    )
+    _write_checkpoint(state)
+
+
+def failed(error: str, recoverable: bool = True) -> None:
+    """Report failure."""
+    # Check state file first so error message is consistent
+    _get_state_file()
+    state = CheckpointState(
+        status=CheckpointStatus.FAILED,
+        session_id=_get_session_id(),
+        error=error,
+        recoverable=recoverable,
+    )
+    _write_checkpoint(state)
