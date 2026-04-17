@@ -162,3 +162,36 @@ def discover_skills(skills_dir: Path) -> list[SkillInfo]:
         )
 
     return sorted(skills, key=lambda s: s.name)
+
+
+def audit_skill(skill: SkillInfo) -> SkillAudit:
+    """Run all audit checks on a skill.
+
+    Args:
+        skill: Skill information.
+
+    Returns:
+        SkillAudit with all check results.
+    """
+    results = {}
+    for check in AuditCheck:
+        results[check] = run_check(skill, check)
+
+    return SkillAudit(
+        name=skill.name,
+        path=skill.path,
+        results=results,
+    )
+
+
+def audit_all(skills_dir: Path) -> list[SkillAudit]:
+    """Audit all skills in a directory.
+
+    Args:
+        skills_dir: Path to skills directory.
+
+    Returns:
+        List of SkillAudit results.
+    """
+    skills = discover_skills(skills_dir)
+    return [audit_skill(skill) for skill in skills]

@@ -175,3 +175,41 @@ class TestAuditChecks:
         )
         result = run_check(skill, AuditCheck.ATTRIBUTION)
         assert result.passed is False
+
+
+class TestAuditFunctions:
+    def test_audit_skill(self, tmp_path: Path) -> None:
+        """audit_skill should run all checks on a skill."""
+        from dev_sync.core.audit import AuditCheck, SkillInfo, audit_skill
+
+        skill = SkillInfo(
+            name="test",
+            path=tmp_path,
+            content="# Skill\n\n```python\nfrom dev_sync import checkpoint\ncheckpoint.done()\n```",
+            frontmatter={},
+        )
+
+        result = audit_skill(skill)
+        assert result.name == "test"
+        assert AuditCheck.CHECKPOINT in result.results
+        assert AuditCheck.HEADLESS in result.results
+
+    def test_audit_all(self, tmp_path: Path) -> None:
+        """audit_all should audit all skills in directory."""
+        from dev_sync.core.audit import AuditCheck, audit_all
+
+        # Create skills
+        skill1 = tmp_path / "skill-one" / "SKILL.md"
+        skill1.parent.mkdir()
+        skill1.write_text("---\nname: skill-one\n---\n# Ready\n\nfrom dev_sync import checkpoint")
+
+        skill2 = tmp_path / "skill-two" / "SKILL.md"
+        skill2.parent.mkdir()
+        skill2.write_text("---\nname: skill-two\n---\n# Not ready")
+
+        results = audit_all(tmp_path)
+        assert len(results) == 2
+
+        by_name = {r.name: r for r in results}
+        assert by_name["skill-one"].results[AuditCheck.CHECKPOINT].passed is True
+        assert by_name["skill-two"].results[AuditCheck.CHECKPOINT].passed is False
