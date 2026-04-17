@@ -101,25 +101,30 @@ def run_check(skill: SkillInfo, check: AuditCheck) -> AuditResult:
     if check == AuditCheck.HEADLESS:
         for pattern in INTERACTIVE_PATTERNS:
             if re.search(pattern, content):
-                return AuditResult(passed=False, reason=f"Interactive prompt pattern found: {pattern}")
+                reason = f"Interactive prompt pattern found: {pattern}"
+                return AuditResult(passed=False, reason=reason)
         for tool in BROWSER_ONLY_TOOLS:
             if tool in content or tool in tools:
                 if "fallback" not in content.lower() and "cli" not in content.lower():
-                    return AuditResult(passed=False, reason=f"Browser-only tool without fallback: {tool}")
+                    reason = f"Browser-only tool without fallback: {tool}"
+                    return AuditResult(passed=False, reason=reason)
         return AuditResult(passed=True)
 
     if check == AuditCheck.CONTEXT_PATH:
         if "REPO_CONTEXT_PATH" in content or "$REPO_CONTEXT_PATH" in content:
             return AuditResult(passed=True)
         if "context" in content.lower() and "/" in content:
-            return AuditResult(passed=False, reason="May use hardcoded context path", auto_fixable=True)
+            return AuditResult(
+                passed=False, reason="May use hardcoded context path", auto_fixable=True
+            )
         return AuditResult(passed=True)
 
     if check == AuditCheck.ATTRIBUTION:
         for pattern in ATTRIBUTION_PATTERNS:
             match = re.search(pattern, content, re.IGNORECASE)
             if match:
-                return AuditResult(passed=False, reason=f"Attribution pattern found: {match.group()}", auto_fixable=True)
+                reason = f"Attribution pattern found: {match.group()}"
+                return AuditResult(passed=False, reason=reason, auto_fixable=True)
         return AuditResult(passed=True)
 
     return AuditResult(passed=True)

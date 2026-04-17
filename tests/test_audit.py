@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from dev_sync.core.audit import AuditCheck, AuditResult, SkillAudit
 
 
