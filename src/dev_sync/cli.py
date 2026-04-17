@@ -110,6 +110,26 @@ skills_app = typer.Typer(help="Skill management commands.")
 app.add_typer(skills_app, name="skills")
 
 
+def _resolve_skills_dir(skills_path: str | None, config_path: str) -> Path:
+    """Resolve skills directory from flag or config."""
+    if skills_path is not None:
+        skills_dir = Path(skills_path).expanduser().resolve()
+    else:
+        try:
+            config = load_config(config_path)
+            skills_dir = config.paths.skills.expanduser().resolve()
+        except ConfigError as e:
+            console.print(f"[red]Error loading config:[/red] {e}")
+            console.print("Use --path to specify skills directory directly.")
+            raise typer.Exit(1)
+
+    if not skills_dir.exists():
+        console.print(f"[red]Skills directory not found:[/red] {skills_dir}")
+        raise typer.Exit(1)
+
+    return skills_dir
+
+
 @skills_app.command("audit")
 def skills_audit(
     skills_path: str = typer.Option(
@@ -128,21 +148,7 @@ def skills_audit(
     """Audit skills for orchestrator readiness."""
     from dev_sync.core.audit import audit_all, format_report
 
-    # Get skills path from config if not provided
-    if skills_path is None:
-        try:
-            config = load_config(config_path)
-            skills_dir = config.paths.skills
-        except ConfigError as e:
-            console.print(f"[red]Error loading config:[/red] {e}")
-            console.print("Use --path to specify skills directory directly.")
-            raise typer.Exit(1)
-    else:
-        skills_dir = Path(skills_path).expanduser()
-
-    if not skills_dir.exists():
-        console.print(f"[red]Skills directory not found:[/red] {skills_dir}")
-        raise typer.Exit(1)
+    skills_dir = _resolve_skills_dir(skills_path, config_path)
 
     console.print(f"Auditing skills in: {skills_dir}\n")
 
@@ -178,19 +184,7 @@ def skills_list(
     """List available skills."""
     from dev_sync.core.audit import discover_skills
 
-    if skills_path is None:
-        try:
-            config = load_config(config_path)
-            skills_dir = config.paths.skills
-        except ConfigError as e:
-            console.print(f"[red]Error loading config:[/red] {e}")
-            raise typer.Exit(1)
-    else:
-        skills_dir = Path(skills_path).expanduser()
-
-    if not skills_dir.exists():
-        console.print(f"[red]Skills directory not found:[/red] {skills_dir}")
-        raise typer.Exit(1)
+    skills_dir = _resolve_skills_dir(skills_path, config_path)
 
     skills = discover_skills(skills_dir)
 
