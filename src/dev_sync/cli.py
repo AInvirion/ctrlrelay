@@ -579,7 +579,7 @@ def run_dev(
         return
 
     repo_config = repos[0]
-    branch_template = getattr(config, "dev_branch_template", "fix/issue-{n}")
+    branch_template = repo_config.dev_branch_template
 
     db = StateDB(config.paths.state_db)
     dispatcher = ClaudeDispatcher(
