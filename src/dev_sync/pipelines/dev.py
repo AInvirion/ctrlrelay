@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import time
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from dev_sync.core.checkpoint import CheckpointStatus
@@ -10,7 +13,7 @@ from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
 from dev_sync.core.github import GitHubCLI
 from dev_sync.core.state import StateDB
 from dev_sync.core.worktree import WorktreeManager
-from dev_sync.dashboard.client import DashboardClient
+from dev_sync.dashboard.client import DashboardClient, EventPayload
 from dev_sync.pipelines.base import PipelineContext, PipelineResult
 from dev_sync.transports.base import Transport
 
@@ -123,3 +126,128 @@ Use checkpoint.failed() if something goes wrong."""
             summary="Failed",
             error=result.state.error,
         )
+
+
+async def run_dev_issue(
+    repo: str,
+    issue_number: int,
+    branch_template: str,
+    dispatcher: ClaudeDispatcher,
+    github: GitHubCLI,
+    worktree: WorktreeManager,
+    dashboard: DashboardClient | None,
+    state_db: StateDB,
+    transport: Transport | None,
+    contexts_dir: Path,
+) -> PipelineResult:
+    """Run dev pipeline for a single issue."""
+    session_id = f"dev-{repo.replace('/', '-')}-{issue_number}-{uuid.uuid4().hex[:8]}"
+    branch_name = branch_template.replace("{n}", str(issue_number))
+
+    if not state_db.acquire_lock(repo, session_id):
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=f"Could not acquire lock for {repo}",
+            error="Repository locked by another session",
+        )
+
+    try:
+        # Get issue details
+        issue = await github.get_issue(repo, issue_number)
+
+        # Create worktree with new branch
+        await worktree.ensure_bare_repo(repo)
+        worktree_path = await worktree.create_worktree_with_new_branch(
+            repo=repo,
+            session_id=session_id,
+            new_branch=branch_name,
+        )
+
+        # Symlink context
+        context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
+        if context_path.exists():
+            worktree.symlink_context(worktree_path, context_path)
+
+        # Setup state file
+        state_file = worktree_path / ".dev-sync" / "state.json"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+
+        ctx = PipelineContext(
+            session_id=session_id,
+            repo=repo,
+            worktree_path=worktree_path,
+            context_path=context_path,
+            state_file=state_file,
+            issue_number=issue_number,
+            extra={
+                "issue_title": issue.get("title", ""),
+                "issue_body": issue.get("body", ""),
+                "branch_name": branch_name,
+            },
+        )
+
+        # Record session
+        state_db.execute(
+            """INSERT INTO sessions (id, pipeline, repo, worktree_path, status, started_at, issue_number)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, "dev", repo, str(worktree_path), "running", int(time.time()), issue_number),
+        )
+        state_db.commit()
+
+        # Run pipeline
+        pipeline = DevPipeline(
+            dispatcher=dispatcher,
+            github=github,
+            worktree=worktree,
+            dashboard=dashboard,
+            state_db=state_db,
+            transport=transport,
+        )
+        result = await pipeline.run(ctx)
+
+        # Update session status
+        status = "done" if result.success else ("blocked" if result.blocked else "failed")
+        state_db.execute(
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? WHERE id = ?",
+            (status, result.summary, int(time.time()), session_id),
+        )
+        state_db.commit()
+
+        # Push event to dashboard
+        if dashboard and result.success:
+            await dashboard.push_event(EventPayload(
+                level="info",
+                pipeline="dev",
+                repo=repo,
+                message=result.summary,
+                session_id=session_id,
+                details={"issue_number": issue_number, "pr_number": result.outputs.get("pr_number")},
+            ))
+
+        # Send notification via transport
+        if transport and result.success:
+            pr_url = result.outputs.get("pr_url", "")
+            await transport.send(f"PR ready for review: {pr_url}")
+
+        # Cleanup
+        worktree.remove_context_symlink(worktree_path)
+        await worktree.remove_worktree(repo, session_id)
+
+        return result
+
+    except Exception as e:
+        state_db.execute(
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? WHERE id = ?",
+            ("failed", f"Error: {e}", int(time.time()), session_id),
+        )
+        state_db.commit()
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=f"Error processing issue #{issue_number}",
+            error=str(e),
+        )
+
+    finally:
+        state_db.release_lock(repo, session_id)
