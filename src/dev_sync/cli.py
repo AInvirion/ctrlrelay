@@ -424,6 +424,111 @@ def bridge_test(
         raise typer.Exit(1)
 
 
+# Run subcommand group
+run_app = typer.Typer(help="Pipeline execution commands.")
+app.add_typer(run_app, name="run")
+
+
+@run_app.command("secops")
+def run_secops(
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+    repo: str = typer.Option(
+        None,
+        "--repo",
+        "-r",
+        help="Run on specific repo only",
+    ),
+) -> None:
+    """Run secops pipeline on configured repos."""
+    import asyncio
+
+    from dev_sync.core.dispatcher import ClaudeDispatcher
+    from dev_sync.core.github import GitHubCLI
+    from dev_sync.core.state import StateDB
+    from dev_sync.core.worktree import WorktreeManager
+    from dev_sync.dashboard.client import DashboardClient
+    from dev_sync.pipelines.secops import run_secops_all
+
+    path = Path(config_path)
+
+    try:
+        config = load_config(path)
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+    repos = config.repos
+    if repo:
+        repos = [r for r in repos if r.name == repo]
+        if not repos:
+            console.print(f"[red]Repo not found:[/red] {repo}")
+            raise typer.Exit(1)
+
+    if not repos:
+        console.print("[yellow]No repos configured.[/yellow]")
+        return
+
+    db = StateDB(config.paths.state_db)
+    dispatcher = ClaudeDispatcher(
+        claude_binary=config.claude.binary,
+        default_timeout=config.claude.default_timeout_seconds,
+    )
+    github = GitHubCLI()
+    worktree = WorktreeManager(
+        worktrees_dir=config.paths.worktrees,
+        bare_repos_dir=config.paths.bare_repos,
+    )
+
+    dashboard = None
+    if config.dashboard.enabled and config.dashboard.url:
+        import os
+        token = os.environ.get(config.dashboard.auth_token_env, "")
+        if token:
+            dashboard = DashboardClient(
+                url=config.dashboard.url,
+                auth_token=token,
+                node_id=config.node_id,
+                queue_dir=config.paths.state_db.parent / "event_queue",
+            )
+
+    console.print(f"Running secops on {len(repos)} repo(s)...")
+
+    async def _run():
+        return await run_secops_all(
+            repos=repos,
+            dispatcher=dispatcher,
+            github=github,
+            worktree=worktree,
+            dashboard=dashboard,
+            state_db=db,
+            transport=None,
+            contexts_dir=config.paths.contexts,
+        )
+
+    try:
+        results = asyncio.run(_run())
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+    finally:
+        db.close()
+
+    success_count = sum(1 for r in results if r.success)
+    console.print(f"\n[bold]Results:[/bold] {success_count}/{len(results)} succeeded")
+
+    for result in results:
+        status = "[green]OK[/green]" if result.success else "[red]FAIL[/red]"
+        console.print(f"  {status} {result.summary}")
+
+    if not all(r.success for r in results):
+        raise typer.Exit(1)
+
+
 @app.command("status")
 def status(
     config_path: str = typer.Option(
