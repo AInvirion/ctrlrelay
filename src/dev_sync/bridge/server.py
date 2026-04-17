@@ -14,6 +14,7 @@ from dev_sync.bridge.protocol import (
     parse_message,
     serialize_message,
 )
+from dev_sync.bridge.telegram_handler import TelegramHandler
 
 
 class BridgeServer:
@@ -30,9 +31,16 @@ class BridgeServer:
         self.chat_id = chat_id
         self._server: asyncio.Server | None = None
         self._running = False
+        self._telegram: TelegramHandler | None = None
+        self._pending_questions: dict[str, int] = {}
 
     async def start(self) -> None:
         """Start the bridge server."""
+        self._telegram = TelegramHandler(
+            bot_token=self.bot_token,
+            chat_id=self.chat_id,
+        )
+
         if self.socket_path.exists():
             self.socket_path.unlink()
 
@@ -55,6 +63,9 @@ class BridgeServer:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+
+        if self._telegram:
+            await self._telegram.close()
 
         if self.socket_path.exists():
             self.socket_path.unlink()
@@ -89,17 +100,31 @@ class BridgeServer:
             return BridgeMessage(op=BridgeOp.PONG)
 
         if msg.op == BridgeOp.SEND:
-            return BridgeMessage(
-                op=BridgeOp.ACK,
-                request_id=msg.request_id,
-                status="sent",
-            )
+            try:
+                assert self._telegram is not None
+                await self._telegram.send(msg.text or "")
+                return BridgeMessage(op=BridgeOp.ACK, request_id=msg.request_id, status="sent")
+            except Exception as e:
+                return BridgeMessage(
+                    op=BridgeOp.ERROR,
+                    request_id=msg.request_id,
+                    error="telegram_api_error",
+                    message=str(e),
+                )
 
         if msg.op == BridgeOp.ASK:
-            return BridgeMessage(
-                op=BridgeOp.ACK,
-                request_id=msg.request_id,
-                status="pending",
-            )
+            try:
+                assert self._telegram is not None
+                msg_id = await self._telegram.ask(msg.question or "", options=msg.options)
+                if msg.request_id:
+                    self._pending_questions[msg.request_id] = msg_id
+                return BridgeMessage(op=BridgeOp.ACK, request_id=msg.request_id, status="pending")
+            except Exception as e:
+                return BridgeMessage(
+                    op=BridgeOp.ERROR,
+                    request_id=msg.request_id,
+                    error="telegram_api_error",
+                    message=str(e),
+                )
 
         return None

@@ -1,9 +1,21 @@
 """Pytest fixtures for dev-sync tests."""
 
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
+
+
+@pytest.fixture(autouse=True)
+def mock_telegram_handler(request):
+    """Auto-mock TelegramHandler for bridge server tests to avoid real API calls."""
+    if "test_bridge_server" in request.fspath.basename:
+        mock_handler = AsyncMock()
+        with patch("dev_sync.bridge.server.TelegramHandler", return_value=mock_handler):
+            yield mock_handler
+    else:
+        yield
 
 
 @pytest.fixture
