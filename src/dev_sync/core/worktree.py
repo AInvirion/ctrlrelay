@@ -99,7 +99,8 @@ class WorktreeManager:
         if worktree_path.exists():
             shutil.rmtree(worktree_path)
 
-        await self._run_git("worktree", "prune", cwd=bare_path)
+        if bare_path.exists():
+            await self._run_git("worktree", "prune", cwd=bare_path)
 
     def symlink_context(
         self,

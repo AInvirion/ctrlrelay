@@ -1,6 +1,5 @@
 """Tests for git worktree management."""
 
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -65,6 +64,9 @@ class TestWorktreeManager:
 
         worktree_path = manager._get_worktree_path("owner/repo", "sess-123")
         worktree_path.mkdir(parents=True)
+
+        bare_path = manager._get_bare_repo_path("owner/repo")
+        bare_path.mkdir(parents=True)
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.return_value = ""
