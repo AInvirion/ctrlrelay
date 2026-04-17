@@ -683,10 +683,132 @@ def poller_start(
     ),
 ) -> None:
     """Start the issue poller."""
-    console.print("[yellow]Poller not yet implemented.[/yellow]")
-    console.print(f"  Config: {config_path}")
-    console.print(f"  Daemon: {daemon}")
-    console.print(f"  Interval: {interval}s")
+    import asyncio
+    import subprocess
+    import sys
+
+    try:
+        config = load_config(Path(config_path))
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+    if daemon:
+        pid_file = _get_poller_pid_file(config_path)
+        if pid_file.exists():
+            import os
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, 0)
+                console.print(f"[yellow]Poller already running (PID {pid})[/yellow]")
+                raise typer.Exit(1)
+            except (ProcessLookupError, ValueError):
+                pid_file.unlink(missing_ok=True)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "dev_sync.cli",
+            "poller",
+            "start",
+            "--config",
+            config_path,
+            "--interval",
+            str(interval),
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(str(proc.pid))
+        console.print(f"[green]Poller started (PID {proc.pid})[/green]")
+    else:
+        from dev_sync.core.dispatcher import ClaudeDispatcher
+        from dev_sync.core.github import GitHubCLI
+        from dev_sync.core.poller import IssuePoller, run_poll_loop
+        from dev_sync.core.state import StateDB
+        from dev_sync.core.worktree import WorktreeManager
+        from dev_sync.pipelines.dev import run_dev_issue
+
+        github = GitHubCLI()
+
+        # Get GitHub username
+        try:
+            result = subprocess.run(
+                ["gh", "api", "user", "--jq", ".login"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            username = result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            console.print(f"[red]Failed to get GitHub username:[/red] {e}")
+            raise typer.Exit(1)
+
+        if not username:
+            console.print("[red]Could not determine GitHub username.[/red]")
+            raise typer.Exit(1)
+
+        repo_names = [r.name for r in config.repos]
+        if not repo_names:
+            console.print("[yellow]No repos configured.[/yellow]")
+            return
+
+        state_file = config.paths.state_db.parent / "poller_state.json"
+
+        poller = IssuePoller(
+            github=github,
+            username=username,
+            repos=repo_names,
+            state_file=state_file,
+        )
+
+        state_db = StateDB(config.paths.state_db)
+        dispatcher = ClaudeDispatcher(
+            claude_binary=config.claude.binary,
+            default_timeout=config.claude.default_timeout_seconds,
+        )
+        worktree = WorktreeManager(
+            worktrees_dir=config.paths.worktrees,
+            bare_repos_dir=config.paths.bare_repos,
+        )
+
+        async def handle_issue(repo: str, issue: dict) -> None:
+            issue_number = issue["number"]
+            console.print(
+                f"[green]New issue detected:[/green] #{issue_number} in {repo} — {issue.get('title', '')}"
+            )
+            # Find matching repo config
+            repo_configs = [r for r in config.repos if r.name == repo]
+            if not repo_configs:
+                console.print(f"[yellow]No config found for repo {repo}, skipping.[/yellow]")
+                return
+            repo_config = repo_configs[0]
+            await run_dev_issue(
+                repo=repo,
+                issue_number=issue_number,
+                branch_template=repo_config.dev_branch_template,
+                dispatcher=dispatcher,
+                github=github,
+                worktree=worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=None,
+                contexts_dir=config.paths.contexts,
+            )
+
+        console.print(f"[green]Starting poller[/green] for {len(repo_names)} repo(s) as {username}")
+        console.print(f"  Interval: {interval}s | Press Ctrl+C to stop")
+
+        try:
+            asyncio.run(run_poll_loop(poller=poller, handler=handle_issue, interval=interval))
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Poller stopped.[/yellow]")
+        finally:
+            state_db.close()
 
 
 @poller_app.command("stop")

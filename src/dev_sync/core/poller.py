@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from dev_sync.core.github import GitHubCLI
 
@@ -92,3 +93,29 @@ class IssuePoller:
         """
         self.seen_issues.setdefault(repo, set()).add(issue_number)
         self._save_state()
+
+
+async def run_poll_loop(
+    poller: IssuePoller,
+    handler: Callable[[str, dict[str, Any]], Awaitable[None]],
+    interval: int = 300,
+    max_iterations: int | None = None,
+) -> None:
+    """Run the polling loop.
+
+    Args:
+        poller: IssuePoller instance
+        handler: Async function to call for each new issue (repo, issue)
+        interval: Seconds between polls
+        max_iterations: Max iterations (None = infinite)
+    """
+    iterations = 0
+    while max_iterations is None or iterations < max_iterations:
+        new_issues = await poller.poll()
+
+        for item in new_issues:
+            await handler(item["repo"], item["issue"])
+
+        iterations += 1
+        if max_iterations is None or iterations < max_iterations:
+            await asyncio.sleep(interval)

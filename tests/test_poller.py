@@ -148,3 +148,35 @@ class TestIssuePoller:
 
         mock_github.list_assigned_issues.assert_not_called()
         assert 99 in poller.seen_issues.get("owner/repo-a", set())
+
+    @pytest.mark.asyncio
+    async def test_run_poll_loop_processes_new_issues(self, tmp_path: Path) -> None:
+        """Should call handler for each new issue."""
+        from dev_sync.core.poller import IssuePoller, run_poll_loop
+
+        mock_github = AsyncMock()
+        mock_github.list_assigned_issues.return_value = [
+            {"number": 123, "title": "Fix bug"},
+        ]
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        handled_issues = []
+
+        async def handler(repo: str, issue: dict) -> None:
+            handled_issues.append((repo, issue["number"]))
+
+        # Run one iteration
+        await run_poll_loop(
+            poller=poller,
+            handler=handler,
+            max_iterations=1,
+        )
+
+        assert len(handled_issues) == 1
+        assert handled_issues[0] == ("owner/repo", 123)
