@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,9 +26,9 @@ class HeartbeatPayload(BaseModel):
     repos_configured: int = 0
     repos_active: int = 0
 
-    def __post_init__(self) -> None:
+    def model_post_init(self, __context: Any) -> None:
         if not self.timestamp:
-            self.timestamp = datetime.now(timezone.utc).isoformat()
+            object.__setattr__(self, "timestamp", datetime.now(timezone.utc).isoformat())
 
 
 class EventPayload(BaseModel):
