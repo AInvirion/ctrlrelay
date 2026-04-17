@@ -529,6 +529,225 @@ def run_secops(
         raise typer.Exit(1)
 
 
+@run_app.command("dev")
+def run_dev(
+    issue: int = typer.Option(
+        ...,
+        "--issue",
+        "-i",
+        help="GitHub issue number to implement",
+    ),
+    repo: str = typer.Option(
+        None,
+        "--repo",
+        "-r",
+        help="Run on specific repo only",
+    ),
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+) -> None:
+    """Run dev pipeline for a GitHub issue."""
+    import asyncio
+
+    from dev_sync.core.dispatcher import ClaudeDispatcher
+    from dev_sync.core.github import GitHubCLI
+    from dev_sync.core.state import StateDB
+    from dev_sync.core.worktree import WorktreeManager
+    from dev_sync.pipelines.dev import run_dev_issue
+
+    path = Path(config_path)
+
+    try:
+        config = load_config(path)
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+    repos = config.repos
+    if repo:
+        repos = [r for r in repos if r.name == repo]
+        if not repos:
+            console.print(f"[red]Repo not found:[/red] {repo}")
+            raise typer.Exit(1)
+
+    if not repos:
+        console.print("[yellow]No repos configured.[/yellow]")
+        return
+
+    repo_config = repos[0]
+    branch_template = getattr(config, "dev_branch_template", "fix/issue-{n}")
+
+    db = StateDB(config.paths.state_db)
+    dispatcher = ClaudeDispatcher(
+        claude_binary=config.claude.binary,
+        default_timeout=config.claude.default_timeout_seconds,
+    )
+    github = GitHubCLI()
+    worktree = WorktreeManager(
+        worktrees_dir=config.paths.worktrees,
+        bare_repos_dir=config.paths.bare_repos,
+    )
+
+    dashboard = None
+    if config.dashboard.enabled and config.dashboard.url:
+        import os
+        token = os.environ.get(config.dashboard.auth_token_env, "")
+        if token:
+            from dev_sync.dashboard.client import DashboardClient
+            dashboard = DashboardClient(
+                url=config.dashboard.url,
+                auth_token=token,
+                node_id=config.node_id,
+                queue_dir=config.paths.state_db.parent / "event_queue",
+            )
+
+    console.print(f"Running dev pipeline for issue #{issue} on {repo_config.name}...")
+
+    async def _run():
+        return await run_dev_issue(
+            repo=repo_config.name,
+            issue_number=issue,
+            branch_template=branch_template,
+            dispatcher=dispatcher,
+            github=github,
+            worktree=worktree,
+            dashboard=dashboard,
+            state_db=db,
+            transport=None,
+            contexts_dir=config.paths.contexts,
+        )
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+    finally:
+        db.close()
+
+    if result.success:
+        pr_url = result.outputs.get("pr_url", "") if result.outputs else ""
+        console.print(f"[green]Success:[/green] {result.summary}")
+        if pr_url:
+            console.print(f"  PR: {pr_url}")
+    elif result.blocked:
+        console.print(f"[blue]Blocked:[/blue] {result.summary}")
+        if result.question:
+            console.print(f"  Question: {result.question}")
+        raise typer.Exit(1)
+    else:
+        console.print(f"[red]Failed:[/red] {result.summary}")
+        if result.error:
+            console.print(f"  Error: {result.error}")
+        raise typer.Exit(1)
+
+
+# Poller subcommand group
+poller_app = typer.Typer(help="Issue poller commands.")
+app.add_typer(poller_app, name="poller")
+
+
+def _get_poller_pid_file(config_path: str) -> Path:
+    """Get PID file path for poller process."""
+    try:
+        config = load_config(config_path)
+        return config.paths.state_db.parent / "poller.pid"
+    except ConfigError:
+        pass
+    return Path("~/.dev-sync/poller.pid").expanduser().resolve()
+
+
+@poller_app.command("start")
+def poller_start(
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+    daemon: bool = typer.Option(
+        False,
+        "--daemon",
+        "-d",
+        help="Run in background",
+    ),
+    interval: int = typer.Option(
+        300,
+        "--interval",
+        "-n",
+        help="Polling interval in seconds",
+    ),
+) -> None:
+    """Start the issue poller."""
+    console.print("[yellow]Poller not yet implemented.[/yellow]")
+    console.print(f"  Config: {config_path}")
+    console.print(f"  Daemon: {daemon}")
+    console.print(f"  Interval: {interval}s")
+
+
+@poller_app.command("stop")
+def poller_stop(
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+) -> None:
+    """Stop the issue poller."""
+    import os
+    import signal
+
+    pid_file = _get_poller_pid_file(config_path)
+
+    if not pid_file.exists():
+        console.print("[yellow]Poller not running (no PID file)[/yellow]")
+        return
+
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        console.print(f"[green]Stopped poller (PID {pid})[/green]")
+        pid_file.unlink(missing_ok=True)
+    except ProcessLookupError:
+        console.print("[yellow]Poller process not found[/yellow]")
+        pid_file.unlink(missing_ok=True)
+    except ValueError:
+        console.print("[red]Invalid PID file[/red]")
+        pid_file.unlink(missing_ok=True)
+
+
+@poller_app.command("status")
+def poller_status(
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+) -> None:
+    """Check poller status."""
+    import os
+
+    pid_file = _get_poller_pid_file(config_path)
+
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            console.print(f"[green]Poller running (PID {pid})[/green]")
+            return
+        except (ProcessLookupError, ValueError):
+            pass
+
+    console.print("[dim]Poller not running[/dim]")
+    raise typer.Exit(1)
+
+
 @app.command("status")
 def status(
     config_path: str = typer.Option(
