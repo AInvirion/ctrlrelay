@@ -1,9 +1,13 @@
 """CLI entry point for dev-sync."""
 
+from pathlib import Path
+
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from dev_sync import __version__
+from dev_sync.core.config import Config, ConfigError, load_config
 
 app = typer.Typer(
     name="dev-sync",
@@ -48,17 +52,57 @@ def config_validate(
     ),
 ) -> None:
     """Validate orchestrator.yaml configuration."""
-    # Placeholder - will be implemented in Task 5
-    console.print(f"[yellow]Validating config at {config_path}...[/yellow]")
-    console.print("[red]Config validation not yet implemented[/red]")
-    raise typer.Exit(1)
+    path = Path(config_path)
+
+    if not path.exists():
+        console.print(f"[red]Error:[/red] Config file not found: {path}")
+        raise typer.Exit(1)
+
+    try:
+        config = load_config(path)
+    except ConfigError as e:
+        console.print(f"[red]Validation failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green] Config valid: {path}")
+    console.print(f"  Node ID: {config.node_id}")
+    console.print(f"  Timezone: {config.timezone}")
+    console.print(f"  Transport: {config.transport.type.value}")
+    console.print(f"  Repos: {len(config.repos)}")
 
 
 @config_app.command("repos")
-def config_repos() -> None:
+def config_repos(
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+) -> None:
     """List configured repositories."""
-    console.print("[yellow]Not yet implemented[/yellow]")
-    raise typer.Exit(1)
+    path = Path(config_path)
+
+    try:
+        config = load_config(path)
+    except ConfigError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    if not config.repos:
+        console.print("[yellow]No repositories configured.[/yellow]")
+        return
+
+    table = Table(title="Configured Repositories")
+    table.add_column("Name", style="cyan")
+    table.add_column("Path", style="dim")
+    table.add_column("Deploy", style="green")
+
+    for repo in config.repos:
+        deploy = repo.deploy.provider if repo.deploy else "-"
+        table.add_row(repo.name, str(repo.local_path), deploy)
+
+    console.print(table)
 
 
 if __name__ == "__main__":
