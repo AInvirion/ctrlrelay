@@ -105,5 +105,74 @@ def config_repos(
     console.print(table)
 
 
+@app.command("status")
+def status(
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+) -> None:
+    """Show orchestrator status and active sessions."""
+    from dev_sync.core.state import StateDB
+
+    try:
+        config = load_config(config_path)
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+    db_path = config.paths.state_db
+    if not db_path.exists():
+        console.print(f"[yellow]State database not found at {db_path}[/yellow]")
+        console.print("Run a pipeline first to initialize the database.")
+        return
+
+    db = StateDB(db_path)
+
+    # Show locks
+    locks = db.list_locks()
+    if locks:
+        console.print("\n[bold]Active Locks:[/bold]")
+        for lock in locks:
+            console.print(f"  • {lock['repo']} → session {lock['session_id']}")
+    else:
+        console.print("\n[dim]No active locks[/dim]")
+
+    # Show recent sessions
+    rows = db.execute(
+        "SELECT * FROM sessions ORDER BY started_at DESC LIMIT 5"
+    ).fetchall()
+
+    if rows:
+        console.print("\n[bold]Recent Sessions:[/bold]")
+        table = Table()
+        table.add_column("ID", style="dim", max_width=12)
+        table.add_column("Pipeline")
+        table.add_column("Repo")
+        table.add_column("Status")
+
+        for row in rows:
+            status_style = {
+                "done": "green",
+                "failed": "red",
+                "running": "yellow",
+                "blocked": "blue",
+            }.get(row["status"], "white")
+
+            table.add_row(
+                row["id"][:12],
+                row["pipeline"],
+                row["repo"],
+                f"[{status_style}]{row['status']}[/{status_style}]",
+            )
+        console.print(table)
+    else:
+        console.print("\n[dim]No sessions recorded yet[/dim]")
+
+    db.close()
+
+
 if __name__ == "__main__":
     app()
