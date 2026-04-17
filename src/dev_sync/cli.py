@@ -129,49 +129,59 @@ def status(
         console.print("Run a pipeline first to initialize the database.")
         return
 
-    db = StateDB(db_path)
+    import sqlite3
 
-    # Show locks
-    locks = db.list_locks()
-    if locks:
-        console.print("\n[bold]Active Locks:[/bold]")
-        for lock in locks:
-            console.print(f"  • {lock['repo']} → session {lock['session_id']}")
-    else:
-        console.print("\n[dim]No active locks[/dim]")
+    try:
+        db = StateDB(db_path)
+    except sqlite3.Error as e:
+        console.print(f"[red]Error opening database:[/red] {e}")
+        raise typer.Exit(1)
 
-    # Show recent sessions
-    rows = db.execute(
-        "SELECT * FROM sessions ORDER BY started_at DESC LIMIT 5"
-    ).fetchall()
+    try:
+        # Show locks
+        locks = db.list_locks()
+        if locks:
+            console.print("\n[bold]Active Locks:[/bold]")
+            for lock in locks:
+                console.print(f"  • {lock['repo']} → session {lock['session_id']}")
+        else:
+            console.print("\n[dim]No active locks[/dim]")
 
-    if rows:
-        console.print("\n[bold]Recent Sessions:[/bold]")
-        table = Table()
-        table.add_column("ID", style="dim", max_width=12)
-        table.add_column("Pipeline")
-        table.add_column("Repo")
-        table.add_column("Status")
+        # Show recent sessions
+        rows = db.execute(
+            "SELECT * FROM sessions ORDER BY started_at DESC LIMIT 5"
+        ).fetchall()
 
-        for row in rows:
-            status_style = {
-                "done": "green",
-                "failed": "red",
-                "running": "yellow",
-                "blocked": "blue",
-            }.get(row["status"], "white")
+        if rows:
+            console.print("\n[bold]Recent Sessions:[/bold]")
+            table = Table()
+            table.add_column("ID", style="dim", max_width=12)
+            table.add_column("Pipeline")
+            table.add_column("Repo")
+            table.add_column("Status")
 
-            table.add_row(
-                row["id"][:12],
-                row["pipeline"],
-                row["repo"],
-                f"[{status_style}]{row['status']}[/{status_style}]",
-            )
-        console.print(table)
-    else:
-        console.print("\n[dim]No sessions recorded yet[/dim]")
+            for row in rows:
+                status_style = {
+                    "done": "green",
+                    "failed": "red",
+                    "running": "yellow",
+                    "blocked": "blue",
+                }.get(row["status"], "white")
 
-    db.close()
+                table.add_row(
+                    row["id"][:12],
+                    row["pipeline"],
+                    row["repo"],
+                    f"[{status_style}]{row['status']}[/{status_style}]",
+                )
+            console.print(table)
+        else:
+            console.print("\n[dim]No sessions recorded yet[/dim]")
+    except sqlite3.Error as e:
+        console.print(f"[red]Database error:[/red] {e}")
+        raise typer.Exit(1)
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
