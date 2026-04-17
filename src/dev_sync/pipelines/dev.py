@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import time
-import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from dev_sync.core.checkpoint import CheckpointStatus
@@ -13,7 +10,7 @@ from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
 from dev_sync.core.github import GitHubCLI
 from dev_sync.core.state import StateDB
 from dev_sync.core.worktree import WorktreeManager
-from dev_sync.dashboard.client import DashboardClient, EventPayload
+from dev_sync.dashboard.client import DashboardClient
 from dev_sync.pipelines.base import PipelineContext, PipelineResult
 from dev_sync.transports.base import Transport
 

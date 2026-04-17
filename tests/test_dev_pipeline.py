@@ -1,6 +1,5 @@
 """Tests for dev pipeline."""
 
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
