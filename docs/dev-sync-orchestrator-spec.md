@@ -410,6 +410,12 @@ repos:
     deploys_to_digitalocean: true
     do_app_id: "abc-123-def"
     dev_branch_template: "fix/issue-{n}"
+    issue_clarification_mode: "telegram"  # "telegram" | "github_comment" | "both"
+    code_review:
+      method: "mcp_then_cli"              # "mcp_only" | "cli_only" | "mcp_then_cli"
+      mcp_tool: "mcp__codex-reviewer__codex_review"
+      cli_command: "codex-cli review"
+    deploy_verify_timeout_seconds: 1200   # 20 min
     secops:
       auto_merge_dependabot: true
       auto_merge_if_green_and_minor: true
@@ -572,15 +578,34 @@ If `ALERT_TELEGRAM_BOT_TOKEN` and `ALERT_CHAT_ID` env vars are set, and the dash
 
 ---
 
-## 11. Open questions to resolve during build
+## 11. Resolved design decisions
 
-These are things I'm deferring to implementation because the answer becomes clearer with real usage. Flag them explicitly:
+These were open questions resolved during spec finalization:
 
-1. **How aggressive to be about killing stale `claude -p` processes.** 30min timeout is a starting guess; real sessions may need longer.
-2. **Whether the dev pipeline should attempt issue clarification autonomously** (via comments on the GH issue itself) before falling back to Telegram checkpoints. Start with Telegram-only, reconsider after 2 weeks.
-3. **How to express codex-cli invocation in the prompt reliably.** The user mentioned circular validation — needs a concrete MCP invocation or bash command, tested.
-4. **Whether `/deploy-verify` should have its own per-repo timeout.** DO deploys can take 2–5 min; allow up to 20 min before marking failed.
-5. **Log location and retention.** Default: systemd journal for daemon, per-session log files under `~/.dev-sync/logs/<session-id>.log`, auto-rotate after 30 days.
+1. **Stale `claude -p` timeout.** 30min default timeout. Validated empirically during hardening; adjust per-repo if needed.
+
+2. **Dev pipeline issue clarification.** Start with Telegram-only (no autonomous GH issue comments). **Configurable per repo** via `issue_clarification_mode`:
+   ```yaml
+   repos:
+     - name: "user/project-a"
+       issue_clarification_mode: "telegram"  # "telegram" | "github_comment" | "both"
+   ```
+
+3. **Code review invocation (codex).** Try MCP tool (`mcp__codex-reviewer__codex_review`) first; if MCP fails, fall back to `codex-cli review <path>`. **Configurable per repo**:
+   ```yaml
+   repos:
+     - name: "user/project-a"
+       code_review:
+         method: "mcp_then_cli"  # "mcp_only" | "cli_only" | "mcp_then_cli"
+         mcp_tool: "mcp__codex-reviewer__codex_review"
+         cli_command: "codex-cli review"
+   ```
+
+   **Note on circular validation:** Claude produces the code and a separate codex instance validates it. This is intentional - codex runs as an independent reviewer with its own context, not as a self-check within the same session. The orchestrator spawns codex review as a distinct step after implementation, breaking the "validate your own work" loop.
+
+4. **`/deploy-verify` timeout.** 20 minutes per repo before marking failed. DO deploys typically take 2-5 min; this allows headroom for slow builds.
+
+5. **Log location and retention.** Systemd journal for daemon logs, per-session logs at `~/.dev-sync/logs/<session-id>.log`, 30-day auto-rotation.
 
 ---
 
