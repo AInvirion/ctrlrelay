@@ -202,6 +202,228 @@ def skills_list(
     console.print(table)
 
 
+# Bridge subcommand group
+bridge_app = typer.Typer(help="Telegram bridge commands.")
+app.add_typer(bridge_app, name="bridge")
+
+
+def _get_socket_path(config_path: str) -> Path:
+    """Get socket path from config."""
+    try:
+        config = load_config(config_path)
+        if config.transport.telegram:
+            return config.transport.telegram.socket_path.expanduser().resolve()
+    except ConfigError:
+        pass
+    return Path("~/.dev-sync/dev-sync.sock").expanduser().resolve()
+
+
+def _get_bridge_pid_file(socket_path: Path) -> Path:
+    """Get PID file path for bridge process."""
+    return socket_path.with_suffix(".pid")
+
+
+@bridge_app.command("start")
+def bridge_start(
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+    daemon: bool = typer.Option(
+        False,
+        "--daemon",
+        "-d",
+        help="Run in background",
+    ),
+) -> None:
+    """Start the Telegram bridge."""
+    import os
+    import subprocess
+    import sys
+
+    try:
+        config = load_config(config_path)
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+    if config.transport.type.value != "telegram":
+        console.print("[yellow]Transport is not set to 'telegram' in config.[/yellow]")
+        console.print("Set transport.type: telegram to use the bridge.")
+        raise typer.Exit(1)
+
+    telegram_config = config.transport.telegram
+    if not telegram_config:
+        console.print("[red]Telegram config not found.[/red]")
+        raise typer.Exit(1)
+
+    socket_path = telegram_config.socket_path.expanduser().resolve()
+    pid_file = _get_bridge_pid_file(socket_path)
+
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            console.print(f"[yellow]Bridge already running (PID {pid})[/yellow]")
+            raise typer.Exit(1)
+        except (ProcessLookupError, ValueError):
+            pid_file.unlink(missing_ok=True)
+
+    bot_token = os.environ.get(telegram_config.bot_token_env)
+    if not bot_token:
+        env_var = telegram_config.bot_token_env
+        console.print(f"[red]Bot token not found.[/red] Set {env_var} environment variable.")
+        raise typer.Exit(1)
+
+    if daemon:
+        cmd = [
+            sys.executable,
+            "-m",
+            "dev_sync.bridge",
+            "--socket-path",
+            str(socket_path),
+            "--bot-token",
+            bot_token,
+            "--chat-id",
+            str(telegram_config.chat_id),
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pid_file.write_text(str(proc.pid))
+        console.print(f"[green]Bridge started (PID {proc.pid})[/green]")
+    else:
+        import asyncio
+
+        from dev_sync.bridge import BridgeServer
+
+        console.print(f"Starting bridge on {socket_path}")
+        console.print("Press Ctrl+C to stop")
+
+        server = BridgeServer(
+            socket_path=socket_path,
+            bot_token=bot_token,
+            chat_id=telegram_config.chat_id,
+        )
+
+        try:
+            asyncio.run(server.start())
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Shutting down...[/yellow]")
+
+
+@bridge_app.command("stop")
+def bridge_stop(
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+) -> None:
+    """Stop the Telegram bridge."""
+    import os
+    import signal
+
+    socket_path = _get_socket_path(config_path)
+    pid_file = _get_bridge_pid_file(socket_path)
+
+    if not pid_file.exists():
+        console.print("[yellow]Bridge not running (no PID file)[/yellow]")
+        return
+
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        console.print(f"[green]Stopped bridge (PID {pid})[/green]")
+        pid_file.unlink(missing_ok=True)
+    except ProcessLookupError:
+        console.print("[yellow]Bridge process not found[/yellow]")
+        pid_file.unlink(missing_ok=True)
+    except ValueError:
+        console.print("[red]Invalid PID file[/red]")
+        pid_file.unlink(missing_ok=True)
+
+
+@bridge_app.command("status")
+def bridge_status(
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+) -> None:
+    """Check bridge status."""
+    import os
+
+    socket_path = _get_socket_path(config_path)
+    pid_file = _get_bridge_pid_file(socket_path)
+
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            console.print(f"[green]Bridge running (PID {pid})[/green]")
+            console.print(f"Socket: {socket_path}")
+            return
+        except (ProcessLookupError, ValueError):
+            pass
+
+    if socket_path.exists():
+        console.print("[yellow]Socket exists but no running process[/yellow]")
+        console.print(f"Socket: {socket_path}")
+    else:
+        console.print("[dim]Bridge not running[/dim]")
+
+
+@bridge_app.command("test")
+def bridge_test(
+    message: str = typer.Option(
+        "Test message from dev-sync bridge",
+        "--message",
+        "-m",
+        help="Message to send",
+    ),
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml",
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml",
+    ),
+) -> None:
+    """Send a test message to verify bridge is working."""
+    import asyncio
+
+    socket_path = _get_socket_path(config_path)
+
+    if not socket_path.exists():
+        console.print("[red]Bridge not running.[/red] Start it with: dev-sync bridge start")
+        raise typer.Exit(1)
+
+    async def send_test():
+        from dev_sync.transports import SocketTransport
+
+        transport = SocketTransport(socket_path)
+        try:
+            await transport.connect()
+            await transport.send(message)
+            console.print("[green]Message sent successfully![/green]")
+        finally:
+            await transport.close()
+
+    try:
+        asyncio.run(send_test())
+    except Exception as e:
+        console.print(f"[red]Failed to send message:[/red] {e}")
+        raise typer.Exit(1)
+
+
 @app.command("status")
 def status(
     config_path: str = typer.Option(
