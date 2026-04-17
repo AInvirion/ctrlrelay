@@ -48,3 +48,19 @@ class TestCheckpointState:
             summary="Done",
         )
         assert state.timestamp is not None
+
+    def test_blocked_without_question_raises(self) -> None:
+        """BLOCKED_NEEDS_INPUT without question should raise."""
+        with pytest.raises(ValueError, match="question is required"):
+            CheckpointState(
+                status=CheckpointStatus.BLOCKED_NEEDS_INPUT,
+                session_id="sess-123",
+            )
+
+    def test_failed_without_error_raises(self) -> None:
+        """FAILED without error should raise."""
+        with pytest.raises(ValueError, match="error is required"):
+            CheckpointState(
+                status=CheckpointStatus.FAILED,
+                session_id="sess-123",
+            )

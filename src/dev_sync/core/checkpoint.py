@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class CheckpointStatus(str, Enum):
@@ -34,3 +34,12 @@ class CheckpointState(BaseModel):
     recoverable: bool = True
 
     outputs: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_status_fields(self) -> "CheckpointState":
+        """Validate that status-dependent fields are present."""
+        if self.status == CheckpointStatus.BLOCKED_NEEDS_INPUT and not self.question:
+            raise ValueError("question is required when status is BLOCKED_NEEDS_INPUT")
+        if self.status == CheckpointStatus.FAILED and not self.error:
+            raise ValueError("error is required when status is FAILED")
+        return self
