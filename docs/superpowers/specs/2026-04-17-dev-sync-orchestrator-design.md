@@ -185,6 +185,7 @@ transport:
   telegram:
     bot_token_env: "DEV_SYNC_TELEGRAM_TOKEN"
     chat_id: 123456789
+    socket_path: "~/.dev-sync/dev-sync.sock"  # Linux: /run/user/$UID/dev-sync.sock
   file_mock:
     inbox: "~/.dev-sync/inbox.txt"
     outbox: "~/.dev-sync/outbox.txt"
@@ -312,8 +313,13 @@ Separate process, communicates via Unix socket.
 
 ```
 Orchestrator ◄─── Unix socket ───► Telegram Bridge ◄──► Telegram API
-             /run/user/$UID/dev-sync.sock
 ```
+
+**Socket path (cross-platform):**
+- Linux: `/run/user/$UID/dev-sync.sock`
+- macOS: `~/.dev-sync/dev-sync.sock`
+
+Configurable via `transport.telegram.socket_path` in `orchestrator.yaml`.
 
 ### Socket Protocol
 
