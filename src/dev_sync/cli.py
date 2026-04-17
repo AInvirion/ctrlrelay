@@ -188,6 +188,10 @@ def skills_list(
     else:
         skills_dir = Path(skills_path).expanduser()
 
+    if not skills_dir.exists():
+        console.print(f"[red]Skills directory not found:[/red] {skills_dir}")
+        raise typer.Exit(1)
+
     skills = discover_skills(skills_dir)
 
     if not skills:
