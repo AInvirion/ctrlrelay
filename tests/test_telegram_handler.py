@@ -1,7 +1,8 @@
 """Tests for Telegram handler."""
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 class TestTelegramHandler:
@@ -10,9 +11,9 @@ class TestTelegramHandler:
         """Should send message via Telegram API."""
         from dev_sync.bridge.telegram_handler import TelegramHandler
 
-        with patch("dev_sync.bridge.telegram_handler.Bot") as MockBot:
+        with patch("dev_sync.bridge.telegram_handler.Bot") as mock_bot_class:
             mock_bot = AsyncMock()
-            MockBot.return_value = mock_bot
+            mock_bot_class.return_value = mock_bot
 
             handler = TelegramHandler(bot_token="test-token", chat_id=12345)
             await handler.send("Hello world")
@@ -27,12 +28,12 @@ class TestTelegramHandler:
         """Should send question with reply keyboard."""
         from dev_sync.bridge.telegram_handler import TelegramHandler
 
-        with patch("dev_sync.bridge.telegram_handler.Bot") as MockBot:
+        with patch("dev_sync.bridge.telegram_handler.Bot") as mock_bot_class:
             mock_bot = AsyncMock()
             mock_message = MagicMock()
             mock_message.message_id = 42
             mock_bot.send_message.return_value = mock_message
-            MockBot.return_value = mock_bot
+            mock_bot_class.return_value = mock_bot
 
             handler = TelegramHandler(bot_token="test-token", chat_id=12345)
             msg_id = await handler.ask("Approve?", options=["yes", "no"])
