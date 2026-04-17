@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 from enum import Enum
@@ -118,3 +119,37 @@ def failed(error: str, recoverable: bool = True) -> None:
         recoverable=recoverable,
     )
     _write_checkpoint(state)
+
+
+def read_checkpoint(path: Path, delete_after: bool = False) -> CheckpointState:
+    """Read and parse a checkpoint file.
+
+    Used by the orchestrator to read skill results.
+
+    Args:
+        path: Path to the checkpoint file.
+        delete_after: If True, delete the file after reading.
+
+    Returns:
+        Parsed CheckpointState.
+
+    Raises:
+        CheckpointError: If file not found or invalid.
+    """
+    if not path.exists():
+        raise CheckpointError(f"Checkpoint file not found: {path}")
+
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise CheckpointError(f"Failed to parse checkpoint file: {e}") from e
+
+    try:
+        state = CheckpointState.model_validate(data)
+    except Exception as e:
+        raise CheckpointError(f"Invalid checkpoint data: {e}") from e
+
+    if delete_after:
+        path.unlink()
+
+    return state

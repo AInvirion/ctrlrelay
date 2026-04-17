@@ -148,3 +148,57 @@ class TestCheckpointHelpers:
 
         with pytest.raises(CheckpointError, match="DEV_SYNC_STATE_FILE"):
             done(summary="Test")
+
+
+class TestReadCheckpoint:
+    def test_read_valid_checkpoint(self, tmp_path: Path) -> None:
+        """Should parse valid checkpoint file."""
+        from dev_sync.core.checkpoint import CheckpointStatus, read_checkpoint
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "version": "1",
+            "status": "DONE",
+            "session_id": "sess-123",
+            "timestamp": "2026-04-17T12:00:00Z",
+            "summary": "Completed",
+            "outputs": {"pr": 42},
+        }))
+
+        state = read_checkpoint(state_file)
+        assert state.status == CheckpointStatus.DONE
+        assert state.summary == "Completed"
+        assert state.outputs["pr"] == 42
+
+    def test_read_deletes_file_after(self, tmp_path: Path) -> None:
+        """Should delete checkpoint file after reading."""
+        from dev_sync.core.checkpoint import read_checkpoint
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "version": "1",
+            "status": "DONE",
+            "session_id": "sess-123",
+            "timestamp": "2026-04-17T12:00:00Z",
+            "summary": "Done",
+        }))
+
+        read_checkpoint(state_file, delete_after=True)
+        assert not state_file.exists()
+
+    def test_read_missing_file_raises(self, tmp_path: Path) -> None:
+        """Should raise if file doesn't exist."""
+        from dev_sync.core.checkpoint import CheckpointError, read_checkpoint
+
+        with pytest.raises(CheckpointError, match="not found"):
+            read_checkpoint(tmp_path / "missing.json")
+
+    def test_read_invalid_json_raises(self, tmp_path: Path) -> None:
+        """Should raise FAILED status for invalid JSON (truncation)."""
+        from dev_sync.core.checkpoint import CheckpointError, read_checkpoint
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text('{"status": "DONE", "session_id": "x", "truncated')
+
+        with pytest.raises(CheckpointError, match="parse"):
+            read_checkpoint(state_file)
