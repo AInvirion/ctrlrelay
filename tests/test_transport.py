@@ -91,6 +91,42 @@ class TestFileMockTransport:
         assert isinstance(transport, Transport)
 
 
+class TestSocketTransport:
+    @pytest.fixture
+    def socket_path(self, tmp_path):
+        """Create temp socket path."""
+        return tmp_path / "test.sock"
+
+    @pytest.mark.asyncio
+    async def test_connect_fails_when_no_server(self, socket_path) -> None:
+        """Should raise when bridge not running."""
+        from dev_sync.transports.base import TransportError
+        from dev_sync.transports.socket_client import SocketTransport
+
+        transport = SocketTransport(socket_path)
+        with pytest.raises(TransportError, match="connect"):
+            await transport.connect()
+
+    @pytest.mark.asyncio
+    async def test_send_requires_connection(self, socket_path) -> None:
+        """Should raise if not connected."""
+        from dev_sync.transports.base import TransportError
+        from dev_sync.transports.socket_client import SocketTransport
+
+        transport = SocketTransport(socket_path)
+        with pytest.raises(TransportError, match="not connected"):
+            await transport.send("test")
+
+    @pytest.mark.asyncio
+    async def test_implements_protocol(self, socket_path) -> None:
+        """SocketTransport should implement Transport protocol."""
+        from dev_sync.transports.base import Transport
+        from dev_sync.transports.socket_client import SocketTransport
+
+        transport = SocketTransport(socket_path)
+        assert isinstance(transport, Transport)
+
+
 class TestTransportError:
     def test_error_exists(self) -> None:
         """TransportError should be defined."""
