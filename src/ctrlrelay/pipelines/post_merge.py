@@ -102,7 +102,16 @@ async def _handle_merge_with_retry(
     On final exhaustion, raises the last exception; pr_watch_task's
     outer handler logs it as dev.pr.watch_failed.
     """
+    # Split the post-merge work into three independent steps with
+    # their own idempotency flags. close_issue() in the github layer
+    # is NOT atomic — it posts a comment then runs `gh issue close`.
+    # If the close fails after the comment succeeded, a retry that
+    # called close_issue again would post a DUPLICATE comment.
+    # Tracking each sub-step separately ensures every side-effect
+    # runs at most once across retries.
+    comment_posted = False
     issue_closed = False
+    notification_sent = False
     last_exc: Exception | None = None
     delay = _HANDLE_MERGE_RETRY_BASE_DELAY
     comment = f"Closed by PR #{pr_number}"
@@ -111,12 +120,8 @@ async def _handle_merge_with_retry(
     )
 
     for attempt in range(1, _HANDLE_MERGE_RETRY_ATTEMPTS + 1):
-        # Build a fresh transport for this attempt — an earlier attempt
-        # may have dropped its socket; a stale one would guarantee a
-        # doomed send(). Failure to build is non-fatal; we can still
-        # close the issue, and surface the failure via log.
         transport: Transport | None = None
-        if transport_factory is not None:
+        if not notification_sent and transport_factory is not None:
             try:
                 transport = await transport_factory()
             except Exception as e:
@@ -130,11 +135,17 @@ async def _handle_merge_with_retry(
                 transport = None
 
         try:
+            if not comment_posted:
+                await github.comment_on_issue(repo, issue_number, comment)
+                comment_posted = True
             if not issue_closed:
-                await github.close_issue(repo, issue_number, comment)
+                await github._run_gh(
+                    "issue", "close", str(issue_number), "--repo", repo,
+                )
                 issue_closed = True
-            if transport is not None:
+            if not notification_sent and transport is not None:
                 await transport.send(notification)
+                notification_sent = True
             return
         except asyncio.CancelledError:
             raise
@@ -146,7 +157,9 @@ async def _handle_merge_with_retry(
                 issue_number=issue_number, pr_number=pr_number,
                 attempt=attempt,
                 max_attempts=_HANDLE_MERGE_RETRY_ATTEMPTS,
+                comment_posted=comment_posted,
                 issue_closed=issue_closed,
+                notification_sent=notification_sent,
                 reason=type(e).__name__, error=str(e)[:200],
             )
             if attempt >= _HANDLE_MERGE_RETRY_ATTEMPTS:

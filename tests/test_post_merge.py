@@ -99,7 +99,11 @@ class TestPRWatchTask:
         events = [r.getMessage() for r in caplog.records]
         assert any("dev.pr.watching" in e for e in events)
         assert any("dev.pr.merged" in e for e in events)
-        mock_github.close_issue.assert_called_once()
+        # Post-merge is now split into comment + close + notify for
+        # idempotent retry. Happy path: each runs once.
+        mock_github.comment_on_issue.assert_called_once()
+        mock_github._run_gh.assert_called()
+        mock_transport.send.assert_called_once()
         mock_transport.close.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -248,9 +252,9 @@ class TestPRWatchTask:
     async def test_retry_does_not_duplicate_close_issue_comment(
         self, caplog
     ) -> None:
-        """Codex P2: if close_issue succeeds but transport.send fails,
-        the retry MUST NOT re-run close_issue and post a duplicate
-        "Closed by PR #N" comment on the issue."""
+        """Codex P2: if comment+close succeed but transport.send fails,
+        the retry MUST NOT re-post the "Closed by PR #N" comment or
+        re-run `gh issue close` — each side-effect runs at most once."""
         import logging
 
         from ctrlrelay.pipelines.post_merge import pr_watch_task
@@ -258,7 +262,7 @@ class TestPRWatchTask:
         mock_github = AsyncMock()
         mock_github.get_pr_state.return_value = {"state": "MERGED"}
 
-        # close_issue succeeds on first call; no retries of it.
+        # comment_on_issue + _run_gh succeed on first attempt.
         # transport.send raises twice, succeeds third.
         send_calls = 0
 
@@ -302,8 +306,13 @@ class TestPRWatchTask:
             pm._HANDLE_MERGE_RETRY_BASE_DELAY = orig
 
         assert outcome["merged"] is True
-        # close_issue called EXACTLY ONCE despite 3 retry attempts.
-        assert mock_github.close_issue.call_count == 1
+        # Each github-side step runs EXACTLY ONCE despite 3 retry attempts.
+        assert mock_github.comment_on_issue.call_count == 1
+        close_calls = [
+            c for c in mock_github._run_gh.call_args_list
+            if c.args[:2] == ("issue", "close")
+        ]
+        assert len(close_calls) == 1
         # transport.send called 3 times (once per attempt).
         assert send_calls == 3
 
@@ -318,16 +327,17 @@ class TestPRWatchTask:
 
         mock_github = AsyncMock()
         mock_github.get_pr_state.return_value = {"state": "MERGED"}
-        # close_issue fails twice, succeeds third.
-        close_calls = 0
+        # comment_on_issue fails twice, succeeds third — forces three
+        # retry attempts, each of which should rebuild the transport.
+        comment_calls = 0
 
-        async def flaky_close(repo, issue_number, comment):
-            nonlocal close_calls
-            close_calls += 1
-            if close_calls < 3:
+        async def flaky_comment(repo, issue_number, comment):
+            nonlocal comment_calls
+            comment_calls += 1
+            if comment_calls < 3:
                 raise RuntimeError("gh transient")
 
-        mock_github.close_issue.side_effect = flaky_close
+        mock_github.comment_on_issue.side_effect = flaky_comment
 
         factory_calls = 0
         built_transports: list = []
@@ -368,7 +378,9 @@ class TestPRWatchTask:
     async def test_handle_merge_transient_failure_retries(self, caplog) -> None:
         """Codex P2: transient `gh issue close` failure at merge time must
         not abandon the post-merge cleanup. Retry with backoff; after
-        a success, the issue is closed."""
+        a success, the issue is closed. With idempotent splitting, a
+        successful comment followed by a failing close should retry
+        ONLY the close step, not re-post the comment."""
         import logging
 
         from ctrlrelay.pipelines.post_merge import pr_watch_task
@@ -376,16 +388,18 @@ class TestPRWatchTask:
         mock_github = AsyncMock()
         mock_github.get_pr_state.return_value = {"state": "MERGED"}
 
-        # First two close_issue attempts fail; third succeeds.
-        close_calls = 0
+        # First two `gh issue close` attempts fail; third succeeds.
+        run_gh_close_calls = 0
 
-        async def flaky_close(repo, issue_number, comment):
-            nonlocal close_calls
-            close_calls += 1
-            if close_calls < 3:
-                raise RuntimeError("gh transient at close")
+        async def flaky_run_gh(*args, **_kw):
+            # Only the close subcommand is flaky.
+            if args[:2] == ("issue", "close"):
+                nonlocal run_gh_close_calls
+                run_gh_close_calls += 1
+                if run_gh_close_calls < 3:
+                    raise RuntimeError("gh transient at close")
 
-        mock_github.close_issue.side_effect = flaky_close
+        mock_github._run_gh.side_effect = flaky_run_gh
 
         async def factory():
             return AsyncMock()
@@ -411,8 +425,10 @@ class TestPRWatchTask:
             pm._HANDLE_MERGE_RETRY_BASE_DELAY = orig
 
         assert outcome["merged"] is True
-        # close_issue was retried until it succeeded.
-        assert close_calls == 3
+        # `gh issue close` was retried until it succeeded.
+        assert run_gh_close_calls == 3
+        # Comment is idempotent: posted exactly once even across retries.
+        assert mock_github.comment_on_issue.call_count == 1
         # At least two retry events logged (the first two failures).
         retry_events = [
             r for r in caplog.records
@@ -432,7 +448,9 @@ class TestPRWatchTask:
 
         mock_github = AsyncMock()
         mock_github.get_pr_state.return_value = {"state": "MERGED"}
-        mock_github.close_issue.side_effect = RuntimeError("permanent auth error")
+        # Permanent failure on `gh issue close` — comment succeeds once,
+        # then every close attempt fails.
+        mock_github._run_gh.side_effect = RuntimeError("permanent auth error")
 
         async def factory():
             return AsyncMock()
@@ -458,8 +476,13 @@ class TestPRWatchTask:
 
         # Task records the failure but doesn't crash.
         assert outcome["failed"] == "RuntimeError"
-        # All attempts consumed.
-        assert mock_github.close_issue.call_count == pm._HANDLE_MERGE_RETRY_ATTEMPTS
+        # All close attempts consumed (comment is idempotent, posted once).
+        assert mock_github.comment_on_issue.call_count == 1
+        close_calls = [
+            c for c in mock_github._run_gh.call_args_list
+            if c.args[:2] == ("issue", "close")
+        ]
+        assert len(close_calls) == pm._HANDLE_MERGE_RETRY_ATTEMPTS
         # Last event is dev.pr.watch_failed.
         assert any(
             "dev.pr.watch_failed" in r.getMessage() for r in caplog.records
@@ -497,4 +520,9 @@ class TestPRWatchTask:
             for r in caplog.records
         )
         # Merge detection still closed the issue even without transport.
-        mock_github.close_issue.assert_called_once()
+        mock_github.comment_on_issue.assert_called_once()
+        close_calls = [
+            c for c in mock_github._run_gh.call_args_list
+            if c.args[:2] == ("issue", "close")
+        ]
+        assert len(close_calls) == 1
