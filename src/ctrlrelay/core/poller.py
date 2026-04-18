@@ -9,7 +9,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from ctrlrelay.core.github import GitHubCLI
+from ctrlrelay.core.github import GitHubCLI, GitHubError
+from ctrlrelay.core.obs import get_logger, log_event
+
+_logger = get_logger("core.poller")
+
+# Exceptions that are transient and should skip the current repo/iteration
+# rather than tear the whole poll loop down. asyncio.CancelledError is
+# deliberately excluded so a shutdown signal still propagates.
+_TRANSIENT_POLL_ERRORS = (TimeoutError, GitHubError, OSError)
 
 
 @dataclass
@@ -65,15 +73,33 @@ class IssuePoller:
 
         Returns:
             A list of ``{"repo": str, "issue": dict}`` entries for issues that
-            have not been seen before.  Updates ``seen_issues`` and persists
+            have not been seen before. Updates ``seen_issues`` and persists
             state to disk.
+
+        Per-repo resilience: a transient failure on one repo (network timeout,
+        ``gh`` exit, OS error) is logged and skipped so the other repos still
+        get polled. Only ``asyncio.CancelledError`` escapes, which allows a
+        clean shutdown signal to propagate.
         """
         new_issues: list[dict[str, Any]] = []
 
         for repo in self.repos:
-            issues = await self.github.list_assigned_issues(
-                repo, assignee=self.username
-            )
+            try:
+                issues = await self.github.list_assigned_issues(
+                    repo, assignee=self.username
+                )
+            except asyncio.CancelledError:
+                raise
+            except _TRANSIENT_POLL_ERRORS as e:
+                log_event(
+                    _logger,
+                    "poll.repo.skipped",
+                    repo=repo,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                )
+                continue
+
             seen_for_repo = self.seen_issues.setdefault(repo, set())
 
             for issue in issues:
@@ -99,11 +125,29 @@ class IssuePoller:
 
         Call this on first startup to avoid treating existing assignments
         as new. Only issues assigned AFTER this seed will trigger handlers.
+
+        Failure mode: if a per-repo lookup fails transiently, the seed skips
+        that repo and logs ``poll.repo.skipped``. The consequence is that on
+        next poll, any currently-assigned issues on the skipped repo will be
+        treated as new and picked up — that's safer than crashing first-run.
         """
         for repo in self.repos:
-            issues = await self.github.list_assigned_issues(
-                repo, assignee=self.username
-            )
+            try:
+                issues = await self.github.list_assigned_issues(
+                    repo, assignee=self.username
+                )
+            except asyncio.CancelledError:
+                raise
+            except _TRANSIENT_POLL_ERRORS as e:
+                log_event(
+                    _logger,
+                    "poll.repo.skipped",
+                    repo=repo,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                    phase="seed",
+                )
+                continue
             seen_for_repo = self.seen_issues.setdefault(repo, set())
             for issue in issues:
                 seen_for_repo.add(issue["number"])
@@ -123,13 +167,28 @@ async def run_poll_loop(
         handler: Async function to call for each new issue (repo, issue)
         interval: Seconds between polls
         max_iterations: Max iterations (None = infinite)
+
+    Iteration resilience: any non-cancellation exception from the poll or a
+    handler call is logged as ``poll.iteration.failed`` and the loop sleeps
+    and continues. This keeps a single bad cycle (slow network, one flaky
+    handler) from crashing the daemon and forcing a launchd restart.
     """
     iterations = 0
     while max_iterations is None or iterations < max_iterations:
-        new_issues = await poller.poll()
-
-        for item in new_issues:
-            await handler(item["repo"], item["issue"])
+        try:
+            new_issues = await poller.poll()
+            for item in new_issues:
+                await handler(item["repo"], item["issue"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event(
+                _logger,
+                "poll.iteration.failed",
+                iteration=iterations,
+                reason=type(e).__name__,
+                error=str(e)[:200],
+            )
 
         iterations += 1
         if max_iterations is None or iterations < max_iterations:

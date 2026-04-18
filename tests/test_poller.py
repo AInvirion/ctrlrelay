@@ -180,3 +180,173 @@ class TestIssuePoller:
 
         assert len(handled_issues) == 1
         assert handled_issues[0] == ("owner/repo", 123)
+
+    @pytest.mark.asyncio
+    async def test_poll_skips_repo_on_timeout_and_continues(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A transient TimeoutError on one repo must skip that repo for the
+        round and return issues from the other repos — not crash the loop."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        async def per_repo(repo: str, *, assignee: str):  # noqa: ARG001
+            if repo == "owner/flaky":
+                raise TimeoutError("gh took too long")
+            return [{"number": 42, "title": "fine"}]
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/flaky", "owner/ok"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            new = await poller.poll()
+
+        # Healthy repo still produced its issue.
+        assert [(x["repo"], x["issue"]["number"]) for x in new] == [
+            ("owner/ok", 42)
+        ]
+        # Flaky repo logged a skip event with the transient reason.
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("poll.repo.skipped" in m for m in msgs), msgs
+
+    @pytest.mark.asyncio
+    async def test_poll_skips_repo_on_gh_error(self, tmp_path: Path) -> None:
+        """GitHubError on one repo (non-zero gh exit) is also skipped."""
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.poller import IssuePoller
+
+        async def per_repo(repo: str, *, assignee: str):  # noqa: ARG001
+            if repo == "owner/broken":
+                raise GitHubError("gh failed: HTTP 503")
+            return [{"number": 1, "title": "ok"}]
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/broken", "owner/ok"],
+            state_file=tmp_path / "poller_state.json",
+        )
+        new = await poller.poll()
+        assert [(x["repo"], x["issue"]["number"]) for x in new] == [
+            ("owner/ok", 1)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_poll_propagates_cancellation(self, tmp_path: Path) -> None:
+        """CancelledError MUST propagate so shutdown signals aren't swallowed."""
+        import asyncio as _asyncio
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        async def always_cancel(repo: str, *, assignee: str):  # noqa: ARG001
+            raise _asyncio.CancelledError()
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=always_cancel)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+        with pytest.raises(_asyncio.CancelledError):
+            await poller.poll()
+
+    @pytest.mark.asyncio
+    async def test_run_poll_loop_survives_iteration_failure(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A failing iteration must be logged + retried next cycle rather
+        than crashing the whole daemon."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+
+        call_count = 0
+
+        async def flaky_then_fine(repo: str, *, assignee: str):  # noqa: ARG001
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise TimeoutError("first call times out")
+            return [{"number": 77, "title": "second cycle"}]
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=flaky_then_fine)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        handled: list[int] = []
+
+        async def handler(repo: str, issue: dict) -> None:
+            handled.append(issue["number"])
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            # 2 iterations: cycle 1 is caught by the per-repo skip handler
+            # (not the outer safety net), cycle 2 succeeds.
+            await run_poll_loop(
+                poller=poller,
+                handler=handler,
+                interval=0,
+                max_iterations=2,
+            )
+
+        # Cycle 2 delivered issue 77.
+        assert handled == [77]
+        # poll.repo.skipped fired on cycle 1.
+        assert any("poll.repo.skipped" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_run_poll_loop_survives_handler_exception(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """An exception from the handler (e.g. run_dev_issue crash) must be
+        caught by the outer safety net so the next poll cycle still runs."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[{"number": 1, "title": "x"}]
+        )
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        async def handler(repo: str, issue: dict) -> None:
+            raise RuntimeError("handler blew up")
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            await run_poll_loop(
+                poller=poller,
+                handler=handler,
+                interval=0,
+                max_iterations=1,
+            )
+
+        # The handler failure should have been logged as iteration.failed,
+        # not propagated up as an unhandled exception.
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("poll.iteration.failed" in m for m in msgs), msgs
