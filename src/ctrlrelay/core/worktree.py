@@ -236,16 +236,22 @@ class WorktreeManager:
         except WorktreeError as e:
             if "already checked out" not in str(e):
                 raise
-            # Find the stale admin entry for this branch and clear it.
+            # Find the stale admin entry for this branch and clear it
+            # WITHOUT running repo-wide `git worktree prune` — that would
+            # also discard admin state for unrelated prunable worktrees
+            # whose paths are temporarily unavailable (removable media,
+            # network mounts), making them unrecoverable when the path
+            # comes back. Instead, delete just the one admin directory.
             stale_path = await self._find_stale_worktree_path(bare_path, branch)
             if stale_path is None:
                 raise
-            try:
-                await self._run_git(
-                    "worktree", "prune", cwd=bare_path, timeout=10,
-                )
-            except Exception:
-                pass
+            # Admin dir is `<bare>/worktrees/<last-path-component>`.
+            admin_dir = bare_path / "worktrees" / Path(stale_path).name
+            if admin_dir.exists():
+                try:
+                    shutil.rmtree(admin_dir)
+                except OSError:
+                    pass
             # Retry the add; if it fails again, let the error surface.
             await self._run_git(
                 "worktree", "add", str(worktree_path), branch,

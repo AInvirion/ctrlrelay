@@ -441,8 +441,18 @@ class TestWorktreeManager:
         bare = tmp_path / "repos" / "owner-repo.git"
         bare.mkdir(parents=True)
 
+        # Stale admin dir path: last path component of the worktree path,
+        # inside <bare>/worktrees/. Create the dir on disk so the targeted
+        # rmtree has something to remove.
+        stale_worktree_path_str = str(
+            tmp_path / "worktrees" / "owner-repo-crashed-sess"
+        )
+        admin_dir = bare / "worktrees" / "owner-repo-crashed-sess"
+        admin_dir.mkdir(parents=True)
+        (admin_dir / "HEAD").write_text("ref: refs/heads/fix/issue-99\n")
+
         stale_porcelain = (
-            "worktree /Users/x/.ctrlrelay/worktrees/owner-repo-crashed-sess\n"
+            f"worktree {stale_worktree_path_str}\n"
             "HEAD abc\n"
             "branch refs/heads/fix/issue-99\n"
             "prunable gitdir file points to non-existent location\n"
@@ -459,7 +469,6 @@ class TestWorktreeManager:
                 # first worktree add attempt FAILS on stale admin
                 WorktreeError("fatal: 'fix/issue-99' is already checked out at /stale"),
                 stale_porcelain,                         # porcelain probe for stale entry
-                "",                                      # worktree prune (recovery)
                 "",                                      # worktree add (retry succeeds)
             ]
             wt = await manager.create_worktree_with_new_branch(
@@ -469,19 +478,22 @@ class TestWorktreeManager:
             )
 
         assert "retry-after-crash" in str(wt)
-        # Prune happened AFTER the failed add, not before.
+        # No repo-wide `git worktree prune` was called.
         prune_calls = [
-            i for i, c in enumerate(mock_git.call_args_list)
+            c for c in mock_git.call_args_list
             if "prune" in c[0]
         ]
+        assert prune_calls == [], (
+            "must not run repo-wide prune; targeted rmtree should suffice"
+        )
+        # The stale admin dir for THIS branch was removed.
+        assert not admin_dir.exists()
+        # Two add attempts were made: first failed, second retry succeeded.
         add_calls = [
-            i for i, c in enumerate(mock_git.call_args_list)
+            c for c in mock_git.call_args_list
             if "worktree" in c[0] and "add" in c[0]
         ]
-        assert prune_calls, "expected a prune call"
-        assert add_calls, "expected at least one add call"
-        # First add attempt precedes prune; second add follows.
-        assert add_calls[0] < prune_calls[0] < add_calls[1]
+        assert len(add_calls) == 2
 
     @pytest.mark.asyncio
     async def test_prunable_worktree_stanza_does_not_block_reuse(
