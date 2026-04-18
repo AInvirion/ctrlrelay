@@ -578,6 +578,13 @@ def run_dev(
         console.print("[yellow]No repos configured.[/yellow]")
         return
 
+    if len(repos) > 1 and not repo:
+        console.print(
+            "[red]Error:[/red] Multiple repos configured. "
+            "Use --repo to specify which one."
+        )
+        raise typer.Exit(1)
+
     repo_config = repos[0]
     branch_template = repo_config.dev_branch_template
 
@@ -759,12 +766,19 @@ def poller_start(
 
         state_file = config.paths.state_db.parent / "poller_state.json"
 
+        first_run = not state_file.exists()
+
         poller = IssuePoller(
             github=github,
             username=username,
             repos=repo_names,
             state_file=state_file,
         )
+
+        # On first run, seed with current assignments to avoid replaying backlog
+        if first_run:
+            console.print("[dim]First run: seeding with current assignments...[/dim]")
+            asyncio.run(poller.seed_current())
 
         state_db = StateDB(config.paths.state_db)
         dispatcher = ClaudeDispatcher(

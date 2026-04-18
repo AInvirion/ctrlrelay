@@ -237,9 +237,10 @@ async def run_dev_issue(
             pr_url = result.outputs.get("pr_url", "")
             await transport.send(f"PR ready for review: {pr_url}")
 
-        # Cleanup
-        worktree.remove_context_symlink(worktree_path)
-        await worktree.remove_worktree(repo, session_id)
+        # Cleanup only if not blocked (blocked sessions need worktree for resume)
+        if not result.blocked:
+            worktree.remove_context_symlink(worktree_path)
+            await worktree.remove_worktree(repo, session_id)
 
         return result
 

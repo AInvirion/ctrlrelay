@@ -94,6 +94,21 @@ class IssuePoller:
         self.seen_issues.setdefault(repo, set()).add(issue_number)
         self._save_state()
 
+    async def seed_current(self) -> None:
+        """Seed seen_issues with all currently assigned issues.
+
+        Call this on first startup to avoid treating existing assignments
+        as new. Only issues assigned AFTER this seed will trigger handlers.
+        """
+        for repo in self.repos:
+            issues = await self.github.list_assigned_issues(
+                repo, assignee=self.username
+            )
+            seen_for_repo = self.seen_issues.setdefault(repo, set())
+            for issue in issues:
+                seen_for_repo.add(issue["number"])
+        self._save_state()
+
 
 async def run_poll_loop(
     poller: IssuePoller,
