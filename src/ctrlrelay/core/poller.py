@@ -153,20 +153,51 @@ class IssuePoller:
                 )
             except asyncio.CancelledError:
                 raise
-            except _TRANSIENT_POLL_ERRORS as e:
-                self._record_repo_failure(repo, e, phase="poll")
+            except Exception as e:
+                # Transient-ish (TimeoutError/GitHubError/OSError) goes through
+                # the failure counter so persistent misconfig escalates; any
+                # other unexpected exception is logged as a skip too so the
+                # surrounding repos still get processed AND new_issues from
+                # prior repos reaches the caller. Without this catch, a later
+                # repo exploding would leave earlier repos' seen_issues
+                # mutated but their new_issues list unreturned.
+                if isinstance(e, _TRANSIENT_POLL_ERRORS):
+                    self._record_repo_failure(repo, e, phase="poll")
+                else:
+                    log_event(
+                        _logger,
+                        "poll.repo.unexpected_error",
+                        repo=repo,
+                        reason=type(e).__name__,
+                        error=str(e)[:200],
+                        phase="poll",
+                    )
                 continue
 
             # Successful lookup — clear any accumulated failure count.
             self._clear_repo_failure(repo)
 
-            seen_for_repo = self.seen_issues.setdefault(repo, set())
-
-            for issue in issues:
-                number: int = issue["number"]
-                if number not in seen_for_repo:
-                    new_issues.append({"repo": repo, "issue": issue})
-                    seen_for_repo.add(number)
+            try:
+                seen_for_repo = self.seen_issues.setdefault(repo, set())
+                for issue in issues:
+                    number: int = issue["number"]
+                    if number not in seen_for_repo:
+                        new_issues.append({"repo": repo, "issue": issue})
+                        seen_for_repo.add(number)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Malformed issue payload (missing 'number', wrong type) etc.
+                # Contain the damage to this repo so other repos' results and
+                # any already-accumulated new_issues still reach the caller.
+                log_event(
+                    _logger,
+                    "poll.repo.processing_failed",
+                    repo=repo,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                )
+                continue
 
         # Never propagate a save_state disk failure out of poll() — the
         # caller has work to do with new_issues. Log and move on.
