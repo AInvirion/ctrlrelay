@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-18
+
+First release under the new `ctrlrelay` name. Ships the full
+`BLOCKED → operator → resume` loop end-to-end, plus the observability +
+verification features that were cooking since 0.1.0.
+
 ### Changed
 
-- **Project renamed: `dev-sync` → `ctrlrelay`**. Repo moved from
+- **Project renamed: `dev-sync` → `ctrlrelay`** (#42). Repo moved from
   `AInvirion/dev-sync` to `AInvirion/ctrlrelay`.
   - Python package: `dev_sync` → `ctrlrelay`; PyPI dist: `dev-sync` →
     `ctrlrelay`; CLI binary: `dev-sync` → `ctrlrelay`.
@@ -17,10 +23,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     bare repos, sockets, logs).
   - Transport socket: `dev-sync.sock` → `ctrlrelay.sock`.
   - Environment variables: `DEV_SYNC_*` → `CTRLRELAY_*`
-    (e.g. `CTRLRELAY_TELEGRAM_TOKEN`, `CTRLRELAY_DASHBOARD_TOKEN`,
+    (`CTRLRELAY_TELEGRAM_TOKEN`, `CTRLRELAY_DASHBOARD_TOKEN`,
     `CTRLRELAY_STATE_FILE`, `CTRLRELAY_SESSION_ID`).
   - launchd labels: `com.ainvirion.dev-sync-{poller,bridge}` →
     `com.ainvirion.ctrlrelay-{poller,bridge}`.
+
+### Added
+
+- **End-to-end `BLOCKED → operator → resume` loop over Telegram** (#38).
+  When Claude signals `BLOCKED_NEEDS_INPUT`, the orchestrator posts the
+  question via the configured transport, the bridge long-polls Telegram
+  for the operator's reply, and the session is resumed with the answer.
+  Bounded by `max_blocked_rounds` (default 5). Transport failures collapse
+  to FAILED cleanly instead of stranding a blocked session.
+  - `TelegramHandler.start_polling(handler)` / `stop_polling()` added.
+  - Bridge server tracks `request_id → (telegram_msg_id, writer)` and
+    delivers an `ANSWER` frame over the originating socket.
+  - Match priority: reply_to_message_id → FIFO fallback.
+  - Client-disconnect path drops that client's pending questions.
+- **Structured observability events** (#40): `dev.question.posted`,
+  `dev.answer.received`, `dev.session.resumed` land as JSON lines in
+  `~/.ctrlrelay/logs/*.log`, with `session_id` / `repo` / `issue_number`
+  correlation across every boundary. Bridge also emits `bridge: ASK`,
+  `bridge: ANSWER`, `bridge: SEND` event lines.
+- **Release-artifact trigger** (#37): the build workflow now fires on
+  tag push (`v*`) and on published releases, and uploads the built
+  wheel + sdist to the matching GitHub release automatically.
+- **Operator / configuration / architecture documentation rebuild**
+  (#39): `docs/` rewritten around how to use, configure, and operate
+  ctrlrelay, closing #36.
+
+### Fixed
+
+- **Bridge: `ConnectionResetError` traceback on client disconnect race**
+  (#45). The bridge used to emit an unhandled traceback in
+  `bridge.error.log` when the client closed its socket while the bridge
+  was still flushing the ACK. Now wraps `writer.write + drain` with an
+  `is_closing()` pre-check and swallows `ConnectionResetError` /
+  `BrokenPipeError` / `OSError` at DEBUG level with `op` + `request_id`
+  for diagnosis.
+- **README**: drop broken docs site link (#44, fixes #43).
 
 ### Migration (clean-slate)
 
@@ -92,5 +134,6 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.1
 [0.1.0]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.0
