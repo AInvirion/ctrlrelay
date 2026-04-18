@@ -90,7 +90,10 @@ class TestAuditChecks:
         skill = SkillInfo(
             name="test",
             path=tmp_path,
-            content="# Skill\n\n```python\nfrom ctrlrelay import checkpoint\ncheckpoint.done()\n```",
+            content=(
+                "# Skill\n\n```python\n"
+                "from ctrlrelay import checkpoint\ncheckpoint.done()\n```"
+            ),
             frontmatter={},
         )
         result = run_check(skill, AuditCheck.CHECKPOINT)
@@ -183,7 +186,10 @@ class TestAuditFunctions:
         skill = SkillInfo(
             name="test",
             path=tmp_path,
-            content="# Skill\n\n```python\nfrom ctrlrelay import checkpoint\ncheckpoint.done()\n```",
+            content=(
+                "# Skill\n\n```python\n"
+                "from ctrlrelay import checkpoint\ncheckpoint.done()\n```"
+            ),
             frontmatter={},
         )
 

@@ -525,7 +525,6 @@ class TestIssuePoller:
     ) -> None:
         """A successful lookup must reset the per-repo failure counter so a
         previously flaky repo doesn't stay escalated forever after it recovers."""
-        import logging
 
         from ctrlrelay.core.poller import IssuePoller
 
