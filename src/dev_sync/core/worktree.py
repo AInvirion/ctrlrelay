@@ -151,6 +151,20 @@ class WorktreeManager:
         except WorktreeError:
             pass
 
+    async def branch_exists_locally(self, repo: str, branch: str) -> bool:
+        """Check if `branch` exists as a local ref in the bare repo."""
+        bare_path = self._get_bare_repo_path(repo)
+        if not bare_path.exists():
+            return False
+        try:
+            await self._run_git(
+                "show-ref", "--verify", "--quiet", f"refs/heads/{branch}",
+                cwd=bare_path,
+            )
+            return True
+        except Exception:
+            return False
+
     async def branch_exists_on_remote(self, repo: str, branch: str) -> bool:
         """Return True if `branch` exists on origin. Fail-closed: on any error
         (WorktreeError, asyncio.TimeoutError from _run_git's wait_for, etc.)

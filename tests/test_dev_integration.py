@@ -119,6 +119,7 @@ class TestDevPipelineCleanup:
         *,
         branch_on_remote: bool = False,
         create_side_effect=None,
+        branch_preexists_locally: bool = False,
     ):
         """Run the dev pipeline with a stub dispatcher behavior, returning
         (result, mocks) so tests can assert on cleanup calls.
@@ -157,10 +158,12 @@ class TestDevPipelineCleanup:
              patch.object(worktree, "remove_worktree", new_callable=AsyncMock) as mock_remove_wt, \
              patch.object(worktree, "delete_branch", new_callable=AsyncMock) as mock_delete_branch, \
              patch.object(worktree, "branch_exists_on_remote", new_callable=AsyncMock) as mock_remote, \
+             patch.object(worktree, "branch_exists_locally", new_callable=AsyncMock) as mock_local, \
              patch.object(worktree, "symlink_context"), \
              patch.object(worktree, "remove_context_symlink"):
 
             mock_remote.return_value = branch_on_remote
+            mock_local.return_value = branch_preexists_locally
 
             if create_side_effect is not None:
                 mock_create.side_effect = create_side_effect
@@ -296,9 +299,9 @@ class TestDevPipelineCleanup:
     async def test_setup_failure_does_not_delete_preexisting_branch(
         self, tmp_path: Path
     ) -> None:
-        """Codex P2: if worktree creation fails (e.g. branch from a prior DONE
-        session with an open PR), cleanup must NOT call delete_branch — this
-        session never created or owned that branch."""
+        """Codex P2: if the branch already existed before this run (from a
+        prior DONE session with an open PR) and worktree creation fails,
+        cleanup must NOT call delete_branch — this session never owned it."""
 
         async def create_boom(**kwargs):
             raise RuntimeError("branch already exists (from a prior DONE run)")
@@ -307,7 +310,10 @@ class TestDevPipelineCleanup:
             raise AssertionError("spawn should not be reached")
 
         result, mock_remove_wt, mock_delete_branch = await self._run(
-            tmp_path, spawn, create_side_effect=create_boom
+            tmp_path,
+            spawn,
+            create_side_effect=create_boom,
+            branch_preexists_locally=True,
         )
 
         assert not result.success
@@ -315,6 +321,39 @@ class TestDevPipelineCleanup:
         mock_remove_wt.assert_not_awaited()
         # and never touch the pre-existing branch
         mock_delete_branch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_partial_worktree_create_still_cleans_up_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex follow-up P2: `git worktree add -b` can create the branch
+        ref before the worktree directory setup fails. In that case we
+        *did* introduce the branch even though create_worktree_with_new_branch
+        raised — cleanup must delete it so the next retry isn't blocked."""
+
+        async def create_partial_fail(**kwargs):
+            # Simulate: ref got created, but the worktree dir step crashed.
+            raise RuntimeError(
+                "worktree add failed after branch ref was created "
+                "(disk full / permission denied on dir)"
+            )
+
+        async def spawn(**kwargs):
+            raise AssertionError("spawn should not be reached")
+
+        result, mock_remove_wt, mock_delete_branch = await self._run(
+            tmp_path,
+            spawn,
+            create_side_effect=create_partial_fail,
+            branch_preexists_locally=False,  # this run introduced the ref
+        )
+
+        assert not result.success
+        # worktree_path never got assigned, so remove_worktree isn't called
+        mock_remove_wt.assert_not_awaited()
+        # but we owned the branch, so it must be deleted
+        mock_delete_branch.assert_awaited_once()
+        assert mock_delete_branch.await_args.args[1] == "fix/issue-13"
 
     @pytest.mark.asyncio
     async def test_success_preserves_branch(self, tmp_path: Path) -> None:

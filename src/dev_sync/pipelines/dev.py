@@ -187,20 +187,27 @@ async def run_dev_issue(
         )
 
     worktree_path: Path | None = None
-    branch_created = False
+    # Pessimistic default: if we never got far enough to check, assume the
+    # branch was pre-existing so cleanup never clobbers unrelated state.
+    branch_preexisted = True
 
     try:
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
 
-        # Create worktree with new branch
+        # Snapshot branch ownership BEFORE we try to create it. If the ref
+        # already exists in the bare repo, it came from another run (possibly
+        # a prior DONE session whose PR is still open) and we must not touch
+        # it. If it does not exist here, any ref we see later belongs to us —
+        # even if `git worktree add -b` fails partway through and leaves the
+        # ref behind without a usable worktree.
         await worktree.ensure_bare_repo(repo)
+        branch_preexisted = await worktree.branch_exists_locally(repo, branch_name)
         worktree_path = await worktree.create_worktree_with_new_branch(
             repo=repo,
             session_id=session_id,
             new_branch=branch_name,
         )
-        branch_created = True
 
         # Symlink context
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
@@ -274,16 +281,16 @@ async def run_dev_issue(
         #   DONE    -> remove worktree, keep branch (the open PR references it)
         #   BLOCKED -> keep both (user may resume the session)
         #   FAILED  -> remove worktree AND delete branch so the next retry can
-        #              re-create `fix/issue-<n>` cleanly — BUT only if we
-        #              created the branch in this run and it was never pushed;
-        #              if it's on origin, the user has recoverable work there.
+        #              re-create `fix/issue-<n>` cleanly — BUT only if the
+        #              branch did not pre-exist (we own it) and it was never
+        #              pushed (no recoverable work on origin).
         if result.success:
             worktree.remove_context_symlink(worktree_path)
             await worktree.remove_worktree(repo, session_id)
         elif not result.blocked:
             worktree.remove_context_symlink(worktree_path)
             await worktree.remove_worktree(repo, session_id)
-            if branch_created and not await worktree.branch_exists_on_remote(
+            if not branch_preexisted and not await worktree.branch_exists_on_remote(
                 repo, branch_name
             ):
                 await worktree.delete_branch(repo, branch_name)
@@ -298,8 +305,10 @@ async def run_dev_issue(
         state_db.commit()
 
         # Best-effort cleanup so a retry isn't blocked by leftover state. Only
-        # touch the branch if this run created it AND it has no remote copy
-        # (preserves pushed work and never clobbers pre-existing branches).
+        # touch the branch if it didn't pre-exist (we own it) AND origin has
+        # no copy (no recoverable work to orphan). Covers partial failures of
+        # `git worktree add -b` that create the ref before the directory setup
+        # crashes.
         if worktree_path is not None:
             try:
                 worktree.remove_context_symlink(worktree_path)
@@ -309,7 +318,7 @@ async def run_dev_issue(
                 await worktree.remove_worktree(repo, session_id)
             except Exception:
                 pass
-        if branch_created:
+        if not branch_preexisted:
             try:
                 has_remote = await worktree.branch_exists_on_remote(repo, branch_name)
             except Exception:
