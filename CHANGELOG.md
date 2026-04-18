@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-04-18
+
+Reliability pass on the poller + retry flow, plus CI gating. No runtime
+behavior change on the happy path — every fix is in the failure modes
+that previously caused operator-visible wedges.
+
+### Added
+
+- **CI: `pytest` + `ruff check` workflow** (#26, via #49). Runs on every
+  push to `main` and every pull request under a managed `uv` venv on
+  Python 3.12. Fails on any test failure or lint violation. Also
+  cleared 19 pre-existing lint errors and converted two
+  backslash-continued `with patch.object` blocks to parenthesized
+  `with` (PEP 617) so the suite passes cleanly under ruff.
+
+### Fixed
+
+- **Poller no longer crashes on individual `gh` failures** (#46, via
+  #48). A slow or failing `gh issue list` used to propagate
+  `TimeoutError` / `GitHubError` out of the polling loop, crashing the
+  daemon and forcing a launchd restart. Two layers now:
+  - Per-repo skip inside `IssuePoller.poll()` / `seed_current()` with
+    a consecutive-failure counter; after 3 in a row the log escalates
+    from INFO to WARNING (`persistent=True`) so a permanent misconfig
+    stops hiding behind routine transient skips.
+  - Outer safety net in `run_poll_loop` wraps both the poll and the
+    per-handler dispatch so a single bad iteration or a handler crash
+    can't take down the daemon. Each surviving event emits a structured
+    `poll.iteration.failed` / `poll.handler.failed` / `poll.repo.skipped`
+    record with correlation fields.
+  - `asyncio.CancelledError` is always re-raised so a clean shutdown
+    still propagates.
+  - `poll()` never loses in-memory `seen_issues` mutations to a
+    `_save_state` failure: the save is best-effort; the returned
+    new_issues list always reaches the caller.
+  - Malformed issue payloads (missing `number`, wrong type, non-dict
+    entry) are skipped per-item so one bad record doesn't block the
+    valid issues before or after it.
+
+- **Verify-exhausted retries no longer wedge on a leftover branch**
+  (#28, via #50). After a dev run exhausted `max_fix_attempts`, the
+  branch was preserved on purpose (for operator inspection) but the
+  next retry immediately failed with `fatal: 'fix/issue-N' already
+  exists` from `git worktree add -b`. Now `create_worktree_with_new_branch`
+  detects a pre-existing branch and handles four cases:
+  - **On origin + local behind**: fast-forward to remote head via a
+    dedicated scratch ref (`refs/ctrlrelay/sync/<branch>`) — never
+    overwrites `refs/heads/<branch>` directly, so an unpushed local
+    commit can't be silently lost. `git fetch` here has a 30s cap and
+    all steps are best-effort.
+  - **On origin + local ahead**: preserve local (likely recoverable
+    unpushed work).
+  - **On origin + diverged**: raise a clear `WorktreeError` — silent
+    reuse would cause a non-ff push rejection later.
+  - **Local-only**: use `git cherry <default> <branch>` to detect if
+    every commit on the branch is already content-equivalent to
+    something in the default branch (catches regular / squash / rebase
+    merges). If yes, the branch is stale; delete + create fresh. If
+    no, the branch has unique unpushed work; reuse.
+  - Refuses reuse when the branch is still checked out by another live
+    worktree (BLOCKED session that's waiting on operator reply).
+  - Handles crash-between-rmtree-and-prune: on `worktree add` failing
+    with "already checked out" against a stale admin entry whose
+    worktree directory is gone, targets the specific admin dir (via
+    its `gitdir` pointer, not path basename — works across git's
+    sanitization and de-duplication) and deletes just that one without
+    running the repo-wide `git worktree prune`. Scope-gated to entries
+    under our managed `worktrees_dir` so a disconnected network mount
+    never gets its admin state destroyed.
+
+### Changed
+
+- All new log events use the structured JSON helper from 0.1.1 with
+  consistent `session_id` / `repo` / `issue_number` / `reason` fields.
+
+### Known follow-ups
+
+The following were identified during codex review and are filed as
+separate tracked issues so the ownership and scope are clear:
+
+- #51 — `branch_preexisted` ownership snapshot in `run_dev_issue`
+  goes stale after `create_worktree_with_new_branch` recreates a
+  stale-merged branch. Needs an API change to return `(path,
+  created_fresh)` so the cleanup path knows whether to delete on
+  failure. Narrow corner case (prior merged PR + retry that fails
+  before push).
+- #52 — Reuse path should refuse a branch that still backs an OPEN
+  PR. Requires a `gh pr list --head <branch>` probe; worth a
+  coordinated PR with #51.
+
 ## [0.1.1] - 2026-04-18
 
 First release under the new `ctrlrelay` name. Ships the full
@@ -134,6 +224,7 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.3
 [0.1.1]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.1
 [0.1.0]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.0
