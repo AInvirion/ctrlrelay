@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Typer's Rich-backed help injects ANSI color escapes into --flag names
+# (e.g. between `-` and `-daemon`) on newer versions, which breaks the
+# CLI tests' substring assertions. NO_COLOR=1 forces plain output.
+env:
+  NO_COLOR: "1"
+
 jobs:
   test:
     name: pytest + ruff
