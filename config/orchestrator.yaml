@@ -39,6 +39,36 @@ repos:
       dependabot_patch: auto
       dependabot_minor: ask
       dependabot_major: never
+  - name: "AInvirion/cliquey"
+    local_path: "~/Projects/AINVIRION/cliquey"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
+  - name: "AInvirion/AgentJunior"
+    local_path: "~/Projects/AINVIRION/AgentJunior"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
+  - name: "AInvirion/aiproxyguard-cloud"
+    local_path: "~/Projects/AINVIRION/AIProxyGuard/cloud"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
+  - name: "SemClone/kenos-orchestrator"
+    local_path: "~/Projects/SEMCL.ONE/kenos-orchestrator"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
+  - name: "oscarvalenzuelab/open_agentic_framework"
+    local_path: "~/Projects/PERSONAL/open_agentic_framework"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
   # Example repo configuration:
   # - name: "owner/repo"
   #   local_path: "~/Projects/repo"
