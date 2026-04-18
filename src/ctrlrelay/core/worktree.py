@@ -108,12 +108,35 @@ class WorktreeManager:
         new_branch: str,
         base_branch: str | None = None,
     ) -> Path:
-        """Create a worktree with a new branch."""
+        """Create a worktree for ``new_branch``.
+
+        If ``new_branch`` already exists in the bare repo — e.g. because a
+        previous session for the same issue ran out of fix attempts and left
+        its PR branch pushed to origin — reuse that branch so the retry can
+        iterate on the prior commits instead of hitting
+        ``fatal: a branch named 'fix/issue-N' already exists`` from
+        ``git worktree add -b``. Without this, any issue that exhausts the
+        verify-fix loop once gets permanently wedged until someone manually
+        deletes the branch.
+
+        When we have to fall back to a brand-new branch, it's cut from
+        ``base_branch`` (default: the repo's default branch).
+        """
         bare_path = self._get_bare_repo_path(repo)
         worktree_path = self._get_worktree_path(repo, session_id)
 
         if worktree_path.exists():
             raise WorktreeError(f"Worktree already exists: {worktree_path}")
+
+        if await self.branch_exists_locally(repo, new_branch):
+            # Reuse: check out the existing ref into the new worktree.
+            await self._run_git(
+                "worktree", "add",
+                str(worktree_path),
+                new_branch,
+                cwd=bare_path,
+            )
+            return worktree_path
 
         if base_branch is None:
             base_branch = await self.get_default_branch(repo)

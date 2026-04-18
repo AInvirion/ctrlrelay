@@ -109,6 +109,51 @@ class TestWorktreeManager:
             assert "add" in args
 
     @pytest.mark.asyncio
+    async def test_create_worktree_with_new_branch_reuses_existing_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for #28: if the target branch already exists in the
+        bare repo (left over from a prior session that ran out of
+        max_fix_attempts with its PR pushed to origin), the worktree creator
+        must reuse that branch instead of tripping
+        ``fatal: a branch named 'X' already exists`` from ``worktree add -b``."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        # branch_exists_locally short-circuits if the bare dir is missing;
+        # make it real so the show-ref path is exercised.
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            # Both show-ref (branch exists: exit 0) and worktree add (success)
+            # return empty stdout successfully.
+            mock_git.return_value = ""
+
+            wt = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="retry-1",
+                new_branch="fix/issue-5",
+            )
+
+        assert "retry-1" in str(wt)
+        worktree_add_calls = [
+            call_ for call_ in mock_git.call_args_list
+            if "worktree" in call_[0] and "add" in call_[0]
+        ]
+        assert len(worktree_add_calls) == 1
+        args = worktree_add_calls[0][0]
+        # Reuse path MUST NOT pass -b (that creates a new branch and would
+        # fail if the branch already existed).
+        assert "-b" not in args, (
+            f"reuse path must not use -b; git call args: {args}"
+        )
+        assert "fix/issue-5" in args
+
+    @pytest.mark.asyncio
     async def test_create_worktree_with_new_branch_uses_default_branch(
         self, tmp_path: Path
     ) -> None:
