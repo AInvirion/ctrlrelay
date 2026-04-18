@@ -246,12 +246,18 @@ class WorktreeManager:
             if stale_path is None:
                 raise
             # Only touch stale entries we OWN — under our managed
-            # worktrees_dir. A prunable stanza can also represent a
-            # worktree on a temporarily-unavailable path (network mount,
-            # removable drive); for those, the operator expects the path
-            # to come back. Deleting that admin state would orphan the
-            # worktree permanently. Scope the recovery to our own
-            # worktrees_dir and surface the original error otherwise.
+            # worktrees_dir — AND only when our worktrees_dir is actually
+            # accessible on disk right now. A prunable stanza can also
+            # represent a worktree on a temporarily-unavailable path
+            # (network mount, removable drive); if the mount is down,
+            # every managed worktree under it appears prunable. Deleting
+            # their admin state would orphan real checkouts when the
+            # mount comes back.
+            #
+            # Safety gate: require worktrees_dir itself to exist and be
+            # a directory. If the whole mount is offline, bail.
+            if not self.worktrees_dir.is_dir():
+                raise e
             try:
                 stale_resolved = Path(stale_path).resolve()
                 wt_root = self.worktrees_dir.resolve()
