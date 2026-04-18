@@ -180,3 +180,465 @@ class TestIssuePoller:
 
         assert len(handled_issues) == 1
         assert handled_issues[0] == ("owner/repo", 123)
+
+    @pytest.mark.asyncio
+    async def test_poll_skips_repo_on_timeout_and_continues(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A transient TimeoutError on one repo must skip that repo for the
+        round and return issues from the other repos — not crash the loop."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        async def per_repo(repo: str, *, assignee: str):  # noqa: ARG001
+            if repo == "owner/flaky":
+                raise TimeoutError("gh took too long")
+            return [{"number": 42, "title": "fine"}]
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/flaky", "owner/ok"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            new = await poller.poll()
+
+        # Healthy repo still produced its issue.
+        assert [(x["repo"], x["issue"]["number"]) for x in new] == [
+            ("owner/ok", 42)
+        ]
+        # Flaky repo logged a skip event with the transient reason.
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("poll.repo.skipped" in m for m in msgs), msgs
+
+    @pytest.mark.asyncio
+    async def test_poll_skips_repo_on_gh_error(self, tmp_path: Path) -> None:
+        """GitHubError on one repo (non-zero gh exit) is also skipped."""
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.poller import IssuePoller
+
+        async def per_repo(repo: str, *, assignee: str):  # noqa: ARG001
+            if repo == "owner/broken":
+                raise GitHubError("gh failed: HTTP 503")
+            return [{"number": 1, "title": "ok"}]
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/broken", "owner/ok"],
+            state_file=tmp_path / "poller_state.json",
+        )
+        new = await poller.poll()
+        assert [(x["repo"], x["issue"]["number"]) for x in new] == [
+            ("owner/ok", 1)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_poll_propagates_cancellation(self, tmp_path: Path) -> None:
+        """CancelledError MUST propagate so shutdown signals aren't swallowed."""
+        import asyncio as _asyncio
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        async def always_cancel(repo: str, *, assignee: str):  # noqa: ARG001
+            raise _asyncio.CancelledError()
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=always_cancel)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+        with pytest.raises(_asyncio.CancelledError):
+            await poller.poll()
+
+    @pytest.mark.asyncio
+    async def test_run_poll_loop_survives_iteration_failure(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A failing iteration must be logged + retried next cycle rather
+        than crashing the whole daemon."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+
+        call_count = 0
+
+        async def flaky_then_fine(repo: str, *, assignee: str):  # noqa: ARG001
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise TimeoutError("first call times out")
+            return [{"number": 77, "title": "second cycle"}]
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=flaky_then_fine)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        handled: list[int] = []
+
+        async def handler(repo: str, issue: dict) -> None:
+            handled.append(issue["number"])
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            # 2 iterations: cycle 1 is caught by the per-repo skip handler
+            # (not the outer safety net), cycle 2 succeeds.
+            await run_poll_loop(
+                poller=poller,
+                handler=handler,
+                interval=0,
+                max_iterations=2,
+            )
+
+        # Cycle 2 delivered issue 77.
+        assert handled == [77]
+        # poll.repo.skipped fired on cycle 1.
+        assert any("poll.repo.skipped" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_poll_unexpected_exception_on_one_repo_does_not_lose_prior_repos(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Codex P2: if an unexpected (non-transient) exception escapes the
+        lookup for a later repo, poll() must still return the issues it
+        already collected from earlier repos. Otherwise earlier repos'
+        seen_issues is mutated in-memory and the handler never runs — silent
+        drop until daemon restart."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        async def per_repo(repo: str, *, assignee: str):  # noqa: ARG001
+            if repo == "owner/first":
+                return [{"number": 1, "title": "fine"}]
+            # RuntimeError is NOT in _TRANSIENT_POLL_ERRORS.
+            raise RuntimeError("unexpected upstream glitch")
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/first", "owner/second"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            new = await poller.poll()
+
+        assert [(x["repo"], x["issue"]["number"]) for x in new] == [
+            ("owner/first", 1)
+        ]
+        # The unexpected error is logged distinctly so operators can spot it.
+        assert any(
+            "poll.repo.unexpected_error" in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_poll_malformed_issue_payload_contained_to_that_repo(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Malformed issue data from one repo (missing 'number') must not
+        poison other repos' results."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        async def per_repo(repo: str, *, assignee: str):  # noqa: ARG001
+            if repo == "owner/bad":
+                return [{"title": "no number field!"}]  # missing 'number'
+            return [{"number": 10, "title": "fine"}]
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/bad", "owner/ok"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            new = await poller.poll()
+
+        # Healthy repo still produces its issue.
+        assert [(x["repo"], x["issue"]["number"]) for x in new] == [
+            ("owner/ok", 10)
+        ]
+        # The malformed item is logged.
+        assert any(
+            "poll.issue.malformed" in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_poll_malformed_issue_does_not_block_later_issues_in_same_repo(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Codex P2: a malformed issue MUST NOT prevent later good issues in
+        the same repo's batch from being discovered. Otherwise the valid
+        issues after the bad one are never processed until someone fixes the
+        data upstream."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[
+                {"number": 1, "title": "first good"},
+                {"title": "no number — malformed"},
+                {"number": 2, "title": "second good AFTER the bad one"},
+            ]
+        )
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            new = await poller.poll()
+
+        numbers = sorted(x["issue"]["number"] for x in new)
+        assert numbers == [1, 2], (
+            "expected both good issues to be discovered even though there "
+            f"was a malformed item between them, got {numbers}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_poll_returns_new_issues_even_if_save_state_fails(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """Codex P2: if _save_state raises (disk full, permissions), poll()
+        must still return the new-issues list so the handler runs — otherwise
+        seen_issues was mutated in-memory and the work is silently lost until
+        the daemon restarts."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[{"number": 42, "title": "work to do"}]
+        )
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        def boom(*a, **kw):
+            raise OSError("disk full")
+        monkeypatch.setattr(poller, "_save_state", boom)
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            new = await poller.poll()
+
+        # New issue MUST flow to the caller even though save_state failed.
+        assert [(x["repo"], x["issue"]["number"]) for x in new] == [
+            ("owner/repo", 42)
+        ]
+        # And the failure is recorded for operator visibility.
+        assert any(
+            "poll.save_state.failed" in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_persistent_repo_failure_escalates_to_warning(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Codex P2: after _REPO_FAILURE_WARN_THRESHOLD consecutive failures
+        on the same repo, the log level escalates to WARNING so a permanent
+        misconfig (expired auth, renamed repo) stops hiding as routine
+        transient skips."""
+        import logging
+
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.poller import IssuePoller
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            side_effect=GitHubError("gh failed: HTTP 401 Bad credentials")
+        )
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/expired-auth"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        # 1st and 2nd cycles: INFO-level skip.
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            await poller.poll()
+            await poller.poll()
+
+        info_skips = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and "poll.repo.skipped" in r.getMessage()
+        ]
+        assert len(info_skips) == 2
+
+        # 3rd cycle: hits threshold, escalates to WARNING.
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            await poller.poll()
+
+        warn_skips = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "poll.repo.skipped" in r.getMessage()
+        ]
+        assert warn_skips, "expected a WARNING-level skip at the threshold"
+        # 4th cycle: still WARNING (persistent).
+        await poller.poll()
+        assert len([
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "poll.repo.skipped" in r.getMessage()
+        ]) >= 2
+
+    @pytest.mark.asyncio
+    async def test_repo_failure_counter_resets_on_success(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A successful lookup must reset the per-repo failure counter so a
+        previously flaky repo doesn't stay escalated forever after it recovers."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        calls = 0
+
+        async def flaky_then_fine(repo: str, *, assignee: str):  # noqa: ARG001
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                raise TimeoutError("first two fail")
+            return [{"number": 5, "title": "ok"}]
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=flaky_then_fine)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+        # Two failures accumulate, then success — counter should reset.
+        await poller.poll()
+        await poller.poll()
+        assert poller._repo_failure_counts.get("owner/repo") == 2
+
+        await poller.poll()
+        assert "owner/repo" not in poller._repo_failure_counts
+
+    @pytest.mark.asyncio
+    async def test_run_poll_loop_survives_handler_exception(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """An exception from the handler (e.g. run_dev_issue crash) must be
+        logged and the loop must continue to the next iteration."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[{"number": 1, "title": "x"}]
+        )
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        async def handler(repo: str, issue: dict) -> None:
+            raise RuntimeError("handler blew up")
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            await run_poll_loop(
+                poller=poller,
+                handler=handler,
+                interval=0,
+                max_iterations=1,
+            )
+
+        msgs = [r.getMessage() for r in caplog.records]
+        # The per-handler guard emits poll.handler.failed with the offending
+        # repo+issue — distinct from the outer poll.iteration.failed which
+        # is only for poll() itself crashing.
+        assert any("poll.handler.failed" in m for m in msgs), msgs
+
+    @pytest.mark.asyncio
+    async def test_run_poll_loop_handler_failure_does_not_skip_rest_of_batch(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Codex P1: if handler fails on the first issue, the rest of the
+        batch from the same poll cycle MUST still run. Otherwise those
+        issues are marked seen (by poll()) but never handled — silently
+        dropped until daemon restart."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[
+                {"number": 1, "title": "will blow up handler"},
+                {"number": 2, "title": "second"},
+                {"number": 3, "title": "third"},
+            ]
+        )
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        processed: list[int] = []
+
+        async def handler(repo: str, issue: dict) -> None:
+            if issue["number"] == 1:
+                raise RuntimeError("handler blew up on first")
+            processed.append(issue["number"])
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            await run_poll_loop(
+                poller=poller,
+                handler=handler,
+                interval=0,
+                max_iterations=1,
+            )
+
+        # Issues 2 and 3 MUST still have run — per-handler isolation.
+        assert processed == [2, 3], processed
+        assert any(
+            "poll.handler.failed" in r.getMessage() for r in caplog.records
+        )
