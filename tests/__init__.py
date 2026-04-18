@@ -1,1 +1,1 @@
-"""Tests for dev-sync package."""
+"""Tests for ctrlrelay package."""

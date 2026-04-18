@@ -9,7 +9,7 @@ class TestPostMergeHandler:
     @pytest.mark.asyncio
     async def test_handle_merge_closes_issue(self) -> None:
         """Should close issue after successful merge."""
-        from dev_sync.pipelines.post_merge import handle_merge
+        from ctrlrelay.pipelines.post_merge import handle_merge
 
         mock_github = AsyncMock()
         mock_transport = AsyncMock()
@@ -32,7 +32,7 @@ class TestPostMergeHandler:
     @pytest.mark.asyncio
     async def test_watch_and_handle_merge(self) -> None:
         """Should watch for merge then close issue."""
-        from dev_sync.pipelines.post_merge import watch_and_handle_merge
+        from ctrlrelay.pipelines.post_merge import watch_and_handle_merge
 
         mock_github = AsyncMock()
         mock_github.get_pr_state.return_value = {"state": "MERGED"}

@@ -10,7 +10,7 @@ class TestDevPipeline:
     @pytest.mark.asyncio
     async def test_dev_pipeline_has_name(self) -> None:
         """Pipeline should have name 'dev'."""
-        from dev_sync.pipelines.dev import DevPipeline
+        from ctrlrelay.pipelines.dev import DevPipeline
 
         pipeline = DevPipeline(
             dispatcher=MagicMock(),
@@ -26,10 +26,10 @@ class TestDevPipeline:
     @pytest.mark.asyncio
     async def test_run_dispatches_claude_session(self, tmp_path: Path) -> None:
         """Should dispatch Claude session with issue context."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.base import PipelineContext
-        from dev_sync.pipelines.dev import DevPipeline
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.dev import DevPipeline
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -79,10 +79,10 @@ class TestDevPipeline:
     @pytest.mark.asyncio
     async def test_run_dev_issue_full_flow(self, tmp_path: Path) -> None:
         """Should run full dev flow for a single issue."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -141,10 +141,10 @@ class TestDevPipeline:
     @pytest.mark.asyncio
     async def test_request_fix_resumes_session_with_instructions(self, tmp_path: Path) -> None:
         """request_fix should resume the session using the provided fix prompt."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.base import PipelineContext
-        from dev_sync.pipelines.dev import DevPipeline
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.dev import DevPipeline
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -192,11 +192,11 @@ class TestDevPipeline:
     @pytest.mark.asyncio
     async def test_run_dev_issue_posts_claim_comment(self, tmp_path: Path) -> None:
         """Should post a claim comment on the issue when work begins."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.core.pr_verifier import VerificationResult
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import AGENT_CLAIM_MARKER, run_dev_issue
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.pr_verifier import VerificationResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import AGENT_CLAIM_MARKER, run_dev_issue
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -262,11 +262,11 @@ class TestDevPipeline:
         self, tmp_path: Path
     ) -> None:
         """Should not post a duplicate claim comment if marker is already present."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.core.pr_verifier import VerificationResult
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import AGENT_CLAIM_MARKER, run_dev_issue
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.pr_verifier import VerificationResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import AGENT_CLAIM_MARKER, run_dev_issue
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -328,10 +328,10 @@ class TestDevPipeline:
     @pytest.mark.asyncio
     async def test_run_returns_blocked_when_needs_input(self, tmp_path: Path) -> None:
         """Should return blocked result when Claude needs input."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.base import PipelineContext
-        from dev_sync.pipelines.dev import DevPipeline
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.dev import DevPipeline
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -379,8 +379,8 @@ class TestRunDevIssueVerification:
 
     @staticmethod
     def _make_done_state(session_id: str = "dev-123", pr_number: int = 42):
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
 
         return SessionResult(
             session_id=session_id,
@@ -403,8 +403,8 @@ class TestRunDevIssueVerification:
     @pytest.mark.asyncio
     async def test_run_dev_issue_verifies_before_returning_success(self, tmp_path: Path) -> None:
         """Should call get_pr_checks and get_pr_state before returning success."""
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
@@ -446,8 +446,8 @@ class TestRunDevIssueVerification:
     @pytest.mark.asyncio
     async def test_run_dev_issue_requests_fix_when_ci_fails(self, tmp_path: Path) -> None:
         """On failing CI, should resume the session with a fix prompt and re-verify."""
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
@@ -494,8 +494,8 @@ class TestRunDevIssueVerification:
     @pytest.mark.asyncio
     async def test_run_dev_issue_requests_fix_when_conflicting(self, tmp_path: Path) -> None:
         """On CONFLICTING mergeable state, should resume the session with a conflict prompt."""
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
@@ -542,11 +542,11 @@ class TestRunDevIssueVerification:
         """If Claude signals BLOCKED with a question, run_dev_issue must post
         the question via the transport, wait for the reply, and resume the
         session with the answer. Loop until DONE."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.core.pr_verifier import VerificationResult
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.pr_verifier import VerificationResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         # 1st spawn = BLOCKED with a question. 2nd spawn (resume) = DONE.
         blocked = SessionResult(
@@ -637,10 +637,10 @@ class TestRunDevIssueVerification:
     ) -> None:
         """Without a transport there's no way to consume the answer, so we
         must return the BLOCKED result rather than spinning."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -693,10 +693,10 @@ class TestRunDevIssueVerification:
         """If the transport raises (bridge down, timeout), the session must
         end cleanly as FAILED rather than leaving the caller with a blocked
         result we can't recover from."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -752,11 +752,11 @@ class TestRunDevIssueVerification:
         """If CI is simply slow (verifier reports timed_out), _verify_and_fix_pr
         must NOT resume Claude — it hands off the PR as-is. Otherwise every
         long-running CI becomes a retry-until-max-attempts failure."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.core.pr_verifier import VerificationResult
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.pr_verifier import VerificationResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -822,8 +822,8 @@ class TestRunDevIssueVerification:
     @pytest.mark.asyncio
     async def test_run_dev_issue_fails_after_max_fix_attempts(self, tmp_path: Path) -> None:
         """Should give up and return failure after max fix attempts."""
-        from dev_sync.core.state import StateDB
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)

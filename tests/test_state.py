@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from dev_sync.core.state import StateDB
+from ctrlrelay.core.state import StateDB
 
 
 class TestStateDBInit:

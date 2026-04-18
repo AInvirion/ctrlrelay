@@ -10,7 +10,7 @@ nav_order: 3
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Enable human-in-the-loop communication via Telegram, with `dev-sync bridge test` delivering a message to the user's phone.
+**Goal:** Enable human-in-the-loop communication via Telegram, with `ctrlrelay bridge test` delivering a message to the user's phone.
 
 **Architecture:** Transport abstraction defines async Protocol for send/ask operations. TelegramTransport connects to a separate Bridge process via Unix socket. Bridge process handles Telegram Bot API and maintains message state.
 
@@ -21,7 +21,7 @@ nav_order: 3
 ## File Structure
 
 ```
-src/dev_sync/
+src/ctrlrelay/
 ├── transports/
 │   ├── __init__.py          # Export Transport, get_transport()
 │   ├── base.py               # Transport Protocol definition
@@ -88,17 +88,17 @@ git commit -m "chore: add python-telegram-bot dependency"
 ### Task 2: Create bridge protocol message types
 
 **Files:**
-- Create: `src/dev_sync/bridge/__init__.py`
-- Create: `src/dev_sync/bridge/protocol.py`
+- Create: `src/ctrlrelay/bridge/__init__.py`
+- Create: `src/ctrlrelay/bridge/protocol.py`
 - Create: `tests/test_bridge_protocol.py`
 
 - [ ] **Step 1: Create bridge package init**
 
-Create `src/dev_sync/bridge/__init__.py`:
+Create `src/ctrlrelay/bridge/__init__.py`:
 ```python
 """Bridge process for Telegram communication."""
 
-from dev_sync.bridge.protocol import (
+from ctrlrelay.bridge.protocol import (
     BridgeMessage,
     BridgeOp,
     parse_message,
@@ -127,7 +127,7 @@ import pytest
 class TestBridgeOp:
     def test_all_ops_defined(self) -> None:
         """All required operations should be defined."""
-        from dev_sync.bridge.protocol import BridgeOp
+        from ctrlrelay.bridge.protocol import BridgeOp
 
         assert BridgeOp.SEND == "send"
         assert BridgeOp.ASK == "ask"
@@ -141,7 +141,7 @@ class TestBridgeOp:
 class TestBridgeMessage:
     def test_send_message(self) -> None:
         """Should create send message."""
-        from dev_sync.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
 
         msg = BridgeMessage(op=BridgeOp.SEND, request_id="r-001", text="Hello")
         assert msg.op == BridgeOp.SEND
@@ -150,7 +150,7 @@ class TestBridgeMessage:
 
     def test_ask_message_with_options(self) -> None:
         """Should create ask message with options."""
-        from dev_sync.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
 
         msg = BridgeMessage(
             op=BridgeOp.ASK,
@@ -163,14 +163,14 @@ class TestBridgeMessage:
 
     def test_ack_message(self) -> None:
         """Should create ack message."""
-        from dev_sync.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
 
         msg = BridgeMessage(op=BridgeOp.ACK, request_id="r-001", status="sent")
         assert msg.status == "sent"
 
     def test_answer_message(self) -> None:
         """Should create answer message."""
-        from dev_sync.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
 
         msg = BridgeMessage(
             op=BridgeOp.ANSWER,
@@ -182,7 +182,7 @@ class TestBridgeMessage:
 
     def test_error_message(self) -> None:
         """Should create error message."""
-        from dev_sync.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
 
         msg = BridgeMessage(
             op=BridgeOp.ERROR,
@@ -197,7 +197,7 @@ class TestBridgeMessage:
 class TestSerialize:
     def test_serialize_message(self) -> None:
         """Should serialize to JSON line."""
-        from dev_sync.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
 
         msg = BridgeMessage(op=BridgeOp.PING)
         line = serialize_message(msg)
@@ -207,7 +207,7 @@ class TestSerialize:
 
     def test_parse_message(self) -> None:
         """Should parse JSON line to message."""
-        from dev_sync.bridge.protocol import BridgeOp, parse_message
+        from ctrlrelay.bridge.protocol import BridgeOp, parse_message
 
         line = '{"op": "pong"}\n'
         msg = parse_message(line)
@@ -215,14 +215,14 @@ class TestSerialize:
 
     def test_parse_invalid_json_raises(self) -> None:
         """Should raise on invalid JSON."""
-        from dev_sync.bridge.protocol import ProtocolError, parse_message
+        from ctrlrelay.bridge.protocol import ProtocolError, parse_message
 
         with pytest.raises(ProtocolError, match="Invalid JSON"):
             parse_message("not json\n")
 
     def test_parse_missing_op_raises(self) -> None:
         """Should raise if op field missing."""
-        from dev_sync.bridge.protocol import ProtocolError, parse_message
+        from ctrlrelay.bridge.protocol import ProtocolError, parse_message
 
         with pytest.raises(ProtocolError, match="Missing 'op'"):
             parse_message('{"request_id": "r-001"}\n')
@@ -234,11 +234,11 @@ Run:
 ```bash
 pytest tests/test_bridge_protocol.py -v
 ```
-Expected: FAIL with "No module named 'dev_sync.bridge'"
+Expected: FAIL with "No module named 'ctrlrelay.bridge'"
 
 - [ ] **Step 4: Implement protocol module**
 
-Create `src/dev_sync/bridge/protocol.py`:
+Create `src/ctrlrelay/bridge/protocol.py`:
 ```python
 """Bridge protocol message types and serialization."""
 
@@ -323,7 +323,7 @@ Expected: All tests PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/dev_sync/bridge/ tests/test_bridge_protocol.py
+git add src/ctrlrelay/bridge/ tests/test_bridge_protocol.py
 git commit -m "feat: add bridge protocol message types"
 ```
 
@@ -332,17 +332,17 @@ git commit -m "feat: add bridge protocol message types"
 ### Task 3: Create transport abstraction
 
 **Files:**
-- Create: `src/dev_sync/transports/__init__.py`
-- Create: `src/dev_sync/transports/base.py`
+- Create: `src/ctrlrelay/transports/__init__.py`
+- Create: `src/ctrlrelay/transports/base.py`
 - Create: `tests/test_transport.py`
 
 - [ ] **Step 1: Create transports package init**
 
-Create `src/dev_sync/transports/__init__.py`:
+Create `src/ctrlrelay/transports/__init__.py`:
 ```python
 """Transport abstraction for orchestrator communication."""
 
-from dev_sync.transports.base import Transport, TransportError
+from ctrlrelay.transports.base import Transport, TransportError
 
 __all__ = [
     "Transport",
@@ -364,7 +364,7 @@ import pytest
 class TestTransportProtocol:
     def test_transport_is_protocol(self) -> None:
         """Transport should be a Protocol."""
-        from dev_sync.transports.base import Transport
+        from ctrlrelay.transports.base import Transport
 
         assert hasattr(Transport, "__protocol_attrs__") or isinstance(
             Transport, type
@@ -372,19 +372,19 @@ class TestTransportProtocol:
 
     def test_transport_has_send(self) -> None:
         """Transport should define send method."""
-        from dev_sync.transports.base import Transport
+        from ctrlrelay.transports.base import Transport
 
         assert hasattr(Transport, "send")
 
     def test_transport_has_ask(self) -> None:
         """Transport should define ask method."""
-        from dev_sync.transports.base import Transport
+        from ctrlrelay.transports.base import Transport
 
         assert hasattr(Transport, "ask")
 
     def test_transport_has_close(self) -> None:
         """Transport should define close method."""
-        from dev_sync.transports.base import Transport
+        from ctrlrelay.transports.base import Transport
 
         assert hasattr(Transport, "close")
 
@@ -392,7 +392,7 @@ class TestTransportProtocol:
 class TestTransportError:
     def test_error_exists(self) -> None:
         """TransportError should be defined."""
-        from dev_sync.transports.base import TransportError
+        from ctrlrelay.transports.base import TransportError
 
         assert issubclass(TransportError, Exception)
 ```
@@ -403,11 +403,11 @@ Run:
 ```bash
 pytest tests/test_transport.py -v
 ```
-Expected: FAIL with "No module named 'dev_sync.transports'"
+Expected: FAIL with "No module named 'ctrlrelay.transports'"
 
 - [ ] **Step 4: Implement transport base**
 
-Create `src/dev_sync/transports/base.py`:
+Create `src/ctrlrelay/transports/base.py`:
 ```python
 """Transport protocol definition."""
 
@@ -453,7 +453,7 @@ Expected: All tests PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/dev_sync/transports/ tests/test_transport.py
+git add src/ctrlrelay/transports/ tests/test_transport.py
 git commit -m "feat: add transport protocol abstraction"
 ```
 
@@ -462,8 +462,8 @@ git commit -m "feat: add transport protocol abstraction"
 ### Task 4: Implement FileMockTransport
 
 **Files:**
-- Create: `src/dev_sync/transports/file_mock.py`
-- Modify: `src/dev_sync/transports/__init__.py`
+- Create: `src/ctrlrelay/transports/file_mock.py`
+- Modify: `src/ctrlrelay/transports/__init__.py`
 - Modify: `tests/test_transport.py`
 
 - [ ] **Step 1: Write failing tests for FileMockTransport**
@@ -483,7 +483,7 @@ class TestFileMockTransport:
     @pytest.mark.asyncio
     async def test_send_writes_to_outbox(self, mock_files) -> None:
         """send() should write message to outbox."""
-        from dev_sync.transports.file_mock import FileMockTransport
+        from ctrlrelay.transports.file_mock import FileMockTransport
 
         inbox, outbox = mock_files
         transport = FileMockTransport(inbox=inbox, outbox=outbox)
@@ -496,7 +496,7 @@ class TestFileMockTransport:
     @pytest.mark.asyncio
     async def test_ask_writes_question_reads_answer(self, mock_files) -> None:
         """ask() should write question and read answer from inbox."""
-        from dev_sync.transports.file_mock import FileMockTransport
+        from ctrlrelay.transports.file_mock import FileMockTransport
 
         inbox, outbox = mock_files
         inbox.write_text("yes\n")
@@ -510,8 +510,8 @@ class TestFileMockTransport:
     @pytest.mark.asyncio
     async def test_ask_timeout_raises(self, mock_files) -> None:
         """ask() should raise on timeout with empty inbox."""
-        from dev_sync.transports.base import TransportError
-        from dev_sync.transports.file_mock import FileMockTransport
+        from ctrlrelay.transports.base import TransportError
+        from ctrlrelay.transports.file_mock import FileMockTransport
 
         inbox, outbox = mock_files
         transport = FileMockTransport(inbox=inbox, outbox=outbox)
@@ -522,8 +522,8 @@ class TestFileMockTransport:
     @pytest.mark.asyncio
     async def test_implements_protocol(self, mock_files) -> None:
         """FileMockTransport should implement Transport protocol."""
-        from dev_sync.transports.base import Transport
-        from dev_sync.transports.file_mock import FileMockTransport
+        from ctrlrelay.transports.base import Transport
+        from ctrlrelay.transports.file_mock import FileMockTransport
 
         inbox, outbox = mock_files
         transport = FileMockTransport(inbox=inbox, outbox=outbox)
@@ -554,11 +554,11 @@ Run:
 ```bash
 pytest tests/test_transport.py::TestFileMockTransport -v
 ```
-Expected: FAIL with "No module named 'dev_sync.transports.file_mock'"
+Expected: FAIL with "No module named 'ctrlrelay.transports.file_mock'"
 
 - [ ] **Step 4: Implement FileMockTransport**
 
-Create `src/dev_sync/transports/file_mock.py`:
+Create `src/ctrlrelay/transports/file_mock.py`:
 ```python
 """File-based mock transport for testing."""
 
@@ -568,7 +568,7 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dev_sync.transports.base import TransportError
+from ctrlrelay.transports.base import TransportError
 
 
 class FileMockTransport:
@@ -618,12 +618,12 @@ class FileMockTransport:
 
 - [ ] **Step 5: Update transports __init__.py**
 
-Update `src/dev_sync/transports/__init__.py`:
+Update `src/ctrlrelay/transports/__init__.py`:
 ```python
 """Transport abstraction for orchestrator communication."""
 
-from dev_sync.transports.base import Transport, TransportError
-from dev_sync.transports.file_mock import FileMockTransport
+from ctrlrelay.transports.base import Transport, TransportError
+from ctrlrelay.transports.file_mock import FileMockTransport
 
 __all__ = [
     "FileMockTransport",
@@ -643,7 +643,7 @@ Expected: All tests PASS
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/dev_sync/transports/ tests/test_transport.py pyproject.toml
+git add src/ctrlrelay/transports/ tests/test_transport.py pyproject.toml
 git commit -m "feat: add FileMockTransport for testing"
 ```
 
@@ -652,8 +652,8 @@ git commit -m "feat: add FileMockTransport for testing"
 ### Task 5: Implement SocketTransport (bridge client)
 
 **Files:**
-- Create: `src/dev_sync/transports/socket_client.py`
-- Modify: `src/dev_sync/transports/__init__.py`
+- Create: `src/ctrlrelay/transports/socket_client.py`
+- Modify: `src/ctrlrelay/transports/__init__.py`
 - Modify: `tests/test_transport.py`
 
 - [ ] **Step 1: Write failing tests for SocketTransport**
@@ -673,8 +673,8 @@ class TestSocketTransport:
     @pytest.mark.asyncio
     async def test_connect_fails_when_no_server(self, socket_path) -> None:
         """Should raise when bridge not running."""
-        from dev_sync.transports.base import TransportError
-        from dev_sync.transports.socket_client import SocketTransport
+        from ctrlrelay.transports.base import TransportError
+        from ctrlrelay.transports.socket_client import SocketTransport
 
         transport = SocketTransport(socket_path)
         with pytest.raises(TransportError, match="connect"):
@@ -683,8 +683,8 @@ class TestSocketTransport:
     @pytest.mark.asyncio
     async def test_send_requires_connection(self, socket_path) -> None:
         """Should raise if not connected."""
-        from dev_sync.transports.base import TransportError
-        from dev_sync.transports.socket_client import SocketTransport
+        from ctrlrelay.transports.base import TransportError
+        from ctrlrelay.transports.socket_client import SocketTransport
 
         transport = SocketTransport(socket_path)
         with pytest.raises(TransportError, match="not connected"):
@@ -693,8 +693,8 @@ class TestSocketTransport:
     @pytest.mark.asyncio
     async def test_implements_protocol(self, socket_path) -> None:
         """SocketTransport should implement Transport protocol."""
-        from dev_sync.transports.base import Transport
-        from dev_sync.transports.socket_client import SocketTransport
+        from ctrlrelay.transports.base import Transport
+        from ctrlrelay.transports.socket_client import SocketTransport
 
         transport = SocketTransport(socket_path)
         assert isinstance(transport, Transport)
@@ -706,11 +706,11 @@ Run:
 ```bash
 pytest tests/test_transport.py::TestSocketTransport -v
 ```
-Expected: FAIL with "No module named 'dev_sync.transports.socket_client'"
+Expected: FAIL with "No module named 'ctrlrelay.transports.socket_client'"
 
 - [ ] **Step 3: Implement SocketTransport**
 
-Create `src/dev_sync/transports/socket_client.py`:
+Create `src/ctrlrelay/transports/socket_client.py`:
 ```python
 """Unix socket transport client for bridge communication."""
 
@@ -720,14 +720,14 @@ import asyncio
 import uuid
 from pathlib import Path
 
-from dev_sync.bridge.protocol import (
+from ctrlrelay.bridge.protocol import (
     BridgeMessage,
     BridgeOp,
     ProtocolError,
     parse_message,
     serialize_message,
 )
-from dev_sync.transports.base import TransportError
+from ctrlrelay.transports.base import TransportError
 
 
 class SocketTransport:
@@ -843,13 +843,13 @@ class SocketTransport:
 
 - [ ] **Step 4: Update transports __init__.py**
 
-Update `src/dev_sync/transports/__init__.py`:
+Update `src/ctrlrelay/transports/__init__.py`:
 ```python
 """Transport abstraction for orchestrator communication."""
 
-from dev_sync.transports.base import Transport, TransportError
-from dev_sync.transports.file_mock import FileMockTransport
-from dev_sync.transports.socket_client import SocketTransport
+from ctrlrelay.transports.base import Transport, TransportError
+from ctrlrelay.transports.file_mock import FileMockTransport
+from ctrlrelay.transports.socket_client import SocketTransport
 
 __all__ = [
     "FileMockTransport",
@@ -870,7 +870,7 @@ Expected: All tests PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/dev_sync/transports/ tests/test_transport.py
+git add src/ctrlrelay/transports/ tests/test_transport.py
 git commit -m "feat: add SocketTransport for bridge communication"
 ```
 
@@ -879,8 +879,8 @@ git commit -m "feat: add SocketTransport for bridge communication"
 ### Task 6: Implement bridge server (socket + basic handlers)
 
 **Files:**
-- Create: `src/dev_sync/bridge/server.py`
-- Modify: `src/dev_sync/bridge/__init__.py`
+- Create: `src/ctrlrelay/bridge/server.py`
+- Modify: `src/ctrlrelay/bridge/__init__.py`
 - Create: `tests/test_bridge_server.py`
 
 - [ ] **Step 1: Write failing tests for bridge server**
@@ -904,7 +904,7 @@ class TestBridgeServer:
     @pytest.mark.asyncio
     async def test_creates_socket_file(self, socket_path) -> None:
         """Server should create socket file."""
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())
@@ -918,7 +918,7 @@ class TestBridgeServer:
     @pytest.mark.asyncio
     async def test_socket_permissions(self, socket_path) -> None:
         """Socket should have 0600 permissions."""
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())
@@ -933,8 +933,8 @@ class TestBridgeServer:
     @pytest.mark.asyncio
     async def test_handles_ping_pong(self, socket_path) -> None:
         """Server should respond to ping with pong."""
-        from dev_sync.bridge.protocol import BridgeOp, parse_message, serialize_message, BridgeMessage
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.protocol import BridgeOp, parse_message, serialize_message, BridgeMessage
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())
@@ -959,7 +959,7 @@ class TestBridgeServer:
     @pytest.mark.asyncio
     async def test_cleans_up_socket_on_stop(self, socket_path) -> None:
         """Server should remove socket file on stop."""
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())
@@ -982,7 +982,7 @@ Expected: FAIL with "cannot import name 'BridgeServer'"
 
 - [ ] **Step 3: Implement BridgeServer**
 
-Create `src/dev_sync/bridge/server.py`:
+Create `src/ctrlrelay/bridge/server.py`:
 ```python
 """Bridge server for Telegram communication."""
 
@@ -993,7 +993,7 @@ import os
 import stat
 from pathlib import Path
 
-from dev_sync.bridge.protocol import (
+from ctrlrelay.bridge.protocol import (
     BridgeMessage,
     BridgeOp,
     ProtocolError,
@@ -1100,18 +1100,18 @@ class BridgeServer:
 
 - [ ] **Step 4: Update bridge __init__.py**
 
-Update `src/dev_sync/bridge/__init__.py`:
+Update `src/ctrlrelay/bridge/__init__.py`:
 ```python
 """Bridge process for Telegram communication."""
 
-from dev_sync.bridge.protocol import (
+from ctrlrelay.bridge.protocol import (
     BridgeMessage,
     BridgeOp,
     ProtocolError,
     parse_message,
     serialize_message,
 )
-from dev_sync.bridge.server import BridgeServer
+from ctrlrelay.bridge.server import BridgeServer
 
 __all__ = [
     "BridgeMessage",
@@ -1134,7 +1134,7 @@ Expected: All tests PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/dev_sync/bridge/ tests/test_bridge_server.py
+git add src/ctrlrelay/bridge/ tests/test_bridge_server.py
 git commit -m "feat: add bridge server with socket handling"
 ```
 
@@ -1143,9 +1143,9 @@ git commit -m "feat: add bridge server with socket handling"
 ### Task 7: Add Telegram handler
 
 **Files:**
-- Create: `src/dev_sync/bridge/telegram_handler.py`
-- Modify: `src/dev_sync/bridge/server.py`
-- Modify: `src/dev_sync/bridge/__init__.py`
+- Create: `src/ctrlrelay/bridge/telegram_handler.py`
+- Modify: `src/ctrlrelay/bridge/server.py`
+- Modify: `src/ctrlrelay/bridge/__init__.py`
 - Create: `tests/test_telegram_handler.py`
 
 - [ ] **Step 1: Write failing tests for TelegramHandler**
@@ -1162,9 +1162,9 @@ class TestTelegramHandler:
     @pytest.mark.asyncio
     async def test_send_message(self) -> None:
         """Should send message via Telegram API."""
-        from dev_sync.bridge.telegram_handler import TelegramHandler
+        from ctrlrelay.bridge.telegram_handler import TelegramHandler
 
-        with patch("dev_sync.bridge.telegram_handler.Bot") as MockBot:
+        with patch("ctrlrelay.bridge.telegram_handler.Bot") as MockBot:
             mock_bot = AsyncMock()
             MockBot.return_value = mock_bot
 
@@ -1179,9 +1179,9 @@ class TestTelegramHandler:
     @pytest.mark.asyncio
     async def test_ask_sends_with_keyboard(self) -> None:
         """Should send question with reply keyboard."""
-        from dev_sync.bridge.telegram_handler import TelegramHandler
+        from ctrlrelay.bridge.telegram_handler import TelegramHandler
 
-        with patch("dev_sync.bridge.telegram_handler.Bot") as MockBot:
+        with patch("ctrlrelay.bridge.telegram_handler.Bot") as MockBot:
             mock_bot = AsyncMock()
             mock_message = MagicMock()
             mock_message.message_id = 42
@@ -1208,7 +1208,7 @@ Expected: FAIL with "cannot import name 'TelegramHandler'"
 
 - [ ] **Step 3: Implement TelegramHandler**
 
-Create `src/dev_sync/bridge/telegram_handler.py`:
+Create `src/ctrlrelay/bridge/telegram_handler.py`:
 ```python
 """Telegram Bot API handler."""
 
@@ -1269,7 +1269,7 @@ Expected: All tests PASS
 
 - [ ] **Step 5: Integrate TelegramHandler into BridgeServer**
 
-Update `src/dev_sync/bridge/server.py` - modify the `__init__` and `_handle_message` methods:
+Update `src/ctrlrelay/bridge/server.py` - modify the `__init__` and `_handle_message` methods:
 ```python
 """Bridge server for Telegram communication."""
 
@@ -1280,14 +1280,14 @@ import os
 import stat
 from pathlib import Path
 
-from dev_sync.bridge.protocol import (
+from ctrlrelay.bridge.protocol import (
     BridgeMessage,
     BridgeOp,
     ProtocolError,
     parse_message,
     serialize_message,
 )
-from dev_sync.bridge.telegram_handler import TelegramHandler
+from ctrlrelay.bridge.telegram_handler import TelegramHandler
 
 
 class BridgeServer:
@@ -1422,19 +1422,19 @@ class BridgeServer:
 
 - [ ] **Step 6: Update bridge __init__.py**
 
-Update `src/dev_sync/bridge/__init__.py`:
+Update `src/ctrlrelay/bridge/__init__.py`:
 ```python
 """Bridge process for Telegram communication."""
 
-from dev_sync.bridge.protocol import (
+from ctrlrelay.bridge.protocol import (
     BridgeMessage,
     BridgeOp,
     ProtocolError,
     parse_message,
     serialize_message,
 )
-from dev_sync.bridge.server import BridgeServer
-from dev_sync.bridge.telegram_handler import TelegramHandler
+from ctrlrelay.bridge.server import BridgeServer
+from ctrlrelay.bridge.telegram_handler import TelegramHandler
 
 __all__ = [
     "BridgeMessage",
@@ -1458,7 +1458,7 @@ Expected: All tests PASS
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/dev_sync/bridge/ tests/test_telegram_handler.py
+git add src/ctrlrelay/bridge/ tests/test_telegram_handler.py
 git commit -m "feat: add Telegram handler and integrate with bridge server"
 ```
 
@@ -1467,11 +1467,11 @@ git commit -m "feat: add Telegram handler and integrate with bridge server"
 ### Task 8: Add bridge CLI commands
 
 **Files:**
-- Modify: `src/dev_sync/cli.py`
+- Modify: `src/ctrlrelay/cli.py`
 
 - [ ] **Step 1: Add bridge subcommand group**
 
-Add to `src/dev_sync/cli.py` after the skills_app section:
+Add to `src/ctrlrelay/cli.py` after the skills_app section:
 ```python
 # Bridge subcommand group
 bridge_app = typer.Typer(help="Telegram bridge commands.")
@@ -1486,7 +1486,7 @@ def _get_socket_path(config_path: str) -> Path:
             return config.transport.telegram.socket_path.expanduser().resolve()
     except ConfigError:
         pass
-    return Path("~/.dev-sync/dev-sync.sock").expanduser().resolve()
+    return Path("~/.ctrlrelay/ctrlrelay.sock").expanduser().resolve()
 
 
 def _get_bridge_pid_file(socket_path: Path) -> Path:
@@ -1556,7 +1556,7 @@ def bridge_start(
         cmd = [
             sys.executable,
             "-m",
-            "dev_sync.bridge",
+            "ctrlrelay.bridge",
             "--socket-path",
             str(socket_path),
             "--bot-token",
@@ -1576,7 +1576,7 @@ def bridge_start(
         # Run in foreground
         import asyncio
 
-        from dev_sync.bridge import BridgeServer
+        from ctrlrelay.bridge import BridgeServer
 
         console.print(f"Starting bridge on {socket_path}")
         console.print("Press Ctrl+C to stop")
@@ -1663,7 +1663,7 @@ def bridge_status(
 @bridge_app.command("test")
 def bridge_test(
     message: str = typer.Option(
-        "Test message from dev-sync bridge",
+        "Test message from ctrlrelay bridge",
         "--message",
         "-m",
         help="Message to send",
@@ -1681,11 +1681,11 @@ def bridge_test(
     socket_path = _get_socket_path(config_path)
 
     if not socket_path.exists():
-        console.print("[red]Bridge not running.[/red] Start it with: dev-sync bridge start")
+        console.print("[red]Bridge not running.[/red] Start it with: ctrlrelay bridge start")
         raise typer.Exit(1)
 
     async def send_test():
-        from dev_sync.transports import SocketTransport
+        from ctrlrelay.transports import SocketTransport
 
         transport = SocketTransport(socket_path)
         try:
@@ -1706,7 +1706,7 @@ def bridge_test(
 
 Run:
 ```bash
-dev-sync bridge --help
+ctrlrelay bridge --help
 ```
 Expected: Shows start, stop, status, test subcommands
 
@@ -1714,14 +1714,14 @@ Expected: Shows start, stop, status, test subcommands
 
 Run:
 ```bash
-dev-sync bridge status
+ctrlrelay bridge status
 ```
 Expected: Shows "Bridge not running"
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/dev_sync/cli.py
+git add src/ctrlrelay/cli.py
 git commit -m "feat: add bridge CLI commands (start, stop, status, test)"
 ```
 
@@ -1730,11 +1730,11 @@ git commit -m "feat: add bridge CLI commands (start, stop, status, test)"
 ### Task 9: Add bridge __main__.py for daemon mode
 
 **Files:**
-- Create: `src/dev_sync/bridge/__main__.py`
+- Create: `src/ctrlrelay/bridge/__main__.py`
 
 - [ ] **Step 1: Create bridge __main__.py**
 
-Create `src/dev_sync/bridge/__main__.py`:
+Create `src/ctrlrelay/bridge/__main__.py`:
 ```python
 """Bridge process entry point for daemon mode."""
 
@@ -1746,11 +1746,11 @@ import signal
 import sys
 from pathlib import Path
 
-from dev_sync.bridge.server import BridgeServer
+from ctrlrelay.bridge.server import BridgeServer
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="dev-sync Telegram bridge")
+    parser = argparse.ArgumentParser(description="ctrlrelay Telegram bridge")
     parser.add_argument("--socket-path", required=True, help="Unix socket path")
     parser.add_argument("--bot-token", required=True, help="Telegram bot token")
     parser.add_argument("--chat-id", type=int, required=True, help="Telegram chat ID")
@@ -1788,14 +1788,14 @@ if __name__ == "__main__":
 
 Run:
 ```bash
-python -m dev_sync.bridge --help
+python -m ctrlrelay.bridge --help
 ```
 Expected: Shows help with socket-path, bot-token, chat-id options
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add src/dev_sync/bridge/__main__.py
+git add src/ctrlrelay/bridge/__main__.py
 git commit -m "feat: add bridge __main__.py for daemon mode"
 ```
 
@@ -1804,7 +1804,7 @@ git commit -m "feat: add bridge __main__.py for daemon mode"
 ### Task 10: Add get_transport factory function
 
 **Files:**
-- Modify: `src/dev_sync/transports/__init__.py`
+- Modify: `src/ctrlrelay/transports/__init__.py`
 - Modify: `tests/test_transport.py`
 
 - [ ] **Step 1: Write failing test for get_transport**
@@ -1814,8 +1814,8 @@ Add to `tests/test_transport.py`:
 class TestGetTransport:
     def test_get_file_mock_transport(self, tmp_path) -> None:
         """Should return FileMockTransport for file_mock type."""
-        from dev_sync.core.config import FileMockConfig, TransportConfig, TransportType
-        from dev_sync.transports import get_transport
+        from ctrlrelay.core.config import FileMockConfig, TransportConfig, TransportType
+        from ctrlrelay.transports import get_transport
 
         config = TransportConfig(
             type=TransportType.FILE_MOCK,
@@ -1832,8 +1832,8 @@ class TestGetTransport:
 
     def test_get_socket_transport(self, tmp_path) -> None:
         """Should return SocketTransport for telegram type."""
-        from dev_sync.core.config import TelegramConfig, TransportConfig, TransportType
-        from dev_sync.transports import get_transport
+        from ctrlrelay.core.config import TelegramConfig, TransportConfig, TransportType
+        from ctrlrelay.transports import get_transport
 
         config = TransportConfig(
             type=TransportType.TELEGRAM,
@@ -1857,14 +1857,14 @@ Expected: FAIL with "cannot import name 'get_transport'"
 
 - [ ] **Step 3: Implement get_transport**
 
-Update `src/dev_sync/transports/__init__.py`:
+Update `src/ctrlrelay/transports/__init__.py`:
 ```python
 """Transport abstraction for orchestrator communication."""
 
-from dev_sync.core.config import TransportConfig, TransportType
-from dev_sync.transports.base import Transport, TransportError
-from dev_sync.transports.file_mock import FileMockTransport
-from dev_sync.transports.socket_client import SocketTransport
+from ctrlrelay.core.config import TransportConfig, TransportType
+from ctrlrelay.transports.base import Transport, TransportError
+from ctrlrelay.transports.file_mock import FileMockTransport
+from ctrlrelay.transports.socket_client import SocketTransport
 
 
 def get_transport(config: TransportConfig) -> Transport:
@@ -1905,7 +1905,7 @@ Expected: All tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/dev_sync/transports/ tests/test_transport.py
+git add src/ctrlrelay/transports/ tests/test_transport.py
 git commit -m "feat: add get_transport factory function"
 ```
 
@@ -1935,14 +1935,14 @@ Expected: No errors
 
 Run:
 ```bash
-dev-sync bridge --help
-dev-sync bridge status
+ctrlrelay bridge --help
+ctrlrelay bridge status
 ```
 Expected: Help shows commands, status shows "not running"
 
 - [ ] **Step 4: Test bridge end-to-end (manual)**
 
-To verify the phase gate (`dev-sync bridge test` delivers message to phone):
+To verify the phase gate (`ctrlrelay bridge test` delivers message to phone):
 
 1. Set up Telegram bot:
    - Create bot via @BotFather, get token
@@ -1959,17 +1959,17 @@ To verify the phase gate (`dev-sync bridge test` delivers message to phone):
 
 3. Set environment:
    ```bash
-   export DEV_SYNC_TELEGRAM_TOKEN="your-bot-token"
+   export CTRLRELAY_TELEGRAM_TOKEN="your-bot-token"
    ```
 
 4. Start bridge:
    ```bash
-   dev-sync bridge start
+   ctrlrelay bridge start
    ```
 
 5. Test message:
    ```bash
-   dev-sync bridge test -m "Hello from dev-sync!"
+   ctrlrelay bridge test -m "Hello from ctrlrelay!"
    ```
 
 Expected: Message appears in Telegram chat
@@ -1989,7 +1989,7 @@ git commit -m "chore: phase 2 complete - telegram bridge"
 
 **Phase 2 is complete when:**
 
-1. `dev-sync bridge start` starts the bridge process
-2. `dev-sync bridge status` shows bridge status
-3. `dev-sync bridge test` delivers message to phone
-4. `dev-sync bridge stop` stops the bridge process
+1. `ctrlrelay bridge start` starts the bridge process
+2. `ctrlrelay bridge status` shows bridge status
+3. `ctrlrelay bridge test` delivers message to phone
+4. `ctrlrelay bridge stop` stops the bridge process

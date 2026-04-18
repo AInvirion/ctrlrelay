@@ -10,7 +10,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_create_worktree(self, tmp_path: Path) -> None:
         """Should create worktree with correct paths."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         worktrees_dir = tmp_path / "worktrees"
         bare_repos_dir = tmp_path / "repos"
@@ -36,7 +36,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_ensure_bare_repo_clones_if_missing(self, tmp_path: Path) -> None:
         """Should clone bare repo if it doesn't exist."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
@@ -55,7 +55,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_remove_worktree(self, tmp_path: Path) -> None:
         """Should remove worktree and prune."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
@@ -80,7 +80,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_create_worktree_with_new_branch(self, tmp_path: Path) -> None:
         """Should create worktree using -b flag for new branch."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
@@ -113,7 +113,7 @@ class TestWorktreeManager:
         self, tmp_path: Path
     ) -> None:
         """Should use default branch when base_branch is None."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
@@ -140,7 +140,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_push_branch(self, tmp_path: Path) -> None:
         """Should push branch to origin with -u flag."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
@@ -163,7 +163,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_symlink_context(self, tmp_path: Path) -> None:
         """Should symlink CLAUDE.md into worktree."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         contexts_dir = tmp_path / "contexts"
         context_file = contexts_dir / "owner-repo" / "CLAUDE.md"
@@ -190,7 +190,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_branch_exists_locally_true(self, tmp_path: Path) -> None:
         """show-ref returning 0 means the branch is a local ref."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "wt",
@@ -206,7 +206,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_branch_exists_locally_false(self, tmp_path: Path) -> None:
         """show-ref raising means the branch does not exist locally."""
-        from dev_sync.core.worktree import WorktreeError, WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "wt",
@@ -222,7 +222,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_branch_exists_locally_no_bare_repo(self, tmp_path: Path) -> None:
         """With no bare repo yet, the branch cannot exist locally."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "wt",
@@ -233,7 +233,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_branch_exists_on_remote_true(self, tmp_path: Path) -> None:
         """ls-remote returning a ref line means the branch is on origin."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "wt",
@@ -251,7 +251,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_branch_exists_on_remote_false(self, tmp_path: Path) -> None:
         """Empty ls-remote output means the branch is not on origin."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "wt",
@@ -271,7 +271,7 @@ class TestWorktreeManager:
         """The remote probe must NOT inherit the default 120s timeout — a
         flaky network would otherwise hold the repo lock for 2 extra minutes
         on every failed cleanup."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "wt",
@@ -294,7 +294,7 @@ class TestWorktreeManager:
         mistakenly treating it as local-only."""
         import asyncio as _asyncio
 
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "wt",
@@ -312,7 +312,7 @@ class TestWorktreeManager:
         self, tmp_path: Path
     ) -> None:
         """Generic git failures (auth, network refused) also fail closed."""
-        from dev_sync.core.worktree import WorktreeError, WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "wt",

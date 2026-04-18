@@ -9,7 +9,7 @@ class TestPRWatcher:
     @pytest.mark.asyncio
     async def test_check_merged_returns_true_when_merged(self) -> None:
         """Should return True when PR is merged."""
-        from dev_sync.core.pr_watcher import PRWatcher
+        from ctrlrelay.core.pr_watcher import PRWatcher
 
         mock_github = AsyncMock()
         mock_github.get_pr_state.return_value = {
@@ -26,7 +26,7 @@ class TestPRWatcher:
     @pytest.mark.asyncio
     async def test_check_merged_returns_false_when_open(self) -> None:
         """Should return False when PR is still open."""
-        from dev_sync.core.pr_watcher import PRWatcher
+        from ctrlrelay.core.pr_watcher import PRWatcher
 
         mock_github = AsyncMock()
         mock_github.get_pr_state.return_value = {
@@ -43,7 +43,7 @@ class TestPRWatcher:
     @pytest.mark.asyncio
     async def test_wait_for_merge_times_out(self) -> None:
         """Should return False when timeout reached."""
-        from dev_sync.core.pr_watcher import PRWatcher
+        from ctrlrelay.core.pr_watcher import PRWatcher
 
         mock_github = AsyncMock()
         mock_github.get_pr_state.return_value = {

@@ -6,7 +6,7 @@ nav_order: 1
 permalink: /reference/orchestrator-spec/
 ---
 
-# dev-sync Orchestrator — Build Spec
+# ctrlrelay Orchestrator — Build Spec
 
 A local-first, cron-driven orchestrator that wraps `claude -p` (headless Claude Code) to run secops and dev pipelines across multiple GitHub repos, with Telegram for human-in-the-loop and a DigitalOcean-hosted dashboard for heartbeats and status.
 
@@ -70,17 +70,17 @@ Audience: a developer (peer) building this out, plus Claude Code itself consumin
 
 Two separate deliverables:
 
-1. **`dev-sync` repo** on the user's machine — the orchestrator and telegram bridge (Python). Lives alongside existing configs and skills in the already-existing `dev-sync` repo.
-2. **`dev-sync-dashboard`** — a small FastAPI app deployed to DigitalOcean App Platform. The peer builds this.
+1. **`ctrlrelay` repo** on the user's machine — the orchestrator and telegram bridge (Python). Lives alongside existing configs and skills in the already-existing `ctrlrelay` repo.
+2. **`ctrlrelay-dashboard`** — a small FastAPI app deployed to DigitalOcean App Platform. The peer builds this.
 
 ---
 
 ## 3. Repository layout
 
-Extend the existing `dev-sync` repo:
+Extend the existing `ctrlrelay` repo:
 
 ```
-dev-sync/
+ctrlrelay/
 ├── skills/                        # existing; user's Claude Code skills
 │   ├── gh-dashboard/
 │   ├── gh-secops/
@@ -91,7 +91,7 @@ dev-sync/
 │   └── repo-b/CLAUDE.md
 ├── orchestrator/                  # new: the daemon
 │   ├── pyproject.toml
-│   ├── src/dev_sync/
+│   ├── src/ctrlrelay/
 │   │   ├── __init__.py
 │   │   ├── main.py                # entrypoint, event loop
 │   │   ├── config.py              # YAML config loader
@@ -115,8 +115,8 @@ dev-sync/
 │       ├── main.py                # aiogram bot + unix socket server
 │       └── protocol.py            # message schema
 ├── systemd/                       # new: unit files
-│   ├── dev-sync-orchestrator.service
-│   └── dev-sync-telegram.service
+│   ├── ctrlrelay-orchestrator.service
+│   └── ctrlrelay-telegram.service
 ├── hooks/                         # new: git hooks
 │   ├── commit-msg                 # strips AI attribution
 │   └── prepare-commit-msg
@@ -125,7 +125,7 @@ dev-sync/
 │   └── .env.example
 └── README.md
 
-dev-sync-dashboard/                # SEPARATE REPO, peer builds this
+ctrlrelay-dashboard/                # SEPARATE REPO, peer builds this
 ├── pyproject.toml
 ├── src/dashboard/
 │   ├── main.py                    # FastAPI app
@@ -147,33 +147,33 @@ Python 3.12 + `uv` for dependency management in both.
 
 Headless `claude -p` can't pause mid-execution to wait for user input. Instead:
 
-- Every skill invocation ends in one of three states, written to a known file (`.dev-sync/state.json` in the worktree, or `stdout` as structured JSON): `DONE`, `BLOCKED_NEEDS_INPUT`, `FAILED`.
+- Every skill invocation ends in one of three states, written to a known file (`.ctrlrelay/state.json` in the worktree, or `stdout` as structured JSON): `DONE`, `BLOCKED_NEEDS_INPUT`, `FAILED`.
 - When `BLOCKED_NEEDS_INPUT`, the skill writes: the question, relevant context, and the session ID. Then exits cleanly.
 - Orchestrator sees the state, forwards the question to Telegram, waits for user reply.
 - On reply, orchestrator runs `claude --resume <session-id>` with the user's answer appended as the next user turn, plus instruction to continue from checkpoint.
 
-This means the **superpowers skill (and any skill that might need input) MUST follow this protocol**. Writing the protocol is part of the build: a shared `skill-lib` helper in `dev-sync/skills/_lib/` that skills import to emit state.
+This means the **superpowers skill (and any skill that might need input) MUST follow this protocol**. Writing the protocol is part of the build: a shared `skill-lib` helper in `ctrlrelay/skills/_lib/` that skills import to emit state.
 
 ### 4.2 One worktree per active dev session
 
-- Working directory for dev sessions: `~/.dev-sync/worktrees/<repo>-<issue-N>/`
-- Created via `git worktree add` from a bare clone the orchestrator maintains at `~/.dev-sync/repos/<repo>.git`.
+- Working directory for dev sessions: `~/.ctrlrelay/worktrees/<repo>-<issue-N>/`
+- Created via `git worktree add` from a bare clone the orchestrator maintains at `~/.ctrlrelay/repos/<repo>.git`.
 - Allows parallel dev sessions across different repos without collision.
 - Per-repo lock in sqlite prevents two sessions for the same repo simultaneously (secops and dev queue against each other).
 
 ### 4.3 Per-repo CLAUDE.md lives outside the repo
 
-- `dev-sync/contexts/<repo>/CLAUDE.md` is the source of truth.
+- `ctrlrelay/contexts/<repo>/CLAUDE.md` is the source of truth.
 - Session start: orchestrator symlinks `contexts/<repo>/CLAUDE.md` → worktree root.
 - Session end: orchestrator removes the symlink before any git operation that might stage it.
 - A `.gitignore` line for `CLAUDE.md` is added to the worktree's `.git/info/exclude` (not `.gitignore` — that would commit) as defense in depth.
-- Context updates (Claude learned something) happen in a dedicated `update-context` skill that writes to `dev-sync/contexts/<repo>/CLAUDE.md` directly via absolute path.
+- Context updates (Claude learned something) happen in a dedicated `update-context` skill that writes to `ctrlrelay/contexts/<repo>/CLAUDE.md` directly via absolute path.
 
 ### 4.4 Attribution scrubbing
 
 Two layers:
 
-1. **Git hooks** (`commit-msg` and `prepare-commit-msg`) installed globally via `git config --global core.hooksPath ~/dev-sync/hooks`. Strips:
+1. **Git hooks** (`commit-msg` and `prepare-commit-msg`) installed globally via `git config --global core.hooksPath ~/.ctrlrelay/hooks`. Strips:
    - `Co-Authored-By: Claude <...>`
    - `🤖 Generated with [Claude Code]...`
    - `Co-Authored-By: Claude Code`
@@ -195,7 +195,7 @@ When the user reports a bug on Telegram after a deployed PR:
 
 ### 4.6 State: sqlite, single file
 
-`~/.dev-sync/state.db`. Tables:
+`~/.ctrlrelay/state.db`. Tables:
 
 ```sql
 CREATE TABLE sessions (
@@ -260,7 +260,7 @@ Why a separate process and not just import `aiogram` into the orchestrator:
 - Clean failure surface: orchestrator pushes a message; if the bridge is down, the push fails and goes to a retry queue.
 - Easier to restart one without the other.
 
-Communication: Unix domain socket at `/run/user/$UID/dev-sync.sock`. Simple line-delimited JSON protocol:
+Communication: Unix domain socket at `/run/user/$UID/ctrlrelay.sock`. Simple line-delimited JSON protocol:
 
 ```json
 {"op": "send", "chat_id": 123, "text": "...", "request_id": "r-abc"}
@@ -289,7 +289,7 @@ Every skill that might block on user input follows this contract:
 
 **When the skill is ready to hand off to Claude to reason/act**: just runs normally.
 
-**When the skill needs the user**: before exiting, write to `$DEV_SYNC_STATE_FILE` (env var set by orchestrator):
+**When the skill needs the user**: before exiting, write to `$CTRLRELAY_STATE_FILE` (env var set by orchestrator):
 
 ```json
 {
@@ -327,7 +327,7 @@ Then exit 0. Orchestrator interprets `BLOCKED_NEEDS_INPUT` and routes to Telegra
 }
 ```
 
-Provide a tiny Python helper in `dev-sync/skills/_lib/checkpoint.py` that skills can import if they're Python, or a bash function `dev_sync_checkpoint` for shell skills.
+Provide a tiny Python helper in `ctrlrelay/skills/_lib/checkpoint.py` that skills can import if they're Python, or a bash function `ctrlrelay_checkpoint` for shell skills.
 
 ---
 
@@ -381,18 +381,18 @@ User messages Telegram: `bug <repo> <description>`.
 
 ## 7. Configuration
 
-`~/dev-sync/config/orchestrator.yaml`:
+`~/.ctrlrelay/config/orchestrator.yaml`:
 
 ```yaml
 node_id: "ubuntu-desktop-01"
 timezone: "America/New_York"          # user sets
 
 paths:
-  state_db: "~/.dev-sync/state.db"
-  worktrees: "~/.dev-sync/worktrees"
-  bare_repos: "~/.dev-sync/repos"
-  contexts: "~/dev-sync/contexts"
-  skills: "~/dev-sync/skills"
+  state_db: "~/.ctrlrelay/state.db"
+  worktrees: "~/.ctrlrelay/worktrees"
+  bare_repos: "~/.ctrlrelay/repos"
+  contexts: "~/.ctrlrelay/contexts"
+  skills: "~/.ctrlrelay/skills"
 
 claude:
   binary: "claude"                    # or full path
@@ -404,12 +404,12 @@ github:
   poll_interval_seconds: 300
 
 telegram:
-  socket_path: "/run/user/1000/dev-sync.sock"
+  socket_path: "/run/user/1000/ctrlrelay.sock"
   chat_id: 123456789                  # user's personal chat
 
 dashboard:
-  url: "https://dev-sync-dashboard.ondigitalocean.app"
-  auth_token_env: "DEV_SYNC_DASHBOARD_TOKEN"
+  url: "https://ctrlrelay-dashboard.ondigitalocean.app"
+  auth_token_env: "CTRLRELAY_DASHBOARD_TOKEN"
   heartbeat_interval_seconds: 300
 
 repos:
@@ -436,7 +436,7 @@ Secrets (`.env`, never committed):
 ```
 GITHUB_TOKEN=...
 TELEGRAM_BOT_TOKEN=...
-DEV_SYNC_DASHBOARD_TOKEN=...
+CTRLRELAY_DASHBOARD_TOKEN=...
 DIGITALOCEAN_API_TOKEN=...
 ```
 
@@ -452,14 +452,14 @@ Recommend the peer builds the dashboard in parallel with you building the orches
 - sqlite schema + migrations applied at startup.
 - YAML config loader with validation.
 - Dashboard client that pushes heartbeat every 5 min.
-- **Gate**: you can `systemctl start dev-sync-orchestrator`, watch heartbeats land on the dashboard for 10 min, restart cleanly.
+- **Gate**: you can `systemctl start ctrlrelay-orchestrator`, watch heartbeats land on the dashboard for 10 min, restart cleanly.
 
 ### Phase 1 — Telegram bridge (~0.5 day)
 
 - Bridge process with unix socket.
 - `send`, `ask`, `answer` ops.
 - Orchestrator `telegram_client.py` calling the bridge.
-- **Gate**: `dev-sync-cli telegram send "hello"` delivers to your phone.
+- **Gate**: `ctrlrelay-cli telegram send "hello"` delivers to your phone.
 
 ### Phase 2 — Claude dispatcher (~1 day)
 
@@ -474,7 +474,7 @@ Recommend the peer builds the dashboard in parallel with you building the orches
 - `pipelines/secops.py` wiring your existing `/gh-dashboard` and `/gh-secops` skills.
 - Cron job at 6am.
 - Aggregated dashboard event on completion.
-- **Gate**: Run manually via `dev-sync-cli trigger secops`, verify full flow on one repo.
+- **Gate**: Run manually via `ctrlrelay-cli trigger secops`, verify full flow on one repo.
 
 ### Phase 4 — Dev pipeline (~1–2 days)
 
@@ -497,7 +497,7 @@ Recommend the peer builds the dashboard in parallel with you building the orches
 
 ## 9. Dashboard spec (separate repo, peer builds)
 
-Repo: `dev-sync-dashboard`. FastAPI + Jinja2 templates + sqlite + `.do/app.yaml` for DO App Platform.
+Repo: `ctrlrelay-dashboard`. FastAPI + Jinja2 templates + sqlite + `.do/app.yaml` for DO App Platform.
 
 ### API
 
@@ -580,7 +580,7 @@ If `ALERT_TELEGRAM_BOT_TOKEN` and `ALERT_CHAT_ID` env vars are set, and the dash
 - All tokens in `.env` files with `chmod 600`. Never committed.
 - Unix socket permissions: `srw-------` (owner only).
 - The dashboard bearer token should be a 32-byte random hex string. Rotate quarterly (manual).
-- Worktrees are under `~/.dev-sync/` with restrictive perms.
+- Worktrees are under `~/.ctrlrelay/` with restrictive perms.
 - `claude -p` inherits the user's environment — no extra sandboxing. This is a single-user machine and the user trusts Claude Code.
 - If secops ever runs against an untrusted repo, revisit this. For the user's own OSS projects, the threat model is low.
 
@@ -613,7 +613,7 @@ These were open questions resolved during spec finalization:
 
 4. **`/deploy-verify` timeout.** 20 minutes per repo before marking failed. DO deploys typically take 2-5 min; this allows headroom for slow builds.
 
-5. **Log location and retention.** Systemd journal for daemon logs, per-session logs at `~/.dev-sync/logs/<session-id>.log`, 30-day auto-rotation.
+5. **Log location and retention.** Systemd journal for daemon logs, per-session logs at `~/.ctrlrelay/logs/<session-id>.log`, 30-day auto-rotation.
 
 ---
 
@@ -624,7 +624,7 @@ To save Claude Code cycles when it executes this spec:
 - Do not build a generic agent framework. This is a narrow tool for one operator's flow.
 - Do not add a web UI to the local orchestrator. The DO dashboard is the UI.
 - Do not try to pause `claude -p` mid-execution. Checkpoint and resume.
-- Do not commit `CLAUDE.md` or `.dev-sync/` to any project repo. These are always external.
+- Do not commit `CLAUDE.md` or `.ctrlrelay/` to any project repo. These are always external.
 - Do not use any branch naming that starts with `claude/`. User rejects this.
 - Do not add co-authorship attribution anywhere. The git hooks enforce this, but don't work around them.
 - Do not import `anthropic` SDK to talk to Claude directly. Shell out to `claude -p`. The subscription is what powers this.

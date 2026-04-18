@@ -1,9 +1,9 @@
-title: dev-sync
+title: ctrlrelay
 description: >-
   Local-first orchestrator for Claude Code across multiple GitHub repos —
   design specs, implementation plans, and operator guides.
 url: "https://ainvirion.github.io"
-baseurl: "/dev-sync"
+baseurl: "/ctrlrelay"
 
 remote_theme: just-the-docs/just-the-docs
 
@@ -29,12 +29,12 @@ heading_anchors: true
 # Aux links appear in the top right of the layout
 aux_links:
   "GitHub":
-    - "https://github.com/AInvirion/dev-sync"
+    - "https://github.com/AInvirion/ctrlrelay"
 aux_links_new_tab: true
 
 # Footer
 footer_content: >-
-  Docs for <a href="https://github.com/AInvirion/dev-sync">AInvirion/dev-sync</a>.
+  Docs for <a href="https://github.com/AInvirion/ctrlrelay">AInvirion/ctrlrelay</a>.
   Served from <code>/docs</code> via GitHub Pages.
 
 # Back to top

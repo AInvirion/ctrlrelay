@@ -11,24 +11,24 @@ import pytest
 
 class TestObsModule:
     def test_get_logger_returns_namespaced_logger(self) -> None:
-        from dev_sync.core.obs import get_logger
+        from ctrlrelay.core.obs import get_logger
 
         logger = get_logger("transport.socket")
-        assert logger.name == "dev_sync.transport.socket"
+        assert logger.name == "ctrlrelay.transport.socket"
 
     def test_configure_logging_is_idempotent(self) -> None:
-        from dev_sync.core.obs import configure_logging
+        from ctrlrelay.core.obs import configure_logging
 
         configure_logging()
-        root = logging.getLogger("dev_sync")
+        root = logging.getLogger("ctrlrelay")
         count = len(root.handlers)
         configure_logging()
         assert len(root.handlers) == count
 
     def test_log_event_emits_json_with_fields(self) -> None:
-        from dev_sync.core.obs import JSONFormatter, log_event
+        from ctrlrelay.core.obs import JSONFormatter, log_event
 
-        logger = logging.getLogger("dev_sync.test_event")
+        logger = logging.getLogger("ctrlrelay.test_event")
         logger.setLevel(logging.INFO)
         logger.handlers.clear()
 
@@ -56,7 +56,7 @@ class TestObsModule:
         assert "ts" in payload
 
     def test_hash_text_is_stable(self) -> None:
-        from dev_sync.core.obs import hash_text
+        from ctrlrelay.core.obs import hash_text
 
         assert hash_text("hello") == hash_text("hello")
         assert hash_text("hello") != hash_text("world")
@@ -75,8 +75,8 @@ class TestSocketTransportLogging:
         import tempfile
         from pathlib import Path
 
-        from dev_sync.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
-        from dev_sync.transports.socket_client import SocketTransport
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.transports.socket_client import SocketTransport
 
         # Short tmpdir to stay under AF_UNIX 104-char limit on macOS.
         tmp_dir = Path(tempfile.mkdtemp())
@@ -88,7 +88,7 @@ class TestSocketTransportLogging:
                 line = await reader.readline()
                 if not line:
                     return
-                from dev_sync.bridge.protocol import parse_message
+                from ctrlrelay.bridge.protocol import parse_message
 
                 msg = parse_message(line.decode())
                 if msg.op == BridgeOp.ASK:
@@ -109,7 +109,7 @@ class TestSocketTransportLogging:
             await transport.connect()
 
             caplog.clear()
-            with caplog.at_level(logging.INFO, logger="dev_sync"):
+            with caplog.at_level(logging.INFO, logger="ctrlrelay"):
                 answer = await transport.ask(
                     "Proceed?",
                     options=["yes", "no"],
@@ -121,7 +121,7 @@ class TestSocketTransportLogging:
 
             assert answer == "yes"
 
-            events = [r for r in caplog.records if r.name.startswith("dev_sync")]
+            events = [r for r in caplog.records if r.name.startswith("ctrlrelay")]
             names = [r.getMessage() for r in events]
             assert "dev.question.posted" in names
             assert "dev.answer.received" in names
@@ -150,7 +150,7 @@ class TestSocketTransportLogging:
 class TestFileMockTransportLogging:
     @pytest.mark.asyncio
     async def test_ask_logs_question_and_answer(self, tmp_path, caplog) -> None:
-        from dev_sync.transports.file_mock import FileMockTransport
+        from ctrlrelay.transports.file_mock import FileMockTransport
 
         inbox = tmp_path / "inbox.txt"
         outbox = tmp_path / "outbox.txt"
@@ -160,7 +160,7 @@ class TestFileMockTransportLogging:
         transport = FileMockTransport(inbox=inbox, outbox=outbox)
 
         caplog.clear()
-        with caplog.at_level(logging.INFO, logger="dev_sync"):
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             answer = await transport.ask(
                 "Go?",
                 timeout=5,
@@ -171,7 +171,7 @@ class TestFileMockTransportLogging:
 
         assert answer == "sure"
 
-        events = [r for r in caplog.records if r.name.startswith("dev_sync")]
+        events = [r for r in caplog.records if r.name.startswith("ctrlrelay")]
         names = [r.getMessage() for r in events]
         assert "dev.question.posted" in names
         assert "dev.answer.received" in names
@@ -191,8 +191,8 @@ class TestBridgeServerLogging:
         from pathlib import Path
         from unittest.mock import AsyncMock, patch
 
-        from dev_sync.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
 
         # Short path to avoid AF_UNIX limit on macOS
         d = tempfile.mkdtemp()
@@ -203,7 +203,7 @@ class TestBridgeServerLogging:
 
         try:
             with patch(
-                "dev_sync.bridge.server.TelegramHandler", return_value=mock_handler
+                "ctrlrelay.bridge.server.TelegramHandler", return_value=mock_handler
             ):
                 server = BridgeServer(
                     socket_path=socket_path, bot_token="x", chat_id=12345
@@ -214,7 +214,7 @@ class TestBridgeServerLogging:
                 reader, writer = await asyncio.open_unix_connection(str(socket_path))
 
                 caplog.clear()
-                with caplog.at_level(logging.INFO, logger="dev_sync"):
+                with caplog.at_level(logging.INFO, logger="ctrlrelay"):
                     ask = serialize_message(
                         BridgeMessage(
                             op=BridgeOp.ASK,
@@ -233,7 +233,7 @@ class TestBridgeServerLogging:
                 events = [
                     r
                     for r in caplog.records
-                    if r.name.startswith("dev_sync.bridge")
+                    if r.name.startswith("ctrlrelay.bridge")
                 ]
                 posted = [
                     r for r in events if r.getMessage() == "dev.question.posted"
@@ -265,10 +265,10 @@ class TestSessionResumeLogging:
     ) -> None:
         from unittest.mock import AsyncMock, MagicMock
 
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.base import PipelineContext
-        from dev_sync.pipelines.dev import DevPipeline
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.dev import DevPipeline
 
         dispatcher = MagicMock()
         dispatcher.spawn_session = AsyncMock(
@@ -302,10 +302,10 @@ class TestSessionResumeLogging:
         )
 
         caplog.clear()
-        with caplog.at_level(logging.INFO, logger="dev_sync"):
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             await pipeline.resume(ctx, "proceed")
 
-        events = [r for r in caplog.records if r.name.startswith("dev_sync")]
+        events = [r for r in caplog.records if r.name.startswith("ctrlrelay")]
         resumed = [r for r in events if r.getMessage() == "dev.session.resumed"]
         assert resumed, f"expected dev.session.resumed, got: {[r.getMessage() for r in events]}"
         r = resumed[0]

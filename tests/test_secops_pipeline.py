@@ -9,7 +9,7 @@ import pytest
 class TestSecopsPipeline:
     def test_secops_pipeline_has_name(self) -> None:
         """SecopsPipeline should have name attribute."""
-        from dev_sync.pipelines.secops import SecopsPipeline
+        from ctrlrelay.pipelines.secops import SecopsPipeline
 
         pipeline = SecopsPipeline(
             dispatcher=MagicMock(),
@@ -25,10 +25,10 @@ class TestSecopsPipeline:
     @pytest.mark.asyncio
     async def test_run_dispatches_claude_session(self, tmp_path: Path) -> None:
         """Should dispatch Claude with secops prompt."""
-        from dev_sync.core.checkpoint import CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.base import PipelineContext
-        from dev_sync.pipelines.secops import SecopsPipeline
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.secops import SecopsPipeline
 
         mock_dispatcher = AsyncMock()
         mock_state = MagicMock()
@@ -68,10 +68,10 @@ class TestSecopsPipeline:
     @pytest.mark.asyncio
     async def test_run_returns_blocked_when_needs_input(self, tmp_path: Path) -> None:
         """Should return blocked result when Claude needs input."""
-        from dev_sync.core.checkpoint import CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.base import PipelineContext
-        from dev_sync.pipelines.secops import SecopsPipeline
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.secops import SecopsPipeline
 
         mock_dispatcher = AsyncMock()
         mock_state = MagicMock()
@@ -113,9 +113,9 @@ class TestSecopsPipeline:
     @pytest.mark.asyncio
     async def test_run_all_processes_multiple_repos(self, tmp_path: Path) -> None:
         """Should run secops on all configured repos."""
-        from dev_sync.core.checkpoint import CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.secops import run_secops_all
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
 
         mock_dispatcher = AsyncMock()
         mock_state = MagicMock()
@@ -160,7 +160,7 @@ class TestSecopsPipeline:
     @pytest.mark.asyncio
     async def test_run_all_skips_locked_repos(self, tmp_path: Path) -> None:
         """Should skip repos that are already locked."""
-        from dev_sync.pipelines.secops import run_secops_all
+        from ctrlrelay.pipelines.secops import run_secops_all
 
         mock_db = MagicMock()
         mock_db.acquire_lock.return_value = False

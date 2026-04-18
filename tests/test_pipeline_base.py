@@ -6,7 +6,7 @@ from pathlib import Path
 class TestPipelineProtocol:
     def test_pipeline_context_has_required_fields(self) -> None:
         """PipelineContext should have all required fields."""
-        from dev_sync.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.base import PipelineContext
 
         ctx = PipelineContext(
             session_id="sess-123",
@@ -21,7 +21,7 @@ class TestPipelineProtocol:
 
     def test_pipeline_result_has_required_fields(self) -> None:
         """PipelineResult should capture execution outcome."""
-        from dev_sync.pipelines.base import PipelineResult
+        from ctrlrelay.pipelines.base import PipelineResult
 
         result = PipelineResult(
             success=True,

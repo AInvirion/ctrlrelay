@@ -22,26 +22,26 @@ render_with_liquid: false
 ## File Structure
 
 **New Files:**
-- `src/dev_sync/core/poller.py` - GitHub issue poller with state tracking
-- `src/dev_sync/core/pr_watcher.py` - PR merge detection
-- `src/dev_sync/pipelines/dev.py` - Dev pipeline implementation
+- `src/ctrlrelay/core/poller.py` - GitHub issue poller with state tracking
+- `src/ctrlrelay/core/pr_watcher.py` - PR merge detection
+- `src/ctrlrelay/pipelines/dev.py` - Dev pipeline implementation
 - `tests/test_poller.py` - Poller tests
 - `tests/test_dev_pipeline.py` - Dev pipeline tests
 - `tests/test_pr_watcher.py` - PR watcher tests
 
 **Modified Files:**
-- `src/dev_sync/core/github.py` - Add issue-related methods
-- `src/dev_sync/core/worktree.py` - Add branch creation method
-- `src/dev_sync/cli.py` - Add poller and dev pipeline commands
-- `src/dev_sync/core/__init__.py` - Export new modules
-- `src/dev_sync/pipelines/__init__.py` - Export dev pipeline
+- `src/ctrlrelay/core/github.py` - Add issue-related methods
+- `src/ctrlrelay/core/worktree.py` - Add branch creation method
+- `src/ctrlrelay/cli.py` - Add poller and dev pipeline commands
+- `src/ctrlrelay/core/__init__.py` - Export new modules
+- `src/ctrlrelay/pipelines/__init__.py` - Export dev pipeline
 
 ---
 
 ### Task 1: GitHub Issue Methods
 
 **Files:**
-- Modify: `src/dev_sync/core/github.py`
+- Modify: `src/ctrlrelay/core/github.py`
 - Test: `tests/test_github.py`
 
 - [ ] **Step 1: Write the failing test for list_assigned_issues**
@@ -52,7 +52,7 @@ render_with_liquid: false
 @pytest.mark.asyncio
 async def test_list_assigned_issues(self) -> None:
     """Should list issues assigned to a user."""
-    from dev_sync.core.github import GitHubCLI
+    from ctrlrelay.core.github import GitHubCLI
 
     with patch("asyncio.create_subprocess_exec") as mock_exec:
         mock_proc = AsyncMock()
@@ -81,7 +81,7 @@ Expected: FAIL with "GitHubCLI has no attribute 'list_assigned_issues'"
 - [ ] **Step 3: Implement list_assigned_issues**
 
 ```python
-# Add to src/dev_sync/core/github.py after list_security_alerts
+# Add to src/ctrlrelay/core/github.py after list_security_alerts
 
 async def list_assigned_issues(
     self,
@@ -115,7 +115,7 @@ Expected: PASS
 @pytest.mark.asyncio
 async def test_get_issue(self) -> None:
     """Should get a single issue by number."""
-    from dev_sync.core.github import GitHubCLI
+    from ctrlrelay.core.github import GitHubCLI
 
     with patch("asyncio.create_subprocess_exec") as mock_exec:
         mock_proc = AsyncMock()
@@ -141,7 +141,7 @@ async def test_get_issue(self) -> None:
 - [ ] **Step 6: Implement get_issue**
 
 ```python
-# Add to src/dev_sync/core/github.py
+# Add to src/ctrlrelay/core/github.py
 
 async def get_issue(
     self,
@@ -166,7 +166,7 @@ async def get_issue(
 @pytest.mark.asyncio
 async def test_create_pr(self) -> None:
     """Should create a pull request."""
-    from dev_sync.core.github import GitHubCLI
+    from ctrlrelay.core.github import GitHubCLI
 
     with patch("asyncio.create_subprocess_exec") as mock_exec:
         mock_proc = AsyncMock()
@@ -195,7 +195,7 @@ async def test_create_pr(self) -> None:
 - [ ] **Step 8: Implement create_pr**
 
 ```python
-# Add to src/dev_sync/core/github.py
+# Add to src/ctrlrelay/core/github.py
 
 async def create_pr(
     self,
@@ -226,7 +226,7 @@ async def create_pr(
 @pytest.mark.asyncio
 async def test_get_pr_state(self) -> None:
     """Should get PR state including merge status."""
-    from dev_sync.core.github import GitHubCLI
+    from ctrlrelay.core.github import GitHubCLI
 
     with patch("asyncio.create_subprocess_exec") as mock_exec:
         mock_proc = AsyncMock()
@@ -250,7 +250,7 @@ async def test_get_pr_state(self) -> None:
 - [ ] **Step 10: Implement get_pr_state**
 
 ```python
-# Add to src/dev_sync/core/github.py
+# Add to src/ctrlrelay/core/github.py
 
 async def get_pr_state(
     self,
@@ -275,7 +275,7 @@ async def get_pr_state(
 @pytest.mark.asyncio
 async def test_close_issue(self) -> None:
     """Should close an issue with a comment."""
-    from dev_sync.core.github import GitHubCLI
+    from ctrlrelay.core.github import GitHubCLI
 
     with patch("asyncio.create_subprocess_exec") as mock_exec:
         mock_proc = AsyncMock()
@@ -293,7 +293,7 @@ async def test_close_issue(self) -> None:
 - [ ] **Step 12: Implement close_issue**
 
 ```python
-# Add to src/dev_sync/core/github.py
+# Add to src/ctrlrelay/core/github.py
 
 async def close_issue(
     self,
@@ -322,7 +322,7 @@ Run: `pytest tests/test_github.py -v`
 Expected: All tests PASS
 
 ```bash
-git add src/dev_sync/core/github.py tests/test_github.py
+git add src/ctrlrelay/core/github.py tests/test_github.py
 git commit -m "feat(github): add issue and PR management methods"
 ```
 
@@ -331,7 +331,7 @@ git commit -m "feat(github): add issue and PR management methods"
 ### Task 2: GitHub Poller
 
 **Files:**
-- Create: `src/dev_sync/core/poller.py`
+- Create: `src/ctrlrelay/core/poller.py`
 - Test: `tests/test_poller.py`
 
 - [ ] **Step 1: Write the failing test for IssuePoller**
@@ -351,7 +351,7 @@ class TestIssuePoller:
     @pytest.mark.asyncio
     async def test_poll_returns_new_issues(self, tmp_path: Path) -> None:
         """Should return newly assigned issues."""
-        from dev_sync.core.poller import IssuePoller
+        from ctrlrelay.core.poller import IssuePoller
 
         mock_github = AsyncMock()
         mock_github.list_assigned_issues.return_value = [
@@ -376,12 +376,12 @@ class TestIssuePoller:
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_poller.py::TestIssuePoller::test_poll_returns_new_issues -v`
-Expected: FAIL with "No module named 'dev_sync.core.poller'"
+Expected: FAIL with "No module named 'ctrlrelay.core.poller'"
 
 - [ ] **Step 3: Implement IssuePoller**
 
 ```python
-# src/dev_sync/core/poller.py
+# src/ctrlrelay/core/poller.py
 """GitHub issue poller for detecting newly assigned issues."""
 
 from __future__ import annotations
@@ -392,7 +392,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from dev_sync.core.github import GitHubCLI
+from ctrlrelay.core.github import GitHubCLI
 
 
 @dataclass
@@ -469,7 +469,7 @@ Expected: PASS
 @pytest.mark.asyncio
 async def test_poll_filters_seen_issues(self, tmp_path: Path) -> None:
     """Should not return issues that were already seen."""
-    from dev_sync.core.poller import IssuePoller
+    from ctrlrelay.core.poller import IssuePoller
 
     # Pre-populate state file with seen issue
     state_file = tmp_path / "poller_state.json"
@@ -510,7 +510,7 @@ Expected: PASS
 @pytest.mark.asyncio
 async def test_poll_saves_state(self, tmp_path: Path) -> None:
     """Should save seen issues to state file after poll."""
-    from dev_sync.core.poller import IssuePoller
+    from ctrlrelay.core.poller import IssuePoller
 
     state_file = tmp_path / "poller_state.json"
 
@@ -540,7 +540,7 @@ Run: `pytest tests/test_poller.py -v`
 Expected: All tests PASS
 
 ```bash
-git add src/dev_sync/core/poller.py tests/test_poller.py
+git add src/ctrlrelay/core/poller.py tests/test_poller.py
 git commit -m "feat(core): add GitHub issue poller"
 ```
 
@@ -549,7 +549,7 @@ git commit -m "feat(core): add GitHub issue poller"
 ### Task 3: Worktree Branch Creation
 
 **Files:**
-- Modify: `src/dev_sync/core/worktree.py`
+- Modify: `src/ctrlrelay/core/worktree.py`
 - Test: `tests/test_worktree.py`
 
 - [ ] **Step 1: Write the failing test**
@@ -560,7 +560,7 @@ git commit -m "feat(core): add GitHub issue poller"
 @pytest.mark.asyncio
 async def test_create_worktree_with_new_branch(self, tmp_path: Path) -> None:
     """Should create worktree with a new branch from default branch."""
-    from dev_sync.core.worktree import WorktreeManager
+    from ctrlrelay.core.worktree import WorktreeManager
 
     with patch.object(WorktreeManager, "_run_git", new_callable=AsyncMock) as mock_git:
         mock_git.return_value = "refs/heads/main\n"
@@ -594,7 +594,7 @@ Expected: FAIL with "WorktreeManager has no attribute 'create_worktree_with_new_
 - [ ] **Step 3: Implement create_worktree_with_new_branch**
 
 ```python
-# Add to src/dev_sync/core/worktree.py after create_worktree method
+# Add to src/ctrlrelay/core/worktree.py after create_worktree method
 
 async def create_worktree_with_new_branch(
     self,
@@ -647,7 +647,7 @@ Expected: PASS
 @pytest.mark.asyncio
 async def test_push_branch(self, tmp_path: Path) -> None:
     """Should push branch to origin."""
-    from dev_sync.core.worktree import WorktreeManager
+    from ctrlrelay.core.worktree import WorktreeManager
 
     with patch.object(WorktreeManager, "_run_git", new_callable=AsyncMock) as mock_git:
         manager = WorktreeManager(
@@ -671,7 +671,7 @@ async def test_push_branch(self, tmp_path: Path) -> None:
 - [ ] **Step 6: Implement push_branch**
 
 ```python
-# Add to src/dev_sync/core/worktree.py
+# Add to src/ctrlrelay/core/worktree.py
 
 async def push_branch(
     self,
@@ -696,7 +696,7 @@ Run: `pytest tests/test_worktree.py -v`
 Expected: All tests PASS
 
 ```bash
-git add src/dev_sync/core/worktree.py tests/test_worktree.py
+git add src/ctrlrelay/core/worktree.py tests/test_worktree.py
 git commit -m "feat(worktree): add branch creation and push methods"
 ```
 
@@ -705,7 +705,7 @@ git commit -m "feat(worktree): add branch creation and push methods"
 ### Task 4: Dev Pipeline Implementation
 
 **Files:**
-- Create: `src/dev_sync/pipelines/dev.py`
+- Create: `src/ctrlrelay/pipelines/dev.py`
 - Test: `tests/test_dev_pipeline.py`
 
 - [ ] **Step 1: Write the failing test for DevPipeline**
@@ -725,7 +725,7 @@ class TestDevPipeline:
     @pytest.mark.asyncio
     async def test_dev_pipeline_has_name(self) -> None:
         """Pipeline should have name 'dev'."""
-        from dev_sync.pipelines.dev import DevPipeline
+        from ctrlrelay.pipelines.dev import DevPipeline
 
         pipeline = DevPipeline(
             dispatcher=MagicMock(),
@@ -742,13 +742,13 @@ class TestDevPipeline:
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_dev_pipeline.py::TestDevPipeline::test_dev_pipeline_has_name -v`
-Expected: FAIL with "No module named 'dev_sync.pipelines.dev'"
+Expected: FAIL with "No module named 'ctrlrelay.pipelines.dev'"
 
 - [ ] **Step 3: Create dev pipeline skeleton**
 
 {% raw %}
 ```python
-# src/dev_sync/pipelines/dev.py
+# src/ctrlrelay/pipelines/dev.py
 """Dev pipeline for issue-to-PR workflow."""
 
 from __future__ import annotations
@@ -759,14 +759,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dev_sync.core.checkpoint import CheckpointStatus
-from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
-from dev_sync.core.github import GitHubCLI
-from dev_sync.core.state import StateDB
-from dev_sync.core.worktree import WorktreeManager
-from dev_sync.dashboard.client import DashboardClient, EventPayload
-from dev_sync.pipelines.base import PipelineContext, PipelineResult
-from dev_sync.transports.base import Transport
+from ctrlrelay.core.checkpoint import CheckpointStatus
+from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+from ctrlrelay.core.github import GitHubCLI
+from ctrlrelay.core.state import StateDB
+from ctrlrelay.core.worktree import WorktreeManager
+from ctrlrelay.dashboard.client import DashboardClient, EventPayload
+from ctrlrelay.pipelines.base import PipelineContext, PipelineResult
+from ctrlrelay.transports.base import Transport
 
 
 @dataclass
@@ -893,10 +893,10 @@ Expected: PASS
 @pytest.mark.asyncio
 async def test_run_dispatches_claude_session(self, tmp_path: Path) -> None:
     """Should dispatch Claude session with issue context."""
-    from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-    from dev_sync.core.dispatcher import SessionResult
-    from dev_sync.pipelines.base import PipelineContext
-    from dev_sync.pipelines.dev import DevPipeline
+    from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+    from ctrlrelay.core.dispatcher import SessionResult
+    from ctrlrelay.pipelines.base import PipelineContext
+    from ctrlrelay.pipelines.dev import DevPipeline
 
     mock_dispatcher = AsyncMock()
     mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -957,10 +957,10 @@ Expected: PASS
 @pytest.mark.asyncio
 async def test_run_returns_blocked_when_needs_input(self, tmp_path: Path) -> None:
     """Should return blocked result when Claude needs input."""
-    from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-    from dev_sync.core.dispatcher import SessionResult
-    from dev_sync.pipelines.base import PipelineContext
-    from dev_sync.pipelines.dev import DevPipeline
+    from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+    from ctrlrelay.core.dispatcher import SessionResult
+    from ctrlrelay.pipelines.base import PipelineContext
+    from ctrlrelay.pipelines.dev import DevPipeline
 
     mock_dispatcher = AsyncMock()
     mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -1009,7 +1009,7 @@ Run: `pytest tests/test_dev_pipeline.py -v`
 Expected: All tests PASS
 
 ```bash
-git add src/dev_sync/pipelines/dev.py tests/test_dev_pipeline.py
+git add src/ctrlrelay/pipelines/dev.py tests/test_dev_pipeline.py
 git commit -m "feat(pipelines): add dev pipeline implementation"
 ```
 
@@ -1018,7 +1018,7 @@ git commit -m "feat(pipelines): add dev pipeline implementation"
 ### Task 5: PR Watcher
 
 **Files:**
-- Create: `src/dev_sync/core/pr_watcher.py`
+- Create: `src/ctrlrelay/core/pr_watcher.py`
 - Test: `tests/test_pr_watcher.py`
 
 - [ ] **Step 1: Write the failing test**
@@ -1036,7 +1036,7 @@ class TestPRWatcher:
     @pytest.mark.asyncio
     async def test_check_merged_returns_true_when_merged(self) -> None:
         """Should return True when PR is merged."""
-        from dev_sync.core.pr_watcher import PRWatcher
+        from ctrlrelay.core.pr_watcher import PRWatcher
 
         mock_github = AsyncMock()
         mock_github.get_pr_state.return_value = {
@@ -1054,12 +1054,12 @@ class TestPRWatcher:
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_pr_watcher.py::TestPRWatcher::test_check_merged_returns_true_when_merged -v`
-Expected: FAIL with "No module named 'dev_sync.core.pr_watcher'"
+Expected: FAIL with "No module named 'ctrlrelay.core.pr_watcher'"
 
 - [ ] **Step 3: Implement PRWatcher**
 
 ```python
-# src/dev_sync/core/pr_watcher.py
+# src/ctrlrelay/core/pr_watcher.py
 """PR merge watcher for monitoring PR state."""
 
 from __future__ import annotations
@@ -1068,7 +1068,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Callable, Awaitable
 
-from dev_sync.core.github import GitHubCLI
+from ctrlrelay.core.github import GitHubCLI
 
 
 @dataclass
@@ -1136,7 +1136,7 @@ Expected: PASS
 @pytest.mark.asyncio
 async def test_check_merged_returns_false_when_open(self) -> None:
     """Should return False when PR is still open."""
-    from dev_sync.core.pr_watcher import PRWatcher
+    from ctrlrelay.core.pr_watcher import PRWatcher
 
     mock_github = AsyncMock()
     mock_github.get_pr_state.return_value = {
@@ -1159,7 +1159,7 @@ async def test_check_merged_returns_false_when_open(self) -> None:
 @pytest.mark.asyncio
 async def test_wait_for_merge_times_out(self) -> None:
     """Should return False when timeout reached."""
-    from dev_sync.core.pr_watcher import PRWatcher
+    from ctrlrelay.core.pr_watcher import PRWatcher
 
     mock_github = AsyncMock()
     mock_github.get_pr_state.return_value = {
@@ -1182,7 +1182,7 @@ Run: `pytest tests/test_pr_watcher.py -v`
 Expected: All tests PASS
 
 ```bash
-git add src/dev_sync/core/pr_watcher.py tests/test_pr_watcher.py
+git add src/ctrlrelay/core/pr_watcher.py tests/test_pr_watcher.py
 git commit -m "feat(core): add PR merge watcher"
 ```
 
@@ -1191,7 +1191,7 @@ git commit -m "feat(core): add PR merge watcher"
 ### Task 6: Run Dev Orchestration Function
 
 **Files:**
-- Modify: `src/dev_sync/pipelines/dev.py`
+- Modify: `src/ctrlrelay/pipelines/dev.py`
 - Test: `tests/test_dev_pipeline.py`
 
 - [ ] **Step 1: Write the failing test for run_dev_issue**
@@ -1202,10 +1202,10 @@ git commit -m "feat(core): add PR merge watcher"
 @pytest.mark.asyncio
 async def test_run_dev_issue_full_flow(self, tmp_path: Path) -> None:
     """Should run full dev flow for a single issue."""
-    from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
-    from dev_sync.core.dispatcher import SessionResult
-    from dev_sync.core.state import StateDB
-    from dev_sync.pipelines.dev import run_dev_issue
+    from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+    from ctrlrelay.core.dispatcher import SessionResult
+    from ctrlrelay.core.state import StateDB
+    from ctrlrelay.pipelines.dev import run_dev_issue
 
     mock_dispatcher = AsyncMock()
     mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -1263,7 +1263,7 @@ Expected: FAIL with "cannot import name 'run_dev_issue'"
 - [ ] **Step 3: Implement run_dev_issue**
 
 ```python
-# Add to src/dev_sync/pipelines/dev.py at the end
+# Add to src/ctrlrelay/pipelines/dev.py at the end
 
 async def run_dev_issue(
     repo: str,
@@ -1323,7 +1323,7 @@ async def run_dev_issue(
             worktree.symlink_context(worktree_path, context_path)
 
         # Setup state file
-        state_file = worktree_path / ".dev-sync" / "state.json"
+        state_file = worktree_path / ".ctrlrelay" / "state.json"
         state_file.parent.mkdir(parents=True, exist_ok=True)
 
         ctx = PipelineContext(
@@ -1409,7 +1409,7 @@ async def run_dev_issue(
 - [ ] **Step 4: Add issue_number column to sessions table**
 
 ```python
-# Modify src/dev_sync/core/state.py - add to _init_db method
+# Modify src/ctrlrelay/core/state.py - add to _init_db method
 # After "summary TEXT," add:
 #     issue_number INTEGER,
 ```
@@ -1425,7 +1425,7 @@ Run: `pytest tests/test_dev_pipeline.py -v`
 Expected: All tests PASS
 
 ```bash
-git add src/dev_sync/pipelines/dev.py src/dev_sync/core/state.py tests/test_dev_pipeline.py
+git add src/ctrlrelay/pipelines/dev.py src/ctrlrelay/core/state.py tests/test_dev_pipeline.py
 git commit -m "feat(pipelines): add run_dev_issue orchestration function"
 ```
 
@@ -1434,7 +1434,7 @@ git commit -m "feat(pipelines): add run_dev_issue orchestration function"
 ### Task 7: CLI Commands
 
 **Files:**
-- Modify: `src/dev_sync/cli.py`
+- Modify: `src/ctrlrelay/cli.py`
 - Test: `tests/test_cli_dev.py`
 
 - [ ] **Step 1: Write test for run dev command**
@@ -1451,7 +1451,7 @@ runner = CliRunner()
 class TestRunDevCommand:
     def test_run_dev_requires_issue(self) -> None:
         """Should require issue number."""
-        from dev_sync.cli import app
+        from ctrlrelay.cli import app
 
         result = runner.invoke(app, ["run", "dev"])
 
@@ -1460,7 +1460,7 @@ class TestRunDevCommand:
 
     def test_run_dev_help(self) -> None:
         """Should show help for run dev command."""
-        from dev_sync.cli import app
+        from ctrlrelay.cli import app
 
         result = runner.invoke(app, ["run", "dev", "--help"])
 
@@ -1477,7 +1477,7 @@ Expected: FAIL (no 'dev' command)
 - [ ] **Step 3: Add run dev command**
 
 ```python
-# Add to src/dev_sync/cli.py after run_secops command
+# Add to src/ctrlrelay/cli.py after run_secops command
 
 @run_app.command("dev")
 def run_dev(
@@ -1503,12 +1503,12 @@ def run_dev(
     """Run dev pipeline on a specific issue."""
     import asyncio
 
-    from dev_sync.core.dispatcher import ClaudeDispatcher
-    from dev_sync.core.github import GitHubCLI
-    from dev_sync.core.state import StateDB
-    from dev_sync.core.worktree import WorktreeManager
-    from dev_sync.dashboard.client import DashboardClient
-    from dev_sync.pipelines.dev import run_dev_issue
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+    from ctrlrelay.core.github import GitHubCLI
+    from ctrlrelay.core.state import StateDB
+    from ctrlrelay.core.worktree import WorktreeManager
+    from ctrlrelay.dashboard.client import DashboardClient
+    from ctrlrelay.pipelines.dev import run_dev_issue
 
     path = Path(config_path)
 
@@ -1603,7 +1603,7 @@ Expected: PASS
 class TestPollerCommands:
     def test_poller_start_help(self) -> None:
         """Should show help for poller start."""
-        from dev_sync.cli import app
+        from ctrlrelay.cli import app
 
         result = runner.invoke(app, ["poller", "start", "--help"])
 
@@ -1612,7 +1612,7 @@ class TestPollerCommands:
 
     def test_poller_status(self) -> None:
         """Should show poller status."""
-        from dev_sync.cli import app
+        from ctrlrelay.cli import app
 
         result = runner.invoke(app, ["poller", "status"])
 
@@ -1623,7 +1623,7 @@ class TestPollerCommands:
 - [ ] **Step 6: Add poller command group**
 
 ```python
-# Add to src/dev_sync/cli.py after bridge_app
+# Add to src/ctrlrelay/cli.py after bridge_app
 
 # Poller subcommand group
 poller_app = typer.Typer(help="GitHub issue poller commands.")
@@ -1636,7 +1636,7 @@ def _get_poller_pid_file(config_path: str) -> Path:
         config = load_config(config_path)
         return config.paths.state_db.parent / "poller.pid"
     except ConfigError:
-        return Path("~/.dev-sync/poller.pid").expanduser()
+        return Path("~/.ctrlrelay/poller.pid").expanduser()
 
 
 @poller_app.command("start")
@@ -1756,7 +1756,7 @@ Run: `pytest tests/test_cli_dev.py -v`
 Expected: All tests PASS
 
 ```bash
-git add src/dev_sync/cli.py tests/test_cli_dev.py
+git add src/ctrlrelay/cli.py tests/test_cli_dev.py
 git commit -m "feat(cli): add dev pipeline and poller commands"
 ```
 
@@ -1765,15 +1765,15 @@ git commit -m "feat(cli): add dev pipeline and poller commands"
 ### Task 8: Update Exports
 
 **Files:**
-- Modify: `src/dev_sync/core/__init__.py`
-- Modify: `src/dev_sync/pipelines/__init__.py`
+- Modify: `src/ctrlrelay/core/__init__.py`
+- Modify: `src/ctrlrelay/pipelines/__init__.py`
 
 - [ ] **Step 1: Update core exports**
 
 ```python
-# Add to src/dev_sync/core/__init__.py imports
-from dev_sync.core.poller import IssuePoller
-from dev_sync.core.pr_watcher import PRWatcher
+# Add to src/ctrlrelay/core/__init__.py imports
+from ctrlrelay.core.poller import IssuePoller
+from ctrlrelay.core.pr_watcher import PRWatcher
 
 # Add to __all__
 "IssuePoller",
@@ -1783,8 +1783,8 @@ from dev_sync.core.pr_watcher import PRWatcher
 - [ ] **Step 2: Update pipelines exports**
 
 ```python
-# Add to src/dev_sync/pipelines/__init__.py imports
-from dev_sync.pipelines.dev import DevPipeline, run_dev_issue
+# Add to src/ctrlrelay/pipelines/__init__.py imports
+from ctrlrelay.pipelines.dev import DevPipeline, run_dev_issue
 
 # Add to __all__
 "DevPipeline",
@@ -1794,13 +1794,13 @@ from dev_sync.pipelines.dev import DevPipeline, run_dev_issue
 - [ ] **Step 3: Verify imports work**
 
 ```bash
-python -c "from dev_sync.core import IssuePoller, PRWatcher; from dev_sync.pipelines import DevPipeline, run_dev_issue; print('Imports OK')"
+python -c "from ctrlrelay.core import IssuePoller, PRWatcher; from ctrlrelay.pipelines import DevPipeline, run_dev_issue; print('Imports OK')"
 ```
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/dev_sync/core/__init__.py src/dev_sync/pipelines/__init__.py
+git add src/ctrlrelay/core/__init__.py src/ctrlrelay/pipelines/__init__.py
 git commit -m "feat: export Phase 4 modules"
 ```
 
@@ -1828,12 +1828,12 @@ class TestDevIntegration:
     @pytest.mark.asyncio
     async def test_full_dev_flow_with_mocked_claude(self, tmp_path: Path) -> None:
         """Should run full dev flow from issue to PR."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
-        from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
-        from dev_sync.core.github import GitHubCLI
-        from dev_sync.core.state import StateDB
-        from dev_sync.core.worktree import WorktreeManager
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.core.worktree import WorktreeManager
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         # Setup state DB
         state_db = StateDB(tmp_path / "state.db")
@@ -1945,13 +1945,13 @@ git commit -m "test: add dev pipeline integration test"
 - [ ] **Step 1: Run ruff check**
 
 ```bash
-ruff check src/dev_sync/core/poller.py src/dev_sync/core/pr_watcher.py src/dev_sync/pipelines/dev.py
+ruff check src/ctrlrelay/core/poller.py src/ctrlrelay/core/pr_watcher.py src/ctrlrelay/pipelines/dev.py
 ```
 
 - [ ] **Step 2: Fix any linting issues**
 
 ```bash
-ruff check --fix src/dev_sync/core/poller.py src/dev_sync/core/pr_watcher.py src/dev_sync/pipelines/dev.py
+ruff check --fix src/ctrlrelay/core/poller.py src/ctrlrelay/core/pr_watcher.py src/ctrlrelay/pipelines/dev.py
 ```
 
 - [ ] **Step 3: Run full test suite**
@@ -1974,7 +1974,7 @@ git commit -m "fix: address linting issues in Phase 4"
 ### Task 11: Post-Merge Handler
 
 **Files:**
-- Create: `src/dev_sync/pipelines/post_merge.py`
+- Create: `src/ctrlrelay/pipelines/post_merge.py`
 - Test: `tests/test_post_merge.py`
 
 - [ ] **Step 1: Write the failing test**
@@ -1992,7 +1992,7 @@ class TestPostMergeHandler:
     @pytest.mark.asyncio
     async def test_handle_merge_closes_issue(self) -> None:
         """Should close issue after successful merge."""
-        from dev_sync.pipelines.post_merge import handle_merge
+        from ctrlrelay.pipelines.post_merge import handle_merge
 
         mock_github = AsyncMock()
         mock_transport = AsyncMock()
@@ -2016,18 +2016,18 @@ class TestPostMergeHandler:
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_post_merge.py -v`
-Expected: FAIL with "No module named 'dev_sync.pipelines.post_merge'"
+Expected: FAIL with "No module named 'ctrlrelay.pipelines.post_merge'"
 
 - [ ] **Step 3: Implement handle_merge**
 
 ```python
-# src/dev_sync/pipelines/post_merge.py
+# src/ctrlrelay/pipelines/post_merge.py
 """Post-merge handling for dev pipeline."""
 
 from __future__ import annotations
 
-from dev_sync.core.github import GitHubCLI
-from dev_sync.transports.base import Transport
+from ctrlrelay.core.github import GitHubCLI
+from ctrlrelay.transports.base import Transport
 
 
 async def handle_merge(
@@ -2073,7 +2073,7 @@ Expected: PASS
 @pytest.mark.asyncio
 async def test_watch_and_handle_merge(self) -> None:
     """Should watch for merge then close issue."""
-    from dev_sync.pipelines.post_merge import watch_and_handle_merge
+    from ctrlrelay.pipelines.post_merge import watch_and_handle_merge
 
     mock_github = AsyncMock()
     mock_github.get_pr_state.return_value = {"state": "MERGED"}
@@ -2097,9 +2097,9 @@ async def test_watch_and_handle_merge(self) -> None:
 - [ ] **Step 6: Implement watch_and_handle_merge**
 
 ```python
-# Add to src/dev_sync/pipelines/post_merge.py
+# Add to src/ctrlrelay/pipelines/post_merge.py
 
-from dev_sync.core.pr_watcher import PRWatcher
+from ctrlrelay.core.pr_watcher import PRWatcher
 
 
 async def watch_and_handle_merge(
@@ -2148,7 +2148,7 @@ Run: `pytest tests/test_post_merge.py -v`
 Expected: All tests PASS
 
 ```bash
-git add src/dev_sync/pipelines/post_merge.py tests/test_post_merge.py
+git add src/ctrlrelay/pipelines/post_merge.py tests/test_post_merge.py
 git commit -m "feat(pipelines): add post-merge handler"
 ```
 
@@ -2157,8 +2157,8 @@ git commit -m "feat(pipelines): add post-merge handler"
 ### Task 12: Poller Loop Implementation
 
 **Files:**
-- Modify: `src/dev_sync/core/poller.py`
-- Modify: `src/dev_sync/cli.py`
+- Modify: `src/ctrlrelay/core/poller.py`
+- Modify: `src/ctrlrelay/cli.py`
 - Test: `tests/test_poller.py`
 
 - [ ] **Step 1: Write test for run_poll_loop**
@@ -2169,7 +2169,7 @@ git commit -m "feat(pipelines): add post-merge handler"
 @pytest.mark.asyncio
 async def test_run_poll_loop_processes_new_issues(self, tmp_path: Path) -> None:
     """Should call handler for each new issue."""
-    from dev_sync.core.poller import IssuePoller, run_poll_loop
+    from ctrlrelay.core.poller import IssuePoller, run_poll_loop
 
     mock_github = AsyncMock()
     mock_github.list_assigned_issues.return_value = [
@@ -2202,7 +2202,7 @@ async def test_run_poll_loop_processes_new_issues(self, tmp_path: Path) -> None:
 - [ ] **Step 2: Implement run_poll_loop**
 
 ```python
-# Add to src/dev_sync/core/poller.py
+# Add to src/ctrlrelay/core/poller.py
 
 import asyncio
 from typing import Callable, Awaitable
@@ -2239,16 +2239,16 @@ async def run_poll_loop(
 Replace the TODO in poller_start with actual implementation:
 
 ```python
-# In src/dev_sync/cli.py, update poller_start command's else branch:
+# In src/ctrlrelay/cli.py, update poller_start command's else branch:
 
 else:
     import asyncio
-    from dev_sync.core.github import GitHubCLI
-    from dev_sync.core.poller import IssuePoller, run_poll_loop
-    from dev_sync.pipelines.dev import run_dev_issue
-    from dev_sync.core.dispatcher import ClaudeDispatcher
-    from dev_sync.core.state import StateDB
-    from dev_sync.core.worktree import WorktreeManager
+    from ctrlrelay.core.github import GitHubCLI
+    from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+    from ctrlrelay.pipelines.dev import run_dev_issue
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+    from ctrlrelay.core.state import StateDB
+    from ctrlrelay.core.worktree import WorktreeManager
 
     github = GitHubCLI()
     state_db = StateDB(config.paths.state_db)
@@ -2307,7 +2307,7 @@ Run: `pytest tests/test_poller.py -v`
 Expected: All tests PASS
 
 ```bash
-git add src/dev_sync/core/poller.py src/dev_sync/cli.py tests/test_poller.py
+git add src/ctrlrelay/core/poller.py src/ctrlrelay/cli.py tests/test_poller.py
 git commit -m "feat(poller): implement polling loop with issue handler"
 ```
 
@@ -2318,13 +2318,13 @@ git commit -m "feat(poller): implement polling loop with issue handler"
 - [ ] **Step 1: Run ruff check on all new files**
 
 ```bash
-ruff check src/dev_sync/core/poller.py src/dev_sync/core/pr_watcher.py src/dev_sync/pipelines/dev.py src/dev_sync/pipelines/post_merge.py
+ruff check src/ctrlrelay/core/poller.py src/ctrlrelay/core/pr_watcher.py src/ctrlrelay/pipelines/dev.py src/ctrlrelay/pipelines/post_merge.py
 ```
 
 - [ ] **Step 2: Fix any issues**
 
 ```bash
-ruff check --fix src/dev_sync/
+ruff check --fix src/ctrlrelay/
 ```
 
 - [ ] **Step 3: Run full test suite**
@@ -2347,11 +2347,11 @@ git commit -m "fix: address linting issues in Phase 4"
 After completing all tasks:
 
 1. **Self-assign a real issue** to trigger the dev pipeline
-2. **Run**: `dev-sync run dev --issue <number> --repo owner/repo`
+2. **Run**: `ctrlrelay run dev --issue <number> --repo owner/repo`
 3. **Verify**: Session recorded in state DB with status
 4. **Test blocked flow**: If Claude asks a question, verify it surfaces correctly
 5. **Verify PR**: Check that PR was opened with correct branch name
-6. **Test poller**: `dev-sync poller start` detects new assigned issues
+6. **Test poller**: `ctrlrelay poller start` detects new assigned issues
 7. **Test post-merge**: After PR merge, issue should be closed automatically
 
 The phase is complete when:

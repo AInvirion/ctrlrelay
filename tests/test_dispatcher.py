@@ -10,8 +10,8 @@ import pytest
 class TestClaudeDispatcher:
     @pytest.mark.asyncio
     async def test_spawn_session_sets_env_vars(self, tmp_path: Path) -> None:
-        """Should set DEV_SYNC env vars for checkpoint protocol."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher
+        """Should set CTRLRELAY env vars for checkpoint protocol."""
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
         dispatcher = ClaudeDispatcher(claude_binary="claude")
 
@@ -38,13 +38,13 @@ class TestClaudeDispatcher:
 
             call_kwargs = mock_exec.call_args.kwargs
             env = call_kwargs.get("env", {})
-            assert "DEV_SYNC_SESSION_ID" in env
-            assert "DEV_SYNC_STATE_FILE" in env
+            assert "CTRLRELAY_SESSION_ID" in env
+            assert "CTRLRELAY_STATE_FILE" in env
 
     @pytest.mark.asyncio
     async def test_spawn_session_handles_timeout(self, tmp_path: Path) -> None:
         """Should kill process on timeout."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
         dispatcher = ClaudeDispatcher(claude_binary="claude", default_timeout=1)
 
@@ -69,7 +69,7 @@ class TestClaudeDispatcher:
     @pytest.mark.asyncio
     async def test_spawn_session_parses_done_state(self, tmp_path: Path) -> None:
         """Should parse DONE checkpoint state."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
         dispatcher = ClaudeDispatcher(claude_binary="claude")
 
@@ -103,7 +103,7 @@ class TestClaudeDispatcher:
     @pytest.mark.asyncio
     async def test_spawn_session_parses_blocked_state(self, tmp_path: Path) -> None:
         """Should parse BLOCKED_NEEDS_INPUT checkpoint state."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
         dispatcher = ClaudeDispatcher(claude_binary="claude")
 

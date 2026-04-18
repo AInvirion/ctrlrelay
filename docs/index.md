@@ -2,11 +2,11 @@
 title: Home
 layout: default
 nav_order: 1
-description: "dev-sync — local-first orchestrator that turns assigned GitHub issues into reviewed PRs by driving Claude Code in the background."
+description: "ctrlrelay — local-first orchestrator that turns assigned GitHub issues into reviewed PRs by driving Claude Code in the background."
 permalink: /
 ---
 
-# dev-sync
+# ctrlrelay
 {: .fs-9 }
 
 Local-first orchestrator that drives headless Claude Code (`claude -p`) across
@@ -46,7 +46,7 @@ isolated git worktree, opens a PR, and asks you on Telegram when it gets stuck.
 
 ## What is this?
 
-dev-sync sits between GitHub and your laptop's `claude` install. The poller
+ctrlrelay sits between GitHub and your laptop's `claude` install. The poller
 checks each configured repo for issues newly assigned to you. When it sees one,
 it acquires a per-repo lock, creates a worktree on a fresh branch, spawns
 `claude -p` with the issue title and body in the prompt, and lets the agent
@@ -56,7 +56,7 @@ your reply resumes the same Claude session.
 
 Everything runs locally. State lives in a SQLite file. Bridge state lives in
 a Unix socket. The Telegram bot is the only outbound dependency, and it's
-optional — `dev-sync` will run without it for local testing.
+optional — `ctrlrelay` will run without it for local testing.
 
 ---
 

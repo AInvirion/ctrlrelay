@@ -8,12 +8,12 @@ permalink: /configuration/
 
 # Configuration reference
 
-dev-sync is configured by a single YAML file, `config/orchestrator.yaml`. The
+ctrlrelay is configured by a single YAML file, `config/orchestrator.yaml`. The
 default path can be overridden with `--config` / `-c` on every CLI command.
 
 This page documents every recognised key. The authoritative source is the
 pydantic schema in
-[`src/dev_sync/core/config.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/core/config.py).
+[`src/ctrlrelay/core/config.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/config.py).
 
 ## Top-level keys
 
@@ -46,24 +46,24 @@ All paths support `~` expansion.
 
 ```yaml
 paths:
-  state_db:    "~/.dev-sync/state.db"
-  worktrees:   "~/.dev-sync/worktrees"
-  bare_repos:  "~/.dev-sync/repos"
-  contexts:    "~/.dev-sync/contexts"
+  state_db:    "~/.ctrlrelay/state.db"
+  worktrees:   "~/.ctrlrelay/worktrees"
+  bare_repos:  "~/.ctrlrelay/repos"
+  contexts:    "~/.ctrlrelay/contexts"
   skills:      "~/.claude/skills"
 ```
 
 | Key | Type | Required | Description |
 |---|---|---|---|
 | `state_db` | path | **yes** | SQLite database for sessions, locks, telegram_pending, automation_decisions. |
-| `worktrees` | path | **yes** | Where dev-sync creates per-session `git worktree` directories. |
-| `bare_repos` | path | **yes** | Where dev-sync clones bare mirrors of each configured repo. |
+| `worktrees` | path | **yes** | Where ctrlrelay creates per-session `git worktree` directories. |
+| `bare_repos` | path | **yes** | Where ctrlrelay clones bare mirrors of each configured repo. |
 | `contexts` | path | **yes** | Per-repo context directory (looked up as `<contexts>/<owner-repo>/CLAUDE.md`). If a `CLAUDE.md` exists, it is symlinked into the worktree at session start. |
-| `skills` | path | **yes** | Claude Code skills directory used by `dev-sync skills audit` and `dev-sync skills list`. |
+| `skills` | path | **yes** | Claude Code skills directory used by `ctrlrelay skills audit` and `ctrlrelay skills list`. |
 
 ## claude
 
-Controls how dev-sync invokes the `claude` CLI.
+Controls how ctrlrelay invokes the `claude` CLI.
 
 ```yaml
 claude:
@@ -78,25 +78,25 @@ claude:
 | `default_timeout_seconds` | int | `1800` | Per-session timeout passed to `asyncio.wait_for`. Sessions that exceed this are killed and reported as failed. |
 | `output_format` | string | `"json"` | Forwarded as `--output-format` to `claude -p`. |
 
-dev-sync always invokes claude with `--dangerously-skip-permissions` so the
+ctrlrelay always invokes claude with `--dangerously-skip-permissions` so the
 agent does not pause on tool-permission prompts in headless runs. This is
 intentional — the orchestrator runs unattended.
 
 ## transport
 
-The transport carries `BLOCKED_NEEDS_INPUT` questions out of dev-sync to a
+The transport carries `BLOCKED_NEEDS_INPUT` questions out of ctrlrelay to a
 human and routes the answer back. Pick one of two types.
 
 ```yaml
 transport:
   type: "telegram"   # or "file_mock"
   telegram:
-    bot_token_env: "DEV_SYNC_TELEGRAM_TOKEN"
+    bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"
     chat_id: 123456789
-    socket_path: "~/.dev-sync/dev-sync.sock"
+    socket_path: "~/.ctrlrelay/ctrlrelay.sock"
   file_mock:
-    inbox:  "~/.dev-sync/inbox.txt"
-    outbox: "~/.dev-sync/outbox.txt"
+    inbox:  "~/.ctrlrelay/inbox.txt"
+    outbox: "~/.ctrlrelay/outbox.txt"
 ```
 
 | Key | Type | Required | Default | Description |
@@ -109,9 +109,9 @@ transport:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `bot_token_env` | string | `"DEV_SYNC_TELEGRAM_TOKEN"` | Name of the environment variable holding the bot token. dev-sync never reads the token directly — only the variable name. |
+| `bot_token_env` | string | `"CTRLRELAY_TELEGRAM_TOKEN"` | Name of the environment variable holding the bot token. ctrlrelay never reads the token directly — only the variable name. |
 | `chat_id` | int | `0` | Telegram chat ID the bridge sends messages to and accepts replies from. |
-| `socket_path` | path | `"~/.dev-sync/dev-sync.sock"` | Unix socket path the bridge listens on. Pipelines connect to this socket as clients. |
+| `socket_path` | path | `"~/.ctrlrelay/ctrlrelay.sock"` | Unix socket path the bridge listens on. Pipelines connect to this socket as clients. |
 
 See [Telegram bridge]({{ '/bridge/' | relative_url }}) for the full setup walkthrough.
 
@@ -132,8 +132,8 @@ Optional remote dashboard for heartbeats and event push.
 ```yaml
 dashboard:
   enabled: false
-  url: "https://dev-sync-dashboard.example.com"
-  auth_token_env: "DEV_SYNC_DASHBOARD_TOKEN"
+  url: "https://ctrlrelay-dashboard.example.com"
+  auth_token_env: "CTRLRELAY_DASHBOARD_TOKEN"
   sync_config_on_heartbeat: false
 ```
 
@@ -141,7 +141,7 @@ dashboard:
 |---|---|---|---|
 | `enabled` | bool | `true` | Set to `false` to skip dashboard wiring entirely. |
 | `url` | string | `""` | Base URL of the dashboard service. Empty disables outbound calls. |
-| `auth_token_env` | string | `"DEV_SYNC_DASHBOARD_TOKEN"` | Env-var name holding the dashboard auth token. |
+| `auth_token_env` | string | `"CTRLRELAY_DASHBOARD_TOKEN"` | Env-var name holding the dashboard auth token. |
 | `sync_config_on_heartbeat` | bool | `false` | When true, the orchestrator pushes its current config alongside each heartbeat. |
 
 The dashboard is optional. Leaving `url` empty (the default) is the supported
@@ -170,11 +170,11 @@ repos:
 | Key | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | **yes** | — | GitHub `owner/repo` slug. Used for `gh` calls and bare-repo / worktree naming. |
-| `local_path` | path | **yes** | — | Where the repo is checked out on disk for human use. dev-sync itself uses bare mirrors under `paths.bare_repos`. |
+| `local_path` | path | **yes** | — | Where the repo is checked out on disk for human use. ctrlrelay itself uses bare mirrors under `paths.bare_repos`. |
 | `dev_branch_template` | string | no | `"fix/issue-{n}"` | Branch-name template for dev-pipeline runs. `{n}` is replaced by the issue number. |
 | `automation` | object | no | (defaults) | See [automation](#repos-automation). |
 | `code_review` | object | no | (defaults) | Reserved for code-review policy. Currently unused by the bundled pipelines. |
-| `deploy` | object | no | `null` | Reserved for deploy policy. Currently surfaced in `dev-sync config repos` but otherwise inert. |
+| `deploy` | object | no | `null` | Reserved for deploy policy. Currently surfaced in `ctrlrelay config repos` but otherwise inert. |
 
 ### repos[].automation
 
@@ -201,10 +201,10 @@ node_id: "studio-mac"
 timezone: "America/Santiago"
 
 paths:
-  state_db:    "~/.dev-sync/state.db"
-  worktrees:   "~/.dev-sync/worktrees"
-  bare_repos:  "~/.dev-sync/repos"
-  contexts:    "~/.dev-sync/contexts"
+  state_db:    "~/.ctrlrelay/state.db"
+  worktrees:   "~/.ctrlrelay/worktrees"
+  bare_repos:  "~/.ctrlrelay/repos"
+  contexts:    "~/.ctrlrelay/contexts"
   skills:      "~/.claude/skills"
 
 claude:
@@ -215,9 +215,9 @@ claude:
 transport:
   type: "telegram"
   telegram:
-    bot_token_env: "DEV_SYNC_TELEGRAM_TOKEN"
+    bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"
     chat_id: 987654321
-    socket_path: "~/.dev-sync/dev-sync.sock"
+    socket_path: "~/.ctrlrelay/ctrlrelay.sock"
 
 dashboard:
   enabled: false
@@ -234,6 +234,6 @@ repos:
 
 ## Validating
 
-Always run `dev-sync config validate` after editing the file. It prints the
+Always run `ctrlrelay config validate` after editing the file. It prints the
 resolved transport, repo count, and parsed timezone — and surfaces any pydantic
 validation errors with line context.

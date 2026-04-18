@@ -2,13 +2,13 @@
 title: Feedback loop
 layout: default
 nav_order: 5
-description: "How dev-sync sessions checkpoint, block on questions, and resume after a human answer."
+description: "How ctrlrelay sessions checkpoint, block on questions, and resume after a human answer."
 permalink: /feedback-loop/
 ---
 
 # Feedback loop
 
-Every Claude session that dev-sync spawns ends with a single JSON checkpoint
+Every Claude session that ctrlrelay spawns ends with a single JSON checkpoint
 file. The orchestrator reads that file, decides what to do, and (if the session
 asked a question) routes a human's answer back to a resumed session.
 
@@ -18,17 +18,17 @@ resume prompt.
 
 ## The checkpoint file
 
-When dev-sync spawns Claude, it sets two environment variables in the child
+When ctrlrelay spawns Claude, it sets two environment variables in the child
 process:
 
 | Variable | Value |
 |---|---|
-| `DEV_SYNC_SESSION_ID` | UUID-tagged ID like `dev-your-org-your-app-42-a3f9cdfe`. |
-| `DEV_SYNC_STATE_FILE` | Absolute path to the per-session JSON state file (typically `<worktree>/.dev-sync/state.json`). |
+| `CTRLRELAY_SESSION_ID` | UUID-tagged ID like `dev-your-org-your-app-42-a3f9cdfe`. |
+| `CTRLRELAY_STATE_FILE` | Absolute path to the per-session JSON state file (typically `<worktree>/.ctrlrelay/state.json`). |
 
 Before exiting, the agent writes one of three statuses to that path. The
 schema is enforced by pydantic in
-[`src/dev_sync/core/checkpoint.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/core/checkpoint.py).
+[`src/ctrlrelay/core/checkpoint.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/checkpoint.py).
 
 ### DONE
 
@@ -86,7 +86,7 @@ hard failure that retries should not attempt.
 
 Here is the full flow when an issue triggers a dev-pipeline run that ends up
 asking the operator a question. The pipeline lives in
-[`src/dev_sync/pipelines/dev.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/pipelines/dev.py);
+[`src/ctrlrelay/pipelines/dev.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/pipelines/dev.py);
 the resume mechanism uses Claude Code's native `--resume <session_id>`.
 
 ```
@@ -98,7 +98,7 @@ the resume mechanism uses Claude Code's native `--resume <session_id>`.
 4)  │               │                │── claude -p ─>│              │             │                │
 5)  │               │                │              │── work ──────┤              │                │
 6)  │               │                │              │── BLOCKED ───┤              │                │
-                          (writes /worktree/.dev-sync/state.json)
+                          (writes /worktree/.ctrlrelay/state.json)
 7)  │               │                │<── checkpoint │              │             │                │
 8)  │               │                │── ask(q) ────────────────────>│             │                │
 9)  │               │                │              │              │── send ────>│                │
@@ -117,17 +117,17 @@ the resume mechanism uses Claude Code's native `--resume <session_id>`.
 
 Step-by-step:
 
-1. **Issue picked up.** The poller (`src/dev_sync/core/poller.py`) lists issues
+1. **Issue picked up.** The poller (`src/ctrlrelay/core/poller.py`) lists issues
    assigned to your GitHub username across configured repos and surfaces ones
    it has not seen before.
 2. **Handler invoked.** The poller's CLI handler calls `run_dev_issue(...)` from
-   `src/dev_sync/pipelines/dev.py`.
+   `src/ctrlrelay/pipelines/dev.py`.
 3. **Lock + worktree.** The pipeline acquires a per-repo lock from the SQLite
    state DB and creates a worktree on a new branch (default
    `fix/issue-{n}`).
 4. **Claude spawned.** `ClaudeDispatcher.spawn_session` runs
    `claude -p <prompt> --output-format json --dangerously-skip-permissions`
-   inside the worktree, with `DEV_SYNC_SESSION_ID` and `DEV_SYNC_STATE_FILE`
+   inside the worktree, with `CTRLRELAY_SESSION_ID` and `CTRLRELAY_STATE_FILE`
    set.
 5–6. **Claude works, hits a question.** The agent writes a
    `BLOCKED_NEEDS_INPUT` checkpoint and exits.
@@ -168,7 +168,7 @@ Step-by-step:
 - **Maximum 5 BLOCKED rounds per session.** This bounds the chat noise from a
   pathological loop. After 5 unanswered/timed-out rounds the pipeline gives up.
 - **State is durable.** The checkpoint file and the SQLite state DB persist
-  across orchestrator restarts. If you kill `dev-sync` mid-session, the state
+  across orchestrator restarts. If you kill `ctrlrelay` mid-session, the state
   is still on disk; resuming it is currently a manual operation (re-run the
   pipeline against the same issue).
 - **`file_mock` is one-way.** The file-mock transport supports outbound
@@ -177,18 +177,18 @@ Step-by-step:
 
 ## Implementing your own BLOCKED in a Claude session
 
-If you write a custom prompt or skill that runs under dev-sync, signal a
+If you write a custom prompt or skill that runs under ctrlrelay, signal a
 question from inside the Claude session using a shell `printf`:
 
 ```bash
 # Inside a Claude session — both vars are set by the dispatcher.
 printf '{"version":"1","status":"BLOCKED_NEEDS_INPUT","session_id":"%s","timestamp":"%s","question":"%s"}' \
-  "$DEV_SYNC_SESSION_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  "$CTRLRELAY_SESSION_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   "Should I migrate the schema in this PR or split it?" \
-  > "$DEV_SYNC_STATE_FILE"
+  > "$CTRLRELAY_STATE_FILE"
 exit 0
 ```
 
 The dev-pipeline prompt template embeds this exact pattern — see the
 `_build_prompt` method in
-[`src/dev_sync/pipelines/dev.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/pipelines/dev.py).
+[`src/ctrlrelay/pipelines/dev.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/pipelines/dev.py).

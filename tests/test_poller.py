@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from dev_sync.core.poller import IssuePoller
+from ctrlrelay.core.poller import IssuePoller
 
 
 def make_issue(number: int, title: str = "Test issue") -> dict:
@@ -152,7 +152,7 @@ class TestIssuePoller:
     @pytest.mark.asyncio
     async def test_run_poll_loop_processes_new_issues(self, tmp_path: Path) -> None:
         """Should call handler for each new issue."""
-        from dev_sync.core.poller import IssuePoller, run_poll_loop
+        from ctrlrelay.core.poller import IssuePoller, run_poll_loop
 
         mock_github = AsyncMock()
         mock_github.list_assigned_issues.return_value = [

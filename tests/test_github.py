@@ -10,14 +10,14 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_list_prs_returns_parsed_json(self) -> None:
         """Should parse gh pr list JSON output."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps([
             {"number": 1, "title": "Bump requests", "author": {"login": "dependabot[bot]"}},
             {"number": 2, "title": "Fix bug", "author": {"login": "user"}},
         ])
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = mock_output
             gh = GitHubCLI()
             prs = await gh.list_prs("owner/repo", state="open")
@@ -29,13 +29,13 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_list_security_alerts(self) -> None:
         """Should fetch Dependabot alerts."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps([
             {"number": 1, "state": "open", "dependency": {"package": {"name": "lodash"}}},
         ])
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = mock_output
             gh = GitHubCLI()
             alerts = await gh.list_security_alerts("owner/repo")
@@ -46,9 +46,9 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_merge_pr(self) -> None:
         """Should merge PR with squash."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = ""
             gh = GitHubCLI()
             await gh.merge_pr("owner/repo", 42, method="squash")
@@ -61,7 +61,7 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_get_pr_checks(self) -> None:
         """Should get PR check status using the bucket field."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps([
             {"name": "tests", "state": "SUCCESS", "bucket": "pass"},
@@ -85,7 +85,7 @@ class TestGitHubCLI:
         still prints the JSON payload to stdout. get_pr_checks must parse it
         instead of silently returning []."""
 
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps([
             {"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"},
@@ -107,7 +107,7 @@ class TestGitHubCLI:
         """gh prints 'no checks reported on the <branch> branch' to stderr
         and exits non-zero when the PR genuinely has no CI. Treat that as []."""
 
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_proc = MagicMock()
         mock_proc.communicate = AsyncMock(return_value=(
@@ -128,7 +128,7 @@ class TestGitHubCLI:
         stdout empty. Must raise GitHubError rather than silently returning []
         (which would be indistinguishable from 'no CI configured')."""
 
-        from dev_sync.core.github import GitHubCLI, GitHubError
+        from ctrlrelay.core.github import GitHubCLI, GitHubError
 
         mock_proc = MagicMock()
         mock_proc.communicate = AsyncMock(return_value=(
@@ -145,14 +145,14 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_list_assigned_issues(self) -> None:
         """Should list issues assigned to a user."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps([
             {"number": 10, "title": "Fix login bug", "state": "open", "assignees": [{"login": "alice"}]},
             {"number": 11, "title": "Add dark mode", "state": "open", "assignees": [{"login": "alice"}]},
         ])
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = mock_output
             gh = GitHubCLI()
             issues = await gh.list_assigned_issues("owner/repo", assignee="alice")
@@ -166,7 +166,7 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_get_issue(self) -> None:
         """Should get a single issue by number."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps({
             "number": 42,
@@ -176,7 +176,7 @@ class TestGitHubCLI:
             "labels": [{"name": "bug"}],
         })
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = mock_output
             gh = GitHubCLI()
             issue = await gh.get_issue("owner/repo", 42)
@@ -190,7 +190,7 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_create_pr(self) -> None:
         """Should create a PR and return its data."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps({
             "number": 99,
@@ -198,7 +198,7 @@ class TestGitHubCLI:
             "url": "https://github.com/owner/repo/pull/99",
         })
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = mock_output
             gh = GitHubCLI()
             pr = await gh.create_pr(
@@ -218,7 +218,7 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_get_pr_state(self) -> None:
         """Should get PR state including merge status."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps({
             "number": 55,
@@ -227,7 +227,7 @@ class TestGitHubCLI:
             "mergeStateStatus": "CLEAN",
         })
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = mock_output
             gh = GitHubCLI()
             state = await gh.get_pr_state("owner/repo", 55)
@@ -242,9 +242,9 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_comment_on_issue(self) -> None:
         """Should post a comment on an issue."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = ""
             gh = GitHubCLI()
             await gh.comment_on_issue("owner/repo", 7, "hello there")
@@ -260,9 +260,9 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_close_issue_without_comment(self) -> None:
         """Should close an issue without adding a comment."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = ""
             gh = GitHubCLI()
             await gh.close_issue("owner/repo", 7)
@@ -275,9 +275,9 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_close_issue_with_comment(self) -> None:
         """Should close an issue and post a comment."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = ""
             gh = GitHubCLI()
             await gh.close_issue("owner/repo", 7, comment="Fixed in PR #99")

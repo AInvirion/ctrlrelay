@@ -12,7 +12,7 @@ class TestDashboardClient:
     @pytest.mark.asyncio
     async def test_push_event_sends_to_server(self) -> None:
         """Should POST event to dashboard server."""
-        from dev_sync.dashboard.client import DashboardClient, EventPayload
+        from ctrlrelay.dashboard.client import DashboardClient, EventPayload
 
         client = DashboardClient(
             url="https://dashboard.example.com",
@@ -40,7 +40,7 @@ class TestDashboardClient:
     @pytest.mark.asyncio
     async def test_push_event_queues_on_failure(self, tmp_path: Path) -> None:
         """Should queue event when server unreachable."""
-        from dev_sync.dashboard.client import DashboardClient, EventPayload
+        from ctrlrelay.dashboard.client import DashboardClient, EventPayload
 
         client = DashboardClient(
             url="https://dashboard.example.com",
@@ -68,7 +68,7 @@ class TestDashboardClient:
     @pytest.mark.asyncio
     async def test_drain_queue_sends_queued_events(self, tmp_path: Path) -> None:
         """Should send queued events when connection restored."""
-        from dev_sync.dashboard.client import DashboardClient
+        from ctrlrelay.dashboard.client import DashboardClient
 
         queue_file = tmp_path / "event_queue.json"
         queue_file.write_text(json.dumps([

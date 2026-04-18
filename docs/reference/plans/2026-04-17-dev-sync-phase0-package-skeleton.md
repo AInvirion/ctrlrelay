@@ -7,7 +7,7 @@ nav_order: 1
 render_with_liquid: false
 ---
 
-# dev-sync Phase 0: Package Skeleton
+# ctrlrelay Phase 0: Package Skeleton
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -17,14 +17,14 @@ render_with_liquid: false
 
 **Tech Stack:** Python 3.12, uv, Typer, Pydantic, SQLite, PyYAML
 
-**Phase Gate:** `pip install -e .` works, `dev-sync config validate` passes on example config.
+**Phase Gate:** `pip install -e .` works, `ctrlrelay config validate` passes on example config.
 
 ---
 
 ## File Structure
 
 ```
-src/dev_sync/
+src/ctrlrelay/
 ├── __init__.py           # Version, public API exports
 ├── cli.py                # Typer CLI entry point
 └── core/
@@ -52,7 +52,7 @@ pyproject.toml
 
 ```toml
 [project]
-name = "dev-sync"
+name = "ctrlrelay"
 version = "0.1.0"
 description = "Local-first orchestrator for Claude Code across multiple GitHub repos"
 readme = "README.md"
@@ -85,14 +85,14 @@ dev = [
 ]
 
 [project.scripts]
-dev-sync = "dev_sync.cli:app"
+ctrlrelay = "ctrlrelay.cli:app"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dev_sync"]
+packages = ["src/ctrlrelay"]
 
 [tool.ruff]
 line-length = 100
@@ -110,14 +110,14 @@ pythonpath = ["src"]
 
 Run:
 ```bash
-mkdir -p src/dev_sync/core tests config
+mkdir -p src/ctrlrelay/core tests config
 ```
 
 - [ ] **Step 3: Verify structure**
 
 Run:
 ```bash
-ls -la src/dev_sync/
+ls -la src/ctrlrelay/
 ```
 Expected: `core/` directory exists
 
@@ -133,13 +133,13 @@ git commit -m "feat: add pyproject.toml with package metadata"
 ### Task 2: Create package __init__.py with version
 
 **Files:**
-- Create: `src/dev_sync/__init__.py`
-- Create: `src/dev_sync/core/__init__.py`
+- Create: `src/ctrlrelay/__init__.py`
+- Create: `src/ctrlrelay/core/__init__.py`
 
-- [ ] **Step 1: Write src/dev_sync/__init__.py**
+- [ ] **Step 1: Write src/ctrlrelay/__init__.py**
 
 ```python
-"""dev-sync: Local-first orchestrator for Claude Code."""
+"""ctrlrelay: Local-first orchestrator for Claude Code."""
 
 __version__ = "0.1.0"
 
@@ -147,24 +147,24 @@ __version__ = "0.1.0"
 __all__ = ["__version__"]
 ```
 
-- [ ] **Step 2: Write src/dev_sync/core/__init__.py**
+- [ ] **Step 2: Write src/ctrlrelay/core/__init__.py**
 
 ```python
-"""Core functionality for dev-sync orchestrator."""
+"""Core functionality for ctrlrelay orchestrator."""
 ```
 
 - [ ] **Step 3: Verify imports work**
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && python -c "from dev_sync import __version__; print(__version__)"
+cd /Users/ovalenzuela/Projects/ctrlrelay && python -c "from ctrlrelay import __version__; print(__version__)"
 ```
 Expected: `0.1.0`
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/dev_sync/__init__.py src/dev_sync/core/__init__.py
+git add src/ctrlrelay/__init__.py src/ctrlrelay/core/__init__.py
 git commit -m "feat: add package init files with version"
 ```
 
@@ -173,20 +173,20 @@ git commit -m "feat: add package init files with version"
 ### Task 3: Create CLI skeleton with Typer
 
 **Files:**
-- Create: `src/dev_sync/cli.py`
+- Create: `src/ctrlrelay/cli.py`
 
 - [ ] **Step 1: Write the CLI skeleton**
 
 ```python
-"""CLI entry point for dev-sync."""
+"""CLI entry point for ctrlrelay."""
 
 import typer
 from rich.console import Console
 
-from dev_sync import __version__
+from ctrlrelay import __version__
 
 app = typer.Typer(
-    name="dev-sync",
+    name="ctrlrelay",
     help="Local-first orchestrator for Claude Code across multiple GitHub repos.",
     no_args_is_help=True,
 )
@@ -195,7 +195,7 @@ console = Console()
 
 def version_callback(value: bool) -> None:
     if value:
-        console.print(f"dev-sync version {__version__}")
+        console.print(f"ctrlrelay version {__version__}")
         raise typer.Exit()
 
 
@@ -210,7 +210,7 @@ def main(
         help="Show version and exit.",
     ),
 ) -> None:
-    """dev-sync orchestrator CLI."""
+    """ctrlrelay orchestrator CLI."""
 
 
 # Subcommand groups
@@ -249,15 +249,15 @@ if __name__ == "__main__":
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && uv pip install -e ".[dev]"
+cd /Users/ovalenzuela/Projects/ctrlrelay && uv pip install -e ".[dev]"
 ```
-Expected: Successfully installed dev-sync
+Expected: Successfully installed ctrlrelay
 
 - [ ] **Step 3: Test CLI help**
 
 Run:
 ```bash
-dev-sync --help
+ctrlrelay --help
 ```
 Expected: Shows help with "config" subcommand listed
 
@@ -265,22 +265,22 @@ Expected: Shows help with "config" subcommand listed
 
 Run:
 ```bash
-dev-sync --version
+ctrlrelay --version
 ```
-Expected: `dev-sync version 0.1.0`
+Expected: `ctrlrelay version 0.1.0`
 
 - [ ] **Step 5: Test config validate (should fail gracefully)**
 
 Run:
 ```bash
-dev-sync config validate || echo "Exit code: $?"
+ctrlrelay config validate || echo "Exit code: $?"
 ```
 Expected: Shows "Config validation not yet implemented" and exit code 1
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/dev_sync/cli.py
+git add src/ctrlrelay/cli.py
 git commit -m "feat: add CLI skeleton with Typer"
 ```
 
@@ -289,7 +289,7 @@ git commit -m "feat: add CLI skeleton with Typer"
 ### Task 4: Create Pydantic config models
 
 **Files:**
-- Create: `src/dev_sync/core/config.py`
+- Create: `src/ctrlrelay/core/config.py`
 - Create: `tests/__init__.py`
 - Create: `tests/conftest.py`
 - Create: `tests/test_config.py`
@@ -298,12 +298,12 @@ git commit -m "feat: add CLI skeleton with Typer"
 
 Create `tests/__init__.py`:
 ```python
-"""Tests for dev-sync package."""
+"""Tests for ctrlrelay package."""
 ```
 
 Create `tests/conftest.py`:
 ```python
-"""Pytest fixtures for dev-sync tests."""
+"""Pytest fixtures for ctrlrelay tests."""
 
 import tempfile
 from pathlib import Path
@@ -320,11 +320,11 @@ def sample_config_dict() -> dict:
         "node_id": "test-node",
         "timezone": "UTC",
         "paths": {
-            "state_db": "~/.dev-sync/state.db",
-            "worktrees": "~/.dev-sync/worktrees",
-            "bare_repos": "~/.dev-sync/repos",
-            "contexts": "~/dev-sync/contexts",
-            "skills": "~/dev-sync/skills",
+            "state_db": "~/.ctrlrelay/state.db",
+            "worktrees": "~/.ctrlrelay/worktrees",
+            "bare_repos": "~/.ctrlrelay/repos",
+            "contexts": "~/.ctrlrelay/contexts",
+            "skills": "~/.ctrlrelay/skills",
         },
         "claude": {
             "binary": "claude",
@@ -334,8 +334,8 @@ def sample_config_dict() -> dict:
         "transport": {
             "type": "file_mock",
             "file_mock": {
-                "inbox": "~/.dev-sync/inbox.txt",
-                "outbox": "~/.dev-sync/outbox.txt",
+                "inbox": "~/.ctrlrelay/inbox.txt",
+                "outbox": "~/.ctrlrelay/outbox.txt",
             },
         },
         "dashboard": {
@@ -362,7 +362,7 @@ from pathlib import Path
 
 import pytest
 
-from dev_sync.core.config import Config, load_config, ConfigError
+from ctrlrelay.core.config import Config, load_config, ConfigError
 
 
 class TestConfigLoading:
@@ -406,15 +406,15 @@ class TestConfigPaths:
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && pytest tests/test_config.py -v
+cd /Users/ovalenzuela/Projects/ctrlrelay && pytest tests/test_config.py -v
 ```
-Expected: FAIL with "No module named 'dev_sync.core.config'"
+Expected: FAIL with "No module named 'ctrlrelay.core.config'"
 
 - [ ] **Step 3: Write the config module**
 
-Create `src/dev_sync/core/config.py`:
+Create `src/ctrlrelay/core/config.py`:
 ```python
-"""Configuration loading and validation for dev-sync."""
+"""Configuration loading and validation for ctrlrelay."""
 
 from __future__ import annotations
 
@@ -469,9 +469,9 @@ class ClaudeConfig(BaseModel):
 class TelegramConfig(BaseModel):
     """Telegram transport configuration."""
 
-    bot_token_env: str = "DEV_SYNC_TELEGRAM_TOKEN"
+    bot_token_env: str = "CTRLRELAY_TELEGRAM_TOKEN"
     chat_id: int = 0
-    socket_path: Path = Path("~/.dev-sync/dev-sync.sock")
+    socket_path: Path = Path("~/.ctrlrelay/ctrlrelay.sock")
 
     @field_validator("socket_path", mode="before")
     @classmethod
@@ -516,7 +516,7 @@ class DashboardConfig(BaseModel):
 
     enabled: bool = True
     url: str = ""
-    auth_token_env: str = "DEV_SYNC_DASHBOARD_TOKEN"
+    auth_token_env: str = "CTRLRELAY_DASHBOARD_TOKEN"
     sync_config_on_heartbeat: bool = False
 
 
@@ -565,7 +565,7 @@ class RepoConfig(BaseModel):
 
 
 class Config(BaseModel):
-    """Root configuration model for dev-sync orchestrator."""
+    """Root configuration model for ctrlrelay orchestrator."""
 
     version: str = "1"
     node_id: str
@@ -613,17 +613,17 @@ def load_config(path: Path | str) -> Config:
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && pytest tests/test_config.py -v
+cd /Users/ovalenzuela/Projects/ctrlrelay && pytest tests/test_config.py -v
 ```
 Expected: All tests PASS
 
 - [ ] **Step 5: Update core __init__.py to export config**
 
-Edit `src/dev_sync/core/__init__.py`:
+Edit `src/ctrlrelay/core/__init__.py`:
 ```python
-"""Core functionality for dev-sync orchestrator."""
+"""Core functionality for ctrlrelay orchestrator."""
 
-from dev_sync.core.config import (
+from ctrlrelay.core.config import (
     Config,
     ConfigError,
     RepoConfig,
@@ -636,7 +636,7 @@ __all__ = ["Config", "ConfigError", "RepoConfig", "load_config"]
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/dev_sync/core/config.py src/dev_sync/core/__init__.py tests/
+git add src/ctrlrelay/core/config.py src/ctrlrelay/core/__init__.py tests/
 git commit -m "feat: add Pydantic config models with validation"
 ```
 
@@ -645,14 +645,14 @@ git commit -m "feat: add Pydantic config models with validation"
 ### Task 5: Wire config validate CLI command
 
 **Files:**
-- Modify: `src/dev_sync/cli.py`
+- Modify: `src/ctrlrelay/cli.py`
 - Create: `config/orchestrator.yaml.example`
 
 - [ ] **Step 1: Create example config file**
 
 Create `config/orchestrator.yaml.example`:
 ```yaml
-# dev-sync orchestrator configuration
+# ctrlrelay orchestrator configuration
 # Copy to orchestrator.yaml and customize
 
 version: "1"
@@ -660,11 +660,11 @@ node_id: "my-machine"
 timezone: "America/Santiago"
 
 paths:
-  state_db: "~/.dev-sync/state.db"
-  worktrees: "~/.dev-sync/worktrees"
-  bare_repos: "~/.dev-sync/repos"
-  contexts: "~/dev-sync/contexts"
-  skills: "~/dev-sync/claude-config/skills"
+  state_db: "~/.ctrlrelay/state.db"
+  worktrees: "~/.ctrlrelay/worktrees"
+  bare_repos: "~/.ctrlrelay/repos"
+  contexts: "~/.ctrlrelay/contexts"
+  skills: "~/.ctrlrelay/claude-config/skills"
 
 claude:
   binary: "claude"
@@ -674,17 +674,17 @@ claude:
 transport:
   type: "file_mock"  # Use "telegram" for production
   telegram:
-    bot_token_env: "DEV_SYNC_TELEGRAM_TOKEN"
+    bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"
     chat_id: 123456789
-    socket_path: "~/.dev-sync/dev-sync.sock"
+    socket_path: "~/.ctrlrelay/ctrlrelay.sock"
   file_mock:
-    inbox: "~/.dev-sync/inbox.txt"
-    outbox: "~/.dev-sync/outbox.txt"
+    inbox: "~/.ctrlrelay/inbox.txt"
+    outbox: "~/.ctrlrelay/outbox.txt"
 
 dashboard:
   enabled: false
-  url: "https://dev-sync-dashboard.example.com"
-  auth_token_env: "DEV_SYNC_DASHBOARD_TOKEN"
+  url: "https://ctrlrelay-dashboard.example.com"
+  auth_token_env: "CTRLRELAY_DASHBOARD_TOKEN"
 
 repos: []
   # Example repo configuration:
@@ -705,9 +705,9 @@ repos: []
 
 - [ ] **Step 2: Update CLI with working config validate**
 
-Edit `src/dev_sync/cli.py` - replace the entire file:
+Edit `src/ctrlrelay/cli.py` - replace the entire file:
 ```python
-"""CLI entry point for dev-sync."""
+"""CLI entry point for ctrlrelay."""
 
 from pathlib import Path
 
@@ -715,11 +715,11 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from dev_sync import __version__
-from dev_sync.core.config import Config, ConfigError, load_config
+from ctrlrelay import __version__
+from ctrlrelay.core.config import Config, ConfigError, load_config
 
 app = typer.Typer(
-    name="dev-sync",
+    name="ctrlrelay",
     help="Local-first orchestrator for Claude Code across multiple GitHub repos.",
     no_args_is_help=True,
 )
@@ -728,7 +728,7 @@ console = Console()
 
 def version_callback(value: bool) -> None:
     if value:
-        console.print(f"dev-sync version {__version__}")
+        console.print(f"ctrlrelay version {__version__}")
         raise typer.Exit()
 
 
@@ -743,7 +743,7 @@ def main(
         help="Show version and exit.",
     ),
 ) -> None:
-    """dev-sync orchestrator CLI."""
+    """ctrlrelay orchestrator CLI."""
 
 
 # Subcommand groups
@@ -829,7 +829,7 @@ cp config/orchestrator.yaml.example config/orchestrator.yaml
 
 Run:
 ```bash
-dev-sync config validate -c config/orchestrator.yaml
+ctrlrelay config validate -c config/orchestrator.yaml
 ```
 Expected: Shows "✓ Config valid" with node_id, timezone, etc.
 
@@ -837,14 +837,14 @@ Expected: Shows "✓ Config valid" with node_id, timezone, etc.
 
 Run:
 ```bash
-dev-sync config validate -c nonexistent.yaml || echo "Exit code: $?"
+ctrlrelay config validate -c nonexistent.yaml || echo "Exit code: $?"
 ```
 Expected: Error message and exit code 1
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/dev_sync/cli.py config/
+git add src/ctrlrelay/cli.py config/
 git commit -m "feat: wire config validate CLI command"
 ```
 
@@ -853,7 +853,7 @@ git commit -m "feat: wire config validate CLI command"
 ### Task 6: Create SQLite state module
 
 **Files:**
-- Create: `src/dev_sync/core/state.py`
+- Create: `src/ctrlrelay/core/state.py`
 - Create: `tests/test_state.py`
 
 - [ ] **Step 1: Write the failing test for state module**
@@ -866,7 +866,7 @@ from pathlib import Path
 
 import pytest
 
-from dev_sync.core.state import StateDB
+from ctrlrelay.core.state import StateDB
 
 
 class TestStateDBInit:
@@ -942,15 +942,15 @@ class TestRepoLocks:
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && pytest tests/test_state.py -v
+cd /Users/ovalenzuela/Projects/ctrlrelay && pytest tests/test_state.py -v
 ```
-Expected: FAIL with "No module named 'dev_sync.core.state'"
+Expected: FAIL with "No module named 'ctrlrelay.core.state'"
 
 - [ ] **Step 3: Write the state module**
 
-Create `src/dev_sync/core/state.py`:
+Create `src/ctrlrelay/core/state.py`:
 ```python
-"""SQLite state management for dev-sync orchestrator."""
+"""SQLite state management for ctrlrelay orchestrator."""
 
 from __future__ import annotations
 
@@ -1114,23 +1114,23 @@ class StateDB:
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && pytest tests/test_state.py -v
+cd /Users/ovalenzuela/Projects/ctrlrelay && pytest tests/test_state.py -v
 ```
 Expected: All tests PASS
 
 - [ ] **Step 5: Update core __init__.py to export state**
 
-Edit `src/dev_sync/core/__init__.py`:
+Edit `src/ctrlrelay/core/__init__.py`:
 ```python
-"""Core functionality for dev-sync orchestrator."""
+"""Core functionality for ctrlrelay orchestrator."""
 
-from dev_sync.core.config import (
+from ctrlrelay.core.config import (
     Config,
     ConfigError,
     RepoConfig,
     load_config,
 )
-from dev_sync.core.state import StateDB
+from ctrlrelay.core.state import StateDB
 
 __all__ = ["Config", "ConfigError", "RepoConfig", "load_config", "StateDB"]
 ```
@@ -1138,7 +1138,7 @@ __all__ = ["Config", "ConfigError", "RepoConfig", "load_config", "StateDB"]
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/dev_sync/core/state.py src/dev_sync/core/__init__.py tests/test_state.py
+git add src/ctrlrelay/core/state.py src/ctrlrelay/core/__init__.py tests/test_state.py
 git commit -m "feat: add SQLite state module with repo locks"
 ```
 
@@ -1147,11 +1147,11 @@ git commit -m "feat: add SQLite state module with repo locks"
 ### Task 7: Add status command showing state
 
 **Files:**
-- Modify: `src/dev_sync/cli.py`
+- Modify: `src/ctrlrelay/cli.py`
 
 - [ ] **Step 1: Add status command to CLI**
 
-Add to `src/dev_sync/cli.py` after the config_app commands:
+Add to `src/ctrlrelay/cli.py` after the config_app commands:
 
 ```python
 @app.command("status")
@@ -1164,7 +1164,7 @@ def status(
     ),
 ) -> None:
     """Show orchestrator status and active sessions."""
-    from dev_sync.core.state import StateDB
+    from ctrlrelay.core.state import StateDB
 
     try:
         config = load_config(config_path)
@@ -1227,14 +1227,14 @@ def status(
 
 Run:
 ```bash
-dev-sync status -c config/orchestrator.yaml
+ctrlrelay status -c config/orchestrator.yaml
 ```
 Expected: Shows "State database not found"
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add src/dev_sync/cli.py
+git add src/ctrlrelay/cli.py
 git commit -m "feat: add status command showing state"
 ```
 
@@ -1248,7 +1248,7 @@ git commit -m "feat: add status command showing state"
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && pytest tests/ -v --cov=dev_sync
+cd /Users/ovalenzuela/Projects/ctrlrelay && pytest tests/ -v --cov=ctrlrelay
 ```
 Expected: All tests pass, coverage report shown
 
@@ -1256,15 +1256,15 @@ Expected: All tests pass, coverage report shown
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && uv pip install -e . && dev-sync --version
+cd /Users/ovalenzuela/Projects/ctrlrelay && uv pip install -e . && ctrlrelay --version
 ```
-Expected: `dev-sync version 0.1.0`
+Expected: `ctrlrelay version 0.1.0`
 
 - [ ] **Step 3: Verify config validate works**
 
 Run:
 ```bash
-dev-sync config validate -c config/orchestrator.yaml
+ctrlrelay config validate -c config/orchestrator.yaml
 ```
 Expected: Shows "✓ Config valid"
 
@@ -1272,7 +1272,7 @@ Expected: Shows "✓ Config valid"
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && ruff check src/ tests/
+cd /Users/ovalenzuela/Projects/ctrlrelay && ruff check src/ tests/
 ```
 Expected: No errors
 
@@ -1292,8 +1292,8 @@ git commit -m "chore: phase 0 complete - package skeleton ready"
 **Phase 0 is complete when:**
 
 1. ✅ `pip install -e .` succeeds
-2. ✅ `dev-sync --version` shows version
-3. ✅ `dev-sync config validate -c config/orchestrator.yaml` passes
+2. ✅ `ctrlrelay --version` shows version
+3. ✅ `ctrlrelay config validate -c config/orchestrator.yaml` passes
 4. ✅ All tests pass
 5. ✅ No linter errors
 

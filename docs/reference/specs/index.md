@@ -9,7 +9,7 @@ permalink: /reference/specs/
 
 # Design specs
 
-Reference-level design documents for dev-sync. These cover system shape,
+Reference-level design documents for ctrlrelay. These cover system shape,
 component responsibilities, and decisions that predate (and inform) the
 implementation plans under [Plans]({{ '/reference/plans/' | relative_url }}).
 

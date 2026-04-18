@@ -9,9 +9,9 @@ class TestTelegramHandler:
     @pytest.mark.asyncio
     async def test_send_message(self) -> None:
         """Should send message via Telegram API."""
-        from dev_sync.bridge.telegram_handler import TelegramHandler
+        from ctrlrelay.bridge.telegram_handler import TelegramHandler
 
-        with patch("dev_sync.bridge.telegram_handler.Bot") as mock_bot_class:
+        with patch("ctrlrelay.bridge.telegram_handler.Bot") as mock_bot_class:
             mock_bot = AsyncMock()
             mock_bot_class.return_value = mock_bot
 
@@ -26,9 +26,9 @@ class TestTelegramHandler:
     @pytest.mark.asyncio
     async def test_ask_sends_with_keyboard(self) -> None:
         """Should send question with reply keyboard."""
-        from dev_sync.bridge.telegram_handler import TelegramHandler
+        from ctrlrelay.bridge.telegram_handler import TelegramHandler
 
-        with patch("dev_sync.bridge.telegram_handler.Bot") as mock_bot_class:
+        with patch("ctrlrelay.bridge.telegram_handler.Bot") as mock_bot_class:
             mock_bot = AsyncMock()
             mock_message = MagicMock()
             mock_message.message_id = 42

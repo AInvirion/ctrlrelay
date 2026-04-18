@@ -11,11 +11,11 @@ class TestSecopsIntegration:
     @pytest.mark.asyncio
     async def test_full_secops_flow_with_mocked_claude(self, tmp_path: Path) -> None:
         """Should run complete secops flow with mocked Claude subprocess."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher
-        from dev_sync.core.github import GitHubCLI
-        from dev_sync.core.state import StateDB
-        from dev_sync.core.worktree import WorktreeManager
-        from dev_sync.pipelines.secops import run_secops_all
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.core.worktree import WorktreeManager
+        from ctrlrelay.pipelines.secops import run_secops_all
 
         db_path = tmp_path / "state.db"
         db = StateDB(db_path)
@@ -51,8 +51,8 @@ class TestSecopsIntegration:
                 "outputs": {"merged_prs": [101, 102]},
             }))
 
-            from dev_sync.core.checkpoint import read_checkpoint
-            from dev_sync.core.dispatcher import SessionResult
+            from ctrlrelay.core.checkpoint import read_checkpoint
+            from ctrlrelay.core.dispatcher import SessionResult
             return SessionResult(
                 session_id=kwargs["session_id"],
                 exit_code=0,

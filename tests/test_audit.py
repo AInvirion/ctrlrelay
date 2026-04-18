@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from dev_sync.core.audit import AuditCheck, AuditResult, SkillAudit
+from ctrlrelay.core.audit import AuditCheck, AuditResult, SkillAudit
 
 
 class TestAuditModels:
@@ -47,7 +47,7 @@ class TestAuditModels:
 class TestSkillDiscovery:
     def test_discover_skills(self, tmp_path: Path) -> None:
         """Should find all SKILL.md files in directory."""
-        from dev_sync.core.audit import discover_skills
+        from ctrlrelay.core.audit import discover_skills
 
         # Create mock skills
         skill1 = tmp_path / "skill-one" / "SKILL.md"
@@ -65,14 +65,14 @@ class TestSkillDiscovery:
 
     def test_discover_skills_empty_dir(self, tmp_path: Path) -> None:
         """Should return empty list if no skills found."""
-        from dev_sync.core.audit import discover_skills
+        from ctrlrelay.core.audit import discover_skills
 
         skills = discover_skills(tmp_path)
         assert skills == []
 
     def test_discover_skills_parses_name(self, tmp_path: Path) -> None:
         """Should parse skill name from YAML frontmatter."""
-        from dev_sync.core.audit import discover_skills
+        from ctrlrelay.core.audit import discover_skills
 
         skill = tmp_path / "my-skill" / "SKILL.md"
         skill.parent.mkdir()
@@ -85,12 +85,12 @@ class TestSkillDiscovery:
 class TestAuditChecks:
     def test_check_checkpoint_passes_with_import(self, tmp_path: Path) -> None:
         """Should pass if skill imports checkpoint module."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
             path=tmp_path,
-            content="# Skill\n\n```python\nfrom dev_sync import checkpoint\ncheckpoint.done()\n```",
+            content="# Skill\n\n```python\nfrom ctrlrelay import checkpoint\ncheckpoint.done()\n```",
             frontmatter={},
         )
         result = run_check(skill, AuditCheck.CHECKPOINT)
@@ -98,7 +98,7 @@ class TestAuditChecks:
 
     def test_check_checkpoint_fails_without(self, tmp_path: Path) -> None:
         """Should fail if skill has no checkpoint references."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -111,7 +111,7 @@ class TestAuditChecks:
 
     def test_check_headless_passes_without_input(self, tmp_path: Path) -> None:
         """Should pass if skill has no interactive prompts."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -124,7 +124,7 @@ class TestAuditChecks:
 
     def test_check_headless_fails_with_input(self, tmp_path: Path) -> None:
         """Should fail if skill uses input()."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -137,7 +137,7 @@ class TestAuditChecks:
 
     def test_check_headless_fails_with_playwright(self, tmp_path: Path) -> None:
         """Should fail if skill uses playwright MCP without fallback."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -150,7 +150,7 @@ class TestAuditChecks:
 
     def test_check_attribution_passes_clean(self, tmp_path: Path) -> None:
         """Should pass if no Claude/Anthropic in output."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -163,7 +163,7 @@ class TestAuditChecks:
 
     def test_check_attribution_fails_with_claude(self, tmp_path: Path) -> None:
         """Should fail if output mentions Claude."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -178,12 +178,12 @@ class TestAuditChecks:
 class TestAuditFunctions:
     def test_audit_skill(self, tmp_path: Path) -> None:
         """audit_skill should run all checks on a skill."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, audit_skill
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, audit_skill
 
         skill = SkillInfo(
             name="test",
             path=tmp_path,
-            content="# Skill\n\n```python\nfrom dev_sync import checkpoint\ncheckpoint.done()\n```",
+            content="# Skill\n\n```python\nfrom ctrlrelay import checkpoint\ncheckpoint.done()\n```",
             frontmatter={},
         )
 
@@ -194,12 +194,12 @@ class TestAuditFunctions:
 
     def test_audit_all(self, tmp_path: Path) -> None:
         """audit_all should audit all skills in directory."""
-        from dev_sync.core.audit import AuditCheck, audit_all
+        from ctrlrelay.core.audit import AuditCheck, audit_all
 
         # Create skills
         skill1 = tmp_path / "skill-one" / "SKILL.md"
         skill1.parent.mkdir()
-        skill1.write_text("---\nname: skill-one\n---\n# Ready\n\nfrom dev_sync import checkpoint")
+        skill1.write_text("---\nname: skill-one\n---\n# Ready\n\nfrom ctrlrelay import checkpoint")
 
         skill2 = tmp_path / "skill-two" / "SKILL.md"
         skill2.parent.mkdir()
@@ -216,7 +216,7 @@ class TestAuditFunctions:
 class TestAuditReport:
     def test_format_report(self) -> None:
         """format_report should generate markdown table."""
-        from dev_sync.core.audit import (
+        from ctrlrelay.core.audit import (
             AuditCheck,
             AuditResult,
             SkillAudit,
