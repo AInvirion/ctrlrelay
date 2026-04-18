@@ -16,3 +16,6 @@ __pycache__/
 # Claude worktrees
 .claude/worktrees/
 
+# Backup of old config system
+bkp/
+
