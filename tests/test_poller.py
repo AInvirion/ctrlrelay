@@ -385,10 +385,46 @@ class TestIssuePoller:
         assert [(x["repo"], x["issue"]["number"]) for x in new] == [
             ("owner/ok", 10)
         ]
-        # Bad repo's processing failure is logged.
+        # The malformed item is logged.
         assert any(
-            "poll.repo.processing_failed" in r.getMessage()
-            for r in caplog.records
+            "poll.issue.malformed" in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_poll_malformed_issue_does_not_block_later_issues_in_same_repo(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Codex P2: a malformed issue MUST NOT prevent later good issues in
+        the same repo's batch from being discovered. Otherwise the valid
+        issues after the bad one are never processed until someone fixes the
+        data upstream."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[
+                {"number": 1, "title": "first good"},
+                {"title": "no number — malformed"},
+                {"number": 2, "title": "second good AFTER the bad one"},
+            ]
+        )
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            new = await poller.poll()
+
+        numbers = sorted(x["issue"]["number"] for x in new)
+        assert numbers == [1, 2], (
+            "expected both good issues to be discovered even though there "
+            f"was a malformed item between them, got {numbers}"
         )
 
     @pytest.mark.asyncio
@@ -524,7 +560,7 @@ class TestIssuePoller:
         self, tmp_path: Path, caplog
     ) -> None:
         """An exception from the handler (e.g. run_dev_issue crash) must be
-        caught by the outer safety net so the next poll cycle still runs."""
+        logged and the loop must continue to the next iteration."""
         import logging
 
         from ctrlrelay.core.poller import IssuePoller, run_poll_loop
@@ -552,7 +588,57 @@ class TestIssuePoller:
                 max_iterations=1,
             )
 
-        # The handler failure should have been logged as iteration.failed,
-        # not propagated up as an unhandled exception.
         msgs = [r.getMessage() for r in caplog.records]
-        assert any("poll.iteration.failed" in m for m in msgs), msgs
+        # The per-handler guard emits poll.handler.failed with the offending
+        # repo+issue — distinct from the outer poll.iteration.failed which
+        # is only for poll() itself crashing.
+        assert any("poll.handler.failed" in m for m in msgs), msgs
+
+    @pytest.mark.asyncio
+    async def test_run_poll_loop_handler_failure_does_not_skip_rest_of_batch(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Codex P1: if handler fails on the first issue, the rest of the
+        batch from the same poll cycle MUST still run. Otherwise those
+        issues are marked seen (by poll()) but never handled — silently
+        dropped until daemon restart."""
+        import logging
+
+        from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[
+                {"number": 1, "title": "will blow up handler"},
+                {"number": 2, "title": "second"},
+                {"number": 3, "title": "third"},
+            ]
+        )
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        processed: list[int] = []
+
+        async def handler(repo: str, issue: dict) -> None:
+            if issue["number"] == 1:
+                raise RuntimeError("handler blew up on first")
+            processed.append(issue["number"])
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            await run_poll_loop(
+                poller=poller,
+                handler=handler,
+                interval=0,
+                max_iterations=1,
+            )
+
+        # Issues 2 and 3 MUST still have run — per-handler isolation.
+        assert processed == [2, 3], processed
+        assert any(
+            "poll.handler.failed" in r.getMessage() for r in caplog.records
+        )

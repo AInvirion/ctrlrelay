@@ -177,27 +177,27 @@ class IssuePoller:
             # Successful lookup — clear any accumulated failure count.
             self._clear_repo_failure(repo)
 
-            try:
-                seen_for_repo = self.seen_issues.setdefault(repo, set())
-                for issue in issues:
-                    number: int = issue["number"]
-                    if number not in seen_for_repo:
-                        new_issues.append({"repo": repo, "issue": issue})
-                        seen_for_repo.add(number)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # Malformed issue payload (missing 'number', wrong type) etc.
-                # Contain the damage to this repo so other repos' results and
-                # any already-accumulated new_issues still reach the caller.
-                log_event(
-                    _logger,
-                    "poll.repo.processing_failed",
-                    repo=repo,
-                    reason=type(e).__name__,
-                    error=str(e)[:200],
-                )
-                continue
+            seen_for_repo = self.seen_issues.setdefault(repo, set())
+            for issue in issues:
+                # Per-issue guard so ONE malformed payload (missing 'number',
+                # wrong type, non-dict entry) doesn't poison the remaining
+                # good issues in the same repo's batch.
+                try:
+                    number = int(issue["number"])
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log_event(
+                        _logger,
+                        "poll.issue.malformed",
+                        repo=repo,
+                        reason=type(e).__name__,
+                        error=str(e)[:200],
+                    )
+                    continue
+                if number not in seen_for_repo:
+                    new_issues.append({"repo": repo, "issue": issue})
+                    seen_for_repo.add(number)
 
         # Never propagate a save_state disk failure out of poll() — the
         # caller has work to do with new_issues. Log and move on.
@@ -262,10 +262,11 @@ async def run_poll_loop(
     """
     iterations = 0
     while max_iterations is None or iterations < max_iterations:
+        # Guard poll() separately from the handler dispatch: a malformed
+        # poll result shouldn't lose queued work, and a handler failure
+        # shouldn't skip the rest of the batch.
         try:
             new_issues = await poller.poll()
-            for item in new_issues:
-                await handler(item["repo"], item["issue"])
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -273,9 +274,30 @@ async def run_poll_loop(
                 _logger,
                 "poll.iteration.failed",
                 iteration=iterations,
+                phase="poll",
                 reason=type(e).__name__,
                 error=str(e)[:200],
             )
+            new_issues = []
+
+        # Each handler invocation is isolated. A failure on one issue must
+        # not cancel the remaining already-seen-and-persisted issues — those
+        # would otherwise be silently dropped until daemon restart.
+        for item in new_issues:
+            try:
+                await handler(item["repo"], item["issue"])
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                issue = item.get("issue") or {}
+                log_event(
+                    _logger,
+                    "poll.handler.failed",
+                    repo=item.get("repo"),
+                    issue_number=issue.get("number"),
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                )
 
         iterations += 1
         if max_iterations is None or iterations < max_iterations:
