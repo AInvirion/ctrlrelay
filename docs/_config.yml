@@ -1,0 +1,59 @@
+title: dev-sync
+description: >-
+  Local-first orchestrator for Claude Code across multiple GitHub repos —
+  design specs, implementation plans, and operator guides.
+url: ""
+baseurl: ""
+
+remote_theme: just-the-docs/just-the-docs
+
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+# just-the-docs configuration
+color_scheme: light
+search_enabled: true
+search:
+  heading_level: 3
+  previews: 2
+  preview_words_before: 3
+  preview_words_after: 3
+  tokenizer_separator: /[\s/]+/
+  rel_url: true
+  button: false
+
+heading_anchors: true
+
+# Aux links appear in the top right of the layout
+aux_links:
+  "GitHub":
+    - "https://github.com/AInvirion/dev-sync"
+aux_links_new_tab: true
+
+# Footer
+footer_content: >-
+  Docs for <a href="https://github.com/AInvirion/dev-sync">AInvirion/dev-sync</a>.
+  Served from <code>/docs</code> via GitHub Pages.
+
+# Back to top
+back_to_top: true
+back_to_top_text: "Back to top"
+
+# Build
+markdown: kramdown
+highlighter: rouge
+kramdown:
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false
+
+# Exclude dev artifacts from the build
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor/
+  - node_modules/
+  - .jekyll-cache/
+  - _site/

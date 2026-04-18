@@ -16,6 +16,13 @@ __pycache__/
 # Claude worktrees
 .claude/worktrees/
 
+# Jekyll (docs site)
+docs/_site/
+docs/.jekyll-cache/
+docs/.jekyll-metadata
+docs/vendor/
+docs/Gemfile.lock
+
 # Backup of old config system
 bkp/
 
