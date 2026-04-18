@@ -4,10 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
+
+
+def _find_claude() -> str:
+    """Find claude binary, checking common paths if not in PATH."""
+    claude = shutil.which("claude")
+    if claude:
+        return claude
+    for path in [
+        os.path.expanduser("~/.local/bin/claude"),
+        "/usr/local/bin/claude",
+        "/opt/homebrew/bin/claude",
+    ]:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return "claude"
 
 
 @dataclass
@@ -40,7 +56,7 @@ class SessionResult:
 class ClaudeDispatcher:
     """Spawns and manages Claude subprocess sessions."""
 
-    claude_binary: str = "claude"
+    claude_binary: str = field(default_factory=_find_claude)
     default_timeout: int = 1800
     extra_env: dict[str, str] = field(default_factory=dict)
 
