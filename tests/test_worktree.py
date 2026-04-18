@@ -186,3 +186,141 @@ class TestWorktreeManager:
         link = worktree_path / "CLAUDE.md"
         assert link.is_symlink()
         assert link.resolve() == context_file.resolve()
+
+    @pytest.mark.asyncio
+    async def test_branch_exists_locally_true(self, tmp_path: Path) -> None:
+        """show-ref returning 0 means the branch is a local ref."""
+        from dev_sync.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare_path = tmp_path / "repos" / "owner-repo.git"
+        bare_path.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.return_value = ""
+            assert await manager.branch_exists_locally("owner/repo", "fix/issue-13") is True
+
+    @pytest.mark.asyncio
+    async def test_branch_exists_locally_false(self, tmp_path: Path) -> None:
+        """show-ref raising means the branch does not exist locally."""
+        from dev_sync.core.worktree import WorktreeError, WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare_path = tmp_path / "repos" / "owner-repo.git"
+        bare_path.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = WorktreeError("bad ref")
+            assert await manager.branch_exists_locally("owner/repo", "fix/issue-13") is False
+
+    @pytest.mark.asyncio
+    async def test_branch_exists_locally_no_bare_repo(self, tmp_path: Path) -> None:
+        """With no bare repo yet, the branch cannot exist locally."""
+        from dev_sync.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        assert await manager.branch_exists_locally("owner/repo", "fix/issue-13") is False
+
+    @pytest.mark.asyncio
+    async def test_branch_exists_on_remote_true(self, tmp_path: Path) -> None:
+        """ls-remote returning a ref line means the branch is on origin."""
+        from dev_sync.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare_path = tmp_path / "repos" / "owner-repo.git"
+        bare_path.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.return_value = (
+                "abc123\trefs/heads/fix/issue-13\n"
+            )
+            assert await manager.branch_exists_on_remote("owner/repo", "fix/issue-13") is True
+
+    @pytest.mark.asyncio
+    async def test_branch_exists_on_remote_false(self, tmp_path: Path) -> None:
+        """Empty ls-remote output means the branch is not on origin."""
+        from dev_sync.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare_path = tmp_path / "repos" / "owner-repo.git"
+        bare_path.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.return_value = ""
+            assert await manager.branch_exists_on_remote("owner/repo", "fix/issue-13") is False
+
+    @pytest.mark.asyncio
+    async def test_branch_exists_on_remote_uses_short_timeout(
+        self, tmp_path: Path
+    ) -> None:
+        """The remote probe must NOT inherit the default 120s timeout — a
+        flaky network would otherwise hold the repo lock for 2 extra minutes
+        on every failed cleanup."""
+        from dev_sync.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare_path = tmp_path / "repos" / "owner-repo.git"
+        bare_path.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.return_value = ""
+            await manager.branch_exists_on_remote("owner/repo", "fix/issue-13")
+            assert mock_git.await_args.kwargs.get("timeout") == 10
+
+    @pytest.mark.asyncio
+    async def test_branch_exists_on_remote_fails_closed_on_timeout(
+        self, tmp_path: Path
+    ) -> None:
+        """If ls-remote hangs / times out (credential prompt, flaky network),
+        the probe must return True so callers preserve the branch instead of
+        mistakenly treating it as local-only."""
+        import asyncio as _asyncio
+
+        from dev_sync.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare_path = tmp_path / "repos" / "owner-repo.git"
+        bare_path.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = _asyncio.TimeoutError()
+            assert await manager.branch_exists_on_remote("owner/repo", "fix/issue-13") is True
+
+    @pytest.mark.asyncio
+    async def test_branch_exists_on_remote_fails_closed_on_worktree_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Generic git failures (auth, network refused) also fail closed."""
+        from dev_sync.core.worktree import WorktreeError, WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare_path = tmp_path / "repos" / "owner-repo.git"
+        bare_path.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = WorktreeError("fatal: could not read Username")
+            assert await manager.branch_exists_on_remote("owner/repo", "fix/issue-13") is True
