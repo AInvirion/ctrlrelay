@@ -137,7 +137,7 @@ class TestWorktreeManager:
             #  update-ref -d refs/ctrlrelay/sync/<b> → worktree add
             mock_git.side_effect = [
                 "",                                  # show-ref --verify
-                "",                                  # worktree list --porcelain (no other checkouts)
+                "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-5\n",     # ls-remote --heads origin
                 "",                                  # fetch into scratch
                 "",                                  # merge-base --is-ancestor (ok)
