@@ -12,6 +12,14 @@ from ctrlrelay.transports.base import Transport
 
 _logger = get_logger("pipelines.post_merge")
 
+# Default merge-watch window. Real PR review cycles commonly exceed a
+# day (weekends, time-zone splits, larger changes), and a silent watch
+# timeout means the linked issue never auto-closes and no merge
+# notification fires. 7 days is the sweet spot: covers typical review
+# lag without keeping a zombie task alive for months on an abandoned PR.
+# Operators can still override via an explicit `timeout=` argument.
+DEFAULT_PR_WATCH_TIMEOUT = 7 * 24 * 60 * 60
+
 
 async def handle_merge(
     repo: str,
@@ -40,7 +48,7 @@ async def watch_and_handle_merge(
     github: GitHubCLI,
     transport: Transport | None = None,
     poll_interval: int = 60,
-    timeout: int = 86400,
+    timeout: int = DEFAULT_PR_WATCH_TIMEOUT,
 ) -> bool:
     """Watch for PR merge and handle post-merge actions."""
     watcher = PRWatcher(github=github, poll_interval=poll_interval)
@@ -70,7 +78,7 @@ async def pr_watch_task(
     github: GitHubCLI,
     transport_factory: Callable[[], Awaitable[Transport | None]] | None = None,
     poll_interval: int = 60,
-    timeout: int = 86400,
+    timeout: int = DEFAULT_PR_WATCH_TIMEOUT,
 ) -> dict[str, Any]:
     """Background-safe wrapper around watch_and_handle_merge that manages
     its own transport lifecycle and emits structured ``dev.pr.*`` events.

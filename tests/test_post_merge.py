@@ -58,6 +58,15 @@ class TestPostMergeHandler:
 class TestPRWatchTask:
     """Cover the background-safe wrapper the poller uses (#55)."""
 
+    def test_default_timeout_covers_typical_review_cycle(self) -> None:
+        """Codex P2: review cycles commonly exceed 24h. Default must not
+        abandon watchers before a normal merge lands."""
+        from ctrlrelay.pipelines.post_merge import DEFAULT_PR_WATCH_TIMEOUT
+
+        # 7 days in seconds; anything shorter risks silent timeouts on
+        # normal review lag.
+        assert DEFAULT_PR_WATCH_TIMEOUT >= 7 * 24 * 60 * 60
+
     @pytest.mark.asyncio
     async def test_merged_logs_event_and_closes_issue(self, caplog) -> None:
         from ctrlrelay.pipelines.post_merge import pr_watch_task
