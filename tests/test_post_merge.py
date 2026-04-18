@@ -177,6 +177,74 @@ class TestPRWatchTask:
         )
 
     @pytest.mark.asyncio
+    async def test_transport_factory_called_only_after_merge_detected(self) -> None:
+        """Codex P2: lazy transport. A 7-day watch would build the
+        transport at start and hold it; bridge restarts during that
+        window would leave us with a stale connection when the merge
+        finally lands. The factory must be invoked only AFTER
+        check_merged returns True, right before handle_merge."""
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        factory_call_count = 0
+
+        async def factory():
+            nonlocal factory_call_count
+            factory_call_count += 1
+            return AsyncMock()
+
+        outcome = await pr_watch_task(
+            repo="owner/repo",
+            issue_number=77,
+            pr_url="",
+            pr_number=42,
+            session_id=None,
+            github=mock_github,
+            transport_factory=factory,
+            poll_interval=0,
+            timeout=5,
+        )
+
+        assert outcome["merged"] is True
+        # Factory invoked exactly once and only because the watcher
+        # reached the merged branch.
+        assert factory_call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_transport_factory_not_called_on_timeout(self) -> None:
+        """No merge → no notification → factory must not be invoked.
+        Avoids creating an unnecessary transport connection for a PR
+        that sat in review and was eventually abandoned."""
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "OPEN"}
+
+        factory_call_count = 0
+
+        async def factory():
+            nonlocal factory_call_count
+            factory_call_count += 1
+            return AsyncMock()
+
+        outcome = await pr_watch_task(
+            repo="owner/repo",
+            issue_number=77,
+            pr_url="",
+            pr_number=42,
+            session_id=None,
+            github=mock_github,
+            transport_factory=factory,
+            poll_interval=0,
+            timeout=0,
+        )
+
+        assert outcome["timed_out"] is True
+        assert factory_call_count == 0
+
+    @pytest.mark.asyncio
     async def test_transport_factory_failure_is_non_fatal(self, caplog) -> None:
         """If the transport factory raises, we log and proceed with
         transport=None — the merge detection itself must not depend on

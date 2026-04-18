@@ -6,7 +6,10 @@ import asyncio
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from ctrlrelay.core.github import GitHubCLI
+from ctrlrelay.core.github import GitHubCLI, GitHubError
+from ctrlrelay.core.obs import get_logger, log_event
+
+_logger = get_logger("core.pr_watcher")
 
 
 @dataclass
@@ -46,14 +49,40 @@ class PRWatcher:
 
         Returns:
             True if merged within timeout, False otherwise
+
+        Transient-failure handling: individual ``gh`` failures
+        (``GitHubError``, ``TimeoutError``, network-level ``OSError``)
+        during a multi-day watch MUST NOT abort the loop — otherwise a
+        single flaky poll cycle permanently stops monitoring the PR.
+        Log a structured ``pr_watch.transient_error`` event and keep
+        polling. ``asyncio.CancelledError`` is always re-raised so a
+        clean shutdown propagates.
         """
         elapsed = 0
         while elapsed < timeout:
-            if await self.check_merged(repo, pr_number):
-                return True
+            try:
+                if await self.check_merged(repo, pr_number):
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except (GitHubError, TimeoutError, OSError) as e:
+                log_event(
+                    _logger, "pr_watch.transient_error",
+                    repo=repo, pr_number=pr_number,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                    elapsed=elapsed,
+                )
+                # Fall through to the sleep + retry; don't count this
+                # as a successful poll in any way.
 
             if on_poll:
-                await on_poll()
+                try:
+                    await on_poll()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass  # on_poll is best-effort diagnostic plumbing
 
             await asyncio.sleep(self.poll_interval)
             elapsed += self.poll_interval

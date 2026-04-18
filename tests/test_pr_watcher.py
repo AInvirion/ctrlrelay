@@ -58,3 +58,62 @@ class TestPRWatcher:
 
         assert result is False
         assert mock_github.get_pr_state.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_wait_for_merge_survives_transient_gh_errors(
+        self, caplog
+    ) -> None:
+        """Codex P1: a single `gh pr view` failure during a multi-day
+        watch MUST NOT abort the loop. Transient errors are logged and
+        the loop keeps polling."""
+        import logging
+
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.pr_watcher import PRWatcher
+
+        calls = 0
+
+        async def flaky_then_merged(*_a, **_kw):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise GitHubError("gh failed: HTTP 503")
+            if calls == 2:
+                raise TimeoutError("gh timed out")
+            return {"state": "MERGED"}
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.side_effect = flaky_then_merged
+
+        watcher = PRWatcher(github=mock_github, poll_interval=0)
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.pr_watcher"):
+            result = await watcher.wait_for_merge(
+                "owner/repo", 42, timeout=60,
+            )
+
+        assert result is True
+        assert calls == 3
+        # Two transient errors logged as structured events.
+        transient = [
+            r for r in caplog.records
+            if "pr_watch.transient_error" in r.getMessage()
+        ]
+        assert len(transient) == 2
+
+    @pytest.mark.asyncio
+    async def test_wait_for_merge_propagates_cancellation(self) -> None:
+        """Shutdown must not be swallowed by the transient-error guard."""
+        import asyncio
+
+        from ctrlrelay.core.pr_watcher import PRWatcher
+
+        async def always_cancel(*_a, **_kw):
+            raise asyncio.CancelledError()
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.side_effect = always_cancel
+
+        watcher = PRWatcher(github=mock_github, poll_interval=0)
+        with pytest.raises(asyncio.CancelledError):
+            await watcher.wait_for_merge("owner/repo", 42, timeout=60)

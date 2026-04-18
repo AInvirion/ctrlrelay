@@ -80,14 +80,17 @@ async def pr_watch_task(
     poll_interval: int = 60,
     timeout: int = DEFAULT_PR_WATCH_TIMEOUT,
 ) -> dict[str, Any]:
-    """Background-safe wrapper around watch_and_handle_merge that manages
-    its own transport lifecycle and emits structured ``dev.pr.*`` events.
+    """Background-safe wrapper around the merge watcher that emits
+    structured ``dev.pr.*`` events and manages a transport LAZILY —
+    the transport is only created AFTER the merge is detected, so a
+    bridge that's down or restarted during the multi-day watch window
+    doesn't leave us with a stale connection at notification time.
 
-    ``transport_factory`` is an async callable returning a CONNECTED
-    transport (or None). It's invoked once at the start of the watch so
-    the watcher's transport is independent of whichever one handled the
-    initial issue dispatch (that one is closed when handle_issue returns).
-    Returning None is fine — the merge notification is then suppressed.
+    ``transport_factory`` is an async callable returning a connected
+    transport (or None). Called once, right before ``handle_merge``;
+    its result is closed immediately after the merge handler runs.
+    A raising factory is logged and skipped (merge detection proceeds
+    without the notification channel rather than aborting the close).
 
     Returns a dict describing the outcome:
       {"merged": bool, "timed_out": bool, "cancelled": bool, "failed": str|None}
@@ -96,18 +99,6 @@ async def pr_watch_task(
         "merged": False, "timed_out": False,
         "cancelled": False, "failed": None,
     }
-    transport: Transport | None = None
-    if transport_factory is not None:
-        try:
-            transport = await transport_factory()
-        except Exception as e:
-            log_event(
-                _logger,
-                "dev.pr.watch_transport_failed",
-                repo=repo, issue_number=issue_number, pr_number=pr_number,
-                reason=type(e).__name__, error=str(e)[:200],
-            )
-            transport = None
 
     log_event(
         _logger, "dev.pr.watching",
@@ -115,15 +106,39 @@ async def pr_watch_task(
         pr_number=pr_number, pr_url=pr_url,
     )
     try:
-        merged = await watch_and_handle_merge(
-            repo=repo,
-            pr_number=pr_number,
-            issue_number=issue_number,
-            github=github,
-            transport=transport,
-            poll_interval=poll_interval,
-            timeout=timeout,
+        watcher = PRWatcher(github=github, poll_interval=poll_interval)
+        merged = await watcher.wait_for_merge(
+            repo=repo, pr_number=pr_number, timeout=timeout,
         )
+        if merged:
+            # Build the transport NOW, not at watch start. Bridge may
+            # have been restarted during the multi-day window; a
+            # freshly-connected socket is the only reliable way to
+            # deliver the merge notification.
+            transport: Transport | None = None
+            if transport_factory is not None:
+                try:
+                    transport = await transport_factory()
+                except Exception as e:
+                    log_event(
+                        _logger, "dev.pr.watch_transport_failed",
+                        session_id=session_id, repo=repo,
+                        issue_number=issue_number, pr_number=pr_number,
+                        reason=type(e).__name__, error=str(e)[:200],
+                    )
+                    transport = None
+            try:
+                await handle_merge(
+                    repo=repo, pr_number=pr_number,
+                    issue_number=issue_number, github=github,
+                    transport=transport,
+                )
+            finally:
+                if transport is not None:
+                    try:
+                        await transport.close()
+                    except Exception:
+                        pass
         outcome["merged"] = merged
         outcome["timed_out"] = not merged
         log_event(
@@ -148,10 +163,4 @@ async def pr_watch_task(
             pr_number=pr_number,
             reason=type(e).__name__, error=str(e)[:200],
         )
-    finally:
-        if transport is not None:
-            try:
-                await transport.close()
-            except Exception:
-                pass
     return outcome
