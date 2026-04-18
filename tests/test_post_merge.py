@@ -489,6 +489,64 @@ class TestPRWatchTask:
         )
 
     @pytest.mark.asyncio
+    async def test_factory_returning_none_is_clean_no_retry(
+        self, caplog
+    ) -> None:
+        """Codex P2: a factory that returns None legitimately (e.g.
+        file_mock transport or Telegram socket absent) means "no
+        notification channel configured". The retry loop MUST NOT
+        treat that as a failure — every merge would otherwise pay full
+        retry backoff and report outcome["failed"] on non-Telegram
+        setups."""
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        factory_calls = 0
+
+        async def factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return None  # no notification channel configured
+
+        import ctrlrelay.pipelines.post_merge as pm
+        orig = pm._HANDLE_MERGE_RETRY_BASE_DELAY
+        pm._HANDLE_MERGE_RETRY_BASE_DELAY = 0
+        try:
+            with caplog.at_level(logging.INFO, logger="ctrlrelay.pipelines.post_merge"):
+                outcome = await pr_watch_task(
+                    repo="owner/repo",
+                    issue_number=77,
+                    pr_url="",
+                    pr_number=42,
+                    session_id=None,
+                    github=mock_github,
+                    transport_factory=factory,
+                    poll_interval=0,
+                    timeout=5,
+                )
+        finally:
+            pm._HANDLE_MERGE_RETRY_BASE_DELAY = orig
+
+        # Clean success: merged + closed, no failure, no retry churn.
+        assert outcome["merged"] is True
+        assert outcome["failed"] is None
+        assert factory_calls == 1
+        mock_github.comment_on_issue.assert_called_once()
+        close_calls = [
+            c for c in mock_github._run_gh.call_args_list
+            if c.args[:2] == ("issue", "close")
+        ]
+        assert len(close_calls) == 1
+        # No retry events fired.
+        retry_events = [
+            r for r in caplog.records
+            if "dev.pr.handle_merge_retry" in r.getMessage()
+        ]
+        assert retry_events == []
+
+    @pytest.mark.asyncio
     async def test_transient_transport_factory_failure_retries_and_recovers(
         self, caplog
     ) -> None:

@@ -119,11 +119,6 @@ async def _handle_merge_with_retry(
         f"Issue #{issue_number} closed after PR #{pr_number} merged in {repo}"
     )
 
-    # Notification is "required" only if the caller asked for one (by
-    # passing a transport_factory). Without a factory, comment+close is
-    # the whole contract and we're done once those land.
-    notification_required = transport_factory is not None
-
     for attempt in range(1, _HANDLE_MERGE_RETRY_ATTEMPTS + 1):
         transport: Transport | None = None
         transport_build_error: Exception | None = None
@@ -131,6 +126,9 @@ async def _handle_merge_with_retry(
             try:
                 transport = await transport_factory()
             except Exception as e:
+                # Factory raised — bridge likely transiently unavailable.
+                # Record the error so we can retry on the next attempt
+                # instead of silently dropping the notification.
                 transport_build_error = e
                 log_event(
                     _logger, "dev.pr.watch_transport_failed",
@@ -140,6 +138,10 @@ async def _handle_merge_with_retry(
                     reason=type(e).__name__, error=str(e)[:200],
                 )
                 transport = None
+            # Factory returned None legitimately (e.g. non-Telegram
+            # config or socket intentionally absent) → no notification
+            # channel is configured; do NOT retry. `transport_build_error`
+            # remains None, so the "done" check below returns cleanly.
 
         try:
             if not comment_posted:
@@ -154,19 +156,15 @@ async def _handle_merge_with_retry(
                 await transport.send(notification)
                 notification_sent = True
 
-            # Done only when every required step has completed. If the
-            # caller wanted a notification but the factory failed to
-            # produce a transport this round, fall through to the retry
-            # path so the next attempt can rebuild the connection —
-            # otherwise a brief bridge outage at merge time would
-            # permanently drop the notification.
-            if notification_sent or not notification_required:
+            # Done when either: we sent the notification this round, OR
+            # the factory returned None meaning no channel was ever
+            # configured. Fall through to the retry path ONLY if the
+            # factory itself raised — that's a transient failure worth
+            # retrying so a brief bridge outage doesn't drop the
+            # notification permanently.
+            if notification_sent or transport_build_error is None:
                 return
-            # Synthesize a retry-worthy error so the transient factory
-            # failure is treated uniformly with send/close failures.
-            raise transport_build_error or RuntimeError(
-                "transport factory returned None; cannot send notification"
-            )
+            raise transport_build_error
         except asyncio.CancelledError:
             raise
         except Exception as e:
