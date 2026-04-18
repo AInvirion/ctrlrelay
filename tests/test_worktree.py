@@ -423,6 +423,57 @@ class TestWorktreeManager:
         )
 
     @pytest.mark.asyncio
+    async def test_prunable_worktree_stanza_does_not_block_reuse(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2: if `git worktree list` still reports a stale stanza
+        for a worktree that's been rm -rf'd but not yet pruned, the
+        branch-checked-out probe must IGNORE it (the `prunable` marker
+        means the checkout is gone). Otherwise a crash between worktree
+        dir removal and `git worktree prune` wedges the branch for all
+        future retries."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        stale_porcelain = (
+            "worktree /Users/x/.ctrlrelay/worktrees/owner-repo-crashed-sess\n"
+            "HEAD abc123\n"
+            "branch refs/heads/fix/issue-88\n"
+            "prunable gitdir file points to non-existent location\n"
+            "\n"
+        )
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",                                      # show-ref (local exists)
+                stale_porcelain,                         # worktree list: prunable stanza
+                "",                                      # ls-remote (no remote)
+                "refs/heads/main\n",                     # get_default_branch
+                "+ abc unique\n",                        # cherry: unique → reuse
+                "",                                      # worktree add (reuse)
+            ]
+            wt = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="retry-after-crash",
+                new_branch="fix/issue-88",
+            )
+
+        assert "retry-after-crash" in str(wt)
+        # Reuse must have happened — no `already checked out` error raised.
+        worktree_add = [
+            c for c in mock_git.call_args_list
+            if "worktree" in c[0] and "add" in c[0]
+        ]
+        assert len(worktree_add) == 1
+        assert "-b" not in worktree_add[0][0]
+
+    @pytest.mark.asyncio
     async def test_local_only_with_unique_commits_is_reused(
         self, tmp_path: Path
     ) -> None:

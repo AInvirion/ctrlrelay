@@ -337,11 +337,19 @@ class WorktreeManager:
         self, bare_path: Path, branch: str,
     ) -> bool:
         """Return True if ``refs/heads/<branch>`` is currently checked out
-        by any linked worktree of this bare repo.
+        by any LIVE linked worktree of this bare repo.
 
-        Conservative (fails closed): if ``git worktree list --porcelain``
-        itself errors, returns True — better to refuse mutation than to
-        risk corrupting a live worktree.
+        `git worktree list --porcelain` emits a blank-line-separated
+        stanza per worktree. A stanza with a ``prunable <reason>`` line
+        is a stale metadata entry — the worktree directory is gone, we
+        just haven't run ``git worktree prune`` yet. Such stanzas don't
+        represent a real checkout and MUST be ignored here, otherwise a
+        crash between ``shutil.rmtree()`` and ``worktree prune`` wedges
+        the branch for all future retries.
+
+        Conservative (fails closed): if the probe itself errors, returns
+        True — better to refuse mutation than to risk corrupting a live
+        worktree.
         """
         try:
             output = await self._run_git(
@@ -350,11 +358,26 @@ class WorktreeManager:
             )
         except Exception:
             return True
+
         target = f"refs/heads/{branch}"
-        for line in output.splitlines():
-            line = line.strip()
-            if line.startswith("branch ") and line[7:].strip() == target:
-                return True
+        current_branch: str | None = None
+        current_prunable = False
+        for raw in output.splitlines() + [""]:  # trailing "" to flush last stanza
+            line = raw.strip()
+            if not line:
+                # End of stanza — check if this one matches and is live.
+                if (
+                    current_branch == target
+                    and not current_prunable
+                ):
+                    return True
+                current_branch = None
+                current_prunable = False
+                continue
+            if line.startswith("branch "):
+                current_branch = line[7:].strip()
+            elif line.startswith("prunable"):
+                current_prunable = True
         return False
 
     async def _branch_is_fully_merged(self, repo: str, branch: str) -> bool:
