@@ -31,8 +31,15 @@ class GitHubCLI:
     gh_binary: str = field(default_factory=_find_gh)
     timeout: int = 60
 
-    async def _run_gh(self, *args: str) -> str:
-        """Run gh command and return stdout."""
+    async def _run_gh(self, *args: str, capture_on_nonzero: bool = False) -> str:
+        """Run gh command and return stdout.
+
+        By default, non-zero exits raise GitHubError. Some commands
+        (notably `gh pr checks`) print their JSON payload to stdout even
+        when they exit non-zero (e.g. while checks are still pending).
+        Callers that need that payload can set `capture_on_nonzero=True` to
+        receive stdout regardless of exit code.
+        """
         cmd = [self.gh_binary, *args]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -43,7 +50,7 @@ class GitHubCLI:
             proc.communicate(), timeout=self.timeout
         )
 
-        if proc.returncode != 0:
+        if proc.returncode != 0 and not capture_on_nonzero:
             raise GitHubError(f"gh failed: {stderr.decode().strip()}")
 
         return stdout.decode()
@@ -102,22 +109,25 @@ class GitHubCLI:
         """Get status checks for a PR.
 
         Uses `gh pr checks --json name,state,bucket,link`. `bucket` categorizes
-        the raw state into: pass, fail, pending, skipping, cancel — the right
-        abstraction for "is this done / did it pass". `gh pr checks` also
-        exits non-zero while any check is pending or failing, which our
-        `_run_gh` surfaces as `GitHubError`. Treat that as "still pending" so
-        the verifier keeps polling instead of crashing.
+        the raw state into: pass, fail, pending, skipping, cancel. `gh pr
+        checks` exits non-zero while any check is pending or failing, but it
+        still prints the JSON payload to stdout — so we use
+        `capture_on_nonzero=True` and parse whatever comes back. Genuine
+        failures (auth, network, missing PR) print nothing/garbage and raise
+        `json.JSONDecodeError`, which we let surface so callers don't mistake
+        them for 'no CI configured'.
         """
-        try:
-            output = await self._run_gh(
-                "pr", "checks",
-                str(pr_number),
-                "--repo", repo,
-                "--json", "name,state,bucket,link",
-            )
-        except GitHubError:
+        output = await self._run_gh(
+            "pr", "checks",
+            str(pr_number),
+            "--repo", repo,
+            "--json", "name,state,bucket,link",
+            capture_on_nonzero=True,
+        )
+        stripped = output.strip()
+        if not stripped:
             return []
-        return json.loads(output) if output.strip() else []
+        return json.loads(stripped)
 
     def all_checks_passed(self, checks: list[dict[str, Any]]) -> bool:
         """Check if all PR checks passed."""

@@ -60,19 +60,43 @@ class TestPRVerifier:
         assert mock_github.get_pr_checks.call_count >= 2
 
     @pytest.mark.asyncio
-    async def test_wait_for_checks_returns_immediately_when_no_checks(self) -> None:
-        """Repos with no CI configured must not block for `check_timeout`."""
+    async def test_wait_for_checks_requires_two_empty_polls_to_conclude_no_ci(
+        self,
+    ) -> None:
+        """GitHub registers check runs asynchronously after `gh pr create`, so
+        a single empty read is ambiguous. Require a confirmation poll before
+        concluding 'no CI configured', otherwise we'd skip CI entirely on a
+        PR whose checks are about to register."""
+        from dev_sync.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        # First read empty (checks not registered yet), second read has a
+        # pending check, third is green.
+        mock_github.get_pr_checks.side_effect = [
+            [],
+            [{"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"}],
+            [{"name": "ci", "state": "SUCCESS", "bucket": "pass"}],
+        ]
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        checks = await verifier.wait_for_checks("owner/repo", 42, timeout=60)
+
+        assert mock_github.get_pr_checks.call_count == 3
+        assert checks[0]["bucket"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_checks_concludes_no_ci_after_confirmation(self) -> None:
+        """Two consecutive empty reads = no CI, safe to exit."""
         from dev_sync.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = []
 
-        # If the bug were present this would hang ~30 minutes.
-        verifier = PRVerifier(github=mock_github, poll_interval=60)
-        checks = await verifier.wait_for_checks("owner/repo", 42, timeout=1800)
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        checks = await verifier.wait_for_checks("owner/repo", 42, timeout=60)
 
         assert checks == []
-        mock_github.get_pr_checks.assert_called_once()
+        assert mock_github.get_pr_checks.call_count == 2
 
     @pytest.mark.asyncio
     async def test_verify_ready_when_all_checks_pass_and_mergeable(self) -> None:
@@ -172,6 +196,69 @@ class TestPRVerifier:
         mock_github.get_pr_state.return_value = {
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
+        }
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        result = await verifier.verify("owner/repo", 42)
+
+        assert result.ready is True
+
+    @pytest.mark.asyncio
+    async def test_verify_not_ready_when_behind_base_branch(self) -> None:
+        """mergeable=MERGEABLE + mergeStateStatus=BEHIND means branch protection
+        requires up-to-date branches. Must not hand off as ready."""
+        from dev_sync.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks.return_value = [
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
+        ]
+        mock_github.get_pr_state.return_value = {
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "BEHIND",
+        }
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        result = await verifier.verify("owner/repo", 42)
+
+        assert result.ready is False
+        assert result.merge_state_status == "BEHIND"
+        assert "behind" in result.reason.lower() or "rebase" in result.reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_verify_not_ready_when_unstable(self) -> None:
+        """mergeable=MERGEABLE + mergeStateStatus=UNSTABLE (non-required failing
+        check) must not be treated as ready — merge UI would reject it."""
+        from dev_sync.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks.return_value = [
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
+        ]
+        mock_github.get_pr_state.return_value = {
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "UNSTABLE",
+        }
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        result = await verifier.verify("owner/repo", 42)
+
+        assert result.ready is False
+        assert result.merge_state_status == "UNSTABLE"
+
+    @pytest.mark.asyncio
+    async def test_verify_ready_when_has_hooks(self) -> None:
+        """HAS_HOOKS is mergeable — the repo has pre-receive hooks but they
+        don't block merge."""
+        from dev_sync.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks.return_value = [
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
+        ]
+        mock_github.get_pr_state.return_value = {
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "HAS_HOOKS",
         }
 
         verifier = PRVerifier(github=mock_github, poll_interval=0)

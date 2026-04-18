@@ -77,17 +77,26 @@ class TestGitHubCLI:
             assert all(c["bucket"] == "pass" for c in checks)
 
     @pytest.mark.asyncio
-    async def test_get_pr_checks_returns_empty_on_non_zero_exit(self) -> None:
-        """`gh pr checks` exits non-zero while any check is pending; we must
-        treat that as "still pending" rather than propagating GitHubError."""
-        from dev_sync.core.github import GitHubCLI, GitHubError
+    async def test_get_pr_checks_parses_json_on_nonzero_exit(self) -> None:
+        """`gh pr checks` exits non-zero while checks are pending/failing, but
+        still prints the JSON payload to stdout. get_pr_checks must parse it
+        (via capture_on_nonzero=True) instead of silently returning []."""
+        from dev_sync.core.github import GitHubCLI
+
+        mock_output = json.dumps([
+            {"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"},
+        ])
 
         with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
-            mock_run.side_effect = GitHubError("gh failed: pending checks")
+            mock_run.return_value = mock_output
             gh = GitHubCLI()
             checks = await gh.get_pr_checks("owner/repo", 42)
 
-            assert checks == []
+            # capture_on_nonzero must be requested
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs.get("capture_on_nonzero") is True
+            assert len(checks) == 1
+            assert checks[0]["bucket"] == "pending"
 
     @pytest.mark.asyncio
     async def test_list_assigned_issues(self) -> None:

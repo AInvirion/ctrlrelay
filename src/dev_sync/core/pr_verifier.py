@@ -15,6 +15,20 @@ _PENDING_BUCKETS = frozenset({"pending"})
 _PASSING_BUCKETS = frozenset({"pass", "skipping"})
 _TERMINAL_MERGEABLE_VALUES = frozenset({"MERGEABLE", "CONFLICTING"})
 
+# mergeStateStatus values GitHub returns (docs: PullRequestMergeStateStatus).
+# We hand off only when CLEAN or HAS_HOOKS — everything else needs a rebase,
+# a failing-check fix, or a protection-rule check first.
+_READY_MERGE_STATE_STATUS = frozenset({"CLEAN", "HAS_HOOKS"})
+# BEHIND = branch not up-to-date with base; base-branch protection commonly
+# blocks merging in this state. Surface it with the same affordance as
+# CONFLICTING so Claude rebases before hand-off.
+_REBASE_REQUIRED_MERGE_STATE_STATUS = frozenset({"BEHIND"})
+
+# Require 2 consecutive empty check-list responses separated by a poll interval
+# before concluding "no CI configured". GitHub registers check runs a few
+# seconds after `gh pr create`, so a single-shot empty read is unreliable.
+_EMPTY_CHECKS_CONFIRM_POLLS = 2
+
 
 @dataclass
 class VerificationResult:
@@ -43,18 +57,27 @@ class PRVerifier:
         timeout: int | None = None,
     ) -> list[dict[str, Any]]:
         """Poll PR checks until every check has left the 'pending' bucket or
-        the timeout is reached. An empty list means the repo has no CI — the
-        caller treats that as "nothing to wait for" and proceeds."""
+        the timeout is reached.
+
+        Empty-check handling: GitHub registers check runs asynchronously after
+        `gh pr create` so a single empty read is ambiguous — the repo might
+        have no CI, or CI just hasn't registered yet. We require
+        `_EMPTY_CHECKS_CONFIRM_POLLS` consecutive empty reads separated by
+        `poll_interval` before concluding "no CI configured"."""
         limit = self.check_timeout if timeout is None else timeout
         elapsed = 0
+        empty_streak = 0
         checks: list[dict[str, Any]] = []
         while True:
             checks = await self.github.get_pr_checks(repo, pr_number)
-            # No checks configured for this repo — nothing to wait for.
             if not checks:
-                return checks
-            if all(c.get("bucket") not in _PENDING_BUCKETS for c in checks):
-                return checks
+                empty_streak += 1
+                if empty_streak >= _EMPTY_CHECKS_CONFIRM_POLLS:
+                    return checks
+            else:
+                empty_streak = 0
+                if all(c.get("bucket") not in _PENDING_BUCKETS for c in checks):
+                    return checks
             if elapsed >= limit:
                 return checks
             await asyncio.sleep(self.poll_interval)
@@ -102,6 +125,28 @@ class PRVerifier:
             return VerificationResult(
                 ready=False,
                 reason=f"PR mergeable state unresolved: {mergeable}",
+                mergeable=mergeable,
+                merge_state_status=merge_state,
+            )
+        if merge_state in _REBASE_REQUIRED_MERGE_STATE_STATUS:
+            return VerificationResult(
+                ready=False,
+                reason=(
+                    "PR is behind the base branch and must be rebased before "
+                    "merge (mergeStateStatus=BEHIND)"
+                ),
+                mergeable=mergeable,
+                merge_state_status=merge_state,
+            )
+        if merge_state not in _READY_MERGE_STATE_STATUS:
+            # UNSTABLE (non-required failing check), BLOCKED (other protection),
+            # DRAFT, UNKNOWN, etc. Refuse to hand off rather than declare a PR
+            # ready when the merge UI would actually reject it.
+            return VerificationResult(
+                ready=False,
+                reason=(
+                    f"PR not ready to merge: mergeStateStatus={merge_state}"
+                ),
                 mergeable=mergeable,
                 merge_state_status=merge_state,
             )

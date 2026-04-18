@@ -201,15 +201,24 @@ def _build_fix_prompt(pr_number: int, verification: VerificationResult) -> str:
             f"PR #{pr_number} has merge conflicts with the base branch "
             f"(mergeStateStatus={verification.merge_state_status}). "
             "Rebase the branch onto the base, resolve the conflicts, push the "
-            "updated branch, then call checkpoint.done() with the same "
-            f'outputs={{"pr_url": "...", "pr_number": {pr_number}}} once the PR '
-            "reports MERGEABLE. Use checkpoint.failed() if conflicts cannot be "
-            "resolved."
+            "updated branch, then signal DONE with the same "
+            f'outputs (pr_url, pr_number={pr_number}) once the PR reports '
+            "MERGEABLE. Signal FAILED if conflicts cannot be resolved."
+        )
+
+    if verification.merge_state_status == "BEHIND":
+        return (
+            f"PR #{pr_number} is behind the base branch and base-branch "
+            "protection requires it to be up-to-date before merge "
+            "(mergeStateStatus=BEHIND). Rebase the branch onto the base and "
+            "force-push, then signal DONE with the same "
+            f"outputs (pr_url, pr_number={pr_number}) once the PR reports "
+            "mergeStateStatus=CLEAN."
         )
 
     if verification.failing_checks:
         names = ", ".join(
-            f"{c.get('name', '?')}={c.get('conclusion') or c.get('status')}"
+            f"{c.get('name', '?')}={c.get('state') or c.get('bucket')}"
             for c in verification.failing_checks
         )
         return (
