@@ -2,8 +2,6 @@
 
 Local-first automation orchestrator for GitHub repos. Wraps Claude CLI to automate security triage, issue-to-PR workflows, and multi-repo operations.
 
-📖 **Docs site:** [ainvirion.github.io/dev-sync](https://ainvirion.github.io/dev-sync/) — design specs, implementation plans, and operator guides, built from [`docs/`](docs/) with Jekyll + just-the-docs and deployed via GitHub Pages.
-
 ## Features
 
 - **Secops Pipeline** - Automated security triage across repos (Dependabot alerts, security PRs)
