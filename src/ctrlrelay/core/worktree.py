@@ -129,6 +129,20 @@ class WorktreeManager:
             raise WorktreeError(f"Worktree already exists: {worktree_path}")
 
         if await self.branch_exists_locally(repo, new_branch):
+            # Sync the local ref to origin/<branch> before checkout so a
+            # retry after an out-of-band push (human commit on the PR,
+            # another machine) doesn't reuse stale local state and then
+            # fail on a non-fast-forward push. Best-effort: if the sync
+            # can't run (no remote branch, network error), fall back to
+            # whatever the local ref points at.
+            if await self.branch_exists_on_remote(repo, new_branch):
+                try:
+                    await self._run_git(
+                        "branch", "-f", new_branch, f"origin/{new_branch}",
+                        cwd=bare_path,
+                    )
+                except WorktreeError:
+                    pass
             # Reuse: check out the existing ref into the new worktree.
             await self._run_git(
                 "worktree", "add",

@@ -116,22 +116,26 @@ class TestWorktreeManager:
         bare repo (left over from a prior session that ran out of
         max_fix_attempts with its PR pushed to origin), the worktree creator
         must reuse that branch instead of tripping
-        ``fatal: a branch named 'X' already exists`` from ``worktree add -b``."""
+        ``fatal: a branch named 'X' already exists`` from ``worktree add -b``,
+        AND refresh the local ref from origin/<branch> first so a mid-flight
+        out-of-band push doesn't start the retry on stale state."""
         from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
             bare_repos_dir=tmp_path / "repos",
         )
-        # branch_exists_locally short-circuits if the bare dir is missing;
-        # make it real so the show-ref path is exercised.
         bare = tmp_path / "repos" / "owner-repo.git"
         bare.mkdir(parents=True)
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            # Both show-ref (branch exists: exit 0) and worktree add (success)
-            # return empty stdout successfully.
-            mock_git.return_value = ""
+            # show-ref (exists), ls-remote (branch on origin), branch -f, worktree add
+            mock_git.side_effect = [
+                "",                                  # show-ref --verify ok
+                "abc123\trefs/heads/fix/issue-5\n",  # ls-remote --heads origin fix/...
+                "",                                  # branch -f fix/issue-5 origin/...
+                "",                                  # worktree add (reuse)
+            ]
 
             wt = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
@@ -140,18 +144,64 @@ class TestWorktreeManager:
             )
 
         assert "retry-1" in str(wt)
+        # A branch -f call must have happened, targeting origin/<branch>.
+        branch_f_calls = [
+            c for c in mock_git.call_args_list
+            if "branch" in c[0] and "-f" in c[0]
+        ]
+        assert len(branch_f_calls) == 1
+        bf_args = branch_f_calls[0][0]
+        assert "fix/issue-5" in bf_args
+        assert "origin/fix/issue-5" in bf_args
+
         worktree_add_calls = [
-            call_ for call_ in mock_git.call_args_list
-            if "worktree" in call_[0] and "add" in call_[0]
+            c for c in mock_git.call_args_list
+            if "worktree" in c[0] and "add" in c[0]
         ]
         assert len(worktree_add_calls) == 1
         args = worktree_add_calls[0][0]
-        # Reuse path MUST NOT pass -b (that creates a new branch and would
-        # fail if the branch already existed).
+        # Reuse path MUST NOT pass -b.
         assert "-b" not in args, (
             f"reuse path must not use -b; git call args: {args}"
         )
         assert "fix/issue-5" in args
+
+    @pytest.mark.asyncio
+    async def test_reuse_when_branch_not_on_remote_skips_sync(
+        self, tmp_path: Path
+    ) -> None:
+        """If the local branch exists but origin has no copy (e.g. a prior
+        session never got as far as pushing), don't attempt the branch -f
+        sync — just reuse the local ref."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",   # show-ref --verify ok (local branch exists)
+                "",   # ls-remote --heads origin (empty → not on remote)
+                "",   # worktree add (reuse)
+            ]
+
+            wt = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="retry-2",
+                new_branch="fix/issue-9",
+            )
+
+        assert "retry-2" in str(wt)
+        # No branch -f should have been called when origin had nothing.
+        branch_f_calls = [
+            c for c in mock_git.call_args_list
+            if "branch" in c[0] and "-f" in c[0]
+        ]
+        assert branch_f_calls == []
 
     @pytest.mark.asyncio
     async def test_create_worktree_with_new_branch_uses_default_branch(
