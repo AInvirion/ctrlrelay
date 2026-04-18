@@ -287,6 +287,55 @@ class TestWorktreeManager:
         assert worktree_add_calls == []
 
     @pytest.mark.asyncio
+    async def test_reuse_falls_back_to_local_when_remote_probe_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2: if ls-remote itself fails (auth, network), we must NOT
+        treat the probe failure as "remote exists" (that would skip the
+        stale-merged recreate) nor as "remote doesn't exist" (that would
+        potentially recreate a branch that DOES exist on origin). Safest
+        is to reuse the local ref as-is, no mutations."""
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",                                  # show-ref
+                "",                                  # worktree list --porcelain
+                WorktreeError("gh ls-remote auth"),  # strict ls-remote raises
+                "",                                  # worktree add (reuse as-is)
+            ]
+            wt = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="retry-probe-fail",
+                new_branch="fix/issue-77",
+            )
+
+        assert "retry-probe-fail" in str(wt)
+        # No ref mutation happened — nothing to the live branch.
+        mutating = [
+            c for c in mock_git.call_args_list
+            if ("update-ref" in c[0]) or ("branch" in c[0] and "-f" in c[0])
+            or ("fetch" in c[0])
+        ]
+        assert mutating == [], (
+            f"no mutations allowed when remote probe fails; got {mutating}"
+        )
+        worktree_add = [
+            c for c in mock_git.call_args_list
+            if "worktree" in c[0] and "add" in c[0]
+        ]
+        assert len(worktree_add) == 1
+        # Reuse path (no -b).
+        assert "-b" not in worktree_add[0][0]
+
+    @pytest.mark.asyncio
     async def test_reuse_survives_fetch_timeout(self, tmp_path: Path) -> None:
         """Codex P2: if the sync fetch times out (asyncio.TimeoutError), the
         retry must still proceed with the local branch as-is rather than

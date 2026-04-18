@@ -143,7 +143,27 @@ class WorktreeManager:
                     "`git worktree remove` in the bare repo before retrying."
                 )
 
-            on_remote = await self.branch_exists_on_remote(repo, new_branch)
+            # Remote presence has to be KNOWN to take either sync-to-origin
+            # or stale-merged branches. branch_exists_on_remote is
+            # fail-closed (returns True on timeout/auth error) which is
+            # good for "should I delete this branch" decisions but wrong
+            # here — a transient probe failure would skip the stale-merged
+            # recreate path and resurrect already-merged commits. Use the
+            # strict variant that raises on probe failure; on error we
+            # reuse the local ref unchanged, without mutations.
+            try:
+                on_remote = await self._branch_exists_on_remote_strict(
+                    bare_path, new_branch,
+                )
+            except Exception:
+                await self._run_git(
+                    "worktree", "add",
+                    str(worktree_path),
+                    new_branch,
+                    cwd=bare_path,
+                )
+                return worktree_path
+
             if on_remote:
                 # Remote exists → sync local to remote head (preserving
                 # unpushed ahead-of-origin commits) and reuse.
@@ -156,7 +176,7 @@ class WorktreeManager:
                 )
                 return worktree_path
 
-            # Local-only. Distinguish between:
+            # Local-only (confirmed). Distinguish between:
             #   (a) stale-merged: the prior PR was merged (any strategy) and
             #       the remote branch auto-deleted. The local ref's commits
             #       are all patch-equivalent to commits in the default
@@ -293,6 +313,25 @@ class WorktreeManager:
                     )
                 except Exception:
                     pass
+
+    async def _branch_exists_on_remote_strict(
+        self, bare_path: Path, branch: str,
+    ) -> bool:
+        """Strict variant of branch_exists_on_remote: True if origin
+        has the branch, False if it does not, RAISES on probe failure.
+
+        The public branch_exists_on_remote is fail-closed (returns True
+        on error) so callers making "safe to delete" decisions err
+        on preservation. That semantic is wrong for the reuse path,
+        where a transient error must NOT be interpreted as "remote
+        exists" — that would skip the stale-merged recreate branch and
+        resurrect already-merged commits into a new PR.
+        """
+        output = await self._run_git(
+            "ls-remote", "--heads", "origin", branch,
+            cwd=bare_path, timeout=10,
+        )
+        return bool(output.strip())
 
     async def _branch_is_checked_out_elsewhere(
         self, bare_path: Path, branch: str,
