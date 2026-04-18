@@ -32,7 +32,7 @@ class GitHubCLI:
     timeout: int = 60
 
     async def _run_gh(self, *args: str) -> str:
-        """Run gh command and return stdout."""
+        """Run gh command and return stdout; raise GitHubError on non-zero."""
         cmd = [self.gh_binary, *args]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -99,23 +99,57 @@ class GitHubCLI:
         repo: str,
         pr_number: int,
     ) -> list[dict[str, Any]]:
-        """Get status checks for a PR."""
-        output = await self._run_gh(
+        """Get status checks for a PR.
+
+        Bypasses `_run_gh` because we need to inspect stdout, stderr, and the
+        exit code independently. `gh pr checks`:
+          - prints a JSON array on stdout when checks exist (exits non-zero
+            when any are pending or failing — the payload is still valid)
+          - prints "no checks reported on the '<branch>' branch" to stderr
+            and exits non-zero when the PR has no checks at all
+          - emits arbitrary errors to stderr (auth, network, missing PR) on
+            non-zero exit with empty stdout
+
+        We return [] only for the "no checks reported" case. Real failures
+        raise GitHubError so callers can distinguish "no CI configured" from
+        "gh is broken".
+        """
+        cmd = [
+            self.gh_binary,
             "pr", "checks",
             str(pr_number),
             "--repo", repo,
-            "--json", "name,status,conclusion",
+            "--json", "name,state,bucket,link",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        return json.loads(output) if output.strip() else []
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=self.timeout,
+        )
+        stdout = stdout_bytes.decode().strip()
+        stderr = stderr_bytes.decode().strip()
+
+        # JSON payload on stdout — always trust it, regardless of exit code.
+        if stdout:
+            return json.loads(stdout)
+
+        # No stdout. Distinguish "no CI configured" from genuine failures by
+        # looking for gh's well-known "no checks reported" message.
+        if "no checks reported" in stderr.lower():
+            return []
+
+        # Anything else is an honest-to-goodness failure. Don't pretend the
+        # repo has no CI.
+        raise GitHubError(f"gh pr checks failed: {stderr}")
 
     def all_checks_passed(self, checks: list[dict[str, Any]]) -> bool:
         """Check if all PR checks passed."""
         if not checks:
             return False
-        return all(
-            c.get("status") == "completed" and c.get("conclusion") == "success"
-            for c in checks
-        )
+        return all(c.get("bucket") in ("pass", "skipping") for c in checks)
 
     async def list_assigned_issues(
         self,

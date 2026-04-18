@@ -39,6 +39,15 @@ class TestDevIntegration:
             "title": "Fix the login bug",
             "body": "Users cannot log in when...",
         }
+        mock_github.get_pr_checks.return_value = [
+            {"name": "ci", "status": "completed", "conclusion": "success"},
+        ]
+        mock_github.get_pr_state.return_value = {
+            "number": 42,
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
 
         # Mock dispatcher
         mock_dispatcher = AsyncMock(spec=ClaudeDispatcher)
@@ -67,6 +76,10 @@ class TestDevIntegration:
 
         mock_dispatcher.spawn_session.side_effect = mock_spawn_session
 
+        from dev_sync.core.pr_verifier import VerificationResult
+        mock_pr_verifier = AsyncMock()
+        mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
+
         # Mock worktree methods
         with patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock), \
              patch.object(worktree, "create_worktree_with_new_branch", new_callable=AsyncMock) as mock_create, \
@@ -89,6 +102,7 @@ class TestDevIntegration:
                 state_db=state_db,
                 transport=None,
                 contexts_dir=tmp_path / "contexts",
+                pr_verifier=mock_pr_verifier,
             )
 
         # Verify result
@@ -172,6 +186,10 @@ class TestDevPipelineCleanup:
                 worktree_path.mkdir(parents=True)
                 mock_create.return_value = worktree_path
 
+            from dev_sync.core.pr_verifier import VerificationResult
+            mock_pr_verifier = AsyncMock()
+            mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
+
             result = await run_dev_issue(
                 repo="owner/repo",
                 issue_number=13,
@@ -183,6 +201,7 @@ class TestDevPipelineCleanup:
                 state_db=state_db,
                 transport=None,
                 contexts_dir=tmp_path / "contexts",
+                pr_verifier=mock_pr_verifier,
             )
 
         state_db.close()
