@@ -744,8 +744,10 @@ def poller_start(
 
         # Get GitHub username
         try:
+            from dev_sync.core.github import _find_gh
+            gh_bin = _find_gh()
             result = subprocess.run(
-                ["gh", "api", "user", "--jq", ".login"],
+                [gh_bin, "api", "user", "--jq", ".login"],
                 capture_output=True,
                 text=True,
                 check=True,
