@@ -50,6 +50,11 @@ class BridgeMessage(BaseModel):
     error: str | None = None
     message: str | None = None
 
+    # Correlation fields (optional; used for structured logging only).
+    session_id: str | None = None
+    repo: str | None = None
+    issue_number: int | None = None
+
 
 def serialize_message(msg: BridgeMessage) -> str:
     """Serialize message to newline-delimited JSON."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from pathlib import Path
 
@@ -13,7 +14,10 @@ from dev_sync.bridge.protocol import (
     parse_message,
     serialize_message,
 )
+from dev_sync.core.obs import get_logger, hash_text, log_event
 from dev_sync.transports.base import TransportError
+
+_logger = get_logger("transport.socket")
 
 
 class SocketTransport:
@@ -80,10 +84,24 @@ class SocketTransport:
         finally:
             self._pending.pop(msg.request_id, None)
 
-    async def send(self, message: str) -> None:
+    async def send(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+        repo: str | None = None,
+        issue_number: int | None = None,
+    ) -> None:
         """Send a one-way message."""
         request_id = f"r-{uuid.uuid4().hex[:8]}"
-        msg = BridgeMessage(op=BridgeOp.SEND, request_id=request_id, text=message)
+        msg = BridgeMessage(
+            op=BridgeOp.SEND,
+            request_id=request_id,
+            text=message,
+            session_id=session_id,
+            repo=repo,
+            issue_number=issue_number,
+        )
         await self._send_message(msg)
 
     async def ask(
@@ -91,6 +109,10 @@ class SocketTransport:
         question: str,
         options: list[str] | None = None,
         timeout: int = 300,
+        *,
+        session_id: str | None = None,
+        repo: str | None = None,
+        issue_number: int | None = None,
     ) -> str:
         """Ask a question and wait for response."""
         request_id = f"r-{uuid.uuid4().hex[:8]}"
@@ -100,12 +122,45 @@ class SocketTransport:
             question=question,
             options=options,
             timeout=timeout,
+            session_id=session_id,
+            repo=repo,
+            issue_number=issue_number,
         )
+
+        log_event(
+            _logger,
+            "dev.question.posted",
+            session_id=session_id,
+            repo=repo,
+            issue_number=issue_number,
+            transport="socket",
+            destination=str(self.socket_path),
+            request_id=request_id,
+            question=question,
+            question_length=len(question),
+            question_hash=hash_text(question),
+            options=options,
+        )
+
+        sent_at = time.monotonic()
         response = await self._send_and_wait(msg, timeout)
 
         if response.op == BridgeOp.ERROR:
             raise TransportError(f"Bridge error: {response.message}")
         if response.op == BridgeOp.ANSWER and response.answer:
+            log_event(
+                _logger,
+                "dev.answer.received",
+                session_id=session_id,
+                repo=repo,
+                issue_number=issue_number,
+                transport="socket",
+                request_id=request_id,
+                answer=response.answer,
+                answer_length=len(response.answer),
+                answer_hash=hash_text(response.answer),
+                elapsed_ms=int((time.monotonic() - sent_at) * 1000),
+            )
             return response.answer
 
         raise TransportError(f"Unexpected response: {response.op}")

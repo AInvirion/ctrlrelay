@@ -11,6 +11,7 @@ from typing import Any
 from dev_sync.core.checkpoint import CheckpointStatus
 from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
 from dev_sync.core.github import GitHubCLI
+from dev_sync.core.obs import get_logger, hash_text, log_event
 from dev_sync.core.pr_verifier import PRVerifier, VerificationResult
 from dev_sync.core.state import StateDB
 from dev_sync.core.worktree import WorktreeManager
@@ -26,6 +27,8 @@ AGENT_CLAIM_COMMENT = (
     "🤖 Agent is working on this issue. A PR will be opened for review.\n\n"
     f"{AGENT_CLAIM_MARKER}"
 )
+
+_logger = get_logger("pipeline.dev")
 
 
 @dataclass
@@ -61,6 +64,18 @@ class DevPipeline:
     async def resume(self, ctx: PipelineContext, answer: str) -> PipelineResult:
         """Resume blocked dev session with user answer."""
         prompt = f"User answered: {answer}\n\nContinue from where you left off."
+
+        log_event(
+            _logger,
+            "dev.session.resumed",
+            session_id=ctx.session_id,
+            repo=ctx.repo,
+            issue_number=ctx.issue_number,
+            pipeline=self.name,
+            resume_session_id=ctx.session_id,
+            answer_length=len(answer),
+            answer_hash=hash_text(answer),
+        )
 
         result = await self.dispatcher.spawn_session(
             session_id=ctx.session_id,
@@ -425,7 +440,12 @@ async def run_dev_issue(
                 "question. Reply with guidance to resume."
             )
             try:
-                answer = await transport.ask(question)
+                answer = await transport.ask(
+                    question,
+                    session_id=session_id,
+                    repo=repo,
+                    issue_number=issue_number,
+                )
             except Exception as e:
                 # Transport failed (bridge down, timeout, etc.) — give up
                 # cleanly and fall through to the normal blocked cleanup.
