@@ -136,6 +136,7 @@ class TestWorktreeManager:
             #  update-ref refs/heads/<b> refs/ctrlrelay/sync/<b> →
             #  update-ref -d refs/ctrlrelay/sync/<b> → worktree add
             mock_git.side_effect = [
+                "",                                  # worktree prune (unconditional)
                 "",                                  # show-ref --verify
                 "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-5\n",     # ls-remote --heads origin
@@ -217,6 +218,7 @@ class TestWorktreeManager:
             # Second check (remote→local) SUCCEEDS: remote is ancestor of
             # local, meaning local is strictly ahead. Preserve local.
             mock_git.side_effect = [
+                "",                                  # worktree prune (unconditional)
                 "",                                  # show-ref
                 "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-9\n",     # ls-remote
@@ -264,6 +266,7 @@ class TestWorktreeManager:
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             # Both ancestor checks fail → diverged.
             mock_git.side_effect = [
+                "",                                  # worktree prune (unconditional)
                 "",                                  # show-ref
                 "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-3\n",     # ls-remote
@@ -306,6 +309,7 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
+                "",                                  # worktree prune (unconditional)
                 "",                                  # show-ref
                 "",                                  # worktree list --porcelain
                 WorktreeError("gh ls-remote auth"),  # strict ls-remote raises
@@ -355,6 +359,7 @@ class TestWorktreeManager:
             # Fetch raises TimeoutError; helper returns early (no cleanup —
             # scratch ref was never created).
             mock_git.side_effect = [
+                "",                                  # worktree prune (unconditional)
                 "",                                  # show-ref
                 "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-42\n",    # ls-remote
@@ -401,6 +406,7 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
+                "",                                  # worktree prune (unconditional)
                 "",                  # show-ref (local exists)
                 porcelain,           # worktree list: another worktree has the branch
             ]
@@ -451,6 +457,7 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
+                "",                                  # worktree prune (unconditional)
                 "",                                      # show-ref (local exists)
                 stale_porcelain,                         # worktree list: prunable stanza
                 "",                                      # ls-remote (no remote)
@@ -491,6 +498,7 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
+                "",                                  # worktree prune (unconditional)
                 "",                                      # show-ref (exists)
                 "",                                      # worktree list --porcelain
                 "",                                      # ls-remote (empty, not on remote)
@@ -539,6 +547,7 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
+                "",                                  # worktree prune (unconditional)
                 "",                                      # show-ref (local exists)
                 "",                                      # worktree list --porcelain
                 "",                                      # ls-remote (empty)
@@ -590,6 +599,7 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
+                "",                                  # worktree prune (unconditional)
                 "",                      # show-ref
                 "",                      # worktree list --porcelain
                 "",                      # ls-remote
@@ -630,7 +640,8 @@ class TestWorktreeManager:
         )
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            mock_git.side_effect = ["refs/heads/main\n", ""]
+            # prune → default-branch probe → worktree add
+            mock_git.side_effect = ["", "refs/heads/main\n", ""]
 
             worktree_path = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
@@ -639,12 +650,14 @@ class TestWorktreeManager:
             )
 
             assert worktree_path is not None
-            # First call should be symbolic-ref HEAD, second should be worktree add
+            # Calls: prune, then symbolic-ref HEAD (for default), then worktree add.
             first_call_args = mock_git.call_args_list[0][0]
-            assert "symbolic-ref" in first_call_args
+            assert "prune" in first_call_args
             second_call_args = mock_git.call_args_list[1][0]
-            assert "-b" in second_call_args
-            assert "main" in second_call_args
+            assert "symbolic-ref" in second_call_args
+            third_call_args = mock_git.call_args_list[2][0]
+            assert "-b" in third_call_args
+            assert "main" in third_call_args
 
     @pytest.mark.asyncio
     async def test_push_branch(self, tmp_path: Path) -> None:

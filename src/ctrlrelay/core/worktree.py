@@ -128,6 +128,20 @@ class WorktreeManager:
         if worktree_path.exists():
             raise WorktreeError(f"Worktree already exists: {worktree_path}")
 
+        # Best-effort: prune stale worktree metadata up front. If a prior
+        # session crashed between `shutil.rmtree(worktree_path)` and
+        # `git worktree prune`, the bare repo still thinks the branch is
+        # checked out — `git worktree add <branch>` would refuse even
+        # though no live worktree exists. Running prune first makes the
+        # subsequent add succeed. Best-effort: ignore errors so a failing
+        # prune doesn't abort creation.
+        try:
+            await self._run_git(
+                "worktree", "prune", cwd=bare_path, timeout=10,
+            )
+        except Exception:
+            pass
+
         if await self.branch_exists_locally(repo, new_branch):
             # CRITICAL safety: never mutate or delete a branch that's still
             # checked out by another linked worktree (e.g. a BLOCKED session
