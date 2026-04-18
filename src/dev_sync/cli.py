@@ -792,30 +792,70 @@ def poller_start(
             bare_repos_dir=config.paths.bare_repos,
         )
 
+        # Set up transport for notifications
+        transport = None
+        if config.transport.type.value == "telegram" and config.transport.telegram:
+            from dev_sync.transports import SocketTransport
+            socket_path = config.transport.telegram.socket_path.expanduser().resolve()
+            if socket_path.exists():
+                transport = SocketTransport(socket_path)
+                console.print(f"[dim]Telegram transport enabled via {socket_path}[/dim]")
+            else:
+                console.print(f"[yellow]Telegram socket not found at {socket_path}[/yellow]")
+                console.print("[yellow]Run 'dev-sync bridge start' to enable notifications[/yellow]")
+
         async def handle_issue(repo: str, issue: dict) -> None:
             issue_number = issue["number"]
             title = issue.get("title", "")
             console.print(
                 f"[green]New issue detected:[/green] #{issue_number} in {repo} — {title}"
             )
+
+            # Connect transport for notifications
+            connected_transport = None
+            if transport:
+                try:
+                    await transport.connect()
+                    connected_transport = transport
+                    await transport.send(f"🔔 New issue #{issue_number} in {repo}: {title}")
+                except Exception as e:
+                    console.print(f"[yellow]Transport error: {e}[/yellow]")
+
             # Find matching repo config
             repo_configs = [r for r in config.repos if r.name == repo]
             if not repo_configs:
                 console.print(f"[yellow]No config found for repo {repo}, skipping.[/yellow]")
+                if connected_transport:
+                    await transport.close()
                 return
+
             repo_config = repo_configs[0]
-            await run_dev_issue(
-                repo=repo,
-                issue_number=issue_number,
-                branch_template=repo_config.dev_branch_template,
-                dispatcher=dispatcher,
-                github=github,
-                worktree=worktree,
-                dashboard=None,
-                state_db=state_db,
-                transport=None,
-                contexts_dir=config.paths.contexts,
-            )
+            try:
+                result = await run_dev_issue(
+                    repo=repo,
+                    issue_number=issue_number,
+                    branch_template=repo_config.dev_branch_template,
+                    dispatcher=dispatcher,
+                    github=github,
+                    worktree=worktree,
+                    dashboard=None,
+                    state_db=state_db,
+                    transport=connected_transport,
+                    contexts_dir=config.paths.contexts,
+                )
+
+                # Send result notification
+                if connected_transport:
+                    if result.success:
+                        pr_url = result.outputs.get("pr_url", "")
+                        await transport.send(f"✅ PR ready: {pr_url}")
+                    elif result.blocked:
+                        await transport.send(f"⏸️ Blocked on #{issue_number}: {result.question}")
+                    else:
+                        await transport.send(f"❌ Failed on #{issue_number}: {result.error or result.summary}")
+            finally:
+                if connected_transport:
+                    await transport.close()
 
         console.print(f"[green]Starting poller[/green] for {len(repo_names)} repo(s) as {username}")
         console.print(f"  Interval: {interval}s | Press Ctrl+C to stop")

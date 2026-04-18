@@ -266,11 +266,6 @@ async def run_dev_issue(
                 },
             ))
 
-        # Send notification via transport
-        if transport and result.success:
-            pr_url = result.outputs.get("pr_url", "")
-            await transport.send(f"PR ready for review: {pr_url}")
-
         # Cleanup only if not blocked (blocked sessions need worktree for resume)
         if not result.blocked:
             worktree.remove_context_symlink(worktree_path)
