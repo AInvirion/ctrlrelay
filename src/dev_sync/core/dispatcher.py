@@ -61,7 +61,12 @@ class ClaudeDispatcher:
         env["DEV_SYNC_SESSION_ID"] = session_id
         env["DEV_SYNC_STATE_FILE"] = str(state_file)
 
-        cmd = [self.claude_binary, "-p", prompt, "--output-format", "json"]
+        cmd = [
+            self.claude_binary,
+            "-p", prompt,
+            "--output-format", "json",
+            "--dangerously-skip-permissions",
+        ]
         if resume_session_id:
             cmd.extend(["--resume", resume_session_id])
 

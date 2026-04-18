@@ -33,7 +33,11 @@ class DevPipeline:
 
     async def run(self, ctx: PipelineContext) -> PipelineResult:
         """Run dev pipeline on a single issue."""
-        prompt = self._build_prompt(ctx.repo, ctx.issue_number, ctx.extra)
+        prompt = self._build_prompt(
+            ctx.repo, ctx.issue_number, ctx.extra,
+            session_id=ctx.session_id,
+            state_file=ctx.state_file,
+        )
 
         result = await self.dispatcher.spawn_session(
             session_id=ctx.session_id,
@@ -63,11 +67,14 @@ class DevPipeline:
         repo: str,
         issue_number: int | None,
         extra: dict[str, Any],
+        session_id: str = "",
+        state_file: Path | None = None,
     ) -> str:
         """Build the dev pipeline prompt."""
         issue_title = extra.get("issue_title", "")
         issue_body = extra.get("issue_body", "")
         branch_name = extra.get("branch_name", "")
+        state_file_path = str(state_file) if state_file else "/tmp/state.json"
 
         return f"""You are working on issue #{issue_number} in repository {repo}.
 
@@ -90,31 +97,34 @@ Do NOT merge the PR - wait for human review.
 
 ## Signaling Completion
 
-Signal completion by writing JSON to $DEV_SYNC_STATE_FILE. Examples:
+**CRITICAL**: Before exiting, you MUST write a checkpoint file to signal completion.
+
+STATE_FILE: {state_file_path}
+SESSION_ID: {session_id}
 
 **DONE** (PR opened):
 ```bash
-printf '{{"version":"1","status":"DONE","session_id":"%s",\\
-"timestamp":"%s","summary":"PR opened",\\
-"outputs":{{"pr_url":"%s","pr_number":%d}}}}' \\
-  "$DEV_SYNC_SESSION_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
-  "https://github.com/owner/repo/pull/42" 42 > "$DEV_SYNC_STATE_FILE"
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\
+'"timestamp":"%s","summary":"PR opened",'\
+'"outputs":{{"pr_url":"%s","pr_number":%d}}}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<PR_URL>" <PR_NUM> > '{state_file_path}'
 ```
 
 **BLOCKED** (need input):
 ```bash
-printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",\\
-"session_id":"%s","timestamp":"%s","question":"%s"}}' \\
-  "$DEV_SYNC_SESSION_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
-  "Your question here" > "$DEV_SYNC_STATE_FILE"
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
+'"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > '{state_file_path}'
 ```
 
 **FAILED**:
 ```bash
-printf '{{"version":"1","status":"FAILED","session_id":"%s",\\
-"timestamp":"%s","error":"%s"}}' \\
-  "$DEV_SYNC_SESSION_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
-  "Error message" > "$DEV_SYNC_STATE_FILE"
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
+'"timestamp":"%s","error":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > '{state_file_path}'
 ```"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
