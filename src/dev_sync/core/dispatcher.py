@@ -4,10 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
+
+
+def _find_claude() -> str:
+    """Find claude binary, checking common paths if not in PATH."""
+    claude = shutil.which("claude")
+    if claude:
+        return claude
+    for path in [
+        os.path.expanduser("~/.local/bin/claude"),
+        "/usr/local/bin/claude",
+        "/opt/homebrew/bin/claude",
+    ]:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return "claude"
 
 
 @dataclass
@@ -40,9 +56,17 @@ class SessionResult:
 class ClaudeDispatcher:
     """Spawns and manages Claude subprocess sessions."""
 
-    claude_binary: str = "claude"
+    claude_binary: str = field(default_factory=_find_claude)
     default_timeout: int = 1800
     extra_env: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Only auto-resolve the bare default. Absolute paths, relative paths
+        # (resolved vs. working_dir by the child), and custom bare names pass
+        # through so explicit config is never silently overridden.
+        if self.claude_binary == "claude":
+            resolved = shutil.which("claude")
+            self.claude_binary = resolved or _find_claude()
 
     async def spawn_session(
         self,
@@ -61,7 +85,12 @@ class ClaudeDispatcher:
         env["DEV_SYNC_SESSION_ID"] = session_id
         env["DEV_SYNC_STATE_FILE"] = str(state_file)
 
-        cmd = [self.claude_binary, "-p", prompt, "--output-format", "json"]
+        cmd = [
+            self.claude_binary,
+            "-p", prompt,
+            "--output-format", "json",
+            "--dangerously-skip-permissions",
+        ]
         if resume_session_id:
             cmd.extend(["--resume", resume_session_id])
 

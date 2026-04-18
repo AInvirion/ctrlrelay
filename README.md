@@ -1,237 +1,56 @@
 # dev-sync
 
-Multi-device development environment sync. Keeps repos, Claude Code config, Codex config, and team-shared settings in sync across machines.
+Local-first orchestrator that drives headless Claude Code (`claude -p`)
+across your GitHub repos. Watches for assigned issues, runs the dev pipeline
+in an isolated git worktree, opens a PR, and asks you on Telegram when it
+gets stuck.
+
+📖 **Docs:** <https://ainvirion.github.io/dev-sync/>
+
+## Install
+
+Requires Python 3.12+, the `claude` CLI, the `gh` CLI, and `git` 2.20+.
+
+```bash
+git clone https://github.com/AInvirion/dev-sync.git
+cd dev-sync
+
+# With uv (recommended):
+uv pip install -e .
+
+# Or with pip:
+pip install -e .
+```
 
 ## Quick start
 
 ```bash
-# First time on a new device:
-./sync setup
+# Copy and edit the example config:
+cp config/orchestrator.yaml.example config/orchestrator.yaml
 
-# Sync all repos:
-./sync repos
+# Validate it:
+dev-sync config validate
 
-# Export your Claude Code config:
-./sync export
+# Run the dev pipeline against an issue you're assigned:
+dev-sync run dev --issue 42 --repo your-org/your-repo
 
-# Import Claude Code config on another device:
-./sync import
+# Or start the poller to auto-process newly assigned issues:
+dev-sync poller start --interval 300
 ```
 
-## Commands
+For everything beyond this — the full config schema, Telegram setup, the
+checkpoint protocol, running as a launchd/systemd service, the architecture,
+and contributing — see the documentation site:
 
-| Command | Description |
-|---|---|
-| `./sync repos` | Clone missing repos, pull existing ones |
-| `./sync repos -f SEMCL` | Sync only repos matching a filter |
-| `./sync repos -n` | Dry run (show what would happen) |
-| `./sync status` | Show status of all repos (dirty, ahead/behind) |
-| `./sync export` | Export Claude Code config to this repo |
-| `./sync export -n` | Dry run export |
-| `./sync import` | Import Claude Code config to this device |
-| `./sync import -n` | Dry run import |
-| `./sync import --no-plugins` | Import without plugin reinstall hints |
-| `./sync team-export` | Export shareable team config |
-| `./sync team-import` | Import shared team config |
-| `./sync setup` | Full device bootstrap (first time) |
-| `./sync manifest` | Re-scan ~/Projects and update repos.manifest |
-| `./sync codex-export` | Export Codex config to this repo |
-| `./sync codex-import` | Import Codex config to this device |
-| `./sync codex-install` | Install Codex skills (AGENTS.md files) |
-| `./sync codex-install --copy` | Install skills as copies instead of symlinks |
+- [Getting started](https://ainvirion.github.io/dev-sync/getting-started/)
+- [Configuration](https://ainvirion.github.io/dev-sync/configuration/)
+- [Telegram bridge](https://ainvirion.github.io/dev-sync/bridge/)
+- [Feedback loop](https://ainvirion.github.io/dev-sync/feedback-loop/)
+- [CLI reference](https://ainvirion.github.io/dev-sync/cli/)
+- [Operations](https://ainvirion.github.io/dev-sync/operations/)
+- [Architecture](https://ainvirion.github.io/dev-sync/architecture/)
+- [Development](https://ainvirion.github.io/dev-sync/development/)
 
-## Claude Code config sync
+## License
 
-### Personal sync (`export` / `import`)
-
-Syncs everything between your own devices:
-
-- **Settings** — `settings.json`, `settings.local.json`
-- **Keybindings** — `keybindings.json`
-- **Plugins** — `plugins/installed_plugins.json` (manifest only; plugins need manual reinstall)
-- **Skills** — `skills/` directory
-- **Rules** — `rules/` directory
-- **MCP servers** — extracted from `~/.claude.json` (no secret redaction)
-- **Project memory** — all `MEMORY.md` files from project dirs
-
-Paths are automatically adjusted between devices (e.g. different home directories).
-
-### Team sync (`team-export` / `team-import`)
-
-Shares config that's useful for teammates without touching personal settings:
-
-- **Skills** — custom Claude Code skills
-- **Rules** — custom Claude Code rules
-- **Plugins** — plugin manifest (import shows `claude /install-plugin` commands)
-- **MCP servers** — server definitions with secrets redacted (`<REDACTED>`)
-
-Does NOT touch: settings, keybindings, memory, or any personal config.
-
-```bash
-# Export team config (run once, commit + push):
-./sync team-export
-
-# Teammates import after pulling:
-./sync team-import
-```
-
-**MCP server notes:**
-- Servers already in your config are skipped (no clobbering)
-- Servers with `<REDACTED>` env values are skipped; fill them in manually in `~/.claude.json`
-
-## Codex config sync
-
-Syncs OpenAI Codex CLI configuration and skills between devices.
-
-### Skills
-
-Codex skills are AGENTS.md instruction files for specialized code review tasks:
-
-| Skill | Purpose |
-|-------|---------|
-| `code-review` | General code review (correctness, readability, maintainability) |
-| `security-review` | Security analysis (STRIDE, injection, auth, data exposure) |
-| `duplicate-code` | Find copy-paste code and suggest DRY refactoring |
-| `dead-code` | Detect unused functions, unreachable code, orphan files |
-| `vid-verification` | Risk scoring and verification checklists |
-
-### Installation
-
-```bash
-# Install skills to ~/.codex/instructions/ (symlinked):
-./sync codex-install
-
-# Or use copies instead of symlinks:
-./sync codex-install --copy
-```
-
-### Usage with Codex
-
-```bash
-cd ~/Projects/some-project
-codex "review this code"
-codex "security audit src/"
-codex "find dead code"
-codex "check for duplicates"
-codex "VID check this change"
-```
-
-### Syncing to other devices
-
-```bash
-# On this machine:
-./sync codex-export
-git add -A && git commit -m "sync codex config" && git push
-
-# On other machines:
-git pull
-./sync codex-import
-./sync codex-install
-```
-
-## Claude + Codex Integration
-
-The `codex-reviewer` MCP server enables Claude Code to invoke Codex for automated code review loops.
-
-### Installation
-
-```bash
-cd mcp-servers/codex-reviewer
-./install.sh
-# Restart Claude Code
-```
-
-### Available Tools (in Claude Code)
-
-| Tool | Purpose |
-|------|---------|
-| `codex_review` | General code review |
-| `codex_security_review` | Security-focused review |
-| `codex_find_duplicates` | Find copy-paste code |
-| `codex_find_dead_code` | Find unused code |
-| `codex_verify_fixes` | Verify issues are fixed |
-| `codex_test_coverage` | Analyze test gaps |
-| `codex_dependency_audit` | Audit dependencies |
-| `codex_performance_review` | Performance issues |
-| `codex_prompt` | Custom Codex prompt |
-
-### The Review Loop
-
-```
-Claude implements → Codex reviews → Claude fixes → Codex verifies → repeat until clean
-```
-
-Usage in Claude Code:
-```
-> Implement user authentication, then run the codex review loop
-> QA this with codex
-> Get codex to review src/
-```
-
-Claude will:
-1. Call Codex review tools
-2. Parse findings (BLOCKING, CONCERNS, SUGGESTIONS)
-3. Fix BLOCKING issues
-4. Call `codex_verify_fixes`
-5. Loop until all issues resolved
-
-## Typical workflow
-
-```bash
-# On your main machine — export and push:
-./sync export
-cd dev-sync && git add -A && git commit -m "sync config" && git push
-
-# On another machine — pull and import:
-cd dev-sync && git pull
-./sync import
-
-# Share config with team:
-./sync team-export
-git add -A && git commit -m "update team config" && git push
-```
-
-## Directory structure
-
-```
-dev-sync/
-├── sync                    # Entry point script
-├── repos.manifest          # List of repos to sync
-├── scripts/
-│   ├── sync-claude.sh      # Claude Code config sync
-│   ├── sync-codex.sh       # Codex config sync
-│   ├── sync-repos.sh       # Repo cloning/pulling
-│   ├── setup-device.sh     # First-time device setup
-│   └── update-manifest.sh  # Manifest regeneration
-├── claude-config/          # Claude Code config (git-tracked)
-│   ├── .home-path          # Source home path for path adjustment
-│   ├── .last-export        # Export metadata
-│   ├── settings.json
-│   ├── settings.local.json
-│   ├── keybindings.json
-│   ├── mcp-servers.json
-│   ├── plugins/
-│   ├── skills/
-│   ├── rules/
-│   ├── memory/
-│   └── team/               # Shareable subset
-│       ├── README.md
-│       ├── plugins/
-│       ├── skills/
-│       ├── rules/
-│       └── mcp-servers.json
-├── codex-config/           # Codex config (git-tracked)
-│   ├── AGENTS.md           # Master instructions
-│   ├── config.toml         # Codex settings (exported)
-│   └── skills/             # Review skills (AGENTS.md format)
-│       ├── code-review/
-│       ├── security-review/
-│       ├── duplicate-code/
-│       ├── dead-code/
-│       └── vid-verification/
-└── mcp-servers/            # MCP servers for tool integration
-    └── codex-reviewer/     # Codex as MCP tools for Claude
-        ├── index.js        # MCP server implementation
-        ├── package.json
-        └── install.sh      # Installation script
-```
+MIT

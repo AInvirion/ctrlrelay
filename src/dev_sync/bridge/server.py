@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import stat
+from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dev_sync.bridge.protocol import (
@@ -18,10 +21,32 @@ from dev_sync.bridge.telegram_handler import TelegramHandler
 from dev_sync.core.obs import get_logger, hash_text, log_event
 
 _logger = get_logger("bridge.server")
+_log = logging.getLogger(__name__)
+
+
+class _PendingQuestion:
+    """Question posted to Telegram, awaiting the operator's reply."""
+
+    __slots__ = ("request_id", "telegram_msg_id", "writer")
+
+    def __init__(
+        self,
+        request_id: str,
+        telegram_msg_id: int,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self.request_id = request_id
+        self.telegram_msg_id = telegram_msg_id
+        self.writer = writer
 
 
 class BridgeServer:
-    """Unix socket server that bridges to Telegram."""
+    """Unix socket server that bridges to Telegram — bidirectional.
+
+    Outbound: clients send SEND/ASK over the socket and we hit Telegram.
+    Inbound: we long-poll Telegram for messages; when a reply arrives it's
+    matched to the oldest outstanding ASK (or by reply_to_message_id if
+    available) and we push an ANSWER frame over that client's socket."""
 
     def __init__(
         self,
@@ -35,7 +60,9 @@ class BridgeServer:
         self._server: asyncio.Server | None = None
         self._running = False
         self._telegram: TelegramHandler | None = None
-        self._pending_questions: dict[str, int] = {}
+        # Insertion-ordered so FIFO dispatch is deterministic.
+        self._pending_questions: OrderedDict[str, _PendingQuestion] = OrderedDict()
+        self._pending_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Start the bridge server."""
@@ -43,6 +70,7 @@ class BridgeServer:
             bot_token=self.bot_token,
             chat_id=self.chat_id,
         )
+        await self._telegram.start_polling(self._on_telegram_reply)
 
         if self.socket_path.exists():
             self.socket_path.unlink()
@@ -87,17 +115,33 @@ class BridgeServer:
 
                 try:
                     msg = parse_message(line.decode())
-                    response = await self._handle_message(msg)
+                    response = await self._handle_message(msg, writer)
                     if response:
                         writer.write(serialize_message(response).encode())
                         await writer.drain()
                 except ProtocolError:
                     pass
         finally:
+            # Client disconnected — drop any outstanding questions tied to
+            # this writer so we don't try to answer a dead socket later.
+            async with self._pending_lock:
+                dead = [
+                    rid for rid, q in self._pending_questions.items()
+                    if q.writer is writer
+                ]
+                for rid in dead:
+                    self._pending_questions.pop(rid, None)
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
-    async def _handle_message(self, msg: BridgeMessage) -> BridgeMessage | None:
+    async def _handle_message(
+        self,
+        msg: BridgeMessage,
+        writer: asyncio.StreamWriter,
+    ) -> BridgeMessage | None:
         """Handle a single message and return response."""
         if msg.op == BridgeOp.PING:
             return BridgeMessage(op=BridgeOp.PONG)
@@ -106,8 +150,10 @@ class BridgeServer:
             try:
                 assert self._telegram is not None
                 await self._telegram.send(msg.text or "")
+                _log.info("bridge: SEND delivered, request_id=%s", msg.request_id)
                 return BridgeMessage(op=BridgeOp.ACK, request_id=msg.request_id, status="sent")
             except Exception as e:
+                _log.warning("bridge: SEND failed, request_id=%s err=%s", msg.request_id, e)
                 return BridgeMessage(
                     op=BridgeOp.ERROR,
                     request_id=msg.request_id,
@@ -133,11 +179,25 @@ class BridgeServer:
                     question_hash=hash_text(question),
                     options=msg.options,
                 )
-                msg_id = await self._telegram.ask(question, options=msg.options)
+                telegram_msg_id = await self._telegram.ask(
+                    question, options=msg.options
+                )
                 if msg.request_id:
-                    self._pending_questions[msg.request_id] = msg_id
-                return BridgeMessage(op=BridgeOp.ACK, request_id=msg.request_id, status="pending")
+                    async with self._pending_lock:
+                        self._pending_questions[msg.request_id] = _PendingQuestion(
+                            request_id=msg.request_id,
+                            telegram_msg_id=telegram_msg_id,
+                            writer=writer,
+                        )
+                _log.info(
+                    "bridge: ASK posted request_id=%s telegram_msg_id=%s",
+                    msg.request_id, telegram_msg_id,
+                )
+                return BridgeMessage(
+                    op=BridgeOp.ACK, request_id=msg.request_id, status="pending",
+                )
             except Exception as e:
+                _log.warning("bridge: ASK failed, request_id=%s err=%s", msg.request_id, e)
                 return BridgeMessage(
                     op=BridgeOp.ERROR,
                     request_id=msg.request_id,
@@ -146,3 +206,62 @@ class BridgeServer:
                 )
 
         return None
+
+    async def _on_telegram_reply(
+        self,
+        text: str,
+        reply_to_message_id: int | None,
+    ) -> None:
+        """Route an incoming Telegram message to the matching pending question.
+
+        Priority: if reply_to_message_id matches a tracked question, use it.
+        Otherwise fall back to FIFO (oldest outstanding question wins) —
+        good enough for the single-operator case."""
+        async with self._pending_lock:
+            match: _PendingQuestion | None = None
+            if reply_to_message_id is not None:
+                for q in self._pending_questions.values():
+                    if q.telegram_msg_id == reply_to_message_id:
+                        match = q
+                        break
+            if match is None and self._pending_questions:
+                # FIFO: pop oldest.
+                match = next(iter(self._pending_questions.values()))
+            if match is None:
+                _log.info(
+                    "bridge: incoming telegram msg with no pending question; "
+                    "text=%r", text[:80],
+                )
+                return
+            self._pending_questions.pop(match.request_id, None)
+
+        _log.info(
+            "bridge: delivering ANSWER request_id=%s len=%d",
+            match.request_id, len(text),
+        )
+        log_event(
+            _logger,
+            "dev.answer.received",
+            transport="telegram",
+            source=f"telegram:chat={self.chat_id}",
+            request_id=match.request_id,
+            telegram_msg_id=match.telegram_msg_id,
+            reply_to_message_id=reply_to_message_id,
+            answer=text,
+            answer_length=len(text),
+            answer_hash=hash_text(text),
+        )
+        answer = BridgeMessage(
+            op=BridgeOp.ANSWER,
+            request_id=match.request_id,
+            answer=text,
+            answered_at=datetime.now(timezone.utc).isoformat(),
+        )
+        try:
+            match.writer.write(serialize_message(answer).encode())
+            await match.writer.drain()
+        except Exception as e:
+            _log.warning(
+                "bridge: failed to deliver ANSWER request_id=%s err=%s",
+                match.request_id, e,
+            )

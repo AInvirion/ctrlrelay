@@ -18,6 +18,7 @@ from dev_sync.core.config import (
 from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
 from dev_sync.core.github import GitHubCLI
 from dev_sync.core.poller import IssuePoller
+from dev_sync.core.pr_verifier import PRVerifier, VerificationResult
 from dev_sync.core.pr_watcher import PRWatcher
 from dev_sync.core.state import StateDB
 from dev_sync.core.worktree import WorktreeManager
@@ -31,10 +32,12 @@ __all__ = [
     "ConfigError",
     "GitHubCLI",
     "IssuePoller",
+    "PRVerifier",
     "PRWatcher",
     "RepoConfig",
     "SessionResult",
     "StateDB",
+    "VerificationResult",
     "WorktreeManager",
     "blocked",
     "done",

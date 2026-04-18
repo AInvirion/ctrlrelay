@@ -18,10 +18,10 @@ claude:
   output_format: "json"
 
 transport:
-  type: "file_mock"  # Use "telegram" for production
+  type: "telegram"
   telegram:
     bot_token_env: "DEV_SYNC_TELEGRAM_TOKEN"
-    chat_id: 123456789
+    chat_id: 61259010
     socket_path: "~/.dev-sync/dev-sync.sock"
   file_mock:
     inbox: "~/.dev-sync/inbox.txt"
@@ -33,8 +33,38 @@ dashboard:
   auth_token_env: "DEV_SYNC_DASHBOARD_TOKEN"
 
 repos:
-  - name: "anthropics/claude-code"
-    local_path: "~/Projects/claude-code"
+  - name: "AInvirion/dev-sync"
+    local_path: "~/Projects/dev-sync"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
+  - name: "AInvirion/cliquey"
+    local_path: "~/Projects/AINVIRION/cliquey"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
+  - name: "AInvirion/AgentJunior"
+    local_path: "~/Projects/AINVIRION/AgentJunior"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
+  - name: "AInvirion/aiproxyguard-cloud"
+    local_path: "~/Projects/AINVIRION/AIProxyGuard/cloud"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
+  - name: "SemClone/kenos-orchestrator"
+    local_path: "~/Projects/SEMCL.ONE/kenos-orchestrator"
+    automation:
+      dependabot_patch: auto
+      dependabot_minor: ask
+      dependabot_major: never
+  - name: "oscarvalenzuelab/open_agentic_framework"
+    local_path: "~/Projects/PERSONAL/open_agentic_framework"
     automation:
       dependabot_patch: auto
       dependabot_minor: ask

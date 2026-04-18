@@ -13,6 +13,16 @@ __pycache__/
 .idea/
 .vscode/
 
-# Claude worktrees
-.claude/worktrees/
+# Claude local state (worktrees, sessions, etc.)
+.claude/
+
+# Jekyll (docs site)
+docs/_site/
+docs/.jekyll-cache/
+docs/.jekyll-metadata
+docs/vendor/
+docs/Gemfile.lock
+
+# Backup of old config system
+bkp/
 
