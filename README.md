@@ -394,16 +394,6 @@ ruff check src/
 pytest tests/test_dev_pipeline.py -v
 ```
 
-## Roadmap
-
-- [x] Phase 1: Core infrastructure (state, config, worktrees)
-- [x] Phase 2: Claude dispatcher and checkpoint protocol
-- [x] Phase 3: Secops pipeline
-- [x] Phase 4: Dev pipeline (issue-to-PR)
-- [x] Phase 5: Telegram integration (human-in-the-loop)
-- [ ] Phase 6: Dashboard integration
-- [ ] Phase 7: Deploy-verify pipeline
-
 ## License
 
 MIT
