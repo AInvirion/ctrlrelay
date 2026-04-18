@@ -25,12 +25,6 @@ uv pip install -e .
 pip install -e .
 ```
 
-### Requirements
-
-- Python 3.11+
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude` command)
-- [GitHub CLI](https://cli.github.com/) (`gh` command, authenticated)
-
 ## Quick Start
 
 ### 1. Configure
