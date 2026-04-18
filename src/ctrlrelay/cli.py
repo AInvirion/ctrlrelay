@@ -867,25 +867,12 @@ def poller_start(
                     contexts_dir=config.paths.contexts,
                 )
 
-                # Send result notification
-                if connected_transport:
-                    if result.success:
-                        pr_url = result.outputs.get("pr_url", "")
-                        await transport.send(f"✅ PR ready: {pr_url}")
-                    elif result.blocked:
-                        await transport.send(f"⏸️ Blocked on #{issue_number}: {result.question}")
-                    else:
-                        await transport.send(
-                            f"❌ Failed on #{issue_number}: "
-                            f"{result.error or result.summary}"
-                        )
-
-                # If the dev pipeline opened a PR, spawn a background
-                # watcher regardless of terminal status — run_dev_issue
-                # preserves `pr_number` in outputs even on BLOCKED/FAILED
-                # paths where verification gave up but the PR is still
-                # live on origin. Watching those too means a human-
-                # completed merge still auto-closes the issue.
+                # Spawn the PR watcher FIRST, before any best-effort
+                # notification. The poller has already marked this issue
+                # as seen in poller_state.json, so if a transient
+                # transport.send failure below raised through the outer
+                # finally, we'd permanently lose the watcher and the
+                # issue would never auto-close on merge.
                 pr_number_raw = result.outputs.get("pr_number")
                 pr_url_str = result.outputs.get("pr_url", "")
                 if pr_number_raw is not None:
@@ -907,6 +894,28 @@ def poller_start(
                         )
                         pr_watch_tasks.add(task)
                         task.add_done_callback(pr_watch_tasks.discard)
+
+                # Send result notification — best-effort. A failed send
+                # must NOT prevent the merge watcher (spawned above)
+                # from running, so swallow transport errors here.
+                if connected_transport:
+                    try:
+                        if result.success:
+                            pr_url = result.outputs.get("pr_url", "")
+                            await transport.send(f"✅ PR ready: {pr_url}")
+                        elif result.blocked:
+                            await transport.send(
+                                f"⏸️ Blocked on #{issue_number}: {result.question}"
+                            )
+                        else:
+                            await transport.send(
+                                f"❌ Failed on #{issue_number}: "
+                                f"{result.error or result.summary}"
+                            )
+                    except Exception as e:
+                        console.print(
+                            f"[yellow]Transport error sending result: {e}[/yellow]"
+                        )
             finally:
                 if connected_transport:
                     await transport.close()
