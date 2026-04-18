@@ -147,9 +147,10 @@ class TestGitHubCLI:
         """Should list issues assigned to a user."""
         from ctrlrelay.core.github import GitHubCLI
 
+        alice = [{"login": "alice"}]
         mock_output = json.dumps([
-            {"number": 10, "title": "Fix login bug", "state": "open", "assignees": [{"login": "alice"}]},
-            {"number": 11, "title": "Add dark mode", "state": "open", "assignees": [{"login": "alice"}]},
+            {"number": 10, "title": "Fix login bug", "state": "open", "assignees": alice},
+            {"number": 11, "title": "Add dark mode", "state": "open", "assignees": alice},
         ])
 
         with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:

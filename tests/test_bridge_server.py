@@ -154,7 +154,10 @@ class TestBridgeServer:
         from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.protocol import (
-            BridgeMessage, BridgeOp, parse_message, serialize_message,
+            BridgeMessage,
+            BridgeOp,
+            parse_message,
+            serialize_message,
         )
         from ctrlrelay.bridge.server import BridgeServer
 
@@ -198,7 +201,9 @@ class TestBridgeServer:
         from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.protocol import (
-            BridgeMessage, BridgeOp, serialize_message, parse_message,
+            BridgeMessage,
+            BridgeOp,
+            serialize_message,
         )
         from ctrlrelay.bridge.server import BridgeServer
 
@@ -239,7 +244,9 @@ class TestBridgeServer:
         from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.protocol import (
-            BridgeMessage, BridgeOp, serialize_message,
+            BridgeMessage,
+            BridgeOp,
+            serialize_message,
         )
         from ctrlrelay.bridge.server import BridgeServer
 

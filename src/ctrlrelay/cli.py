@@ -802,7 +802,9 @@ def poller_start(
                 console.print(f"[dim]Telegram transport enabled via {socket_path}[/dim]")
             else:
                 console.print(f"[yellow]Telegram socket not found at {socket_path}[/yellow]")
-                console.print("[yellow]Run 'ctrlrelay bridge start' to enable notifications[/yellow]")
+                console.print(
+                    "[yellow]Run 'ctrlrelay bridge start' to enable notifications[/yellow]"
+                )
 
         async def handle_issue(repo: str, issue: dict) -> None:
             issue_number = issue["number"]
@@ -852,7 +854,10 @@ def poller_start(
                     elif result.blocked:
                         await transport.send(f"⏸️ Blocked on #{issue_number}: {result.question}")
                     else:
-                        await transport.send(f"❌ Failed on #{issue_number}: {result.error or result.summary}")
+                        await transport.send(
+                            f"❌ Failed on #{issue_number}: "
+                            f"{result.error or result.summary}"
+                        )
             finally:
                 if connected_transport:
                     await transport.close()

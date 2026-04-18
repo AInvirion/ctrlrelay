@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -11,7 +11,7 @@ class TestDevIntegration:
     @pytest.mark.asyncio
     async def test_full_dev_flow_with_mocked_claude(self, tmp_path: Path) -> None:
         """Should run full dev flow from issue to PR."""
-        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
+        from ctrlrelay.core.checkpoint import read_checkpoint
         from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
         from ctrlrelay.core.github import GitHubCLI
         from ctrlrelay.core.state import StateDB
@@ -81,11 +81,15 @@ class TestDevIntegration:
         mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
 
         # Mock worktree methods
-        with patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock), \
-             patch.object(worktree, "create_worktree_with_new_branch", new_callable=AsyncMock) as mock_create, \
-             patch.object(worktree, "remove_worktree", new_callable=AsyncMock), \
-             patch.object(worktree, "symlink_context"), \
-             patch.object(worktree, "remove_context_symlink"):
+        with (
+            patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock),
+            patch.object(
+                worktree, "create_worktree_with_new_branch", new_callable=AsyncMock
+            ) as mock_create,
+            patch.object(worktree, "remove_worktree", new_callable=AsyncMock),
+            patch.object(worktree, "symlink_context"),
+            patch.object(worktree, "remove_context_symlink"),
+        ):
 
             worktree_path = tmp_path / "worktrees" / "test-worktree"
             worktree_path.mkdir(parents=True)
@@ -167,14 +171,26 @@ class TestDevPipelineCleanup:
         mock_dispatcher = AsyncMock(spec=ClaudeDispatcher)
         mock_dispatcher.spawn_session.side_effect = spawn_side_effect
 
-        with patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock), \
-             patch.object(worktree, "create_worktree_with_new_branch", new_callable=AsyncMock) as mock_create, \
-             patch.object(worktree, "remove_worktree", new_callable=AsyncMock) as mock_remove_wt, \
-             patch.object(worktree, "delete_branch", new_callable=AsyncMock) as mock_delete_branch, \
-             patch.object(worktree, "branch_exists_on_remote", new_callable=AsyncMock) as mock_remote, \
-             patch.object(worktree, "branch_exists_locally", new_callable=AsyncMock) as mock_local, \
-             patch.object(worktree, "symlink_context"), \
-             patch.object(worktree, "remove_context_symlink"):
+        with (
+            patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock),
+            patch.object(
+                worktree, "create_worktree_with_new_branch", new_callable=AsyncMock
+            ) as mock_create,
+            patch.object(
+                worktree, "remove_worktree", new_callable=AsyncMock
+            ) as mock_remove_wt,
+            patch.object(
+                worktree, "delete_branch", new_callable=AsyncMock
+            ) as mock_delete_branch,
+            patch.object(
+                worktree, "branch_exists_on_remote", new_callable=AsyncMock
+            ) as mock_remote,
+            patch.object(
+                worktree, "branch_exists_locally", new_callable=AsyncMock
+            ) as mock_local,
+            patch.object(worktree, "symlink_context"),
+            patch.object(worktree, "remove_context_symlink"),
+        ):
 
             mock_remote.return_value = branch_on_remote
             mock_local.return_value = branch_preexists_locally
