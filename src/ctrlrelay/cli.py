@@ -739,6 +739,7 @@ def poller_start(
         from ctrlrelay.core.state import StateDB
         from ctrlrelay.core.worktree import WorktreeManager
         from ctrlrelay.pipelines.dev import run_dev_issue
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
 
         github = GitHubCLI()
 
@@ -806,6 +807,26 @@ def poller_start(
                     "[yellow]Run 'ctrlrelay bridge start' to enable notifications[/yellow]"
                 )
 
+        # Track in-flight PR-watch background tasks so they outlive
+        # handle_issue and aren't garbage-collected. Cleared via
+        # done_callback as each task terminates.
+        pr_watch_tasks: set[asyncio.Task] = set()
+
+        async def _watch_transport_factory():
+            """Build a fresh connected SocketTransport for a single watcher,
+            independent of the transport used in handle_issue (which is
+            closed on exit). Returns None when no Telegram transport is
+            configured or the socket is missing."""
+            if config.transport.type.value != "telegram" or not config.transport.telegram:
+                return None
+            from ctrlrelay.transports import SocketTransport
+            socket_path = config.transport.telegram.socket_path.expanduser().resolve()
+            if not socket_path.exists():
+                return None
+            watch_transport = SocketTransport(socket_path)
+            await watch_transport.connect()
+            return watch_transport
+
         async def handle_issue(repo: str, issue: dict) -> None:
             issue_number = issue["number"]
             title = issue.get("title", "")
@@ -858,6 +879,32 @@ def poller_start(
                             f"❌ Failed on #{issue_number}: "
                             f"{result.error or result.summary}"
                         )
+
+                # If the dev pipeline opened a PR, spawn a background
+                # watcher that fires a Telegram notification + closes
+                # the issue when the reviewer merges. Fire-and-forget;
+                # task is tracked in pr_watch_tasks so it's not GC'd.
+                pr_number_raw = result.outputs.get("pr_number") if result.success else None
+                pr_url_str = result.outputs.get("pr_url", "") if result.success else ""
+                if pr_number_raw is not None:
+                    try:
+                        pr_number = int(pr_number_raw)
+                    except (TypeError, ValueError):
+                        pr_number = None
+                    if pr_number is not None:
+                        task = asyncio.create_task(
+                            pr_watch_task(
+                                repo=repo,
+                                issue_number=issue_number,
+                                pr_url=pr_url_str,
+                                pr_number=pr_number,
+                                session_id=result.session_id,
+                                github=github,
+                                transport_factory=_watch_transport_factory,
+                            )
+                        )
+                        pr_watch_tasks.add(task)
+                        task.add_done_callback(pr_watch_tasks.discard)
             finally:
                 if connected_transport:
                     await transport.close()
@@ -865,8 +912,23 @@ def poller_start(
         console.print(f"[green]Starting poller[/green] for {len(repo_names)} repo(s) as {username}")
         console.print(f"  Interval: {interval}s | Press Ctrl+C to stop")
 
+        async def _main() -> None:
+            try:
+                await run_poll_loop(
+                    poller=poller, handler=handle_issue, interval=interval,
+                )
+            finally:
+                # Cancel any in-flight PR watchers so a poller stop/restart
+                # doesn't leak asyncio tasks. Their handlers log
+                # dev.pr.watch_cancelled and close their transport via the
+                # finally block.
+                if pr_watch_tasks:
+                    for t in list(pr_watch_tasks):
+                        t.cancel()
+                    await asyncio.gather(*list(pr_watch_tasks), return_exceptions=True)
+
         try:
-            asyncio.run(run_poll_loop(poller=poller, handler=handle_issue, interval=interval))
+            asyncio.run(_main())
         except KeyboardInterrupt:
             console.print("\n[yellow]Poller stopped.[/yellow]")
         finally:
