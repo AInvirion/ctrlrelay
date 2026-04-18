@@ -245,6 +245,126 @@ class TestPRWatchTask:
         assert factory_call_count == 0
 
     @pytest.mark.asyncio
+    async def test_retry_does_not_duplicate_close_issue_comment(
+        self, caplog
+    ) -> None:
+        """Codex P2: if close_issue succeeds but transport.send fails,
+        the retry MUST NOT re-run close_issue and post a duplicate
+        "Closed by PR #N" comment on the issue."""
+        import logging
+
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        # close_issue succeeds on first call; no retries of it.
+        # transport.send raises twice, succeeds third.
+        send_calls = 0
+
+        def make_transport():
+            nonlocal send_calls
+            t = AsyncMock()
+
+            async def send(_msg):
+                nonlocal send_calls
+                send_calls += 1
+                if send_calls < 3:
+                    raise RuntimeError("bridge transient")
+
+            t.send.side_effect = send
+            return t
+
+        attempt_transports: list = []
+
+        async def factory():
+            t = make_transport()
+            attempt_transports.append(t)
+            return t
+
+        import ctrlrelay.pipelines.post_merge as pm
+        orig = pm._HANDLE_MERGE_RETRY_BASE_DELAY
+        pm._HANDLE_MERGE_RETRY_BASE_DELAY = 0
+        try:
+            with caplog.at_level(logging.INFO, logger="ctrlrelay.pipelines.post_merge"):
+                outcome = await pr_watch_task(
+                    repo="owner/repo",
+                    issue_number=77,
+                    pr_url="",
+                    pr_number=42,
+                    session_id=None,
+                    github=mock_github,
+                    transport_factory=factory,
+                    poll_interval=0,
+                    timeout=5,
+                )
+        finally:
+            pm._HANDLE_MERGE_RETRY_BASE_DELAY = orig
+
+        assert outcome["merged"] is True
+        # close_issue called EXACTLY ONCE despite 3 retry attempts.
+        assert mock_github.close_issue.call_count == 1
+        # transport.send called 3 times (once per attempt).
+        assert send_calls == 3
+
+    @pytest.mark.asyncio
+    async def test_retry_rebuilds_transport_on_each_attempt(
+        self
+    ) -> None:
+        """Codex P2: factory is invoked inside each retry attempt, so a
+        bridge that drops its socket between retries gets a fresh
+        connection on the next try — not a stale dead socket."""
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+        # close_issue fails twice, succeeds third.
+        close_calls = 0
+
+        async def flaky_close(repo, issue_number, comment):
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls < 3:
+                raise RuntimeError("gh transient")
+
+        mock_github.close_issue.side_effect = flaky_close
+
+        factory_calls = 0
+        built_transports: list = []
+
+        async def factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            t = AsyncMock()
+            built_transports.append(t)
+            return t
+
+        import ctrlrelay.pipelines.post_merge as pm
+        orig = pm._HANDLE_MERGE_RETRY_BASE_DELAY
+        pm._HANDLE_MERGE_RETRY_BASE_DELAY = 0
+        try:
+            outcome = await pr_watch_task(
+                repo="owner/repo",
+                issue_number=77,
+                pr_url="",
+                pr_number=42,
+                session_id=None,
+                github=mock_github,
+                transport_factory=factory,
+                poll_interval=0,
+                timeout=5,
+            )
+        finally:
+            pm._HANDLE_MERGE_RETRY_BASE_DELAY = orig
+
+        assert outcome["merged"] is True
+        # One factory call per retry attempt (3 total).
+        assert factory_calls == 3
+        # Each built transport was closed at the end of its attempt.
+        for t in built_transports:
+            t.close.assert_awaited()
+
+    @pytest.mark.asyncio
     async def test_handle_merge_transient_failure_retries(self, caplog) -> None:
         """Codex P2: transient `gh issue close` failure at merge time must
         not abandon the post-merge cleanup. Retry with backoff; after
