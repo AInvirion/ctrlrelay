@@ -266,6 +266,116 @@ transport:
 5. Set the environment variable: `export DEV_SYNC_TELEGRAM_TOKEN="your-token"`
 6. Start the bridge: `dev-sync bridge start --daemon`
 
+## Running as a Service (macOS)
+
+To run dev-sync automatically on login and after reboots:
+
+### 1. Create launchd plist files
+
+**Bridge service** (`~/Library/LaunchAgents/com.ainvirion.dev-sync-bridge.plist`):
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ainvirion.dev-sync-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/dev-sync</string>
+        <string>bridge</string>
+        <string>start</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DEV_SYNC_TELEGRAM_TOKEN</key>
+        <string>YOUR_BOT_TOKEN</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>/path/to/dev-sync</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.dev-sync/logs/bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.dev-sync/logs/bridge.error.log</string>
+</dict>
+</plist>
+```
+
+**Poller service** (`~/Library/LaunchAgents/com.ainvirion.dev-sync-poller.plist`):
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ainvirion.dev-sync-poller</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/dev-sync</string>
+        <string>poller</string>
+        <string>start</string>
+        <string>--interval</string>
+        <string>300</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DEV_SYNC_TELEGRAM_TOKEN</key>
+        <string>YOUR_BOT_TOKEN</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>/path/to/dev-sync</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.dev-sync/logs/poller.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.dev-sync/logs/poller.error.log</string>
+</dict>
+</plist>
+```
+
+### 2. Create logs directory
+
+```bash
+mkdir -p ~/.dev-sync/logs
+```
+
+### 3. Load the services
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ainvirion.dev-sync-bridge.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ainvirion.dev-sync-poller.plist
+```
+
+### 4. Managing services
+
+```bash
+# Check status
+launchctl list | grep dev-sync
+
+# View logs
+tail -f ~/.dev-sync/logs/poller.log
+tail -f ~/.dev-sync/logs/bridge.log
+
+# Stop services
+launchctl bootout gui/$(id -u)/com.ainvirion.dev-sync-bridge
+launchctl bootout gui/$(id -u)/com.ainvirion.dev-sync-poller
+
+# Start services
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ainvirion.dev-sync-bridge.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ainvirion.dev-sync-poller.plist
+```
+
 ## Development
 
 ```bash
