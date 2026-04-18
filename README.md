@@ -2,6 +2,8 @@
 
 Multi-device development environment sync. Keeps repos, Claude Code config, Codex config, and team-shared settings in sync across machines.
 
+📖 **Docs site:** [ainvirion.github.io/dev-sync](https://ainvirion.github.io/dev-sync/) — design specs, implementation plans, and operator guides, built from [`docs/`](docs/) with Jekyll + just-the-docs and deployed via GitHub Pages.
+
 ## Quick start
 
 ```bash

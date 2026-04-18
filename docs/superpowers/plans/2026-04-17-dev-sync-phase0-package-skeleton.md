@@ -1,3 +1,10 @@
+---
+title: Phase 0 — Package Skeleton
+layout: default
+parent: Plans
+nav_order: 1
+---
+
 # dev-sync Phase 0: Package Skeleton
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

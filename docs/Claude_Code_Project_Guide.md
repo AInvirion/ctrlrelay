@@ -1,3 +1,9 @@
+---
+title: Claude Code Project Guide
+layout: default
+nav_order: 2
+---
+
 # Claude Code Project Development Guide
 
 ## Core Frame

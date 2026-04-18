@@ -1,3 +1,10 @@
+---
+title: Orchestrator Implementation Design
+layout: default
+parent: Specs
+nav_order: 1
+---
+
 # dev-sync Orchestrator — Implementation Design
 
 **Date:** 2026-04-17  
