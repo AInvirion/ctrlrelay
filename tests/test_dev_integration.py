@@ -107,3 +107,182 @@ class TestDevIntegration:
         assert rows[0]["issue_number"] == 123
 
         state_db.close()
+
+
+class TestDevPipelineCleanup:
+    """Regression tests for #17: worktree + branch cleanup on failure paths."""
+
+    async def _run(
+        self,
+        tmp_path: Path,
+        spawn_side_effect,
+    ):
+        """Run the dev pipeline with a stub dispatcher behavior, returning
+        (result, worktree_manager_mocks) so tests can assert on cleanup calls."""
+        from dev_sync.core.dispatcher import ClaudeDispatcher
+        from dev_sync.core.github import GitHubCLI
+        from dev_sync.core.state import StateDB
+        from dev_sync.core.worktree import WorktreeManager
+        from dev_sync.pipelines.dev import run_dev_issue
+
+        state_db = StateDB(tmp_path / "state.db")
+
+        worktree = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+
+        mock_github = AsyncMock(spec=GitHubCLI)
+        mock_github.get_issue.return_value = {
+            "number": 13,
+            "title": "Remove roadmap section from README",
+            "body": "Outdated.",
+        }
+
+        mock_dispatcher = AsyncMock(spec=ClaudeDispatcher)
+        mock_dispatcher.spawn_session.side_effect = spawn_side_effect
+
+        with patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock), \
+             patch.object(worktree, "create_worktree_with_new_branch", new_callable=AsyncMock) as mock_create, \
+             patch.object(worktree, "remove_worktree", new_callable=AsyncMock) as mock_remove_wt, \
+             patch.object(worktree, "delete_branch", new_callable=AsyncMock) as mock_delete_branch, \
+             patch.object(worktree, "symlink_context"), \
+             patch.object(worktree, "remove_context_symlink"):
+
+            worktree_path = tmp_path / "worktrees" / "wt-13"
+            worktree_path.mkdir(parents=True)
+            mock_create.return_value = worktree_path
+
+            result = await run_dev_issue(
+                repo="owner/repo",
+                issue_number=13,
+                branch_template="fix/issue-{n}",
+                dispatcher=mock_dispatcher,
+                github=mock_github,
+                worktree=worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+
+        state_db.close()
+        return result, mock_remove_wt, mock_delete_branch
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_exception_cleans_up_worktree_and_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for #17: if dispatcher raises (e.g. claude binary missing),
+        the leftover worktree and fix/issue-<n> branch must be cleaned up so the
+        next retry can re-create them."""
+
+        async def spawn(**kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "claude")
+
+        result, mock_remove_wt, mock_delete_branch = await self._run(tmp_path, spawn)
+
+        assert not result.success
+        assert not result.blocked
+        mock_remove_wt.assert_awaited_once()
+        mock_delete_branch.assert_awaited_once()
+        assert mock_delete_branch.await_args.args[1] == "fix/issue-13"
+
+    @pytest.mark.asyncio
+    async def test_failed_checkpoint_cleans_up_worktree_and_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """A FAILED checkpoint (claude exited cleanly but flagged failure) must
+        trigger the same cleanup as an exception — retry must not be blocked by
+        a leftover branch."""
+        from dev_sync.core.checkpoint import read_checkpoint
+        from dev_sync.core.dispatcher import SessionResult
+
+        async def spawn(**kwargs):
+            state_file = kwargs["state_file"]
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps({
+                "version": "1",
+                "status": "FAILED",
+                "session_id": kwargs["session_id"],
+                "timestamp": "2026-04-17T12:00:00Z",
+                "error": "something broke",
+            }))
+            return SessionResult(
+                session_id=kwargs["session_id"],
+                exit_code=1,
+                stdout="",
+                stderr="",
+                state=read_checkpoint(state_file),
+            )
+
+        result, mock_remove_wt, mock_delete_branch = await self._run(tmp_path, spawn)
+
+        assert not result.success
+        assert not result.blocked
+        mock_remove_wt.assert_awaited_once()
+        mock_delete_branch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_blocked_preserves_worktree_and_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """BLOCKED must NOT clean up — the user may resume the session."""
+        from dev_sync.core.checkpoint import read_checkpoint
+        from dev_sync.core.dispatcher import SessionResult
+
+        async def spawn(**kwargs):
+            state_file = kwargs["state_file"]
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps({
+                "version": "1",
+                "status": "BLOCKED_NEEDS_INPUT",
+                "session_id": kwargs["session_id"],
+                "timestamp": "2026-04-17T12:00:00Z",
+                "question": "pin or bump?",
+            }))
+            return SessionResult(
+                session_id=kwargs["session_id"],
+                exit_code=0,
+                stdout="",
+                stderr="",
+                state=read_checkpoint(state_file),
+            )
+
+        result, mock_remove_wt, mock_delete_branch = await self._run(tmp_path, spawn)
+
+        assert result.blocked
+        mock_remove_wt.assert_not_awaited()
+        mock_delete_branch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_success_preserves_branch(self, tmp_path: Path) -> None:
+        """DONE removes the worktree but keeps the branch — the open PR
+        references it, so deleting would break the PR."""
+        from dev_sync.core.checkpoint import read_checkpoint
+        from dev_sync.core.dispatcher import SessionResult
+
+        async def spawn(**kwargs):
+            state_file = kwargs["state_file"]
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps({
+                "version": "1",
+                "status": "DONE",
+                "session_id": kwargs["session_id"],
+                "timestamp": "2026-04-17T12:00:00Z",
+                "summary": "PR opened",
+                "outputs": {"pr_url": "https://x/pr/1", "pr_number": 1},
+            }))
+            return SessionResult(
+                session_id=kwargs["session_id"],
+                exit_code=0,
+                stdout="",
+                stderr="",
+                state=read_checkpoint(state_file),
+            )
+
+        result, mock_remove_wt, mock_delete_branch = await self._run(tmp_path, spawn)
+
+        assert result.success
+        mock_remove_wt.assert_awaited_once()
+        mock_delete_branch.assert_not_awaited()

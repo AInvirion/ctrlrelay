@@ -141,6 +141,16 @@ class WorktreeManager:
         if bare_path.exists():
             await self._run_git("worktree", "prune", cwd=bare_path)
 
+    async def delete_branch(self, repo: str, branch: str) -> None:
+        """Delete a local branch in the bare repo. Best-effort; no-op if absent."""
+        bare_path = self._get_bare_repo_path(repo)
+        if not bare_path.exists():
+            return
+        try:
+            await self._run_git("branch", "-D", branch, cwd=bare_path)
+        except WorktreeError:
+            pass
+
     def _get_gitdir(self, worktree_path: Path) -> Path:
         """Get the real gitdir for a worktree.
 

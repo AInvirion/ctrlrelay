@@ -186,6 +186,8 @@ async def run_dev_issue(
             error="Repository locked by another session",
         )
 
+    worktree_path: Path | None = None
+
     try:
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
@@ -266,10 +268,18 @@ async def run_dev_issue(
                 },
             ))
 
-        # Cleanup only if not blocked (blocked sessions need worktree for resume)
-        if not result.blocked:
+        # Cleanup rules:
+        #   DONE    -> remove worktree, keep branch (the open PR references it)
+        #   BLOCKED -> keep both (user may resume the session)
+        #   FAILED  -> remove worktree AND delete branch so the next retry can
+        #              re-create `fix/issue-<n>` cleanly
+        if result.success:
             worktree.remove_context_symlink(worktree_path)
             await worktree.remove_worktree(repo, session_id)
+        elif not result.blocked:
+            worktree.remove_context_symlink(worktree_path)
+            await worktree.remove_worktree(repo, session_id)
+            await worktree.delete_branch(repo, branch_name)
 
         return result
 
@@ -279,6 +289,22 @@ async def run_dev_issue(
             ("failed", f"Error: {e}", int(time.time()), session_id),
         )
         state_db.commit()
+
+        # Best-effort cleanup so a retry isn't blocked by leftover branch/worktree.
+        if worktree_path is not None:
+            try:
+                worktree.remove_context_symlink(worktree_path)
+            except Exception:
+                pass
+            try:
+                await worktree.remove_worktree(repo, session_id)
+            except Exception:
+                pass
+        try:
+            await worktree.delete_branch(repo, branch_name)
+        except Exception:
+            pass
+
         return PipelineResult(
             success=False,
             session_id=session_id,
