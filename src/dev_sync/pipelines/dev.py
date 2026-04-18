@@ -17,6 +17,12 @@ from dev_sync.dashboard.client import DashboardClient, EventPayload
 from dev_sync.pipelines.base import PipelineContext, PipelineResult
 from dev_sync.transports.base import Transport
 
+AGENT_CLAIM_MARKER = "<!-- dev-sync:claimed -->"
+AGENT_CLAIM_COMMENT = (
+    "🤖 Agent is working on this issue. A PR will be opened for review.\n\n"
+    f"{AGENT_CLAIM_MARKER}"
+)
+
 
 @dataclass
 class DevPipeline:
@@ -155,6 +161,21 @@ async def run_dev_issue(
     try:
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
+
+        # Post claim comment so collaborators can see the agent picked it up.
+        # Skip if a previous attempt already left the marker — keeps it idempotent
+        # across retries / resumed sessions.
+        existing_comments = issue.get("comments") or []
+        already_claimed = any(
+            AGENT_CLAIM_MARKER in (c.get("body") or "")
+            for c in existing_comments
+        )
+        if not already_claimed:
+            await github.comment_on_issue(
+                repo=repo,
+                issue_number=issue_number,
+                body=AGENT_CLAIM_COMMENT,
+            )
 
         # Create worktree with new branch
         await worktree.ensure_bare_repo(repo)

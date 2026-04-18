@@ -172,6 +172,20 @@ class GitHubCLI:
         )
         return json.loads(output)
 
+    async def comment_on_issue(
+        self,
+        repo: str,
+        issue_number: int,
+        body: str,
+    ) -> None:
+        """Post a comment on an issue."""
+        await self._run_gh(
+            "issue", "comment",
+            str(issue_number),
+            "--repo", repo,
+            "--body", body,
+        )
+
     async def close_issue(
         self,
         repo: str,
@@ -180,12 +194,7 @@ class GitHubCLI:
     ) -> None:
         """Close an issue with an optional comment."""
         if comment is not None:
-            await self._run_gh(
-                "issue", "comment",
-                str(issue_number),
-                "--repo", repo,
-                "--body", comment,
-            )
+            await self.comment_on_issue(repo, issue_number, comment)
         await self._run_gh(
             "issue", "close",
             str(issue_number),
