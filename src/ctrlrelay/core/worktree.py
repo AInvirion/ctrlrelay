@@ -245,9 +245,15 @@ class WorktreeManager:
             stale_path = await self._find_stale_worktree_path(bare_path, branch)
             if stale_path is None:
                 raise
-            # Admin dir is `<bare>/worktrees/<last-path-component>`.
-            admin_dir = bare_path / "worktrees" / Path(stale_path).name
-            if admin_dir.exists():
+            # Locate the admin dir via its canonical `gitdir` pointer,
+            # NOT by assuming the path basename matches. Git sanitizes
+            # names (`foo bar` → `foo-bar`) and disambiguates duplicates
+            # (`wt`, `wt1`, …), so Path(stale_path).name can point at the
+            # wrong admin dir or a live unrelated worktree's metadata.
+            # Each admin dir has a `gitdir` file that points at
+            # `<worktree-path>/.git` — that pointer is the source of truth.
+            admin_dir = self._resolve_admin_dir(bare_path, stale_path)
+            if admin_dir is not None and admin_dir.exists():
                 try:
                     shutil.rmtree(admin_dir)
                 except OSError:
@@ -257,6 +263,37 @@ class WorktreeManager:
                 "worktree", "add", str(worktree_path), branch,
                 cwd=bare_path,
             )
+
+    def _resolve_admin_dir(
+        self, bare_path: Path, worktree_dir: str,
+    ) -> Path | None:
+        """Find the bare repo's admin dir whose ``gitdir`` pointer file
+        resolves to ``<worktree_dir>/.git``. Returns None if no
+        matching entry exists.
+
+        Git may name admin dirs differently from the worktree path
+        basename (sanitization, collision-suffix), so the only robust
+        way to pair them is to inspect each admin's gitdir pointer.
+        """
+        worktrees_root = bare_path / "worktrees"
+        if not worktrees_root.is_dir():
+            return None
+        target = str(Path(worktree_dir) / ".git")
+        try:
+            entries = list(worktrees_root.iterdir())
+        except OSError:
+            return None
+        for admin_dir in entries:
+            gitdir_file = admin_dir / "gitdir"
+            if not gitdir_file.exists():
+                continue
+            try:
+                pointer = gitdir_file.read_text().strip()
+            except OSError:
+                continue
+            if pointer == target:
+                return admin_dir
+        return None
 
     async def _find_stale_worktree_path(
         self, bare_path: Path, branch: str,

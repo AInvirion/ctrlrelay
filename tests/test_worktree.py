@@ -441,15 +441,25 @@ class TestWorktreeManager:
         bare = tmp_path / "repos" / "owner-repo.git"
         bare.mkdir(parents=True)
 
-        # Stale admin dir path: last path component of the worktree path,
-        # inside <bare>/worktrees/. Create the dir on disk so the targeted
-        # rmtree has something to remove.
+        # Stale admin dir is paired to a worktree path via its `gitdir`
+        # file, NOT via basename. Deliberately use a non-matching admin
+        # name to prove the resolver uses the canonical pointer.
         stale_worktree_path_str = str(
             tmp_path / "worktrees" / "owner-repo-crashed-sess"
         )
-        admin_dir = bare / "worktrees" / "owner-repo-crashed-sess"
+        admin_dir = bare / "worktrees" / "sanitized-differently"
         admin_dir.mkdir(parents=True)
         (admin_dir / "HEAD").write_text("ref: refs/heads/fix/issue-99\n")
+        (admin_dir / "gitdir").write_text(
+            f"{stale_worktree_path_str}/.git\n"
+        )
+        # Also create an unrelated admin dir that would be wrongly
+        # targeted by the old basename heuristic, to prove we don't
+        # touch it.
+        decoy = bare / "worktrees" / "owner-repo-crashed-sess"
+        decoy.mkdir(parents=True)
+        (decoy / "HEAD").write_text("ref: refs/heads/other-branch\n")
+        (decoy / "gitdir").write_text("/some/other/worktree/.git\n")
 
         stale_porcelain = (
             f"worktree {stale_worktree_path_str}\n"
@@ -486,8 +496,14 @@ class TestWorktreeManager:
         assert prune_calls == [], (
             "must not run repo-wide prune; targeted rmtree should suffice"
         )
-        # The stale admin dir for THIS branch was removed.
+        # The stale admin dir for THIS branch (matched via gitdir pointer,
+        # not basename) was removed.
         assert not admin_dir.exists()
+        # The unrelated same-basename admin dir was NOT touched.
+        assert decoy.exists(), (
+            "basename-only matcher would have wrongly deleted this; "
+            "gitdir-pointer resolver must spare it"
+        )
         # Two add attempts were made: first failed, second retry succeeded.
         add_calls = [
             c for c in mock_git.call_args_list
