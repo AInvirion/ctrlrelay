@@ -7,19 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Project renamed: `dev-sync` → `ctrlrelay`**. Repo moved from
+  `AInvirion/dev-sync` to `AInvirion/ctrlrelay`.
+  - Python package: `dev_sync` → `ctrlrelay`; PyPI dist: `dev-sync` →
+    `ctrlrelay`; CLI binary: `dev-sync` → `ctrlrelay`.
+  - Runtime paths: `~/.dev-sync/` → `~/.ctrlrelay/` (state DB, worktrees,
+    bare repos, sockets, logs).
+  - Transport socket: `dev-sync.sock` → `ctrlrelay.sock`.
+  - Environment variables: `DEV_SYNC_*` → `CTRLRELAY_*`
+    (e.g. `CTRLRELAY_TELEGRAM_TOKEN`, `CTRLRELAY_DASHBOARD_TOKEN`,
+    `CTRLRELAY_STATE_FILE`, `CTRLRELAY_SESSION_ID`).
+  - launchd labels: `com.ainvirion.dev-sync-{poller,bridge}` →
+    `com.ainvirion.ctrlrelay-{poller,bridge}`.
+
+### Migration (clean-slate)
+
+Existing installs need a reset:
+```bash
+# stop + remove old daemons
+launchctl bootout gui/$(id -u)/com.ainvirion.dev-sync-poller 2>/dev/null
+launchctl bootout gui/$(id -u)/com.ainvirion.dev-sync-bridge 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.ainvirion.dev-sync-*.plist
+# uninstall old package + remove all state
+pip uninstall -y dev-sync
+rm -rf ~/.dev-sync
+# update shell env: rename DEV_SYNC_* → CTRLRELAY_*
+# reinstall ctrlrelay, install new plists, bootstrap
+```
+
 ## [0.1.0] - 2026-04-18
 
-First tagged release of the `dev-sync` orchestrator. Bundles the multi-device
+First tagged release of the `ctrlrelay` orchestrator. Bundles the multi-device
 sync toolkit with the Phase 0–4 implementation of the local-first Claude Code
 orchestrator (config, checkpoints, Telegram bridge, secops pipeline, and dev
 pipeline).
 
 ### Added
 
-#### Orchestrator package (`dev_sync`)
+#### Orchestrator package (`ctrlrelay`)
 
 - **Phase 0 — package skeleton**: `pyproject.toml` with metadata and entry
-  point, Typer-based CLI (`dev-sync`), Pydantic config models with validation,
+  point, Typer-based CLI (`ctrlrelay`), Pydantic config models with validation,
   SQLite-backed state with per-repo locks, and `config validate` / `status`
   commands.
 - **Phase 1 — checkpoints & skill audit**: checkpoint Pydantic models,
@@ -57,10 +87,10 @@ pipeline).
 
 ### Documentation
 
-- `docs/dev-sync-orchestrator-spec.md` — orchestrator design spec.
-- `docs/superpowers/specs/2026-04-17-dev-sync-orchestrator-design.md` and
+- `docs/ctrlrelay-orchestrator-spec.md` — orchestrator design spec.
+- `docs/superpowers/specs/2026-04-17-ctrlrelay-orchestrator-design.md` and
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/dev-sync/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/AInvirion/dev-sync/releases/tag/v0.1.0
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.0

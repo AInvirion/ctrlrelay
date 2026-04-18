@@ -8,7 +8,7 @@ runner = CliRunner()
 class TestRunDevCommand:
     def test_run_dev_requires_issue(self) -> None:
         """Should require issue number."""
-        from dev_sync.cli import app
+        from ctrlrelay.cli import app
 
         result = runner.invoke(app, ["run", "dev"])
 
@@ -17,7 +17,7 @@ class TestRunDevCommand:
 
     def test_run_dev_help(self) -> None:
         """Should show help for run dev command."""
-        from dev_sync.cli import app
+        from ctrlrelay.cli import app
 
         result = runner.invoke(app, ["run", "dev", "--help"])
 
@@ -29,7 +29,7 @@ class TestRunDevCommand:
 class TestPollerCommands:
     def test_poller_start_help(self) -> None:
         """Should show help for poller start."""
-        from dev_sync.cli import app
+        from ctrlrelay.cli import app
 
         result = runner.invoke(app, ["poller", "start", "--help"])
 
@@ -38,7 +38,7 @@ class TestPollerCommands:
 
     def test_poller_status(self) -> None:
         """Should show poller status."""
-        from dev_sync.cli import app
+        from ctrlrelay.cli import app
 
         result = runner.invoke(app, ["poller", "status"])
 

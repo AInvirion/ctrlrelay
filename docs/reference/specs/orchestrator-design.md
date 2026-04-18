@@ -6,12 +6,12 @@ grand_parent: Design & history
 nav_order: 1
 ---
 
-# dev-sync Orchestrator — Implementation Design
+# ctrlrelay Orchestrator — Implementation Design
 
 **Date:** 2026-04-17  
 **Status:** Approved  
 **Approach:** Minimal Viable Orchestrator (MVO) with PyPI-ready package structure  
-**Base spec:** `docs/dev-sync-orchestrator-spec.md` — this document is a delta, not standalone
+**Base spec:** `docs/ctrlrelay-orchestrator-spec.md` — this document is a delta, not standalone
 
 > **Note:** This design extends the base spec with PyPI packaging, cross-platform support, and refined abstractions. For full behavioral details (pipeline flows, scheduling jobs, complete SQLite schema, security model), refer to the base spec. This document only overrides or adds to what's there.
 
@@ -21,7 +21,7 @@ A local-first, cron-driven orchestrator that wraps `claude -p` (headless Claude 
 
 **Key decisions from brainstorming:**
 - Portable across macOS and Ubuntu
-- Published as Python package on PyPI (`pip install dev-sync`)
+- Published as Python package on PyPI (`pip install ctrlrelay`)
 - Config editable locally now, via dashboard later (sync on heartbeat)
 - Configurable repo subset, expand over time
 - Fine-grained automation policies per repo (auto/ask/never per operation)
@@ -29,9 +29,9 @@ A local-first, cron-driven orchestrator that wraps `claude -p` (headless Claude 
 ## 1. Package Structure
 
 ```
-dev-sync/
+ctrlrelay/
 ├── pyproject.toml
-├── src/dev_sync/
+├── src/ctrlrelay/
 │   ├── __init__.py              # version, public API
 │   ├── cli.py                   # Typer CLI
 │   ├── core/
@@ -65,37 +65,37 @@ dev-sync/
 
 ```bash
 # Core operations
-dev-sync run secops [--repo REPO]
-dev-sync run dev --issue 42 --repo X
-dev-sync status
+ctrlrelay run secops [--repo REPO]
+ctrlrelay run dev --issue 42 --repo X
+ctrlrelay status
 
 # Skill management
-dev-sync skills audit [--fix]
-dev-sync skills list
+ctrlrelay skills audit [--fix]
+ctrlrelay skills list
 
 # Config
-dev-sync config validate
-dev-sync config repos
+ctrlrelay config validate
+ctrlrelay config repos
 
 # Bridge
-dev-sync bridge start [--daemon]
-dev-sync bridge stop
-dev-sync bridge status
-dev-sync bridge test
+ctrlrelay bridge start [--daemon]
+ctrlrelay bridge stop
+ctrlrelay bridge status
+ctrlrelay bridge test
 
 # Daemon (Phase 5+)
-dev-sync daemon start
-dev-sync daemon stop
-dev-sync daemon status
+ctrlrelay daemon start
+ctrlrelay daemon stop
+ctrlrelay daemon status
 ```
 
 ## 2. Checkpoint Protocol
 
-The contract between orchestrator and skills. Skills write state to `$DEV_SYNC_STATE_FILE`.
+The contract between orchestrator and skills. Skills write state to `$CTRLRELAY_STATE_FILE`.
 
 ### Atomic Write Rules
 
-1. **Write to temp, then rename:** `checkpoint.*` helpers write to `$DEV_SYNC_STATE_FILE.tmp`, then `os.rename()` to final path
+1. **Write to temp, then rename:** `checkpoint.*` helpers write to `$CTRLRELAY_STATE_FILE.tmp`, then `os.rename()` to final path
 2. **One checkpoint per session:** Only the final state matters; overwrites are allowed
 3. **Orchestrator deletes on read:** After parsing, orchestrator removes the state file to prevent re-reads on restart
 4. **Truncation protection:** Orchestrator validates JSON is complete before acting; incomplete file = FAILED
@@ -131,10 +131,10 @@ The contract between orchestrator and skills. Skills write state to `$DEV_SYNC_S
 
 ### Skill Helper Library
 
-Public API re-exported from package root (`src/dev_sync/__init__.py`):
+Public API re-exported from package root (`src/ctrlrelay/__init__.py`):
 
 ```python
-from dev_sync import checkpoint  # Re-exported from dev_sync.core.checkpoint
+from ctrlrelay import checkpoint  # Re-exported from ctrlrelay.core.checkpoint
 
 checkpoint.done(summary="Merged 3 PRs", outputs={"merged_prs": [1,2,3]})
 
@@ -201,11 +201,11 @@ node_id: "macbook-pro-01"
 timezone: "America/Santiago"
 
 paths:
-  state_db: "~/.dev-sync/state.db"
-  worktrees: "~/.dev-sync/worktrees"
-  bare_repos: "~/.dev-sync/repos"    # Bare clones for worktree creation
-  contexts: "~/dev-sync/contexts"
-  skills: "~/dev-sync/claude-config/skills"
+  state_db: "~/.ctrlrelay/state.db"
+  worktrees: "~/.ctrlrelay/worktrees"
+  bare_repos: "~/.ctrlrelay/repos"    # Bare clones for worktree creation
+  contexts: "~/.ctrlrelay/contexts"
+  skills: "~/.ctrlrelay/claude-config/skills"
 
 claude:
   binary: "claude"
@@ -215,17 +215,17 @@ claude:
 transport:
   type: "telegram"  # or "file_mock"
   telegram:
-    bot_token_env: "DEV_SYNC_TELEGRAM_TOKEN"
+    bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"
     chat_id: 123456789
-    socket_path: "~/.dev-sync/dev-sync.sock"  # Linux: /run/user/$UID/dev-sync.sock
+    socket_path: "~/.ctrlrelay/ctrlrelay.sock"  # Linux: /run/user/$UID/ctrlrelay.sock
   file_mock:
-    inbox: "~/.dev-sync/inbox.txt"
-    outbox: "~/.dev-sync/outbox.txt"
+    inbox: "~/.ctrlrelay/inbox.txt"
+    outbox: "~/.ctrlrelay/outbox.txt"
 
 dashboard:
   enabled: true
-  url: "https://dev-sync-dashboard.example.com"
-  auth_token_env: "DEV_SYNC_DASHBOARD_TOKEN"
+  url: "https://ctrlrelay-dashboard.example.com"
+  auth_token_env: "CTRLRELAY_DASHBOARD_TOKEN"
   sync_config_on_heartbeat: false  # Future
 
 repos:
@@ -263,7 +263,7 @@ class DashboardConfigProvider(ConfigProvider):
 
 ## 5. State (SQLite)
 
-Path: `~/.dev-sync/state.db`
+Path: `~/.ctrlrelay/state.db`
 
 > **Full schema:** See base spec section 4.6. This section shows the tables this design adds or modifies.
 
@@ -371,8 +371,8 @@ Orchestrator ◄─── Unix socket ───► Telegram Bridge ◄──► 
 ```
 
 **Socket path (cross-platform):**
-- Linux: `/run/user/$UID/dev-sync.sock`
-- macOS: `~/.dev-sync/dev-sync.sock`
+- Linux: `/run/user/$UID/ctrlrelay.sock`
+- macOS: `~/.ctrlrelay/ctrlrelay.sock`
 
 Configurable via `transport.telegram.socket_path` in `orchestrator.yaml`.
 
@@ -420,7 +420,7 @@ class CLITransport(Transport): ...        # For manual testing
 
 ## 8. Dashboard Integration
 
-### Client (in dev-sync package)
+### Client (in ctrlrelay package)
 
 ```python
 class DashboardClient:
@@ -453,7 +453,7 @@ class HeartbeatPayload:
 - `pr_merged`, `pr_created`
 - `deploy_started`, `deploy_completed`, `deploy_failed`
 
-### Server (separate repo: dev-sync-dashboard)
+### Server (separate repo: ctrlrelay-dashboard)
 
 FastAPI app on DigitalOcean App Platform.
 
@@ -482,14 +482,14 @@ FastAPI app on DigitalOcean App Platform.
 
 ### Phase Gates
 
-- **Phase 0:** `pip install -e .` works, `dev-sync config validate` passes
-- **Phase 1:** `dev-sync skills audit` produces compliance report
-- **Phase 2:** `dev-sync bridge test` delivers message to phone
+- **Phase 0:** `pip install -e .` works, `ctrlrelay config validate` passes
+- **Phase 1:** `ctrlrelay skills audit` produces compliance report
+- **Phase 2:** `ctrlrelay bridge test` delivers message to phone
 - **Phase 3:** Secops runs on 2-3 repos, events logged locally (dashboard client queues if server unavailable)
 - **Phase 4:** Self-assign issue, get PR notification
 - **Phase 5:** Start daemon, wake up to secops summary
 - **Phase 6:** Dashboard shows live status, queued events drain
-- **Phase 7:** `pip install dev-sync` from PyPI works
+- **Phase 7:** `pip install ctrlrelay` from PyPI works
 
 ## 10. What NOT to Do
 
@@ -506,7 +506,7 @@ From original spec, still applies:
 
 ## 11. Relationship to Original Spec
 
-This design extends `docs/dev-sync-orchestrator-spec.md` with:
+This design extends `docs/ctrlrelay-orchestrator-spec.md` with:
 
 1. **PyPI package structure** — publishable library/CLI
 2. **Cross-platform support** — macOS + Ubuntu

@@ -152,7 +152,7 @@ wheels = [
 ]
 
 [[package]]
-name = "dev-sync"
+name = "ctrlrelay"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

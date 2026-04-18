@@ -2,21 +2,21 @@
 title: Getting Started
 layout: default
 nav_order: 2
-description: "Install dev-sync, configure your first repo, and run the dev pipeline end-to-end."
+description: "Install ctrlrelay, configure your first repo, and run the dev pipeline end-to-end."
 permalink: /getting-started/
 ---
 
 # Getting started
 
-This page walks through installing dev-sync, writing a minimal `orchestrator.yaml`,
+This page walks through installing ctrlrelay, writing a minimal `orchestrator.yaml`,
 and running the dev pipeline against a real GitHub issue. Allow about 15 minutes.
 
 ## Requirements
 
 - **Python 3.12+** — the package targets `requires-python = ">=3.12"`.
-- **`claude` CLI** — Claude Code installed and authenticated. dev-sync shells out
+- **`claude` CLI** — Claude Code installed and authenticated. ctrlrelay shells out
   to `claude -p ...`. See [Claude Code installation](https://docs.anthropic.com/claude/docs/claude-code).
-- **`gh` CLI** — GitHub CLI installed and authenticated (`gh auth login`). dev-sync
+- **`gh` CLI** — GitHub CLI installed and authenticated (`gh auth login`). ctrlrelay
   uses `gh` for all GitHub API calls.
 - **`git` 2.20+** — for `git worktree add`.
 - A unix-like shell (macOS or Linux). Windows is not supported.
@@ -31,8 +31,8 @@ Optional:
 Clone the repo and install in editable mode:
 
 ```bash
-git clone https://github.com/AInvirion/dev-sync.git
-cd dev-sync
+git clone https://github.com/AInvirion/ctrlrelay.git
+cd ctrlrelay
 
 # With uv (recommended):
 uv pip install -e .
@@ -41,15 +41,15 @@ uv pip install -e .
 pip install -e .
 ```
 
-This installs the `dev-sync` console script. Verify:
+This installs the `ctrlrelay` console script. Verify:
 
 ```bash
-dev-sync --version
+ctrlrelay --version
 ```
 
 ## Write your first config
 
-dev-sync reads `config/orchestrator.yaml` by default. Start from the example:
+ctrlrelay reads `config/orchestrator.yaml` by default. Start from the example:
 
 ```bash
 cp config/orchestrator.yaml.example config/orchestrator.yaml
@@ -70,10 +70,10 @@ node_id: "my-laptop"
 timezone: "America/New_York"
 
 paths:
-  state_db: "~/.dev-sync/state.db"
-  worktrees: "~/.dev-sync/worktrees"
-  bare_repos: "~/.dev-sync/repos"
-  contexts: "~/.dev-sync/contexts"
+  state_db: "~/.ctrlrelay/state.db"
+  worktrees: "~/.ctrlrelay/worktrees"
+  bare_repos: "~/.ctrlrelay/repos"
+  contexts: "~/.ctrlrelay/contexts"
   skills: "~/.claude/skills"
 
 claude:
@@ -84,8 +84,8 @@ claude:
 transport:
   type: "file_mock"
   file_mock:
-    inbox: "~/.dev-sync/inbox.txt"
-    outbox: "~/.dev-sync/outbox.txt"
+    inbox: "~/.ctrlrelay/inbox.txt"
+    outbox: "~/.ctrlrelay/outbox.txt"
 
 repos:
   - name: "your-org/your-repo"
@@ -95,7 +95,7 @@ repos:
 Validate it:
 
 ```bash
-dev-sync config validate
+ctrlrelay config validate
 ```
 
 You should see something like:
@@ -117,12 +117,12 @@ worktree, and opens a PR. Pick a small issue assigned to you (or create one to
 test against), then:
 
 ```bash
-dev-sync run dev --issue 42 --repo your-org/your-repo
+ctrlrelay run dev --issue 42 --repo your-org/your-repo
 ```
 
 What happens:
 
-1. dev-sync acquires a per-repo lock so only one session runs against the repo
+1. ctrlrelay acquires a per-repo lock so only one session runs against the repo
    at a time.
 2. It clones the repo into `paths.bare_repos` (if not already there) and creates
    a worktree under `paths.worktrees` on a branch named from
@@ -131,9 +131,9 @@ What happens:
    structured prompt that instructs Claude to TDD-implement the change, push the
    branch, and open a PR.
 4. Claude writes a checkpoint JSON file (`DONE`, `BLOCKED_NEEDS_INPUT`, or
-   `FAILED`) when it finishes. dev-sync reads the checkpoint and reports the
+   `FAILED`) when it finishes. ctrlrelay reads the checkpoint and reports the
    outcome.
-5. On success, dev-sync removes the worktree (the branch stays — the open PR
+5. On success, ctrlrelay removes the worktree (the branch stays — the open PR
    references it). On failure, it cleans up.
 
 If Claude blocks asking a question, the answer mechanism only works when a
@@ -147,7 +147,7 @@ The poller watches your configured repos for newly assigned issues and runs the
 dev pipeline against each one. To run it interactively:
 
 ```bash
-dev-sync poller start --interval 60
+ctrlrelay poller start --interval 60
 ```
 
 On the very first run the poller seeds its "seen" set with whatever is currently
@@ -165,4 +165,4 @@ To run the poller as a long-lived background service, see [Operations]({{ '/oper
 - [Telegram bridge]({{ '/bridge/' | relative_url }}) — how to set up the human-in-the-loop channel.
 - [Feedback loop]({{ '/feedback-loop/' | relative_url }}) — what `BLOCKED_NEEDS_INPUT` actually does end-to-end.
 - [CLI reference]({{ '/cli/' | relative_url }}) — every subcommand and flag.
-- [Operations]({{ '/operations/' | relative_url }}) — running dev-sync as a service.
+- [Operations]({{ '/operations/' | relative_url }}) — running ctrlrelay as a service.

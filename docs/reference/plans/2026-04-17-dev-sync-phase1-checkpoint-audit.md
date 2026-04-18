@@ -6,24 +6,24 @@ grand_parent: Design & history
 nav_order: 2
 ---
 
-# dev-sync Phase 1: Checkpoint Protocol + Skill Audit Tool
+# ctrlrelay Phase 1: Checkpoint Protocol + Skill Audit Tool
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Create the checkpoint protocol for skill-orchestrator communication and a skill audit tool to verify orchestrator readiness.
 
-**Architecture:** The checkpoint module provides helper functions (`done`, `blocked`, `failed`) that skills call to report their final state. State is written atomically to `$DEV_SYNC_STATE_FILE`. The skill audit tool scans SKILL.md files and their referenced code for orchestrator compliance patterns.
+**Architecture:** The checkpoint module provides helper functions (`done`, `blocked`, `failed`) that skills call to report their final state. State is written atomically to `$CTRLRELAY_STATE_FILE`. The skill audit tool scans SKILL.md files and their referenced code for orchestrator compliance patterns.
 
 **Tech Stack:** Python 3.12, Pydantic, pytest, Rich
 
-**Phase Gate:** `dev-sync skills audit` produces compliance report for existing skills.
+**Phase Gate:** `ctrlrelay skills audit` produces compliance report for existing skills.
 
 ---
 
 ## File Structure
 
 ```
-src/dev_sync/
+src/ctrlrelay/
 ├── __init__.py              # Add checkpoint re-export
 ├── cli.py                   # Add skills subcommand group
 └── core/
@@ -40,7 +40,7 @@ tests/
 ### Task 1: Create checkpoint Pydantic models
 
 **Files:**
-- Create: `src/dev_sync/core/checkpoint.py`
+- Create: `src/ctrlrelay/core/checkpoint.py`
 - Create: `tests/test_checkpoint.py`
 
 - [ ] **Step 1: Write failing test for CheckpointState model**
@@ -53,7 +53,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
+from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
 
 
 class TestCheckpointState:
@@ -103,13 +103,13 @@ class TestCheckpointState:
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && pytest tests/test_checkpoint.py -v
+cd /Users/ovalenzuela/Projects/ctrlrelay && pytest tests/test_checkpoint.py -v
 ```
-Expected: FAIL with "No module named 'dev_sync.core.checkpoint'"
+Expected: FAIL with "No module named 'ctrlrelay.core.checkpoint'"
 
 - [ ] **Step 3: Write the checkpoint models**
 
-Create `src/dev_sync/core/checkpoint.py`:
+Create `src/ctrlrelay/core/checkpoint.py`:
 ```python
 """Checkpoint protocol for skill-orchestrator communication."""
 
@@ -160,7 +160,7 @@ Expected: All tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/dev_sync/core/checkpoint.py tests/test_checkpoint.py
+git add src/ctrlrelay/core/checkpoint.py tests/test_checkpoint.py
 git commit -m "feat: add checkpoint Pydantic models"
 ```
 
@@ -169,7 +169,7 @@ git commit -m "feat: add checkpoint Pydantic models"
 ### Task 2: Add checkpoint helper functions
 
 **Files:**
-- Modify: `src/dev_sync/core/checkpoint.py`
+- Modify: `src/ctrlrelay/core/checkpoint.py`
 - Modify: `tests/test_checkpoint.py`
 
 - [ ] **Step 1: Write failing tests for helper functions**
@@ -184,11 +184,11 @@ from pathlib import Path
 class TestCheckpointHelpers:
     def test_done_writes_state_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """done() should write DONE state to state file."""
-        from dev_sync.core.checkpoint import done
+        from ctrlrelay.core.checkpoint import done
 
         state_file = tmp_path / "state.json"
-        monkeypatch.setenv("DEV_SYNC_STATE_FILE", str(state_file))
-        monkeypatch.setenv("DEV_SYNC_SESSION_ID", "sess-abc")
+        monkeypatch.setenv("CTRLRELAY_STATE_FILE", str(state_file))
+        monkeypatch.setenv("CTRLRELAY_SESSION_ID", "sess-abc")
 
         done(summary="Completed task", outputs={"pr_url": "https://..."})
 
@@ -202,11 +202,11 @@ class TestCheckpointHelpers:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """blocked() should write BLOCKED_NEEDS_INPUT state."""
-        from dev_sync.core.checkpoint import blocked
+        from ctrlrelay.core.checkpoint import blocked
 
         state_file = tmp_path / "state.json"
-        monkeypatch.setenv("DEV_SYNC_STATE_FILE", str(state_file))
-        monkeypatch.setenv("DEV_SYNC_SESSION_ID", "sess-abc")
+        monkeypatch.setenv("CTRLRELAY_STATE_FILE", str(state_file))
+        monkeypatch.setenv("CTRLRELAY_SESSION_ID", "sess-abc")
 
         blocked(
             question="Which version?",
@@ -221,11 +221,11 @@ class TestCheckpointHelpers:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """failed() should write FAILED state."""
-        from dev_sync.core.checkpoint import failed
+        from ctrlrelay.core.checkpoint import failed
 
         state_file = tmp_path / "state.json"
-        monkeypatch.setenv("DEV_SYNC_STATE_FILE", str(state_file))
-        monkeypatch.setenv("DEV_SYNC_SESSION_ID", "sess-abc")
+        monkeypatch.setenv("CTRLRELAY_STATE_FILE", str(state_file))
+        monkeypatch.setenv("CTRLRELAY_SESSION_ID", "sess-abc")
 
         failed(error="Connection timeout", recoverable=True)
 
@@ -238,11 +238,11 @@ class TestCheckpointHelpers:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Checkpoint should write to .tmp then rename for atomicity."""
-        from dev_sync.core.checkpoint import done
+        from ctrlrelay.core.checkpoint import done
 
         state_file = tmp_path / "state.json"
-        monkeypatch.setenv("DEV_SYNC_STATE_FILE", str(state_file))
-        monkeypatch.setenv("DEV_SYNC_SESSION_ID", "sess-abc")
+        monkeypatch.setenv("CTRLRELAY_STATE_FILE", str(state_file))
+        monkeypatch.setenv("CTRLRELAY_SESSION_ID", "sess-abc")
 
         done(summary="Test")
 
@@ -252,13 +252,13 @@ class TestCheckpointHelpers:
         assert state_file.exists()
 
     def test_missing_env_raises_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Should raise if DEV_SYNC_STATE_FILE not set."""
-        from dev_sync.core.checkpoint import CheckpointError, done
+        """Should raise if CTRLRELAY_STATE_FILE not set."""
+        from ctrlrelay.core.checkpoint import CheckpointError, done
 
-        monkeypatch.delenv("DEV_SYNC_STATE_FILE", raising=False)
-        monkeypatch.delenv("DEV_SYNC_SESSION_ID", raising=False)
+        monkeypatch.delenv("CTRLRELAY_STATE_FILE", raising=False)
+        monkeypatch.delenv("CTRLRELAY_SESSION_ID", raising=False)
 
-        with pytest.raises(CheckpointError, match="DEV_SYNC_STATE_FILE"):
+        with pytest.raises(CheckpointError, match="CTRLRELAY_STATE_FILE"):
             done(summary="Test")
 ```
 
@@ -272,7 +272,7 @@ Expected: FAIL with "cannot import name 'done'"
 
 - [ ] **Step 3: Implement helper functions**
 
-Add to `src/dev_sync/core/checkpoint.py`:
+Add to `src/ctrlrelay/core/checkpoint.py`:
 ```python
 import json
 import os
@@ -285,17 +285,17 @@ class CheckpointError(Exception):
 
 def _get_state_file() -> Path:
     """Get state file path from environment."""
-    path = os.environ.get("DEV_SYNC_STATE_FILE")
+    path = os.environ.get("CTRLRELAY_STATE_FILE")
     if not path:
-        raise CheckpointError("DEV_SYNC_STATE_FILE environment variable not set")
+        raise CheckpointError("CTRLRELAY_STATE_FILE environment variable not set")
     return Path(path)
 
 
 def _get_session_id() -> str:
     """Get session ID from environment."""
-    session_id = os.environ.get("DEV_SYNC_SESSION_ID")
+    session_id = os.environ.get("CTRLRELAY_SESSION_ID")
     if not session_id:
-        raise CheckpointError("DEV_SYNC_SESSION_ID environment variable not set")
+        raise CheckpointError("CTRLRELAY_SESSION_ID environment variable not set")
     return session_id
 
 
@@ -372,7 +372,7 @@ Expected: All tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/dev_sync/core/checkpoint.py tests/test_checkpoint.py
+git add src/ctrlrelay/core/checkpoint.py tests/test_checkpoint.py
 git commit -m "feat: add checkpoint helper functions (done, blocked, failed)"
 ```
 
@@ -381,7 +381,7 @@ git commit -m "feat: add checkpoint helper functions (done, blocked, failed)"
 ### Task 3: Add read_checkpoint for orchestrator
 
 **Files:**
-- Modify: `src/dev_sync/core/checkpoint.py`
+- Modify: `src/ctrlrelay/core/checkpoint.py`
 - Modify: `tests/test_checkpoint.py`
 
 - [ ] **Step 1: Write failing tests for read_checkpoint**
@@ -391,7 +391,7 @@ Add to `tests/test_checkpoint.py`:
 class TestReadCheckpoint:
     def test_read_valid_checkpoint(self, tmp_path: Path) -> None:
         """Should parse valid checkpoint file."""
-        from dev_sync.core.checkpoint import CheckpointStatus, read_checkpoint
+        from ctrlrelay.core.checkpoint import CheckpointStatus, read_checkpoint
 
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps({
@@ -410,7 +410,7 @@ class TestReadCheckpoint:
 
     def test_read_deletes_file_after(self, tmp_path: Path) -> None:
         """Should delete checkpoint file after reading."""
-        from dev_sync.core.checkpoint import read_checkpoint
+        from ctrlrelay.core.checkpoint import read_checkpoint
 
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps({
@@ -426,14 +426,14 @@ class TestReadCheckpoint:
 
     def test_read_missing_file_raises(self, tmp_path: Path) -> None:
         """Should raise if file doesn't exist."""
-        from dev_sync.core.checkpoint import CheckpointError, read_checkpoint
+        from ctrlrelay.core.checkpoint import CheckpointError, read_checkpoint
 
         with pytest.raises(CheckpointError, match="not found"):
             read_checkpoint(tmp_path / "missing.json")
 
     def test_read_invalid_json_raises(self, tmp_path: Path) -> None:
         """Should raise FAILED status for invalid JSON (truncation)."""
-        from dev_sync.core.checkpoint import CheckpointError, read_checkpoint
+        from ctrlrelay.core.checkpoint import CheckpointError, read_checkpoint
 
         state_file = tmp_path / "state.json"
         state_file.write_text('{"status": "DONE", "session_id": "x", "truncated')
@@ -452,7 +452,7 @@ Expected: FAIL with "cannot import name 'read_checkpoint'"
 
 - [ ] **Step 3: Implement read_checkpoint**
 
-Add to `src/dev_sync/core/checkpoint.py`:
+Add to `src/ctrlrelay/core/checkpoint.py`:
 ```python
 def read_checkpoint(path: Path, delete_after: bool = False) -> CheckpointState:
     """Read and parse a checkpoint file.
@@ -499,7 +499,7 @@ Expected: All tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/dev_sync/core/checkpoint.py tests/test_checkpoint.py
+git add src/ctrlrelay/core/checkpoint.py tests/test_checkpoint.py
 git commit -m "feat: add read_checkpoint for orchestrator"
 ```
 
@@ -508,16 +508,16 @@ git commit -m "feat: add read_checkpoint for orchestrator"
 ### Task 4: Export checkpoint from package root
 
 **Files:**
-- Modify: `src/dev_sync/__init__.py`
-- Modify: `src/dev_sync/core/__init__.py`
+- Modify: `src/ctrlrelay/__init__.py`
+- Modify: `src/ctrlrelay/core/__init__.py`
 
 - [ ] **Step 1: Update core exports**
 
-Edit `src/dev_sync/core/__init__.py`:
+Edit `src/ctrlrelay/core/__init__.py`:
 ```python
-"""Core functionality for dev-sync orchestrator."""
+"""Core functionality for ctrlrelay orchestrator."""
 
-from dev_sync.core.checkpoint import (
+from ctrlrelay.core.checkpoint import (
     CheckpointError,
     CheckpointState,
     CheckpointStatus,
@@ -526,13 +526,13 @@ from dev_sync.core.checkpoint import (
     failed,
     read_checkpoint,
 )
-from dev_sync.core.config import (
+from ctrlrelay.core.config import (
     Config,
     ConfigError,
     RepoConfig,
     load_config,
 )
-from dev_sync.core.state import StateDB
+from ctrlrelay.core.state import StateDB
 
 __all__ = [
     "CheckpointError",
@@ -552,11 +552,11 @@ __all__ = [
 
 - [ ] **Step 2: Update package root exports**
 
-Edit `src/dev_sync/__init__.py`:
+Edit `src/ctrlrelay/__init__.py`:
 ```python
-"""dev-sync: Local-first orchestrator for Claude Code."""
+"""ctrlrelay: Local-first orchestrator for Claude Code."""
 
-from dev_sync.core import checkpoint
+from ctrlrelay.core import checkpoint
 
 __version__ = "0.1.0"
 
@@ -568,14 +568,14 @@ __all__ = ["__version__", "checkpoint"]
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && python -c "from dev_sync import checkpoint; print(checkpoint.done)"
+cd /Users/ovalenzuela/Projects/ctrlrelay && python -c "from ctrlrelay import checkpoint; print(checkpoint.done)"
 ```
 Expected: `<function done at ...>`
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/dev_sync/__init__.py src/dev_sync/core/__init__.py
+git add src/ctrlrelay/__init__.py src/ctrlrelay/core/__init__.py
 git commit -m "feat: export checkpoint module from package root"
 ```
 
@@ -584,7 +584,7 @@ git commit -m "feat: export checkpoint module from package root"
 ### Task 5: Create skill audit models
 
 **Files:**
-- Create: `src/dev_sync/core/audit.py`
+- Create: `src/ctrlrelay/core/audit.py`
 - Create: `tests/test_audit.py`
 
 - [ ] **Step 1: Write failing test for audit models**
@@ -597,7 +597,7 @@ from pathlib import Path
 
 import pytest
 
-from dev_sync.core.audit import AuditCheck, AuditResult, SkillAudit
+from ctrlrelay.core.audit import AuditCheck, AuditResult, SkillAudit
 
 
 class TestAuditModels:
@@ -645,11 +645,11 @@ Run:
 ```bash
 pytest tests/test_audit.py -v
 ```
-Expected: FAIL with "No module named 'dev_sync.core.audit'"
+Expected: FAIL with "No module named 'ctrlrelay.core.audit'"
 
 - [ ] **Step 3: Implement audit models**
 
-Create `src/dev_sync/core/audit.py`:
+Create `src/ctrlrelay/core/audit.py`:
 ```python
 """Skill audit functionality for orchestrator readiness checks."""
 
@@ -708,7 +708,7 @@ Expected: All tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/dev_sync/core/audit.py tests/test_audit.py
+git add src/ctrlrelay/core/audit.py tests/test_audit.py
 git commit -m "feat: add skill audit models"
 ```
 
@@ -717,7 +717,7 @@ git commit -m "feat: add skill audit models"
 ### Task 6: Implement skill discovery
 
 **Files:**
-- Modify: `src/dev_sync/core/audit.py`
+- Modify: `src/ctrlrelay/core/audit.py`
 - Modify: `tests/test_audit.py`
 
 - [ ] **Step 1: Write failing test for skill discovery**
@@ -727,7 +727,7 @@ Add to `tests/test_audit.py`:
 class TestSkillDiscovery:
     def test_discover_skills(self, tmp_path: Path) -> None:
         """Should find all SKILL.md files in directory."""
-        from dev_sync.core.audit import discover_skills
+        from ctrlrelay.core.audit import discover_skills
 
         # Create mock skills
         skill1 = tmp_path / "skill-one" / "SKILL.md"
@@ -745,14 +745,14 @@ class TestSkillDiscovery:
 
     def test_discover_skills_empty_dir(self, tmp_path: Path) -> None:
         """Should return empty list if no skills found."""
-        from dev_sync.core.audit import discover_skills
+        from ctrlrelay.core.audit import discover_skills
 
         skills = discover_skills(tmp_path)
         assert skills == []
 
     def test_discover_skills_parses_name(self, tmp_path: Path) -> None:
         """Should parse skill name from YAML frontmatter."""
-        from dev_sync.core.audit import discover_skills
+        from ctrlrelay.core.audit import discover_skills
 
         skill = tmp_path / "my-skill" / "SKILL.md"
         skill.parent.mkdir()
@@ -772,7 +772,7 @@ Expected: FAIL with "cannot import name 'discover_skills'"
 
 - [ ] **Step 3: Implement discover_skills**
 
-Add to `src/dev_sync/core/audit.py`:
+Add to `src/ctrlrelay/core/audit.py`:
 ```python
 import re
 import yaml
@@ -836,7 +836,7 @@ Expected: All tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/dev_sync/core/audit.py tests/test_audit.py
+git add src/ctrlrelay/core/audit.py tests/test_audit.py
 git commit -m "feat: add skill discovery from SKILL.md files"
 ```
 
@@ -845,7 +845,7 @@ git commit -m "feat: add skill discovery from SKILL.md files"
 ### Task 7: Implement audit checks
 
 **Files:**
-- Modify: `src/dev_sync/core/audit.py`
+- Modify: `src/ctrlrelay/core/audit.py`
 - Modify: `tests/test_audit.py`
 
 - [ ] **Step 1: Write failing tests for audit checks**
@@ -855,12 +855,12 @@ Add to `tests/test_audit.py`:
 class TestAuditChecks:
     def test_check_checkpoint_passes_with_import(self, tmp_path: Path) -> None:
         """Should pass if skill imports checkpoint module."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
             path=tmp_path,
-            content="# Skill\n\n```python\nfrom dev_sync import checkpoint\ncheckpoint.done()\n```",
+            content="# Skill\n\n```python\nfrom ctrlrelay import checkpoint\ncheckpoint.done()\n```",
             frontmatter={},
         )
         result = run_check(skill, AuditCheck.CHECKPOINT)
@@ -868,7 +868,7 @@ class TestAuditChecks:
 
     def test_check_checkpoint_fails_without(self, tmp_path: Path) -> None:
         """Should fail if skill has no checkpoint references."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -881,7 +881,7 @@ class TestAuditChecks:
 
     def test_check_headless_passes_without_input(self, tmp_path: Path) -> None:
         """Should pass if skill has no interactive prompts."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -894,7 +894,7 @@ class TestAuditChecks:
 
     def test_check_headless_fails_with_input(self, tmp_path: Path) -> None:
         """Should fail if skill uses input()."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -907,7 +907,7 @@ class TestAuditChecks:
 
     def test_check_headless_fails_with_playwright(self, tmp_path: Path) -> None:
         """Should fail if skill uses playwright MCP without fallback."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -920,7 +920,7 @@ class TestAuditChecks:
 
     def test_check_attribution_passes_clean(self, tmp_path: Path) -> None:
         """Should pass if no Claude/Anthropic in output."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -933,7 +933,7 @@ class TestAuditChecks:
 
     def test_check_attribution_fails_with_claude(self, tmp_path: Path) -> None:
         """Should fail if output mentions Claude."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, run_check
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, run_check
 
         skill = SkillInfo(
             name="test",
@@ -955,7 +955,7 @@ Expected: FAIL with "cannot import name 'run_check'"
 
 - [ ] **Step 3: Implement run_check**
 
-Add to `src/dev_sync/core/audit.py`:
+Add to `src/ctrlrelay/core/audit.py`:
 ```python
 # Patterns for headless check
 INTERACTIVE_PATTERNS = [
@@ -972,10 +972,10 @@ BROWSER_ONLY_TOOLS = [
 
 # Patterns for checkpoint check
 CHECKPOINT_PATTERNS = [
-    r"from\s+dev_sync\s+import\s+checkpoint",
-    r"from\s+dev_sync\.core\.checkpoint\s+import",
+    r"from\s+ctrlrelay\s+import\s+checkpoint",
+    r"from\s+ctrlrelay\.core\.checkpoint\s+import",
     r"checkpoint\.(done|blocked|failed)\s*\(",
-    r"DEV_SYNC_STATE_FILE",
+    r"CTRLRELAY_STATE_FILE",
 ]
 
 # Attribution patterns to avoid in output
@@ -1066,7 +1066,7 @@ Expected: All tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/dev_sync/core/audit.py tests/test_audit.py
+git add src/ctrlrelay/core/audit.py tests/test_audit.py
 git commit -m "feat: implement skill audit checks"
 ```
 
@@ -1075,7 +1075,7 @@ git commit -m "feat: implement skill audit checks"
 ### Task 8: Implement audit_skill and audit_all
 
 **Files:**
-- Modify: `src/dev_sync/core/audit.py`
+- Modify: `src/ctrlrelay/core/audit.py`
 - Modify: `tests/test_audit.py`
 
 - [ ] **Step 1: Write failing tests**
@@ -1085,12 +1085,12 @@ Add to `tests/test_audit.py`:
 class TestAuditFunctions:
     def test_audit_skill(self, tmp_path: Path) -> None:
         """audit_skill should run all checks on a skill."""
-        from dev_sync.core.audit import AuditCheck, SkillInfo, audit_skill
+        from ctrlrelay.core.audit import AuditCheck, SkillInfo, audit_skill
 
         skill = SkillInfo(
             name="test",
             path=tmp_path,
-            content="# Skill\n\n```python\nfrom dev_sync import checkpoint\ncheckpoint.done()\n```",
+            content="# Skill\n\n```python\nfrom ctrlrelay import checkpoint\ncheckpoint.done()\n```",
             frontmatter={},
         )
 
@@ -1101,12 +1101,12 @@ class TestAuditFunctions:
 
     def test_audit_all(self, tmp_path: Path) -> None:
         """audit_all should audit all skills in directory."""
-        from dev_sync.core.audit import audit_all
+        from ctrlrelay.core.audit import audit_all
 
         # Create skills
         skill1 = tmp_path / "skill-one" / "SKILL.md"
         skill1.parent.mkdir()
-        skill1.write_text("---\nname: skill-one\n---\n# Ready\n\nfrom dev_sync import checkpoint")
+        skill1.write_text("---\nname: skill-one\n---\n# Ready\n\nfrom ctrlrelay import checkpoint")
 
         skill2 = tmp_path / "skill-two" / "SKILL.md"
         skill2.parent.mkdir()
@@ -1130,7 +1130,7 @@ Expected: FAIL with "cannot import name 'audit_skill'"
 
 - [ ] **Step 3: Implement audit functions**
 
-Add to `src/dev_sync/core/audit.py`:
+Add to `src/ctrlrelay/core/audit.py`:
 ```python
 def audit_skill(skill: SkillInfo) -> SkillAudit:
     """Run all audit checks on a skill.
@@ -1176,7 +1176,7 @@ Expected: All tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/dev_sync/core/audit.py tests/test_audit.py
+git add src/ctrlrelay/core/audit.py tests/test_audit.py
 git commit -m "feat: add audit_skill and audit_all functions"
 ```
 
@@ -1185,7 +1185,7 @@ git commit -m "feat: add audit_skill and audit_all functions"
 ### Task 9: Add format_report for markdown output
 
 **Files:**
-- Modify: `src/dev_sync/core/audit.py`
+- Modify: `src/ctrlrelay/core/audit.py`
 - Modify: `tests/test_audit.py`
 
 - [ ] **Step 1: Write failing test**
@@ -1195,7 +1195,7 @@ Add to `tests/test_audit.py`:
 class TestAuditReport:
     def test_format_report(self) -> None:
         """format_report should generate markdown table."""
-        from dev_sync.core.audit import (
+        from ctrlrelay.core.audit import (
             AuditCheck,
             AuditResult,
             SkillAudit,
@@ -1244,7 +1244,7 @@ Expected: FAIL with "cannot import name 'format_report'"
 
 - [ ] **Step 3: Implement format_report**
 
-Add to `src/dev_sync/core/audit.py`:
+Add to `src/ctrlrelay/core/audit.py`:
 ```python
 def format_report(audits: list[SkillAudit]) -> str:
     """Format audit results as markdown report.
@@ -1312,7 +1312,7 @@ Expected: All tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/dev_sync/core/audit.py tests/test_audit.py
+git add src/ctrlrelay/core/audit.py tests/test_audit.py
 git commit -m "feat: add markdown report formatting for skill audit"
 ```
 
@@ -1321,11 +1321,11 @@ git commit -m "feat: add markdown report formatting for skill audit"
 ### Task 10: Add skills CLI subcommand
 
 **Files:**
-- Modify: `src/dev_sync/cli.py`
+- Modify: `src/ctrlrelay/cli.py`
 
 - [ ] **Step 1: Add skills subcommand group and audit command**
 
-Add to `src/dev_sync/cli.py` after the config_app section:
+Add to `src/ctrlrelay/cli.py` after the config_app section:
 ```python
 # Skills subcommand group
 skills_app = typer.Typer(help="Skill management commands.")
@@ -1348,7 +1348,7 @@ def skills_audit(
     ),
 ) -> None:
     """Audit skills for orchestrator readiness."""
-    from dev_sync.core.audit import audit_all, format_report
+    from ctrlrelay.core.audit import audit_all, format_report
 
     # Get skills path from config if not provided
     if skills_path is None:
@@ -1398,7 +1398,7 @@ def skills_list(
     ),
 ) -> None:
     """List available skills."""
-    from dev_sync.core.audit import discover_skills
+    from ctrlrelay.core.audit import discover_skills
 
     if skills_path is None:
         try:
@@ -1430,7 +1430,7 @@ def skills_list(
 
 Run:
 ```bash
-dev-sync skills --help
+ctrlrelay skills --help
 ```
 Expected: Shows audit and list subcommands
 
@@ -1438,7 +1438,7 @@ Expected: Shows audit and list subcommands
 
 Run:
 ```bash
-dev-sync skills audit --path claude-config/skills
+ctrlrelay skills audit --path claude-config/skills
 ```
 Expected: Shows audit report with skill statuses
 
@@ -1446,14 +1446,14 @@ Expected: Shows audit report with skill statuses
 
 Run:
 ```bash
-dev-sync skills list --path claude-config/skills
+ctrlrelay skills list --path claude-config/skills
 ```
 Expected: Shows table of skills
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/dev_sync/cli.py
+git add src/ctrlrelay/cli.py
 git commit -m "feat: add skills audit and list CLI commands"
 ```
 
@@ -1467,7 +1467,7 @@ git commit -m "feat: add skills audit and list CLI commands"
 
 Run:
 ```bash
-cd /Users/ovalenzuela/Projects/dev-sync && pytest tests/ -v --cov=dev_sync
+cd /Users/ovalenzuela/Projects/ctrlrelay && pytest tests/ -v --cov=ctrlrelay
 ```
 Expected: All tests pass
 
@@ -1483,7 +1483,7 @@ Expected: No errors
 
 Run:
 ```bash
-dev-sync skills audit --path claude-config/skills
+ctrlrelay skills audit --path claude-config/skills
 ```
 Expected: Markdown report showing skill compliance statuses
 
@@ -1502,9 +1502,9 @@ git commit -m "chore: phase 1 complete - checkpoint protocol and skill audit"
 
 **Phase 1 is complete when:**
 
-1. ✅ `from dev_sync import checkpoint` works
+1. ✅ `from ctrlrelay import checkpoint` works
 2. ✅ `checkpoint.done()`, `checkpoint.blocked()`, `checkpoint.failed()` write state files
-3. ✅ `dev-sync skills audit` produces compliance report
+3. ✅ `ctrlrelay skills audit` produces compliance report
 4. ✅ All tests pass
 5. ✅ No linter errors
 

@@ -1,4 +1,4 @@
-# dev-sync orchestrator configuration
+# ctrlrelay orchestrator configuration
 # Copy to orchestrator.yaml and customize
 
 version: "1"
@@ -6,11 +6,11 @@ node_id: "my-machine"
 timezone: "America/Santiago"
 
 paths:
-  state_db: "~/.dev-sync/state.db"
-  worktrees: "~/.dev-sync/worktrees"
-  bare_repos: "~/.dev-sync/repos"
-  contexts: "~/dev-sync/contexts"
-  skills: "~/dev-sync/claude-config/skills"
+  state_db: "~/.ctrlrelay/state.db"
+  worktrees: "~/.ctrlrelay/worktrees"
+  bare_repos: "~/.ctrlrelay/repos"
+  contexts: "~/.ctrlrelay/contexts"
+  skills: "~/.ctrlrelay/claude-config/skills"
 
 claude:
   binary: "claude"
@@ -20,17 +20,17 @@ claude:
 transport:
   type: "file_mock"  # Use "telegram" for production
   telegram:
-    bot_token_env: "DEV_SYNC_TELEGRAM_TOKEN"
+    bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"
     chat_id: 123456789
-    socket_path: "~/.dev-sync/dev-sync.sock"
+    socket_path: "~/.ctrlrelay/ctrlrelay.sock"
   file_mock:
-    inbox: "~/.dev-sync/inbox.txt"
-    outbox: "~/.dev-sync/outbox.txt"
+    inbox: "~/.ctrlrelay/inbox.txt"
+    outbox: "~/.ctrlrelay/outbox.txt"
 
 dashboard:
   enabled: false
-  url: "https://dev-sync-dashboard.example.com"
-  auth_token_env: "DEV_SYNC_DASHBOARD_TOKEN"
+  url: "https://ctrlrelay-dashboard.example.com"
+  auth_token_env: "CTRLRELAY_DASHBOARD_TOKEN"
 
 repos: []
   # Example repo configuration:

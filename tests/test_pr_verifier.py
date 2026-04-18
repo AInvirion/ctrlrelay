@@ -9,7 +9,7 @@ class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_wait_for_checks_returns_when_all_completed(self) -> None:
         """Should return immediately when every check has left the pending bucket."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -27,7 +27,7 @@ class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_wait_for_checks_polls_until_completed(self) -> None:
         """Should keep polling while any check is still pending."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.side_effect = [
@@ -45,7 +45,7 @@ class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_wait_for_checks_returns_when_timeout_exceeded(self) -> None:
         """Should stop polling and return the last observed checks at timeout."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -67,7 +67,7 @@ class TestPRVerifier:
         a single empty read is ambiguous. Require a confirmation poll before
         concluding 'no CI configured', otherwise we'd skip CI entirely on a
         PR whose checks are about to register."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         # First read empty (checks not registered yet), second read has a
@@ -87,7 +87,7 @@ class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_wait_for_checks_concludes_no_ci_after_confirmation(self) -> None:
         """Two consecutive empty reads = no CI, safe to exit."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = []
@@ -101,7 +101,7 @@ class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_verify_ready_when_all_checks_pass_and_mergeable(self) -> None:
         """Should report ready when CI is green and PR is mergeable."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -124,7 +124,7 @@ class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_verify_ready_when_no_checks_and_mergeable(self) -> None:
         """Repos with no CI should still verify ready if mergeable."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = []
@@ -142,7 +142,7 @@ class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_verify_not_ready_when_check_fails(self) -> None:
         """Should report not-ready and list failing checks."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -165,7 +165,7 @@ class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_verify_not_ready_when_conflicting(self) -> None:
         """Should report not-ready when PR has merge conflicts."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -186,7 +186,7 @@ class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_verify_treats_skipping_as_pass(self) -> None:
         """bucket=skipping must not block — skipped checks don't fail a PR."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -207,7 +207,7 @@ class TestPRVerifier:
     async def test_verify_not_ready_when_behind_base_branch(self) -> None:
         """mergeable=MERGEABLE + mergeStateStatus=BEHIND means branch protection
         requires up-to-date branches. Must not hand off as ready."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -231,7 +231,7 @@ class TestPRVerifier:
         required-check failures would have been caught in failing_checks
         above, and the dev pipeline never auto-merges — UNSTABLE is a
         human-review concern, not a Claude-fixable state."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -253,7 +253,7 @@ class TestPRVerifier:
         """On repos requiring review approval, mergeStateStatus=BLOCKED is the
         expected state after CI passes. The dev pipeline explicitly does NOT
         auto-merge — awaiting-review is the right terminal state to hand off."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -275,7 +275,7 @@ class TestPRVerifier:
         """Matrix build where one job already failed while another is still
         pending at timeout must be reported as failing (Claude can fix),
         not timed_out (hand off a known-bad PR)."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -296,7 +296,7 @@ class TestPRVerifier:
         """If wait_for_checks returns with pending entries (timeout hit),
         verify must mark the result timed_out=True rather than folding those
         checks into failing_checks — Claude can't 'fix' slow CI."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         # Forever pending at a very short timeout.
@@ -317,7 +317,7 @@ class TestPRVerifier:
     async def test_verify_ready_when_has_hooks(self) -> None:
         """HAS_HOOKS is mergeable — the repo has pre-receive hooks but they
         don't block merge."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
@@ -336,7 +336,7 @@ class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_verify_waits_for_mergeable_when_unknown(self) -> None:
         """Should retry get_pr_state while mergeable is UNKNOWN."""
-        from dev_sync.core.pr_verifier import PRVerifier
+        from ctrlrelay.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [

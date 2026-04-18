@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
+from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
 
 
 class TestCheckpointState:
@@ -70,11 +70,11 @@ class TestCheckpointState:
 class TestCheckpointHelpers:
     def test_done_writes_state_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """done() should write DONE state to state file."""
-        from dev_sync.core.checkpoint import done
+        from ctrlrelay.core.checkpoint import done
 
         state_file = tmp_path / "state.json"
-        monkeypatch.setenv("DEV_SYNC_STATE_FILE", str(state_file))
-        monkeypatch.setenv("DEV_SYNC_SESSION_ID", "sess-abc")
+        monkeypatch.setenv("CTRLRELAY_STATE_FILE", str(state_file))
+        monkeypatch.setenv("CTRLRELAY_SESSION_ID", "sess-abc")
 
         done(summary="Completed task", outputs={"pr_url": "https://..."})
 
@@ -88,11 +88,11 @@ class TestCheckpointHelpers:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """blocked() should write BLOCKED_NEEDS_INPUT state."""
-        from dev_sync.core.checkpoint import blocked
+        from ctrlrelay.core.checkpoint import blocked
 
         state_file = tmp_path / "state.json"
-        monkeypatch.setenv("DEV_SYNC_STATE_FILE", str(state_file))
-        monkeypatch.setenv("DEV_SYNC_SESSION_ID", "sess-abc")
+        monkeypatch.setenv("CTRLRELAY_STATE_FILE", str(state_file))
+        monkeypatch.setenv("CTRLRELAY_SESSION_ID", "sess-abc")
 
         blocked(
             question="Which version?",
@@ -107,11 +107,11 @@ class TestCheckpointHelpers:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """failed() should write FAILED state."""
-        from dev_sync.core.checkpoint import failed
+        from ctrlrelay.core.checkpoint import failed
 
         state_file = tmp_path / "state.json"
-        monkeypatch.setenv("DEV_SYNC_STATE_FILE", str(state_file))
-        monkeypatch.setenv("DEV_SYNC_SESSION_ID", "sess-abc")
+        monkeypatch.setenv("CTRLRELAY_STATE_FILE", str(state_file))
+        monkeypatch.setenv("CTRLRELAY_SESSION_ID", "sess-abc")
 
         failed(error="Connection timeout", recoverable=True)
 
@@ -124,11 +124,11 @@ class TestCheckpointHelpers:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Checkpoint should write to .tmp then rename for atomicity."""
-        from dev_sync.core.checkpoint import done
+        from ctrlrelay.core.checkpoint import done
 
         state_file = tmp_path / "state.json"
-        monkeypatch.setenv("DEV_SYNC_STATE_FILE", str(state_file))
-        monkeypatch.setenv("DEV_SYNC_SESSION_ID", "sess-abc")
+        monkeypatch.setenv("CTRLRELAY_STATE_FILE", str(state_file))
+        monkeypatch.setenv("CTRLRELAY_SESSION_ID", "sess-abc")
 
         done(summary="Test")
 
@@ -138,20 +138,20 @@ class TestCheckpointHelpers:
         assert state_file.exists()
 
     def test_missing_env_raises_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Should raise if DEV_SYNC_STATE_FILE not set."""
-        from dev_sync.core.checkpoint import CheckpointError, done
+        """Should raise if CTRLRELAY_STATE_FILE not set."""
+        from ctrlrelay.core.checkpoint import CheckpointError, done
 
-        monkeypatch.delenv("DEV_SYNC_STATE_FILE", raising=False)
-        monkeypatch.delenv("DEV_SYNC_SESSION_ID", raising=False)
+        monkeypatch.delenv("CTRLRELAY_STATE_FILE", raising=False)
+        monkeypatch.delenv("CTRLRELAY_SESSION_ID", raising=False)
 
-        with pytest.raises(CheckpointError, match="DEV_SYNC_STATE_FILE"):
+        with pytest.raises(CheckpointError, match="CTRLRELAY_STATE_FILE"):
             done(summary="Test")
 
 
 class TestReadCheckpoint:
     def test_read_valid_checkpoint(self, tmp_path: Path) -> None:
         """Should parse valid checkpoint file."""
-        from dev_sync.core.checkpoint import CheckpointStatus, read_checkpoint
+        from ctrlrelay.core.checkpoint import CheckpointStatus, read_checkpoint
 
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps({
@@ -170,7 +170,7 @@ class TestReadCheckpoint:
 
     def test_read_deletes_file_after(self, tmp_path: Path) -> None:
         """Should delete checkpoint file after reading."""
-        from dev_sync.core.checkpoint import read_checkpoint
+        from ctrlrelay.core.checkpoint import read_checkpoint
 
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps({
@@ -186,14 +186,14 @@ class TestReadCheckpoint:
 
     def test_read_missing_file_raises(self, tmp_path: Path) -> None:
         """Should raise if file doesn't exist."""
-        from dev_sync.core.checkpoint import CheckpointError, read_checkpoint
+        from ctrlrelay.core.checkpoint import CheckpointError, read_checkpoint
 
         with pytest.raises(CheckpointError, match="not found"):
             read_checkpoint(tmp_path / "missing.json")
 
     def test_read_invalid_json_raises(self, tmp_path: Path) -> None:
         """Should raise FAILED status for invalid JSON (truncation)."""
-        from dev_sync.core.checkpoint import CheckpointError, read_checkpoint
+        from ctrlrelay.core.checkpoint import CheckpointError, read_checkpoint
 
         state_file = tmp_path / "state.json"
         state_file.write_text('{"status": "DONE", "session_id": "x", "truncated')

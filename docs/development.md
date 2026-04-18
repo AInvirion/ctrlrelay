@@ -11,8 +11,8 @@ permalink: /development/
 ## Local setup
 
 ```bash
-git clone https://github.com/AInvirion/dev-sync.git
-cd dev-sync
+git clone https://github.com/AInvirion/ctrlrelay.git
+cd ctrlrelay
 
 # Editable install with dev extras (uv recommended):
 uv pip install -e '.[dev]'
@@ -27,7 +27,7 @@ the runtime dependencies.
 Confirm the CLI is wired up:
 
 ```bash
-dev-sync --version
+ctrlrelay --version
 ```
 
 ## Running tests
@@ -46,7 +46,7 @@ pytest tests/test_dev_pipeline.py -v
 pytest tests/test_dev_pipeline.py::test_blocked_then_resume -v
 
 # With coverage:
-pytest --cov=src/dev_sync --cov-report=term-missing
+pytest --cov=src/ctrlrelay --cov-report=term-missing
 ```
 
 `pyproject.toml` sets `pythonpath = ["src"]` and `testpaths = ["tests"]` so
@@ -101,14 +101,14 @@ You can also build the site locally if you have Ruby installed:
 cd docs
 bundle install         # one-time
 bundle exec jekyll serve
-# Open http://localhost:4000/dev-sync/
+# Open http://localhost:4000/ctrlrelay/
 ```
 
 ## Project layout
 
 ```text
-dev-sync/
-├── src/dev_sync/                # Python package (orchestrator core)
+ctrlrelay/
+├── src/ctrlrelay/                # Python package (orchestrator core)
 │   ├── cli.py                   # Typer CLI entry point
 │   ├── core/                    # Dispatcher, worktree, state, config, ...
 │   ├── pipelines/               # dev, secops, post_merge
@@ -127,7 +127,7 @@ dev-sync/
 ## Contributing
 
 1. **Open an issue first** for anything beyond a typo or trivial fix. The
-   `dev-sync` poller can pick assigned issues up automatically — see
+   `ctrlrelay` poller can pick assigned issues up automatically — see
    [Getting started]({{ '/getting-started/' | relative_url }}).
 2. **Branch naming.** Use `fix/issue-{n}` (the dev-pipeline default) so the
    issue ↔ branch ↔ PR linkage stays clean.

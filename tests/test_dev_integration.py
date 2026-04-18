@@ -11,12 +11,12 @@ class TestDevIntegration:
     @pytest.mark.asyncio
     async def test_full_dev_flow_with_mocked_claude(self, tmp_path: Path) -> None:
         """Should run full dev flow from issue to PR."""
-        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
-        from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
-        from dev_sync.core.github import GitHubCLI
-        from dev_sync.core.state import StateDB
-        from dev_sync.core.worktree import WorktreeManager
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.core.worktree import WorktreeManager
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         # Setup state DB
         state_db = StateDB(tmp_path / "state.db")
@@ -76,7 +76,7 @@ class TestDevIntegration:
 
         mock_dispatcher.spawn_session.side_effect = mock_spawn_session
 
-        from dev_sync.core.pr_verifier import VerificationResult
+        from ctrlrelay.core.pr_verifier import VerificationResult
         mock_pr_verifier = AsyncMock()
         mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
 
@@ -144,11 +144,11 @@ class TestDevPipelineCleanup:
         - `create_side_effect`: if set, overrides create_worktree_with_new_branch
           to simulate setup failure before the branch is created.
         """
-        from dev_sync.core.dispatcher import ClaudeDispatcher
-        from dev_sync.core.github import GitHubCLI
-        from dev_sync.core.state import StateDB
-        from dev_sync.core.worktree import WorktreeManager
-        from dev_sync.pipelines.dev import run_dev_issue
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.core.worktree import WorktreeManager
+        from ctrlrelay.pipelines.dev import run_dev_issue
 
         state_db = StateDB(tmp_path / "state.db")
 
@@ -186,7 +186,7 @@ class TestDevPipelineCleanup:
                 worktree_path.mkdir(parents=True)
                 mock_create.return_value = worktree_path
 
-            from dev_sync.core.pr_verifier import VerificationResult
+            from ctrlrelay.core.pr_verifier import VerificationResult
             mock_pr_verifier = AsyncMock()
             mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
 
@@ -233,8 +233,8 @@ class TestDevPipelineCleanup:
         """A FAILED checkpoint (claude exited cleanly but flagged failure) must
         trigger the same cleanup as an exception — retry must not be blocked by
         a leftover branch."""
-        from dev_sync.core.checkpoint import read_checkpoint
-        from dev_sync.core.dispatcher import SessionResult
+        from ctrlrelay.core.checkpoint import read_checkpoint
+        from ctrlrelay.core.dispatcher import SessionResult
 
         async def spawn(**kwargs):
             state_file = kwargs["state_file"]
@@ -266,8 +266,8 @@ class TestDevPipelineCleanup:
         self, tmp_path: Path
     ) -> None:
         """BLOCKED must NOT clean up — the user may resume the session."""
-        from dev_sync.core.checkpoint import read_checkpoint
-        from dev_sync.core.dispatcher import SessionResult
+        from ctrlrelay.core.checkpoint import read_checkpoint
+        from ctrlrelay.core.dispatcher import SessionResult
 
         async def spawn(**kwargs):
             state_file = kwargs["state_file"]
@@ -381,8 +381,8 @@ class TestDevPipelineCleanup:
     async def test_success_preserves_branch(self, tmp_path: Path) -> None:
         """DONE removes the worktree but keeps the branch — the open PR
         references it, so deleting would break the PR."""
-        from dev_sync.core.checkpoint import read_checkpoint
-        from dev_sync.core.dispatcher import SessionResult
+        from ctrlrelay.core.checkpoint import read_checkpoint
+        from ctrlrelay.core.dispatcher import SessionResult
 
         async def spawn(**kwargs):
             state_file = kwargs["state_file"]

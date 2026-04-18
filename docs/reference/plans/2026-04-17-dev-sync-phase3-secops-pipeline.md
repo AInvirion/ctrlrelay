@@ -21,7 +21,7 @@ nav_order: 4
 ## File Structure
 
 ```
-src/dev_sync/
+src/ctrlrelay/
 ├── core/
 │   ├── dispatcher.py      # NEW: claude -p subprocess manager
 │   ├── worktree.py        # NEW: git worktree management
@@ -47,7 +47,7 @@ tests/
 ### Task 1: GitHub CLI Wrapper
 
 **Files:**
-- Create: `src/dev_sync/core/github.py`
+- Create: `src/ctrlrelay/core/github.py`
 - Test: `tests/test_github.py`
 
 - [ ] **Step 1: Write failing test for list_prs**
@@ -66,14 +66,14 @@ class TestGitHubCLI:
     @pytest.mark.asyncio
     async def test_list_prs_returns_parsed_json(self) -> None:
         """Should parse gh pr list JSON output."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps([
             {"number": 1, "title": "Bump requests", "author": {"login": "dependabot[bot]"}},
             {"number": 2, "title": "Fix bug", "author": {"login": "user"}},
         ])
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = mock_output
             gh = GitHubCLI()
             prs = await gh.list_prs("owner/repo", state="open")
@@ -86,13 +86,13 @@ class TestGitHubCLI:
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_github.py::TestGitHubCLI::test_list_prs_returns_parsed_json -v`
-Expected: FAIL with "No module named 'dev_sync.core.github'"
+Expected: FAIL with "No module named 'ctrlrelay.core.github'"
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/dev_sync/core/github.py
-"""GitHub CLI (gh) wrapper for dev-sync."""
+# src/ctrlrelay/core/github.py
+"""GitHub CLI (gh) wrapper for ctrlrelay."""
 
 from __future__ import annotations
 
@@ -158,13 +158,13 @@ Expected: PASS
     @pytest.mark.asyncio
     async def test_list_security_alerts(self) -> None:
         """Should fetch Dependabot alerts."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps([
             {"number": 1, "state": "open", "dependency": {"package": {"name": "lodash"}}},
         ])
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = mock_output
             gh = GitHubCLI()
             alerts = await gh.list_security_alerts("owner/repo")
@@ -175,7 +175,7 @@ Expected: PASS
 
 - [ ] **Step 6: Implement list_security_alerts**
 
-Add to `src/dev_sync/core/github.py`:
+Add to `src/ctrlrelay/core/github.py`:
 
 ```python
     async def list_security_alerts(
@@ -198,9 +198,9 @@ Add to `src/dev_sync/core/github.py`:
     @pytest.mark.asyncio
     async def test_merge_pr(self) -> None:
         """Should merge PR with squash."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = ""
             gh = GitHubCLI()
             await gh.merge_pr("owner/repo", 42, method="squash")
@@ -213,7 +213,7 @@ Add to `src/dev_sync/core/github.py`:
 
 - [ ] **Step 8: Implement merge_pr**
 
-Add to `src/dev_sync/core/github.py`:
+Add to `src/ctrlrelay/core/github.py`:
 
 ```python
     async def merge_pr(
@@ -239,14 +239,14 @@ Add to `src/dev_sync/core/github.py`:
     @pytest.mark.asyncio
     async def test_get_pr_checks(self) -> None:
         """Should get PR check status."""
-        from dev_sync.core.github import GitHubCLI
+        from ctrlrelay.core.github import GitHubCLI
 
         mock_output = json.dumps([
             {"name": "tests", "status": "completed", "conclusion": "success"},
             {"name": "lint", "status": "completed", "conclusion": "success"},
         ])
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
             mock_run.return_value = mock_output
             gh = GitHubCLI()
             checks = await gh.get_pr_checks("owner/repo", 42)
@@ -257,7 +257,7 @@ Add to `src/dev_sync/core/github.py`:
 
 - [ ] **Step 10: Implement get_pr_checks**
 
-Add to `src/dev_sync/core/github.py`:
+Add to `src/ctrlrelay/core/github.py`:
 
 ```python
     async def get_pr_checks(
@@ -292,7 +292,7 @@ Expected: All tests PASS
 - [ ] **Step 12: Commit**
 
 ```bash
-git add src/dev_sync/core/github.py tests/test_github.py
+git add src/ctrlrelay/core/github.py tests/test_github.py
 git commit -m "$(cat <<'EOF'
 feat(core): add GitHub CLI wrapper
 
@@ -307,7 +307,7 @@ EOF
 ### Task 2: Git Worktree Manager
 
 **Files:**
-- Create: `src/dev_sync/core/worktree.py`
+- Create: `src/ctrlrelay/core/worktree.py`
 - Test: `tests/test_worktree.py`
 
 - [ ] **Step 1: Write failing test for create_worktree**
@@ -327,7 +327,7 @@ class TestWorktreeManager:
     @pytest.mark.asyncio
     async def test_create_worktree(self, tmp_path: Path) -> None:
         """Should create worktree with correct paths."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         worktrees_dir = tmp_path / "worktrees"
         bare_repos_dir = tmp_path / "repos"
@@ -354,12 +354,12 @@ class TestWorktreeManager:
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_worktree.py::TestWorktreeManager::test_create_worktree -v`
-Expected: FAIL with "No module named 'dev_sync.core.worktree'"
+Expected: FAIL with "No module named 'ctrlrelay.core.worktree'"
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/dev_sync/core/worktree.py
+# src/ctrlrelay/core/worktree.py
 """Git worktree management for isolated sessions."""
 
 from __future__ import annotations
@@ -450,7 +450,7 @@ Expected: PASS
     @pytest.mark.asyncio
     async def test_ensure_bare_repo_clones_if_missing(self, tmp_path: Path) -> None:
         """Should clone bare repo if it doesn't exist."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
@@ -469,7 +469,7 @@ Expected: PASS
 
 - [ ] **Step 6: Implement ensure_bare_repo**
 
-Add to `src/dev_sync/core/worktree.py`:
+Add to `src/ctrlrelay/core/worktree.py`:
 
 ```python
     async def ensure_bare_repo(self, repo: str) -> Path:
@@ -494,7 +494,7 @@ Add to `src/dev_sync/core/worktree.py`:
     @pytest.mark.asyncio
     async def test_remove_worktree(self, tmp_path: Path) -> None:
         """Should remove worktree and prune."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
@@ -516,7 +516,7 @@ Add to `src/dev_sync/core/worktree.py`:
 
 - [ ] **Step 8: Implement remove_worktree**
 
-Add to `src/dev_sync/core/worktree.py`:
+Add to `src/ctrlrelay/core/worktree.py`:
 
 ```python
     async def remove_worktree(self, repo: str, session_id: str) -> None:
@@ -537,7 +537,7 @@ Add to `src/dev_sync/core/worktree.py`:
     @pytest.mark.asyncio
     async def test_symlink_context(self, tmp_path: Path) -> None:
         """Should symlink CLAUDE.md into worktree."""
-        from dev_sync.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         contexts_dir = tmp_path / "contexts"
         context_file = contexts_dir / "owner-repo" / "CLAUDE.md"
@@ -564,7 +564,7 @@ Add to `src/dev_sync/core/worktree.py`:
 
 - [ ] **Step 10: Implement symlink_context**
 
-Add to `src/dev_sync/core/worktree.py`:
+Add to `src/ctrlrelay/core/worktree.py`:
 
 ```python
     def symlink_context(
@@ -601,7 +601,7 @@ Expected: All tests PASS
 - [ ] **Step 12: Commit**
 
 ```bash
-git add src/dev_sync/core/worktree.py tests/test_worktree.py
+git add src/ctrlrelay/core/worktree.py tests/test_worktree.py
 git commit -m "$(cat <<'EOF'
 feat(core): add git worktree manager
 
@@ -616,7 +616,7 @@ EOF
 ### Task 3: Claude Dispatcher
 
 **Files:**
-- Create: `src/dev_sync/core/dispatcher.py`
+- Create: `src/ctrlrelay/core/dispatcher.py`
 - Test: `tests/test_dispatcher.py`
 
 - [ ] **Step 1: Write failing test for spawn_session**
@@ -636,8 +636,8 @@ import pytest
 class TestClaudeDispatcher:
     @pytest.mark.asyncio
     async def test_spawn_session_sets_env_vars(self, tmp_path: Path) -> None:
-        """Should set DEV_SYNC env vars for checkpoint protocol."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
+        """Should set CTRLRELAY env vars for checkpoint protocol."""
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
 
         dispatcher = ClaudeDispatcher(claude_binary="claude")
 
@@ -664,20 +664,20 @@ class TestClaudeDispatcher:
 
             call_kwargs = mock_exec.call_args.kwargs
             env = call_kwargs.get("env", {})
-            assert "DEV_SYNC_SESSION_ID" in env
-            assert "DEV_SYNC_STATE_FILE" in env
+            assert "CTRLRELAY_SESSION_ID" in env
+            assert "CTRLRELAY_STATE_FILE" in env
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_dispatcher.py::TestClaudeDispatcher::test_spawn_session_sets_env_vars -v`
-Expected: FAIL with "No module named 'dev_sync.core.dispatcher'"
+Expected: FAIL with "No module named 'ctrlrelay.core.dispatcher'"
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/dev_sync/core/dispatcher.py
-"""Claude subprocess dispatcher for dev-sync."""
+# src/ctrlrelay/core/dispatcher.py
+"""Claude subprocess dispatcher for ctrlrelay."""
 
 from __future__ import annotations
 
@@ -687,7 +687,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
+from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
 
 
 @dataclass
@@ -738,8 +738,8 @@ class ClaudeDispatcher:
 
         env = os.environ.copy()
         env.update(self.extra_env)
-        env["DEV_SYNC_SESSION_ID"] = session_id
-        env["DEV_SYNC_STATE_FILE"] = str(state_file)
+        env["CTRLRELAY_SESSION_ID"] = session_id
+        env["CTRLRELAY_STATE_FILE"] = str(state_file)
 
         cmd = [self.claude_binary, "-p", prompt, "--output-format", "json"]
         if resume_session_id:
@@ -794,7 +794,7 @@ Expected: PASS
     @pytest.mark.asyncio
     async def test_spawn_session_handles_timeout(self, tmp_path: Path) -> None:
         """Should kill process on timeout."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
         dispatcher = ClaudeDispatcher(claude_binary="claude", default_timeout=1)
 
@@ -828,7 +828,7 @@ Expected: PASS (already implemented)
     @pytest.mark.asyncio
     async def test_spawn_session_parses_done_state(self, tmp_path: Path) -> None:
         """Should parse DONE checkpoint state."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
         dispatcher = ClaudeDispatcher(claude_binary="claude")
 
@@ -871,7 +871,7 @@ Expected: PASS (already implemented)
     @pytest.mark.asyncio
     async def test_spawn_session_parses_blocked_state(self, tmp_path: Path) -> None:
         """Should parse BLOCKED_NEEDS_INPUT checkpoint state."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
         dispatcher = ClaudeDispatcher(claude_binary="claude")
 
@@ -910,7 +910,7 @@ Expected: All tests PASS
 - [ ] **Step 11: Commit**
 
 ```bash
-git add src/dev_sync/core/dispatcher.py tests/test_dispatcher.py
+git add src/ctrlrelay/core/dispatcher.py tests/test_dispatcher.py
 git commit -m "$(cat <<'EOF'
 feat(core): add Claude subprocess dispatcher
 
@@ -925,17 +925,17 @@ EOF
 ### Task 4: Dashboard Client with Offline Queue
 
 **Files:**
-- Create: `src/dev_sync/dashboard/__init__.py`
-- Create: `src/dev_sync/dashboard/client.py`
+- Create: `src/ctrlrelay/dashboard/__init__.py`
+- Create: `src/ctrlrelay/dashboard/client.py`
 - Test: `tests/test_dashboard_client.py`
 
 - [ ] **Step 1: Create dashboard package init**
 
 ```python
-# src/dev_sync/dashboard/__init__.py
-"""Dashboard client for dev-sync."""
+# src/ctrlrelay/dashboard/__init__.py
+"""Dashboard client for ctrlrelay."""
 
-from dev_sync.dashboard.client import DashboardClient, EventPayload, HeartbeatPayload
+from ctrlrelay.dashboard.client import DashboardClient, EventPayload, HeartbeatPayload
 
 __all__ = ["DashboardClient", "EventPayload", "HeartbeatPayload"]
 ```
@@ -957,7 +957,7 @@ class TestDashboardClient:
     @pytest.mark.asyncio
     async def test_push_event_sends_to_server(self) -> None:
         """Should POST event to dashboard server."""
-        from dev_sync.dashboard.client import DashboardClient, EventPayload
+        from ctrlrelay.dashboard.client import DashboardClient, EventPayload
 
         client = DashboardClient(
             url="https://dashboard.example.com",
@@ -986,12 +986,12 @@ class TestDashboardClient:
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `pytest tests/test_dashboard_client.py::TestDashboardClient::test_push_event_sends_to_server -v`
-Expected: FAIL with "No module named 'dev_sync.dashboard'"
+Expected: FAIL with "No module named 'ctrlrelay.dashboard'"
 
 - [ ] **Step 4: Write minimal implementation**
 
 ```python
-# src/dev_sync/dashboard/client.py
+# src/ctrlrelay/dashboard/client.py
 """Dashboard client for event push and heartbeat."""
 
 from __future__ import annotations
@@ -1164,7 +1164,7 @@ Expected: PASS
     @pytest.mark.asyncio
     async def test_push_event_queues_on_failure(self, tmp_path: Path) -> None:
         """Should queue event when server unreachable."""
-        from dev_sync.dashboard.client import DashboardClient, EventPayload
+        from ctrlrelay.dashboard.client import DashboardClient, EventPayload
 
         client = DashboardClient(
             url="https://dashboard.example.com",
@@ -1201,7 +1201,7 @@ Expected: PASS
     @pytest.mark.asyncio
     async def test_drain_queue_sends_queued_events(self, tmp_path: Path) -> None:
         """Should send queued events when connection restored."""
-        from dev_sync.dashboard.client import DashboardClient, EventPayload
+        from ctrlrelay.dashboard.client import DashboardClient, EventPayload
 
         queue_file = tmp_path / "event_queue.json"
         queue_file.write_text(json.dumps([
@@ -1237,7 +1237,7 @@ Expected: All tests PASS
 - [ ] **Step 10: Commit**
 
 ```bash
-git add src/dev_sync/dashboard/__init__.py src/dev_sync/dashboard/client.py tests/test_dashboard_client.py
+git add src/ctrlrelay/dashboard/__init__.py src/ctrlrelay/dashboard/client.py tests/test_dashboard_client.py
 git commit -m "$(cat <<'EOF'
 feat(dashboard): add client with offline event queue
 
@@ -1252,17 +1252,17 @@ EOF
 ### Task 5: Pipeline Base Protocol
 
 **Files:**
-- Create: `src/dev_sync/pipelines/__init__.py`
-- Create: `src/dev_sync/pipelines/base.py`
+- Create: `src/ctrlrelay/pipelines/__init__.py`
+- Create: `src/ctrlrelay/pipelines/base.py`
 - Test: `tests/test_pipeline_base.py`
 
 - [ ] **Step 1: Create pipelines package init**
 
 ```python
-# src/dev_sync/pipelines/__init__.py
-"""Pipeline implementations for dev-sync."""
+# src/ctrlrelay/pipelines/__init__.py
+"""Pipeline implementations for ctrlrelay."""
 
-from dev_sync.pipelines.base import Pipeline, PipelineContext, PipelineResult
+from ctrlrelay.pipelines.base import Pipeline, PipelineContext, PipelineResult
 
 __all__ = ["Pipeline", "PipelineContext", "PipelineResult"]
 ```
@@ -1281,7 +1281,7 @@ import pytest
 class TestPipelineProtocol:
     def test_pipeline_context_has_required_fields(self) -> None:
         """PipelineContext should have all required fields."""
-        from dev_sync.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.base import PipelineContext
 
         ctx = PipelineContext(
             session_id="sess-123",
@@ -1296,7 +1296,7 @@ class TestPipelineProtocol:
 
     def test_pipeline_result_has_required_fields(self) -> None:
         """PipelineResult should capture execution outcome."""
-        from dev_sync.pipelines.base import PipelineResult
+        from ctrlrelay.pipelines.base import PipelineResult
 
         result = PipelineResult(
             success=True,
@@ -1311,12 +1311,12 @@ class TestPipelineProtocol:
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `pytest tests/test_pipeline_base.py -v`
-Expected: FAIL with "No module named 'dev_sync.pipelines'"
+Expected: FAIL with "No module named 'ctrlrelay.pipelines'"
 
 - [ ] **Step 4: Write implementation**
 
 ```python
-# src/dev_sync/pipelines/base.py
+# src/ctrlrelay/pipelines/base.py
 """Base protocol and types for pipelines."""
 
 from __future__ import annotations
@@ -1377,7 +1377,7 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/dev_sync/pipelines/__init__.py src/dev_sync/pipelines/base.py tests/test_pipeline_base.py
+git add src/ctrlrelay/pipelines/__init__.py src/ctrlrelay/pipelines/base.py tests/test_pipeline_base.py
 git commit -m "$(cat <<'EOF'
 feat(pipelines): add base protocol and types
 
@@ -1392,7 +1392,7 @@ EOF
 ### Task 6: Secops Pipeline Implementation
 
 **Files:**
-- Create: `src/dev_sync/pipelines/secops.py`
+- Create: `src/ctrlrelay/pipelines/secops.py`
 - Test: `tests/test_secops_pipeline.py`
 
 - [ ] **Step 1: Write failing test for secops pipeline initialization**
@@ -1410,7 +1410,7 @@ import pytest
 class TestSecopsPipeline:
     def test_secops_pipeline_has_name(self) -> None:
         """SecopsPipeline should have name attribute."""
-        from dev_sync.pipelines.secops import SecopsPipeline
+        from ctrlrelay.pipelines.secops import SecopsPipeline
 
         pipeline = SecopsPipeline(
             dispatcher=MagicMock(),
@@ -1427,12 +1427,12 @@ class TestSecopsPipeline:
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_secops_pipeline.py::TestSecopsPipeline::test_secops_pipeline_has_name -v`
-Expected: FAIL with "No module named 'dev_sync.pipelines.secops'"
+Expected: FAIL with "No module named 'ctrlrelay.pipelines.secops'"
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/dev_sync/pipelines/secops.py
+# src/ctrlrelay/pipelines/secops.py
 """Secops pipeline for security triage across repos."""
 
 from __future__ import annotations
@@ -1442,14 +1442,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dev_sync.core.checkpoint import CheckpointStatus
-from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
-from dev_sync.core.github import GitHubCLI
-from dev_sync.core.state import StateDB
-from dev_sync.core.worktree import WorktreeManager
-from dev_sync.dashboard.client import DashboardClient, EventPayload
-from dev_sync.pipelines.base import Pipeline, PipelineContext, PipelineResult
-from dev_sync.transports.base import Transport
+from ctrlrelay.core.checkpoint import CheckpointStatus
+from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+from ctrlrelay.core.github import GitHubCLI
+from ctrlrelay.core.state import StateDB
+from ctrlrelay.core.worktree import WorktreeManager
+from ctrlrelay.dashboard.client import DashboardClient, EventPayload
+from ctrlrelay.pipelines.base import Pipeline, PipelineContext, PipelineResult
+from ctrlrelay.transports.base import Transport
 
 
 @dataclass
@@ -1553,10 +1553,10 @@ Expected: PASS
     @pytest.mark.asyncio
     async def test_run_dispatches_claude_session(self, tmp_path: Path) -> None:
         """Should dispatch Claude with secops prompt."""
-        from dev_sync.core.checkpoint import CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.base import PipelineContext
-        from dev_sync.pipelines.secops import SecopsPipeline
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.secops import SecopsPipeline
 
         mock_dispatcher = AsyncMock()
         mock_state = MagicMock()
@@ -1605,10 +1605,10 @@ Expected: PASS
     @pytest.mark.asyncio
     async def test_run_returns_blocked_when_needs_input(self, tmp_path: Path) -> None:
         """Should return blocked result when Claude needs input."""
-        from dev_sync.core.checkpoint import CheckpointStatus
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.base import PipelineContext
-        from dev_sync.pipelines.secops import SecopsPipeline
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.secops import SecopsPipeline
 
         mock_dispatcher = AsyncMock()
         mock_state = MagicMock()
@@ -1661,7 +1661,7 @@ Expected: All tests PASS
 - [ ] **Step 10: Commit**
 
 ```bash
-git add src/dev_sync/pipelines/secops.py tests/test_secops_pipeline.py
+git add src/ctrlrelay/pipelines/secops.py tests/test_secops_pipeline.py
 git commit -m "$(cat <<'EOF'
 feat(pipelines): add secops pipeline
 
@@ -1676,7 +1676,7 @@ EOF
 ### Task 7: Secops Orchestration (run_secops_all)
 
 **Files:**
-- Modify: `src/dev_sync/pipelines/secops.py`
+- Modify: `src/ctrlrelay/pipelines/secops.py`
 - Test: `tests/test_secops_pipeline.py`
 
 - [ ] **Step 1: Write failing test for run_all**
@@ -1685,10 +1685,10 @@ EOF
     @pytest.mark.asyncio
     async def test_run_all_processes_multiple_repos(self, tmp_path: Path) -> None:
         """Should run secops on all configured repos."""
-        from dev_sync.core.checkpoint import CheckpointStatus
-        from dev_sync.core.config import RepoConfig
-        from dev_sync.core.dispatcher import SessionResult
-        from dev_sync.pipelines.secops import SecopsPipeline, run_secops_all
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.config import RepoConfig
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import SecopsPipeline, run_secops_all
 
         mock_dispatcher = AsyncMock()
         mock_state = MagicMock()
@@ -1738,7 +1738,7 @@ Expected: FAIL with "cannot import name 'run_secops_all'"
 
 - [ ] **Step 3: Implement run_secops_all**
 
-Add to `src/dev_sync/pipelines/secops.py`:
+Add to `src/ctrlrelay/pipelines/secops.py`:
 
 ```python
 import time
@@ -1787,7 +1787,7 @@ async def run_secops_all(
             if context_path.exists():
                 worktree.symlink_context(worktree_path, context_path)
 
-            state_file = worktree_path / ".dev-sync" / "state.json"
+            state_file = worktree_path / ".ctrlrelay" / "state.json"
             state_file.parent.mkdir(parents=True, exist_ok=True)
 
             ctx = PipelineContext(
@@ -1852,7 +1852,7 @@ Expected: PASS
     @pytest.mark.asyncio
     async def test_run_all_skips_locked_repos(self, tmp_path: Path) -> None:
         """Should skip repos that are already locked."""
-        from dev_sync.pipelines.secops import run_secops_all
+        from ctrlrelay.pipelines.secops import run_secops_all
 
         mock_db = MagicMock()
         mock_db.acquire_lock.return_value = False
@@ -1883,11 +1883,11 @@ Expected: PASS
 - [ ] **Step 7: Update pipelines __init__.py**
 
 ```python
-# src/dev_sync/pipelines/__init__.py
-"""Pipeline implementations for dev-sync."""
+# src/ctrlrelay/pipelines/__init__.py
+"""Pipeline implementations for ctrlrelay."""
 
-from dev_sync.pipelines.base import Pipeline, PipelineContext, PipelineResult
-from dev_sync.pipelines.secops import SecopsPipeline, run_secops_all
+from ctrlrelay.pipelines.base import Pipeline, PipelineContext, PipelineResult
+from ctrlrelay.pipelines.secops import SecopsPipeline, run_secops_all
 
 __all__ = [
     "Pipeline",
@@ -1906,7 +1906,7 @@ Expected: All tests PASS
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/dev_sync/pipelines/secops.py src/dev_sync/pipelines/__init__.py tests/test_secops_pipeline.py
+git add src/ctrlrelay/pipelines/secops.py src/ctrlrelay/pipelines/__init__.py tests/test_secops_pipeline.py
 git commit -m "$(cat <<'EOF'
 feat(pipelines): add run_secops_all orchestration
 
@@ -1921,7 +1921,7 @@ EOF
 ### Task 8: CLI Command for Secops
 
 **Files:**
-- Modify: `src/dev_sync/cli.py`
+- Modify: `src/ctrlrelay/cli.py`
 - Test: `tests/test_cli.py` (add secops tests)
 
 - [ ] **Step 1: Write failing test for secops run command**
@@ -1942,7 +1942,7 @@ runner = CliRunner()
 class TestSecopsCLI:
     def test_run_secops_requires_config(self) -> None:
         """Should fail without valid config."""
-        from dev_sync.cli import app
+        from ctrlrelay.cli import app
 
         result = runner.invoke(app, ["run", "secops", "--config", "/nonexistent.yaml"])
 
@@ -1957,7 +1957,7 @@ Expected: FAIL with "No such command 'run'"
 
 - [ ] **Step 3: Add run command group to CLI**
 
-Add to `src/dev_sync/cli.py` after the bridge_app section:
+Add to `src/ctrlrelay/cli.py` after the bridge_app section:
 
 ```python
 # Run subcommand group
@@ -1983,12 +1983,12 @@ def run_secops(
     """Run secops pipeline on configured repos."""
     import asyncio
 
-    from dev_sync.core.dispatcher import ClaudeDispatcher
-    from dev_sync.core.github import GitHubCLI
-    from dev_sync.core.state import StateDB
-    from dev_sync.core.worktree import WorktreeManager
-    from dev_sync.dashboard.client import DashboardClient
-    from dev_sync.pipelines.secops import run_secops_all
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+    from ctrlrelay.core.github import GitHubCLI
+    from ctrlrelay.core.state import StateDB
+    from ctrlrelay.core.worktree import WorktreeManager
+    from ctrlrelay.dashboard.client import DashboardClient
+    from ctrlrelay.pipelines.secops import run_secops_all
 
     path = Path(config_path)
 
@@ -2078,7 +2078,7 @@ Expected: All tests PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/dev_sync/cli.py tests/test_cli_secops.py
+git add src/ctrlrelay/cli.py tests/test_cli_secops.py
 git commit -m "$(cat <<'EOF'
 feat(cli): add run secops command
 
@@ -2113,11 +2113,11 @@ class TestSecopsIntegration:
     @pytest.mark.asyncio
     async def test_full_secops_flow_with_mocked_claude(self, tmp_path: Path) -> None:
         """Should run complete secops flow with mocked Claude subprocess."""
-        from dev_sync.core.dispatcher import ClaudeDispatcher
-        from dev_sync.core.github import GitHubCLI
-        from dev_sync.core.state import StateDB
-        from dev_sync.core.worktree import WorktreeManager
-        from dev_sync.pipelines.secops import run_secops_all
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.core.worktree import WorktreeManager
+        from ctrlrelay.pipelines.secops import run_secops_all
 
         db_path = tmp_path / "state.db"
         db = StateDB(db_path)
@@ -2153,8 +2153,8 @@ class TestSecopsIntegration:
                 "outputs": {"merged_prs": [101, 102]},
             }))
 
-            from dev_sync.core.dispatcher import SessionResult
-            from dev_sync.core.checkpoint import read_checkpoint
+            from ctrlrelay.core.dispatcher import SessionResult
+            from ctrlrelay.core.checkpoint import read_checkpoint
             return SessionResult(
                 session_id=kwargs["session_id"],
                 exit_code=0,
@@ -2224,16 +2224,16 @@ EOF
 
 - [ ] **Step 1: Run ruff check**
 
-Run: `ruff check src/dev_sync/core/github.py src/dev_sync/core/worktree.py src/dev_sync/core/dispatcher.py src/dev_sync/dashboard/ src/dev_sync/pipelines/`
+Run: `ruff check src/ctrlrelay/core/github.py src/ctrlrelay/core/worktree.py src/ctrlrelay/core/dispatcher.py src/ctrlrelay/dashboard/ src/ctrlrelay/pipelines/`
 Expected: No errors
 
 - [ ] **Step 2: Fix any linting issues**
 
-Run: `ruff check --fix src/dev_sync/`
+Run: `ruff check --fix src/ctrlrelay/`
 
 - [ ] **Step 3: Run type check**
 
-Run: `pyright src/dev_sync/` or `mypy src/dev_sync/`
+Run: `pyright src/ctrlrelay/` or `mypy src/ctrlrelay/`
 Expected: No errors (or only known issues)
 
 - [ ] **Step 4: Run full test suite**
@@ -2258,22 +2258,22 @@ git commit -m "chore: fix linting and type issues"
 ### Task 11: Update Exports and Documentation
 
 **Files:**
-- Modify: `src/dev_sync/__init__.py`
-- Modify: `src/dev_sync/core/__init__.py`
+- Modify: `src/ctrlrelay/__init__.py`
+- Modify: `src/ctrlrelay/core/__init__.py`
 
 - [ ] **Step 1: Update core module exports**
 
 ```python
-# src/dev_sync/core/__init__.py
-"""Core modules for dev-sync orchestrator."""
+# src/ctrlrelay/core/__init__.py
+"""Core modules for ctrlrelay orchestrator."""
 
-from dev_sync.core import checkpoint
-from dev_sync.core.audit import audit_all, audit_skill, discover_skills
-from dev_sync.core.config import Config, ConfigError, load_config
-from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
-from dev_sync.core.github import GitHubCLI, GitHubError
-from dev_sync.core.state import StateDB
-from dev_sync.core.worktree import WorktreeError, WorktreeManager
+from ctrlrelay.core import checkpoint
+from ctrlrelay.core.audit import audit_all, audit_skill, discover_skills
+from ctrlrelay.core.config import Config, ConfigError, load_config
+from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+from ctrlrelay.core.github import GitHubCLI, GitHubError
+from ctrlrelay.core.state import StateDB
+from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
 
 __all__ = [
     "checkpoint",
@@ -2295,13 +2295,13 @@ __all__ = [
 
 - [ ] **Step 2: Run tests to verify exports**
 
-Run: `python -c "from dev_sync.core import ClaudeDispatcher, GitHubCLI, WorktreeManager; print('OK')"`
+Run: `python -c "from ctrlrelay.core import ClaudeDispatcher, GitHubCLI, WorktreeManager; print('OK')"`
 Expected: OK
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add src/dev_sync/core/__init__.py
+git add src/ctrlrelay/core/__init__.py
 git commit -m "$(cat <<'EOF'
 chore: update core module exports
 
@@ -2316,15 +2316,15 @@ EOF
 
 After completing all tasks, verify the phase gate:
 
-- [ ] **Gate 1:** Run `dev-sync run secops --config config/orchestrator.yaml --repo <test-repo>` on a single repo
+- [ ] **Gate 1:** Run `ctrlrelay run secops --config config/orchestrator.yaml --repo <test-repo>` on a single repo
 - [ ] **Gate 2:** Run on 2-3 repos, verify events are logged to state.db
 - [ ] **Gate 3:** Verify dashboard client queues events when server unavailable (disconnect network, run secops, check queue file)
 
 ```bash
 # Test commands
-dev-sync run secops --config config/orchestrator.yaml --repo owner/repo1
-dev-sync status --config config/orchestrator.yaml
-sqlite3 ~/.dev-sync/state.db "SELECT * FROM sessions WHERE pipeline='secops'"
+ctrlrelay run secops --config config/orchestrator.yaml --repo owner/repo1
+ctrlrelay status --config config/orchestrator.yaml
+sqlite3 ~/.ctrlrelay/state.db "SELECT * FROM sessions WHERE pipeline='secops'"
 ```
 
 Expected: Sessions recorded, events queued or sent, no errors.

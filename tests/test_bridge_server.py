@@ -21,7 +21,7 @@ class TestBridgeServer:
     @pytest.mark.asyncio
     async def test_creates_socket_file(self, socket_path) -> None:
         """Server should create socket file."""
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())
@@ -35,7 +35,7 @@ class TestBridgeServer:
     @pytest.mark.asyncio
     async def test_socket_permissions(self, socket_path) -> None:
         """Socket should have 0600 permissions."""
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())
@@ -50,13 +50,13 @@ class TestBridgeServer:
     @pytest.mark.asyncio
     async def test_handles_ping_pong(self, socket_path) -> None:
         """Server should respond to ping with pong."""
-        from dev_sync.bridge.protocol import (
+        from ctrlrelay.bridge.protocol import (
             BridgeMessage,
             BridgeOp,
             parse_message,
             serialize_message,
         )
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())
@@ -79,7 +79,7 @@ class TestBridgeServer:
     @pytest.mark.asyncio
     async def test_cleans_up_socket_on_stop(self, socket_path) -> None:
         """Server should remove socket file on stop."""
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())
@@ -97,13 +97,13 @@ class TestBridgeServer:
         incoming Telegram reply routes back to the same client as ANSWER."""
         from unittest.mock import AsyncMock
 
-        from dev_sync.bridge.protocol import (
+        from ctrlrelay.bridge.protocol import (
             BridgeMessage,
             BridgeOp,
             parse_message,
             serialize_message,
         )
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())
@@ -153,10 +153,10 @@ class TestBridgeServer:
         telegram_msg_id rather than falling back to FIFO order."""
         from unittest.mock import AsyncMock
 
-        from dev_sync.bridge.protocol import (
+        from ctrlrelay.bridge.protocol import (
             BridgeMessage, BridgeOp, parse_message, serialize_message,
         )
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())
@@ -197,10 +197,10 @@ class TestBridgeServer:
         so we don't try to deliver ANSWER to a dead socket."""
         from unittest.mock import AsyncMock
 
-        from dev_sync.bridge.protocol import (
+        from ctrlrelay.bridge.protocol import (
             BridgeMessage, BridgeOp, serialize_message, parse_message,
         )
-        from dev_sync.bridge.server import BridgeServer
+        from ctrlrelay.bridge.server import BridgeServer
 
         server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
         task = asyncio.create_task(server.start())

@@ -9,7 +9,7 @@ permalink: /reference/plans/
 
 # Implementation plans
 
-Phase-by-phase plans for building dev-sync. Each plan is written so an agentic
+Phase-by-phase plans for building ctrlrelay. Each plan is written so an agentic
 worker (via the `superpowers:executing-plans` or
 `superpowers:subagent-driven-development` skill) can execute it task-by-task.
 

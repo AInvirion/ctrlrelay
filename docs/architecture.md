@@ -8,7 +8,7 @@ permalink: /architecture/
 
 # Architecture
 
-This page is for people working _on_ dev-sync, not just _with_ it. For an
+This page is for people working _on_ ctrlrelay, not just _with_ it. For an
 operator-level view of the BLOCKED protocol see
 [Feedback loop]({{ '/feedback-loop/' | relative_url }}).
 
@@ -17,14 +17,14 @@ operator-level view of the BLOCKED protocol see
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │  CLI / daemons                                                         │
-│  src/dev_sync/cli.py        (Typer app, subcommand groups)             │
-│  src/dev_sync/bridge/__main__.py (bridge daemon entry point)           │
+│  src/ctrlrelay/cli.py        (Typer app, subcommand groups)             │
+│  src/ctrlrelay/bridge/__main__.py (bridge daemon entry point)           │
 └──────────────┬─────────────────────────┬───────────────────────────────┘
                │                         │
                ▼                         ▼
 ┌──────────────────────────┐    ┌──────────────────────────┐
 │  Pipelines               │    │  Bridge                  │
-│  src/dev_sync/pipelines/ │    │  src/dev_sync/bridge/    │
+│  src/ctrlrelay/pipelines/ │    │  src/ctrlrelay/bridge/    │
 │   - dev.py               │    │   - server.py            │
 │   - secops.py            │    │   - protocol.py          │
 │   - post_merge.py        │    │   - telegram_handler.py  │
@@ -34,7 +34,7 @@ operator-level view of the BLOCKED protocol see
                ▼
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Core                                                                  │
-│  src/dev_sync/core/                                                    │
+│  src/ctrlrelay/core/                                                    │
 │  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐           │
 │  │ Dispatcher │ │ Worktree   │ │ GitHub CLI │ │ Checkpoint │           │
 │  │ (claude -p)│ │ Manager    │ │ wrapper    │ │ protocol   │           │
@@ -47,7 +47,7 @@ operator-level view of the BLOCKED protocol see
                                      ▲
 ┌────────────────────────────────────┴───────────────────────────────────┐
 │  Transports (pluggable)            Dashboard (optional, push-only)      │
-│  src/dev_sync/transports/          src/dev_sync/dashboard/              │
+│  src/ctrlrelay/transports/          src/ctrlrelay/dashboard/              │
 │   - SocketTransport (telegram)      - DashboardClient                  │
 │   - FileMockTransport (tests)                                           │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -61,13 +61,13 @@ pipeline work.
 ## Dispatcher ↔ Claude interaction
 
 `ClaudeDispatcher` (in
-[`src/dev_sync/core/dispatcher.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/core/dispatcher.py))
-is the only place dev-sync calls out to Claude Code.
+[`src/ctrlrelay/core/dispatcher.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/dispatcher.py))
+is the only place ctrlrelay calls out to Claude Code.
 
 - **Spawn shape:** `claude -p <prompt> --output-format json --dangerously-skip-permissions [--resume <session_id>]`.
 - **Working directory:** the session's worktree (so file edits land on the
   right branch).
-- **Environment additions:** `DEV_SYNC_SESSION_ID` and `DEV_SYNC_STATE_FILE`
+- **Environment additions:** `CTRLRELAY_SESSION_ID` and `CTRLRELAY_STATE_FILE`
   are the only contract between dispatcher and child. Anything else the agent
   needs (issue body, PR rules, etc.) goes into the prompt.
 - **Result:** `SessionResult(session_id, exit_code, state, stdout, stderr)`.
@@ -75,7 +75,7 @@ is the only place dev-sync calls out to Claude Code.
   `None`. The wrapper exposes `.success`, `.blocked`, `.failed` properties for
   pattern-matching pipelines.
 - **Resume:** `resume_session_id` translates to `--resume <id>`, which has
-  Claude rejoin the same conversation history. dev-sync sets the resume id to
+  Claude rejoin the same conversation history. ctrlrelay sets the resume id to
   the same session id it spawned with, so a single dev-pipeline session can
   span many `BLOCKED → answer → resume` round-trips.
 
@@ -85,7 +85,7 @@ same way you'd shell out to `gh` or `git`. This is deliberate.
 ## State DB shape
 
 Schema in
-[`src/dev_sync/core/state.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/core/state.py).
+[`src/ctrlrelay/core/state.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/state.py).
 SQLite, single file at `paths.state_db`.
 
 | Table | Columns | Notes |
@@ -103,7 +103,7 @@ for the `sessions` table on purpose — kept thin and grep-able.
 ## Worktree lifecycle
 
 `WorktreeManager` (in
-[`src/dev_sync/core/worktree.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/core/worktree.py))
+[`src/ctrlrelay/core/worktree.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/worktree.py))
 is a thin wrapper over `git worktree`. Conventions:
 
 - **Bare repo path:** `<paths.bare_repos>/<owner>-<repo>.git`. Cloned on first
@@ -131,23 +131,23 @@ holds an open PR from a previous successful session.
 ## PR verifier and post-merge
 
 After a `DONE`-with-`pr_url` checkpoint, the dev pipeline runs
-[`PRVerifier`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/core/pr_verifier.py)
+[`PRVerifier`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/pr_verifier.py)
 to confirm the PR is mergeable and CI is green. If not, it builds a fix prompt
 (merge conflicts → "rebase and resolve", failing checks → "investigate and
 fix"), resumes the same Claude session with that prompt, and re-verifies. Up
 to `DEFAULT_MAX_FIX_ATTEMPTS` (3) attempts.
 
 `PRWatcher` (in
-[`src/dev_sync/core/pr_watcher.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/core/pr_watcher.py))
+[`src/ctrlrelay/core/pr_watcher.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/pr_watcher.py))
 polls a PR for merge status; the post-merge handler in
-[`src/dev_sync/pipelines/post_merge.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/pipelines/post_merge.py)
+[`src/ctrlrelay/pipelines/post_merge.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/pipelines/post_merge.py)
 closes the originating issue and notifies the operator once the PR lands.
 These are not yet wired into the standard dev-pipeline flow; they're available
 for future use.
 
 ## Bridge architecture
 
-The bridge daemon (`dev_sync/bridge/server.py`) listens on a Unix socket
+The bridge daemon (`ctrlrelay/bridge/server.py`) listens on a Unix socket
 (mode `0o600` — owner-only). It speaks newline-delimited JSON, defined in
 `bridge/protocol.py`:
 
@@ -180,10 +180,10 @@ and the session will be marked failed-after-blocked. Restart the bridge
 
 A few decisions worth flagging:
 
-- **Local-first, file-based protocol.** Everything between dev-sync and Claude
+- **Local-first, file-based protocol.** Everything between ctrlrelay and Claude
   is a file under the worktree. No long-lived shared memory, no socket
   contract with the agent. Survives orchestrator restart trivially.
-- **Subprocess-not-library.** `claude` is invoked as a subprocess. dev-sync
+- **Subprocess-not-library.** `claude` is invoked as a subprocess. ctrlrelay
   has no Python coupling to Claude Code's internals — it exchanges a prompt
   in and a JSON file out. Versioning is decoupled.
 - **Per-repo serial, parallel across repos.** Repo locks in SQLite enforce
@@ -198,11 +198,11 @@ A few decisions worth flagging:
 
 ## Where to read next
 
-- [`src/dev_sync/core/config.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/core/config.py)
+- [`src/ctrlrelay/core/config.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/config.py)
   — pydantic schema, the source of truth for the YAML.
-- [`src/dev_sync/pipelines/dev.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/pipelines/dev.py)
+- [`src/ctrlrelay/pipelines/dev.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/pipelines/dev.py)
   — full dev-pipeline orchestration including BLOCKED loop and PR-fix loop.
-- [`src/dev_sync/core/dispatcher.py`](https://github.com/AInvirion/dev-sync/blob/main/src/dev_sync/core/dispatcher.py)
+- [`src/ctrlrelay/core/dispatcher.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/dispatcher.py)
   — the only place we call `claude`.
-- [`tests/`](https://github.com/AInvirion/dev-sync/tree/main/tests) — covers
+- [`tests/`](https://github.com/AInvirion/ctrlrelay/tree/main/tests) — covers
   every public surface; treat tests as executable specifications.
