@@ -39,6 +39,15 @@ class TestDevIntegration:
             "title": "Fix the login bug",
             "body": "Users cannot log in when...",
         }
+        mock_github.get_pr_checks.return_value = [
+            {"name": "ci", "status": "completed", "conclusion": "success"},
+        ]
+        mock_github.get_pr_state.return_value = {
+            "number": 42,
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
 
         # Mock dispatcher
         mock_dispatcher = AsyncMock(spec=ClaudeDispatcher)
