@@ -108,12 +108,101 @@ class WorktreeManager:
         new_branch: str,
         base_branch: str | None = None,
     ) -> Path:
-        """Create a worktree with a new branch."""
+        """Create a worktree for ``new_branch``.
+
+        If ``new_branch`` already exists in the bare repo — e.g. because a
+        previous session for the same issue ran out of fix attempts and left
+        its PR branch pushed to origin — reuse that branch so the retry can
+        iterate on the prior commits instead of hitting
+        ``fatal: a branch named 'fix/issue-N' already exists`` from
+        ``git worktree add -b``. Without this, any issue that exhausts the
+        verify-fix loop once gets permanently wedged until someone manually
+        deletes the branch.
+
+        When we have to fall back to a brand-new branch, it's cut from
+        ``base_branch`` (default: the repo's default branch).
+        """
         bare_path = self._get_bare_repo_path(repo)
         worktree_path = self._get_worktree_path(repo, session_id)
 
         if worktree_path.exists():
             raise WorktreeError(f"Worktree already exists: {worktree_path}")
+
+        if await self.branch_exists_locally(repo, new_branch):
+            # CRITICAL safety: never mutate or delete a branch that's still
+            # checked out by another linked worktree (e.g. a BLOCKED session
+            # that kept its worktree alive on purpose so it can be resumed
+            # when the operator replies). `git update-ref` / `update-ref -d`
+            # don't refuse in that case; they'd leave the live worktree's
+            # HEAD pointing at a stale or missing ref, corrupting the
+            # resumable state. Surface a clean error instead.
+            if await self._branch_is_checked_out_elsewhere(bare_path, new_branch):
+                raise WorktreeError(
+                    f"Branch {new_branch!r} is already checked out in another "
+                    f"worktree of {repo!r}. Resolve with `git worktree list` + "
+                    "`git worktree remove` in the bare repo before retrying."
+                )
+
+            # Remote presence has to be KNOWN to take either sync-to-origin
+            # or stale-merged branches. branch_exists_on_remote is
+            # fail-closed (returns True on timeout/auth error) which is
+            # good for "should I delete this branch" decisions but wrong
+            # here — a transient probe failure would skip the stale-merged
+            # recreate path and resurrect already-merged commits. Use the
+            # strict variant that raises on probe failure; on error we
+            # reuse the local ref unchanged, without mutations.
+            try:
+                on_remote = await self._branch_exists_on_remote_strict(
+                    bare_path, new_branch,
+                )
+            except Exception:
+                await self._run_git(
+                    "worktree", "add",
+                    str(worktree_path),
+                    new_branch,
+                    cwd=bare_path,
+                )
+                return worktree_path
+
+            if on_remote:
+                # Remote exists → sync local to remote head (preserving
+                # unpushed ahead-of-origin commits) and reuse.
+                await self._sync_reused_branch_to_origin(bare_path, new_branch)
+                await self._run_git(
+                    "worktree", "add",
+                    str(worktree_path),
+                    new_branch,
+                    cwd=bare_path,
+                )
+                return worktree_path
+
+            # Local-only (confirmed). Distinguish between:
+            #   (a) stale-merged: the prior PR was merged (any strategy) and
+            #       the remote branch auto-deleted. The local ref's commits
+            #       are all patch-equivalent to commits in the default
+            #       branch. Reusing it would resurrect already-merged
+            #       changes into the next PR — delete + create fresh.
+            #   (b) recoverable unpushed work: the prior session made
+            #       commits locally and died before push. Local has
+            #       content not represented in the default branch — reuse
+            #       so the operator's work isn't silently dropped.
+            if await self._branch_is_fully_merged(repo, new_branch):
+                try:
+                    await self._run_git(
+                        "update-ref", "-d", f"refs/heads/{new_branch}",
+                        cwd=bare_path, timeout=10,
+                    )
+                except Exception:
+                    pass
+                # Fall through to the fresh-branch creation below.
+            else:
+                await self._run_git(
+                    "worktree", "add",
+                    str(worktree_path),
+                    new_branch,
+                    cwd=bare_path,
+                )
+                return worktree_path
 
         if base_branch is None:
             base_branch = await self.get_default_branch(repo)
@@ -126,6 +215,200 @@ class WorktreeManager:
             cwd=bare_path,
         )
         return worktree_path
+
+    async def _sync_reused_branch_to_origin(
+        self, bare_path: Path, branch: str,
+    ) -> None:
+        """Fast-forward the local ``branch`` to origin's head using a
+        scratch ref so it never touches ``refs/heads/<branch>`` except
+        via a safe `update-ref` that's gated by a merge-base ancestor
+        check.
+
+        Bare clones from `git clone --bare` have fetch refspec
+        `+refs/heads/*:refs/heads/*`, so there are NO
+        `refs/remotes/origin/*` tracking refs AND an unscoped
+        `git fetch origin <branch>` would overwrite the live local ref
+        directly — destroying any unpushed local commits before we get
+        to compare. Routing through a scratch ref in
+        `refs/ctrlrelay/sync/*` avoids both problems.
+
+        Rules:
+          - If local is ancestor of the fetched remote tip → fast-forward.
+          - If local is ahead or diverged → leave local alone (ahead
+            contains unpushed work; forcing would destroy it).
+
+        All steps are best-effort: any failure (timeout, network,
+        permissions, bad ref) falls back to reusing the local ref
+        unchanged, so a flaky origin never aborts the retry.
+        """
+        scratch_ref = f"refs/ctrlrelay/sync/{branch}"
+        fetched = False
+        try:
+            await self._run_git(
+                "fetch", "origin",
+                f"+refs/heads/{branch}:{scratch_ref}",
+                cwd=bare_path, timeout=30,
+            )
+            fetched = True
+        except Exception:
+            return
+        try:
+            # Distinguish three cases cleanly:
+            #   a) local is ancestor of remote → local behind → fast-forward
+            #   b) remote is ancestor of local → local ahead (unpushed work) → preserve
+            #   c) neither → diverged → raise; caller surfaces as session failure
+            #      so we don't silently reuse a branch that will fail on push.
+            local_behind = False
+            local_ahead = False
+            try:
+                await self._run_git(
+                    "merge-base", "--is-ancestor", branch, scratch_ref,
+                    cwd=bare_path, timeout=10,
+                )
+                local_behind = True
+            except WorktreeError:
+                pass
+            except Exception:
+                # Timeout or other — play safe and preserve local.
+                return
+            if not local_behind:
+                try:
+                    await self._run_git(
+                        "merge-base", "--is-ancestor", scratch_ref, branch,
+                        cwd=bare_path, timeout=10,
+                    )
+                    local_ahead = True
+                except WorktreeError:
+                    pass
+                except Exception:
+                    return
+
+            if local_behind:
+                try:
+                    await self._run_git(
+                        "update-ref", f"refs/heads/{branch}", scratch_ref,
+                        cwd=bare_path, timeout=10,
+                    )
+                except Exception:
+                    pass
+            elif local_ahead:
+                # Preserve local — ahead means unpushed operator work.
+                pass
+            else:
+                # Diverged: local has commits origin doesn't, and origin has
+                # commits local doesn't. Reusing either side silently loses
+                # work or produces non-ff pushes. Surface the conflict so
+                # the session fails cleanly.
+                raise WorktreeError(
+                    f"Local branch {branch!r} has diverged from "
+                    f"origin/{branch}. Rebase or reset manually in the bare "
+                    "repo before retrying."
+                )
+        finally:
+            if fetched:
+                try:
+                    await self._run_git(
+                        "update-ref", "-d", scratch_ref,
+                        cwd=bare_path, timeout=10,
+                    )
+                except Exception:
+                    pass
+
+    async def _branch_exists_on_remote_strict(
+        self, bare_path: Path, branch: str,
+    ) -> bool:
+        """Strict variant of branch_exists_on_remote: True if origin
+        has the branch, False if it does not, RAISES on probe failure.
+
+        The public branch_exists_on_remote is fail-closed (returns True
+        on error) so callers making "safe to delete" decisions err
+        on preservation. That semantic is wrong for the reuse path,
+        where a transient error must NOT be interpreted as "remote
+        exists" — that would skip the stale-merged recreate branch and
+        resurrect already-merged commits into a new PR.
+        """
+        output = await self._run_git(
+            "ls-remote", "--heads", "origin", branch,
+            cwd=bare_path, timeout=10,
+        )
+        return bool(output.strip())
+
+    async def _branch_is_checked_out_elsewhere(
+        self, bare_path: Path, branch: str,
+    ) -> bool:
+        """Return True if ``refs/heads/<branch>`` is currently checked out
+        by any LIVE linked worktree of this bare repo.
+
+        `git worktree list --porcelain` emits a blank-line-separated
+        stanza per worktree. A stanza with a ``prunable <reason>`` line
+        is a stale metadata entry — the worktree directory is gone, we
+        just haven't run ``git worktree prune`` yet. Such stanzas don't
+        represent a real checkout and MUST be ignored here, otherwise a
+        crash between ``shutil.rmtree()`` and ``worktree prune`` wedges
+        the branch for all future retries.
+
+        Conservative (fails closed): if the probe itself errors, returns
+        True — better to refuse mutation than to risk corrupting a live
+        worktree.
+        """
+        try:
+            output = await self._run_git(
+                "worktree", "list", "--porcelain",
+                cwd=bare_path, timeout=10,
+            )
+        except Exception:
+            return True
+
+        target = f"refs/heads/{branch}"
+        current_branch: str | None = None
+        current_prunable = False
+        for raw in output.splitlines() + [""]:  # trailing "" to flush last stanza
+            line = raw.strip()
+            if not line:
+                # End of stanza — check if this one matches and is live.
+                if (
+                    current_branch == target
+                    and not current_prunable
+                ):
+                    return True
+                current_branch = None
+                current_prunable = False
+                continue
+            if line.startswith("branch "):
+                current_branch = line[7:].strip()
+            elif line.startswith("prunable"):
+                current_prunable = True
+        return False
+
+    async def _branch_is_fully_merged(self, repo: str, branch: str) -> bool:
+        """Return True if every commit reachable from ``branch`` is
+        patch-equivalent to something already in the default branch.
+
+        Uses ``git cherry <default> <branch>`` which compares commits
+        by patch-id (content), not by SHA — so this catches squash and
+        rebase merges too, not just regular merge commits.
+
+        Conservative: on any error (unknown default branch, cherry
+        failure) returns False so we preserve the local ref.
+        """
+        bare_path = self._get_bare_repo_path(repo)
+        try:
+            default = await self.get_default_branch(repo)
+        except Exception:
+            return False
+        try:
+            out = await self._run_git(
+                "cherry", default, branch,
+                cwd=bare_path, timeout=15,
+            )
+        except Exception:
+            return False
+        lines = [line for line in out.splitlines() if line.strip()]
+        if not lines:
+            # No commits in branch not in default — fully merged / stale.
+            return True
+        # Each line starts with "+" (unique) or "-" (patch-equivalent in upstream).
+        return all(line.startswith("-") for line in lines)
 
     async def push_branch(self, worktree_path: Path, branch: str) -> None:
         """Push a branch to origin."""
