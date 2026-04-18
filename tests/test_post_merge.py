@@ -245,6 +245,107 @@ class TestPRWatchTask:
         assert factory_call_count == 0
 
     @pytest.mark.asyncio
+    async def test_handle_merge_transient_failure_retries(self, caplog) -> None:
+        """Codex P2: transient `gh issue close` failure at merge time must
+        not abandon the post-merge cleanup. Retry with backoff; after
+        a success, the issue is closed."""
+        import logging
+
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        # First two close_issue attempts fail; third succeeds.
+        close_calls = 0
+
+        async def flaky_close(repo, issue_number, comment):
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls < 3:
+                raise RuntimeError("gh transient at close")
+
+        mock_github.close_issue.side_effect = flaky_close
+
+        async def factory():
+            return AsyncMock()
+
+        # Patch the retry base delay to 0 so the test doesn't sleep.
+        import ctrlrelay.pipelines.post_merge as pm
+        orig = pm._HANDLE_MERGE_RETRY_BASE_DELAY
+        pm._HANDLE_MERGE_RETRY_BASE_DELAY = 0
+        try:
+            with caplog.at_level(logging.INFO, logger="ctrlrelay.pipelines.post_merge"):
+                outcome = await pr_watch_task(
+                    repo="owner/repo",
+                    issue_number=77,
+                    pr_url="",
+                    pr_number=42,
+                    session_id=None,
+                    github=mock_github,
+                    transport_factory=factory,
+                    poll_interval=0,
+                    timeout=5,
+                )
+        finally:
+            pm._HANDLE_MERGE_RETRY_BASE_DELAY = orig
+
+        assert outcome["merged"] is True
+        # close_issue was retried until it succeeded.
+        assert close_calls == 3
+        # At least two retry events logged (the first two failures).
+        retry_events = [
+            r for r in caplog.records
+            if "dev.pr.handle_merge_retry" in r.getMessage()
+        ]
+        assert len(retry_events) == 2
+
+    @pytest.mark.asyncio
+    async def test_handle_merge_exhausts_retries_and_logs_failure(
+        self, caplog
+    ) -> None:
+        """After all retries exhausted, log dev.pr.watch_failed and
+        surface outcome['failed'] so the operator can act."""
+        import logging
+
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+        mock_github.close_issue.side_effect = RuntimeError("permanent auth error")
+
+        async def factory():
+            return AsyncMock()
+
+        import ctrlrelay.pipelines.post_merge as pm
+        orig = pm._HANDLE_MERGE_RETRY_BASE_DELAY
+        pm._HANDLE_MERGE_RETRY_BASE_DELAY = 0
+        try:
+            with caplog.at_level(logging.INFO, logger="ctrlrelay.pipelines.post_merge"):
+                outcome = await pr_watch_task(
+                    repo="owner/repo",
+                    issue_number=77,
+                    pr_url="",
+                    pr_number=42,
+                    session_id=None,
+                    github=mock_github,
+                    transport_factory=factory,
+                    poll_interval=0,
+                    timeout=5,
+                )
+        finally:
+            pm._HANDLE_MERGE_RETRY_BASE_DELAY = orig
+
+        # Task records the failure but doesn't crash.
+        assert outcome["failed"] == "RuntimeError"
+        # All attempts consumed.
+        assert mock_github.close_issue.call_count == pm._HANDLE_MERGE_RETRY_ATTEMPTS
+        # Last event is dev.pr.watch_failed.
+        assert any(
+            "dev.pr.watch_failed" in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_transport_factory_failure_is_non_fatal(self, caplog) -> None:
         """If the transport factory raises, we log and proceed with
         transport=None — the merge detection itself must not depend on

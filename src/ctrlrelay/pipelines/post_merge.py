@@ -20,6 +20,14 @@ _logger = get_logger("pipelines.post_merge")
 # Operators can still override via an explicit `timeout=` argument.
 DEFAULT_PR_WATCH_TIMEOUT = 7 * 24 * 60 * 60
 
+# After a merge is detected, handle_merge can fail transiently on
+# `gh issue close` or the transport.send (network blip, rate limit).
+# Without retry the whole automation is wasted — PR merged, issue
+# stays open forever. Retry with modest backoff; if all attempts fail,
+# the last failure is logged via dev.pr.watch_failed.
+_HANDLE_MERGE_RETRY_ATTEMPTS = 5
+_HANDLE_MERGE_RETRY_BASE_DELAY = 5  # seconds; doubled each attempt
+
 
 async def handle_merge(
     repo: str,
@@ -66,6 +74,51 @@ async def watch_and_handle_merge(
         return True
 
     return False
+
+
+async def _handle_merge_with_retry(
+    *,
+    repo: str,
+    pr_number: int,
+    issue_number: int,
+    github: GitHubCLI,
+    transport: Transport | None,
+    session_id: str | None,
+) -> None:
+    """Run handle_merge with exponential-backoff retry so a transient
+    gh / transport failure at merge time doesn't waste the whole watch.
+
+    On final exhaustion, raise the last exception; pr_watch_task's
+    outer handler logs it as dev.pr.watch_failed.
+    """
+    last_exc: Exception | None = None
+    delay = _HANDLE_MERGE_RETRY_BASE_DELAY
+    for attempt in range(1, _HANDLE_MERGE_RETRY_ATTEMPTS + 1):
+        try:
+            await handle_merge(
+                repo=repo, pr_number=pr_number,
+                issue_number=issue_number, github=github,
+                transport=transport,
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last_exc = e
+            log_event(
+                _logger, "dev.pr.handle_merge_retry",
+                session_id=session_id, repo=repo,
+                issue_number=issue_number, pr_number=pr_number,
+                attempt=attempt,
+                max_attempts=_HANDLE_MERGE_RETRY_ATTEMPTS,
+                reason=type(e).__name__, error=str(e)[:200],
+            )
+            if attempt >= _HANDLE_MERGE_RETRY_ATTEMPTS:
+                break
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)  # cap at 5 min
+    assert last_exc is not None
+    raise last_exc
 
 
 async def pr_watch_task(
@@ -128,10 +181,10 @@ async def pr_watch_task(
                     )
                     transport = None
             try:
-                await handle_merge(
+                await _handle_merge_with_retry(
                     repo=repo, pr_number=pr_number,
                     issue_number=issue_number, github=github,
-                    transport=transport,
+                    transport=transport, session_id=session_id,
                 )
             finally:
                 if transport is not None:

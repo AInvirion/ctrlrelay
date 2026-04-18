@@ -881,11 +881,13 @@ def poller_start(
                         )
 
                 # If the dev pipeline opened a PR, spawn a background
-                # watcher that fires a Telegram notification + closes
-                # the issue when the reviewer merges. Fire-and-forget;
-                # task is tracked in pr_watch_tasks so it's not GC'd.
-                pr_number_raw = result.outputs.get("pr_number") if result.success else None
-                pr_url_str = result.outputs.get("pr_url", "") if result.success else ""
+                # watcher regardless of terminal status — run_dev_issue
+                # preserves `pr_number` in outputs even on BLOCKED/FAILED
+                # paths where verification gave up but the PR is still
+                # live on origin. Watching those too means a human-
+                # completed merge still auto-closes the issue.
+                pr_number_raw = result.outputs.get("pr_number")
+                pr_url_str = result.outputs.get("pr_url", "")
                 if pr_number_raw is not None:
                     try:
                         pr_number = int(pr_number_raw)
