@@ -15,6 +15,9 @@ from dev_sync.bridge.protocol import (
     serialize_message,
 )
 from dev_sync.bridge.telegram_handler import TelegramHandler
+from dev_sync.core.obs import get_logger, hash_text, log_event
+
+_logger = get_logger("bridge.server")
 
 
 class BridgeServer:
@@ -115,7 +118,22 @@ class BridgeServer:
         if msg.op == BridgeOp.ASK:
             try:
                 assert self._telegram is not None
-                msg_id = await self._telegram.ask(msg.question or "", options=msg.options)
+                question = msg.question or ""
+                log_event(
+                    _logger,
+                    "dev.question.posted",
+                    session_id=msg.session_id,
+                    repo=msg.repo,
+                    issue_number=msg.issue_number,
+                    transport="telegram",
+                    destination=f"telegram:chat={self.chat_id}",
+                    request_id=msg.request_id,
+                    question=question,
+                    question_length=len(question),
+                    question_hash=hash_text(question),
+                    options=msg.options,
+                )
+                msg_id = await self._telegram.ask(question, options=msg.options)
                 if msg.request_id:
                     self._pending_questions[msg.request_id] = msg_id
                 return BridgeMessage(op=BridgeOp.ACK, request_id=msg.request_id, status="pending")

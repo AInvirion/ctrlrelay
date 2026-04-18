@@ -11,11 +11,14 @@ from typing import Any
 from dev_sync.core.checkpoint import CheckpointStatus
 from dev_sync.core.dispatcher import ClaudeDispatcher, SessionResult
 from dev_sync.core.github import GitHubCLI
+from dev_sync.core.obs import get_logger, hash_text, log_event
 from dev_sync.core.state import StateDB
 from dev_sync.core.worktree import WorktreeManager
 from dev_sync.dashboard.client import DashboardClient, EventPayload
 from dev_sync.pipelines.base import PipelineContext, PipelineResult
 from dev_sync.transports.base import Transport
+
+_logger = get_logger("pipeline.dev")
 
 
 @dataclass
@@ -47,6 +50,18 @@ class DevPipeline:
     async def resume(self, ctx: PipelineContext, answer: str) -> PipelineResult:
         """Resume blocked dev session with user answer."""
         prompt = f"User answered: {answer}\n\nContinue from where you left off."
+
+        log_event(
+            _logger,
+            "dev.session.resumed",
+            session_id=ctx.session_id,
+            repo=ctx.repo,
+            issue_number=ctx.issue_number,
+            pipeline=self.name,
+            resume_session_id=ctx.session_id,
+            answer_length=len(answer),
+            answer_hash=hash_text(answer),
+        )
 
         result = await self.dispatcher.spawn_session(
             session_id=ctx.session_id,

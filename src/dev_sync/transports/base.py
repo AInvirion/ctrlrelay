@@ -11,9 +11,21 @@ class TransportError(Exception):
 
 @runtime_checkable
 class Transport(Protocol):
-    """Protocol for orchestrator-to-human communication."""
+    """Protocol for orchestrator-to-human communication.
 
-    async def send(self, message: str) -> None:
+    Implementations accept optional correlation kwargs (``session_id``,
+    ``repo``, ``issue_number``) used solely for structured logging — they are
+    never part of the wire payload.
+    """
+
+    async def send(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+        repo: str | None = None,
+        issue_number: int | None = None,
+    ) -> None:
         """Send a one-way message (no response expected)."""
         ...
 
@@ -22,6 +34,10 @@ class Transport(Protocol):
         question: str,
         options: list[str] | None = None,
         timeout: int = 300,
+        *,
+        session_id: str | None = None,
+        repo: str | None = None,
+        issue_number: int | None = None,
     ) -> str:
         """Ask a question and wait for response."""
         ...
