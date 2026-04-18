@@ -124,14 +124,27 @@ dev-sync poller status
 dev-sync poller stop
 ```
 
-### Session Commands
+### Bridge Commands (Telegram)
 
 ```bash
-# List recent sessions
-dev-sync sessions list
+# Start the Telegram bridge
+dev-sync bridge start [--daemon]
 
-# Resume a blocked session
-dev-sync sessions resume <session-id> --answer "your answer"
+# Check bridge status
+dev-sync bridge status
+
+# Send a test message
+dev-sync bridge test -m "Hello from dev-sync!"
+
+# Stop the bridge
+dev-sync bridge stop
+```
+
+### Status Commands
+
+```bash
+# Show orchestrator status and recent sessions
+dev-sync status
 ```
 
 ### Config Sync Commands
@@ -236,6 +249,23 @@ repos:
 | `ask` | Send notification, wait for approval |
 | `never` | Skip entirely |
 
+### Telegram Setup
+
+1. Create a bot via [@BotFather](https://t.me/botfather) and get the token
+2. Message your bot to initialize the chat
+3. Get your chat ID: `curl "https://api.telegram.org/bot<TOKEN>/getUpdates"`
+4. Configure:
+```yaml
+transport:
+  type: telegram
+  telegram:
+    bot_token_env: "DEV_SYNC_TELEGRAM_TOKEN"
+    chat_id: YOUR_CHAT_ID
+    socket_path: "~/.dev-sync/dev-sync.sock"
+```
+5. Set the environment variable: `export DEV_SYNC_TELEGRAM_TOKEN="your-token"`
+6. Start the bridge: `dev-sync bridge start --daemon`
+
 ## Development
 
 ```bash
@@ -258,7 +288,7 @@ pytest tests/test_dev_pipeline.py -v
 - [x] Phase 2: Claude dispatcher and checkpoint protocol
 - [x] Phase 3: Secops pipeline
 - [x] Phase 4: Dev pipeline (issue-to-PR)
-- [ ] Phase 5: Telegram integration (human-in-the-loop)
+- [x] Phase 5: Telegram integration (human-in-the-loop)
 - [ ] Phase 6: Dashboard integration
 - [ ] Phase 7: Deploy-verify pipeline
 
