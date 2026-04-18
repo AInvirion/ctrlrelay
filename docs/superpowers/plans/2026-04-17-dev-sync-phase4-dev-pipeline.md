@@ -745,6 +745,7 @@ Expected: FAIL with "No module named 'dev_sync.pipelines.dev'"
 
 - [ ] **Step 3: Create dev pipeline skeleton**
 
+{% raw %}
 ```python
 # src/dev_sync/pipelines/dev.py
 """Dev pipeline for issue-to-PR workflow."""
@@ -876,6 +877,7 @@ Use checkpoint.failed() if something goes wrong."""
             error=result.state.error,
         )
 ```
+{% endraw %}
 
 - [ ] **Step 4: Run test to verify it passes**
 
