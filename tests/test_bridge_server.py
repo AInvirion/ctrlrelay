@@ -225,3 +225,59 @@ class TestBridgeServer:
 
         await server.stop()
         task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_during_response_write_is_silent(
+        self, socket_path, caplog,
+    ) -> None:
+        """Race: the client closes the socket right after sending a request
+        but before the bridge finishes flushing the ACK. The bridge used to
+        propagate ConnectionResetError from writer.drain() as an unhandled
+        exception into bridge.error.log. After the fix it must be swallowed
+        quietly (DEBUG-level at most)."""
+        import logging
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import (
+            BridgeMessage, BridgeOp, serialize_message,
+        )
+        from ctrlrelay.bridge.server import BridgeServer
+
+        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+
+        # Make the telegram call slow enough that we can close the client
+        # before the bridge finishes the response write.
+        async def slow_ask(*args, **kwargs):
+            await asyncio.sleep(0.1)
+            return 42
+        server._telegram.ask = AsyncMock(side_effect=slow_ask)  # type: ignore[attr-defined]
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        writer.write(serialize_message(BridgeMessage(
+            op=BridgeOp.ASK, request_id="r-race", question="?",
+        )).encode())
+        await writer.drain()
+
+        # Close immediately — race the bridge's write-back path.
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        # Give the server a moment to try to flush the response and observe
+        # the disconnect, THEN shutdown.
+        with caplog.at_level(logging.ERROR, logger="asyncio"), \
+             caplog.at_level(logging.ERROR, logger="ctrlrelay.bridge.server"):
+            await asyncio.sleep(0.3)
+            await server.stop()
+            task.cancel()
+
+        # Must not have logged an unhandled ERROR-level traceback.
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not errors, (
+            f"bridge logged ERROR records during client-disconnect race: "
+            f"{[r.getMessage() for r in errors]}"
+        )
