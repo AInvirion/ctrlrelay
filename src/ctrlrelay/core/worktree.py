@@ -233,21 +233,57 @@ class WorktreeManager:
         except Exception:
             return
         try:
+            # Distinguish three cases cleanly:
+            #   a) local is ancestor of remote → local behind → fast-forward
+            #   b) remote is ancestor of local → local ahead (unpushed work) → preserve
+            #   c) neither → diverged → raise; caller surfaces as session failure
+            #      so we don't silently reuse a branch that will fail on push.
+            local_behind = False
+            local_ahead = False
             try:
                 await self._run_git(
                     "merge-base", "--is-ancestor", branch, scratch_ref,
                     cwd=bare_path, timeout=10,
                 )
-            except Exception:
-                # Local ahead / diverged / error — preserve local.
-                return
-            try:
-                await self._run_git(
-                    "update-ref", f"refs/heads/{branch}", scratch_ref,
-                    cwd=bare_path, timeout=10,
-                )
-            except Exception:
+                local_behind = True
+            except WorktreeError:
                 pass
+            except Exception:
+                # Timeout or other — play safe and preserve local.
+                return
+            if not local_behind:
+                try:
+                    await self._run_git(
+                        "merge-base", "--is-ancestor", scratch_ref, branch,
+                        cwd=bare_path, timeout=10,
+                    )
+                    local_ahead = True
+                except WorktreeError:
+                    pass
+                except Exception:
+                    return
+
+            if local_behind:
+                try:
+                    await self._run_git(
+                        "update-ref", f"refs/heads/{branch}", scratch_ref,
+                        cwd=bare_path, timeout=10,
+                    )
+                except Exception:
+                    pass
+            elif local_ahead:
+                # Preserve local — ahead means unpushed operator work.
+                pass
+            else:
+                # Diverged: local has commits origin doesn't, and origin has
+                # commits local doesn't. Reusing either side silently loses
+                # work or produces non-ff pushes. Surface the conflict so
+                # the session fails cleanly.
+                raise WorktreeError(
+                    f"Local branch {branch!r} has diverged from "
+                    f"origin/{branch}. Rebase or reset manually in the bare "
+                    "repo before retrying."
+                )
         finally:
             if fetched:
                 try:

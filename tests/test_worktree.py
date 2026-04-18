@@ -213,14 +213,16 @@ class TestWorktreeManager:
         bare.mkdir(parents=True)
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            # Ancestor check FAILS — local ahead/diverged. Cleanup of the
-            # scratch ref still runs via the helper's finally block.
+            # First merge-base check (local→remote) fails: local NOT ancestor.
+            # Second check (remote→local) SUCCEEDS: remote is ancestor of
+            # local, meaning local is strictly ahead. Preserve local.
             mock_git.side_effect = [
                 "",                                  # show-ref
-                "",                                  # worktree list --porcelain (no other checkouts)
+                "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-9\n",     # ls-remote
                 "",                                  # fetch into scratch
-                WorktreeError("not an ancestor"),    # merge-base --is-ancestor
+                WorktreeError("not an ancestor"),    # merge-base local→scratch
+                "",                                  # merge-base scratch→local (ok → ahead)
                 "",                                  # update-ref -d scratch (finally)
                 "",                                  # worktree add (reuse as-is)
             ]
@@ -243,6 +245,46 @@ class TestWorktreeManager:
             "reuse must not update refs/heads/<branch> when local is ahead "
             "(would destroy unpushed commits)"
         )
+
+    @pytest.mark.asyncio
+    async def test_reuse_raises_on_diverged_branches(self, tmp_path: Path) -> None:
+        """Codex P2: if local has commits origin doesn't, AND origin has
+        commits local doesn't (true divergence), silently reusing either
+        side would lose commits or produce a non-fast-forward push. Surface
+        the conflict as a WorktreeError so the session fails cleanly."""
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            # Both ancestor checks fail → diverged.
+            mock_git.side_effect = [
+                "",                                  # show-ref
+                "",                                  # worktree list --porcelain
+                "abc\trefs/heads/fix/issue-3\n",     # ls-remote
+                "",                                  # fetch scratch
+                WorktreeError("not an ancestor"),    # merge-base local→scratch
+                WorktreeError("not an ancestor"),    # merge-base scratch→local
+                "",                                  # update-ref -d scratch (finally)
+            ]
+            with pytest.raises(WorktreeError, match="diverged"):
+                await manager.create_worktree_with_new_branch(
+                    repo="owner/repo",
+                    session_id="retry-diverged",
+                    new_branch="fix/issue-3",
+                )
+
+        # Worktree add must NOT have been attempted.
+        worktree_add_calls = [
+            c for c in mock_git.call_args_list
+            if "worktree" in c[0] and "add" in c[0]
+        ]
+        assert worktree_add_calls == []
 
     @pytest.mark.asyncio
     async def test_reuse_survives_fetch_timeout(self, tmp_path: Path) -> None:
