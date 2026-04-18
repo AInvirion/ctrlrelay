@@ -11,6 +11,16 @@ from ctrlrelay.core.obs import get_logger, log_event
 
 _logger = get_logger("core.pr_watcher")
 
+# After this many CONSECUTIVE transient failures we give up on the watch.
+# gh can raise "transient-looking" errors (GitHubError, TimeoutError,
+# OSError) for permanent problems too — bad repo, expired auth,
+# permission change, missing gh binary. Without a cap, those would
+# silently loop for the full 7-day timeout and never surface the
+# problem. 10 × poll_interval is enough to cover a reasonable network
+# blip (several minutes on 60s polls) while still failing fast on a
+# genuinely stuck watch.
+_TRANSIENT_FAILURE_CAP = 10
+
 
 @dataclass
 class PRWatcher:
@@ -59,22 +69,37 @@ class PRWatcher:
         clean shutdown propagates.
         """
         elapsed = 0
+        consecutive_failures = 0
         while elapsed < timeout:
             try:
                 if await self.check_merged(repo, pr_number):
                     return True
+                consecutive_failures = 0  # successful poll resets the counter
             except asyncio.CancelledError:
                 raise
             except (GitHubError, TimeoutError, OSError) as e:
+                consecutive_failures += 1
                 log_event(
                     _logger, "pr_watch.transient_error",
                     repo=repo, pr_number=pr_number,
                     reason=type(e).__name__,
                     error=str(e)[:200],
                     elapsed=elapsed,
+                    consecutive_failures=consecutive_failures,
                 )
-                # Fall through to the sleep + retry; don't count this
-                # as a successful poll in any way.
+                if consecutive_failures >= _TRANSIENT_FAILURE_CAP:
+                    # Likely permanent: bad repo, expired auth, 404,
+                    # missing gh binary. Fail fast instead of zombie-
+                    # sleeping for 7 days.
+                    log_event(
+                        _logger, "pr_watch.abandoned_after_too_many_errors",
+                        repo=repo, pr_number=pr_number,
+                        consecutive_failures=consecutive_failures,
+                        last_reason=type(e).__name__,
+                        last_error=str(e)[:200],
+                    )
+                    raise
+                # Fall through to the sleep + retry.
 
             if on_poll:
                 try:
