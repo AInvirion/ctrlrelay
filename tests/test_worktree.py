@@ -129,16 +129,19 @@ class TestWorktreeManager:
         bare.mkdir(parents=True)
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            # Reuse path happy-case: local behind origin, fast-forward to origin.
-            #  show-ref (exists) → ls-remote (on origin) → fetch origin <branch>
-            #    → merge-base --is-ancestor (exit 0, local behind)
-            #    → branch -f <branch> origin/<branch> → worktree add
+            # Reuse happy-case: local behind origin, fast-forward via scratch ref.
+            #  show-ref → ls-remote (on origin) →
+            #  fetch +refs/heads/<b>:refs/ctrlrelay/sync/<b> →
+            #  merge-base --is-ancestor <b> refs/ctrlrelay/sync/<b> (0) →
+            #  update-ref refs/heads/<b> refs/ctrlrelay/sync/<b> →
+            #  update-ref -d refs/ctrlrelay/sync/<b> → worktree add
             mock_git.side_effect = [
                 "",                                  # show-ref --verify
-                "abc123\trefs/heads/fix/issue-5\n",  # ls-remote --heads origin
-                "",                                  # fetch origin fix/issue-5
+                "abc\trefs/heads/fix/issue-5\n",     # ls-remote --heads origin
+                "",                                  # fetch into scratch
                 "",                                  # merge-base --is-ancestor (ok)
-                "",                                  # branch -f
+                "",                                  # update-ref refs/heads/...
+                "",                                  # update-ref -d scratch
                 "",                                  # worktree add
             ]
 
@@ -149,29 +152,38 @@ class TestWorktreeManager:
             )
 
         assert "retry-1" in str(wt)
-        # Fetched the specific branch to refresh the tracking ref.
-        fetch_calls = [
-            c for c in mock_git.call_args_list
-            if "fetch" in c[0] and "origin" in c[0]
-        ]
-        assert any("fix/issue-5" in c[0] for c in fetch_calls), (
-            f"expected `git fetch origin fix/issue-5`; got {fetch_calls}"
-        )
-        # Ancestor-check ran before any force-update.
+
+        # Fetch goes into the dedicated scratch ref, NOT overwriting refs/heads.
+        fetch_calls = [c for c in mock_git.call_args_list if "fetch" in c[0]]
+        assert len(fetch_calls) == 1
+        fargs = fetch_calls[0][0]
+        assert "origin" in fargs
+        refspec = [a for a in fargs if ":" in a and "refs/" in a]
+        assert refspec, f"expected a refs/... refspec in fetch; got {fargs}"
+        assert "refs/ctrlrelay/sync/fix/issue-5" in refspec[0]
+
+        # Ancestor check compares local branch against scratch ref.
         ancestor_calls = [
             c for c in mock_git.call_args_list
             if "merge-base" in c[0] and "--is-ancestor" in c[0]
         ]
         assert len(ancestor_calls) == 1
-        # branch -f happened (fast-forward was safe).
-        branch_f_calls = [
-            c for c in mock_git.call_args_list
-            if "branch" in c[0] and "-f" in c[0]
-        ]
-        assert len(branch_f_calls) == 1
-        bf_args = branch_f_calls[0][0]
-        assert "fix/issue-5" in bf_args
-        assert "origin/fix/issue-5" in bf_args
+        assert "refs/ctrlrelay/sync/fix/issue-5" in ancestor_calls[0][0]
+
+        # Fast-forward via update-ref (NOT branch -f origin/...).
+        update_calls = [c for c in mock_git.call_args_list if "update-ref" in c[0]]
+        assert any(
+            "refs/heads/fix/issue-5" in c[0] and "refs/ctrlrelay/sync/fix/issue-5" in c[0]
+            and "-d" not in c[0]
+            for c in update_calls
+        ), f"expected the live-branch update-ref; got {update_calls}"
+
+        # Scratch ref gets cleaned up.
+        assert any(
+            "-d" in c[0] and "refs/ctrlrelay/sync/fix/issue-5" in c[0]
+            for c in update_calls
+        ), f"expected cleanup of scratch ref; got {update_calls}"
+
         # worktree add without -b.
         worktree_add_calls = [
             c for c in mock_git.call_args_list
@@ -188,8 +200,8 @@ class TestWorktreeManager:
     ) -> None:
         """Codex P1: if the prior attempt made commits locally but died
         before pushing, the local branch is AHEAD of origin. The sync MUST
-        NOT `branch -f` over those commits — that's the only copy of the
-        operator's recoverable work."""
+        NOT update refs/heads/<branch> to the remote tip — those commits
+        are the only recoverable copy."""
         from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
 
         manager = WorktreeManager(
@@ -200,12 +212,13 @@ class TestWorktreeManager:
         bare.mkdir(parents=True)
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            # Ancestor check FAILS (non-zero → local is ahead or diverged).
+            # Ancestor check FAILS — local ahead/diverged.
             mock_git.side_effect = [
                 "",                                  # show-ref
                 "abc\trefs/heads/fix/issue-9\n",     # ls-remote
-                "",                                  # fetch origin
+                "",                                  # fetch into scratch
                 WorktreeError("not an ancestor"),    # merge-base --is-ancestor
+                "",                                  # update-ref -d scratch (cleanup)
                 "",                                  # worktree add (reuse as-is)
             ]
 
@@ -216,15 +229,55 @@ class TestWorktreeManager:
             )
 
         assert "retry-ahead" in str(wt)
-        # CRITICAL: no branch -f should have been attempted.
-        branch_f_calls = [
+        # CRITICAL: no update-ref that touches refs/heads/fix/issue-9 ran.
+        refs_heads_updates = [
             c for c in mock_git.call_args_list
-            if "branch" in c[0] and "-f" in c[0]
+            if "update-ref" in c[0]
+            and "refs/heads/fix/issue-9" in c[0]
+            and "-d" not in c[0]
         ]
-        assert branch_f_calls == [], (
-            "reuse must not force-update when local is ahead of origin "
+        assert refs_heads_updates == [], (
+            "reuse must not update refs/heads/<branch> when local is ahead "
             "(would destroy unpushed commits)"
         )
+
+    @pytest.mark.asyncio
+    async def test_reuse_survives_fetch_timeout(self, tmp_path: Path) -> None:
+        """Codex P2: if the sync fetch times out (asyncio.TimeoutError), the
+        retry must still proceed with the local branch as-is rather than
+        failing the whole worktree creation."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        import asyncio as _asyncio
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",                                  # show-ref
+                "abc\trefs/heads/fix/issue-42\n",    # ls-remote
+                _asyncio.TimeoutError(),             # fetch scratch — hangs
+                "",                                  # worktree add (proceed)
+            ]
+
+            wt = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="retry-timeout",
+                new_branch="fix/issue-42",
+            )
+
+        assert "retry-timeout" in str(wt)
+        # Worktree add must still have been called.
+        worktree_add_calls = [
+            c for c in mock_git.call_args_list
+            if "worktree" in c[0] and "add" in c[0]
+        ]
+        assert len(worktree_add_calls) == 1
 
     @pytest.mark.asyncio
     async def test_reuse_when_branch_not_on_remote_skips_sync(

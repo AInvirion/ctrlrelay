@@ -129,47 +129,70 @@ class WorktreeManager:
             raise WorktreeError(f"Worktree already exists: {worktree_path}")
 
         if await self.branch_exists_locally(repo, new_branch):
-            # Sync the local ref to origin/<branch> before checkout so a
-            # retry after an out-of-band push (reviewer commit on the PR,
-            # another machine) starts from the fresh upstream state. Two
-            # safeties matter here:
-            #   1. ensure_bare_repo's earlier `fetch --all` may have run
-            #      seconds or minutes ago; between then and now someone
-            #      could have pushed. Re-fetch this specific branch so
-            #      origin/<branch> really does reflect the remote head.
-            #   2. The local branch may be AHEAD of origin — e.g. the
-            #      prior session committed locally and died before
-            #      `git push`. A blind `branch -f` would rewind those
-            #      commits and destroy the only copy. Only fast-forward
-            #      when the local tip is an ancestor of origin/<branch>;
-            #      if local is ahead or diverged, leave it alone.
+            # Sync the reused branch to the remote head BEFORE checkout so
+            # a retry after an out-of-band push (reviewer commit on the
+            # PR, another machine) starts from the fresh upstream state.
+            # Two constraints drive the shape of this:
+            #
+            #   1. ensure_bare_repo uses plain `git clone --bare`, whose
+            #      default fetch refspec is `+refs/heads/*:refs/heads/*`
+            #      — there are NO `refs/remotes/origin/*` tracking refs,
+            #      and an unscoped `git fetch origin <branch>` would
+            #      OVERWRITE refs/heads/<branch> directly, destroying any
+            #      unpushed local commits. So we fetch into a dedicated
+            #      scratch ref `refs/ctrlrelay/sync/<branch>` that never
+            #      touches the live branch.
+            #   2. If the local branch is AHEAD of origin (prior session
+            #      committed locally but died before push), only
+            #      fast-forward is safe. `merge-base --is-ancestor`
+            #      exit 0 means local is behind/equal — ok to update.
+            #      Non-zero means ahead or diverged — preserve local.
+            #
+            # Everything in this block is best-effort: if any step fails
+            # (network timeout, permissions, invalid ref) we fall back to
+            # reusing the local ref as-is rather than aborting the retry.
             if await self.branch_exists_on_remote(repo, new_branch):
+                scratch_ref = f"refs/ctrlrelay/sync/{new_branch}"
+                fetched = False
                 try:
                     await self._run_git(
-                        "fetch", "origin", new_branch, cwd=bare_path,
-                    )
-                except WorktreeError:
-                    pass
-                try:
-                    # merge-base --is-ancestor exits 0 if local is ancestor
-                    # of origin/<branch> (i.e. behind or equal). Non-zero =
-                    # local is ahead or diverged.
-                    await self._run_git(
-                        "merge-base", "--is-ancestor",
-                        new_branch, f"origin/{new_branch}",
+                        "fetch", "origin",
+                        f"+refs/heads/{new_branch}:{scratch_ref}",
                         cwd=bare_path,
+                        timeout=30,
                     )
-                except WorktreeError:
-                    # Local is ahead or diverged — preserve recoverable
-                    # commits; skip the force-update.
+                    fetched = True
+                except Exception:
                     pass
-                else:
+                if fetched:
                     try:
                         await self._run_git(
-                            "branch", "-f", new_branch, f"origin/{new_branch}",
+                            "merge-base", "--is-ancestor",
+                            new_branch, scratch_ref,
                             cwd=bare_path,
+                            timeout=10,
                         )
-                    except WorktreeError:
+                    except Exception:
+                        # Ahead / diverged / error — preserve local.
+                        pass
+                    else:
+                        try:
+                            await self._run_git(
+                                "update-ref", f"refs/heads/{new_branch}",
+                                scratch_ref,
+                                cwd=bare_path,
+                                timeout=10,
+                            )
+                        except Exception:
+                            pass
+                    # Clean up the scratch ref regardless of outcome.
+                    try:
+                        await self._run_git(
+                            "update-ref", "-d", scratch_ref,
+                            cwd=bare_path,
+                            timeout=10,
+                        )
+                    except Exception:
                         pass
             # Reuse: check out the (possibly-updated) ref into the new worktree.
             await self._run_git(
