@@ -5,8 +5,6 @@ across your GitHub repos. Watches for assigned issues, runs the dev pipeline
 in an isolated git worktree, opens a PR, and asks you on Telegram when it
 gets stuck.
 
-📖 **Docs:** <https://ainvirion.github.io/ctrlrelay/>
-
 ## Install
 
 Requires Python 3.12+, the `claude` CLI, the `gh` CLI, and `git` 2.20+.
