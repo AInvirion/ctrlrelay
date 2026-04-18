@@ -887,6 +887,12 @@ def poller_status(
     raise typer.Exit(1)
 
 
+@app.command("version")
+def version() -> None:
+    """Print the package version."""
+    console.print(__version__)
+
+
 @app.command("status")
 def status(
     config_path: str = typer.Option(
