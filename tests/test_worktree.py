@@ -212,13 +212,14 @@ class TestWorktreeManager:
         bare.mkdir(parents=True)
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            # Ancestor check FAILS — local ahead/diverged.
+            # Ancestor check FAILS — local ahead/diverged. Cleanup of the
+            # scratch ref still runs via the helper's finally block.
             mock_git.side_effect = [
                 "",                                  # show-ref
                 "abc\trefs/heads/fix/issue-9\n",     # ls-remote
                 "",                                  # fetch into scratch
                 WorktreeError("not an ancestor"),    # merge-base --is-ancestor
-                "",                                  # update-ref -d scratch (cleanup)
+                "",                                  # update-ref -d scratch (finally)
                 "",                                  # worktree add (reuse as-is)
             ]
 
@@ -258,6 +259,8 @@ class TestWorktreeManager:
         import asyncio as _asyncio
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            # Fetch raises TimeoutError; helper returns early (no cleanup —
+            # scratch ref was never created).
             mock_git.side_effect = [
                 "",                                  # show-ref
                 "abc\trefs/heads/fix/issue-42\n",    # ls-remote
@@ -280,12 +283,12 @@ class TestWorktreeManager:
         assert len(worktree_add_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_reuse_when_branch_not_on_remote_skips_sync(
+    async def test_local_only_with_unique_commits_is_reused(
         self, tmp_path: Path
     ) -> None:
-        """If the local branch exists but origin has no copy (e.g. a prior
-        session never got as far as pushing), don't attempt the branch -f
-        sync — just reuse the local ref."""
+        """Local-only branch with unique unpushed commits (prior session
+        died before push) must be REUSED, not recreated — otherwise the
+        operator's work is silently dropped."""
         from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
@@ -297,24 +300,128 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
-                "",   # show-ref --verify ok (local branch exists)
-                "",   # ls-remote --heads origin (empty → not on remote)
-                "",   # worktree add (reuse)
+                "",                                      # show-ref (exists)
+                "",                                      # ls-remote (empty, not on remote)
+                "refs/heads/main\n",                     # get_default_branch → symbolic-ref HEAD
+                "+ abc123 unpushed\n+ def456 more\n",    # cherry default branch — all unique
+                "",                                      # worktree add (reuse)
             ]
-
             wt = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
-                session_id="retry-2",
+                session_id="retry-keep",
                 new_branch="fix/issue-9",
             )
 
-        assert "retry-2" in str(wt)
-        # No branch -f should have been called when origin had nothing.
-        branch_f_calls = [
+        assert "retry-keep" in str(wt)
+        # No delete + no fresh-branch creation.
+        delete_calls = [
             c for c in mock_git.call_args_list
-            if "branch" in c[0] and "-f" in c[0]
+            if "update-ref" in c[0] and "-d" in c[0]
         ]
-        assert branch_f_calls == []
+        assert delete_calls == []
+        worktree_add_calls = [
+            c for c in mock_git.call_args_list
+            if "worktree" in c[0] and "add" in c[0]
+        ]
+        assert len(worktree_add_calls) == 1
+        # Reuse path: no -b.
+        assert "-b" not in worktree_add_calls[0][0]
+
+    @pytest.mark.asyncio
+    async def test_local_only_fully_merged_is_deleted_and_recreated(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2: local-only branch whose commits are all already in the
+        default branch (prior PR was merged — any strategy — and the
+        remote was auto-deleted) must NOT be reused. Delete + recreate
+        fresh from default so the next PR doesn't resurrect already-merged
+        changes."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",                                      # show-ref (local exists)
+                "",                                      # ls-remote (empty)
+                "refs/heads/main\n",                     # get_default_branch (1st)
+                "- abc already merged\n- def ditto\n",   # cherry: all "-" (patch-equivalent)
+                "",                                      # update-ref -d refs/heads/<branch>
+                "refs/heads/main\n",                     # get_default_branch (2nd, for fresh path)
+                "",                                      # worktree add -b
+            ]
+            wt = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="rerun-merged",
+                new_branch="fix/issue-7",
+            )
+
+        assert "rerun-merged" in str(wt)
+        # update-ref -d refs/heads/<branch> was called.
+        delete_calls = [
+            c for c in mock_git.call_args_list
+            if "update-ref" in c[0] and "-d" in c[0]
+            and "refs/heads/fix/issue-7" in c[0]
+        ]
+        assert len(delete_calls) == 1
+        # Fresh worktree add with -b.
+        worktree_add_calls = [
+            c for c in mock_git.call_args_list
+            if "worktree" in c[0] and "add" in c[0]
+        ]
+        assert len(worktree_add_calls) == 1
+        args = worktree_add_calls[0][0]
+        assert "-b" in args
+        assert "fix/issue-7" in args
+
+    @pytest.mark.asyncio
+    async def test_local_only_empty_cherry_is_treated_as_merged(
+        self, tmp_path: Path
+    ) -> None:
+        """If `git cherry <default> <branch>` returns empty output, the
+        branch has no commits that aren't in default (branch tip == or
+        ancestor of default). Treat as fully merged → delete + recreate."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",                      # show-ref
+                "",                      # ls-remote
+                "refs/heads/main\n",     # get_default_branch
+                "",                      # cherry: empty
+                "",                      # update-ref -d
+                "refs/heads/main\n",     # get_default_branch (fresh path)
+                "",                      # worktree add -b
+            ]
+            await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="s",
+                new_branch="fix/issue-x",
+            )
+
+        # Path took the stale-merged branch (delete + recreate).
+        delete_calls = [
+            c for c in mock_git.call_args_list
+            if "update-ref" in c[0] and "-d" in c[0]
+        ]
+        assert len(delete_calls) == 1
+        worktree_add_calls = [
+            c for c in mock_git.call_args_list
+            if "worktree" in c[0] and "add" in c[0]
+        ]
+        assert "-b" in worktree_add_calls[0][0]
 
     @pytest.mark.asyncio
     async def test_create_worktree_with_new_branch_uses_default_branch(
