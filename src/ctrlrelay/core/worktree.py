@@ -245,6 +245,19 @@ class WorktreeManager:
             stale_path = await self._find_stale_worktree_path(bare_path, branch)
             if stale_path is None:
                 raise
+            # Only touch stale entries we OWN — under our managed
+            # worktrees_dir. A prunable stanza can also represent a
+            # worktree on a temporarily-unavailable path (network mount,
+            # removable drive); for those, the operator expects the path
+            # to come back. Deleting that admin state would orphan the
+            # worktree permanently. Scope the recovery to our own
+            # worktrees_dir and surface the original error otherwise.
+            try:
+                stale_resolved = Path(stale_path).resolve()
+                wt_root = self.worktrees_dir.resolve()
+                stale_resolved.relative_to(wt_root)
+            except (OSError, ValueError):
+                raise e  # not under our dir — unsafe to recover
             # Locate the admin dir via its canonical `gitdir` pointer,
             # NOT by assuming the path basename matches. Git sanitizes
             # names (`foo bar` → `foo-bar`) and disambiguates duplicates

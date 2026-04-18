@@ -512,6 +512,63 @@ class TestWorktreeManager:
         assert len(add_calls) == 2
 
     @pytest.mark.asyncio
+    async def test_stale_recovery_refuses_paths_outside_managed_worktrees_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P1: a `prunable` stanza can also represent a worktree on
+        a temporarily-unavailable path (network mount, removable drive).
+        The recovery path must only touch stale entries UNDER our
+        managed worktrees_dir; anything else (user-managed path, network
+        mount) is surfaced as the original error so the operator can
+        decide, not silently deleted."""
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        # Stale worktree is claimed under /Volumes/Backup (outside our dir).
+        external_stale_path = "/Volumes/Backup/some-worktree-elsewhere"
+        admin_dir = bare / "worktrees" / "something"
+        admin_dir.mkdir(parents=True)
+        (admin_dir / "gitdir").write_text(f"{external_stale_path}/.git\n")
+
+        stale_porcelain = (
+            f"worktree {external_stale_path}\n"
+            "HEAD abc\n"
+            "branch refs/heads/fix/issue-55\n"
+            "prunable gitdir file points to non-existent location\n"
+            "\n"
+        )
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",                                      # show-ref
+                "",                                      # worktree list (no live)
+                "",                                      # ls-remote
+                "refs/heads/main\n",                     # get_default_branch
+                "+ abc unique\n",                        # cherry
+                WorktreeError(
+                    "fatal: 'fix/issue-55' is already checked out at "
+                    + external_stale_path
+                ),                                       # first add fails
+                stale_porcelain,                         # porcelain probe
+            ]
+            with pytest.raises(WorktreeError, match="already checked out"):
+                await manager.create_worktree_with_new_branch(
+                    repo="owner/repo",
+                    session_id="retry-external-path",
+                    new_branch="fix/issue-55",
+                )
+
+        # Admin dir MUST NOT have been removed (could be on a mount that
+        # comes back later).
+        assert admin_dir.exists()
+
+    @pytest.mark.asyncio
     async def test_prunable_worktree_stanza_does_not_block_reuse(
         self, tmp_path: Path
     ) -> None:
