@@ -2,6 +2,7 @@
 title: Phase 2 — Telegram Bridge
 layout: default
 parent: Plans
+grand_parent: Design & history
 nav_order: 3
 ---
 

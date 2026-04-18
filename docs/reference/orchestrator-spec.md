@@ -1,7 +1,9 @@
 ---
-title: Orchestrator Build Spec
+title: Orchestrator build spec
 layout: default
-nav_order: 3
+parent: Design & history
+nav_order: 1
+permalink: /reference/orchestrator-spec/
 ---
 
 # dev-sync Orchestrator — Build Spec

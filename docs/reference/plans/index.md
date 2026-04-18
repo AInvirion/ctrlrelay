@@ -1,9 +1,10 @@
 ---
 title: Plans
 layout: default
-nav_order: 4
+parent: Design & history
+nav_order: 3
 has_children: true
-permalink: /superpowers/plans/
+permalink: /reference/plans/
 ---
 
 # Implementation plans
