@@ -3,6 +3,7 @@ title: Phase 0 — Package Skeleton
 layout: default
 parent: Plans
 nav_order: 1
+render_with_liquid: false
 ---
 
 # dev-sync Phase 0: Package Skeleton

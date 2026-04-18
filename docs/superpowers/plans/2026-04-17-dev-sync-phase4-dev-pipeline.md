@@ -3,6 +3,7 @@ title: Phase 4 — Dev Pipeline
 layout: default
 parent: Plans
 nav_order: 5
+render_with_liquid: false
 ---
 
 # Phase 4: Dev Pipeline Implementation Plan
