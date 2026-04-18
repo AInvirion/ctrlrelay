@@ -81,17 +81,41 @@ class DevPipeline:
 Execute the following workflow:
 
 1. Validate the issue still applies to the current codebase
-2. If anything is unclear, use checkpoint.blocked() to ask for clarification
-3. Run /superpowers to plan and implement the fix using TDD
-4. Run codex review and address any feedback
-5. Push the branch and open a PR that references the issue
-6. Use checkpoint.done() with the PR URL in outputs["pr_url"]
+2. If anything is unclear, signal BLOCKED (see below) to ask for clarification
+3. Plan and implement the fix using TDD
+4. Push the branch and open a PR that references the issue
+5. Signal DONE with the PR URL
 
 Do NOT merge the PR - wait for human review.
 
-Use checkpoint.done() with outputs={{"pr_url": "...", "pr_number": N}} when PR is opened.
-Use checkpoint.blocked() if you need human input.
-Use checkpoint.failed() if something goes wrong."""
+## Signaling Completion
+
+Signal completion by writing JSON to $DEV_SYNC_STATE_FILE. Examples:
+
+**DONE** (PR opened):
+```bash
+printf '{{"version":"1","status":"DONE","session_id":"%s",\\
+"timestamp":"%s","summary":"PR opened",\\
+"outputs":{{"pr_url":"%s","pr_number":%d}}}}' \\
+  "$DEV_SYNC_SESSION_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
+  "https://github.com/owner/repo/pull/42" 42 > "$DEV_SYNC_STATE_FILE"
+```
+
+**BLOCKED** (need input):
+```bash
+printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",\\
+"session_id":"%s","timestamp":"%s","question":"%s"}}' \\
+  "$DEV_SYNC_SESSION_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
+  "Your question here" > "$DEV_SYNC_STATE_FILE"
+```
+
+**FAILED**:
+```bash
+printf '{{"version":"1","status":"FAILED","session_id":"%s",\\
+"timestamp":"%s","error":"%s"}}' \\
+  "$DEV_SYNC_SESSION_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
+  "Error message" > "$DEV_SYNC_STATE_FILE"
+```"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
         """Convert SessionResult to PipelineResult."""
