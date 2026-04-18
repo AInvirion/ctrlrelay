@@ -55,7 +55,6 @@ SEMCL.ONE/upmex | main | git@github.com:SemClone/upmex.git
 SEMCL.ONE/vulnq | main | git@github.com:SemClone/vulnq.git
 SCANOSS/AIModelSniffer/aisniff-client | main | git@github.com:SemClone/aisniff-client.git
 SCANOSS/AIModelSniffer/aisniff-server | main | git@github.com:SemClone/aisniff-server.git
-SCANOSS/scanoss-ai-fork | main | git@github.com:oscarvalenzuelab/scanoss-ai-fork.git
 PERSONAL/agentic-ai-github-actions | main | git@github.com:oscarvalenzuelab/agentic-ai-github-actions.git
 PERSONAL/open_agentic_framework | main | git@github.com:oscarvalenzuelab/open_agentic_framework.git
 PERSONAL/openagenticframework.com | main | git@github.com:oscarvalenzuelab/openagenticframework.com.git

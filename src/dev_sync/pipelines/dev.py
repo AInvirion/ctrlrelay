@@ -20,6 +20,12 @@ from dev_sync.transports.base import Transport
 
 DEFAULT_MAX_FIX_ATTEMPTS = 3
 
+AGENT_CLAIM_MARKER = "<!-- dev-sync:claimed -->"
+AGENT_CLAIM_COMMENT = (
+    "🤖 Agent is working on this issue. A PR will be opened for review.\n\n"
+    f"{AGENT_CLAIM_MARKER}"
+)
+
 
 @dataclass
 class DevPipeline:
@@ -36,7 +42,11 @@ class DevPipeline:
 
     async def run(self, ctx: PipelineContext) -> PipelineResult:
         """Run dev pipeline on a single issue."""
-        prompt = self._build_prompt(ctx.repo, ctx.issue_number, ctx.extra)
+        prompt = self._build_prompt(
+            ctx.repo, ctx.issue_number, ctx.extra,
+            session_id=ctx.session_id,
+            state_file=ctx.state_file,
+        )
 
         result = await self.dispatcher.spawn_session(
             session_id=ctx.session_id,
@@ -79,11 +89,14 @@ class DevPipeline:
         repo: str,
         issue_number: int | None,
         extra: dict[str, Any],
+        session_id: str = "",
+        state_file: Path | None = None,
     ) -> str:
         """Build the dev pipeline prompt."""
         issue_title = extra.get("issue_title", "")
         issue_body = extra.get("issue_body", "")
         branch_name = extra.get("branch_name", "")
+        state_file_path = str(state_file) if state_file else "/tmp/state.json"
 
         return f"""You are working on issue #{issue_number} in repository {repo}.
 
@@ -97,26 +110,54 @@ class DevPipeline:
 Execute the following workflow:
 
 1. Validate the issue still applies to the current codebase
-2. If anything is unclear, use checkpoint.blocked() to ask for clarification
-3. Run /superpowers to plan and implement the fix using TDD
-4. Run codex review and address any feedback
-5. Push the branch and open a PR that references the issue
-6. Before marking the task complete, verify the PR is mergeable:
-   - Poll `gh pr checks <PR>` until every check is completed; if any conclusion
-     is failure/cancelled/timed_out, investigate, fix, push again, and re-poll.
-   - Run `gh pr view <PR> --json mergeable,mergeStateStatus` — if mergeable is
-     `CONFLICTING` or mergeStateStatus is `DIRTY`, rebase onto the base branch,
-     resolve conflicts, and push again.
-7. Use checkpoint.done() only when the PR is green AND conflict-free, passing
-   outputs={{"pr_url": "...", "pr_number": N}}.
+2. If anything is unclear, signal BLOCKED (see below) to ask for clarification
+3. Plan and implement the fix using TDD
+4. Push the branch and open a PR that references the issue
+5. Before signaling DONE, verify the PR is mergeable:
+   - Poll `gh pr checks <PR>` until every check is `completed`; if any
+     conclusion is `failure`/`cancelled`/`timed_out`, investigate, fix, push
+     again, and re-poll.
+   - Run `gh pr view <PR> --json mergeable,mergeStateStatus` — if `mergeable`
+     is `CONFLICTING` or `mergeStateStatus` is `DIRTY`, rebase onto the base
+     branch, resolve conflicts, and push again.
+6. Signal DONE only when the PR is green AND conflict-free, with the PR URL.
 
 Do NOT merge the PR - wait for human review.
 
-Use checkpoint.blocked() if you need human input.
-Use checkpoint.failed() if something goes wrong.
-
 The orchestrator re-verifies CI and mergeability after you hand off; if it
-finds the PR broken it will resume this session asking you to fix it."""
+finds the PR broken it will resume this session asking you to fix it.
+
+## Signaling Completion
+
+**CRITICAL**: Before exiting, you MUST write a checkpoint file to signal completion.
+
+STATE_FILE: {state_file_path}
+SESSION_ID: {session_id}
+
+**DONE** (PR opened AND verified green + conflict-free):
+```bash
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\
+'"timestamp":"%s","summary":"PR opened",'\
+'"outputs":{{"pr_url":"%s","pr_number":%d}}}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<PR_URL>" <PR_NUM> > '{state_file_path}'
+```
+
+**BLOCKED** (need input):
+```bash
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
+'"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > '{state_file_path}'
+```
+
+**FAILED**:
+```bash
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
+'"timestamp":"%s","error":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > '{state_file_path}'
+```"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
         """Convert SessionResult to PipelineResult."""
@@ -265,12 +306,38 @@ async def run_dev_issue(
             error="Repository locked by another session",
         )
 
+    worktree_path: Path | None = None
+    # Pessimistic default: if we never got far enough to check, assume the
+    # branch was pre-existing so cleanup never clobbers unrelated state.
+    branch_preexisted = True
+
     try:
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
 
-        # Create worktree with new branch
+        # Post claim comment so collaborators can see the agent picked it up.
+        # Skip if a previous attempt already left the marker — keeps it idempotent
+        # across retries / resumed sessions.
+        existing_comments = issue.get("comments") or []
+        already_claimed = any(
+            AGENT_CLAIM_MARKER in (c.get("body") or "")
+            for c in existing_comments
+        )
+        if not already_claimed:
+            await github.comment_on_issue(
+                repo=repo,
+                issue_number=issue_number,
+                body=AGENT_CLAIM_COMMENT,
+            )
+
+        # Snapshot branch ownership BEFORE we try to create it. If the ref
+        # already exists in the bare repo, it came from another run (possibly
+        # a prior DONE session whose PR is still open) and we must not touch
+        # it. If it does not exist here, any ref we see later belongs to us —
+        # even if `git worktree add -b` fails partway through and leaves the
+        # ref behind without a usable worktree.
         await worktree.ensure_bare_repo(repo)
+        branch_preexisted = await worktree.branch_exists_locally(repo, branch_name)
         worktree_path = await worktree.create_worktree_with_new_branch(
             repo=repo,
             session_id=session_id,
@@ -357,15 +424,23 @@ async def run_dev_issue(
                 },
             ))
 
-        # Send notification via transport
-        if transport and result.success:
-            pr_url = result.outputs.get("pr_url", "")
-            await transport.send(f"PR ready for review: {pr_url}")
-
-        # Cleanup only if not blocked (blocked sessions need worktree for resume)
-        if not result.blocked:
+        # Cleanup rules:
+        #   DONE    -> remove worktree, keep branch (the open PR references it)
+        #   BLOCKED -> keep both (user may resume the session)
+        #   FAILED  -> remove worktree AND delete branch so the next retry can
+        #              re-create `fix/issue-<n>` cleanly — BUT only if the
+        #              branch did not pre-exist (we own it) and it was never
+        #              pushed (no recoverable work on origin).
+        if result.success:
             worktree.remove_context_symlink(worktree_path)
             await worktree.remove_worktree(repo, session_id)
+        elif not result.blocked:
+            worktree.remove_context_symlink(worktree_path)
+            await worktree.remove_worktree(repo, session_id)
+            if not branch_preexisted and not await worktree.branch_exists_on_remote(
+                repo, branch_name
+            ):
+                await worktree.delete_branch(repo, branch_name)
 
         return result
 
@@ -375,6 +450,36 @@ async def run_dev_issue(
             ("failed", f"Error: {e}", int(time.time()), session_id),
         )
         state_db.commit()
+
+        # Best-effort cleanup so a retry isn't blocked by leftover state. Only
+        # touch the branch if it didn't pre-exist (we own it) AND origin has
+        # no copy (no recoverable work to orphan). Covers partial failures of
+        # `git worktree add -b` that create the ref before the directory setup
+        # crashes.
+        if worktree_path is not None:
+            try:
+                worktree.remove_context_symlink(worktree_path)
+            except Exception:
+                pass
+        # Always attempt remove_worktree + prune — handles the case where
+        # `git worktree add -b` registered worktree metadata before the dir
+        # step failed, leaving worktree_path unassigned but metadata in the
+        # bare repo that would prevent the branch from being deleted.
+        try:
+            await worktree.remove_worktree(repo, session_id)
+        except Exception:
+            pass
+        if not branch_preexisted:
+            try:
+                has_remote = await worktree.branch_exists_on_remote(repo, branch_name)
+            except Exception:
+                has_remote = True
+            if not has_remote:
+                try:
+                    await worktree.delete_branch(repo, branch_name)
+                except Exception:
+                    pass
+
         return PipelineResult(
             success=False,
             session_id=session_id,

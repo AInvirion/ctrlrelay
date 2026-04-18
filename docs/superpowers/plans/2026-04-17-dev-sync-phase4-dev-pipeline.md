@@ -1,3 +1,11 @@
+---
+title: Phase 4 — Dev Pipeline
+layout: default
+parent: Plans
+nav_order: 5
+render_with_liquid: false
+---
+
 # Phase 4: Dev Pipeline Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -737,6 +745,7 @@ Expected: FAIL with "No module named 'dev_sync.pipelines.dev'"
 
 - [ ] **Step 3: Create dev pipeline skeleton**
 
+{% raw %}
 ```python
 # src/dev_sync/pipelines/dev.py
 """Dev pipeline for issue-to-PR workflow."""
@@ -868,6 +877,7 @@ Use checkpoint.failed() if something goes wrong."""
             error=result.state.error,
         )
 ```
+{% endraw %}
 
 - [ ] **Step 4: Run test to verify it passes**
 

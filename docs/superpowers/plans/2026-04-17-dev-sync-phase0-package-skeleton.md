@@ -1,3 +1,11 @@
+---
+title: Phase 0 — Package Skeleton
+layout: default
+parent: Plans
+nav_order: 1
+render_with_liquid: false
+---
+
 # dev-sync Phase 0: Package Skeleton
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -345,6 +353,7 @@ def sample_config_file(sample_config_dict: dict, tmp_path: Path) -> Path:
 ```
 
 Create `tests/test_config.py`:
+{% raw %}
 ```python
 """Tests for configuration loading and validation."""
 
@@ -390,6 +399,7 @@ class TestConfigPaths:
         assert "~" not in str(config.paths.state_db)
         assert str(config.paths.state_db).startswith("/")
 ```
+{% endraw %}
 
 - [ ] **Step 2: Run tests to verify they fail**
 

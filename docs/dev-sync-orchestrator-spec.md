@@ -1,3 +1,9 @@
+---
+title: Orchestrator Build Spec
+layout: default
+nav_order: 3
+---
+
 # dev-sync Orchestrator — Build Spec
 
 A local-first, cron-driven orchestrator that wraps `claude -p` (headless Claude Code) to run secops and dev pipelines across multiple GitHub repos, with Telegram for human-in-the-loop and a DigitalOcean-hosted dashboard for heartbeats and status.

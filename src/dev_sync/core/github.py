@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -12,11 +13,22 @@ class GitHubError(Exception):
     """Raised when gh CLI operations fail."""
 
 
+def _find_gh() -> str:
+    """Find gh binary, checking common paths if not in PATH."""
+    gh = shutil.which("gh")
+    if gh:
+        return gh
+    for path in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]:
+        if shutil.which(path):
+            return path
+    return "gh"
+
+
 @dataclass
 class GitHubCLI:
     """Async wrapper around the gh CLI."""
 
-    gh_binary: str = "gh"
+    gh_binary: str = field(default_factory=_find_gh)
     timeout: int = 60
 
     async def _run_gh(self, *args: str) -> str:
@@ -172,6 +184,20 @@ class GitHubCLI:
         )
         return json.loads(output)
 
+    async def comment_on_issue(
+        self,
+        repo: str,
+        issue_number: int,
+        body: str,
+    ) -> None:
+        """Post a comment on an issue."""
+        await self._run_gh(
+            "issue", "comment",
+            str(issue_number),
+            "--repo", repo,
+            "--body", body,
+        )
+
     async def close_issue(
         self,
         repo: str,
@@ -180,12 +206,7 @@ class GitHubCLI:
     ) -> None:
         """Close an issue with an optional comment."""
         if comment is not None:
-            await self._run_gh(
-                "issue", "comment",
-                str(issue_number),
-                "--repo", repo,
-                "--body", comment,
-            )
+            await self.comment_on_issue(repo, issue_number, comment)
         await self._run_gh(
             "issue", "close",
             str(issue_number),

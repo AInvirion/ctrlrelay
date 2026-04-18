@@ -26,8 +26,15 @@ class WorktreeManager:
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
         self.bare_repos_dir.mkdir(parents=True, exist_ok=True)
 
-    async def _run_git(self, *args: str, cwd: Path | None = None) -> str:
-        """Run git command and return stdout."""
+    async def _run_git(
+        self,
+        *args: str,
+        cwd: Path | None = None,
+        timeout: int | None = None,
+    ) -> str:
+        """Run git command and return stdout. `timeout` overrides self.timeout
+        for one call — useful for cheap probes that shouldn't inherit the full
+        120s default when network is flaky."""
         cmd = ["git", *args]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -35,9 +42,18 @@ class WorktreeManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=self.timeout
-        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout if timeout is not None else self.timeout,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            raise
 
         if proc.returncode != 0:
             raise WorktreeError(f"git failed: {stderr.decode().strip()}")
@@ -140,6 +156,47 @@ class WorktreeManager:
 
         if bare_path.exists():
             await self._run_git("worktree", "prune", cwd=bare_path)
+
+    async def delete_branch(self, repo: str, branch: str) -> None:
+        """Delete a local branch in the bare repo. Best-effort; no-op if absent."""
+        bare_path = self._get_bare_repo_path(repo)
+        if not bare_path.exists():
+            return
+        try:
+            await self._run_git("branch", "-D", branch, cwd=bare_path)
+        except WorktreeError:
+            pass
+
+    async def branch_exists_locally(self, repo: str, branch: str) -> bool:
+        """Check if `branch` exists as a local ref in the bare repo."""
+        bare_path = self._get_bare_repo_path(repo)
+        if not bare_path.exists():
+            return False
+        try:
+            await self._run_git(
+                "show-ref", "--verify", "--quiet", f"refs/heads/{branch}",
+                cwd=bare_path,
+            )
+            return True
+        except Exception:
+            return False
+
+    async def branch_exists_on_remote(self, repo: str, branch: str) -> bool:
+        """Return True if `branch` exists on origin. Fail-closed: on any error
+        (WorktreeError, asyncio.TimeoutError from _run_git's wait_for, etc.)
+        returns True so callers err on the side of NOT deleting."""
+        bare_path = self._get_bare_repo_path(repo)
+        if not bare_path.exists():
+            return True
+        try:
+            output = await self._run_git(
+                "ls-remote", "--heads", "origin", branch,
+                cwd=bare_path,
+                timeout=10,
+            )
+            return bool(output.strip())
+        except Exception:
+            return True
 
     def _get_gitdir(self, worktree_path: Path) -> Path:
         """Get the real gitdir for a worktree.
