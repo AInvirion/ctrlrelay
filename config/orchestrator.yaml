@@ -18,10 +18,10 @@ claude:
   output_format: "json"
 
 transport:
-  type: "file_mock"  # Use "telegram" for production
+  type: "telegram"
   telegram:
     bot_token_env: "DEV_SYNC_TELEGRAM_TOKEN"
-    chat_id: 123456789
+    chat_id: 61259010
     socket_path: "~/.dev-sync/dev-sync.sock"
   file_mock:
     inbox: "~/.dev-sync/inbox.txt"
