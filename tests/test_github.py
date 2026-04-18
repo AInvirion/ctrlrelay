@@ -60,12 +60,12 @@ class TestGitHubCLI:
 
     @pytest.mark.asyncio
     async def test_get_pr_checks(self) -> None:
-        """Should get PR check status."""
+        """Should get PR check status using the bucket field."""
         from dev_sync.core.github import GitHubCLI
 
         mock_output = json.dumps([
-            {"name": "tests", "status": "completed", "conclusion": "success"},
-            {"name": "lint", "status": "completed", "conclusion": "success"},
+            {"name": "tests", "state": "SUCCESS", "bucket": "pass"},
+            {"name": "lint", "state": "SUCCESS", "bucket": "pass"},
         ])
 
         with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
@@ -74,7 +74,20 @@ class TestGitHubCLI:
             checks = await gh.get_pr_checks("owner/repo", 42)
 
             assert len(checks) == 2
-            assert all(c["conclusion"] == "success" for c in checks)
+            assert all(c["bucket"] == "pass" for c in checks)
+
+    @pytest.mark.asyncio
+    async def test_get_pr_checks_returns_empty_on_non_zero_exit(self) -> None:
+        """`gh pr checks` exits non-zero while any check is pending; we must
+        treat that as "still pending" rather than propagating GitHubError."""
+        from dev_sync.core.github import GitHubCLI, GitHubError
+
+        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.side_effect = GitHubError("gh failed: pending checks")
+            gh = GitHubCLI()
+            checks = await gh.get_pr_checks("owner/repo", 42)
+
+            assert checks == []
 
     @pytest.mark.asyncio
     async def test_list_assigned_issues(self) -> None:

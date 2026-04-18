@@ -8,7 +8,11 @@ from typing import Any
 
 from dev_sync.core.github import GitHubCLI
 
-_PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+# `gh pr checks --json bucket` returns one of: pass, fail, pending, skipping, cancel.
+# Treat skipping as pass (skipped jobs don't block a merge) and everything except
+# pending as "terminal".
+_PENDING_BUCKETS = frozenset({"pending"})
+_PASSING_BUCKETS = frozenset({"pass", "skipping"})
 _TERMINAL_MERGEABLE_VALUES = frozenset({"MERGEABLE", "CONFLICTING"})
 
 
@@ -38,13 +42,18 @@ class PRVerifier:
         pr_number: int,
         timeout: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Poll PR checks until every check is completed or timeout is reached."""
+        """Poll PR checks until every check has left the 'pending' bucket or
+        the timeout is reached. An empty list means the repo has no CI — the
+        caller treats that as "nothing to wait for" and proceeds."""
         limit = self.check_timeout if timeout is None else timeout
         elapsed = 0
         checks: list[dict[str, Any]] = []
         while True:
             checks = await self.github.get_pr_checks(repo, pr_number)
-            if checks and all(c.get("status") == "completed" for c in checks):
+            # No checks configured for this repo — nothing to wait for.
+            if not checks:
+                return checks
+            if all(c.get("bucket") not in _PENDING_BUCKETS for c in checks):
                 return checks
             if elapsed >= limit:
                 return checks
@@ -61,8 +70,8 @@ class PRVerifier:
         checks = await self.wait_for_checks(repo, pr_number, timeout=timeout)
         failing = [
             c for c in checks
-            if c.get("status") != "completed"
-            or c.get("conclusion") not in _PASSING_CONCLUSIONS
+            if c.get("bucket") in _PENDING_BUCKETS
+            or c.get("bucket") not in _PASSING_BUCKETS
         ]
         if failing:
             names = ", ".join(c.get("name", "?") for c in failing)

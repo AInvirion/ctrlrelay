@@ -8,39 +8,39 @@ import pytest
 class TestPRVerifier:
     @pytest.mark.asyncio
     async def test_wait_for_checks_returns_when_all_completed(self) -> None:
-        """Should return immediately when every check is already completed."""
+        """Should return immediately when every check has left the pending bucket."""
         from dev_sync.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
-            {"name": "ci", "status": "completed", "conclusion": "success"},
-            {"name": "lint", "status": "completed", "conclusion": "success"},
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
+            {"name": "lint", "state": "SUCCESS", "bucket": "pass"},
         ]
 
         verifier = PRVerifier(github=mock_github, poll_interval=0)
         checks = await verifier.wait_for_checks("owner/repo", 42, timeout=5)
 
         assert len(checks) == 2
-        assert all(c["status"] == "completed" for c in checks)
+        assert all(c["bucket"] == "pass" for c in checks)
         mock_github.get_pr_checks.assert_called_once_with("owner/repo", 42)
 
     @pytest.mark.asyncio
     async def test_wait_for_checks_polls_until_completed(self) -> None:
-        """Should keep polling while any check is still running."""
+        """Should keep polling while any check is still pending."""
         from dev_sync.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.side_effect = [
-            [{"name": "ci", "status": "in_progress", "conclusion": None}],
-            [{"name": "ci", "status": "in_progress", "conclusion": None}],
-            [{"name": "ci", "status": "completed", "conclusion": "success"}],
+            [{"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"}],
+            [{"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"}],
+            [{"name": "ci", "state": "SUCCESS", "bucket": "pass"}],
         ]
 
         verifier = PRVerifier(github=mock_github, poll_interval=0)
         checks = await verifier.wait_for_checks("owner/repo", 42, timeout=5)
 
         assert mock_github.get_pr_checks.call_count == 3
-        assert checks[0]["status"] == "completed"
+        assert checks[0]["bucket"] == "pass"
 
     @pytest.mark.asyncio
     async def test_wait_for_checks_returns_when_timeout_exceeded(self) -> None:
@@ -49,15 +49,30 @@ class TestPRVerifier:
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
-            {"name": "ci", "status": "in_progress", "conclusion": None},
+            {"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"},
         ]
 
         verifier = PRVerifier(github=mock_github, poll_interval=1)
         checks = await verifier.wait_for_checks("owner/repo", 42, timeout=2)
 
-        # in_progress, not completed
-        assert checks[0]["status"] == "in_progress"
+        # Still pending at timeout.
+        assert checks[0]["bucket"] == "pending"
         assert mock_github.get_pr_checks.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_wait_for_checks_returns_immediately_when_no_checks(self) -> None:
+        """Repos with no CI configured must not block for `check_timeout`."""
+        from dev_sync.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks.return_value = []
+
+        # If the bug were present this would hang ~30 minutes.
+        verifier = PRVerifier(github=mock_github, poll_interval=60)
+        checks = await verifier.wait_for_checks("owner/repo", 42, timeout=1800)
+
+        assert checks == []
+        mock_github.get_pr_checks.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_verify_ready_when_all_checks_pass_and_mergeable(self) -> None:
@@ -66,7 +81,7 @@ class TestPRVerifier:
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
-            {"name": "ci", "status": "completed", "conclusion": "success"},
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
         ]
         mock_github.get_pr_state.return_value = {
             "number": 42,
@@ -83,14 +98,32 @@ class TestPRVerifier:
         assert result.failing_checks == []
 
     @pytest.mark.asyncio
+    async def test_verify_ready_when_no_checks_and_mergeable(self) -> None:
+        """Repos with no CI should still verify ready if mergeable."""
+        from dev_sync.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks.return_value = []
+        mock_github.get_pr_state.return_value = {
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        result = await verifier.verify("owner/repo", 42)
+
+        assert result.ready is True
+        assert result.failing_checks == []
+
+    @pytest.mark.asyncio
     async def test_verify_not_ready_when_check_fails(self) -> None:
         """Should report not-ready and list failing checks."""
         from dev_sync.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
-            {"name": "ci", "status": "completed", "conclusion": "success"},
-            {"name": "lint", "status": "completed", "conclusion": "failure"},
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
+            {"name": "lint", "state": "FAILURE", "bucket": "fail"},
         ]
         mock_github.get_pr_state.return_value = {
             "mergeable": "MERGEABLE",
@@ -112,7 +145,7 @@ class TestPRVerifier:
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
-            {"name": "ci", "status": "completed", "conclusion": "success"},
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
         ]
         mock_github.get_pr_state.return_value = {
             "mergeable": "CONFLICTING",
@@ -127,15 +160,14 @@ class TestPRVerifier:
         assert "conflict" in result.reason.lower()
 
     @pytest.mark.asyncio
-    async def test_verify_treats_neutral_and_skipped_as_pass(self) -> None:
-        """Should treat neutral and skipped conclusions as passing."""
+    async def test_verify_treats_skipping_as_pass(self) -> None:
+        """bucket=skipping must not block — skipped checks don't fail a PR."""
         from dev_sync.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
-            {"name": "a", "status": "completed", "conclusion": "success"},
-            {"name": "b", "status": "completed", "conclusion": "skipped"},
-            {"name": "c", "status": "completed", "conclusion": "neutral"},
+            {"name": "a", "state": "SUCCESS", "bucket": "pass"},
+            {"name": "b", "state": "SKIPPED", "bucket": "skipping"},
         ]
         mock_github.get_pr_state.return_value = {
             "mergeable": "MERGEABLE",
@@ -154,7 +186,7 @@ class TestPRVerifier:
 
         mock_github = AsyncMock()
         mock_github.get_pr_checks.return_value = [
-            {"name": "ci", "status": "completed", "conclusion": "success"},
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
         ]
         mock_github.get_pr_state.side_effect = [
             {"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"},

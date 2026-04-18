@@ -112,7 +112,7 @@ class TestDevPipeline:
             "body": "Bug description",
         }
         mock_github.get_pr_checks.return_value = [
-            {"name": "ci", "status": "completed", "conclusion": "success"},
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
         ]
         mock_github.get_pr_state.return_value = {
             "mergeable": "MERGEABLE",
@@ -417,7 +417,7 @@ class TestRunDevIssueVerification:
         mock_github = AsyncMock()
         mock_github.get_issue.return_value = {"number": 1, "title": "x", "body": "y"}
         mock_github.get_pr_checks.return_value = [
-            {"name": "ci", "status": "completed", "conclusion": "success"},
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
         ]
         mock_github.get_pr_state.return_value = {
             "mergeable": "MERGEABLE",
@@ -461,8 +461,8 @@ class TestRunDevIssueVerification:
         mock_github.get_issue.return_value = {"number": 1, "title": "x", "body": "y"}
         # First verification: CI fails. Second: CI passes.
         mock_github.get_pr_checks.side_effect = [
-            [{"name": "ci", "status": "completed", "conclusion": "failure"}],
-            [{"name": "ci", "status": "completed", "conclusion": "success"}],
+            [{"name": "ci", "state": "FAILURE", "bucket": "fail"}],
+            [{"name": "ci", "state": "SUCCESS", "bucket": "pass"}],
         ]
         mock_github.get_pr_state.return_value = {
             "mergeable": "MERGEABLE",
@@ -508,7 +508,7 @@ class TestRunDevIssueVerification:
         mock_github = AsyncMock()
         mock_github.get_issue.return_value = {"number": 1, "title": "x", "body": "y"}
         mock_github.get_pr_checks.return_value = [
-            {"name": "ci", "status": "completed", "conclusion": "success"},
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
         ]
         mock_github.get_pr_state.side_effect = [
             {"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"},
@@ -553,7 +553,7 @@ class TestRunDevIssueVerification:
         mock_github.get_issue.return_value = {"number": 1, "title": "x", "body": "y"}
         # Always failing
         mock_github.get_pr_checks.return_value = [
-            {"name": "ci", "status": "completed", "conclusion": "failure"},
+            {"name": "ci", "state": "FAILURE", "bucket": "fail"},
         ]
         mock_github.get_pr_state.return_value = {
             "mergeable": "MERGEABLE",

@@ -99,23 +99,31 @@ class GitHubCLI:
         repo: str,
         pr_number: int,
     ) -> list[dict[str, Any]]:
-        """Get status checks for a PR."""
-        output = await self._run_gh(
-            "pr", "checks",
-            str(pr_number),
-            "--repo", repo,
-            "--json", "name,status,conclusion",
-        )
+        """Get status checks for a PR.
+
+        Uses `gh pr checks --json name,state,bucket,link`. `bucket` categorizes
+        the raw state into: pass, fail, pending, skipping, cancel — the right
+        abstraction for "is this done / did it pass". `gh pr checks` also
+        exits non-zero while any check is pending or failing, which our
+        `_run_gh` surfaces as `GitHubError`. Treat that as "still pending" so
+        the verifier keeps polling instead of crashing.
+        """
+        try:
+            output = await self._run_gh(
+                "pr", "checks",
+                str(pr_number),
+                "--repo", repo,
+                "--json", "name,state,bucket,link",
+            )
+        except GitHubError:
+            return []
         return json.loads(output) if output.strip() else []
 
     def all_checks_passed(self, checks: list[dict[str, Any]]) -> bool:
         """Check if all PR checks passed."""
         if not checks:
             return False
-        return all(
-            c.get("status") == "completed" and c.get("conclusion") == "success"
-            for c in checks
-        )
+        return all(c.get("bucket") in ("pass", "skipping") for c in checks)
 
     async def list_assigned_issues(
         self,
