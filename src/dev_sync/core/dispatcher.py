@@ -60,6 +60,14 @@ class ClaudeDispatcher:
     default_timeout: int = 1800
     extra_env: dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # Only auto-resolve the bare default. Absolute paths, relative paths
+        # (resolved vs. working_dir by the child), and custom bare names pass
+        # through so explicit config is never silently overridden.
+        if self.claude_binary == "claude":
+            resolved = shutil.which("claude")
+            self.claude_binary = resolved or _find_claude()
+
     async def spawn_session(
         self,
         session_id: str,
