@@ -11,13 +11,15 @@ from typing import Any
 import httpx
 from pydantic import BaseModel
 
+from dev_sync import __version__
+
 
 class HeartbeatPayload(BaseModel):
     """Payload for heartbeat endpoint."""
 
     node_id: str
     timestamp: str = ""
-    version: str = "0.1.0"
+    version: str = __version__
     uptime_seconds: int = 0
     platform: str = ""
     active_sessions: list[dict[str, Any]] = []
