@@ -19,6 +19,7 @@ from dev_sync.pipelines.base import PipelineContext, PipelineResult
 from dev_sync.transports.base import Transport
 
 DEFAULT_MAX_FIX_ATTEMPTS = 3
+DEFAULT_MAX_BLOCKED_ROUNDS = 5
 
 AGENT_CLAIM_MARKER = "<!-- dev-sync:claimed -->"
 AGENT_CLAIM_COMMENT = (
@@ -308,6 +309,7 @@ async def run_dev_issue(
     transport: Transport | None,
     contexts_dir: Path,
     max_fix_attempts: int = DEFAULT_MAX_FIX_ATTEMPTS,
+    max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
     pr_verifier: PRVerifier | None = None,
 ) -> PipelineResult:
     """Run dev pipeline for a single issue."""
@@ -405,6 +407,39 @@ async def run_dev_issue(
             transport=transport,
         )
         result = await pipeline.run(ctx)
+
+        # BLOCKED loop: if Claude needs input, post the question to the
+        # transport (Telegram), wait for the operator's reply, and resume
+        # the session. Loop until Claude signals DONE/FAILED or we run out
+        # of trips. Each round-trip is capped at the transport's own
+        # timeout (see Transport.ask signature — default 300s); the total
+        # is bounded by max_blocked_rounds.
+        rounds = 0
+        while (
+            result.blocked
+            and transport is not None
+            and rounds < max_blocked_rounds
+        ):
+            question = (result.question or "").strip() or (
+                f"Session {session_id} is blocked but did not include a "
+                "question. Reply with guidance to resume."
+            )
+            try:
+                answer = await transport.ask(question)
+            except Exception as e:
+                # Transport failed (bridge down, timeout, etc.) — give up
+                # cleanly and fall through to the normal blocked cleanup.
+                result = PipelineResult(
+                    success=False,
+                    blocked=False,
+                    session_id=session_id,
+                    summary=f"Blocked session abandoned: {e}",
+                    error=str(e),
+                    outputs=result.outputs,
+                )
+                break
+            rounds += 1
+            result = await pipeline.resume(ctx, answer)
 
         # Verify PR is green & conflict-free before handing off. Resume the
         # session with a fix request if either is broken, up to max_fix_attempts.

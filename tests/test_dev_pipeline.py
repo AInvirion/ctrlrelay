@@ -536,6 +536,216 @@ class TestRunDevIssueVerification:
         assert "conflict" in fix_call["prompt"].lower()
 
     @pytest.mark.asyncio
+    async def test_run_dev_issue_blocked_asks_transport_and_resumes(
+        self, tmp_path: Path
+    ) -> None:
+        """If Claude signals BLOCKED with a question, run_dev_issue must post
+        the question via the transport, wait for the reply, and resume the
+        session with the answer. Loop until DONE."""
+        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
+        from dev_sync.core.dispatcher import SessionResult
+        from dev_sync.core.pr_verifier import VerificationResult
+        from dev_sync.core.state import StateDB
+        from dev_sync.pipelines.dev import run_dev_issue
+
+        # 1st spawn = BLOCKED with a question. 2nd spawn (resume) = DONE.
+        blocked = SessionResult(
+            session_id="dev-123",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.BLOCKED_NEEDS_INPUT,
+                session_id="dev-123",
+                timestamp="2026-04-17T12:00:00Z",
+                question="pin or bump?",
+            ),
+        )
+        done = SessionResult(
+            session_id="dev-123",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.DONE,
+                session_id="dev-123",
+                timestamp="2026-04-17T12:01:00Z",
+                summary="PR opened",
+                outputs={
+                    "pr_url": "https://github.com/o/r/pull/42",
+                    "pr_number": 42,
+                },
+            ),
+        )
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.side_effect = [blocked, done]
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree_with_new_branch.return_value = tmp_path / "wt"
+        mock_worktree.symlink_context = MagicMock()
+        mock_worktree.remove_context_symlink = MagicMock()
+
+        mock_github = AsyncMock()
+        mock_github.get_issue.return_value = {
+            "number": 13,
+            "title": "x",
+            "body": "y",
+            "comments": [],
+        }
+
+        state_db = StateDB(tmp_path / "state.db")
+
+        mock_transport = AsyncMock()
+        mock_transport.ask.return_value = "pin to 2.4.1"
+        mock_pr_verifier = AsyncMock()
+        mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
+
+        result = await run_dev_issue(
+            repo="owner/repo",
+            issue_number=13,
+            branch_template="fix/issue-{n}",
+            dispatcher=mock_dispatcher,
+            github=mock_github,
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=state_db,
+            transport=mock_transport,
+            contexts_dir=tmp_path / "contexts",
+            pr_verifier=mock_pr_verifier,
+        )
+
+        # Transport was asked the exact BLOCKED question.
+        mock_transport.ask.assert_awaited_once()
+        asked_q = mock_transport.ask.await_args.args[0]
+        assert "pin or bump?" in asked_q
+
+        # Dispatcher was called twice: initial run + resume-with-answer.
+        assert mock_dispatcher.spawn_session.call_count == 2
+        resume_kwargs = mock_dispatcher.spawn_session.await_args_list[1].kwargs
+        assert resume_kwargs["resume_session_id"] == resume_kwargs["session_id"]
+        assert "pin to 2.4.1" in resume_kwargs["prompt"]
+
+        # Final result is the DONE state.
+        assert result.success
+        assert result.outputs["pr_number"] == 42
+
+    @pytest.mark.asyncio
+    async def test_run_dev_issue_blocked_no_transport_returns_blocked(
+        self, tmp_path: Path
+    ) -> None:
+        """Without a transport there's no way to consume the answer, so we
+        must return the BLOCKED result rather than spinning."""
+        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
+        from dev_sync.core.dispatcher import SessionResult
+        from dev_sync.core.state import StateDB
+        from dev_sync.pipelines.dev import run_dev_issue
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="dev-123",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.BLOCKED_NEEDS_INPUT,
+                session_id="dev-123",
+                timestamp="2026-04-17T12:00:00Z",
+                question="?",
+            ),
+        )
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree_with_new_branch.return_value = tmp_path / "wt"
+        mock_worktree.symlink_context = MagicMock()
+        mock_worktree.remove_context_symlink = MagicMock()
+
+        mock_github = AsyncMock()
+        mock_github.get_issue.return_value = {
+            "number": 13, "title": "x", "body": "y", "comments": [],
+        }
+
+        state_db = StateDB(tmp_path / "state.db")
+
+        result = await run_dev_issue(
+            repo="owner/repo",
+            issue_number=13,
+            branch_template="fix/issue-{n}",
+            dispatcher=mock_dispatcher,
+            github=mock_github,
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        assert result.blocked
+        # dispatcher called exactly once — no resume without a transport.
+        assert mock_dispatcher.spawn_session.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_run_dev_issue_blocked_transport_failure_fails_clean(
+        self, tmp_path: Path
+    ) -> None:
+        """If the transport raises (bridge down, timeout), the session must
+        end cleanly as FAILED rather than leaving the caller with a blocked
+        result we can't recover from."""
+        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
+        from dev_sync.core.dispatcher import SessionResult
+        from dev_sync.core.state import StateDB
+        from dev_sync.pipelines.dev import run_dev_issue
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="dev-123",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.BLOCKED_NEEDS_INPUT,
+                session_id="dev-123",
+                timestamp="2026-04-17T12:00:00Z",
+                question="?",
+            ),
+        )
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree_with_new_branch.return_value = tmp_path / "wt"
+        mock_worktree.symlink_context = MagicMock()
+        mock_worktree.remove_context_symlink = MagicMock()
+
+        mock_github = AsyncMock()
+        mock_github.get_issue.return_value = {
+            "number": 13, "title": "x", "body": "y", "comments": [],
+        }
+
+        state_db = StateDB(tmp_path / "state.db")
+
+        mock_transport = AsyncMock()
+        mock_transport.ask.side_effect = RuntimeError("bridge down")
+
+        result = await run_dev_issue(
+            repo="owner/repo",
+            issue_number=13,
+            branch_template="fix/issue-{n}",
+            dispatcher=mock_dispatcher,
+            github=mock_github,
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=state_db,
+            transport=mock_transport,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        assert not result.blocked
+        assert not result.success
+        assert "bridge down" in (result.error or "")
+
+    @pytest.mark.asyncio
     async def test_run_dev_issue_does_not_retry_on_ci_timeout(
         self, tmp_path: Path
     ) -> None:
