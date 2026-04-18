@@ -17,7 +17,18 @@ _logger = get_logger("core.poller")
 # Exceptions that are transient and should skip the current repo/iteration
 # rather than tear the whole poll loop down. asyncio.CancelledError is
 # deliberately excluded so a shutdown signal still propagates.
+#
+# GitHubError is included because we can't distinguish transient (rate
+# limit, 5xx, network) from permanent (bad repo name, expired auth, 404)
+# without fragile error-message parsing — classifying both as skip avoids
+# crashes. A persistent-failure counter (see below) makes permanent
+# misconfiguration visible even though it's technically skipped here.
 _TRANSIENT_POLL_ERRORS = (TimeoutError, GitHubError, OSError)
+
+# After this many consecutive per-repo failures, escalate log level to
+# WARNING so a persistent misconfiguration (expired auth, renamed repo,
+# revoked access) stops hiding behind routine "transient" skip logs.
+_REPO_FAILURE_WARN_THRESHOLD = 3
 
 
 @dataclass
@@ -33,6 +44,10 @@ class IssuePoller:
     repos: list[str]
     state_file: Path
     seen_issues: dict[str, set[int]] = field(default_factory=dict)
+    # Per-repo consecutive-skip counter; populated at runtime by poll() /
+    # seed_current(). Not persisted — intentionally resets on daemon
+    # restart so an operator fix is exercised before we re-escalate.
+    _repo_failure_counts: dict[str, int] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -64,6 +79,54 @@ class IssuePoller:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.write_text(json.dumps(data, indent=2))
 
+    def _save_state_best_effort(self) -> None:
+        """Try to persist state; log and continue on disk errors.
+
+        Callers MUST NOT let a _save_state failure propagate out of poll() —
+        doing so would drop the new-issues list on the floor while the
+        in-memory seen_issues set has already been mutated, silently
+        abandoning the work until the daemon restarts.
+        """
+        try:
+            self._save_state()
+        except OSError as e:
+            log_event(
+                _logger,
+                "poll.save_state.failed",
+                reason=type(e).__name__,
+                error=str(e)[:200],
+                state_file=str(self.state_file),
+            )
+
+    def _record_repo_failure(
+        self,
+        repo: str,
+        exc: Exception,
+        *,
+        phase: str = "poll",
+    ) -> None:
+        """Bump the consecutive-failure counter and log with an escalated
+        level once the threshold is reached. ``phase`` distinguishes
+        poll-time vs seed-time skips in the event payload."""
+        count = self._repo_failure_counts.get(repo, 0) + 1
+        self._repo_failure_counts[repo] = count
+        fields = {
+            "repo": repo,
+            "reason": type(exc).__name__,
+            "error": str(exc)[:200],
+            "consecutive_failures": count,
+            "phase": phase,
+        }
+        if count >= _REPO_FAILURE_WARN_THRESHOLD:
+            fields["persistent"] = True
+            _logger.warning("poll.repo.skipped", extra=fields)
+        else:
+            log_event(_logger, "poll.repo.skipped", **fields)
+
+    def _clear_repo_failure(self, repo: str) -> None:
+        """Reset the failure counter after a successful repo lookup."""
+        self._repo_failure_counts.pop(repo, None)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -91,14 +154,11 @@ class IssuePoller:
             except asyncio.CancelledError:
                 raise
             except _TRANSIENT_POLL_ERRORS as e:
-                log_event(
-                    _logger,
-                    "poll.repo.skipped",
-                    repo=repo,
-                    reason=type(e).__name__,
-                    error=str(e)[:200],
-                )
+                self._record_repo_failure(repo, e, phase="poll")
                 continue
+
+            # Successful lookup — clear any accumulated failure count.
+            self._clear_repo_failure(repo)
 
             seen_for_repo = self.seen_issues.setdefault(repo, set())
 
@@ -108,7 +168,9 @@ class IssuePoller:
                     new_issues.append({"repo": repo, "issue": issue})
                     seen_for_repo.add(number)
 
-        self._save_state()
+        # Never propagate a save_state disk failure out of poll() — the
+        # caller has work to do with new_issues. Log and move on.
+        self._save_state_best_effort()
         return new_issues
 
     def mark_seen(self, repo: str, issue_number: int) -> None:
@@ -139,19 +201,13 @@ class IssuePoller:
             except asyncio.CancelledError:
                 raise
             except _TRANSIENT_POLL_ERRORS as e:
-                log_event(
-                    _logger,
-                    "poll.repo.skipped",
-                    repo=repo,
-                    reason=type(e).__name__,
-                    error=str(e)[:200],
-                    phase="seed",
-                )
+                self._record_repo_failure(repo, e, phase="seed")
                 continue
+            self._clear_repo_failure(repo)
             seen_for_repo = self.seen_issues.setdefault(repo, set())
             for issue in issues:
                 seen_for_repo.add(issue["number"])
-        self._save_state()
+        self._save_state_best_effort()
 
 
 async def run_poll_loop(
