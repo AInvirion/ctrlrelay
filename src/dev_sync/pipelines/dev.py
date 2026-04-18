@@ -33,7 +33,11 @@ class DevPipeline:
 
     async def run(self, ctx: PipelineContext) -> PipelineResult:
         """Run dev pipeline on a single issue."""
-        prompt = self._build_prompt(ctx.repo, ctx.issue_number, ctx.extra)
+        prompt = self._build_prompt(
+            ctx.repo, ctx.issue_number, ctx.extra,
+            session_id=ctx.session_id,
+            state_file=ctx.state_file,
+        )
 
         result = await self.dispatcher.spawn_session(
             session_id=ctx.session_id,
@@ -63,11 +67,14 @@ class DevPipeline:
         repo: str,
         issue_number: int | None,
         extra: dict[str, Any],
+        session_id: str = "",
+        state_file: Path | None = None,
     ) -> str:
         """Build the dev pipeline prompt."""
         issue_title = extra.get("issue_title", "")
         issue_body = extra.get("issue_body", "")
         branch_name = extra.get("branch_name", "")
+        state_file_path = str(state_file) if state_file else "/tmp/state.json"
 
         return f"""You are working on issue #{issue_number} in repository {repo}.
 
@@ -81,17 +88,44 @@ class DevPipeline:
 Execute the following workflow:
 
 1. Validate the issue still applies to the current codebase
-2. If anything is unclear, use checkpoint.blocked() to ask for clarification
-3. Run /superpowers to plan and implement the fix using TDD
-4. Run codex review and address any feedback
-5. Push the branch and open a PR that references the issue
-6. Use checkpoint.done() with the PR URL in outputs["pr_url"]
+2. If anything is unclear, signal BLOCKED (see below) to ask for clarification
+3. Plan and implement the fix using TDD
+4. Push the branch and open a PR that references the issue
+5. Signal DONE with the PR URL
 
 Do NOT merge the PR - wait for human review.
 
-Use checkpoint.done() with outputs={{"pr_url": "...", "pr_number": N}} when PR is opened.
-Use checkpoint.blocked() if you need human input.
-Use checkpoint.failed() if something goes wrong."""
+## Signaling Completion
+
+**CRITICAL**: Before exiting, you MUST write a checkpoint file to signal completion.
+
+STATE_FILE: {state_file_path}
+SESSION_ID: {session_id}
+
+**DONE** (PR opened):
+```bash
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\
+'"timestamp":"%s","summary":"PR opened",'\
+'"outputs":{{"pr_url":"%s","pr_number":%d}}}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<PR_URL>" <PR_NUM> > '{state_file_path}'
+```
+
+**BLOCKED** (need input):
+```bash
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
+'"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > '{state_file_path}'
+```
+
+**FAILED**:
+```bash
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
+'"timestamp":"%s","error":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > '{state_file_path}'
+```"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
         """Convert SessionResult to PipelineResult."""

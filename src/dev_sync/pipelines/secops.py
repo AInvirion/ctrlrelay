@@ -33,7 +33,11 @@ class SecopsPipeline:
 
     async def run(self, ctx: PipelineContext) -> PipelineResult:
         """Run secops on a single repo."""
-        prompt = self._build_prompt(ctx.repo)
+        prompt = self._build_prompt(
+            ctx.repo,
+            session_id=ctx.session_id,
+            state_file=ctx.state_file,
+        )
 
         result = await self.dispatcher.spawn_session(
             session_id=ctx.session_id,
@@ -58,20 +62,57 @@ class SecopsPipeline:
 
         return self._session_to_result(result)
 
-    def _build_prompt(self, repo: str) -> str:
+    def _build_prompt(
+        self,
+        repo: str,
+        session_id: str = "",
+        state_file: Path | None = None,
+    ) -> str:
         """Build the secops prompt."""
+        state_file_path = str(state_file) if state_file else "/tmp/state.json"
+
         return f"""Execute security operations for repository {repo}.
 
-1. Run /gh-dashboard to get current security status
-2. For each Dependabot alert or security PR:
+1. Check Dependabot alerts:
+   `gh api repos/{repo}/dependabot/alerts --jq '.[] | select(.state=="open")'`
+2. Check security PRs:
+   `gh pr list --repo {repo} --author "app/dependabot" --json number,title`
+3. For each alert or PR:
    - Review the severity and impact
-   - If patch/minor with green CI, auto-merge
-   - If major or unclear, use checkpoint.blocked() to ask for guidance
-3. Summarize actions taken
+   - If patch/minor update with passing CI, merge the PR
+   - If major or unclear, signal BLOCKED to ask for guidance
+4. Summarize actions taken
 
-Use checkpoint.done() when complete with summary of actions.
-Use checkpoint.blocked() if you need human input.
-Use checkpoint.failed() if something goes wrong."""
+## Signaling Completion
+
+**CRITICAL**: Before exiting, you MUST write a checkpoint file to signal completion.
+
+STATE_FILE: {state_file_path}
+SESSION_ID: {session_id}
+
+**DONE** (completed):
+```bash
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\
+'"timestamp":"%s","summary":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<SUMMARY>" > '{state_file_path}'
+```
+
+**BLOCKED** (need input):
+```bash
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
+'"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > '{state_file_path}'
+```
+
+**FAILED**:
+```bash
+mkdir -p "$(dirname '{state_file_path}')"
+printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
+'"timestamp":"%s","error":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > '{state_file_path}'
+```"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
         """Convert SessionResult to PipelineResult."""

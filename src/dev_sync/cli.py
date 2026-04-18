@@ -744,8 +744,10 @@ def poller_start(
 
         # Get GitHub username
         try:
+            from dev_sync.core.github import _find_gh
+            gh_bin = _find_gh()
             result = subprocess.run(
-                ["gh", "api", "user", "--jq", ".login"],
+                [gh_bin, "api", "user", "--jq", ".login"],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -883,6 +885,12 @@ def poller_status(
 
     console.print("[dim]Poller not running[/dim]")
     raise typer.Exit(1)
+
+
+@app.command("version")
+def version() -> None:
+    """Print the package version."""
+    console.print(__version__)
 
 
 @app.command("status")

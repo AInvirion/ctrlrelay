@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -12,11 +13,22 @@ class GitHubError(Exception):
     """Raised when gh CLI operations fail."""
 
 
+def _find_gh() -> str:
+    """Find gh binary, checking common paths if not in PATH."""
+    gh = shutil.which("gh")
+    if gh:
+        return gh
+    for path in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]:
+        if shutil.which(path):
+            return path
+    return "gh"
+
+
 @dataclass
 class GitHubCLI:
     """Async wrapper around the gh CLI."""
 
-    gh_binary: str = "gh"
+    gh_binary: str = field(default_factory=_find_gh)
     timeout: int = 60
 
     async def _run_gh(self, *args: str) -> str:
