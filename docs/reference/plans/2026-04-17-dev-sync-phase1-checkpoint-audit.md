@@ -2,6 +2,7 @@
 title: Phase 1 — Checkpoint Protocol + Skill Audit
 layout: default
 parent: Plans
+grand_parent: Design & history
 nav_order: 2
 ---
 

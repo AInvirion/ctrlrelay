@@ -1,7 +1,9 @@
 ---
-title: Claude Code Project Guide
+title: Claude Code project guide
 layout: default
+parent: Design & history
 nav_order: 2
+permalink: /reference/claude-code-project-guide/
 ---
 
 # Claude Code Project Development Guide

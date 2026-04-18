@@ -2,6 +2,7 @@
 title: Phase 3 — Secops Pipeline
 layout: default
 parent: Plans
+grand_parent: Design & history
 nav_order: 4
 ---
 
