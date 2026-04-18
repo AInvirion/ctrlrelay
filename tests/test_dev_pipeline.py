@@ -536,6 +536,80 @@ class TestRunDevIssueVerification:
         assert "conflict" in fix_call["prompt"].lower()
 
     @pytest.mark.asyncio
+    async def test_run_dev_issue_does_not_retry_on_ci_timeout(
+        self, tmp_path: Path
+    ) -> None:
+        """If CI is simply slow (verifier reports timed_out), _verify_and_fix_pr
+        must NOT resume Claude — it hands off the PR as-is. Otherwise every
+        long-running CI becomes a retry-until-max-attempts failure."""
+        from dev_sync.core.checkpoint import CheckpointState, CheckpointStatus
+        from dev_sync.core.dispatcher import SessionResult
+        from dev_sync.core.pr_verifier import VerificationResult
+        from dev_sync.core.state import StateDB
+        from dev_sync.pipelines.dev import run_dev_issue
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="dev-123",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.DONE,
+                session_id="dev-123",
+                timestamp="2026-04-17T12:00:00Z",
+                summary="PR #42 opened",
+                outputs={"pr_url": "https://github.com/o/r/pull/42", "pr_number": 42},
+            ),
+        )
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree_with_new_branch.return_value = tmp_path / "worktree"
+        mock_worktree.symlink_context = MagicMock()
+        mock_worktree.remove_context_symlink = MagicMock()
+
+        mock_github = AsyncMock()
+        mock_github.get_issue.return_value = {
+            "number": 123,
+            "title": "Fix bug",
+            "body": "Bug description",
+            "comments": [],
+        }
+
+        state_db = StateDB(tmp_path / "state.db")
+
+        mock_pr_verifier = AsyncMock()
+        mock_pr_verifier.verify.return_value = VerificationResult(
+            ready=False,
+            timed_out=True,
+            reason="CI still running after timeout: 1 check(s) pending (long-ci)",
+            pending_checks=[
+                {"name": "long-ci", "state": "IN_PROGRESS", "bucket": "pending"}
+            ],
+        )
+
+        result = await run_dev_issue(
+            repo="owner/repo",
+            issue_number=123,
+            branch_template="fix/issue-{n}",
+            dispatcher=mock_dispatcher,
+            github=mock_github,
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+            pr_verifier=mock_pr_verifier,
+        )
+
+        # Hand-off as success — CI is slow but the PR is opened.
+        assert result.success
+        assert result.outputs["pr_number"] == 42
+        # No fix attempt was issued.
+        assert mock_dispatcher.spawn_session.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_run_dev_issue_fails_after_max_fix_attempts(self, tmp_path: Path) -> None:
         """Should give up and return failure after max fix attempts."""
         from dev_sync.core.state import StateDB

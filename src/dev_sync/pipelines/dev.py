@@ -251,6 +251,10 @@ async def _verify_and_fix_pr(
     pr_number = int(pr_number_raw)
 
     verification = await verifier.verify(ctx.repo, pr_number)
+    # If CI is simply slow (timed_out) we hand the PR off rather than asking
+    # Claude to "fix" something that isn't broken.
+    if verification.timed_out:
+        return result
     attempts = 0
     while not verification.ready and attempts < max_attempts:
         fix_prompt = _build_fix_prompt(pr_number, verification)
@@ -273,6 +277,9 @@ async def _verify_and_fix_pr(
 
         result = fix_result
         verification = await verifier.verify(ctx.repo, pr_number)
+        if verification.timed_out:
+            # Same rule after a fix round: slow CI isn't a Claude task.
+            return result
 
     if verification.ready:
         return result

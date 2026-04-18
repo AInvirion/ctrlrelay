@@ -247,6 +247,50 @@ class TestPRVerifier:
         assert result.merge_state_status == "UNSTABLE"
 
     @pytest.mark.asyncio
+    async def test_verify_ready_when_blocked_awaiting_review(self) -> None:
+        """On repos requiring review approval, mergeStateStatus=BLOCKED is the
+        expected state after CI passes. The dev pipeline explicitly does NOT
+        auto-merge — awaiting-review is the right terminal state to hand off."""
+        from dev_sync.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks.return_value = [
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
+        ]
+        mock_github.get_pr_state.return_value = {
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "BLOCKED",
+        }
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        result = await verifier.verify("owner/repo", 42)
+
+        assert result.ready is True
+        assert result.merge_state_status == "BLOCKED"
+
+    @pytest.mark.asyncio
+    async def test_verify_timed_out_when_checks_still_pending(self) -> None:
+        """If wait_for_checks returns with pending entries (timeout hit),
+        verify must mark the result timed_out=True rather than folding those
+        checks into failing_checks — Claude can't 'fix' slow CI."""
+        from dev_sync.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        # Forever pending at a very short timeout.
+        mock_github.get_pr_checks.return_value = [
+            {"name": "long-ci", "state": "IN_PROGRESS", "bucket": "pending"},
+        ]
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        result = await verifier.verify("owner/repo", 42, timeout=0)
+
+        assert result.ready is False
+        assert result.timed_out is True
+        assert result.failing_checks == []
+        assert len(result.pending_checks) == 1
+        assert "pending" in result.reason.lower() or "timeout" in result.reason.lower()
+
+    @pytest.mark.asyncio
     async def test_verify_ready_when_has_hooks(self) -> None:
         """HAS_HOOKS is mergeable — the repo has pre-receive hooks but they
         don't block merge."""

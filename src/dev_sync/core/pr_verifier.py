@@ -16,9 +16,12 @@ _PASSING_BUCKETS = frozenset({"pass", "skipping"})
 _TERMINAL_MERGEABLE_VALUES = frozenset({"MERGEABLE", "CONFLICTING"})
 
 # mergeStateStatus values GitHub returns (docs: PullRequestMergeStateStatus).
-# We hand off only when CLEAN or HAS_HOOKS — everything else needs a rebase,
-# a failing-check fix, or a protection-rule check first.
-_READY_MERGE_STATE_STATUS = frozenset({"CLEAN", "HAS_HOOKS"})
+# CLEAN / HAS_HOOKS are obviously mergeable. BLOCKED is mergeable-pending-
+# review on repos that require an approving review — the dev pipeline never
+# auto-merges, so awaiting review is the intended terminal state for us.
+# (Failing required checks would already have been caught in failing_checks
+# above, so reaching here with BLOCKED means a human approval step.)
+_READY_MERGE_STATE_STATUS = frozenset({"CLEAN", "HAS_HOOKS", "BLOCKED"})
 # BEHIND = branch not up-to-date with base; base-branch protection commonly
 # blocks merging in this state. Surface it with the same affordance as
 # CONFLICTING so Claude rebases before hand-off.
@@ -37,6 +40,11 @@ class VerificationResult:
     ready: bool
     reason: str = ""
     failing_checks: list[dict[str, Any]] = field(default_factory=list)
+    pending_checks: list[dict[str, Any]] = field(default_factory=list)
+    # Set True when wait_for_checks returned with pending entries (timeout hit
+    # while CI was still running). Callers use this to distinguish "needs a
+    # fix" from "just slow CI" and avoid burning retry budget on the latter.
+    timed_out: bool = False
     mergeable: str | None = None
     merge_state_status: str | None = None
 
@@ -91,16 +99,32 @@ class PRVerifier:
     ) -> VerificationResult:
         """Wait for CI, then check mergeability. Report ready only when both are green."""
         checks = await self.wait_for_checks(repo, pr_number, timeout=timeout)
+        pending = [c for c in checks if c.get("bucket") in _PENDING_BUCKETS]
         failing = [
             c for c in checks
-            if c.get("bucket") in _PENDING_BUCKETS
-            or c.get("bucket") not in _PASSING_BUCKETS
+            if c.get("bucket") not in _PENDING_BUCKETS
+            and c.get("bucket") not in _PASSING_BUCKETS
         ]
+        if pending:
+            # wait_for_checks returned with pending entries still outstanding,
+            # which only happens on timeout. Don't ask Claude to "fix" slow CI
+            # — surface it as a separate outcome the caller can pass through.
+            names = ", ".join(c.get("name", "?") for c in pending)
+            return VerificationResult(
+                ready=False,
+                timed_out=True,
+                reason=(
+                    f"CI still running after timeout: {len(pending)} "
+                    f"check(s) pending ({names})"
+                ),
+                pending_checks=pending,
+                failing_checks=failing,
+            )
         if failing:
             names = ", ".join(c.get("name", "?") for c in failing)
             return VerificationResult(
                 ready=False,
-                reason=f"{len(failing)} check(s) failing or incomplete: {names}",
+                reason=f"{len(failing)} check(s) failing: {names}",
                 failing_checks=failing,
             )
 
