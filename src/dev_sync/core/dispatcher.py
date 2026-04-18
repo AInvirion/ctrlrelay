@@ -60,6 +60,11 @@ class ClaudeDispatcher:
     default_timeout: int = 1800
     extra_env: dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not os.path.isabs(self.claude_binary):
+            resolved = shutil.which(self.claude_binary)
+            self.claude_binary = resolved or _find_claude()
+
     async def spawn_session(
         self,
         session_id: str,
