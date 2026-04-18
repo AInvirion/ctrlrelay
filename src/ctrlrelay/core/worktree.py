@@ -130,20 +130,48 @@ class WorktreeManager:
 
         if await self.branch_exists_locally(repo, new_branch):
             # Sync the local ref to origin/<branch> before checkout so a
-            # retry after an out-of-band push (human commit on the PR,
-            # another machine) doesn't reuse stale local state and then
-            # fail on a non-fast-forward push. Best-effort: if the sync
-            # can't run (no remote branch, network error), fall back to
-            # whatever the local ref points at.
+            # retry after an out-of-band push (reviewer commit on the PR,
+            # another machine) starts from the fresh upstream state. Two
+            # safeties matter here:
+            #   1. ensure_bare_repo's earlier `fetch --all` may have run
+            #      seconds or minutes ago; between then and now someone
+            #      could have pushed. Re-fetch this specific branch so
+            #      origin/<branch> really does reflect the remote head.
+            #   2. The local branch may be AHEAD of origin — e.g. the
+            #      prior session committed locally and died before
+            #      `git push`. A blind `branch -f` would rewind those
+            #      commits and destroy the only copy. Only fast-forward
+            #      when the local tip is an ancestor of origin/<branch>;
+            #      if local is ahead or diverged, leave it alone.
             if await self.branch_exists_on_remote(repo, new_branch):
                 try:
                     await self._run_git(
-                        "branch", "-f", new_branch, f"origin/{new_branch}",
-                        cwd=bare_path,
+                        "fetch", "origin", new_branch, cwd=bare_path,
                     )
                 except WorktreeError:
                     pass
-            # Reuse: check out the existing ref into the new worktree.
+                try:
+                    # merge-base --is-ancestor exits 0 if local is ancestor
+                    # of origin/<branch> (i.e. behind or equal). Non-zero =
+                    # local is ahead or diverged.
+                    await self._run_git(
+                        "merge-base", "--is-ancestor",
+                        new_branch, f"origin/{new_branch}",
+                        cwd=bare_path,
+                    )
+                except WorktreeError:
+                    # Local is ahead or diverged — preserve recoverable
+                    # commits; skip the force-update.
+                    pass
+                else:
+                    try:
+                        await self._run_git(
+                            "branch", "-f", new_branch, f"origin/{new_branch}",
+                            cwd=bare_path,
+                        )
+                    except WorktreeError:
+                        pass
+            # Reuse: check out the (possibly-updated) ref into the new worktree.
             await self._run_git(
                 "worktree", "add",
                 str(worktree_path),

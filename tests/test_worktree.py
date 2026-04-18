@@ -129,12 +129,17 @@ class TestWorktreeManager:
         bare.mkdir(parents=True)
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            # show-ref (exists), ls-remote (branch on origin), branch -f, worktree add
+            # Reuse path happy-case: local behind origin, fast-forward to origin.
+            #  show-ref (exists) → ls-remote (on origin) → fetch origin <branch>
+            #    → merge-base --is-ancestor (exit 0, local behind)
+            #    → branch -f <branch> origin/<branch> → worktree add
             mock_git.side_effect = [
-                "",                                  # show-ref --verify ok
-                "abc123\trefs/heads/fix/issue-5\n",  # ls-remote --heads origin fix/...
-                "",                                  # branch -f fix/issue-5 origin/...
-                "",                                  # worktree add (reuse)
+                "",                                  # show-ref --verify
+                "abc123\trefs/heads/fix/issue-5\n",  # ls-remote --heads origin
+                "",                                  # fetch origin fix/issue-5
+                "",                                  # merge-base --is-ancestor (ok)
+                "",                                  # branch -f
+                "",                                  # worktree add
             ]
 
             wt = await manager.create_worktree_with_new_branch(
@@ -144,7 +149,21 @@ class TestWorktreeManager:
             )
 
         assert "retry-1" in str(wt)
-        # A branch -f call must have happened, targeting origin/<branch>.
+        # Fetched the specific branch to refresh the tracking ref.
+        fetch_calls = [
+            c for c in mock_git.call_args_list
+            if "fetch" in c[0] and "origin" in c[0]
+        ]
+        assert any("fix/issue-5" in c[0] for c in fetch_calls), (
+            f"expected `git fetch origin fix/issue-5`; got {fetch_calls}"
+        )
+        # Ancestor-check ran before any force-update.
+        ancestor_calls = [
+            c for c in mock_git.call_args_list
+            if "merge-base" in c[0] and "--is-ancestor" in c[0]
+        ]
+        assert len(ancestor_calls) == 1
+        # branch -f happened (fast-forward was safe).
         branch_f_calls = [
             c for c in mock_git.call_args_list
             if "branch" in c[0] and "-f" in c[0]
@@ -153,18 +172,59 @@ class TestWorktreeManager:
         bf_args = branch_f_calls[0][0]
         assert "fix/issue-5" in bf_args
         assert "origin/fix/issue-5" in bf_args
-
+        # worktree add without -b.
         worktree_add_calls = [
             c for c in mock_git.call_args_list
             if "worktree" in c[0] and "add" in c[0]
         ]
         assert len(worktree_add_calls) == 1
         args = worktree_add_calls[0][0]
-        # Reuse path MUST NOT pass -b.
-        assert "-b" not in args, (
-            f"reuse path must not use -b; git call args: {args}"
-        )
+        assert "-b" not in args
         assert "fix/issue-5" in args
+
+    @pytest.mark.asyncio
+    async def test_reuse_preserves_local_commits_when_ahead_of_origin(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P1: if the prior attempt made commits locally but died
+        before pushing, the local branch is AHEAD of origin. The sync MUST
+        NOT `branch -f` over those commits — that's the only copy of the
+        operator's recoverable work."""
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            # Ancestor check FAILS (non-zero → local is ahead or diverged).
+            mock_git.side_effect = [
+                "",                                  # show-ref
+                "abc\trefs/heads/fix/issue-9\n",     # ls-remote
+                "",                                  # fetch origin
+                WorktreeError("not an ancestor"),    # merge-base --is-ancestor
+                "",                                  # worktree add (reuse as-is)
+            ]
+
+            wt = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="retry-ahead",
+                new_branch="fix/issue-9",
+            )
+
+        assert "retry-ahead" in str(wt)
+        # CRITICAL: no branch -f should have been attempted.
+        branch_f_calls = [
+            c for c in mock_git.call_args_list
+            if "branch" in c[0] and "-f" in c[0]
+        ]
+        assert branch_f_calls == [], (
+            "reuse must not force-update when local is ahead of origin "
+            "(would destroy unpushed commits)"
+        )
 
     @pytest.mark.asyncio
     async def test_reuse_when_branch_not_on_remote_skips_sync(
