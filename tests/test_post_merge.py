@@ -489,40 +489,120 @@ class TestPRWatchTask:
         )
 
     @pytest.mark.asyncio
-    async def test_transport_factory_failure_is_non_fatal(self, caplog) -> None:
-        """If the transport factory raises, we log and proceed with
-        transport=None — the merge detection itself must not depend on
-        the notification channel being up."""
+    async def test_transient_transport_factory_failure_retries_and_recovers(
+        self, caplog
+    ) -> None:
+        """Codex P2: a transient bridge outage right at merge time must
+        not permanently drop the notification. The factory is retried
+        on each attempt, and once it recovers the notification lands."""
         from ctrlrelay.pipelines.post_merge import pr_watch_task
 
         mock_github = AsyncMock()
         mock_github.get_pr_state.return_value = {"state": "MERGED"}
 
-        async def factory():
-            raise RuntimeError("bridge socket missing")
+        factory_calls = 0
+        built: list = []
 
-        with caplog.at_level(logging.INFO, logger="ctrlrelay.pipelines.post_merge"):
-            outcome = await pr_watch_task(
-                repo="owner/repo",
-                issue_number=77,
-                pr_url="",
-                pr_number=42,
-                session_id=None,
-                github=mock_github,
-                transport_factory=factory,
-                poll_interval=0,
-                timeout=5,
-            )
+        async def factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls < 3:
+                raise RuntimeError("bridge socket missing")
+            t = AsyncMock()
+            built.append(t)
+            return t
+
+        import ctrlrelay.pipelines.post_merge as pm
+        orig = pm._HANDLE_MERGE_RETRY_BASE_DELAY
+        pm._HANDLE_MERGE_RETRY_BASE_DELAY = 0
+        try:
+            with caplog.at_level(logging.INFO, logger="ctrlrelay.pipelines.post_merge"):
+                outcome = await pr_watch_task(
+                    repo="owner/repo",
+                    issue_number=77,
+                    pr_url="",
+                    pr_number=42,
+                    session_id=None,
+                    github=mock_github,
+                    transport_factory=factory,
+                    poll_interval=0,
+                    timeout=5,
+                )
+        finally:
+            pm._HANDLE_MERGE_RETRY_BASE_DELAY = orig
 
         assert outcome["merged"] is True
-        assert any(
-            "dev.pr.watch_transport_failed" in r.getMessage()
-            for r in caplog.records
-        )
-        # Merge detection still closed the issue even without transport.
+        assert outcome["failed"] is None
+        # Comment + close stayed idempotent across the retry loop.
         mock_github.comment_on_issue.assert_called_once()
         close_calls = [
             c for c in mock_github._run_gh.call_args_list
             if c.args[:2] == ("issue", "close")
         ]
         assert len(close_calls) == 1
+        # Factory was retried until it recovered.
+        assert factory_calls == 3
+        # The recovered transport received the notification.
+        assert len(built) == 1
+        built[0].send.assert_awaited_once()
+        # Transient failures were surfaced as structured events.
+        failed_events = [
+            r for r in caplog.records
+            if "dev.pr.watch_transport_failed" in r.getMessage()
+        ]
+        assert len(failed_events) == 2
+
+    @pytest.mark.asyncio
+    async def test_persistent_transport_factory_failure_closes_issue_and_reports_failure(
+        self, caplog
+    ) -> None:
+        """If the factory NEVER recovers, the merge is still detected,
+        the issue is still closed exactly once (comment + gh close),
+        and the task surfaces the failure in outcome["failed"] so an
+        operator can see the notification was lost."""
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        async def factory():
+            raise RuntimeError("bridge permanently gone")
+
+        import ctrlrelay.pipelines.post_merge as pm
+        orig = pm._HANDLE_MERGE_RETRY_BASE_DELAY
+        pm._HANDLE_MERGE_RETRY_BASE_DELAY = 0
+        try:
+            with caplog.at_level(logging.INFO, logger="ctrlrelay.pipelines.post_merge"):
+                outcome = await pr_watch_task(
+                    repo="owner/repo",
+                    issue_number=77,
+                    pr_url="",
+                    pr_number=42,
+                    session_id=None,
+                    github=mock_github,
+                    transport_factory=factory,
+                    poll_interval=0,
+                    timeout=5,
+                )
+        finally:
+            pm._HANDLE_MERGE_RETRY_BASE_DELAY = orig
+
+        # Merge WAS detected — record it even though cleanup degraded.
+        assert outcome["merged"] is True
+        # But the task surfaces the notification failure.
+        assert outcome["failed"] == "RuntimeError"
+        # Issue closed exactly once — idempotency held across retries.
+        mock_github.comment_on_issue.assert_called_once()
+        close_calls = [
+            c for c in mock_github._run_gh.call_args_list
+            if c.args[:2] == ("issue", "close")
+        ]
+        assert len(close_calls) == 1
+        # dev.pr.merged fired (merge was real) AND dev.pr.watch_failed
+        # fired at the end (notification path exhausted retries).
+        assert any(
+            "dev.pr.merged" in r.getMessage() for r in caplog.records
+        )
+        assert any(
+            "dev.pr.watch_failed" in r.getMessage() for r in caplog.records
+        )

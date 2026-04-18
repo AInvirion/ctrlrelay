@@ -119,12 +119,19 @@ async def _handle_merge_with_retry(
         f"Issue #{issue_number} closed after PR #{pr_number} merged in {repo}"
     )
 
+    # Notification is "required" only if the caller asked for one (by
+    # passing a transport_factory). Without a factory, comment+close is
+    # the whole contract and we're done once those land.
+    notification_required = transport_factory is not None
+
     for attempt in range(1, _HANDLE_MERGE_RETRY_ATTEMPTS + 1):
         transport: Transport | None = None
+        transport_build_error: Exception | None = None
         if not notification_sent and transport_factory is not None:
             try:
                 transport = await transport_factory()
             except Exception as e:
+                transport_build_error = e
                 log_event(
                     _logger, "dev.pr.watch_transport_failed",
                     session_id=session_id, repo=repo,
@@ -146,7 +153,20 @@ async def _handle_merge_with_retry(
             if not notification_sent and transport is not None:
                 await transport.send(notification)
                 notification_sent = True
-            return
+
+            # Done only when every required step has completed. If the
+            # caller wanted a notification but the factory failed to
+            # produce a transport this round, fall through to the retry
+            # path so the next attempt can rebuild the connection —
+            # otherwise a brief bridge outage at merge time would
+            # permanently drop the notification.
+            if notification_sent or not notification_required:
+                return
+            # Synthesize a retry-worthy error so the transient factory
+            # failure is treated uniformly with send/close failures.
+            raise transport_build_error or RuntimeError(
+                "transport factory returned None; cannot send notification"
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -218,6 +238,19 @@ async def pr_watch_task(
         merged = await watcher.wait_for_merge(
             repo=repo, pr_number=pr_number, timeout=timeout,
         )
+        # Record merge detection BEFORE running the post-merge handler,
+        # so an exhausted retry loop (e.g. permanent bridge outage) still
+        # leaves `outcome["merged"] = True`. The merge really did happen;
+        # only the cleanup chain is degraded, and `outcome["failed"]`
+        # already surfaces that via the except branch below.
+        outcome["merged"] = merged
+        outcome["timed_out"] = not merged
+        log_event(
+            _logger,
+            "dev.pr.merged" if merged else "dev.pr.watch_timeout",
+            session_id=session_id, repo=repo, issue_number=issue_number,
+            pr_number=pr_number,
+        )
         if merged:
             # Defer transport construction to inside the retry loop so
             # each attempt gets a fresh connection — a bridge restart
@@ -229,14 +262,6 @@ async def pr_watch_task(
                 transport_factory=transport_factory,
                 session_id=session_id,
             )
-        outcome["merged"] = merged
-        outcome["timed_out"] = not merged
-        log_event(
-            _logger,
-            "dev.pr.merged" if merged else "dev.pr.watch_timeout",
-            session_id=session_id, repo=repo, issue_number=issue_number,
-            pr_number=pr_number,
-        )
     except asyncio.CancelledError:
         outcome["cancelled"] = True
         log_event(
