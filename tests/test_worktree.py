@@ -136,7 +136,6 @@ class TestWorktreeManager:
             #  update-ref refs/heads/<b> refs/ctrlrelay/sync/<b> →
             #  update-ref -d refs/ctrlrelay/sync/<b> → worktree add
             mock_git.side_effect = [
-                "",                                  # worktree prune (unconditional)
                 "",                                  # show-ref --verify
                 "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-5\n",     # ls-remote --heads origin
@@ -218,7 +217,6 @@ class TestWorktreeManager:
             # Second check (remote→local) SUCCEEDS: remote is ancestor of
             # local, meaning local is strictly ahead. Preserve local.
             mock_git.side_effect = [
-                "",                                  # worktree prune (unconditional)
                 "",                                  # show-ref
                 "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-9\n",     # ls-remote
@@ -266,7 +264,6 @@ class TestWorktreeManager:
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             # Both ancestor checks fail → diverged.
             mock_git.side_effect = [
-                "",                                  # worktree prune (unconditional)
                 "",                                  # show-ref
                 "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-3\n",     # ls-remote
@@ -309,7 +306,6 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
-                "",                                  # worktree prune (unconditional)
                 "",                                  # show-ref
                 "",                                  # worktree list --porcelain
                 WorktreeError("gh ls-remote auth"),  # strict ls-remote raises
@@ -359,7 +355,6 @@ class TestWorktreeManager:
             # Fetch raises TimeoutError; helper returns early (no cleanup —
             # scratch ref was never created).
             mock_git.side_effect = [
-                "",                                  # worktree prune (unconditional)
                 "",                                  # show-ref
                 "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-42\n",    # ls-remote
@@ -406,7 +401,6 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
-                "",                                  # worktree prune (unconditional)
                 "",                  # show-ref (local exists)
                 porcelain,           # worktree list: another worktree has the branch
             ]
@@ -427,6 +421,67 @@ class TestWorktreeManager:
             f"no mutating git ops allowed when branch is checked out "
             f"elsewhere; got {mutating_calls}"
         )
+
+    @pytest.mark.asyncio
+    async def test_worktree_add_retries_after_targeted_prune_on_stale_admin(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P1: if a prior worktree crashed between rmtree and prune,
+        `git worktree add` fails with 'already checked out' even though no
+        live checkout exists. The reuse path must detect the stale entry,
+        run a scoped prune, and retry — NOT an unconditional up-front
+        prune that would also remove admin state for unrelated worktrees
+        whose paths are temporarily unavailable."""
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        stale_porcelain = (
+            "worktree /Users/x/.ctrlrelay/worktrees/owner-repo-crashed-sess\n"
+            "HEAD abc\n"
+            "branch refs/heads/fix/issue-99\n"
+            "prunable gitdir file points to non-existent location\n"
+            "\n"
+        )
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",                                      # show-ref (branch exists)
+                "",                                      # worktree list (no live, prunable only)
+                "",                                      # ls-remote (no remote)
+                "refs/heads/main\n",                     # get_default_branch
+                "+ abc unique\n",                        # cherry (unique — reuse path)
+                # first worktree add attempt FAILS on stale admin
+                WorktreeError("fatal: 'fix/issue-99' is already checked out at /stale"),
+                stale_porcelain,                         # porcelain probe for stale entry
+                "",                                      # worktree prune (recovery)
+                "",                                      # worktree add (retry succeeds)
+            ]
+            wt = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="retry-after-crash",
+                new_branch="fix/issue-99",
+            )
+
+        assert "retry-after-crash" in str(wt)
+        # Prune happened AFTER the failed add, not before.
+        prune_calls = [
+            i for i, c in enumerate(mock_git.call_args_list)
+            if "prune" in c[0]
+        ]
+        add_calls = [
+            i for i, c in enumerate(mock_git.call_args_list)
+            if "worktree" in c[0] and "add" in c[0]
+        ]
+        assert prune_calls, "expected a prune call"
+        assert add_calls, "expected at least one add call"
+        # First add attempt precedes prune; second add follows.
+        assert add_calls[0] < prune_calls[0] < add_calls[1]
 
     @pytest.mark.asyncio
     async def test_prunable_worktree_stanza_does_not_block_reuse(
@@ -457,7 +512,6 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
-                "",                                  # worktree prune (unconditional)
                 "",                                      # show-ref (local exists)
                 stale_porcelain,                         # worktree list: prunable stanza
                 "",                                      # ls-remote (no remote)
@@ -498,7 +552,6 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
-                "",                                  # worktree prune (unconditional)
                 "",                                      # show-ref (exists)
                 "",                                      # worktree list --porcelain
                 "",                                      # ls-remote (empty, not on remote)
@@ -547,7 +600,6 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
-                "",                                  # worktree prune (unconditional)
                 "",                                      # show-ref (local exists)
                 "",                                      # worktree list --porcelain
                 "",                                      # ls-remote (empty)
@@ -599,7 +651,6 @@ class TestWorktreeManager:
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
-                "",                                  # worktree prune (unconditional)
                 "",                      # show-ref
                 "",                      # worktree list --porcelain
                 "",                      # ls-remote
@@ -640,8 +691,7 @@ class TestWorktreeManager:
         )
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            # prune → default-branch probe → worktree add
-            mock_git.side_effect = ["", "refs/heads/main\n", ""]
+            mock_git.side_effect = ["refs/heads/main\n", ""]
 
             worktree_path = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
@@ -650,14 +700,13 @@ class TestWorktreeManager:
             )
 
             assert worktree_path is not None
-            # Calls: prune, then symbolic-ref HEAD (for default), then worktree add.
+            # First call: symbolic-ref HEAD (default branch probe).
             first_call_args = mock_git.call_args_list[0][0]
-            assert "prune" in first_call_args
+            assert "symbolic-ref" in first_call_args
+            # Second call: worktree add -b <new> <base>.
             second_call_args = mock_git.call_args_list[1][0]
-            assert "symbolic-ref" in second_call_args
-            third_call_args = mock_git.call_args_list[2][0]
-            assert "-b" in third_call_args
-            assert "main" in third_call_args
+            assert "-b" in second_call_args
+            assert "main" in second_call_args
 
     @pytest.mark.asyncio
     async def test_push_branch(self, tmp_path: Path) -> None:

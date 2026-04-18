@@ -128,20 +128,6 @@ class WorktreeManager:
         if worktree_path.exists():
             raise WorktreeError(f"Worktree already exists: {worktree_path}")
 
-        # Best-effort: prune stale worktree metadata up front. If a prior
-        # session crashed between `shutil.rmtree(worktree_path)` and
-        # `git worktree prune`, the bare repo still thinks the branch is
-        # checked out — `git worktree add <branch>` would refuse even
-        # though no live worktree exists. Running prune first makes the
-        # subsequent add succeed. Best-effort: ignore errors so a failing
-        # prune doesn't abort creation.
-        try:
-            await self._run_git(
-                "worktree", "prune", cwd=bare_path, timeout=10,
-            )
-        except Exception:
-            pass
-
         if await self.branch_exists_locally(repo, new_branch):
             # CRITICAL safety: never mutate or delete a branch that's still
             # checked out by another linked worktree (e.g. a BLOCKED session
@@ -170,11 +156,8 @@ class WorktreeManager:
                     bare_path, new_branch,
                 )
             except Exception:
-                await self._run_git(
-                    "worktree", "add",
-                    str(worktree_path),
-                    new_branch,
-                    cwd=bare_path,
+                await self._worktree_add_with_stale_cleanup(
+                    bare_path, worktree_path, new_branch,
                 )
                 return worktree_path
 
@@ -182,11 +165,8 @@ class WorktreeManager:
                 # Remote exists → sync local to remote head (preserving
                 # unpushed ahead-of-origin commits) and reuse.
                 await self._sync_reused_branch_to_origin(bare_path, new_branch)
-                await self._run_git(
-                    "worktree", "add",
-                    str(worktree_path),
-                    new_branch,
-                    cwd=bare_path,
+                await self._worktree_add_with_stale_cleanup(
+                    bare_path, worktree_path, new_branch,
                 )
                 return worktree_path
 
@@ -210,11 +190,8 @@ class WorktreeManager:
                     pass
                 # Fall through to the fresh-branch creation below.
             else:
-                await self._run_git(
-                    "worktree", "add",
-                    str(worktree_path),
-                    new_branch,
-                    cwd=bare_path,
+                await self._worktree_add_with_stale_cleanup(
+                    bare_path, worktree_path, new_branch,
                 )
                 return worktree_path
 
@@ -229,6 +206,92 @@ class WorktreeManager:
             cwd=bare_path,
         )
         return worktree_path
+
+    async def _worktree_add_with_stale_cleanup(
+        self, bare_path: Path, worktree_path: Path, branch: str,
+    ) -> None:
+        """``git worktree add <path> <branch>`` with targeted recovery
+        if the add fails because a stale (prunable) admin entry still
+        claims the branch.
+
+        Try the add. If it succeeds, done. If it fails with "already
+        checked out" AND we've already established there's no LIVE
+        checkout of this branch (the caller checked
+        _branch_is_checked_out_elsewhere), we scope a `git worktree
+        prune` to this one stale entry and retry.
+
+        We deliberately do NOT prune up front: an unconditional prune
+        in a bare repo whose worktrees_dir is on a removable / network
+        path would destroy admin state for unrelated worktrees whose
+        paths are temporarily unavailable. Scoping to this specific
+        branch via a post-failure recovery keeps the blast radius
+        minimal.
+        """
+        try:
+            await self._run_git(
+                "worktree", "add", str(worktree_path), branch,
+                cwd=bare_path,
+            )
+            return
+        except WorktreeError as e:
+            if "already checked out" not in str(e):
+                raise
+            # Find the stale admin entry for this branch and clear it.
+            stale_path = await self._find_stale_worktree_path(bare_path, branch)
+            if stale_path is None:
+                raise
+            try:
+                await self._run_git(
+                    "worktree", "prune", cwd=bare_path, timeout=10,
+                )
+            except Exception:
+                pass
+            # Retry the add; if it fails again, let the error surface.
+            await self._run_git(
+                "worktree", "add", str(worktree_path), branch,
+                cwd=bare_path,
+            )
+
+    async def _find_stale_worktree_path(
+        self, bare_path: Path, branch: str,
+    ) -> str | None:
+        """If ``refs/heads/<branch>`` is claimed by a worktree entry marked
+        ``prunable``, return the path of that entry. Otherwise None.
+        Used to confirm that a "already checked out" failure is safe to
+        recover from via prune (i.e. the stale entry IS for our branch
+        and not a real live checkout).
+        """
+        try:
+            output = await self._run_git(
+                "worktree", "list", "--porcelain",
+                cwd=bare_path, timeout=10,
+            )
+        except Exception:
+            return None
+        target = f"refs/heads/{branch}"
+        current_path: str | None = None
+        current_branch: str | None = None
+        current_prunable = False
+        for raw in output.splitlines() + [""]:
+            line = raw.strip()
+            if not line:
+                if (
+                    current_branch == target
+                    and current_prunable
+                    and current_path is not None
+                ):
+                    return current_path
+                current_path = None
+                current_branch = None
+                current_prunable = False
+                continue
+            if line.startswith("worktree "):
+                current_path = line[9:].strip()
+            elif line.startswith("branch "):
+                current_branch = line[7:].strip()
+            elif line.startswith("prunable"):
+                current_prunable = True
+        return None
 
     async def _sync_reused_branch_to_origin(
         self, bare_path: Path, branch: str,
