@@ -187,6 +187,7 @@ async def run_dev_issue(
         )
 
     worktree_path: Path | None = None
+    branch_created = False
 
     try:
         # Get issue details
@@ -199,6 +200,7 @@ async def run_dev_issue(
             session_id=session_id,
             new_branch=branch_name,
         )
+        branch_created = True
 
         # Symlink context
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
@@ -272,14 +274,19 @@ async def run_dev_issue(
         #   DONE    -> remove worktree, keep branch (the open PR references it)
         #   BLOCKED -> keep both (user may resume the session)
         #   FAILED  -> remove worktree AND delete branch so the next retry can
-        #              re-create `fix/issue-<n>` cleanly
+        #              re-create `fix/issue-<n>` cleanly — BUT only if we
+        #              created the branch in this run and it was never pushed;
+        #              if it's on origin, the user has recoverable work there.
         if result.success:
             worktree.remove_context_symlink(worktree_path)
             await worktree.remove_worktree(repo, session_id)
         elif not result.blocked:
             worktree.remove_context_symlink(worktree_path)
             await worktree.remove_worktree(repo, session_id)
-            await worktree.delete_branch(repo, branch_name)
+            if branch_created and not await worktree.branch_exists_on_remote(
+                repo, branch_name
+            ):
+                await worktree.delete_branch(repo, branch_name)
 
         return result
 
@@ -290,7 +297,9 @@ async def run_dev_issue(
         )
         state_db.commit()
 
-        # Best-effort cleanup so a retry isn't blocked by leftover branch/worktree.
+        # Best-effort cleanup so a retry isn't blocked by leftover state. Only
+        # touch the branch if this run created it AND it has no remote copy
+        # (preserves pushed work and never clobbers pre-existing branches).
         if worktree_path is not None:
             try:
                 worktree.remove_context_symlink(worktree_path)
@@ -300,10 +309,16 @@ async def run_dev_issue(
                 await worktree.remove_worktree(repo, session_id)
             except Exception:
                 pass
-        try:
-            await worktree.delete_branch(repo, branch_name)
-        except Exception:
-            pass
+        if branch_created:
+            try:
+                has_remote = await worktree.branch_exists_on_remote(repo, branch_name)
+            except Exception:
+                has_remote = True
+            if not has_remote:
+                try:
+                    await worktree.delete_branch(repo, branch_name)
+                except Exception:
+                    pass
 
         return PipelineResult(
             success=False,

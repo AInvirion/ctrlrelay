@@ -116,9 +116,19 @@ class TestDevPipelineCleanup:
         self,
         tmp_path: Path,
         spawn_side_effect,
+        *,
+        branch_on_remote: bool = False,
+        create_side_effect=None,
     ):
         """Run the dev pipeline with a stub dispatcher behavior, returning
-        (result, worktree_manager_mocks) so tests can assert on cleanup calls."""
+        (result, mocks) so tests can assert on cleanup calls.
+
+        - `branch_on_remote`: what branch_exists_on_remote() returns. False
+          means the branch is local-only (safe to delete). True means origin
+          has it (must preserve).
+        - `create_side_effect`: if set, overrides create_worktree_with_new_branch
+          to simulate setup failure before the branch is created.
+        """
         from dev_sync.core.dispatcher import ClaudeDispatcher
         from dev_sync.core.github import GitHubCLI
         from dev_sync.core.state import StateDB
@@ -146,12 +156,18 @@ class TestDevPipelineCleanup:
              patch.object(worktree, "create_worktree_with_new_branch", new_callable=AsyncMock) as mock_create, \
              patch.object(worktree, "remove_worktree", new_callable=AsyncMock) as mock_remove_wt, \
              patch.object(worktree, "delete_branch", new_callable=AsyncMock) as mock_delete_branch, \
+             patch.object(worktree, "branch_exists_on_remote", new_callable=AsyncMock) as mock_remote, \
              patch.object(worktree, "symlink_context"), \
              patch.object(worktree, "remove_context_symlink"):
 
-            worktree_path = tmp_path / "worktrees" / "wt-13"
-            worktree_path.mkdir(parents=True)
-            mock_create.return_value = worktree_path
+            mock_remote.return_value = branch_on_remote
+
+            if create_side_effect is not None:
+                mock_create.side_effect = create_side_effect
+            else:
+                worktree_path = tmp_path / "worktrees" / "wt-13"
+                worktree_path.mkdir(parents=True)
+                mock_create.return_value = worktree_path
 
             result = await run_dev_issue(
                 repo="owner/repo",
@@ -253,6 +269,51 @@ class TestDevPipelineCleanup:
 
         assert result.blocked
         mock_remove_wt.assert_not_awaited()
+        mock_delete_branch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pushed_branch_is_preserved_on_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P1: if Claude pushed the branch to origin before failing,
+        cleanup must NOT delete the local branch — the user's commits are on
+        origin and deleting local state would orphan them from their clone."""
+
+        async def spawn(**kwargs):
+            raise RuntimeError("claude died after pushing")
+
+        result, mock_remove_wt, mock_delete_branch = await self._run(
+            tmp_path, spawn, branch_on_remote=True
+        )
+
+        assert not result.success
+        # worktree can still be removed (branch ref persists locally anyway)
+        mock_remove_wt.assert_awaited_once()
+        # but the branch must be preserved
+        mock_delete_branch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_setup_failure_does_not_delete_preexisting_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2: if worktree creation fails (e.g. branch from a prior DONE
+        session with an open PR), cleanup must NOT call delete_branch — this
+        session never created or owned that branch."""
+
+        async def create_boom(**kwargs):
+            raise RuntimeError("branch already exists (from a prior DONE run)")
+
+        async def spawn(**kwargs):
+            raise AssertionError("spawn should not be reached")
+
+        result, mock_remove_wt, mock_delete_branch = await self._run(
+            tmp_path, spawn, create_side_effect=create_boom
+        )
+
+        assert not result.success
+        # no worktree to remove either
+        mock_remove_wt.assert_not_awaited()
+        # and never touch the pre-existing branch
         mock_delete_branch.assert_not_awaited()
 
     @pytest.mark.asyncio

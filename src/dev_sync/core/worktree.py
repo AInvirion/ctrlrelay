@@ -151,6 +151,20 @@ class WorktreeManager:
         except WorktreeError:
             pass
 
+    async def branch_exists_on_remote(self, repo: str, branch: str) -> bool:
+        """Return True if `branch` exists on origin. Fail-closed: on error,
+        returns True so callers err on the side of NOT deleting."""
+        bare_path = self._get_bare_repo_path(repo)
+        if not bare_path.exists():
+            return True
+        try:
+            output = await self._run_git(
+                "ls-remote", "--heads", "origin", branch, cwd=bare_path
+            )
+            return bool(output.strip())
+        except WorktreeError:
+            return True
+
     def _get_gitdir(self, worktree_path: Path) -> Path:
         """Get the real gitdir for a worktree.
 
