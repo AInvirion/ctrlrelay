@@ -226,9 +226,11 @@ class TestPRVerifier:
         assert "behind" in result.reason.lower() or "rebase" in result.reason.lower()
 
     @pytest.mark.asyncio
-    async def test_verify_not_ready_when_unstable(self) -> None:
-        """mergeable=MERGEABLE + mergeStateStatus=UNSTABLE (non-required failing
-        check) must not be treated as ready — merge UI would reject it."""
+    async def test_verify_ready_when_unstable(self) -> None:
+        """UNSTABLE (non-required failing check) is accepted as ready:
+        required-check failures would have been caught in failing_checks
+        above, and the dev pipeline never auto-merges — UNSTABLE is a
+        human-review concern, not a Claude-fixable state."""
         from dev_sync.core.pr_verifier import PRVerifier
 
         mock_github = AsyncMock()
@@ -243,7 +245,7 @@ class TestPRVerifier:
         verifier = PRVerifier(github=mock_github, poll_interval=0)
         result = await verifier.verify("owner/repo", 42)
 
-        assert result.ready is False
+        assert result.ready is True
         assert result.merge_state_status == "UNSTABLE"
 
     @pytest.mark.asyncio
@@ -267,6 +269,27 @@ class TestPRVerifier:
 
         assert result.ready is True
         assert result.merge_state_status == "BLOCKED"
+
+    @pytest.mark.asyncio
+    async def test_verify_prioritizes_failing_over_pending_on_timeout(self) -> None:
+        """Matrix build where one job already failed while another is still
+        pending at timeout must be reported as failing (Claude can fix),
+        not timed_out (hand off a known-bad PR)."""
+        from dev_sync.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks.return_value = [
+            {"name": "lint", "state": "FAILURE", "bucket": "fail"},
+            {"name": "long-ci", "state": "IN_PROGRESS", "bucket": "pending"},
+        ]
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        result = await verifier.verify("owner/repo", 42, timeout=0)
+
+        assert result.ready is False
+        assert result.timed_out is False
+        assert len(result.failing_checks) == 1
+        assert result.failing_checks[0]["name"] == "lint"
 
     @pytest.mark.asyncio
     async def test_verify_timed_out_when_checks_still_pending(self) -> None:

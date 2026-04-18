@@ -1,7 +1,7 @@
 """Tests for GitHub CLI wrapper."""
 
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -68,35 +68,79 @@ class TestGitHubCLI:
             {"name": "lint", "state": "SUCCESS", "bucket": "pass"},
         ])
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
-            mock_run.return_value = mock_output
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
+        mock_proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
             gh = GitHubCLI()
             checks = await gh.get_pr_checks("owner/repo", 42)
 
-            assert len(checks) == 2
-            assert all(c["bucket"] == "pass" for c in checks)
+        assert len(checks) == 2
+        assert all(c["bucket"] == "pass" for c in checks)
 
     @pytest.mark.asyncio
     async def test_get_pr_checks_parses_json_on_nonzero_exit(self) -> None:
         """`gh pr checks` exits non-zero while checks are pending/failing, but
         still prints the JSON payload to stdout. get_pr_checks must parse it
-        (via capture_on_nonzero=True) instead of silently returning []."""
+        instead of silently returning []."""
+
         from dev_sync.core.github import GitHubCLI
 
         mock_output = json.dumps([
             {"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"},
         ])
 
-        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
-            mock_run.return_value = mock_output
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
+        mock_proc.returncode = 1  # non-zero, checks still pending
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
             gh = GitHubCLI()
             checks = await gh.get_pr_checks("owner/repo", 42)
 
-            # capture_on_nonzero must be requested
-            call_kwargs = mock_run.call_args.kwargs
-            assert call_kwargs.get("capture_on_nonzero") is True
-            assert len(checks) == 1
-            assert checks[0]["bucket"] == "pending"
+        assert len(checks) == 1
+        assert checks[0]["bucket"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_get_pr_checks_returns_empty_when_no_checks_reported(self) -> None:
+        """gh prints 'no checks reported on the <branch> branch' to stderr
+        and exits non-zero when the PR genuinely has no CI. Treat that as []."""
+
+        from dev_sync.core.github import GitHubCLI
+
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(
+            b"",
+            b"no checks reported on the 'fix/issue-10' branch\n",
+        ))
+        mock_proc.returncode = 1
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+            gh = GitHubCLI()
+            checks = await gh.get_pr_checks("owner/repo", 42)
+
+        assert checks == []
+
+    @pytest.mark.asyncio
+    async def test_get_pr_checks_raises_on_genuine_failure(self) -> None:
+        """Auth/network/missing-PR failures print errors to stderr and leave
+        stdout empty. Must raise GitHubError rather than silently returning []
+        (which would be indistinguishable from 'no CI configured')."""
+
+        from dev_sync.core.github import GitHubCLI, GitHubError
+
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(
+            b"",
+            b"HTTP 401: Bad credentials\n",
+        ))
+        mock_proc.returncode = 1
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+            gh = GitHubCLI()
+            with pytest.raises(GitHubError, match="401"):
+                await gh.get_pr_checks("owner/repo", 42)
 
     @pytest.mark.asyncio
     async def test_list_assigned_issues(self) -> None:

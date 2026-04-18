@@ -15,16 +15,13 @@ _PENDING_BUCKETS = frozenset({"pending"})
 _PASSING_BUCKETS = frozenset({"pass", "skipping"})
 _TERMINAL_MERGEABLE_VALUES = frozenset({"MERGEABLE", "CONFLICTING"})
 
-# mergeStateStatus values GitHub returns (docs: PullRequestMergeStateStatus).
-# CLEAN / HAS_HOOKS are obviously mergeable. BLOCKED is mergeable-pending-
-# review on repos that require an approving review — the dev pipeline never
-# auto-merges, so awaiting review is the intended terminal state for us.
-# (Failing required checks would already have been caught in failing_checks
-# above, so reaching here with BLOCKED means a human approval step.)
-_READY_MERGE_STATE_STATUS = frozenset({"CLEAN", "HAS_HOOKS", "BLOCKED"})
-# BEHIND = branch not up-to-date with base; base-branch protection commonly
-# blocks merging in this state. Surface it with the same affordance as
-# CONFLICTING so Claude rebases before hand-off.
+# The dev pipeline's contract is "open a PR and hand it to humans for review",
+# not "merge the PR". So the verifier does NOT require the PR be in a directly-
+# mergeable state — human-gated states (awaiting review, unresolved comments,
+# pending deployments, merge-queue requirements) are all expected terminal
+# states for us. What we DO reject is state that (a) indicates broken code
+# (failing checks) or (b) the orchestrator can itself fix before hand-off
+# (conflicts, behind base). All other mergeStateStatus values are accepted.
 _REBASE_REQUIRED_MERGE_STATE_STATUS = frozenset({"BEHIND"})
 
 # Require 2 consecutive empty check-list responses separated by a poll interval
@@ -105,10 +102,23 @@ class PRVerifier:
             if c.get("bucket") not in _PENDING_BUCKETS
             and c.get("bucket") not in _PASSING_BUCKETS
         ]
+        # Failing checks take priority over pending. A matrix where lint
+        # already failed but a long integration run is still pending must be
+        # reported as broken, not timed out — otherwise the caller would hand
+        # off a known-bad PR.
+        if failing:
+            names = ", ".join(c.get("name", "?") for c in failing)
+            return VerificationResult(
+                ready=False,
+                reason=f"{len(failing)} check(s) failing: {names}",
+                failing_checks=failing,
+                pending_checks=pending,
+            )
         if pending:
-            # wait_for_checks returned with pending entries still outstanding,
-            # which only happens on timeout. Don't ask Claude to "fix" slow CI
-            # — surface it as a separate outcome the caller can pass through.
+            # All failing paths ruled out; we simply hit the timeout while
+            # everything still in flight was healthy. Don't ask Claude to
+            # "fix" slow CI — surface it as a distinct outcome so the caller
+            # hands off the PR as-is.
             names = ", ".join(c.get("name", "?") for c in pending)
             return VerificationResult(
                 ready=False,
@@ -118,14 +128,6 @@ class PRVerifier:
                     f"check(s) pending ({names})"
                 ),
                 pending_checks=pending,
-                failing_checks=failing,
-            )
-        if failing:
-            names = ", ".join(c.get("name", "?") for c in failing)
-            return VerificationResult(
-                ready=False,
-                reason=f"{len(failing)} check(s) failing: {names}",
-                failing_checks=failing,
             )
 
         mergeable: str | None = None
@@ -162,19 +164,12 @@ class PRVerifier:
                 mergeable=mergeable,
                 merge_state_status=merge_state,
             )
-        if merge_state not in _READY_MERGE_STATE_STATUS:
-            # UNSTABLE (non-required failing check), BLOCKED (other protection),
-            # DRAFT, UNKNOWN, etc. Refuse to hand off rather than declare a PR
-            # ready when the merge UI would actually reject it.
-            return VerificationResult(
-                ready=False,
-                reason=(
-                    f"PR not ready to merge: mergeStateStatus={merge_state}"
-                ),
-                mergeable=mergeable,
-                merge_state_status=merge_state,
-            )
 
+        # Any remaining state (CLEAN, HAS_HOOKS, BLOCKED, UNSTABLE, DRAFT,
+        # etc.) is accepted. CI is verified green above, conflicts and
+        # behind-base are handled explicitly, so what's left is either
+        # directly mergeable or human-gated — both are valid hand-off states
+        # for a pipeline that never auto-merges.
         return VerificationResult(
             ready=True,
             mergeable=mergeable,

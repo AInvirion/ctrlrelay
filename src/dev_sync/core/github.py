@@ -31,15 +31,8 @@ class GitHubCLI:
     gh_binary: str = field(default_factory=_find_gh)
     timeout: int = 60
 
-    async def _run_gh(self, *args: str, capture_on_nonzero: bool = False) -> str:
-        """Run gh command and return stdout.
-
-        By default, non-zero exits raise GitHubError. Some commands
-        (notably `gh pr checks`) print their JSON payload to stdout even
-        when they exit non-zero (e.g. while checks are still pending).
-        Callers that need that payload can set `capture_on_nonzero=True` to
-        receive stdout regardless of exit code.
-        """
+    async def _run_gh(self, *args: str) -> str:
+        """Run gh command and return stdout; raise GitHubError on non-zero."""
         cmd = [self.gh_binary, *args]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -50,7 +43,7 @@ class GitHubCLI:
             proc.communicate(), timeout=self.timeout
         )
 
-        if proc.returncode != 0 and not capture_on_nonzero:
+        if proc.returncode != 0:
             raise GitHubError(f"gh failed: {stderr.decode().strip()}")
 
         return stdout.decode()
@@ -108,26 +101,49 @@ class GitHubCLI:
     ) -> list[dict[str, Any]]:
         """Get status checks for a PR.
 
-        Uses `gh pr checks --json name,state,bucket,link`. `bucket` categorizes
-        the raw state into: pass, fail, pending, skipping, cancel. `gh pr
-        checks` exits non-zero while any check is pending or failing, but it
-        still prints the JSON payload to stdout — so we use
-        `capture_on_nonzero=True` and parse whatever comes back. Genuine
-        failures (auth, network, missing PR) print nothing/garbage and raise
-        `json.JSONDecodeError`, which we let surface so callers don't mistake
-        them for 'no CI configured'.
+        Bypasses `_run_gh` because we need to inspect stdout, stderr, and the
+        exit code independently. `gh pr checks`:
+          - prints a JSON array on stdout when checks exist (exits non-zero
+            when any are pending or failing — the payload is still valid)
+          - prints "no checks reported on the '<branch>' branch" to stderr
+            and exits non-zero when the PR has no checks at all
+          - emits arbitrary errors to stderr (auth, network, missing PR) on
+            non-zero exit with empty stdout
+
+        We return [] only for the "no checks reported" case. Real failures
+        raise GitHubError so callers can distinguish "no CI configured" from
+        "gh is broken".
         """
-        output = await self._run_gh(
+        cmd = [
+            self.gh_binary,
             "pr", "checks",
             str(pr_number),
             "--repo", repo,
             "--json", "name,state,bucket,link",
-            capture_on_nonzero=True,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        stripped = output.strip()
-        if not stripped:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=self.timeout,
+        )
+        stdout = stdout_bytes.decode().strip()
+        stderr = stderr_bytes.decode().strip()
+
+        # JSON payload on stdout — always trust it, regardless of exit code.
+        if stdout:
+            return json.loads(stdout)
+
+        # No stdout. Distinguish "no CI configured" from genuine failures by
+        # looking for gh's well-known "no checks reported" message.
+        if "no checks reported" in stderr.lower():
             return []
-        return json.loads(stripped)
+
+        # Anything else is an honest-to-goodness failure. Don't pretend the
+        # repo has no CI.
+        raise GitHubError(f"gh pr checks failed: {stderr}")
 
     def all_checks_passed(self, checks: list[dict[str, Any]]) -> bool:
         """Check if all PR checks passed."""
