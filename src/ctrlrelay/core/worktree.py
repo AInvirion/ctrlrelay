@@ -129,6 +129,20 @@ class WorktreeManager:
             raise WorktreeError(f"Worktree already exists: {worktree_path}")
 
         if await self.branch_exists_locally(repo, new_branch):
+            # CRITICAL safety: never mutate or delete a branch that's still
+            # checked out by another linked worktree (e.g. a BLOCKED session
+            # that kept its worktree alive on purpose so it can be resumed
+            # when the operator replies). `git update-ref` / `update-ref -d`
+            # don't refuse in that case; they'd leave the live worktree's
+            # HEAD pointing at a stale or missing ref, corrupting the
+            # resumable state. Surface a clean error instead.
+            if await self._branch_is_checked_out_elsewhere(bare_path, new_branch):
+                raise WorktreeError(
+                    f"Branch {new_branch!r} is already checked out in another "
+                    f"worktree of {repo!r}. Resolve with `git worktree list` + "
+                    "`git worktree remove` in the bare repo before retrying."
+                )
+
             on_remote = await self.branch_exists_on_remote(repo, new_branch)
             if on_remote:
                 # Remote exists → sync local to remote head (preserving
@@ -243,6 +257,30 @@ class WorktreeManager:
                     )
                 except Exception:
                     pass
+
+    async def _branch_is_checked_out_elsewhere(
+        self, bare_path: Path, branch: str,
+    ) -> bool:
+        """Return True if ``refs/heads/<branch>`` is currently checked out
+        by any linked worktree of this bare repo.
+
+        Conservative (fails closed): if ``git worktree list --porcelain``
+        itself errors, returns True — better to refuse mutation than to
+        risk corrupting a live worktree.
+        """
+        try:
+            output = await self._run_git(
+                "worktree", "list", "--porcelain",
+                cwd=bare_path, timeout=10,
+            )
+        except Exception:
+            return True
+        target = f"refs/heads/{branch}"
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("branch ") and line[7:].strip() == target:
+                return True
+        return False
 
     async def _branch_is_fully_merged(self, repo: str, branch: str) -> bool:
         """Return True if every commit reachable from ``branch`` is

@@ -137,6 +137,7 @@ class TestWorktreeManager:
             #  update-ref -d refs/ctrlrelay/sync/<b> → worktree add
             mock_git.side_effect = [
                 "",                                  # show-ref --verify
+                "",                                  # worktree list --porcelain (no other checkouts)
                 "abc\trefs/heads/fix/issue-5\n",     # ls-remote --heads origin
                 "",                                  # fetch into scratch
                 "",                                  # merge-base --is-ancestor (ok)
@@ -216,6 +217,7 @@ class TestWorktreeManager:
             # scratch ref still runs via the helper's finally block.
             mock_git.side_effect = [
                 "",                                  # show-ref
+                "",                                  # worktree list --porcelain (no other checkouts)
                 "abc\trefs/heads/fix/issue-9\n",     # ls-remote
                 "",                                  # fetch into scratch
                 WorktreeError("not an ancestor"),    # merge-base --is-ancestor
@@ -263,6 +265,7 @@ class TestWorktreeManager:
             # scratch ref was never created).
             mock_git.side_effect = [
                 "",                                  # show-ref
+                "",                                  # worktree list --porcelain
                 "abc\trefs/heads/fix/issue-42\n",    # ls-remote
                 _asyncio.TimeoutError(),             # fetch scratch — hangs
                 "",                                  # worktree add (proceed)
@@ -283,6 +286,52 @@ class TestWorktreeManager:
         assert len(worktree_add_calls) == 1
 
     @pytest.mark.asyncio
+    async def test_reuse_refuses_when_branch_checked_out_elsewhere(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P1: if the branch is checked out by another worktree
+        (e.g. a BLOCKED session that kept its worktree alive for resume),
+        mutating or deleting refs/heads/<branch> would corrupt that live
+        worktree. Raise WorktreeError before touching anything."""
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        porcelain = (
+            "worktree /Users/x/.ctrlrelay/worktrees/owner-repo-blocked-sess\n"
+            "HEAD abc123def456\n"
+            "branch refs/heads/fix/issue-7\n"
+        )
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",                  # show-ref (local exists)
+                porcelain,           # worktree list: another worktree has the branch
+            ]
+            with pytest.raises(WorktreeError, match="already checked out"):
+                await manager.create_worktree_with_new_branch(
+                    repo="owner/repo",
+                    session_id="retry-colliding",
+                    new_branch="fix/issue-7",
+                )
+
+        # No ref mutation should have happened.
+        mutating_calls = [
+            c for c in mock_git.call_args_list
+            if "update-ref" in c[0] or ("branch" in c[0] and "-f" in c[0])
+            or ("worktree" in c[0] and "add" in c[0])
+        ]
+        assert mutating_calls == [], (
+            f"no mutating git ops allowed when branch is checked out "
+            f"elsewhere; got {mutating_calls}"
+        )
+
+    @pytest.mark.asyncio
     async def test_local_only_with_unique_commits_is_reused(
         self, tmp_path: Path
     ) -> None:
@@ -301,6 +350,7 @@ class TestWorktreeManager:
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
                 "",                                      # show-ref (exists)
+                "",                                      # worktree list --porcelain
                 "",                                      # ls-remote (empty, not on remote)
                 "refs/heads/main\n",                     # get_default_branch → symbolic-ref HEAD
                 "+ abc123 unpushed\n+ def456 more\n",    # cherry default branch — all unique
@@ -348,6 +398,7 @@ class TestWorktreeManager:
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
                 "",                                      # show-ref (local exists)
+                "",                                      # worktree list --porcelain
                 "",                                      # ls-remote (empty)
                 "refs/heads/main\n",                     # get_default_branch (1st)
                 "- abc already merged\n- def ditto\n",   # cherry: all "-" (patch-equivalent)
@@ -398,6 +449,7 @@ class TestWorktreeManager:
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = [
                 "",                      # show-ref
+                "",                      # worktree list --porcelain
                 "",                      # ls-remote
                 "refs/heads/main\n",     # get_default_branch
                 "",                      # cherry: empty
