@@ -115,12 +115,30 @@ class BridgeServer:
 
                 try:
                     msg = parse_message(line.decode())
-                    response = await self._handle_message(msg, writer)
-                    if response:
-                        writer.write(serialize_message(response).encode())
-                        await writer.drain()
                 except ProtocolError:
-                    pass
+                    continue
+
+                response = await self._handle_message(msg, writer)
+                if response is None:
+                    continue
+
+                # Response write races client disconnect: the transport
+                # (SocketTransport) finishes a send/ask round-trip and closes
+                # the socket while we're still flushing the ACK. Swallow the
+                # expected disconnect errors instead of propagating a
+                # traceback into bridge.error.log.
+                if writer.is_closing():
+                    break
+                try:
+                    writer.write(serialize_message(response).encode())
+                    await writer.drain()
+                except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                    _log.debug(
+                        "bridge: client disconnected mid-response "
+                        "(op=%s request_id=%s err=%s)",
+                        msg.op, msg.request_id, e,
+                    )
+                    break
         finally:
             # Client disconnected — drop any outstanding questions tied to
             # this writer so we don't try to answer a dead socket later.
