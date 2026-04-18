@@ -2,8 +2,6 @@
 
 Local-first automation orchestrator for GitHub repos. Wraps Claude CLI to automate security triage, issue-to-PR workflows, and multi-repo operations.
 
-📖 **Docs site:** [ainvirion.github.io/dev-sync](https://ainvirion.github.io/dev-sync/) — design specs, implementation plans, and operator guides, built from [`docs/`](docs/) with Jekyll + just-the-docs and deployed via GitHub Pages.
-
 ## Features
 
 - **Secops Pipeline** - Automated security triage across repos (Dependabot alerts, security PRs)
@@ -24,12 +22,6 @@ uv pip install -e .
 # Or with pip
 pip install -e .
 ```
-
-### Requirements
-
-- Python 3.11+
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude` command)
-- [GitHub CLI](https://cli.github.com/) (`gh` command, authenticated)
 
 ## Quick Start
 
@@ -393,16 +385,6 @@ ruff check src/
 # Run specific test
 pytest tests/test_dev_pipeline.py -v
 ```
-
-## Roadmap
-
-- [x] Phase 1: Core infrastructure (state, config, worktrees)
-- [x] Phase 2: Claude dispatcher and checkpoint protocol
-- [x] Phase 3: Secops pipeline
-- [x] Phase 4: Dev pipeline (issue-to-PR)
-- [x] Phase 5: Telegram integration (human-in-the-loop)
-- [ ] Phase 6: Dashboard integration
-- [ ] Phase 7: Deploy-verify pipeline
 
 ## License
 

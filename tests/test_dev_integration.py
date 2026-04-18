@@ -317,9 +317,10 @@ class TestDevPipelineCleanup:
         )
 
         assert not result.success
-        # no worktree to remove either
-        mock_remove_wt.assert_not_awaited()
-        # and never touch the pre-existing branch
+        # remove_worktree is called unconditionally to prune any stale metadata
+        # — that's fine, it's keyed by session_id so it only touches our own.
+        mock_remove_wt.assert_awaited_once()
+        # but we must never touch the pre-existing branch
         mock_delete_branch.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -349,9 +350,11 @@ class TestDevPipelineCleanup:
         )
 
         assert not result.success
-        # worktree_path never got assigned, so remove_worktree isn't called
-        mock_remove_wt.assert_not_awaited()
-        # but we owned the branch, so it must be deleted
+        # remove_worktree is called unconditionally so a partially-registered
+        # worktree (metadata only, no dir) still gets pruned. Without this,
+        # git would refuse to delete the branch that's still "checked out".
+        mock_remove_wt.assert_awaited_once()
+        # we owned the branch, so it must be deleted
         mock_delete_branch.assert_awaited_once()
         assert mock_delete_branch.await_args.args[1] == "fix/issue-13"
 

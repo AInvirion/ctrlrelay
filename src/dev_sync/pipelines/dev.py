@@ -17,6 +17,12 @@ from dev_sync.dashboard.client import DashboardClient, EventPayload
 from dev_sync.pipelines.base import PipelineContext, PipelineResult
 from dev_sync.transports.base import Transport
 
+AGENT_CLAIM_MARKER = "<!-- dev-sync:claimed -->"
+AGENT_CLAIM_COMMENT = (
+    "🤖 Agent is working on this issue. A PR will be opened for review.\n\n"
+    f"{AGENT_CLAIM_MARKER}"
+)
+
 
 @dataclass
 class DevPipeline:
@@ -195,6 +201,21 @@ async def run_dev_issue(
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
 
+        # Post claim comment so collaborators can see the agent picked it up.
+        # Skip if a previous attempt already left the marker — keeps it idempotent
+        # across retries / resumed sessions.
+        existing_comments = issue.get("comments") or []
+        already_claimed = any(
+            AGENT_CLAIM_MARKER in (c.get("body") or "")
+            for c in existing_comments
+        )
+        if not already_claimed:
+            await github.comment_on_issue(
+                repo=repo,
+                issue_number=issue_number,
+                body=AGENT_CLAIM_COMMENT,
+            )
+
         # Snapshot branch ownership BEFORE we try to create it. If the ref
         # already exists in the bare repo, it came from another run (possibly
         # a prior DONE session whose PR is still open) and we must not touch
@@ -314,10 +335,14 @@ async def run_dev_issue(
                 worktree.remove_context_symlink(worktree_path)
             except Exception:
                 pass
-            try:
-                await worktree.remove_worktree(repo, session_id)
-            except Exception:
-                pass
+        # Always attempt remove_worktree + prune — handles the case where
+        # `git worktree add -b` registered worktree metadata before the dir
+        # step failed, leaving worktree_path unassigned but metadata in the
+        # bare repo that would prevent the branch from being deleted.
+        try:
+            await worktree.remove_worktree(repo, session_id)
+        except Exception:
+            pass
         if not branch_preexisted:
             try:
                 has_remote = await worktree.branch_exists_on_remote(repo, branch_name)

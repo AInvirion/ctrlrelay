@@ -26,8 +26,15 @@ class WorktreeManager:
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
         self.bare_repos_dir.mkdir(parents=True, exist_ok=True)
 
-    async def _run_git(self, *args: str, cwd: Path | None = None) -> str:
-        """Run git command and return stdout."""
+    async def _run_git(
+        self,
+        *args: str,
+        cwd: Path | None = None,
+        timeout: int | None = None,
+    ) -> str:
+        """Run git command and return stdout. `timeout` overrides self.timeout
+        for one call — useful for cheap probes that shouldn't inherit the full
+        120s default when network is flaky."""
         cmd = ["git", *args]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -35,9 +42,18 @@ class WorktreeManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=self.timeout
-        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout if timeout is not None else self.timeout,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            raise
 
         if proc.returncode != 0:
             raise WorktreeError(f"git failed: {stderr.decode().strip()}")
@@ -174,7 +190,9 @@ class WorktreeManager:
             return True
         try:
             output = await self._run_git(
-                "ls-remote", "--heads", "origin", branch, cwd=bare_path
+                "ls-remote", "--heads", "origin", branch,
+                cwd=bare_path,
+                timeout=10,
             )
             return bool(output.strip())
         except Exception:

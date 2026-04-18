@@ -265,6 +265,27 @@ class TestWorktreeManager:
             assert await manager.branch_exists_on_remote("owner/repo", "fix/issue-13") is False
 
     @pytest.mark.asyncio
+    async def test_branch_exists_on_remote_uses_short_timeout(
+        self, tmp_path: Path
+    ) -> None:
+        """The remote probe must NOT inherit the default 120s timeout — a
+        flaky network would otherwise hold the repo lock for 2 extra minutes
+        on every failed cleanup."""
+        from dev_sync.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare_path = tmp_path / "repos" / "owner-repo.git"
+        bare_path.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.return_value = ""
+            await manager.branch_exists_on_remote("owner/repo", "fix/issue-13")
+            assert mock_git.await_args.kwargs.get("timeout") == 10
+
+    @pytest.mark.asyncio
     async def test_branch_exists_on_remote_fails_closed_on_timeout(
         self, tmp_path: Path
     ) -> None:

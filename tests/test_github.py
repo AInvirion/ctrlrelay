@@ -174,6 +174,24 @@ class TestGitHubCLI:
             assert "55" in args
 
     @pytest.mark.asyncio
+    async def test_comment_on_issue(self) -> None:
+        """Should post a comment on an issue."""
+        from dev_sync.core.github import GitHubCLI
+
+        with patch("dev_sync.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.return_value = ""
+            gh = GitHubCLI()
+            await gh.comment_on_issue("owner/repo", 7, "hello there")
+
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0]
+            assert "issue" in args
+            assert "comment" in args
+            assert "7" in args
+            assert "--body" in args
+            assert "hello there" in args
+
+    @pytest.mark.asyncio
     async def test_close_issue_without_comment(self) -> None:
         """Should close an issue without adding a comment."""
         from dev_sync.core.github import GitHubCLI
