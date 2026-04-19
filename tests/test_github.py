@@ -143,6 +143,57 @@ class TestGitHubCLI:
                 await gh.get_pr_checks("owner/repo", 42)
 
     @pytest.mark.asyncio
+    async def test_run_gh_kills_child_on_timeout(self) -> None:
+        """A hung `gh` must be terminated on timeout — otherwise the
+        long-running PR-watch daemon (which retries on TimeoutError up
+        to _TRANSIENT_FAILURE_CAP times) would leak subprocesses while
+        the network stalls."""
+        import asyncio
+
+        from ctrlrelay.core.github import GitHubCLI
+
+        mock_proc = MagicMock()
+
+        async def never_returns():
+            await asyncio.Event().wait()
+
+        mock_proc.communicate = AsyncMock(side_effect=never_returns)
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+            gh = GitHubCLI(timeout=0.01)
+            with pytest.raises(asyncio.TimeoutError):
+                await gh._run_gh("issue", "list")
+
+        mock_proc.kill.assert_called_once()
+        mock_proc.wait.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_get_pr_checks_kills_child_on_timeout(self) -> None:
+        """Same reaper guarantee for get_pr_checks, which bypasses _run_gh."""
+        import asyncio
+
+        from ctrlrelay.core.github import GitHubCLI
+
+        mock_proc = MagicMock()
+
+        async def never_returns():
+            await asyncio.Event().wait()
+
+        mock_proc.communicate = AsyncMock(side_effect=never_returns)
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+            gh = GitHubCLI(timeout=0.01)
+            with pytest.raises(asyncio.TimeoutError):
+                await gh.get_pr_checks("owner/repo", 42)
+
+        mock_proc.kill.assert_called_once()
+        mock_proc.wait.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_list_assigned_issues(self) -> None:
         """Should list issues assigned to a user."""
         from ctrlrelay.core.github import GitHubCLI
