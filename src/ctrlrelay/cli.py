@@ -815,14 +815,25 @@ def poller_start(
         async def _watch_transport_factory():
             """Build a fresh connected SocketTransport for a single watcher,
             independent of the transport used in handle_issue (which is
-            closed on exit). Returns None when no Telegram transport is
-            configured or the socket is missing."""
+            closed on exit).
+
+            Return None ONLY when Telegram notifications aren't
+            configured at all — that's a legitimate "no channel" signal
+            and the retry loop treats it as clean success. A configured-
+            but-currently-missing socket is a transient outage (bridge
+            restart, daemon crash mid-merge), so RAISE to trigger the
+            retry path; the next attempt will reach the socket once the
+            bridge is back.
+            """
             if config.transport.type.value != "telegram" or not config.transport.telegram:
                 return None
             from ctrlrelay.transports import SocketTransport
             socket_path = config.transport.telegram.socket_path.expanduser().resolve()
             if not socket_path.exists():
-                return None
+                raise FileNotFoundError(
+                    f"Telegram bridge socket missing at {socket_path}; "
+                    "retryable — bridge may be restarting"
+                )
             watch_transport = SocketTransport(socket_path)
             await watch_transport.connect()
             return watch_transport
