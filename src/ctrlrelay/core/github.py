@@ -32,16 +32,32 @@ class GitHubCLI:
     timeout: int = 60
 
     async def _run_gh(self, *args: str) -> str:
-        """Run gh command and return stdout; raise GitHubError on non-zero."""
+        """Run gh command and return stdout; raise GitHubError on non-zero.
+
+        Kills the child and waits for it to reap on timeout so a
+        long-running daemon (e.g. 7-day PR-watch loop that retries on
+        TimeoutError) doesn't leak subprocesses while the network hangs.
+        """
         cmd = [self.gh_binary, *args]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=self.timeout
-        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self.timeout
+            )
+        except asyncio.TimeoutError:
+            # Reap the hung child so we don't accumulate zombies across
+            # many retries. kill() is SIGKILL on POSIX; wait() returns
+            # quickly because the signal is terminal.
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            raise
 
         if proc.returncode != 0:
             raise GitHubError(f"gh failed: {stderr.decode().strip()}")
@@ -126,9 +142,17 @@ class GitHubCLI:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=self.timeout,
-        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=self.timeout,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            raise
         stdout = stdout_bytes.decode().strip()
         stderr = stderr_bytes.decode().strip()
 
