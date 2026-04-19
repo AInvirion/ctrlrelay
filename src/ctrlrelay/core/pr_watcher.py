@@ -16,10 +16,16 @@ _logger = get_logger("core.pr_watcher")
 # OSError) for permanent problems too — bad repo, expired auth,
 # permission change, missing gh binary. Without a cap, those would
 # silently loop for the full 7-day timeout and never surface the
-# problem. 10 × poll_interval is enough to cover a reasonable network
-# blip (several minutes on 60s polls) while still failing fast on a
-# genuinely stuck watch.
-_TRANSIENT_FAILURE_CAP = 10
+# problem.
+#
+# Sizing: at the default 60s poll interval, 60 consecutive failures
+# covers a ~1-hour outage window. That's enough slack for routine VPN
+# flaps, GitHub incidents, or auth token rotations without abandoning
+# the watch, while still bounding truly permanent failures (deleted
+# repo, revoked credentials) to an hour instead of the full 7-day
+# timeout. A successful poll resets the counter, so genuinely
+# intermittent failures never accumulate.
+_TRANSIENT_FAILURE_CAP = 60
 
 
 @dataclass
