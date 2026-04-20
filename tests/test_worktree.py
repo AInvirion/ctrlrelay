@@ -980,3 +980,39 @@ class TestWorktreeManager:
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = WorktreeError("fatal: could not read Username")
             assert await manager.branch_exists_on_remote("owner/repo", "fix/issue-13") is True
+
+
+class TestRunGitCancellation:
+    """Regression for codex round-9 [P2]: `_run_git` only killed the child
+    on TimeoutError; a CancelledError during `proc.communicate()`
+    (scheduler shutdown during scheduled secops) left the git subprocess
+    running in the background where it could mutate the bare repo /
+    worktree after the poller exited."""
+
+    @pytest.mark.asyncio
+    async def test_run_git_kills_child_on_cancel(
+        self, tmp_path: Path
+    ) -> None:
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        mgr = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "bare",
+            timeout=60,
+        )
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = None
+        mock_proc.communicate.side_effect = asyncio.CancelledError()
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock()
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            with pytest.raises(asyncio.CancelledError):
+                await mgr._run_git("status")
+
+        mock_proc.kill.assert_called_once()
+        mock_proc.wait.assert_awaited()

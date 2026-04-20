@@ -54,6 +54,20 @@ class WorktreeManager:
             except Exception:
                 pass
             raise
+        except asyncio.CancelledError:
+            # Scheduler/shutdown cancel: kill the child BEFORE re-raising
+            # so the git subprocess isn't left mutating the bare repo /
+            # worktree after the daemon exits. A restarted daemon would
+            # otherwise race with a stray `git worktree add` on the
+            # same repo. Shield the reaping so a second cancel between
+            # kill() and wait() doesn't leak the zombie.
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                    await asyncio.shield(proc.wait())
+                except (asyncio.CancelledError, Exception):
+                    pass
+            raise
 
         if proc.returncode != 0:
             raise WorktreeError(f"git failed: {stderr.decode().strip()}")
