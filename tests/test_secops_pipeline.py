@@ -248,6 +248,100 @@ class TestSecopsCleanupLogging:
         mock_db.release_lock.assert_called()
 
 
+class TestSecopsLockReleaseOrdering:
+    """Regression for codex round-5 [P1]: the repo lock must be released
+    BEFORE the async worktree cleanup, not after. Scheduler.shutdown's
+    bounded timeout can tear us down mid-cleanup; if the lock release
+    sat after the shielded await, a shutdown interruption would leave
+    the repo locked across daemon restart — the exact failure the
+    scheduler wiring was meant to prevent."""
+
+    @pytest.mark.asyncio
+    async def test_lock_released_before_worktree_cleanup_on_cancel(
+        self, tmp_path: Path
+    ) -> None:
+        import asyncio
+
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        events: list[str] = []
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+
+        def record_release(*_args, **_kwargs):
+            events.append("release_lock")
+
+        mock_db.release_lock.side_effect = record_release
+
+        async def slow_remove(repo_, session_id_):
+            events.append("remove_worktree_start")
+            # Short sleep is enough — we only need to verify that the
+            # shielded await STARTS after release_lock. The real-world
+            # scenario is 120s git-worktree-prune; simulating that would
+            # just slow the test.
+            await asyncio.sleep(0.05)
+            events.append("remove_worktree_done")
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+        mock_worktree.remove_worktree.side_effect = slow_remove
+
+        async def hang(ctx):  # noqa: ARG001
+            await asyncio.Event().wait()
+
+        repo = MagicMock(name="owner/repo")
+        repo.name = "owner/repo"
+
+        with patch(
+            "ctrlrelay.pipelines.secops.SecopsPipeline.run",
+            side_effect=hang,
+        ):
+            task = asyncio.create_task(
+                run_secops_all(
+                    repos=[repo],
+                    dispatcher=AsyncMock(),
+                    github=MagicMock(),
+                    worktree=mock_worktree,
+                    dashboard=None,
+                    state_db=mock_db,
+                    transport=None,
+                    contexts_dir=tmp_path / "contexts",
+                )
+            )
+
+            # Wait until we're inside the hanging pipeline.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                if any(
+                    "INSERT INTO sessions" in c.args[0]
+                    for c in mock_db.execute.call_args_list
+                    if c.args
+                ):
+                    break
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        # The crucial ordering: release_lock must appear before (or at
+        # the same time as) the start of remove_worktree. A build that
+        # released last would see `remove_worktree_start` first and then
+        # get cut off before `release_lock` fires.
+        assert "release_lock" in events, "lock must have been released"
+        release_idx = events.index("release_lock")
+        remove_idx = (
+            events.index("remove_worktree_start")
+            if "remove_worktree_start" in events
+            else len(events)
+        )
+        assert release_idx < remove_idx, (
+            f"release_lock must fire before remove_worktree starts; "
+            f"got events={events} (codex round-5 [P1] regression)"
+        )
+
+
 class TestSecopsCancellation:
     """Regression for codex [P2]: when a scheduled secops sweep is
     cancelled mid-run (scheduler.shutdown → SIGTERM), the session row

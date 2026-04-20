@@ -64,25 +64,48 @@ def _expand_numeric_dow_range(
 
 def _remap_dow_token(tok: str) -> str:
     """Convert a single Vixie DOW token (number, range, step, or name) to
-    APScheduler's named-weekday form. Numeric ranges are expanded into
-    comma-separated name lists to avoid the Vixie/APScheduler ordering
-    mismatch that would reject valid Sunday-starting ranges. Non-numeric
-    tokens are returned unchanged."""
-    # Step form: "base/step"
+    APScheduler's named-weekday form.
+
+    Every numeric step/range form is expanded into an explicit comma-
+    separated name list. That's because APScheduler's interpretation of
+    stepped DOW differs from Vixie: ``mon/2`` under APScheduler is NOT
+    Vixie's ``1/2`` (Mon, Wed, Fri) — it's "every second Monday". Passing
+    numeric steps through unchanged would silently fire on the wrong
+    days. Named ranges/steps (e.g. ``mon-fri/2``) are left alone because
+    APScheduler's named-weekday semantics for those are well-defined and
+    match what users expect.
+    """
     if "/" in tok:
         base, step_str = tok.split("/", 1)
         try:
             step = int(step_str)
         except ValueError:
             return tok
+        if step < 1:
+            return tok
+        # Numeric range with step: "a-b/s"
         if "-" in base:
             a, b = base.split("-", 1)
             if a.isdigit() and b.isdigit():
                 expanded = _expand_numeric_dow_range(int(a), int(b), step)
                 if expanded is not None:
                     return ",".join(expanded)
-        return f"{_remap_dow_token(base)}/{step}"
-    # Range form: "a-b"
+            return tok  # named range with step — APScheduler handles it
+        # Wildcard with step: "*/s" — expand across the full week.
+        if base == "*":
+            expanded = _expand_numeric_dow_range(0, 6, step)
+            return ",".join(expanded) if expanded else tok
+        # Single numeric base with step: "n/s" — Vixie says "from n, every s
+        # days until end of week". Expand to [n, n+s, n+2s, ...] ≤ 6.
+        if base.isdigit():
+            n = int(base)
+            if 0 <= n <= 7:
+                start = 0 if n == 7 else n
+                expanded = _expand_numeric_dow_range(start, 6, step)
+                if expanded is not None:
+                    return ",".join(expanded)
+        return tok
+    # Range without step: "a-b"
     if "-" in tok:
         a, b = tok.split("-", 1)
         if a.isdigit() and b.isdigit():

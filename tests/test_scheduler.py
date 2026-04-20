@@ -66,6 +66,27 @@ class TestCronDowNormalization:
 
         assert _normalize_cron("0 6 * * 1-5/2") == "0 6 * * mon,wed,fri"
 
+    def test_numeric_step_without_range_expands(self) -> None:
+        """Regression for codex round-5 [P2]: ``1/2`` was passing through as
+        ``mon/2``, but APScheduler reads ``mon/2`` as 'every 2nd Monday',
+        not Vixie's 'from Mon, every 2 days' = Mon, Wed, Fri."""
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * 1/2") == "0 6 * * mon,wed,fri"
+
+    def test_wildcard_step_expands_to_every_other_day(self) -> None:
+        """``*/2`` in Vixie DOW = Sun, Tue, Thu, Sat. APScheduler's own
+        ``*/2`` interpretation differs, so expand explicitly."""
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * */2") == "0 6 * * sun,tue,thu,sat"
+
+    def test_late_week_step_has_only_remaining_days(self) -> None:
+        """``5/3`` = from Fri, step 3. Only Fri fits within Sun..Sat."""
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * 5/3") == "0 6 * * fri"
+
     def test_dow_list_is_remapped(self) -> None:
         from ctrlrelay.core.scheduler import _normalize_cron
 
