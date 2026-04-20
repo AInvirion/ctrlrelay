@@ -150,6 +150,35 @@ class RepoConfig(BaseModel):
         return v
 
 
+class SchedulesConfig(BaseModel):
+    """Cron schedules for background jobs run by the poller daemon.
+
+    Values are standard 5-field cron expressions (minute hour dom month dow),
+    evaluated in the top-level ``timezone``. Each schedule is validated at
+    config load time so an unparseable expression fails fast rather than
+    silently disabling the job.
+    """
+
+    secops_cron: str = "0 6 * * *"
+
+    @field_validator("secops_cron")
+    @classmethod
+    def validate_cron(cls, v: str) -> str:
+        from ctrlrelay.core.scheduler import _build_vixie_trigger
+
+        try:
+            # Build through the same helper the scheduler uses so
+            # (a) DOW normalization and (b) Vixie DOM/DOW-OR splitting
+            # are both exercised at load time. Bad expressions surface
+            # synchronously instead of at daemon start.
+            _build_vixie_trigger(v, timezone=None)
+        except Exception as e:
+            raise ValueError(
+                f"invalid cron expression {v!r}: {e}"
+            ) from e
+        return v
+
+
 class Config(BaseModel):
     """Root configuration model for ctrlrelay orchestrator."""
 
@@ -160,7 +189,26 @@ class Config(BaseModel):
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
     transport: TransportConfig
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
     repos: list[RepoConfig] = Field(default_factory=list)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        """Reject unparseable IANA zones at load time.
+
+        Since the scheduler feeds ``timezone`` directly into APScheduler's
+        CronTrigger, a typo like ``America/Santiagoo`` would only surface
+        as a ``ZoneInfoNotFoundError`` when the poller daemon starts —
+        much worse than a synchronous config error at load.
+        """
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(v)
+        except ZoneInfoNotFoundError as e:
+            raise ValueError(f"unknown timezone {v!r}: {e}") from e
+        return v
 
 
 def load_config(path: Path | str) -> Config:

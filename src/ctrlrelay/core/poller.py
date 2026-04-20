@@ -213,6 +213,21 @@ class IssuePoller:
         self.seen_issues.setdefault(repo, set()).add(issue_number)
         self._save_state()
 
+    def unmark_seen(self, repo: str, issue_number: int) -> None:
+        """Remove an issue from the seen-set so the next poll picks it up
+        again. Use this when a handler failed for a transient reason that
+        retrying would fix — the canonical case is a per-repo lock
+        conflict with a concurrent secops sweep. Without this, the
+        issue would be silently dropped forever because
+        ``poll()`` marks issues seen **before** handing them to the
+        handler, so a single handler failure is fatal by default.
+        Disk-save is best-effort; a failed save is logged but never
+        propagates."""
+        seen = self.seen_issues.get(repo)
+        if seen and issue_number in seen:
+            seen.discard(issue_number)
+            self._save_state_best_effort()
+
     async def seed_current(self) -> None:
         """Seed seen_issues with all currently assigned issues.
 

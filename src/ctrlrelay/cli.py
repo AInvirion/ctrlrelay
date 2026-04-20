@@ -853,10 +853,28 @@ def poller_start(
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
         from ctrlrelay.core.github import GitHubCLI
         from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+        from ctrlrelay.core.scheduler import make_scheduler
         from ctrlrelay.core.state import StateDB
         from ctrlrelay.core.worktree import WorktreeManager
         from ctrlrelay.pipelines.dev import run_dev_issue
         from ctrlrelay.pipelines.post_merge import pr_watch_task
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        # Build a DashboardClient if configured BEFORE the gh probe runs,
+        # so even if gh fails the user gets clear failure ordering and so
+        # tests can short-circuit at gh while still observing this wiring.
+        # Mirrors what `ctrlrelay run secops` does for the manual path.
+        scheduled_dashboard = None
+        if config.dashboard.enabled and config.dashboard.url:
+            token = os.environ.get(config.dashboard.auth_token_env, "")
+            if token:
+                from ctrlrelay.dashboard.client import DashboardClient
+                scheduled_dashboard = DashboardClient(
+                    url=config.dashboard.url,
+                    auth_token=token,
+                    node_id=config.node_id,
+                    queue_dir=config.paths.state_db.parent / "event_queue",
+                )
 
         github = GitHubCLI()
 
@@ -895,10 +913,11 @@ def poller_start(
             state_file=state_file,
         )
 
-        # On first run, seed with current assignments to avoid replaying backlog
-        if first_run:
-            console.print("[dim]First run: seeding with current assignments...[/dim]")
-            asyncio.run(poller.seed_current())
+        # NOTE: first-run seeding moved into `_main()` so the APScheduler
+        # cron is registered + running BEFORE the slow seed_current() pass
+        # (one GitHub API call per repo) takes place. Otherwise the 6am
+        # scheduled fire can pass during startup and APScheduler's misfire
+        # grace only catches up on fires that happened AFTER registration.
 
         state_db = StateDB(config.paths.state_db)
         dispatcher = ClaudeDispatcher(
@@ -995,6 +1014,35 @@ def poller_start(
                     contexts_dir=config.paths.contexts,
                 )
 
+                # Lock-conflict retry hook. The poller marks issues seen
+                # BEFORE handle_issue runs, so a failed attempt would
+                # permanently drop the issue. If run_dev_issue couldn't
+                # acquire the per-repo lock (common when a scheduled
+                # secops sweep is mid-run on the same repo), un-mark the
+                # issue so the next poll picks it up. Any other failure
+                # still stays seen — those aren't transient.
+                if (
+                    not result.success
+                    and not result.blocked
+                    and result.error
+                    and "locked by another session" in result.error.lower()
+                ):
+                    poller.unmark_seen(repo, issue_number)
+                    console.print(
+                        f"[yellow]#{issue_number} in {repo}: repo locked "
+                        "(secops running?) — un-marked for retry next "
+                        "poll.[/yellow]"
+                    )
+                    if connected_transport:
+                        try:
+                            await transport.send(
+                                f"⏳ #{issue_number} in {repo} "
+                                "deferred (repo busy); will retry."
+                            )
+                        except Exception:
+                            pass
+                    return
+
                 # Spawn the PR watcher FIRST, before any best-effort
                 # notification. The poller has already marked this issue
                 # as seen in poller_state.json, so if a transient
@@ -1051,12 +1099,130 @@ def poller_start(
         console.print(f"[green]Starting poller[/green] for {len(repo_names)} repo(s) as {username}")
         console.print(f"  Interval: {interval}s | Press Ctrl+C to stop")
 
+        async def _run_scheduled_secops() -> None:
+            """Scheduler callback: run the secops sweep across all repos.
+
+            Shares the poller's open state_db, github, dispatcher, and
+            worktree. Per-repo locks in the state DB prevent collisions
+            with an in-flight dev pipeline (and the dev handler now
+            retries on lock-conflict so issues aren't silently dropped).
+
+            Builds a fresh SocketTransport per run so blocked/failed
+            results notify Telegram — the dashboard only pushes for
+            successful runs, so without a transport here operators would
+            lose visibility into scheduled failures.
+            """
+            if not config.repos:
+                return
+            console.print(
+                f"[dim]Scheduled secops: starting across "
+                f"{len(config.repos)} repo(s)[/dim]"
+            )
+
+            secops_transport = None
+            if config.transport.type.value == "telegram" and config.transport.telegram:
+                from ctrlrelay.transports import SocketTransport
+                sock = config.transport.telegram.socket_path.expanduser().resolve()
+                if sock.exists():
+                    try:
+                        candidate = SocketTransport(sock)
+                        await candidate.connect()
+                        secops_transport = candidate
+                    except Exception as e:
+                        console.print(
+                            f"[yellow]Scheduled secops: transport connect "
+                            f"failed ({e}) — running without notifications[/yellow]"
+                        )
+
+            try:
+                results = await run_secops_all(
+                    repos=config.repos,
+                    dispatcher=dispatcher,
+                    github=github,
+                    worktree=worktree,
+                    dashboard=scheduled_dashboard,
+                    state_db=state_db,
+                    transport=secops_transport,
+                    contexts_dir=config.paths.contexts,
+                )
+                ok = sum(1 for r in results if r.success)
+                console.print(
+                    f"[dim]Scheduled secops: {ok}/{len(results)} succeeded[/dim]"
+                )
+                # Fan-out a single summary notification for blocked/failed
+                # runs so operators see the bad cases — the dashboard path
+                # only pushes on success.
+                if secops_transport:
+                    blocked = [r for r in results if r.blocked]
+                    failed = [
+                        r for r in results
+                        if not r.success and not r.blocked
+                    ]
+                    try:
+                        if failed:
+                            names = ", ".join(r.summary for r in failed[:3])
+                            more = (
+                                f" (+{len(failed) - 3} more)"
+                                if len(failed) > 3 else ""
+                            )
+                            await secops_transport.send(
+                                f"❌ Scheduled secops: {len(failed)} failed — "
+                                f"{names}{more}"
+                            )
+                        if blocked:
+                            await secops_transport.send(
+                                f"⏸️ Scheduled secops: {len(blocked)} "
+                                "run(s) blocked on user input"
+                            )
+                    except Exception as e:
+                        console.print(
+                            f"[yellow]Scheduled secops: notify failed: {e}[/yellow]"
+                        )
+            finally:
+                if secops_transport:
+                    try:
+                        await secops_transport.close()
+                    except Exception:
+                        pass
+
         async def _main() -> None:
+            # Register + start the scheduler FIRST, before any potentially
+            # slow startup work. Otherwise a 6am fire that lands during
+            # seed_current's per-repo GitHub calls would be lost —
+            # APScheduler's misfire_grace_time only rescues fires that
+            # happened AFTER the job was registered.
+            scheduler = make_scheduler(timezone=config.timezone)
+            scheduler.add_cron_job(
+                name="secops",
+                cron_expr=config.schedules.secops_cron,
+                func=_run_scheduled_secops,
+            )
+            scheduler.start()
+            console.print(
+                f"[dim]Scheduler: secops cron={config.schedules.secops_cron} "
+                f"tz={config.timezone}[/dim]"
+            )
+
+            # Now the slow startup: first-run seeding (one gh call per
+            # repo). Done inside _main so the scheduler is already up.
+            if first_run:
+                console.print(
+                    "[dim]First run: seeding with current assignments..."
+                    "[/dim]"
+                )
+                await poller.seed_current()
+
             try:
                 await run_poll_loop(
                     poller=poller, handler=handle_issue, interval=interval,
                 )
             finally:
+                # Scheduler shutdown is async so it can cancel + await any
+                # in-flight job tasks (e.g. a scheduled secops sweep that was
+                # running when SIGTERM arrived). Without awaiting here the
+                # loop closes before jobs finalize — state_db locks stay
+                # held and worktrees stay dirty.
+                await scheduler.shutdown()
                 # Cancel any in-flight PR watchers so a poller stop/restart
                 # doesn't leak asyncio tasks. Their handlers log
                 # dev.pr.watch_cancelled and close their transport via the

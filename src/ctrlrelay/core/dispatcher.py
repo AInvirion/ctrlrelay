@@ -115,6 +115,18 @@ class ClaudeDispatcher:
                 state=None,
                 stderr="Session timed out",
             )
+        except asyncio.CancelledError:
+            # Scheduler/shutdown cancel: kill the child BEFORE re-raising
+            # so `claude` isn't left running against the worktree after
+            # the daemon exits. Shield the wait so further cancels don't
+            # orphan the process between `kill()` and the reaping.
+            if proc.returncode is None:
+                proc.kill()
+                try:
+                    await asyncio.shield(proc.wait())
+                except asyncio.CancelledError:
+                    pass
+            raise
 
         state = None
         if state_file.exists():

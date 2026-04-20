@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass
@@ -199,6 +200,9 @@ async def run_secops_all(
             ))
             continue
 
+        worktree_path: Path | None = None
+        session_row_inserted = False
+        session_final_state_written = False
         try:
             await worktree.ensure_bare_repo(repo)
             worktree_path = await worktree.create_worktree(repo, session_id)
@@ -224,6 +228,7 @@ async def run_secops_all(
                 (session_id, "secops", repo, str(worktree_path), "running", int(time.time())),
             )
             state_db.commit()
+            session_row_inserted = True
 
             result = await pipeline.run(ctx)
             results.append(result)
@@ -234,6 +239,7 @@ async def run_secops_all(
                 (status, result.summary, int(time.time()), session_id),
             )
             state_db.commit()
+            session_final_state_written = True
 
             if dashboard and result.success:
                 await dashboard.push_event(EventPayload(
@@ -244,15 +250,39 @@ async def run_secops_all(
                     session_id=session_id,
                 ))
 
-            worktree.remove_context_symlink(worktree_path)
-            await worktree.remove_worktree(repo, session_id)
+        except asyncio.CancelledError:
+            # Scheduled secops interrupted mid-run (SIGTERM during a
+            # scheduler.shutdown). Mark the session as cancelled so later
+            # inspection doesn't see a phantom "running" row — but ONLY
+            # if we hadn't already written a final state. Without this
+            # guard, a cancel landing during the post-run dashboard push
+            # would clobber a successful "done" status with "cancelled"
+            # even though the work completed.
+            if session_row_inserted and not session_final_state_written:
+                try:
+                    state_db.execute(
+                        "UPDATE sessions SET status = ?, summary = ?, "
+                        "ended_at = ? WHERE id = ?",
+                        (
+                            "cancelled",
+                            "Cancelled during shutdown",
+                            int(time.time()),
+                            session_id,
+                        ),
+                    )
+                    state_db.commit()
+                except Exception:
+                    pass
+            raise
 
         except Exception as e:
-            state_db.execute(
-                "UPDATE sessions SET status = ?, summary = ?, ended_at = ? WHERE id = ?",
-                ("failed", f"Error: {e}", int(time.time()), session_id),
-            )
-            state_db.commit()
+            if session_row_inserted:
+                state_db.execute(
+                    "UPDATE sessions SET status = ?, summary = ?, "
+                    "ended_at = ? WHERE id = ?",
+                    ("failed", f"Error: {e}", int(time.time()), session_id),
+                )
+                state_db.commit()
             results.append(PipelineResult(
                 success=False,
                 session_id=session_id,
@@ -261,6 +291,89 @@ async def run_secops_all(
             ))
 
         finally:
-            state_db.release_lock(repo, session_id)
+            # Hold the per-repo lock THROUGH worktree cleanup so a
+            # concurrent dev/secops run can't acquire the same repo and
+            # race `git worktree prune` on the shared bare clone.
+            # Cleanup is bounded by an asyncio.wait_for timeout so a
+            # truly-stuck operation can't pin the lock forever — once
+            # the timeout fires we release anyway, preferring "possibly
+            # leaked git admin state (recoverable via `git worktree
+            # prune`)" over "repo locked across daemon restart".
+            #
+            # No asyncio.shield here: `_run_git` kills its subprocess
+            # synchronously on CancelledError so unshielded cleanup
+            # unwinds fast and without leaking a stray git. Previously
+            # the shield made the outer task cancel immediately while
+            # the inner cleanup kept running untracked — leaking state.
+            if worktree_path is not None:
+                try:
+                    worktree.remove_context_symlink(worktree_path)
+                except Exception as cleanup_exc:
+                    log_event(
+                        _logger,
+                        "secops.cleanup.symlink_failed",
+                        session_id=session_id,
+                        repo=repo,
+                        error_type=type(cleanup_exc).__name__,
+                        error=str(cleanup_exc)[:200],
+                    )
+                try:
+                    # Timeout matches Scheduler's cancel budget (150s) — a
+                    # full worktree prune can take up to 120s per
+                    # WorktreeManager._run_git ceiling.
+                    await asyncio.wait_for(
+                        worktree.remove_worktree(repo, session_id),
+                        timeout=130.0,
+                    )
+                except asyncio.TimeoutError:
+                    log_event(
+                        _logger,
+                        "secops.cleanup.worktree_timeout",
+                        session_id=session_id,
+                        repo=repo,
+                        worktree_path=str(worktree_path),
+                    )
+                except asyncio.CancelledError:
+                    log_event(
+                        _logger,
+                        "secops.cleanup.worktree_cancelled_mid_shutdown",
+                        session_id=session_id,
+                        repo=repo,
+                        worktree_path=str(worktree_path),
+                    )
+                    # Release the lock before propagating — leaving it
+                    # held across a daemon restart is worse than the
+                    # small race with a future scheduled run (the dev
+                    # handler retries on lock conflict anyway).
+                    try:
+                        state_db.release_lock(repo, session_id)
+                    except Exception:
+                        pass
+                    raise
+                except Exception as cleanup_exc:
+                    log_event(
+                        _logger,
+                        "secops.cleanup.worktree_failed",
+                        session_id=session_id,
+                        repo=repo,
+                        worktree_path=str(worktree_path),
+                        error_type=type(cleanup_exc).__name__,
+                        error=str(cleanup_exc)[:200],
+                    )
+
+            # Release the lock AFTER cleanup attempt so new runs don't
+            # race the prune. In the cancel path above we released early
+            # and re-raised; here we handle the non-cancel paths.
+            try:
+                state_db.release_lock(repo, session_id)
+            except Exception as lock_exc:
+                log_event(
+                    _logger,
+                    "secops.cleanup.lock_release_failed",
+                    session_id=session_id,
+                    repo=repo,
+                    error_type=type(lock_exc).__name__,
+                    error=str(lock_exc)[:200],
+                )
 
     return results

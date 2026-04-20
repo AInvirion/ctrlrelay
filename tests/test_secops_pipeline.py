@@ -1,7 +1,7 @@
 """Tests for secops pipeline."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -181,3 +181,375 @@ class TestSecopsPipeline:
         assert len(results) == 1
         assert not results[0].success
         assert "locked" in results[0].error.lower()
+
+
+class TestSecopsCleanupLogging:
+    """Regression for codex round-4 [P3]: worktree cleanup failures must
+    not be silently swallowed. Log them via the obs stream so operators
+    can see leaked admin state instead of discovering it later via a
+    "worktree already exists" failure on a subsequent run."""
+
+    @pytest.mark.asyncio
+    async def test_worktree_remove_failure_is_logged(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        mock_dispatcher = AsyncMock()
+        mock_state = MagicMock()
+        mock_state.status = CheckpointStatus.DONE
+        mock_state.summary = "Done"
+        mock_state.outputs = {}
+        mock_state.error = None
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="sess",
+            exit_code=0,
+            state=mock_state,
+        )
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+        # remove_worktree blows up — simulates a wedged `git worktree prune`.
+        mock_worktree.remove_worktree.side_effect = RuntimeError(
+            "worktree removal failed"
+        )
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.release_lock.return_value = True
+
+        repo = MagicMock(name="owner/repo")
+        repo.name = "owner/repo"
+
+        with patch("ctrlrelay.pipelines.secops._logger") as mock_logger:
+            results = await run_secops_all(
+                repos=[repo],
+                dispatcher=mock_dispatcher,
+                github=MagicMock(),
+                worktree=mock_worktree,
+                dashboard=None,
+                state_db=mock_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+
+        # Cleanup failure should not break the pipeline (result is still
+        # recorded) but it MUST be logged — `log_event` calls _logger.info
+        # under the hood so it shows up somewhere in mock_calls.
+        assert len(results) == 1
+        assert "secops.cleanup.worktree_failed" in str(mock_logger.mock_calls), (
+            "worktree removal failure must be logged via obs, not "
+            "swallowed (codex round-4 [P3] regression)"
+        )
+        # The repo lock must still be released.
+        mock_db.release_lock.assert_called()
+
+
+class TestSecopsCancelDoesNotOverwriteCompletedStatus:
+    """Regression for codex round-6 [P2]: a CancelledError landing AFTER
+    the session has already been marked done/blocked/failed (e.g. during
+    the post-run dashboard.push_event) must NOT overwrite that final
+    status with 'cancelled'."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_dashboard_push_preserves_done_status(
+        self, tmp_path: Path
+    ) -> None:
+        import asyncio
+
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        mock_state = MagicMock()
+        mock_state.status = CheckpointStatus.DONE
+        mock_state.summary = "Ran clean"
+        mock_state.outputs = {}
+        mock_state.error = None
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="sess",
+            exit_code=0,
+            state=mock_state,
+        )
+
+        # Dashboard push hangs; we'll cancel during it.
+        async def slow_push(payload):  # noqa: ARG001
+            await asyncio.sleep(60)
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.push_event = AsyncMock(side_effect=slow_push)
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        task = asyncio.create_task(
+            run_secops_all(
+                repos=[repo],
+                dispatcher=mock_dispatcher,
+                github=MagicMock(),
+                worktree=mock_worktree,
+                dashboard=mock_dashboard,
+                state_db=mock_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+        )
+
+        # Wait until dashboard.push_event has started — that's when the
+        # session is already marked 'done' but we're stuck in the await.
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if mock_dashboard.push_event.called:
+                break
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Examine all UPDATE sessions calls. The 'done' row must have
+        # been written, and NO subsequent 'cancelled' overwrite must
+        # have happened.
+        updates = [
+            c.args[1] for c in mock_db.execute.call_args_list
+            if c.args and "UPDATE sessions" in c.args[0]
+        ]
+        statuses = [u[0] for u in updates if u]
+        assert "done" in statuses, "happy-path 'done' update should have run"
+        assert "cancelled" not in statuses, (
+            "cancel during post-run cleanup must NOT clobber 'done' with "
+            "'cancelled' (codex round-6 [P2] regression)"
+        )
+
+
+class TestSecopsLockHeldThroughCleanup:
+    """Regression for codex round-10 [P1-a]: the per-repo lock must be
+    held THROUGH worktree cleanup (not released before). Releasing early
+    lets a concurrent dev/secops run acquire the same repo and race
+    `git worktree prune` on the shared bare clone. Round 5 asked for
+    release-before-cleanup to avoid lock leaks on cancel, but the
+    bounded `asyncio.wait_for` timeout we use now makes that tradeoff
+    unnecessary — cleanup either finishes or bails within 130s, then
+    the lock is released."""
+
+    @pytest.mark.asyncio
+    async def test_lock_held_across_worktree_removal_on_happy_path(
+        self, tmp_path: Path
+    ) -> None:
+        import asyncio
+
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        events: list[str] = []
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.release_lock.side_effect = lambda *a, **kw: events.append(
+            "release_lock"
+        )
+
+        async def traced_remove(repo_, session_id_):
+            events.append("remove_worktree_start")
+            await asyncio.sleep(0)
+            events.append("remove_worktree_done")
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+        mock_worktree.remove_worktree.side_effect = traced_remove
+
+        mock_state = MagicMock()
+        mock_state.status = CheckpointStatus.DONE
+        mock_state.summary = "ok"
+        mock_state.outputs = {}
+        mock_state.error = None
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="s", exit_code=0, state=mock_state,
+        )
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        # remove_worktree must complete BEFORE release_lock — the repo
+        # must be locked throughout cleanup so a concurrent run can't
+        # race `git worktree prune`.
+        assert "remove_worktree_done" in events
+        assert "release_lock" in events
+        assert events.index("remove_worktree_done") < events.index(
+            "release_lock"
+        ), (
+            f"lock must stay held until worktree cleanup completes; "
+            f"got events={events} (codex round-10 [P1-a] regression)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_still_releases_lock_so_daemon_restart_not_wedged(
+        self, tmp_path: Path
+    ) -> None:
+        """Round-5 concern (lock-leak on cancel) is preserved: if cleanup
+        is cancelled mid-flight, the lock is released explicitly in the
+        except-CancelledError path before the error propagates."""
+        import asyncio
+
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        release_calls: list[tuple] = []
+        mock_db.release_lock.side_effect = lambda *a, **kw: (
+            release_calls.append(a) or True
+        )
+
+        async def slow_remove(repo_, session_id_):
+            # Long enough that cancel will fire before it returns;
+            # short enough that the test doesn't wait on a stray task.
+            await asyncio.sleep(0.5)
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+        mock_worktree.remove_worktree.side_effect = slow_remove
+
+        async def hang(ctx):  # noqa: ARG001
+            await asyncio.Event().wait()
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        with patch(
+            "ctrlrelay.pipelines.secops.SecopsPipeline.run",
+            side_effect=hang,
+        ):
+            task = asyncio.create_task(
+                run_secops_all(
+                    repos=[repo],
+                    dispatcher=AsyncMock(),
+                    github=MagicMock(),
+                    worktree=mock_worktree,
+                    dashboard=None,
+                    state_db=mock_db,
+                    transport=None,
+                    contexts_dir=tmp_path / "contexts",
+                )
+            )
+
+            for _ in range(30):
+                await asyncio.sleep(0.01)
+                if any(
+                    "INSERT INTO sessions" in c.args[0]
+                    for c in mock_db.execute.call_args_list
+                    if c.args
+                ):
+                    break
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert release_calls, (
+            "cancel path must release the lock so a daemon restart "
+            "isn't wedged"
+        )
+
+
+class TestSecopsCancellation:
+    """Regression for codex [P2]: when a scheduled secops sweep is
+    cancelled mid-run (scheduler.shutdown → SIGTERM), the session row
+    must not be left in 'running' and the worktree must still be
+    removed. Previously only the `except Exception` path wrote the
+    session row, so CancelledError bypassed cleanup entirely."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_run_marks_session_cancelled_and_removes_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        import asyncio
+
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        # Pipeline blocks forever; we'll cancel from the outside.
+        async def hang_forever(ctx):  # noqa: ARG001
+            await asyncio.Event().wait()
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+
+        repo = MagicMock(name="owner/repo")
+        repo.name = "owner/repo"
+
+        with patch(
+            "ctrlrelay.pipelines.secops.SecopsPipeline.run",
+            side_effect=hang_forever,
+        ):
+            task = asyncio.create_task(
+                run_secops_all(
+                    repos=[repo],
+                    dispatcher=AsyncMock(),
+                    github=MagicMock(),
+                    worktree=mock_worktree,
+                    dashboard=None,
+                    state_db=mock_db,
+                    transport=None,
+                    contexts_dir=tmp_path / "contexts",
+                )
+            )
+
+            # Wait until the pipeline is actually running inside the try
+            # block (sessions INSERT has happened), then cancel.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                execute_calls = [c.args[0] for c in mock_db.execute.call_args_list]
+                if any("INSERT INTO sessions" in s for s in execute_calls):
+                    break
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        # Assert: session was updated to 'cancelled' before cleanup.
+        cancel_updates = [
+            c for c in mock_db.execute.call_args_list
+            if c.args and "UPDATE sessions" in c.args[0]
+            and len(c.args) > 1 and "cancelled" in c.args[1]
+        ]
+        assert cancel_updates, (
+            "CancelledError path must write 'cancelled' status — "
+            "codex [P2] regression"
+        )
+
+        # Assert: worktree cleanup was called in the finally block.
+        assert mock_worktree.remove_worktree.called, (
+            "finally block must remove the worktree on cancel"
+        )
+
+        # Assert: the per-repo lock was released.
+        assert mock_db.release_lock.called

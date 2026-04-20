@@ -197,6 +197,39 @@ systemctl --user status ctrlrelay-poller
 journalctl --user -u ctrlrelay-poller -f
 ```
 
+## Scheduled jobs
+
+The poller daemon also hosts an in-process cron (APScheduler). The jobs run
+inside the same asyncio loop as the issue poll, so they inherit the poller's
+supervision (launchd `KeepAlive` on macOS, systemd `Restart=always` on Linux)
+without needing a separate `.timer` unit.
+
+| Job | Default schedule | What it does |
+|---|---|---|
+| `secops` | `0 6 * * *` (6am daily) | Runs the secops pipeline across every configured repo — equivalent to `ctrlrelay run secops`. |
+
+Schedules are configured under `schedules:` in `orchestrator.yaml`, using
+standard 5-field cron expressions. The top-level `timezone:` controls how
+they're interpreted:
+
+```yaml
+timezone: "America/Santiago"
+schedules:
+  secops_cron: "0 6 * * *"   # daily 6am; use "0 6 * * 1" for weekly (Mondays)
+```
+
+An invalid cron expression fails at config load time rather than silently
+disabling the job. If the machine is asleep at the fire time, the job runs
+when it wakes — up to one hour late; older misfires are coalesced into a
+single run.
+
+On poller stop, the scheduler waits up to **150 seconds** for an in-flight
+job (e.g. `git worktree prune` cleanup at the end of a secops sweep) to
+finish before letting the asyncio loop close. If your launchd plist's
+`ExitTimeOut` or systemd unit's `TimeoutStopSec` is shorter, the
+supervisor will SIGKILL the daemon first — bump that limit if you've
+seen leaked worktree admin state across restarts.
+
 ## When to restart
 
 | You changed... | Restart... |
@@ -206,6 +239,7 @@ journalctl --user -u ctrlrelay-poller -f
 | `claude.*` (binary path, timeout) | poller |
 | `paths.*` | both |
 | Anything in `dashboard.*` | poller |
+| `schedules.*` (cron expressions) | poller |
 | Bot token env var | bridge **and** poller |
 
 After a `ctrlrelay` package upgrade (`uv pip install -e .`), restart both.
