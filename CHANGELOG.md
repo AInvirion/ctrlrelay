@@ -7,12 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-04-20
+
+Big day: daemon UX, a security fix, and the scheduler finally lands. The
+poller is now a real service — it forks and returns the terminal, owns a
+PID file that `status`/`stop` can actually find, and hosts an in-process
+cron that runs `secops` daily at 6am (the design called for this in
+Phase 3; Phase 3 shipped manual-only). End-to-end verified live:
+scheduler fired at the exact cron minute, 6 repos swept in 2m32s.
+
 ### Added
 
-- **In-process scheduler hosted by the poller daemon** (APScheduler). One
-  cron job registered today — `secops` at `0 6 * * *` in the config
-  timezone — matching the original design spec that was never shipped in
-  Phase 3. Configurable via a new top-level `schedules:` section in
+- **In-process scheduler hosted by the poller daemon** (APScheduler).
+  Registered today: `secops` at `0 6 * * *` in the config timezone,
+  matching the original design spec that was never shipped in Phase 3
+  (PR #60). Configurable via a new top-level `schedules:` section in
   `orchestrator.yaml`:
 
   ```yaml
@@ -20,14 +29,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     secops_cron: "0 6 * * *"   # override to e.g. "0 6 * * 1" for weekly
   ```
 
-  Invalid cron expressions fail at config-load time. Misfires coalesce
+  Invalid cron expressions fail at config-load time. Vixie cron DOW
+  semantics (0=Sun, 7=Sun-alias) and DOM/DOW-OR semantics are normalized
+  so standard 5-field expressions behave the way every reference
+  describes, independent of APScheduler's quirks. Misfires coalesce
   with a 1-hour grace window, so a laptop asleep at the fire time still
   runs the job on wake without replaying missed fires. Cross-platform:
   the scheduler runs inside the poller's asyncio loop, so macOS
   (launchd) and Linux (systemd) behave identically — no per-OS timer
   unit required.
 
+  Operator-facing note: the in-process scheduler needs up to 150s to
+  drain a running secops sweep on stop. The supervisor's stop timeout
+  must cover that — the example launchd plist and systemd unit in
+  `docs/operations.md` now set `ExitTimeOut=180` / `TimeoutStopSec=180`
+  respectively (PR #61). If you're upgrading from an older unit file,
+  add those fields before restarting.
+
 ### Changed
+
+- **Issue-claim comment on picked-up issues now signs as
+  `CTRLRelay`** instead of `🤖 Agent` (PR #59), so the tool identifies
+  itself by name on the issues it claims.
 
 - **`ctrlrelay bridge start` / `ctrlrelay poller start` now daemonize by
   default** and return to the shell immediately, writing a PID file so
