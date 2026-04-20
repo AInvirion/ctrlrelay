@@ -14,9 +14,16 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: System :: Systems Administration",
 ]
+
 dependencies = [
     "typer>=0.12.0",
     "pydantic>=2.0.0",
@@ -36,6 +43,13 @@ dev = [
 
 [project.scripts]
 ctrlrelay = "ctrlrelay.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/AInvirion/ctrlrelay"
+Documentation = "https://ainvirion.github.io/ctrlrelay/"
+Repository = "https://github.com/AInvirion/ctrlrelay"
+Issues = "https://github.com/AInvirion/ctrlrelay/issues"
+Changelog = "https://github.com/AInvirion/ctrlrelay/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]

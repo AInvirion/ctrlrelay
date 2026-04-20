@@ -26,3 +26,11 @@ docs/Gemfile.lock
 # Backup of old config system
 bkp/
 
+# Operator-specific config — ship only the .example. The real file
+# contains personal chat_id, private repo list, and local paths.
+config/orchestrator.yaml
+
+# Historic local artifact — not consumed by ctrlrelay itself. Keeps a
+# local list of repos to clone; no reason to track it publicly.
+repos.manifest
+
