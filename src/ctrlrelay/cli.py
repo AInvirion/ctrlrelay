@@ -314,14 +314,26 @@ def bridge_start(
         try:
             asyncio.set_event_loop(loop)
 
+            async def _run_server() -> None:
+                # Wrap start() in a finally that awaits stop() so the loop
+                # can't close before _telegram.close() and the socket unlink
+                # have actually completed. Scheduling stop() as a bare task
+                # in the signal handler would not guarantee that ordering.
+                try:
+                    await server.start()
+                finally:
+                    await server.stop()
+
+            main_task = loop.create_task(_run_server())
+
             def _handle_stop(sig: int) -> None:
-                loop.create_task(server.stop())
+                main_task.cancel()
 
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, _handle_stop, sig)
 
             try:
-                loop.run_until_complete(server.start())
+                loop.run_until_complete(main_task)
             except asyncio.CancelledError:
                 pass
         finally:
@@ -355,13 +367,19 @@ def bridge_start(
             proc.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
             console.print(f"[green]Bridge started (PID {proc.pid})[/green]")
-        else:
-            pid_file.unlink(missing_ok=True)
+            return
+        # Child exited within 1s. Zero = clean no-op; non-zero = crash.
+        pid_file.unlink(missing_ok=True)
+        if proc.returncode == 0:
             console.print(
-                f"[red]Bridge failed to start[/red] "
-                f"(child exited with code {proc.returncode})"
+                "[yellow]Bridge exited immediately with no work to do.[/yellow]"
             )
-            raise typer.Exit(1)
+            return
+        console.print(
+            f"[red]Bridge failed to start[/red] "
+            f"(child exited with code {proc.returncode})"
+        )
+        raise typer.Exit(1)
 
 
 @bridge_app.command("stop")
@@ -803,14 +821,20 @@ def poller_start(
             proc.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
             console.print(f"[green]Poller started (PID {proc.pid})[/green]")
-        else:
-            pid_file.unlink(missing_ok=True)
+            return
+        # Child exited. Zero = clean no-op (e.g. `repos: []`); non-zero = crash.
+        pid_file.unlink(missing_ok=True)
+        if proc.returncode == 0:
             console.print(
-                f"[red]Poller failed to start[/red] "
-                f"(child exited with code {proc.returncode})"
+                "[yellow]Poller exited immediately with no work to do "
+                "(check `repos:` in your config).[/yellow]"
             )
-            raise typer.Exit(1)
-        return
+            return
+        console.print(
+            f"[red]Poller failed to start[/red] "
+            f"(child exited with code {proc.returncode})"
+        )
+        raise typer.Exit(1)
 
     # Install SIGTERM/SIGINT handlers BEFORE any startup work so a supervisor
     # stop during `gh api user` / `seed_current()` still unwinds through the

@@ -132,7 +132,11 @@ class TestBridgeStartForeground:
         async def _fake_start():
             return None
 
+        async def _fake_stop():
+            return None
+
         server_instance.start = _fake_start
+        server_instance.stop = _fake_stop
         with (
             patch("subprocess.Popen") as popen,
             patch(
@@ -162,7 +166,11 @@ class TestBridgeStartForeground:
         async def _fake_start():
             return None
 
+        async def _fake_stop():
+            return None
+
         server_instance.start = _fake_start
+        server_instance.stop = _fake_stop
         with patch("ctrlrelay.bridge.BridgeServer", return_value=server_instance):
             result = runner.invoke(
                 app,
@@ -179,6 +187,73 @@ class TestBridgeStartForeground:
         pid_file = telegram_config.parent / "ctrlrelay.pid"
         assert not pid_file.exists(), (
             "foreground mode must clean up the PID file on graceful exit"
+        )
+
+
+class TestBridgeForegroundShutdownOrdering:
+    """Regression for codex [P2]: when the foreground bridge is cancelled
+    (SIGTERM / SIGINT), server.stop() must actually run and complete before
+    the event loop closes. Fire-and-forget `create_task(server.stop())` from
+    the signal handler does NOT guarantee that ordering."""
+
+    def test_stop_completes_when_start_is_cancelled(
+        self, telegram_config: Path, bot_token_env: None
+    ) -> None:
+        import asyncio
+
+        calls: list[str] = []
+
+        async def fake_start():
+            calls.append("start")
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                calls.append("start_cancelled")
+                raise
+
+        async def fake_stop():
+            await asyncio.sleep(0)
+            calls.append("stop_done")
+
+        server_instance = MagicMock()
+        server_instance.start = fake_start
+        server_instance.stop = fake_stop
+
+        # Monkeypatch asyncio.new_event_loop to inject a cancellation just
+        # after run_until_complete starts, simulating a SIGTERM arrival.
+        orig_new_event_loop = asyncio.new_event_loop
+
+        def tracked_new_loop():
+            loop = orig_new_event_loop()
+            orig_rc = loop.run_until_complete
+
+            def rc_with_cancel(task):
+                loop.call_soon(task.cancel)
+                return orig_rc(task)
+
+            loop.run_until_complete = rc_with_cancel
+            return loop
+
+        with (
+            patch("ctrlrelay.bridge.BridgeServer", return_value=server_instance),
+            patch("asyncio.new_event_loop", side_effect=tracked_new_loop),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "bridge",
+                    "start",
+                    "--foreground",
+                    "--config",
+                    str(telegram_config),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "start_cancelled" in calls, "start() must observe the cancel"
+        assert "stop_done" in calls, (
+            "server.stop() must run to completion before the loop closes "
+            "(codex [P2] regression — stale socket would otherwise remain)"
         )
 
 
@@ -212,7 +287,7 @@ class TestBridgeStartDaemonFailFast:
     (bad env, crash-on-import, missing dep), the parent must report failure
     rather than printing 'Bridge started (PID N)' and dropping the user."""
 
-    def test_reports_failure_when_child_exits_immediately(
+    def test_reports_failure_when_child_exits_nonzero(
         self, telegram_config: Path, bot_token_env: None
     ) -> None:
         fake_proc = MagicMock()
@@ -226,6 +301,23 @@ class TestBridgeStartDaemonFailFast:
 
         assert result.exit_code != 0
         assert "failed to start" in result.output.lower()
+
+    def test_clean_child_exit_zero_is_not_a_failure(
+        self, telegram_config: Path, bot_token_env: None
+    ) -> None:
+        """Regression for codex [P3]: exit 0 must not be classified as a
+        crash (symmetry with the poller fix)."""
+        fake_proc = MagicMock()
+        fake_proc.pid = 2719
+        fake_proc.wait.return_value = 0
+        fake_proc.returncode = 0
+        with patch("subprocess.Popen", return_value=fake_proc):
+            result = runner.invoke(
+                app, ["bridge", "start", "--config", str(telegram_config)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "failed to start" not in result.output.lower()
 
 
 class TestBridgeStartDaemonNoStartupRace:
@@ -321,7 +413,7 @@ class TestPollerStartDaemonFailFast:
     """Regression for codex [P2]: if the spawned child exits immediately
     (missing gh, bad config, etc), the parent must NOT claim success."""
 
-    def test_reports_failure_when_child_exits_immediately(
+    def test_reports_failure_when_child_exits_nonzero(
         self, telegram_config: Path
     ) -> None:
         fake_proc = MagicMock()
@@ -335,6 +427,23 @@ class TestPollerStartDaemonFailFast:
 
         assert result.exit_code != 0
         assert "failed to start" in result.output.lower()
+
+    def test_clean_child_exit_zero_is_not_a_failure(
+        self, telegram_config: Path
+    ) -> None:
+        """Regression for codex [P3]: if the child exits 0 within 1s (e.g.
+        `repos: []` no-op), the parent must NOT report 'failed to start'."""
+        fake_proc = MagicMock()
+        fake_proc.pid = 4343
+        fake_proc.wait.return_value = 0
+        fake_proc.returncode = 0
+        with patch("subprocess.Popen", return_value=fake_proc):
+            result = runner.invoke(
+                app, ["poller", "start", "--config", str(telegram_config)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "failed to start" not in result.output.lower()
 
 
 class TestPollerStartDaemonNoStartupRace:

@@ -41,14 +41,24 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    async def _run_server() -> None:
+        # Wrap start() in a finally that awaits stop() so the loop can't
+        # close before _telegram.close() and the socket unlink complete.
+        try:
+            await server.start()
+        finally:
+            await server.stop()
+
+    main_task = loop.create_task(_run_server())
+
     def handle_signal(sig: int) -> None:
-        loop.create_task(server.stop())
+        main_task.cancel()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, handle_signal, sig)
 
     try:
-        loop.run_until_complete(server.start())
+        loop.run_until_complete(main_task)
     except asyncio.CancelledError:
         pass
     finally:
