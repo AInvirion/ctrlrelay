@@ -860,6 +860,22 @@ def poller_start(
         from ctrlrelay.pipelines.post_merge import pr_watch_task
         from ctrlrelay.pipelines.secops import run_secops_all
 
+        # Build a DashboardClient if configured BEFORE the gh probe runs,
+        # so even if gh fails the user gets clear failure ordering and so
+        # tests can short-circuit at gh while still observing this wiring.
+        # Mirrors what `ctrlrelay run secops` does for the manual path.
+        scheduled_dashboard = None
+        if config.dashboard.enabled and config.dashboard.url:
+            token = os.environ.get(config.dashboard.auth_token_env, "")
+            if token:
+                from ctrlrelay.dashboard.client import DashboardClient
+                scheduled_dashboard = DashboardClient(
+                    url=config.dashboard.url,
+                    auth_token=token,
+                    node_id=config.node_id,
+                    queue_dir=config.paths.state_db.parent / "event_queue",
+                )
+
         github = GitHubCLI()
 
         # Get GitHub username
@@ -1057,9 +1073,10 @@ def poller_start(
             """Scheduler callback: run the secops sweep across all repos.
 
             Shares the poller's open state_db, github, dispatcher, and
-            worktree. No transport — scheduled secops notifications are a
-            separate concern we'll add when needed. Per-repo locks in the
-            state DB prevent collisions with an in-flight dev pipeline.
+            worktree. Per-repo locks in the state DB prevent collisions
+            with an in-flight dev pipeline. Transport is None — scheduled
+            secops Telegram notifications are out of scope for now; the
+            dashboard path covers operator visibility.
             """
             if not config.repos:
                 return
@@ -1072,7 +1089,7 @@ def poller_start(
                 dispatcher=dispatcher,
                 github=github,
                 worktree=worktree,
-                dashboard=None,
+                dashboard=scheduled_dashboard,
                 state_db=state_db,
                 transport=None,
                 contexts_dir=config.paths.contexts,

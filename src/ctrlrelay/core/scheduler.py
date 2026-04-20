@@ -248,7 +248,7 @@ class Scheduler:
         self._started = True
         log_event(_logger, "scheduler.started")
 
-    async def shutdown(self, *, cancel_timeout: float = 30.0) -> None:
+    async def shutdown(self, *, cancel_timeout: float = 150.0) -> None:
         """Stop the scheduler and await in-flight jobs to finalize.
 
         1. Signals APScheduler to stop accepting new fires.
@@ -256,6 +256,15 @@ class Scheduler:
            blocks run (release DB locks, close transports).
         3. Awaits those tasks up to ``cancel_timeout`` seconds so the
            poller's ``loop.close()`` doesn't land mid-cleanup.
+
+        ``cancel_timeout`` defaults to 150s — comfortably above the
+        ``WorktreeManager._run_git`` 120s ceiling so a scheduled secops
+        sweep that's mid ``git worktree prune`` when SIGTERM arrives
+        gets a real chance to finish cleanup before ``loop.close()``
+        terminates everything. If your launchd plist /
+        systemd unit imposes a stricter ``ExitTimeOut`` /
+        ``TimeoutStopSec``, raise that limit too — the scheduler can
+        only keep the loop alive within the supervisor's kill window.
 
         Calling shutdown before ``start`` is a no-op.
         """

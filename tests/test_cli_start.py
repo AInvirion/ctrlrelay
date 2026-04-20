@@ -478,6 +478,62 @@ class TestPollerStartDaemonNoStartupRace:
         )
 
 
+class TestScheduledSecopsDashboardWiring:
+    """Regression for codex round-7 [P2]: when ``dashboard.enabled`` is
+    set in the config and the auth-token env var is present, the
+    scheduled secops closure must build a ``DashboardClient`` and pass
+    it into ``run_secops_all`` — same as the manual ``ctrlrelay run
+    secops`` path does. Hardcoding ``dashboard=None`` would silently
+    drop every scheduled-sweep event from the dashboard's view."""
+
+    def test_dashboard_client_built_when_enabled(
+        self, telegram_config: Path
+    ) -> None:
+        # Modify the loaded config to enable dashboard + provide an env var
+        # so the closure constructs a real DashboardClient.
+        import yaml
+
+        cfg_data = yaml.safe_load(telegram_config.read_text())
+        cfg_data["dashboard"] = {
+            "enabled": True,
+            "url": "https://example.test",
+            "auth_token_env": "CTRLRELAY_TEST_DASHBOARD_TOKEN",
+        }
+        telegram_config.write_text(yaml.dump(cfg_data))
+
+        fake_client = MagicMock()
+        with (
+            patch.dict(
+                os.environ,
+                {"CTRLRELAY_TEST_DASHBOARD_TOKEN": "dummy-dash-token"},
+            ),
+            patch(
+                "ctrlrelay.dashboard.client.DashboardClient",
+                return_value=fake_client,
+            ) as dc_cls,
+            patch(
+                "ctrlrelay.core.github._find_gh",
+                side_effect=RuntimeError("short-circuit"),
+            ),
+        ):
+            runner.invoke(
+                app,
+                [
+                    "poller",
+                    "start",
+                    "--foreground",
+                    "--config",
+                    str(telegram_config),
+                ],
+            )
+
+        assert dc_cls.called, (
+            "scheduled-secops path must build a DashboardClient when "
+            "dashboard is enabled and the token env var is set "
+            "(codex round-7 [P2] regression)"
+        )
+
+
 class TestPollerStartSchedulerWiring:
     """The poller foreground path must build an APScheduler, register the
     secops cron job from config, start it, and shut it down on exit. This
