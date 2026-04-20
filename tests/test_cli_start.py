@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,18 @@ from typer.testing import CliRunner
 from ctrlrelay.cli import app
 
 runner = CliRunner()
+
+
+def _make_live_proc(pid: int) -> MagicMock:
+    """Build a subprocess.Popen mock that behaves like a still-running child.
+
+    `proc.wait(timeout=...)` must raise TimeoutExpired so the daemon-start
+    path interprets the child as healthy.
+    """
+    proc = MagicMock()
+    proc.pid = pid
+    proc.wait.side_effect = subprocess.TimeoutExpired(cmd="<test>", timeout=1.0)
+    return proc
 
 # Typer/Rich injects ANSI escapes around flag names (e.g. "--foreground" becomes
 # "-" + ESC[...m + "-foreground" + ESC[0m), so substring matches on the raw
@@ -72,8 +85,7 @@ class TestBridgeStartDefault:
     def test_default_spawns_subprocess_and_returns(
         self, telegram_config: Path, bot_token_env: None, tmp_path: Path
     ) -> None:
-        fake_proc = MagicMock()
-        fake_proc.pid = 99999
+        fake_proc = _make_live_proc(99999)
         with patch("subprocess.Popen", return_value=fake_proc) as popen:
             result = runner.invoke(
                 app, ["bridge", "start", "--config", str(telegram_config)]
@@ -93,8 +105,7 @@ class TestBridgeStartDefault:
         self, telegram_config: Path, bot_token_env: None
     ) -> None:
         """Default path must NOT import/run BridgeServer in-process."""
-        fake_proc = MagicMock()
-        fake_proc.pid = 42
+        fake_proc = _make_live_proc(42)
         with (
             patch("subprocess.Popen", return_value=fake_proc),
             patch("ctrlrelay.bridge.BridgeServer") as server_cls,
@@ -170,6 +181,52 @@ class TestBridgeStartForeground:
         )
 
 
+class TestBridgeStartDaemonSecrets:
+    """Regression for codex [P1]: the Telegram bot token must NEVER appear
+    in the daemon child's argv (readable via `ps` / /proc/*/cmdline)."""
+
+    def test_bot_token_not_in_argv(
+        self, telegram_config: Path, bot_token_env: None
+    ) -> None:
+        fake_proc = _make_live_proc(31415)
+        with patch("subprocess.Popen", return_value=fake_proc) as popen:
+            result = runner.invoke(
+                app, ["bridge", "start", "--config", str(telegram_config)]
+            )
+
+        assert result.exit_code == 0, result.output
+        cmd = popen.call_args[0][0]
+        assert "dummy-token" not in cmd, (
+            "bot token leaked into daemon argv — would be visible to anyone "
+            "reading `ps`. Pass the env-var name and inherit the process env "
+            "instead."
+        )
+        assert "--bot-token-env" in cmd, (
+            "daemon should tell the child which env var holds the token"
+        )
+
+
+class TestBridgeStartDaemonFailFast:
+    """Regression for codex [P2]: if the spawned child exits immediately
+    (bad env, crash-on-import, missing dep), the parent must report failure
+    rather than printing 'Bridge started (PID N)' and dropping the user."""
+
+    def test_reports_failure_when_child_exits_immediately(
+        self, telegram_config: Path, bot_token_env: None
+    ) -> None:
+        fake_proc = MagicMock()
+        fake_proc.pid = 2718
+        fake_proc.wait.return_value = 1  # child exited with code 1
+        fake_proc.returncode = 1
+        with patch("subprocess.Popen", return_value=fake_proc):
+            result = runner.invoke(
+                app, ["bridge", "start", "--config", str(telegram_config)]
+            )
+
+        assert result.exit_code != 0
+        assert "failed to start" in result.output.lower()
+
+
 class TestBridgeStartAlreadyRunning:
     def test_refuses_when_live_pid_in_file(
         self, telegram_config: Path, bot_token_env: None, tmp_path: Path
@@ -193,8 +250,7 @@ class TestPollerStartDefault:
     def test_default_spawns_child_with_foreground_flag(
         self, telegram_config: Path, tmp_path: Path
     ) -> None:
-        fake_proc = MagicMock()
-        fake_proc.pid = 77777
+        fake_proc = _make_live_proc(77777)
         with patch("subprocess.Popen", return_value=fake_proc) as popen:
             result = runner.invoke(
                 app, ["poller", "start", "--config", str(telegram_config)]
@@ -208,6 +264,26 @@ class TestPollerStartDefault:
             "instead of recursively daemonizing"
         )
         assert f"PID {fake_proc.pid}" in result.output
+
+
+class TestPollerStartDaemonFailFast:
+    """Regression for codex [P2]: if the spawned child exits immediately
+    (missing gh, bad config, etc), the parent must NOT claim success."""
+
+    def test_reports_failure_when_child_exits_immediately(
+        self, telegram_config: Path
+    ) -> None:
+        fake_proc = MagicMock()
+        fake_proc.pid = 4242
+        fake_proc.wait.return_value = 2  # e.g. gh not found
+        fake_proc.returncode = 2
+        with patch("subprocess.Popen", return_value=fake_proc):
+            result = runner.invoke(
+                app, ["poller", "start", "--config", str(telegram_config)]
+            )
+
+        assert result.exit_code != 0
+        assert "failed to start" in result.output.lower()
 
 
 class TestPollerStartForeground:

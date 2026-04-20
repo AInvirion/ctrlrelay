@@ -27,6 +27,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior is now the default. Scripts using `--daemon` will need to
   drop the flag.
 
+### Security
+
+- **Telegram bot token is no longer passed via subprocess argv.** Before
+  this release, daemon-mode `bridge start` invoked the child with
+  `--bot-token <TOKEN>` on the command line, exposing the secret to any
+  local user or tool that reads `ps` / `/proc/*/cmdline`. The daemon
+  parent now tells the child which env var to read (`--bot-token-env`)
+  and relies on the inherited process environment instead. Since
+  daemonize mode is now the default, this would have leaked the token on
+  every vanilla `ctrlrelay bridge start` — rotate your bot token if you
+  ran a pre-release `main` build of this branch in a shared environment.
+
+### Fixed
+
+- **Daemon `start` no longer reports success for a crashed child.** The
+  parent now waits briefly for the child after `subprocess.Popen` and
+  reports failure if it exited (e.g. `gh` missing, env var unset,
+  crash-on-import). Previously the parent printed `Poller started
+  (PID N)` even when the child died within milliseconds.
+- **Foreground `poller start` now handles `SIGTERM` cleanly.** Under
+  launchd/systemd, service stop sends SIGTERM; the prior code only
+  caught `KeyboardInterrupt`, so the outer `finally` that unlinks
+  `poller.pid` and closes the state DB never ran. A recycled PID could
+  then be mistaken for a live poller by the next `start`/`status`. The
+  foreground path now installs SIGTERM/SIGINT handlers, cancels the poll
+  loop task, and lets cleanup run.
+
 ## [0.1.3] - 2026-04-18
 
 Reliability pass on the poller + retry flow, plus CI gating. No runtime

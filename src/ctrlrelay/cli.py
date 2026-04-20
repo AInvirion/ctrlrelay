@@ -318,14 +318,16 @@ def bridge_start(
             loop.close()
             pid_file.unlink(missing_ok=True)
     else:
+        # Pass the token via environment, never argv. Putting it on the command
+        # line would expose it to anyone who can read `ps` / /proc/*/cmdline.
         cmd = [
             sys.executable,
             "-m",
             "ctrlrelay.bridge",
             "--socket-path",
             str(socket_path),
-            "--bot-token",
-            bot_token,
+            "--bot-token-env",
+            telegram_config.bot_token_env,
             "--chat-id",
             str(telegram_config.chat_id),
         ]
@@ -335,8 +337,17 @@ def bridge_start(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        pid_file.write_text(str(proc.pid))
-        console.print(f"[green]Bridge started (PID {proc.pid})[/green]")
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pid_file.write_text(str(proc.pid))
+            console.print(f"[green]Bridge started (PID {proc.pid})[/green]")
+        else:
+            console.print(
+                f"[red]Bridge failed to start[/red] "
+                f"(child exited with code {proc.returncode})"
+            )
+            raise typer.Exit(1)
 
 
 @bridge_app.command("stop")
@@ -725,6 +736,7 @@ def poller_start(
     """
     import asyncio
     import os
+    import signal
     import subprocess
     import sys
 
@@ -769,8 +781,17 @@ def poller_start(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        pid_file.write_text(str(proc.pid))
-        console.print(f"[green]Poller started (PID {proc.pid})[/green]")
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pid_file.write_text(str(proc.pid))
+            console.print(f"[green]Poller started (PID {proc.pid})[/green]")
+        else:
+            console.print(
+                f"[red]Poller failed to start[/red] "
+                f"(child exited with code {proc.returncode})"
+            )
+            raise typer.Exit(1)
         return
 
     pid_file.write_text(str(os.getpid()))
@@ -991,11 +1012,23 @@ def poller_start(
                         t.cancel()
                     await asyncio.gather(*list(pr_watch_tasks), return_exceptions=True)
 
+        loop = asyncio.new_event_loop()
         try:
-            asyncio.run(_main())
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Poller stopped.[/yellow]")
+            asyncio.set_event_loop(loop)
+            main_task = loop.create_task(_main())
+
+            def _handle_stop(sig: int) -> None:
+                main_task.cancel()
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, _handle_stop, sig)
+
+            try:
+                loop.run_until_complete(main_task)
+            except asyncio.CancelledError:
+                console.print("\n[yellow]Poller stopped.[/yellow]")
         finally:
+            loop.close()
             state_db.close()
     finally:
         pid_file.unlink(missing_ok=True)
