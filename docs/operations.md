@@ -23,6 +23,11 @@ ctrlrelay ships with no service files — you write your own. The two daemons:
 
 Both should restart on failure and on login.
 
+`ctrlrelay bridge start` and `ctrlrelay poller start` daemonize by default
+(fork, write a PID file, return to the shell). Under a process supervisor
+(launchd, systemd) pass `--foreground` so the supervisor can track the PID
+and restart on failure — the unit examples below already do this.
+
 ### macOS — launchd
 
 Save plist files under `~/Library/LaunchAgents/`. Use the **absolute** path to
@@ -43,6 +48,7 @@ Save plist files under `~/Library/LaunchAgents/`. Use the **absolute** path to
         <string>/opt/homebrew/bin/ctrlrelay</string>
         <string>bridge</string>
         <string>start</string>
+        <string>--foreground</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -81,6 +87,7 @@ Save plist files under `~/Library/LaunchAgents/`. Use the **absolute** path to
         <string>/opt/homebrew/bin/ctrlrelay</string>
         <string>poller</string>
         <string>start</string>
+        <string>--foreground</string>
         <string>--interval</string>
         <string>300</string>
     </array>
@@ -137,7 +144,7 @@ After=network-online.target
 Type=simple
 WorkingDirectory=%h/Projects/ctrlrelay
 Environment=CTRLRELAY_TELEGRAM_TOKEN=your-bot-token-here
-ExecStart=%h/.local/bin/ctrlrelay bridge start
+ExecStart=%h/.local/bin/ctrlrelay bridge start --foreground
 Restart=always
 RestartSec=5
 StandardOutput=append:%h/.ctrlrelay/logs/bridge.log
@@ -158,7 +165,7 @@ After=network-online.target ctrlrelay-bridge.service
 Type=simple
 WorkingDirectory=%h/Projects/ctrlrelay
 Environment=CTRLRELAY_TELEGRAM_TOKEN=your-bot-token-here
-ExecStart=%h/.local/bin/ctrlrelay poller start --interval 300
+ExecStart=%h/.local/bin/ctrlrelay poller start --foreground --interval 300
 Restart=always
 RestartSec=5
 StandardOutput=append:%h/.ctrlrelay/logs/poller.log

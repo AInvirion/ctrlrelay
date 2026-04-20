@@ -231,14 +231,19 @@ def bridge_start(
         "-c",
         help="Path to orchestrator.yaml",
     ),
-    daemon: bool = typer.Option(
+    foreground: bool = typer.Option(
         False,
-        "--daemon",
-        "-d",
-        help="Run in background",
+        "--foreground",
+        "-F",
+        help="Run in the foreground (for launchd/systemd/debugging). Default is to daemonize.",
     ),
 ) -> None:
-    """Start the Telegram bridge."""
+    """Start the Telegram bridge.
+
+    Daemonizes by default so the terminal returns to you. Pass --foreground
+    under a process supervisor (launchd Type=simple, systemd Type=simple) or
+    when debugging interactively.
+    """
     import os
     import subprocess
     import sys
@@ -277,31 +282,25 @@ def bridge_start(
         console.print(f"[red]Bot token not found.[/red] Set {env_var} environment variable.")
         raise typer.Exit(1)
 
-    if daemon:
-        cmd = [
-            sys.executable,
-            "-m",
-            "ctrlrelay.bridge",
-            "--socket-path",
-            str(socket_path),
-            "--bot-token",
-            bot_token,
-            "--chat-id",
-            str(telegram_config.chat_id),
-        ]
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        pid_file.write_text(str(proc.pid))
-        console.print(f"[green]Bridge started (PID {proc.pid})[/green]")
-    else:
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if foreground:
         import asyncio
+        import signal
 
         from ctrlrelay.bridge import BridgeServer
 
+        # Install early SIGTERM/SIGINT handlers so a supervisor stop between
+        # now and loop.add_signal_handler below still runs the `finally`
+        # that unlinks the PID file. loop.add_signal_handler replaces them
+        # once the asyncio loop is running.
+        def _raise_systemexit_on_signal(sig: int, _frame: object) -> None:
+            raise SystemExit(0)
+
+        for _sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(_sig, _raise_systemexit_on_signal)
+
+        pid_file.write_text(str(os.getpid()))
         console.print(f"Starting bridge on {socket_path}")
         console.print("Press Ctrl+C to stop")
 
@@ -311,10 +310,76 @@ def bridge_start(
             chat_id=telegram_config.chat_id,
         )
 
+        loop = asyncio.new_event_loop()
         try:
-            asyncio.run(server.start())
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Shutting down...[/yellow]")
+            asyncio.set_event_loop(loop)
+
+            async def _run_server() -> None:
+                # Wrap start() in a finally that awaits stop() so the loop
+                # can't close before _telegram.close() and the socket unlink
+                # have actually completed. Scheduling stop() as a bare task
+                # in the signal handler would not guarantee that ordering.
+                try:
+                    await server.start()
+                finally:
+                    await server.stop()
+
+            main_task = loop.create_task(_run_server())
+
+            def _handle_stop(sig: int) -> None:
+                main_task.cancel()
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, _handle_stop, sig)
+
+            try:
+                loop.run_until_complete(main_task)
+            except asyncio.CancelledError:
+                pass
+        finally:
+            loop.close()
+            pid_file.unlink(missing_ok=True)
+    else:
+        # Pass the token via environment, never argv. Putting it on the command
+        # line would expose it to anyone who can read `ps` / /proc/*/cmdline.
+        cmd = [
+            sys.executable,
+            "-m",
+            "ctrlrelay.bridge",
+            "--socket-path",
+            str(socket_path),
+            "--bot-token-env",
+            telegram_config.bot_token_env,
+            "--chat-id",
+            str(telegram_config.chat_id),
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        # Claim the PID file BEFORE the liveness probe; a second concurrent
+        # `bridge start` in the 1-second window would otherwise see no PID
+        # file, spawn its own child, and both would rebind the shared socket.
+        pid_file.write_text(str(proc.pid))
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            console.print(f"[green]Bridge started (PID {proc.pid})[/green]")
+            return
+        # Child exited within 1s. Zero = clean no-op; non-zero = crash.
+        pid_file.unlink(missing_ok=True)
+        if proc.returncode == 0:
+            console.print(
+                "[yellow]Bridge exited immediately with no work to do.[/yellow]"
+            )
+            return
+        console.print(
+            f"[red]Bridge failed to start[/red] "
+            f"(child exited with code {proc.returncode})"
+        )
+        raise typer.Exit(1)
 
 
 @bridge_app.command("stop")
@@ -376,10 +441,16 @@ def bridge_status(
             pass
 
     if socket_path.exists():
-        console.print("[yellow]Socket exists but no running process[/yellow]")
+        console.print("[yellow]Socket exists but no PID file[/yellow]")
+        console.print(
+            "[dim]The bridge may be running under a supervisor that pre-dates "
+            "the PID-file change — restart it to refresh state.[/dim]"
+        )
         console.print(f"Socket: {socket_path}")
-    else:
-        console.print("[dim]Bridge not running[/dim]")
+        raise typer.Exit(1)
+
+    console.print("[dim]Bridge not running[/dim]")
+    raise typer.Exit(1)
 
 
 @bridge_app.command("test")
@@ -676,11 +747,11 @@ def poller_start(
         "-c",
         help="Path to orchestrator.yaml",
     ),
-    daemon: bool = typer.Option(
+    foreground: bool = typer.Option(
         False,
-        "--daemon",
-        "-d",
-        help="Run in background",
+        "--foreground",
+        "-F",
+        help="Run in the foreground (for launchd/systemd/debugging). Default is to daemonize.",
     ),
     interval: int = typer.Option(
         300,
@@ -689,8 +760,15 @@ def poller_start(
         help="Polling interval in seconds",
     ),
 ) -> None:
-    """Start the issue poller."""
+    """Start the issue poller.
+
+    Daemonizes by default so the terminal returns to you. Pass --foreground
+    under a process supervisor (launchd Type=simple, systemd Type=simple) or
+    when debugging interactively.
+    """
     import asyncio
+    import os
+    import signal
     import subprocess
     import sys
 
@@ -700,18 +778,23 @@ def poller_start(
         console.print(f"[red]Error loading config:[/red] {e}")
         raise typer.Exit(1)
 
-    if daemon:
-        pid_file = _get_poller_pid_file(config_path)
-        if pid_file.exists():
-            import os
-            try:
-                pid = int(pid_file.read_text().strip())
+    pid_file = _get_poller_pid_file(config_path)
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if pid == os.getpid():
+                # The daemon parent wrote our own PID here before spawning us
+                # as the `--foreground` child. Don't treat it as a conflict.
+                pass
+            else:
                 os.kill(pid, 0)
                 console.print(f"[yellow]Poller already running (PID {pid})[/yellow]")
                 raise typer.Exit(1)
-            except (ProcessLookupError, ValueError):
-                pid_file.unlink(missing_ok=True)
+        except (ProcessLookupError, ValueError):
+            pid_file.unlink(missing_ok=True)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
 
+    if not foreground:
         cmd = [
             sys.executable,
             "-m",
@@ -722,6 +805,7 @@ def poller_start(
             config_path,
             "--interval",
             str(interval),
+            "--foreground",
         ]
         proc = subprocess.Popen(
             cmd,
@@ -729,10 +813,43 @@ def poller_start(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        # Claim the PID file BEFORE the liveness probe; otherwise a second
+        # concurrent `start` in the 1-second window would see no PID file and
+        # spawn a duplicate poller.
         pid_file.write_text(str(proc.pid))
-        console.print(f"[green]Poller started (PID {proc.pid})[/green]")
-    else:
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            console.print(f"[green]Poller started (PID {proc.pid})[/green]")
+            return
+        # Child exited. Zero = clean no-op (e.g. `repos: []`); non-zero = crash.
+        pid_file.unlink(missing_ok=True)
+        if proc.returncode == 0:
+            console.print(
+                "[yellow]Poller exited immediately with no work to do "
+                "(check `repos:` in your config).[/yellow]"
+            )
+            return
+        console.print(
+            f"[red]Poller failed to start[/red] "
+            f"(child exited with code {proc.returncode})"
+        )
+        raise typer.Exit(1)
+
+    # Install SIGTERM/SIGINT handlers BEFORE any startup work so a supervisor
+    # stop during `gh api user` / `seed_current()` still unwinds through the
+    # `finally` that unlinks poller.pid. Converting the signal into SystemExit
+    # lets Python's normal unwind run `finally` blocks. Once the asyncio loop
+    # is up below, `loop.add_signal_handler` overrides these to drive a
+    # graceful cancel of the poll loop.
+    def _raise_systemexit_on_signal(sig: int, _frame: object) -> None:
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _raise_systemexit_on_signal)
+
+    pid_file.write_text(str(os.getpid()))
+    try:
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
         from ctrlrelay.core.github import GitHubCLI
         from ctrlrelay.core.poller import IssuePoller, run_poll_loop
@@ -949,12 +1066,26 @@ def poller_start(
                         t.cancel()
                     await asyncio.gather(*list(pr_watch_tasks), return_exceptions=True)
 
+        loop = asyncio.new_event_loop()
         try:
-            asyncio.run(_main())
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Poller stopped.[/yellow]")
+            asyncio.set_event_loop(loop)
+            main_task = loop.create_task(_main())
+
+            def _handle_stop(sig: int) -> None:
+                main_task.cancel()
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, _handle_stop, sig)
+
+            try:
+                loop.run_until_complete(main_task)
+            except asyncio.CancelledError:
+                console.print("\n[yellow]Poller stopped.[/yellow]")
         finally:
+            loop.close()
             state_db.close()
+    finally:
+        pid_file.unlink(missing_ok=True)
 
 
 @poller_app.command("stop")

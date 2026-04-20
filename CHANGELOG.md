@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`ctrlrelay bridge start` / `ctrlrelay poller start` now daemonize by
+  default** and return to the shell immediately, writing a PID file so
+  `status`/`stop` can find the process. This matches the normal "start a
+  service" UX expectation and fixes the previous behavior where the
+  terminal would block until Ctrl+C.
+- Added `--foreground` / `-F` flag to both commands. Under a process
+  supervisor (launchd, systemd) pass this so the supervisor — not the
+  CLI's own fork — owns the long-lived PID. Existing supervisor unit
+  files must be updated to include this flag; examples in
+  `docs/operations.md` are revised.
+- `ctrlrelay bridge status` and `poller status` rely on the PID file as
+  before. If a supervisor runs the old (pre-`--foreground`) command, no
+  PID file is written and `status` now prints a migration hint instead
+  of a misleading "not running".
+- The deprecated `--daemon` / `-d` flag has been removed; the daemonize
+  behavior is now the default. Scripts using `--daemon` will need to
+  drop the flag.
+
+### Security
+
+- **Telegram bot token is no longer passed via subprocess argv.** Before
+  this release, daemon-mode `bridge start` invoked the child with
+  `--bot-token <TOKEN>` on the command line, exposing the secret to any
+  local user or tool that reads `ps` / `/proc/*/cmdline`. The daemon
+  parent now tells the child which env var to read (`--bot-token-env`)
+  and relies on the inherited process environment instead. Since
+  daemonize mode is now the default, this would have leaked the token on
+  every vanilla `ctrlrelay bridge start` — rotate your bot token if you
+  ran a pre-release `main` build of this branch in a shared environment.
+
+### Fixed
+
+- **Daemon `start` no longer reports success for a crashed child.** The
+  parent now waits briefly for the child after `subprocess.Popen` and
+  reports failure if it exited (e.g. `gh` missing, env var unset,
+  crash-on-import). Previously the parent printed `Poller started
+  (PID N)` even when the child died within milliseconds.
+- **Foreground `poller start` now handles `SIGTERM` cleanly.** Under
+  launchd/systemd, service stop sends SIGTERM; the prior code only
+  caught `KeyboardInterrupt`, so the outer `finally` that unlinks
+  `poller.pid` and closes the state DB never ran. A recycled PID could
+  then be mistaken for a live poller by the next `start`/`status`. The
+  foreground path now installs SIGTERM/SIGINT handlers, cancels the poll
+  loop task, and lets cleanup run.
+
 ## [0.1.3] - 2026-04-18
 
 Reliability pass on the poller + retry flow, plus CI gating. No runtime

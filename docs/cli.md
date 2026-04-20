@@ -87,14 +87,16 @@ See [Telegram bridge]({{ '/bridge/' | relative_url }}) for the full setup walkth
 ### `bridge start`
 
 ```bash
-ctrlrelay bridge start [-c PATH] [-d|--daemon]
+ctrlrelay bridge start [-c PATH] [-F|--foreground]
 ```
 
 Starts the bridge listening on `transport.telegram.socket_path`. Reads the
 bot token from the env var named in `transport.telegram.bot_token_env`
-(default `CTRLRELAY_TELEGRAM_TOKEN`). Without `--daemon` runs in the
-foreground; with `--daemon` spawns a detached process and writes a PID file
-alongside the socket.
+(default `CTRLRELAY_TELEGRAM_TOKEN`). Daemonizes by default — forks a
+detached process, writes a PID file alongside the socket, and returns to
+the shell. Pass `--foreground` / `-F` under launchd/systemd or when
+debugging interactively; the process runs in the foreground and still
+writes its PID file so `ctrlrelay bridge status` works.
 
 Fails if `transport.type` is not `telegram`, the token env var is unset, or a
 PID file already exists for a live process.
@@ -113,8 +115,11 @@ Reads the PID file and sends `SIGTERM`.
 ctrlrelay bridge status [-c PATH]
 ```
 
-Reports running / not-running. Detects orphan socket files (socket exists but
-the process is gone).
+Reports running / not-running by consulting the PID file. If the PID file is
+missing but the socket exists (e.g. the bridge was started by an older
+launchd plist that pre-dates the PID-file change), exits non-zero with a
+hint to restart the bridge — a restart on the new version will regenerate
+the PID file and let `status` work.
 
 ### `bridge test`
 
@@ -161,13 +166,13 @@ any repo failed.
 ### `poller start`
 
 ```bash
-ctrlrelay poller start [-c PATH] [-d|--daemon] [-i SECONDS]
+ctrlrelay poller start [-c PATH] [-F|--foreground] [-i SECONDS]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--interval` / `-i` | `300` | Seconds between polls. |
-| `--daemon` / `-d` | off | Background mode (writes PID file). |
+| `--foreground` / `-F` | off | Run in the foreground. Default is to daemonize (fork + return to shell). Pass this under launchd/systemd. |
 | `--config` / `-c` | `config/orchestrator.yaml` | Config path. |
 
 Polls each configured repo for issues assigned to your GitHub user (resolved
