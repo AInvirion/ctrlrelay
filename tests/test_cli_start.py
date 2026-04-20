@@ -215,3 +215,39 @@ class TestPollerStartForeground:
         result = runner.invoke(app, ["poller", "start", "--help"])
         assert result.exit_code == 0
         assert "--foreground" in _plain(result.output)
+
+    def test_foreground_tolerates_its_own_pid_in_pidfile(
+        self, telegram_config: Path, tmp_path: Path
+    ) -> None:
+        """Regression for codex P1: when the daemon parent writes the child's
+        PID to the file before spawning `--foreground`, the child must NOT
+        treat its own PID as a conflict and exit."""
+        pid_file = tmp_path / "poller.pid"
+        pid_file.write_text(str(os.getpid()))
+
+        # Force the body of the foreground branch to short-circuit before it
+        # tries to talk to GitHub or start polling; we only care that the
+        # self-PID guard doesn't fire.
+        with patch(
+            "ctrlrelay.core.github._find_gh",
+            side_effect=RuntimeError("short-circuit"),
+        ) as find_gh:
+            result = runner.invoke(
+                app,
+                [
+                    "poller",
+                    "start",
+                    "--foreground",
+                    "--config",
+                    str(telegram_config),
+                ],
+            )
+
+        assert "already running" not in result.output.lower(), (
+            "foreground child must not treat its own PID in the file as a "
+            "conflict (codex [P1] regression)"
+        )
+        assert find_gh.called, (
+            "execution must proceed past the PID-file guard into the poll "
+            "setup path"
+        )

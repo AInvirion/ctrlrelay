@@ -286,6 +286,7 @@ def bridge_start(
 
     if foreground:
         import asyncio
+        import signal
 
         from ctrlrelay.bridge import BridgeServer
 
@@ -299,11 +300,22 @@ def bridge_start(
             chat_id=telegram_config.chat_id,
         )
 
+        loop = asyncio.new_event_loop()
         try:
-            asyncio.run(server.start())
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Shutting down...[/yellow]")
+            asyncio.set_event_loop(loop)
+
+            def _handle_stop(sig: int) -> None:
+                loop.create_task(server.stop())
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, _handle_stop, sig)
+
+            try:
+                loop.run_until_complete(server.start())
+            except asyncio.CancelledError:
+                pass
         finally:
+            loop.close()
             pid_file.unlink(missing_ok=True)
     else:
         cmd = [
@@ -726,9 +738,14 @@ def poller_start(
     if pid_file.exists():
         try:
             pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
-            console.print(f"[yellow]Poller already running (PID {pid})[/yellow]")
-            raise typer.Exit(1)
+            if pid == os.getpid():
+                # The daemon parent wrote our own PID here before spawning us
+                # as the `--foreground` child. Don't treat it as a conflict.
+                pass
+            else:
+                os.kill(pid, 0)
+                console.print(f"[yellow]Poller already running (PID {pid})[/yellow]")
+                raise typer.Exit(1)
         except (ProcessLookupError, ValueError):
             pid_file.unlink(missing_ok=True)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
