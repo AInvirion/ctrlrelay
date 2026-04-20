@@ -333,40 +333,102 @@ class TestSecopsCancelDoesNotOverwriteCompletedStatus:
         )
 
 
-class TestSecopsLockReleaseOrdering:
-    """Regression for codex round-5 [P1]: the repo lock must be released
-    BEFORE the async worktree cleanup, not after. Scheduler.shutdown's
-    bounded timeout can tear us down mid-cleanup; if the lock release
-    sat after the shielded await, a shutdown interruption would leave
-    the repo locked across daemon restart — the exact failure the
-    scheduler wiring was meant to prevent."""
+class TestSecopsLockHeldThroughCleanup:
+    """Regression for codex round-10 [P1-a]: the per-repo lock must be
+    held THROUGH worktree cleanup (not released before). Releasing early
+    lets a concurrent dev/secops run acquire the same repo and race
+    `git worktree prune` on the shared bare clone. Round 5 asked for
+    release-before-cleanup to avoid lock leaks on cancel, but the
+    bounded `asyncio.wait_for` timeout we use now makes that tradeoff
+    unnecessary — cleanup either finishes or bails within 130s, then
+    the lock is released."""
 
     @pytest.mark.asyncio
-    async def test_lock_released_before_worktree_cleanup_on_cancel(
+    async def test_lock_held_across_worktree_removal_on_happy_path(
         self, tmp_path: Path
     ) -> None:
         import asyncio
 
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
         from ctrlrelay.pipelines.secops import run_secops_all
 
         events: list[str] = []
 
         mock_db = MagicMock()
         mock_db.acquire_lock.return_value = True
+        mock_db.release_lock.side_effect = lambda *a, **kw: events.append(
+            "release_lock"
+        )
 
-        def record_release(*_args, **_kwargs):
-            events.append("release_lock")
+        async def traced_remove(repo_, session_id_):
+            events.append("remove_worktree_start")
+            await asyncio.sleep(0)
+            events.append("remove_worktree_done")
 
-        mock_db.release_lock.side_effect = record_release
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+        mock_worktree.remove_worktree.side_effect = traced_remove
+
+        mock_state = MagicMock()
+        mock_state.status = CheckpointStatus.DONE
+        mock_state.summary = "ok"
+        mock_state.outputs = {}
+        mock_state.error = None
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="s", exit_code=0, state=mock_state,
+        )
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        # remove_worktree must complete BEFORE release_lock — the repo
+        # must be locked throughout cleanup so a concurrent run can't
+        # race `git worktree prune`.
+        assert "remove_worktree_done" in events
+        assert "release_lock" in events
+        assert events.index("remove_worktree_done") < events.index(
+            "release_lock"
+        ), (
+            f"lock must stay held until worktree cleanup completes; "
+            f"got events={events} (codex round-10 [P1-a] regression)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_still_releases_lock_so_daemon_restart_not_wedged(
+        self, tmp_path: Path
+    ) -> None:
+        """Round-5 concern (lock-leak on cancel) is preserved: if cleanup
+        is cancelled mid-flight, the lock is released explicitly in the
+        except-CancelledError path before the error propagates."""
+        import asyncio
+
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        release_calls: list[tuple] = []
+        mock_db.release_lock.side_effect = lambda *a, **kw: (
+            release_calls.append(a) or True
+        )
 
         async def slow_remove(repo_, session_id_):
-            events.append("remove_worktree_start")
-            # Short sleep is enough — we only need to verify that the
-            # shielded await STARTS after release_lock. The real-world
-            # scenario is 120s git-worktree-prune; simulating that would
-            # just slow the test.
-            await asyncio.sleep(0.05)
-            events.append("remove_worktree_done")
+            # Long enough that cancel will fire before it returns;
+            # short enough that the test doesn't wait on a stray task.
+            await asyncio.sleep(0.5)
 
         mock_worktree = AsyncMock()
         mock_worktree.create_worktree.return_value = tmp_path / "worktree"
@@ -376,7 +438,7 @@ class TestSecopsLockReleaseOrdering:
         async def hang(ctx):  # noqa: ARG001
             await asyncio.Event().wait()
 
-        repo = MagicMock(name="owner/repo")
+        repo = MagicMock()
         repo.name = "owner/repo"
 
         with patch(
@@ -396,8 +458,7 @@ class TestSecopsLockReleaseOrdering:
                 )
             )
 
-            # Wait until we're inside the hanging pipeline.
-            for _ in range(20):
+            for _ in range(30):
                 await asyncio.sleep(0.01)
                 if any(
                     "INSERT INTO sessions" in c.args[0]
@@ -410,20 +471,9 @@ class TestSecopsLockReleaseOrdering:
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-        # The crucial ordering: release_lock must appear before (or at
-        # the same time as) the start of remove_worktree. A build that
-        # released last would see `remove_worktree_start` first and then
-        # get cut off before `release_lock` fires.
-        assert "release_lock" in events, "lock must have been released"
-        release_idx = events.index("release_lock")
-        remove_idx = (
-            events.index("remove_worktree_start")
-            if "remove_worktree_start" in events
-            else len(events)
-        )
-        assert release_idx < remove_idx, (
-            f"release_lock must fire before remove_worktree starts; "
-            f"got events={events} (codex round-5 [P1] regression)"
+        assert release_calls, (
+            "cancel path must release the lock so a daemon restart "
+            "isn't wedged"
         )
 
 

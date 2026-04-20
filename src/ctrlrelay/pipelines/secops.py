@@ -291,28 +291,20 @@ async def run_secops_all(
             ))
 
         finally:
-            # Release the repo lock FIRST. Worktree cleanup below uses an
-            # asyncio.shield so the inner coroutine can finish, but a
-            # scheduler shutdown cancel can still raise CancelledError
-            # into our await point — and the Scheduler shutdown window
-            # (30s) is shorter than `_run_git`'s own 120s timeout, so
-            # cleanup CAN be cut off. If we released the lock last, a
-            # cut-off cleanup would leave the repo locked across daemon
-            # restart. Releasing first trades "worktree may leak on disk"
-            # (recoverable via `git worktree prune`) for "next run can
-            # always proceed" (which is what actually matters).
-            try:
-                state_db.release_lock(repo, session_id)
-            except Exception as lock_exc:
-                log_event(
-                    _logger,
-                    "secops.cleanup.lock_release_failed",
-                    session_id=session_id,
-                    repo=repo,
-                    error_type=type(lock_exc).__name__,
-                    error=str(lock_exc)[:200],
-                )
-
+            # Hold the per-repo lock THROUGH worktree cleanup so a
+            # concurrent dev/secops run can't acquire the same repo and
+            # race `git worktree prune` on the shared bare clone.
+            # Cleanup is bounded by an asyncio.wait_for timeout so a
+            # truly-stuck operation can't pin the lock forever — once
+            # the timeout fires we release anyway, preferring "possibly
+            # leaked git admin state (recoverable via `git worktree
+            # prune`)" over "repo locked across daemon restart".
+            #
+            # No asyncio.shield here: `_run_git` kills its subprocess
+            # synchronously on CancelledError so unshielded cleanup
+            # unwinds fast and without leaking a stray git. Previously
+            # the shield made the outer task cancel immediately while
+            # the inner cleanup kept running untracked — leaking state.
             if worktree_path is not None:
                 try:
                     worktree.remove_context_symlink(worktree_path)
@@ -326,15 +318,22 @@ async def run_secops_all(
                         error=str(cleanup_exc)[:200],
                     )
                 try:
-                    await asyncio.shield(
-                        worktree.remove_worktree(repo, session_id)
+                    # Timeout matches Scheduler's cancel budget (150s) — a
+                    # full worktree prune can take up to 120s per
+                    # WorktreeManager._run_git ceiling.
+                    await asyncio.wait_for(
+                        worktree.remove_worktree(repo, session_id),
+                        timeout=130.0,
+                    )
+                except asyncio.TimeoutError:
+                    log_event(
+                        _logger,
+                        "secops.cleanup.worktree_timeout",
+                        session_id=session_id,
+                        repo=repo,
+                        worktree_path=str(worktree_path),
                     )
                 except asyncio.CancelledError:
-                    # Shutdown raced us past the scheduler's cleanup
-                    # window. The inner shielded coroutine continues on
-                    # the loop (APScheduler won't close it until its
-                    # own shutdown completes), but we can't wait for it
-                    # here. Log and let the cancel propagate.
                     log_event(
                         _logger,
                         "secops.cleanup.worktree_cancelled_mid_shutdown",
@@ -342,6 +341,14 @@ async def run_secops_all(
                         repo=repo,
                         worktree_path=str(worktree_path),
                     )
+                    # Release the lock before propagating — leaving it
+                    # held across a daemon restart is worse than the
+                    # small race with a future scheduled run (the dev
+                    # handler retries on lock conflict anyway).
+                    try:
+                        state_db.release_lock(repo, session_id)
+                    except Exception:
+                        pass
                     raise
                 except Exception as cleanup_exc:
                     log_event(
@@ -353,5 +360,20 @@ async def run_secops_all(
                         error_type=type(cleanup_exc).__name__,
                         error=str(cleanup_exc)[:200],
                     )
+
+            # Release the lock AFTER cleanup attempt so new runs don't
+            # race the prune. In the cancel path above we released early
+            # and re-raised; here we handle the non-cancel paths.
+            try:
+                state_db.release_lock(repo, session_id)
+            except Exception as lock_exc:
+                log_event(
+                    _logger,
+                    "secops.cleanup.lock_release_failed",
+                    session_id=session_id,
+                    repo=repo,
+                    error_type=type(lock_exc).__name__,
+                    error=str(lock_exc)[:200],
+                )
 
     return results

@@ -913,10 +913,11 @@ def poller_start(
             state_file=state_file,
         )
 
-        # On first run, seed with current assignments to avoid replaying backlog
-        if first_run:
-            console.print("[dim]First run: seeding with current assignments...[/dim]")
-            asyncio.run(poller.seed_current())
+        # NOTE: first-run seeding moved into `_main()` so the APScheduler
+        # cron is registered + running BEFORE the slow seed_current() pass
+        # (one GitHub API call per repo) takes place. Otherwise the 6am
+        # scheduled fire can pass during startup and APScheduler's misfire
+        # grace only catches up on fires that happened AFTER registration.
 
         state_db = StateDB(config.paths.state_db)
         dispatcher = ClaudeDispatcher(
@@ -1185,6 +1186,11 @@ def poller_start(
                         pass
 
         async def _main() -> None:
+            # Register + start the scheduler FIRST, before any potentially
+            # slow startup work. Otherwise a 6am fire that lands during
+            # seed_current's per-repo GitHub calls would be lost —
+            # APScheduler's misfire_grace_time only rescues fires that
+            # happened AFTER the job was registered.
             scheduler = make_scheduler(timezone=config.timezone)
             scheduler.add_cron_job(
                 name="secops",
@@ -1196,6 +1202,16 @@ def poller_start(
                 f"[dim]Scheduler: secops cron={config.schedules.secops_cron} "
                 f"tz={config.timezone}[/dim]"
             )
+
+            # Now the slow startup: first-run seeding (one gh call per
+            # repo). Done inside _main so the scheduler is already up.
+            if first_run:
+                console.print(
+                    "[dim]First run: seeding with current assignments..."
+                    "[/dim]"
+                )
+                await poller.seed_current()
+
             try:
                 await run_poll_loop(
                     poller=poller, handler=handle_issue, interval=interval,
