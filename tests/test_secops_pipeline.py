@@ -183,6 +183,71 @@ class TestSecopsPipeline:
         assert "locked" in results[0].error.lower()
 
 
+class TestSecopsCleanupLogging:
+    """Regression for codex round-4 [P3]: worktree cleanup failures must
+    not be silently swallowed. Log them via the obs stream so operators
+    can see leaked admin state instead of discovering it later via a
+    "worktree already exists" failure on a subsequent run."""
+
+    @pytest.mark.asyncio
+    async def test_worktree_remove_failure_is_logged(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        mock_dispatcher = AsyncMock()
+        mock_state = MagicMock()
+        mock_state.status = CheckpointStatus.DONE
+        mock_state.summary = "Done"
+        mock_state.outputs = {}
+        mock_state.error = None
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="sess",
+            exit_code=0,
+            state=mock_state,
+        )
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+        # remove_worktree blows up — simulates a wedged `git worktree prune`.
+        mock_worktree.remove_worktree.side_effect = RuntimeError(
+            "worktree removal failed"
+        )
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.release_lock.return_value = True
+
+        repo = MagicMock(name="owner/repo")
+        repo.name = "owner/repo"
+
+        with patch("ctrlrelay.pipelines.secops._logger") as mock_logger:
+            results = await run_secops_all(
+                repos=[repo],
+                dispatcher=mock_dispatcher,
+                github=MagicMock(),
+                worktree=mock_worktree,
+                dashboard=None,
+                state_db=mock_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+
+        # Cleanup failure should not break the pipeline (result is still
+        # recorded) but it MUST be logged — `log_event` calls _logger.info
+        # under the hood so it shows up somewhere in mock_calls.
+        assert len(results) == 1
+        assert "secops.cleanup.worktree_failed" in str(mock_logger.mock_calls), (
+            "worktree removal failure must be logged via obs, not "
+            "swallowed (codex round-4 [P3] regression)"
+        )
+        # The repo lock must still be released.
+        mock_db.release_lock.assert_called()
+
+
 class TestSecopsCancellation:
     """Regression for codex [P2]: when a scheduled secops sweep is
     cancelled mid-run (scheduler.shutdown → SIGTERM), the session row

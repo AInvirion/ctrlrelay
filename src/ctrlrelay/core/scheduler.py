@@ -41,20 +41,59 @@ JobFunc = Callable[[], Awaitable[None]]
 _VIXIE_DOW_NAMES = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
 
 
+def _dow_name(n: int) -> str:
+    """Vixie DOW number → APScheduler name. 0 and 7 both = Sunday."""
+    return _VIXIE_DOW_NAMES[0 if n == 7 else n]
+
+
+def _expand_numeric_dow_range(
+    start: int, end: int, step: int = 1
+) -> list[str] | None:
+    """Expand a numeric Vixie-style DOW range to a list of APScheduler names,
+    or ``None`` if any endpoint is out of 0..7. Vixie ordering (Sun=0..Sat=6,
+    7=Sun alias) is NOT compatible with APScheduler's named-weekday ordering
+    (mon..sun), so a range like ``0-6`` cannot be rewritten as ``sun-sat`` —
+    APScheduler would reject that as an inverted range. Expand to an
+    explicit comma-list instead so the behavior is always well-defined."""
+    if not (0 <= start <= 7 and 0 <= end <= 7 and step >= 1):
+        return None
+    if start > end:
+        return None
+    return [_dow_name(n) for n in range(start, end + 1, step)]
+
+
 def _remap_dow_token(tok: str) -> str:
-    """Convert a single numeric Vixie DOW token (or a range/step/name) to
-    APScheduler's named-weekday form. Leaves non-numeric tokens alone."""
+    """Convert a single Vixie DOW token (number, range, step, or name) to
+    APScheduler's named-weekday form. Numeric ranges are expanded into
+    comma-separated name lists to avoid the Vixie/APScheduler ordering
+    mismatch that would reject valid Sunday-starting ranges. Non-numeric
+    tokens are returned unchanged."""
+    # Step form: "base/step"
     if "/" in tok:
-        base, step = tok.split("/", 1)
+        base, step_str = tok.split("/", 1)
+        try:
+            step = int(step_str)
+        except ValueError:
+            return tok
+        if "-" in base:
+            a, b = base.split("-", 1)
+            if a.isdigit() and b.isdigit():
+                expanded = _expand_numeric_dow_range(int(a), int(b), step)
+                if expanded is not None:
+                    return ",".join(expanded)
         return f"{_remap_dow_token(base)}/{step}"
+    # Range form: "a-b"
     if "-" in tok:
         a, b = tok.split("-", 1)
-        return f"{_remap_dow_token(a)}-{_remap_dow_token(b)}"
+        if a.isdigit() and b.isdigit():
+            expanded = _expand_numeric_dow_range(int(a), int(b))
+            if expanded is not None:
+                return ",".join(expanded)
+    # Bare number: "0".."7"
     if tok.isdigit():
         n = int(tok)
         if 0 <= n <= 7:
-            # 0 and 7 both = Sunday in Vixie cron.
-            return _VIXIE_DOW_NAMES[0 if n == 7 else n]
+            return _dow_name(n)
     return tok
 
 

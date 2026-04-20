@@ -35,11 +35,36 @@ class TestCronDowNormalization:
 
         assert _normalize_cron("0 6 * * 7") == "0 6 * * sun"
 
-    def test_dow_range_is_remapped(self) -> None:
+    def test_dow_range_is_expanded_to_name_list(self) -> None:
+        """Numeric ranges are expanded to an explicit name list because
+        APScheduler orders weekdays mon..sun — a range like `sun-sat`
+        (what naïve remapping of `0-6` would produce) is an inverted
+        range under that ordering and gets rejected."""
         from ctrlrelay.core.scheduler import _normalize_cron
 
-        # Weekdays only: Mon-Fri.
-        assert _normalize_cron("0 6 * * 1-5") == "0 6 * * mon-fri"
+        assert _normalize_cron("0 6 * * 1-5") == "0 6 * * mon,tue,wed,thu,fri"
+
+    def test_sunday_spanning_range_expands_to_every_day(self) -> None:
+        """Regression for codex round-4 [P2]: ``0-6`` must not collapse
+        to the invalid ``sun-sat`` inverted-range form. Full-week Vixie
+        ranges are valid and must survive normalization."""
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert (
+            _normalize_cron("0 6 * * 0-6")
+            == "0 6 * * sun,mon,tue,wed,thu,fri,sat"
+        )
+
+    def test_sunday_spanning_step_range_expands_correctly(self) -> None:
+        """Step-form range starting at Sunday: ``0-6/2`` = Sun, Tue, Thu, Sat."""
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * 0-6/2") == "0 6 * * sun,tue,thu,sat"
+
+    def test_numeric_step_range_not_wrapping_sunday_still_works(self) -> None:
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * 1-5/2") == "0 6 * * mon,wed,fri"
 
     def test_dow_list_is_remapped(self) -> None:
         from ctrlrelay.core.scheduler import _normalize_cron

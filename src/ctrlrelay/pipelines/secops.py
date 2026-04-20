@@ -290,18 +290,35 @@ async def run_secops_all(
             # Always release the worktree we created — success, failure, or
             # cancellation. Shield the removal from further cancels so the
             # cleanup actually completes even if we're already unwinding
-            # from asyncio.CancelledError.
+            # from asyncio.CancelledError. Log any failures via the obs
+            # stream rather than swallowing silently — operators need to
+            # see leaked admin state.
             if worktree_path is not None:
                 try:
                     worktree.remove_context_symlink(worktree_path)
-                except Exception:
-                    pass
+                except Exception as cleanup_exc:
+                    log_event(
+                        _logger,
+                        "secops.cleanup.symlink_failed",
+                        session_id=session_id,
+                        repo=repo,
+                        error_type=type(cleanup_exc).__name__,
+                        error=str(cleanup_exc)[:200],
+                    )
                 try:
                     await asyncio.shield(
                         worktree.remove_worktree(repo, session_id)
                     )
-                except Exception:
-                    pass
+                except Exception as cleanup_exc:
+                    log_event(
+                        _logger,
+                        "secops.cleanup.worktree_failed",
+                        session_id=session_id,
+                        repo=repo,
+                        worktree_path=str(worktree_path),
+                        error_type=type(cleanup_exc).__name__,
+                        error=str(cleanup_exc)[:200],
+                    )
             state_db.release_lock(repo, session_id)
 
     return results
