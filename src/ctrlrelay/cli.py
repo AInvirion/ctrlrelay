@@ -853,10 +853,12 @@ def poller_start(
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
         from ctrlrelay.core.github import GitHubCLI
         from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+        from ctrlrelay.core.scheduler import make_scheduler
         from ctrlrelay.core.state import StateDB
         from ctrlrelay.core.worktree import WorktreeManager
         from ctrlrelay.pipelines.dev import run_dev_issue
         from ctrlrelay.pipelines.post_merge import pr_watch_task
+        from ctrlrelay.pipelines.secops import run_secops_all
 
         github = GitHubCLI()
 
@@ -1051,12 +1053,53 @@ def poller_start(
         console.print(f"[green]Starting poller[/green] for {len(repo_names)} repo(s) as {username}")
         console.print(f"  Interval: {interval}s | Press Ctrl+C to stop")
 
+        async def _run_scheduled_secops() -> None:
+            """Scheduler callback: run the secops sweep across all repos.
+
+            Shares the poller's open state_db, github, dispatcher, and
+            worktree. No transport — scheduled secops notifications are a
+            separate concern we'll add when needed. Per-repo locks in the
+            state DB prevent collisions with an in-flight dev pipeline.
+            """
+            if not config.repos:
+                return
+            console.print(
+                f"[dim]Scheduled secops: starting across "
+                f"{len(config.repos)} repo(s)[/dim]"
+            )
+            results = await run_secops_all(
+                repos=config.repos,
+                dispatcher=dispatcher,
+                github=github,
+                worktree=worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=None,
+                contexts_dir=config.paths.contexts,
+            )
+            ok = sum(1 for r in results if r.success)
+            console.print(
+                f"[dim]Scheduled secops: {ok}/{len(results)} succeeded[/dim]"
+            )
+
         async def _main() -> None:
+            scheduler = make_scheduler(timezone=config.timezone)
+            scheduler.add_cron_job(
+                name="secops",
+                cron_expr=config.schedules.secops_cron,
+                func=_run_scheduled_secops,
+            )
+            scheduler.start()
+            console.print(
+                f"[dim]Scheduler: secops cron={config.schedules.secops_cron} "
+                f"tz={config.timezone}[/dim]"
+            )
             try:
                 await run_poll_loop(
                     poller=poller, handler=handle_issue, interval=interval,
                 )
             finally:
+                scheduler.shutdown(wait=False)
                 # Cancel any in-flight PR watchers so a poller stop/restart
                 # doesn't leak asyncio tasks. Their handlers log
                 # dev.pr.watch_cancelled and close their transport via the

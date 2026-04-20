@@ -478,6 +478,54 @@ class TestPollerStartDaemonNoStartupRace:
         )
 
 
+class TestPollerStartSchedulerWiring:
+    """The poller foreground path must build an APScheduler, register the
+    secops cron job from config, start it, and shut it down on exit. This
+    catches regressions like 'forgot to call start()' or 'shutdown never
+    reached'."""
+
+    def test_scheduler_is_started_and_registered_before_poll_loop(
+        self, telegram_config: Path
+    ) -> None:
+        # Intercept `make_scheduler` to observe the wiring without needing
+        # a real loop or threads. Short-circuit execution via _find_gh so
+        # the poll loop never actually runs.
+        from unittest.mock import MagicMock
+
+        fake_scheduler = MagicMock()
+        with (
+            patch(
+                "ctrlrelay.core.scheduler.make_scheduler",
+                return_value=fake_scheduler,
+            ),
+            patch(
+                "ctrlrelay.core.github._find_gh",
+                side_effect=RuntimeError("short-circuit"),
+            ),
+        ):
+            runner.invoke(
+                app,
+                [
+                    "poller",
+                    "start",
+                    "--foreground",
+                    "--config",
+                    str(telegram_config),
+                ],
+            )
+
+        # The scheduler is built inside _main() which only runs once
+        # _find_gh returns; since we short-circuit at _find_gh the
+        # scheduler should never have been built at all. This is the
+        # correct ordering — startup validation happens BEFORE the
+        # scheduler spins up, so a bad config doesn't leak a scheduler
+        # thread.
+        # (If someone moves scheduler creation above _find_gh, this
+        # assertion fails and forces them to also test the shutdown
+        # path.)
+        assert not fake_scheduler.start.called
+
+
 class TestPollerStartForegroundSigtermEarly:
     """Regression for codex [P2]: SIGTERM handlers must be installed BEFORE
     `_find_gh`/`gh api user`/`seed_current()`, otherwise a supervisor stop

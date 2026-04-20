@@ -32,6 +32,12 @@ dashboard:
   url: "https://ctrlrelay-dashboard.example.com"
   auth_token_env: "CTRLRELAY_DASHBOARD_TOKEN"
 
+# Scheduled jobs run in-process by the poller daemon. Cron expressions are
+# standard 5-field (minute hour dom month dow) and evaluate in the `timezone`
+# set above. Change `secops_cron` to e.g. "0 6 * * 1" for weekly (Mondays).
+schedules:
+  secops_cron: "0 6 * * *"
+
 repos: []
   # Example repo configuration:
   # - name: "owner/repo"

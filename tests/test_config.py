@@ -41,3 +41,38 @@ class TestConfigPaths:
         config = load_config(sample_config_file)
         assert "~" not in str(config.paths.state_db)
         assert str(config.paths.state_db).startswith("/")
+
+
+class TestSchedulesConfig:
+    def test_default_secops_cron_is_six_am_daily(
+        self, sample_config_file: Path
+    ) -> None:
+        """When the config omits schedules, secops_cron must default to 6am
+        daily — the target from the original design doc."""
+        config = load_config(sample_config_file)
+        assert config.schedules.secops_cron == "0 6 * * *"
+
+    def test_secops_cron_override_accepted(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """Valid cron expressions should pass through untouched."""
+        import yaml
+
+        sample_config_dict["schedules"] = {"secops_cron": "0 6 * * 1"}
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        config = load_config(cfg_path)
+        assert config.schedules.secops_cron == "0 6 * * 1"
+
+    def test_invalid_cron_raises_config_error(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """A malformed cron expression must fail fast at config load time,
+        not silently disable the scheduled job at runtime."""
+        import yaml
+
+        sample_config_dict["schedules"] = {"secops_cron": "not a cron expression"}
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        with pytest.raises(ConfigError, match="invalid cron"):
+            load_config(cfg_path)

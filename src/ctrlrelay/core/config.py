@@ -150,6 +150,31 @@ class RepoConfig(BaseModel):
         return v
 
 
+class SchedulesConfig(BaseModel):
+    """Cron schedules for background jobs run by the poller daemon.
+
+    Values are standard 5-field cron expressions (minute hour dom month dow),
+    evaluated in the top-level ``timezone``. Each schedule is validated at
+    config load time so an unparseable expression fails fast rather than
+    silently disabling the job.
+    """
+
+    secops_cron: str = "0 6 * * *"
+
+    @field_validator("secops_cron")
+    @classmethod
+    def validate_cron(cls, v: str) -> str:
+        from apscheduler.triggers.cron import CronTrigger
+
+        try:
+            CronTrigger.from_crontab(v)
+        except Exception as e:
+            raise ValueError(
+                f"invalid cron expression {v!r}: {e}"
+            ) from e
+        return v
+
+
 class Config(BaseModel):
     """Root configuration model for ctrlrelay orchestrator."""
 
@@ -160,6 +185,7 @@ class Config(BaseModel):
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
     transport: TransportConfig
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
     repos: list[RepoConfig] = Field(default_factory=list)
 
 

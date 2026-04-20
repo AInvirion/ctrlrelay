@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **In-process scheduler hosted by the poller daemon** (APScheduler). One
+  cron job registered today — `secops` at `0 6 * * *` in the config
+  timezone — matching the original design spec that was never shipped in
+  Phase 3. Configurable via a new top-level `schedules:` section in
+  `orchestrator.yaml`:
+
+  ```yaml
+  schedules:
+    secops_cron: "0 6 * * *"   # override to e.g. "0 6 * * 1" for weekly
+  ```
+
+  Invalid cron expressions fail at config-load time. Misfires coalesce
+  with a 1-hour grace window, so a laptop asleep at the fire time still
+  runs the job on wake without replaying missed fires. Cross-platform:
+  the scheduler runs inside the poller's asyncio loop, so macOS
+  (launchd) and Linux (systemd) behave identically — no per-OS timer
+  unit required.
+
 ### Changed
 
 - **`ctrlrelay bridge start` / `ctrlrelay poller start` now daemonize by
