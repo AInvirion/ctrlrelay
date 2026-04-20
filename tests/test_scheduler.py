@@ -157,6 +157,76 @@ class TestCronDowNormalization:
         )
 
 
+class TestVixieDomDowOrSemantics:
+    """Regression for codex round-8 [P2]: when BOTH DOM and DOW are set,
+    Vixie cron fires on EITHER (union); APScheduler's raw
+    CronTrigger.from_crontab fires only on the intersection (AND). The
+    scheduler must split such expressions into an OrTrigger."""
+
+    def test_dom_and_dow_produces_or_trigger(self) -> None:
+        from apscheduler.triggers.combining import OrTrigger
+
+        from ctrlrelay.core.scheduler import _build_vixie_trigger
+
+        trigger = _build_vixie_trigger("0 6 1 * 1", timezone="UTC")
+        assert isinstance(trigger, OrTrigger), (
+            "DOM+DOW expression must wrap two CronTriggers in OrTrigger "
+            "(codex round-8 [P2] regression)"
+        )
+
+    def test_dom_only_stays_single_trigger(self) -> None:
+        from apscheduler.triggers.cron import CronTrigger
+
+        from ctrlrelay.core.scheduler import _build_vixie_trigger
+
+        trigger = _build_vixie_trigger("0 6 15 * *", timezone="UTC")
+        assert isinstance(trigger, CronTrigger)
+
+    def test_dow_only_stays_single_trigger(self) -> None:
+        from apscheduler.triggers.cron import CronTrigger
+
+        from ctrlrelay.core.scheduler import _build_vixie_trigger
+
+        trigger = _build_vixie_trigger("0 6 * * 1", timezone="UTC")
+        assert isinstance(trigger, CronTrigger)
+
+    def test_dom_or_dow_fires_on_dow_match_when_dom_wouldnt(self) -> None:
+        """Concrete semantic check: ``0 6 1 * 1`` (1st OR Monday). A
+        Monday that is NOT the 1st must still fire; APScheduler's AND
+        reading would skip it."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from ctrlrelay.core.scheduler import _build_vixie_trigger
+
+        trigger = _build_vixie_trigger("0 6 1 * 1", timezone="UTC")
+        # Sunday 2024-01-07 — next fire under Vixie OR should be
+        # Monday 2024-01-08 (DOW match). Under AND it would skip until
+        # a Monday that also happens to be the 1st.
+        start = datetime(2024, 1, 7, 0, 0, 0, tzinfo=ZoneInfo("UTC"))
+        next_fire = trigger.get_next_fire_time(None, start)
+        assert next_fire is not None
+        assert next_fire.date().isoformat() == "2024-01-08", (
+            f"expected 2024-01-08 (Monday fire), got {next_fire}"
+        )
+
+    def test_dom_or_dow_also_fires_on_dom_match(self) -> None:
+        """Concrete semantic check: same expression, pick a start where
+        the next 1st-of-month comes before the next Monday."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from ctrlrelay.core.scheduler import _build_vixie_trigger
+
+        trigger = _build_vixie_trigger("0 6 1 * 1", timezone="UTC")
+        # Tuesday 2024-01-30 — next Monday is Feb 5. But Feb 1 (a
+        # Thursday) comes first via the DOM branch.
+        start = datetime(2024, 1, 30, 0, 0, 0, tzinfo=ZoneInfo("UTC"))
+        next_fire = trigger.get_next_fire_time(None, start)
+        assert next_fire is not None
+        assert next_fire.date().isoformat() == "2024-02-01"
+
+
 class TestMakeScheduler:
     def test_honors_timezone(self) -> None:
         """The scheduler's timezone must match the orchestrator config so

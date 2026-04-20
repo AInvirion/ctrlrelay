@@ -641,3 +641,60 @@ class TestIssuePoller:
         assert any(
             "poll.handler.failed" in r.getMessage() for r in caplog.records
         )
+
+
+class TestUnmarkSeen:
+    """Regression for codex round-8 [P1]: the poller marks issues seen
+    BEFORE the handler runs, so a handler failure would permanently
+    drop the issue. `unmark_seen` lets a caller revert the claim for
+    transient failures (e.g. per-repo lock conflict with a scheduled
+    secops sweep) so the next poll picks it up again."""
+
+    def test_unmark_removes_from_seen_set(self, state_file: Path) -> None:
+        poller = IssuePoller(
+            github=MagicMock(),
+            username="tester",
+            repos=["owner/repo"],
+            state_file=state_file,
+        )
+        poller.mark_seen("owner/repo", 42)
+        assert 42 in poller.seen_issues["owner/repo"]
+
+        poller.unmark_seen("owner/repo", 42)
+        assert 42 not in poller.seen_issues["owner/repo"]
+
+    def test_unmark_unknown_repo_is_noop(self, state_file: Path) -> None:
+        poller = IssuePoller(
+            github=MagicMock(),
+            username="tester",
+            repos=["owner/repo"],
+            state_file=state_file,
+        )
+        # Should not raise and should not materialize an empty entry.
+        poller.unmark_seen("owner/other-repo", 99)
+
+    def test_unmark_unknown_issue_is_noop(self, state_file: Path) -> None:
+        poller = IssuePoller(
+            github=MagicMock(),
+            username="tester",
+            repos=["owner/repo"],
+            state_file=state_file,
+        )
+        poller.mark_seen("owner/repo", 1)
+        poller.unmark_seen("owner/repo", 999)
+        assert poller.seen_issues["owner/repo"] == {1}
+
+    def test_unmark_persists_state_to_disk(self, state_file: Path) -> None:
+        """State must persist so a daemon restart between the un-mark
+        and the next poll doesn't forget the re-queue."""
+        poller = IssuePoller(
+            github=MagicMock(),
+            username="tester",
+            repos=["owner/repo"],
+            state_file=state_file,
+        )
+        poller.mark_seen("owner/repo", 55)
+        poller.unmark_seen("owner/repo", 55)
+
+        on_disk = json.loads(state_file.read_text())
+        assert 55 not in on_disk["seen_issues"].get("owner/repo", [])

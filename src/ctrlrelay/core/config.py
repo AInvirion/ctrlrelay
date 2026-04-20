@@ -164,14 +164,14 @@ class SchedulesConfig(BaseModel):
     @field_validator("secops_cron")
     @classmethod
     def validate_cron(cls, v: str) -> str:
-        from apscheduler.triggers.cron import CronTrigger
-
-        from ctrlrelay.core.scheduler import _normalize_cron
+        from ctrlrelay.core.scheduler import _build_vixie_trigger
 
         try:
-            # Parse what the scheduler will actually feed to APScheduler,
-            # after Vixie-DOW normalization — not the raw string.
-            CronTrigger.from_crontab(_normalize_cron(v))
+            # Build through the same helper the scheduler uses so
+            # (a) DOW normalization and (b) Vixie DOM/DOW-OR splitting
+            # are both exercised at load time. Bad expressions surface
+            # synchronously instead of at daemon start.
+            _build_vixie_trigger(v, timezone=None)
         except Exception as e:
             raise ValueError(
                 f"invalid cron expression {v!r}: {e}"

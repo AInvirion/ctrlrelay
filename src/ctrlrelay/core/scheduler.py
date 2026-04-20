@@ -22,6 +22,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 
 from ctrlrelay.core.obs import get_logger, log_event
@@ -135,6 +136,41 @@ def _remap_dow_token(tok: str) -> str:
     return tok
 
 
+def _build_vixie_trigger(cron_expr: str, timezone):
+    """Build an APScheduler trigger that honors Vixie cron DOM/DOW OR
+    semantics.
+
+    Vixie cron: when BOTH day-of-month and day-of-week are non-wildcard,
+    the expression fires when EITHER field matches (union). APScheduler's
+    ``CronTrigger.from_crontab`` treats them as AND (intersection), which
+    makes ``0 6 1 * mon`` fire only on Mondays that fall on the 1st — a
+    much rarer schedule than the user wrote.
+
+    When both fields are set, we split the expression into two triggers
+    (``m h DOM mon *`` and ``m h * mon DOW``) wrapped in an ``OrTrigger``
+    so APScheduler fires on either match. The rare case where a given
+    minute matches both triggers (Aug 1 is a Monday + cron is
+    ``0 6 1 8 mon``) produces a single fire because ``OrTrigger``
+    coalesces simultaneous sub-trigger hits by fire time.
+
+    If either DOM or DOW is a wildcard (the common case), we take the
+    simple path and return a single ``CronTrigger`` — saves a log entry
+    and an allocation.
+    """
+    normalized = _normalize_cron(cron_expr)
+    parts = normalized.split()
+    if len(parts) == 5:
+        m, h, dom, mon, dow = parts
+        if dom != "*" and dow != "*":
+            dom_only = f"{m} {h} {dom} {mon} *"
+            dow_only = f"{m} {h} * {mon} {dow}"
+            return OrTrigger([
+                CronTrigger.from_crontab(dom_only, timezone=timezone),
+                CronTrigger.from_crontab(dow_only, timezone=timezone),
+            ])
+    return CronTrigger.from_crontab(normalized, timezone=timezone)
+
+
 def _normalize_cron(expr: str) -> str:
     """Convert a Vixie-style 5-field cron expression to APScheduler syntax.
 
@@ -199,9 +235,7 @@ class Scheduler:
         the poll loop isolates per-repo failures. Also tracks the running
         task so ``shutdown`` can cancel and await it cleanly.
         """
-        trigger = CronTrigger.from_crontab(
-            _normalize_cron(cron_expr), timezone=self._impl.timezone,
-        )
+        trigger = _build_vixie_trigger(cron_expr, timezone=self._impl.timezone)
 
         async def _safe_job() -> None:
             task = asyncio.current_task()

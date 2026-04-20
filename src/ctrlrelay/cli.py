@@ -1013,6 +1013,35 @@ def poller_start(
                     contexts_dir=config.paths.contexts,
                 )
 
+                # Lock-conflict retry hook. The poller marks issues seen
+                # BEFORE handle_issue runs, so a failed attempt would
+                # permanently drop the issue. If run_dev_issue couldn't
+                # acquire the per-repo lock (common when a scheduled
+                # secops sweep is mid-run on the same repo), un-mark the
+                # issue so the next poll picks it up. Any other failure
+                # still stays seen — those aren't transient.
+                if (
+                    not result.success
+                    and not result.blocked
+                    and result.error
+                    and "locked by another session" in result.error.lower()
+                ):
+                    poller.unmark_seen(repo, issue_number)
+                    console.print(
+                        f"[yellow]#{issue_number} in {repo}: repo locked "
+                        "(secops running?) — un-marked for retry next "
+                        "poll.[/yellow]"
+                    )
+                    if connected_transport:
+                        try:
+                            await transport.send(
+                                f"⏳ #{issue_number} in {repo} "
+                                "deferred (repo busy); will retry."
+                            )
+                        except Exception:
+                            pass
+                    return
+
                 # Spawn the PR watcher FIRST, before any best-effort
                 # notification. The poller has already marked this issue
                 # as seen in poller_state.json, so if a transient
@@ -1074,9 +1103,13 @@ def poller_start(
 
             Shares the poller's open state_db, github, dispatcher, and
             worktree. Per-repo locks in the state DB prevent collisions
-            with an in-flight dev pipeline. Transport is None — scheduled
-            secops Telegram notifications are out of scope for now; the
-            dashboard path covers operator visibility.
+            with an in-flight dev pipeline (and the dev handler now
+            retries on lock-conflict so issues aren't silently dropped).
+
+            Builds a fresh SocketTransport per run so blocked/failed
+            results notify Telegram — the dashboard only pushes for
+            successful runs, so without a transport here operators would
+            lose visibility into scheduled failures.
             """
             if not config.repos:
                 return
@@ -1084,20 +1117,72 @@ def poller_start(
                 f"[dim]Scheduled secops: starting across "
                 f"{len(config.repos)} repo(s)[/dim]"
             )
-            results = await run_secops_all(
-                repos=config.repos,
-                dispatcher=dispatcher,
-                github=github,
-                worktree=worktree,
-                dashboard=scheduled_dashboard,
-                state_db=state_db,
-                transport=None,
-                contexts_dir=config.paths.contexts,
-            )
-            ok = sum(1 for r in results if r.success)
-            console.print(
-                f"[dim]Scheduled secops: {ok}/{len(results)} succeeded[/dim]"
-            )
+
+            secops_transport = None
+            if config.transport.type.value == "telegram" and config.transport.telegram:
+                from ctrlrelay.transports import SocketTransport
+                sock = config.transport.telegram.socket_path.expanduser().resolve()
+                if sock.exists():
+                    try:
+                        candidate = SocketTransport(sock)
+                        await candidate.connect()
+                        secops_transport = candidate
+                    except Exception as e:
+                        console.print(
+                            f"[yellow]Scheduled secops: transport connect "
+                            f"failed ({e}) — running without notifications[/yellow]"
+                        )
+
+            try:
+                results = await run_secops_all(
+                    repos=config.repos,
+                    dispatcher=dispatcher,
+                    github=github,
+                    worktree=worktree,
+                    dashboard=scheduled_dashboard,
+                    state_db=state_db,
+                    transport=secops_transport,
+                    contexts_dir=config.paths.contexts,
+                )
+                ok = sum(1 for r in results if r.success)
+                console.print(
+                    f"[dim]Scheduled secops: {ok}/{len(results)} succeeded[/dim]"
+                )
+                # Fan-out a single summary notification for blocked/failed
+                # runs so operators see the bad cases — the dashboard path
+                # only pushes on success.
+                if secops_transport:
+                    blocked = [r for r in results if r.blocked]
+                    failed = [
+                        r for r in results
+                        if not r.success and not r.blocked
+                    ]
+                    try:
+                        if failed:
+                            names = ", ".join(r.summary for r in failed[:3])
+                            more = (
+                                f" (+{len(failed) - 3} more)"
+                                if len(failed) > 3 else ""
+                            )
+                            await secops_transport.send(
+                                f"❌ Scheduled secops: {len(failed)} failed — "
+                                f"{names}{more}"
+                            )
+                        if blocked:
+                            await secops_transport.send(
+                                f"⏸️ Scheduled secops: {len(blocked)} "
+                                "run(s) blocked on user input"
+                            )
+                    except Exception as e:
+                        console.print(
+                            f"[yellow]Scheduled secops: notify failed: {e}[/yellow]"
+                        )
+            finally:
+                if secops_transport:
+                    try:
+                        await secops_transport.close()
+                    except Exception:
+                        pass
 
         async def _main() -> None:
             scheduler = make_scheduler(timezone=config.timezone)
