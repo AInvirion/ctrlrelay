@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -227,6 +228,56 @@ class TestBridgeStartDaemonFailFast:
         assert "failed to start" in result.output.lower()
 
 
+class TestBridgeStartDaemonNoStartupRace:
+    """Regression for codex [P2]: PID file must be claimed BEFORE the 1-second
+    liveness probe, so a second concurrent `start` can't spawn a duplicate."""
+
+    def test_pid_file_claimed_before_liveness_probe(
+        self, telegram_config: Path, bot_token_env: None
+    ) -> None:
+        probe_seen_pid = {"value": None}
+        pid_file = telegram_config.parent / "ctrlrelay.pid"
+
+        def wait_with_assert(timeout: float) -> int:
+            probe_seen_pid["value"] = (
+                pid_file.read_text().strip() if pid_file.exists() else None
+            )
+            raise subprocess.TimeoutExpired(cmd="<test>", timeout=timeout)
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 99001
+        fake_proc.wait.side_effect = wait_with_assert
+        with patch("subprocess.Popen", return_value=fake_proc):
+            result = runner.invoke(
+                app, ["bridge", "start", "--config", str(telegram_config)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert probe_seen_pid["value"] == str(fake_proc.pid), (
+            "PID file must be written before proc.wait() so a concurrent "
+            "`start` in the probe window sees the claim"
+        )
+
+    def test_pid_file_removed_if_child_crashes_on_start(
+        self, telegram_config: Path, bot_token_env: None
+    ) -> None:
+        pid_file = telegram_config.parent / "ctrlrelay.pid"
+        fake_proc = MagicMock()
+        fake_proc.pid = 99002
+        fake_proc.wait.return_value = 5
+        fake_proc.returncode = 5
+        with patch("subprocess.Popen", return_value=fake_proc):
+            result = runner.invoke(
+                app, ["bridge", "start", "--config", str(telegram_config)]
+            )
+
+        assert result.exit_code != 0
+        assert not pid_file.exists(), (
+            "PID file must be removed when the child crashed on start, so "
+            "subsequent `start` is not blocked by a stale claim"
+        )
+
+
 class TestBridgeStartAlreadyRunning:
     def test_refuses_when_live_pid_in_file(
         self, telegram_config: Path, bot_token_env: None, tmp_path: Path
@@ -284,6 +335,86 @@ class TestPollerStartDaemonFailFast:
 
         assert result.exit_code != 0
         assert "failed to start" in result.output.lower()
+
+
+class TestPollerStartDaemonNoStartupRace:
+    """Regression for codex [P1]: PID file must be claimed BEFORE the 1-second
+    liveness probe, so a second concurrent `start` can't spawn a duplicate
+    poller (which would process the same issue twice)."""
+
+    def test_pid_file_claimed_before_liveness_probe(
+        self, telegram_config: Path, tmp_path: Path
+    ) -> None:
+        pid_file = tmp_path / "poller.pid"
+        probe_seen_pid = {"value": None}
+
+        def wait_with_assert(timeout: float) -> int:
+            probe_seen_pid["value"] = (
+                pid_file.read_text().strip() if pid_file.exists() else None
+            )
+            raise subprocess.TimeoutExpired(cmd="<test>", timeout=timeout)
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 55001
+        fake_proc.wait.side_effect = wait_with_assert
+        with patch("subprocess.Popen", return_value=fake_proc):
+            result = runner.invoke(
+                app, ["poller", "start", "--config", str(telegram_config)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert probe_seen_pid["value"] == str(fake_proc.pid), (
+            "PID file must be written before proc.wait() so a concurrent "
+            "`start` in the probe window sees the claim"
+        )
+
+
+class TestPollerStartForegroundSigtermEarly:
+    """Regression for codex [P2]: SIGTERM handlers must be installed BEFORE
+    `_find_gh`/`gh api user`/`seed_current()`, otherwise a supervisor stop
+    during startup bypasses the `finally` that unlinks poller.pid."""
+
+    def test_sigterm_installed_before_startup_work(
+        self, telegram_config: Path
+    ) -> None:
+        call_order: list[str] = []
+
+        def record_signal(sig: int, handler: object) -> None:
+            if sig == signal.SIGTERM:
+                call_order.append("signal.signal(SIGTERM)")
+
+        def record_find_gh() -> None:
+            call_order.append("_find_gh")
+            raise RuntimeError("short-circuit")
+
+        with (
+            patch("signal.signal", side_effect=record_signal),
+            patch("ctrlrelay.core.github._find_gh", side_effect=record_find_gh),
+        ):
+            runner.invoke(
+                app,
+                [
+                    "poller",
+                    "start",
+                    "--foreground",
+                    "--config",
+                    str(telegram_config),
+                ],
+            )
+
+        assert "signal.signal(SIGTERM)" in call_order, (
+            "poller foreground must install a SIGTERM handler"
+        )
+        assert "_find_gh" in call_order, (
+            "test invariant: startup must reach _find_gh"
+        )
+        assert call_order.index("signal.signal(SIGTERM)") < call_order.index(
+            "_find_gh"
+        ), (
+            "SIGTERM handler must be installed BEFORE _find_gh() / the rest "
+            "of the startup work, so a supervisor stop during startup still "
+            "runs the PID-file cleanup finally"
+        )
 
 
 class TestPollerStartForeground:

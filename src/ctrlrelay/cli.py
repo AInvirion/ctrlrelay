@@ -290,6 +290,16 @@ def bridge_start(
 
         from ctrlrelay.bridge import BridgeServer
 
+        # Install early SIGTERM/SIGINT handlers so a supervisor stop between
+        # now and loop.add_signal_handler below still runs the `finally`
+        # that unlinks the PID file. loop.add_signal_handler replaces them
+        # once the asyncio loop is running.
+        def _raise_systemexit_on_signal(sig: int, _frame: object) -> None:
+            raise SystemExit(0)
+
+        for _sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(_sig, _raise_systemexit_on_signal)
+
         pid_file.write_text(str(os.getpid()))
         console.print(f"Starting bridge on {socket_path}")
         console.print("Press Ctrl+C to stop")
@@ -337,12 +347,16 @@ def bridge_start(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        # Claim the PID file BEFORE the liveness probe; a second concurrent
+        # `bridge start` in the 1-second window would otherwise see no PID
+        # file, spawn its own child, and both would rebind the shared socket.
+        pid_file.write_text(str(proc.pid))
         try:
             proc.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
-            pid_file.write_text(str(proc.pid))
             console.print(f"[green]Bridge started (PID {proc.pid})[/green]")
         else:
+            pid_file.unlink(missing_ok=True)
             console.print(
                 f"[red]Bridge failed to start[/red] "
                 f"(child exited with code {proc.returncode})"
@@ -781,18 +795,34 @@ def poller_start(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        # Claim the PID file BEFORE the liveness probe; otherwise a second
+        # concurrent `start` in the 1-second window would see no PID file and
+        # spawn a duplicate poller.
+        pid_file.write_text(str(proc.pid))
         try:
             proc.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
-            pid_file.write_text(str(proc.pid))
             console.print(f"[green]Poller started (PID {proc.pid})[/green]")
         else:
+            pid_file.unlink(missing_ok=True)
             console.print(
                 f"[red]Poller failed to start[/red] "
                 f"(child exited with code {proc.returncode})"
             )
             raise typer.Exit(1)
         return
+
+    # Install SIGTERM/SIGINT handlers BEFORE any startup work so a supervisor
+    # stop during `gh api user` / `seed_current()` still unwinds through the
+    # `finally` that unlinks poller.pid. Converting the signal into SystemExit
+    # lets Python's normal unwind run `finally` blocks. Once the asyncio loop
+    # is up below, `loop.add_signal_handler` overrides these to drive a
+    # graceful cancel of the poll loop.
+    def _raise_systemexit_on_signal(sig: int, _frame: object) -> None:
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _raise_systemexit_on_signal)
 
     pid_file.write_text(str(os.getpid()))
     try:
