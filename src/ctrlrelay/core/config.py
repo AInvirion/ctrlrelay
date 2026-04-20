@@ -188,6 +188,24 @@ class Config(BaseModel):
     schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
     repos: list[RepoConfig] = Field(default_factory=list)
 
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        """Reject unparseable IANA zones at load time.
+
+        Since the scheduler feeds ``timezone`` directly into APScheduler's
+        CronTrigger, a typo like ``America/Santiagoo`` would only surface
+        as a ``ZoneInfoNotFoundError`` when the poller daemon starts —
+        much worse than a synchronous config error at load.
+        """
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(v)
+        except ZoneInfoNotFoundError as e:
+            raise ValueError(f"unknown timezone {v!r}: {e}") from e
+        return v
+
 
 def load_config(path: Path | str) -> Config:
     """Load and validate configuration from a YAML file.

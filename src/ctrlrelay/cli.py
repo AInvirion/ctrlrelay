@@ -1099,7 +1099,12 @@ def poller_start(
                     poller=poller, handler=handle_issue, interval=interval,
                 )
             finally:
-                scheduler.shutdown(wait=False)
+                # Scheduler shutdown is async so it can cancel + await any
+                # in-flight job tasks (e.g. a scheduled secops sweep that was
+                # running when SIGTERM arrived). Without awaiting here the
+                # loop closes before jobs finalize — state_db locks stay
+                # held and worktrees stay dirty.
+                await scheduler.shutdown()
                 # Cancel any in-flight PR watchers so a poller stop/restart
                 # doesn't leak asyncio tasks. Their handlers log
                 # dev.pr.watch_cancelled and close their transport via the

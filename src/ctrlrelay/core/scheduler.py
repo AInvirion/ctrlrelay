@@ -40,15 +40,23 @@ class Scheduler:
         scheduler.add_cron_job("secops", "0 6 * * *", my_async_fn)
         scheduler.start()
         ...
-        scheduler.shutdown()
+        await scheduler.shutdown()  # must be awaited; see below
 
     The wrapper is intentionally narrow (no pause/resume, no job lookup):
     yagni — we have one caller and one job today.
+
+    ``shutdown`` is async so it can cancel and await in-flight job tasks.
+    ``AsyncIOScheduler.shutdown(wait=False)`` only posts the shutdown —
+    the loop has to keep running for the pending job coroutines to finish
+    their ``finally`` blocks (releasing state-DB locks, closing worktrees).
+    Calling ``wait=True`` synchronously from inside the loop would
+    deadlock because the jobs need the same loop to complete.
     """
 
     def __init__(self, impl: AsyncIOScheduler) -> None:
         self._impl = impl
         self._started = False
+        self._running_jobs: set[asyncio.Task[None]] = set()
 
     def add_cron_job(
         self,
@@ -63,11 +71,15 @@ class Scheduler:
 
         Wraps ``func`` so exceptions are logged but don't poison the
         scheduler — the next fire should still go through. This matches how
-        the poll loop isolates per-repo failures.
+        the poll loop isolates per-repo failures. Also tracks the running
+        task so ``shutdown`` can cancel and await it cleanly.
         """
         trigger = CronTrigger.from_crontab(cron_expr, timezone=self._impl.timezone)
 
         async def _safe_job() -> None:
+            task = asyncio.current_task()
+            if task is not None:
+                self._running_jobs.add(task)
             log_event(_logger, "scheduler.job.start", job=name, cron=cron_expr)
             try:
                 await func()
@@ -83,6 +95,9 @@ class Scheduler:
                     error_type=type(e).__name__,
                     error=str(e)[:200],
                 )
+            finally:
+                if task is not None:
+                    self._running_jobs.discard(task)
 
         self._impl.add_job(
             _safe_job,
@@ -106,16 +121,38 @@ class Scheduler:
         self._started = True
         log_event(_logger, "scheduler.started")
 
-    def shutdown(self, *, wait: bool = False) -> None:
-        """Stop firing jobs. ``wait=False`` (the default) returns immediately
-        even if a job is mid-run; the running coroutine is left to finish on
-        its own task. The poller's shutdown path cancels the main task,
-        which transitively cancels in-flight jobs — waiting here would risk
-        deadlocking on a job that's blocked on a subprocess."""
+    async def shutdown(self, *, cancel_timeout: float = 30.0) -> None:
+        """Stop the scheduler and await in-flight jobs to finalize.
+
+        1. Signals APScheduler to stop accepting new fires.
+        2. Cancels any currently running job tasks so their ``finally``
+           blocks run (release DB locks, close transports).
+        3. Awaits those tasks up to ``cancel_timeout`` seconds so the
+           poller's ``loop.close()`` doesn't land mid-cleanup.
+
+        Calling shutdown before ``start`` is a no-op.
+        """
         if not self._started:
             return
-        self._impl.shutdown(wait=wait)
+        self._impl.shutdown(wait=False)
         self._started = False
+
+        if self._running_jobs:
+            in_flight = list(self._running_jobs)
+            for task in in_flight:
+                task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*in_flight, return_exceptions=True),
+                    timeout=cancel_timeout,
+                )
+            except asyncio.TimeoutError:
+                log_event(
+                    _logger,
+                    "scheduler.shutdown.jobs_timed_out",
+                    count=len(in_flight),
+                    timeout=cancel_timeout,
+                )
         log_event(_logger, "scheduler.shutdown")
 
 

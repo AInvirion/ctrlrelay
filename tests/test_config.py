@@ -76,3 +76,32 @@ class TestSchedulesConfig:
         cfg_path.write_text(yaml.dump(sample_config_dict))
         with pytest.raises(ConfigError, match="invalid cron"):
             load_config(cfg_path)
+
+
+class TestTimezoneValidation:
+    """Regression for codex [P2]: invalid IANA zones must fail at load,
+    not at poller startup. Since the scheduler feeds timezone directly
+    into APScheduler, a typo would otherwise crash the daemon with
+    ZoneInfoNotFoundError."""
+
+    def test_invalid_timezone_raises_config_error(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        import yaml
+
+        sample_config_dict["timezone"] = "America/Santiagoo"  # typo
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        with pytest.raises(ConfigError, match="unknown timezone"):
+            load_config(cfg_path)
+
+    def test_valid_iana_timezone_accepted(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        import yaml
+
+        sample_config_dict["timezone"] = "America/Santiago"
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        config = load_config(cfg_path)
+        assert config.timezone == "America/Santiago"
