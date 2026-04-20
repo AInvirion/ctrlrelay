@@ -67,6 +67,38 @@ class TestClaudeDispatcher:
             mock_proc.kill.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_spawn_session_kills_child_on_cancel(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for codex round-3 [P1]: a CancelledError during
+        `proc.communicate()` (scheduler shutdown / SIGTERM during a
+        scheduled secops run) must kill the child process before
+        re-raising, so `claude` isn't left running against the worktree
+        after the daemon exits."""
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+        dispatcher = ClaudeDispatcher(claude_binary="claude", default_timeout=60)
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = None  # still running
+        mock_proc.communicate.side_effect = asyncio.CancelledError()
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock()
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            with pytest.raises(asyncio.CancelledError):
+                await dispatcher.spawn_session(
+                    session_id="test-cancel",
+                    prompt="Test",
+                    working_dir=tmp_path,
+                    state_file=tmp_path / "state.json",
+                    timeout=60,
+                )
+
+        mock_proc.kill.assert_called_once()
+        mock_proc.wait.assert_awaited()
+
+    @pytest.mark.asyncio
     async def test_spawn_session_parses_done_state(self, tmp_path: Path) -> None:
         """Should parse DONE checkpoint state."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher

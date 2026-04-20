@@ -57,6 +57,15 @@ class TestCronDowNormalization:
 
         assert _normalize_cron("0 6 * * *") == "0 6 * * *"
 
+    def test_mixed_named_and_numeric_dow_is_fully_remapped(self) -> None:
+        """Regression for codex round-3 [P2]: `sun,1` previously escaped
+        normalization because the field contained letters; APScheduler then
+        read `1` as Tuesday. Every token must be remapped individually."""
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * sun,1") == "0 6 * * sun,mon"
+        assert _normalize_cron("0 6 * * mon,5") == "0 6 * * mon,fri"
+
     def test_registered_monday_trigger_fires_on_monday_not_tuesday(self) -> None:
         """End-to-end: feed the raw Vixie expression into the scheduler and
         inspect the underlying CronTrigger. The `day_of_week` field must

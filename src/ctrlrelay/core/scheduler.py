@@ -65,13 +65,16 @@ def _normalize_cron(expr: str) -> str:
     four fields share semantics across both systems. Returns the input
     unchanged if it isn't a 5-field expression so APScheduler's own
     parser can emit the real error message.
+
+    Every DOW token is passed through ``_remap_dow_token`` individually
+    so mixed expressions like ``sun,1`` or ``mon,5`` get normalized —
+    leaving a bare numeric token in a mostly-named list would let
+    APScheduler silently mis-interpret it (their 1 = Tuesday).
     """
     parts = expr.split()
     if len(parts) != 5:
         return expr
     m, h, dom, mon, dow = parts
-    if dow == "*" or any(c.isalpha() for c in dow):
-        return expr
     new_dow = ",".join(_remap_dow_token(t) for t in dow.split(","))
     return f"{m} {h} {dom} {mon} {new_dow}"
 
