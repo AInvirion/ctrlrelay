@@ -31,6 +31,51 @@ _logger = get_logger("core.scheduler")
 JobFunc = Callable[[], Awaitable[None]]
 
 
+# APScheduler's CronTrigger.from_crontab uses Mon=0..Sun=6 for numeric
+# day-of-week, and rejects 7 entirely. Vixie cron (the one every reference
+# and the orchestrator.yaml docs describe) uses Sun=0..Sat=6 with 7 as an
+# alias of Sun. Users writing `0 6 * * 1` expecting Monday would silently
+# get Tuesday runs under APScheduler's numbering. Normalize by remapping
+# numeric DOW fields to APScheduler's named weekdays before building the
+# trigger — names mean the same thing under either numbering scheme.
+_VIXIE_DOW_NAMES = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+
+
+def _remap_dow_token(tok: str) -> str:
+    """Convert a single numeric Vixie DOW token (or a range/step/name) to
+    APScheduler's named-weekday form. Leaves non-numeric tokens alone."""
+    if "/" in tok:
+        base, step = tok.split("/", 1)
+        return f"{_remap_dow_token(base)}/{step}"
+    if "-" in tok:
+        a, b = tok.split("-", 1)
+        return f"{_remap_dow_token(a)}-{_remap_dow_token(b)}"
+    if tok.isdigit():
+        n = int(tok)
+        if 0 <= n <= 7:
+            # 0 and 7 both = Sunday in Vixie cron.
+            return _VIXIE_DOW_NAMES[0 if n == 7 else n]
+    return tok
+
+
+def _normalize_cron(expr: str) -> str:
+    """Convert a Vixie-style 5-field cron expression to APScheduler syntax.
+
+    Only the day-of-week field is rewritten (numeric → name); the other
+    four fields share semantics across both systems. Returns the input
+    unchanged if it isn't a 5-field expression so APScheduler's own
+    parser can emit the real error message.
+    """
+    parts = expr.split()
+    if len(parts) != 5:
+        return expr
+    m, h, dom, mon, dow = parts
+    if dow == "*" or any(c.isalpha() for c in dow):
+        return expr
+    new_dow = ",".join(_remap_dow_token(t) for t in dow.split(","))
+    return f"{m} {h} {dom} {mon} {new_dow}"
+
+
 class Scheduler:
     """Thin wrapper so the poller doesn't import APScheduler directly.
 
@@ -74,7 +119,9 @@ class Scheduler:
         the poll loop isolates per-repo failures. Also tracks the running
         task so ``shutdown`` can cancel and await it cleanly.
         """
-        trigger = CronTrigger.from_crontab(cron_expr, timezone=self._impl.timezone)
+        trigger = CronTrigger.from_crontab(
+            _normalize_cron(cron_expr), timezone=self._impl.timezone,
+        )
 
         async def _safe_job() -> None:
             task = asyncio.current_task()

@@ -1,7 +1,7 @@
 """Tests for secops pipeline."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -181,3 +181,81 @@ class TestSecopsPipeline:
         assert len(results) == 1
         assert not results[0].success
         assert "locked" in results[0].error.lower()
+
+
+class TestSecopsCancellation:
+    """Regression for codex [P2]: when a scheduled secops sweep is
+    cancelled mid-run (scheduler.shutdown → SIGTERM), the session row
+    must not be left in 'running' and the worktree must still be
+    removed. Previously only the `except Exception` path wrote the
+    session row, so CancelledError bypassed cleanup entirely."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_run_marks_session_cancelled_and_removes_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        import asyncio
+
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        # Pipeline blocks forever; we'll cancel from the outside.
+        async def hang_forever(ctx):  # noqa: ARG001
+            await asyncio.Event().wait()
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+
+        repo = MagicMock(name="owner/repo")
+        repo.name = "owner/repo"
+
+        with patch(
+            "ctrlrelay.pipelines.secops.SecopsPipeline.run",
+            side_effect=hang_forever,
+        ):
+            task = asyncio.create_task(
+                run_secops_all(
+                    repos=[repo],
+                    dispatcher=AsyncMock(),
+                    github=MagicMock(),
+                    worktree=mock_worktree,
+                    dashboard=None,
+                    state_db=mock_db,
+                    transport=None,
+                    contexts_dir=tmp_path / "contexts",
+                )
+            )
+
+            # Wait until the pipeline is actually running inside the try
+            # block (sessions INSERT has happened), then cancel.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                execute_calls = [c.args[0] for c in mock_db.execute.call_args_list]
+                if any("INSERT INTO sessions" in s for s in execute_calls):
+                    break
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        # Assert: session was updated to 'cancelled' before cleanup.
+        cancel_updates = [
+            c for c in mock_db.execute.call_args_list
+            if c.args and "UPDATE sessions" in c.args[0]
+            and len(c.args) > 1 and "cancelled" in c.args[1]
+        ]
+        assert cancel_updates, (
+            "CancelledError path must write 'cancelled' status — "
+            "codex [P2] regression"
+        )
+
+        # Assert: worktree cleanup was called in the finally block.
+        assert mock_worktree.remove_worktree.called, (
+            "finally block must remove the worktree on cancel"
+        )
+
+        # Assert: the per-repo lock was released.
+        assert mock_db.release_lock.called

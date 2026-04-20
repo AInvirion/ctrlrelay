@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass
@@ -199,6 +200,8 @@ async def run_secops_all(
             ))
             continue
 
+        worktree_path: Path | None = None
+        session_row_inserted = False
         try:
             await worktree.ensure_bare_repo(repo)
             worktree_path = await worktree.create_worktree(repo, session_id)
@@ -224,6 +227,7 @@ async def run_secops_all(
                 (session_id, "secops", repo, str(worktree_path), "running", int(time.time())),
             )
             state_db.commit()
+            session_row_inserted = True
 
             result = await pipeline.run(ctx)
             results.append(result)
@@ -244,15 +248,37 @@ async def run_secops_all(
                     session_id=session_id,
                 ))
 
-            worktree.remove_context_symlink(worktree_path)
-            await worktree.remove_worktree(repo, session_id)
+        except asyncio.CancelledError:
+            # Scheduled secops interrupted mid-run (SIGTERM during a
+            # scheduler.shutdown). Mark the session so later inspection
+            # doesn't see a phantom "running" row, then let the finally
+            # block reclaim the worktree + lock. Re-raise so callers
+            # (scheduler teardown) can finish unwinding.
+            if session_row_inserted:
+                try:
+                    state_db.execute(
+                        "UPDATE sessions SET status = ?, summary = ?, "
+                        "ended_at = ? WHERE id = ?",
+                        (
+                            "cancelled",
+                            "Cancelled during shutdown",
+                            int(time.time()),
+                            session_id,
+                        ),
+                    )
+                    state_db.commit()
+                except Exception:
+                    pass
+            raise
 
         except Exception as e:
-            state_db.execute(
-                "UPDATE sessions SET status = ?, summary = ?, ended_at = ? WHERE id = ?",
-                ("failed", f"Error: {e}", int(time.time()), session_id),
-            )
-            state_db.commit()
+            if session_row_inserted:
+                state_db.execute(
+                    "UPDATE sessions SET status = ?, summary = ?, "
+                    "ended_at = ? WHERE id = ?",
+                    ("failed", f"Error: {e}", int(time.time()), session_id),
+                )
+                state_db.commit()
             results.append(PipelineResult(
                 success=False,
                 session_id=session_id,
@@ -261,6 +287,21 @@ async def run_secops_all(
             ))
 
         finally:
+            # Always release the worktree we created — success, failure, or
+            # cancellation. Shield the removal from further cancels so the
+            # cleanup actually completes even if we're already unwinding
+            # from asyncio.CancelledError.
+            if worktree_path is not None:
+                try:
+                    worktree.remove_context_symlink(worktree_path)
+                except Exception:
+                    pass
+                try:
+                    await asyncio.shield(
+                        worktree.remove_worktree(repo, session_id)
+                    )
+                except Exception:
+                    pass
             state_db.release_lock(repo, session_id)
 
     return results

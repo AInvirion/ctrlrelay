@@ -166,8 +166,12 @@ class SchedulesConfig(BaseModel):
     def validate_cron(cls, v: str) -> str:
         from apscheduler.triggers.cron import CronTrigger
 
+        from ctrlrelay.core.scheduler import _normalize_cron
+
         try:
-            CronTrigger.from_crontab(v)
+            # Parse what the scheduler will actually feed to APScheduler,
+            # after Vixie-DOW normalization — not the raw string.
+            CronTrigger.from_crontab(_normalize_cron(v))
         except Exception as e:
             raise ValueError(
                 f"invalid cron expression {v!r}: {e}"

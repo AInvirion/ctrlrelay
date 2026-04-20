@@ -10,6 +10,78 @@ from apscheduler.triggers.cron import CronTrigger
 from ctrlrelay.core.scheduler import Scheduler, make_scheduler
 
 
+class TestCronDowNormalization:
+    """Regression for codex [P1]: APScheduler treats numeric DOW as
+    Mon=0..Sun=6 and rejects 7; Vixie cron (what users write and what
+    our docs describe) treats it as Sun=0..Sat=6 with 7=Sun. The
+    scheduler must remap numeric DOWs so ``0 6 * * 1`` really means
+    Mondays and ``0 6 * * 7`` doesn't fail at load."""
+
+    def test_numeric_monday_parses_as_monday(self) -> None:
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        # Vixie: 1 = Monday. After normalization, APScheduler sees "mon".
+        assert _normalize_cron("0 6 * * 1") == "0 6 * * mon"
+
+    def test_numeric_sunday_zero_parses_as_sunday(self) -> None:
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * 0") == "0 6 * * sun"
+
+    def test_numeric_sunday_seven_is_alias_of_sunday(self) -> None:
+        """Vixie allows 7 as an alias for Sunday; APScheduler outright
+        rejects 7, so normalization must rewrite it to `sun`."""
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * 7") == "0 6 * * sun"
+
+    def test_dow_range_is_remapped(self) -> None:
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        # Weekdays only: Mon-Fri.
+        assert _normalize_cron("0 6 * * 1-5") == "0 6 * * mon-fri"
+
+    def test_dow_list_is_remapped(self) -> None:
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        # Mon, Wed, Fri.
+        assert _normalize_cron("0 6 * * 1,3,5") == "0 6 * * mon,wed,fri"
+
+    def test_named_dow_is_unchanged(self) -> None:
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * mon-fri") == "0 6 * * mon-fri"
+
+    def test_wildcard_dow_is_unchanged(self) -> None:
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * *") == "0 6 * * *"
+
+    def test_registered_monday_trigger_fires_on_monday_not_tuesday(self) -> None:
+        """End-to-end: feed the raw Vixie expression into the scheduler and
+        inspect the underlying CronTrigger. The `day_of_week` field must
+        resolve to Monday."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        scheduler = make_scheduler(timezone="UTC")
+
+        async def noop() -> None:
+            return None
+
+        scheduler.add_cron_job("weekly", "0 6 * * 1", noop)
+        trigger = scheduler._impl.get_job("weekly").trigger
+
+        # Pick a known Sunday (2024-01-07) and ask "when's the next fire?"
+        # A correct Monday-trigger must advance to Monday 2024-01-08.
+        sunday = datetime(2024, 1, 7, 0, 0, 0, tzinfo=ZoneInfo("UTC"))
+        next_fire = trigger.get_next_fire_time(None, sunday)
+        assert next_fire is not None
+        assert next_fire.weekday() == 0, (
+            f"expected Monday (weekday=0), got weekday={next_fire.weekday()}"
+        )
+
+
 class TestMakeScheduler:
     def test_honors_timezone(self) -> None:
         """The scheduler's timezone must match the orchestrator config so
