@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,15 @@ from typer.testing import CliRunner
 from ctrlrelay.cli import app
 
 runner = CliRunner()
+
+# Typer/Rich injects ANSI escapes around flag names (e.g. "--foreground" becomes
+# "-" + ESC[...m + "-foreground" + ESC[0m), so substring matches on the raw
+# output fail under a TTY-emulating runner. Strip escapes before asserting.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 @pytest.fixture
@@ -204,4 +214,4 @@ class TestPollerStartForeground:
     def test_foreground_flag_accepted(self) -> None:
         result = runner.invoke(app, ["poller", "start", "--help"])
         assert result.exit_code == 0
-        assert "--foreground" in result.output
+        assert "--foreground" in _plain(result.output)
