@@ -231,14 +231,19 @@ def bridge_start(
         "-c",
         help="Path to orchestrator.yaml",
     ),
-    daemon: bool = typer.Option(
+    foreground: bool = typer.Option(
         False,
-        "--daemon",
-        "-d",
-        help="Run in background",
+        "--foreground",
+        "-F",
+        help="Run in the foreground (for launchd/systemd/debugging). Default is to daemonize.",
     ),
 ) -> None:
-    """Start the Telegram bridge."""
+    """Start the Telegram bridge.
+
+    Daemonizes by default so the terminal returns to you. Pass --foreground
+    under a process supervisor (launchd Type=simple, systemd Type=simple) or
+    when debugging interactively.
+    """
     import os
     import subprocess
     import sys
@@ -277,7 +282,30 @@ def bridge_start(
         console.print(f"[red]Bot token not found.[/red] Set {env_var} environment variable.")
         raise typer.Exit(1)
 
-    if daemon:
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if foreground:
+        import asyncio
+
+        from ctrlrelay.bridge import BridgeServer
+
+        pid_file.write_text(str(os.getpid()))
+        console.print(f"Starting bridge on {socket_path}")
+        console.print("Press Ctrl+C to stop")
+
+        server = BridgeServer(
+            socket_path=socket_path,
+            bot_token=bot_token,
+            chat_id=telegram_config.chat_id,
+        )
+
+        try:
+            asyncio.run(server.start())
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Shutting down...[/yellow]")
+        finally:
+            pid_file.unlink(missing_ok=True)
+    else:
         cmd = [
             sys.executable,
             "-m",
@@ -297,24 +325,6 @@ def bridge_start(
         )
         pid_file.write_text(str(proc.pid))
         console.print(f"[green]Bridge started (PID {proc.pid})[/green]")
-    else:
-        import asyncio
-
-        from ctrlrelay.bridge import BridgeServer
-
-        console.print(f"Starting bridge on {socket_path}")
-        console.print("Press Ctrl+C to stop")
-
-        server = BridgeServer(
-            socket_path=socket_path,
-            bot_token=bot_token,
-            chat_id=telegram_config.chat_id,
-        )
-
-        try:
-            asyncio.run(server.start())
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Shutting down...[/yellow]")
 
 
 @bridge_app.command("stop")
@@ -376,10 +386,16 @@ def bridge_status(
             pass
 
     if socket_path.exists():
-        console.print("[yellow]Socket exists but no running process[/yellow]")
+        console.print("[yellow]Socket exists but no PID file[/yellow]")
+        console.print(
+            "[dim]The bridge may be running under a supervisor that pre-dates "
+            "the PID-file change — restart it to refresh state.[/dim]"
+        )
         console.print(f"Socket: {socket_path}")
-    else:
-        console.print("[dim]Bridge not running[/dim]")
+        raise typer.Exit(1)
+
+    console.print("[dim]Bridge not running[/dim]")
+    raise typer.Exit(1)
 
 
 @bridge_app.command("test")
@@ -676,11 +692,11 @@ def poller_start(
         "-c",
         help="Path to orchestrator.yaml",
     ),
-    daemon: bool = typer.Option(
+    foreground: bool = typer.Option(
         False,
-        "--daemon",
-        "-d",
-        help="Run in background",
+        "--foreground",
+        "-F",
+        help="Run in the foreground (for launchd/systemd/debugging). Default is to daemonize.",
     ),
     interval: int = typer.Option(
         300,
@@ -689,8 +705,14 @@ def poller_start(
         help="Polling interval in seconds",
     ),
 ) -> None:
-    """Start the issue poller."""
+    """Start the issue poller.
+
+    Daemonizes by default so the terminal returns to you. Pass --foreground
+    under a process supervisor (launchd Type=simple, systemd Type=simple) or
+    when debugging interactively.
+    """
     import asyncio
+    import os
     import subprocess
     import sys
 
@@ -700,18 +722,18 @@ def poller_start(
         console.print(f"[red]Error loading config:[/red] {e}")
         raise typer.Exit(1)
 
-    if daemon:
-        pid_file = _get_poller_pid_file(config_path)
-        if pid_file.exists():
-            import os
-            try:
-                pid = int(pid_file.read_text().strip())
-                os.kill(pid, 0)
-                console.print(f"[yellow]Poller already running (PID {pid})[/yellow]")
-                raise typer.Exit(1)
-            except (ProcessLookupError, ValueError):
-                pid_file.unlink(missing_ok=True)
+    pid_file = _get_poller_pid_file(config_path)
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            console.print(f"[yellow]Poller already running (PID {pid})[/yellow]")
+            raise typer.Exit(1)
+        except (ProcessLookupError, ValueError):
+            pid_file.unlink(missing_ok=True)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
 
+    if not foreground:
         cmd = [
             sys.executable,
             "-m",
@@ -722,6 +744,7 @@ def poller_start(
             config_path,
             "--interval",
             str(interval),
+            "--foreground",
         ]
         proc = subprocess.Popen(
             cmd,
@@ -729,10 +752,12 @@ def poller_start(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        pid_file.parent.mkdir(parents=True, exist_ok=True)
         pid_file.write_text(str(proc.pid))
         console.print(f"[green]Poller started (PID {proc.pid})[/green]")
-    else:
+        return
+
+    pid_file.write_text(str(os.getpid()))
+    try:
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
         from ctrlrelay.core.github import GitHubCLI
         from ctrlrelay.core.poller import IssuePoller, run_poll_loop
@@ -955,6 +980,8 @@ def poller_start(
             console.print("\n[yellow]Poller stopped.[/yellow]")
         finally:
             state_db.close()
+    finally:
+        pid_file.unlink(missing_ok=True)
 
 
 @poller_app.command("stop")

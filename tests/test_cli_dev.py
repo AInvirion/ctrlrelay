@@ -7,8 +7,9 @@ from typer.testing import CliRunner
 runner = CliRunner()
 
 # Typer's Rich-backed help renderer injects ANSI escapes (bold/underline/color)
-# around CLI flag names, which can split "--daemon" into "-" + bold + "-daemon"
-# in the raw output. Strip escape sequences before asserting on substrings.
+# around CLI flag names, which can split "--foreground" into "-" + bold +
+# "-foreground" in the raw output. Strip escape sequences before asserting on
+# substrings.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -46,7 +47,7 @@ class TestPollerCommands:
         result = runner.invoke(app, ["poller", "start", "--help"])
 
         assert result.exit_code == 0
-        assert "--daemon" in _plain(result.output)
+        assert "--foreground" in _plain(result.output)
 
     def test_poller_status(self) -> None:
         """Should show poller status."""

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`ctrlrelay bridge start` / `ctrlrelay poller start` now daemonize by
+  default** and return to the shell immediately, writing a PID file so
+  `status`/`stop` can find the process. This matches the normal "start a
+  service" UX expectation and fixes the previous behavior where the
+  terminal would block until Ctrl+C.
+- Added `--foreground` / `-F` flag to both commands. Under a process
+  supervisor (launchd, systemd) pass this so the supervisor — not the
+  CLI's own fork — owns the long-lived PID. Existing supervisor unit
+  files must be updated to include this flag; examples in
+  `docs/operations.md` are revised.
+- `ctrlrelay bridge status` and `poller status` rely on the PID file as
+  before. If a supervisor runs the old (pre-`--foreground`) command, no
+  PID file is written and `status` now prints a migration hint instead
+  of a misleading "not running".
+- The deprecated `--daemon` / `-d` flag has been removed; the daemonize
+  behavior is now the default. Scripts using `--daemon` will need to
+  drop the flag.
+
 ## [0.1.3] - 2026-04-18
 
 Reliability pass on the poller + retry flow, plus CI gating. No runtime
