@@ -24,7 +24,7 @@ DEFAULT_MAX_BLOCKED_ROUNDS = 5
 
 AGENT_CLAIM_MARKER = "<!-- ctrlrelay:claimed -->"
 AGENT_CLAIM_COMMENT = (
-    "🤖 Agent is working on this issue. A PR will be opened for review.\n\n"
+    "CTRLRelay is working on this issue. A PR will be opened for review.\n\n"
     f"{AGENT_CLAIM_MARKER}"
 )
 
