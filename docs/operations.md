@@ -104,6 +104,11 @@ Save plist files under `~/Library/LaunchAgents/`. Use the **absolute** path to
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- Give the in-process scheduler time to drain a running secops
+         sweep on stop (worktree cleanup can take ~120s). launchd's
+         default ExitTimeOut is 20s, which would SIGKILL mid-cleanup. -->
+    <key>ExitTimeOut</key>
+    <integer>180</integer>
     <key>StandardOutPath</key>
     <string>/Users/YOU/.ctrlrelay/logs/poller.log</string>
     <key>StandardErrorPath</key>
@@ -168,6 +173,11 @@ Environment=CTRLRELAY_TELEGRAM_TOKEN=your-bot-token-here
 ExecStart=%h/.local/bin/ctrlrelay poller start --foreground --interval 300
 Restart=always
 RestartSec=5
+# Give the in-process scheduler time to drain a running secops sweep on
+# stop (worktree cleanup can take ~120s). systemd's default
+# TimeoutStopSec is 90s, which would SIGKILL the poller mid-cleanup and
+# leak git worktree admin state.
+TimeoutStopSec=180
 StandardOutput=append:%h/.ctrlrelay/logs/poller.log
 StandardError=append:%h/.ctrlrelay/logs/poller.error.log
 
@@ -225,10 +235,13 @@ single run.
 
 On poller stop, the scheduler waits up to **150 seconds** for an in-flight
 job (e.g. `git worktree prune` cleanup at the end of a secops sweep) to
-finish before letting the asyncio loop close. If your launchd plist's
-`ExitTimeOut` or systemd unit's `TimeoutStopSec` is shorter, the
-supervisor will SIGKILL the daemon first — bump that limit if you've
-seen leaked worktree admin state across restarts.
+finish before letting the asyncio loop close. **This requires your
+supervisor's stop timeout to be at least that generous — the example
+unit files above set `ExitTimeOut=180` (launchd) and
+`TimeoutStopSec=180` (systemd).** Without those, the platform default
+(launchd 20s, systemd 90s) SIGKILLs the daemon before cleanup finishes
+and leaves stale `git worktree` admin state behind. If you're upgrading
+from an older plist/unit that didn't set these, add them and reload.
 
 ## When to restart
 
