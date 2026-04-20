@@ -39,6 +39,20 @@ JobFunc = Callable[[], Awaitable[None]]
 # numeric DOW fields to APScheduler's named weekdays before building the
 # trigger — names mean the same thing under either numbering scheme.
 _VIXIE_DOW_NAMES = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+_VIXIE_NAME_TO_NUM = {name: idx for idx, name in enumerate(_VIXIE_DOW_NAMES)}
+
+
+def _dow_to_vixie_num(tok: str) -> int | None:
+    """Parse a DOW token as a Vixie number. Accepts digits 0..7 (with 7 as
+    Sunday alias) and the standard three-letter names. Returns ``None`` if
+    the token is neither (so callers can leave it for APScheduler to
+    error on)."""
+    if tok.isdigit():
+        n = int(tok)
+        if 0 <= n <= 7:
+            return 0 if n == 7 else n
+        return None
+    return _VIXIE_NAME_TO_NUM.get(tok.lower())
 
 
 def _dow_name(n: int) -> str:
@@ -66,14 +80,13 @@ def _remap_dow_token(tok: str) -> str:
     """Convert a single Vixie DOW token (number, range, step, or name) to
     APScheduler's named-weekday form.
 
-    Every numeric step/range form is expanded into an explicit comma-
-    separated name list. That's because APScheduler's interpretation of
-    stepped DOW differs from Vixie: ``mon/2`` under APScheduler is NOT
-    Vixie's ``1/2`` (Mon, Wed, Fri) — it's "every second Monday". Passing
-    numeric steps through unchanged would silently fire on the wrong
-    days. Named ranges/steps (e.g. ``mon-fri/2``) are left alone because
-    APScheduler's named-weekday semantics for those are well-defined and
-    match what users expect.
+    Every range/step form — numeric OR named — is expanded into an
+    explicit comma-separated name list. APScheduler orders weekdays
+    ``mon..sun``, so a perfectly valid Vixie expression like ``sun-fri``
+    looks inverted to APScheduler and gets rejected; expanding to a name
+    list dodges the ordering mismatch. Stepped forms like ``mon/2`` also
+    need expansion because APScheduler reads named-with-step as "every
+    Nth named-weekday occurrence", not Vixie's "from base, every N days".
     """
     if "/" in tok:
         base, step_str = tok.split("/", 1)
@@ -83,33 +96,35 @@ def _remap_dow_token(tok: str) -> str:
             return tok
         if step < 1:
             return tok
-        # Numeric range with step: "a-b/s"
+        # Range-with-step "a-b/s" — endpoints can be numeric or named.
         if "-" in base:
             a, b = base.split("-", 1)
-            if a.isdigit() and b.isdigit():
-                expanded = _expand_numeric_dow_range(int(a), int(b), step)
+            a_num = _dow_to_vixie_num(a)
+            b_num = _dow_to_vixie_num(b)
+            if a_num is not None and b_num is not None:
+                expanded = _expand_numeric_dow_range(a_num, b_num, step)
                 if expanded is not None:
                     return ",".join(expanded)
-            return tok  # named range with step — APScheduler handles it
+            return tok
         # Wildcard with step: "*/s" — expand across the full week.
         if base == "*":
             expanded = _expand_numeric_dow_range(0, 6, step)
             return ",".join(expanded) if expanded else tok
-        # Single numeric base with step: "n/s" — Vixie says "from n, every s
-        # days until end of week". Expand to [n, n+s, n+2s, ...] ≤ 6.
-        if base.isdigit():
-            n = int(base)
-            if 0 <= n <= 7:
-                start = 0 if n == 7 else n
-                expanded = _expand_numeric_dow_range(start, 6, step)
-                if expanded is not None:
-                    return ",".join(expanded)
+        # Single base with step: "n/s" or "mon/s" — Vixie says "from base,
+        # every s days until end of week". Expand explicitly.
+        base_num = _dow_to_vixie_num(base)
+        if base_num is not None:
+            expanded = _expand_numeric_dow_range(base_num, 6, step)
+            if expanded is not None:
+                return ",".join(expanded)
         return tok
-    # Range without step: "a-b"
+    # Range without step "a-b" — endpoints numeric or named.
     if "-" in tok:
         a, b = tok.split("-", 1)
-        if a.isdigit() and b.isdigit():
-            expanded = _expand_numeric_dow_range(int(a), int(b))
+        a_num = _dow_to_vixie_num(a)
+        b_num = _dow_to_vixie_num(b)
+        if a_num is not None and b_num is not None:
+            expanded = _expand_numeric_dow_range(a_num, b_num)
             if expanded is not None:
                 return ",".join(expanded)
     # Bare number: "0".."7"

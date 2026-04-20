@@ -202,6 +202,7 @@ async def run_secops_all(
 
         worktree_path: Path | None = None
         session_row_inserted = False
+        session_final_state_written = False
         try:
             await worktree.ensure_bare_repo(repo)
             worktree_path = await worktree.create_worktree(repo, session_id)
@@ -238,6 +239,7 @@ async def run_secops_all(
                 (status, result.summary, int(time.time()), session_id),
             )
             state_db.commit()
+            session_final_state_written = True
 
             if dashboard and result.success:
                 await dashboard.push_event(EventPayload(
@@ -250,11 +252,13 @@ async def run_secops_all(
 
         except asyncio.CancelledError:
             # Scheduled secops interrupted mid-run (SIGTERM during a
-            # scheduler.shutdown). Mark the session so later inspection
-            # doesn't see a phantom "running" row, then let the finally
-            # block reclaim the worktree + lock. Re-raise so callers
-            # (scheduler teardown) can finish unwinding.
-            if session_row_inserted:
+            # scheduler.shutdown). Mark the session as cancelled so later
+            # inspection doesn't see a phantom "running" row — but ONLY
+            # if we hadn't already written a final state. Without this
+            # guard, a cancel landing during the post-run dashboard push
+            # would clobber a successful "done" status with "cancelled"
+            # even though the work completed.
+            if session_row_inserted and not session_final_state_written:
                 try:
                     state_db.execute(
                         "UPDATE sessions SET status = ?, summary = ?, "

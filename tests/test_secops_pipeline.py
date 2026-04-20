@@ -248,6 +248,91 @@ class TestSecopsCleanupLogging:
         mock_db.release_lock.assert_called()
 
 
+class TestSecopsCancelDoesNotOverwriteCompletedStatus:
+    """Regression for codex round-6 [P2]: a CancelledError landing AFTER
+    the session has already been marked done/blocked/failed (e.g. during
+    the post-run dashboard.push_event) must NOT overwrite that final
+    status with 'cancelled'."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_dashboard_push_preserves_done_status(
+        self, tmp_path: Path
+    ) -> None:
+        import asyncio
+
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        mock_state = MagicMock()
+        mock_state.status = CheckpointStatus.DONE
+        mock_state.summary = "Ran clean"
+        mock_state.outputs = {}
+        mock_state.error = None
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="sess",
+            exit_code=0,
+            state=mock_state,
+        )
+
+        # Dashboard push hangs; we'll cancel during it.
+        async def slow_push(payload):  # noqa: ARG001
+            await asyncio.sleep(60)
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.push_event = AsyncMock(side_effect=slow_push)
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        task = asyncio.create_task(
+            run_secops_all(
+                repos=[repo],
+                dispatcher=mock_dispatcher,
+                github=MagicMock(),
+                worktree=mock_worktree,
+                dashboard=mock_dashboard,
+                state_db=mock_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+        )
+
+        # Wait until dashboard.push_event has started — that's when the
+        # session is already marked 'done' but we're stuck in the await.
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if mock_dashboard.push_event.called:
+                break
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Examine all UPDATE sessions calls. The 'done' row must have
+        # been written, and NO subsequent 'cancelled' overwrite must
+        # have happened.
+        updates = [
+            c.args[1] for c in mock_db.execute.call_args_list
+            if c.args and "UPDATE sessions" in c.args[0]
+        ]
+        statuses = [u[0] for u in updates if u]
+        assert "done" in statuses, "happy-path 'done' update should have run"
+        assert "cancelled" not in statuses, (
+            "cancel during post-run cleanup must NOT clobber 'done' with "
+            "'cancelled' (codex round-6 [P2] regression)"
+        )
+
+
 class TestSecopsLockReleaseOrdering:
     """Regression for codex round-5 [P1]: the repo lock must be released
     BEFORE the async worktree cleanup, not after. Scheduler.shutdown's

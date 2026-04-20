@@ -93,10 +93,30 @@ class TestCronDowNormalization:
         # Mon, Wed, Fri.
         assert _normalize_cron("0 6 * * 1,3,5") == "0 6 * * mon,wed,fri"
 
-    def test_named_dow_is_unchanged(self) -> None:
+    def test_named_dow_range_is_expanded(self) -> None:
+        """Named ranges expand to explicit name lists too — APScheduler
+        orders mon..sun, so even ``mon-fri`` is unambiguous, but the goal
+        is one consistent normalized form regardless of input style."""
         from ctrlrelay.core.scheduler import _normalize_cron
 
-        assert _normalize_cron("0 6 * * mon-fri") == "0 6 * * mon-fri"
+        assert _normalize_cron("0 6 * * mon-fri") == "0 6 * * mon,tue,wed,thu,fri"
+
+    def test_sun_fri_named_inverted_range_is_expanded(self) -> None:
+        """Regression for codex round-6 [P2]: ``sun-fri`` is valid in
+        Vixie (Sun, Mon, Tue, Wed, Thu, Fri) but APScheduler rejects it as
+        inverted because its named ordering is ``mon..sun``. Expansion
+        produces a list APScheduler accepts regardless."""
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert (
+            _normalize_cron("0 6 * * sun-fri")
+            == "0 6 * * sun,mon,tue,wed,thu,fri"
+        )
+
+    def test_singleton_named_token_unchanged(self) -> None:
+        from ctrlrelay.core.scheduler import _normalize_cron
+
+        assert _normalize_cron("0 6 * * mon") == "0 6 * * mon"
 
     def test_wildcard_dow_is_unchanged(self) -> None:
         from ctrlrelay.core.scheduler import _normalize_cron
