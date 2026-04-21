@@ -1105,9 +1105,9 @@ def poller_start(
             """
             if not config.repos:
                 return
+            n_repos = len(config.repos)
             console.print(
-                f"[dim]Scheduled secops: starting across "
-                f"{len(config.repos)} repo(s)[/dim]"
+                f"[dim]Scheduled secops: starting across {n_repos} repo(s)[/dim]"
             )
 
             secops_transport = None
@@ -1125,6 +1125,21 @@ def poller_start(
                             f"failed ({e}) — running without notifications[/yellow]"
                         )
 
+            # Tell the operator the sweep started so a long run isn't
+            # silent. Without this, a 10-min sweep that ends with a
+            # blocked-on-input result looks like "out of nowhere" pings.
+            if secops_transport:
+                try:
+                    await secops_transport.send(
+                        f"🔄 Scheduled secops: starting sweep across "
+                        f"{n_repos} repo(s)"
+                    )
+                except Exception as e:
+                    console.print(
+                        f"[yellow]Scheduled secops: start-notify failed: "
+                        f"{e}[/yellow]"
+                    )
+
             try:
                 results = await run_secops_all(
                     repos=config.repos,
@@ -1140,30 +1155,63 @@ def poller_start(
                 console.print(
                     f"[dim]Scheduled secops: {ok}/{len(results)} succeeded[/dim]"
                 )
-                # Fan-out a single summary notification for blocked/failed
-                # runs so operators see the bad cases — the dashboard path
-                # only pushes on success.
+
+                # Per-repo notifications for the cases an operator must
+                # act on. The aggregate "N blocked" message we used to
+                # send was useless on its own — it didn't say which
+                # repos blocked or what the question was. Fan out one
+                # message per blocked or failed result with the actual
+                # question/error and session id so the operator can
+                # respond directly via the bridge.
+                #
+                # `run_secops_all` returns results in the same order as
+                # the input `repos` list, so zip is safe — only repos
+                # with successful lock-acquisition produce results.
                 if secops_transport:
-                    blocked = [r for r in results if r.blocked]
-                    failed = [
-                        r for r in results
-                        if not r.success and not r.blocked
-                    ]
                     try:
-                        if failed:
-                            names = ", ".join(r.summary for r in failed[:3])
-                            more = (
-                                f" (+{len(failed) - 3} more)"
-                                if len(failed) > 3 else ""
-                            )
+                        for repo_cfg, result in zip(
+                            config.repos, results, strict=False
+                        ):
+                            if result.blocked:
+                                question = (
+                                    result.question or "(no question text)"
+                                )
+                                await secops_transport.send(
+                                    f"⏸️ Scheduled secops blocked on "
+                                    f"{repo_cfg.name}\n"
+                                    f"Session: `{result.session_id}`\n"
+                                    f"\n{question}"
+                                )
+                            elif not result.success:
+                                err = result.error or result.summary
+                                await secops_transport.send(
+                                    f"❌ Scheduled secops failed on "
+                                    f"{repo_cfg.name}\n"
+                                    f"Session: `{result.session_id}`\n"
+                                    f"\n{err}"
+                                )
+                        # Final at-a-glance summary — kept because it's
+                        # the single message the operator scans first.
+                        blocked_n = sum(1 for r in results if r.blocked)
+                        failed_n = sum(
+                            1 for r in results
+                            if not r.success and not r.blocked
+                        )
+                        if blocked_n or failed_n:
+                            parts = []
+                            if blocked_n:
+                                parts.append(f"{blocked_n} blocked")
+                            if failed_n:
+                                parts.append(f"{failed_n} failed")
                             await secops_transport.send(
-                                f"❌ Scheduled secops: {len(failed)} failed — "
-                                f"{names}{more}"
+                                f"📋 Scheduled secops sweep done: "
+                                f"{ok}/{len(results)} ok, "
+                                f"{', '.join(parts)}"
                             )
-                        if blocked:
+                        else:
                             await secops_transport.send(
-                                f"⏸️ Scheduled secops: {len(blocked)} "
-                                "run(s) blocked on user input"
+                                f"✅ Scheduled secops sweep done: "
+                                f"{ok}/{len(results)} ok"
                             )
                     except Exception as e:
                         console.print(
