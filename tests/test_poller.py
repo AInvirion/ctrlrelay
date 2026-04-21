@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,13 +12,17 @@ import pytest
 from ctrlrelay.core.poller import IssuePoller
 
 
-def make_issue(number: int, title: str = "Test issue") -> dict:
+def make_issue(
+    number: int,
+    title: str = "Test issue",
+    labels: list[dict] | list[str] | None = None,
+) -> dict:
     return {
         "number": number,
         "title": title,
         "state": "open",
         "body": "",
-        "labels": [],
+        "labels": labels or [],
         "assignees": [],
         "createdAt": "2026-01-01T00:00:00Z",
         "updatedAt": "2026-01-01T00:00:00Z",
@@ -161,6 +166,168 @@ class TestIssuePoller:
 
         mock_github.list_assigned_issues.assert_not_called()
         assert 99 in poller.seen_issues.get("owner/repo-a", set())
+
+    @pytest.mark.asyncio
+    async def test_poll_excludes_issues_with_matching_label(
+        self,
+        mock_github: MagicMock,
+        state_file: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Issues carrying an exclude label are marked seen but NOT returned."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(1, "Operator task", labels=[{"name": "manual"}]),
+            make_issue(2, "Real code work", labels=[{"name": "bug"}]),
+        ]
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            exclude_labels_by_repo={"owner/repo-a": ["manual", "operator"]},
+        )
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.poller"):
+            results = await poller.poll()
+
+        # Only issue #2 survives; #1 is filtered out by label.
+        assert [r["issue"]["number"] for r in results] == [2]
+
+        # Both issues are now marked seen — #1 will not re-appear.
+        assert poller.seen_issues["owner/repo-a"] == {1, 2}
+
+        # The excluded issue is logged under the agreed event name.
+        records = [
+            r for r in caplog.records if r.getMessage() == "poll.issue.excluded_by_label"
+        ]
+        assert len(records) == 1
+        rec = records[0]
+        assert rec.repo == "owner/repo-a"
+        assert rec.issue_number == 1
+        assert rec.matched_label == "manual"
+
+    @pytest.mark.asyncio
+    async def test_poll_without_exclude_labels_returns_everything(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Labeled issues pass through when no exclude_labels are configured."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(1, "Looks operator-y but no exclude configured", labels=[{"name": "manual"}]),
+        ]
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+        )
+
+        results = await poller.poll()
+
+        assert len(results) == 1
+        assert results[0]["issue"]["number"] == 1
+
+    @pytest.mark.asyncio
+    async def test_poll_exclude_match_is_case_insensitive(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """'Manual' label matches 'manual' in exclude config."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(1, "Case mismatch", labels=[{"name": "Manual"}]),
+        ]
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            exclude_labels_by_repo={"owner/repo-a": ["manual"]},
+        )
+
+        results = await poller.poll()
+
+        assert results == []
+        assert 1 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
+    async def test_poll_excluded_issue_not_rereported_across_polls(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Once excluded and marked seen, the issue stays excluded on next poll.
+
+        Guards against the failure mode in #91: the issue keeps re-appearing
+        and the dev pipeline keeps getting spawned for operator-only work.
+        """
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(1, "Operator task", labels=[{"name": "manual"}]),
+        ]
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            exclude_labels_by_repo={"owner/repo-a": ["manual"]},
+        )
+
+        # First poll: excluded, marked seen.
+        assert await poller.poll() == []
+
+        # Second poll with the same issue still present: still no handoff.
+        assert await poller.poll() == []
+
+    @pytest.mark.asyncio
+    async def test_poll_exclude_labels_persist_in_state_file(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """An excluded issue survives a poller restart (written to state.json)."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(1, "Op task", labels=[{"name": "manual"}]),
+        ]
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            exclude_labels_by_repo={"owner/repo-a": ["manual"]},
+        )
+        await poller.poll()
+
+        saved = json.loads(state_file.read_text())
+        assert saved["seen_issues"]["owner/repo-a"] == [1]
+
+        # Restart: no exclude config this time. The issue still shouldn't
+        # re-appear because it was persisted as seen.
+        restarted = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+        )
+        assert await restarted.poll() == []
+
+    @pytest.mark.asyncio
+    async def test_poll_accepts_string_labels(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Label matching tolerates labels given as plain strings (test robustness)."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(1, "Plain string labels", labels=["manual", "bug"]),
+        ]
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            exclude_labels_by_repo={"owner/repo-a": ["manual"]},
+        )
+
+        results = await poller.poll()
+
+        assert results == []
 
     @pytest.mark.asyncio
     async def test_run_poll_loop_processes_new_issues(self, tmp_path: Path) -> None:

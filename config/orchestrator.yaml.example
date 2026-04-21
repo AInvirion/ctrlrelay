@@ -51,3 +51,10 @@ repos: []
   #     dependabot_patch: auto
   #     dependabot_minor: ask
   #     dependabot_major: never
+  #     # Issues carrying any of these labels are skipped by the poller:
+  #     # marked seen, logged as poll.issue.excluded_by_label, and never
+  #     # handed to the dev pipeline. Intended for operator tasks and
+  #     # pure instruction issues that should not trigger code changes.
+  #     # Matching is case-insensitive. Defaults to ["manual", "operator",
+  #     # "instruction"]; override with an empty list to disable.
+  #     exclude_labels: ["manual", "operator", "instruction"]

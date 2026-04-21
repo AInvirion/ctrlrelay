@@ -42,6 +42,14 @@ class IssuePoller:
     ``assigned`` event naming ``username`` was performed by ``username``
     themselves — i.e. self-assignment only. Repos listed in
     ``accept_foreign_assignments`` bypass this check.
+
+    ``exclude_labels_by_repo`` gives the operator a way to mark issues as
+    "not for the agent" (operator tasks, pure instructions, manual work).
+    Matched issues are marked seen so they don't keep reappearing, logged
+    under ``poll.issue.excluded_by_label``, and never handed to the dev
+    pipeline. The exclusion check runs BEFORE the assignment-event lookup
+    so it short-circuits the extra ``gh`` call for excluded issues.
+    Matching is case-insensitive.
     """
 
     github: GitHubCLI
@@ -50,6 +58,7 @@ class IssuePoller:
     state_file: Path
     seen_issues: dict[str, set[int]] = field(default_factory=dict)
     accept_foreign_assignments: set[str] = field(default_factory=set)
+    exclude_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
     # Per-repo consecutive-skip counter; populated at runtime by poll() /
     # seed_current(). Not persisted — intentionally resets on daemon
     # restart so an operator fix is exercised before we re-escalate.
@@ -149,6 +158,11 @@ class IssuePoller:
         ``gh`` exit, OS error) is logged and skipped so the other repos still
         get polled. Only ``asyncio.CancelledError`` escapes, which allows a
         clean shutdown signal to propagate.
+
+        Issues carrying any label from ``exclude_labels_by_repo[repo]`` are
+        marked seen and dropped before the assignment-event check runs, so
+        operator-only / instruction-only issues never reach the dev pipeline
+        and we don't pay a second ``gh`` call for them.
         """
         new_issues: list[dict[str, Any]] = []
 
@@ -184,6 +198,10 @@ class IssuePoller:
             self._clear_repo_failure(repo)
 
             seen_for_repo = self.seen_issues.setdefault(repo, set())
+            exclude_lowered = {
+                label.lower()
+                for label in self.exclude_labels_by_repo.get(repo, [])
+            }
             for issue in issues:
                 # Per-issue guard so ONE malformed payload (missing 'number',
                 # wrong type, non-dict entry) doesn't poison the remaining
@@ -203,6 +221,22 @@ class IssuePoller:
                     continue
 
                 if number in seen_for_repo:
+                    continue
+
+                # Exclude-label filter runs before the assignment-event
+                # lookup so operator-only issues never trigger a second
+                # gh call, and are permanently marked seen so they stop
+                # re-appearing in future polls.
+                matched = self._matched_exclude_label(issue, exclude_lowered)
+                if matched is not None:
+                    seen_for_repo.add(number)
+                    log_event(
+                        _logger,
+                        "poll.issue.excluded_by_label",
+                        repo=repo,
+                        issue_number=number,
+                        matched_label=matched,
+                    )
                     continue
 
                 # Mark seen before deciding whether to surface the issue so a
@@ -278,6 +312,28 @@ class IssuePoller:
             assigner_login=assigner_login,
         )
         return False
+
+    @staticmethod
+    def _matched_exclude_label(
+        issue: dict[str, Any], exclude_lowered: set[str]
+    ) -> str | None:
+        """Return the first issue label that matches ``exclude_lowered``.
+
+        Labels come back from ``gh issue list`` as ``[{"name": "...", ...}]``;
+        we also accept a plain list of strings for flexibility in tests.
+        Matching is case-insensitive; the returned value is the label's
+        original casing so log output reflects what's actually on the issue.
+        """
+        if not exclude_lowered:
+            return None
+        for label in issue.get("labels") or []:
+            if isinstance(label, dict):
+                name = label.get("name", "")
+            else:
+                name = str(label)
+            if name and name.lower() in exclude_lowered:
+                return name
+        return None
 
     def mark_seen(self, repo: str, issue_number: int) -> None:
         """Mark an issue as seen without triggering a poll.

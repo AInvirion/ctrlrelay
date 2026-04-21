@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assignments are logged as `poll.issue.foreign_assignment` and marked seen
   so they aren't re-checked. Repos can opt back into the old "any assignment
   counts" behaviour with `automation.accept_foreign_assignments: true`.
+- **Poller exclude-label filter** (`repos[].automation.exclude_labels`): issues
+  carrying any configured label are marked seen, logged as
+  `poll.issue.excluded_by_label`, and skipped by the dev pipeline — lets the
+  operator mark issues as "manual / operator / instruction" without the agent
+  opening off-topic PRs for them. Defaults to `["manual", "operator",
+  "instruction"]`; set to `[]` to disable. Closes #91.
 
 ## [0.1.5] - 2026-04-20
 
