@@ -38,14 +38,16 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      # Only attach on release: published. Tag-push alone (push.tags: v*)
+      # races `gh release create` — if the tag lands a second before the
+      # release is created, this step fails with "release not found".
+      # The release event fires AFTER the release exists, so the upload
+      # is always safe.
       - name: Attach artifacts to GitHub release
-        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
-            TAG="${{ github.event.release.tag_name }}"
-          fi
+          TAG="${{ github.event.release.tag_name }}"
           echo "Uploading dist/* to release ${TAG}"
           gh release upload "${TAG}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
