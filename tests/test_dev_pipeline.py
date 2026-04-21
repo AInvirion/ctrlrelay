@@ -23,6 +23,43 @@ class TestDevPipeline:
 
         assert pipeline.name == "dev"
 
+    def test_prompt_directs_claude_to_ci_wait_helper(self) -> None:
+        """Prompt must tell Claude to call `ctrlrelay ci wait` (or equivalent
+        approved command) rather than improvising a bash `until`/`while` loop.
+        Issue #85: hand-written loops were inverted-semantics and ate exit
+        codes, burning 30-min timeouts on PRs that had already gone green.
+        """
+        from ctrlrelay.pipelines.dev import DevPipeline
+
+        pipeline = DevPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+
+        prompt = pipeline._build_prompt(
+            repo="owner/repo",
+            issue_number=42,
+            extra={
+                "issue_title": "t",
+                "issue_body": "b",
+                "branch_name": "fix/issue-42",
+            },
+            session_id="dev-42",
+            state_file=Path("/tmp/state.json"),
+        )
+
+        # Points Claude at the approved waiter.
+        assert "ctrlrelay ci wait" in prompt
+        # Explicitly forbids the pattern that broke in issue #85.
+        lower = prompt.lower()
+        assert "until" in lower and "while" in lower, (
+            "prompt should explicitly ban `until`/`while` bash CI-wait loops"
+        )
+
     @pytest.mark.asyncio
     async def test_run_dispatches_claude_session(self, tmp_path: Path) -> None:
         """Should dispatch Claude session with issue context."""

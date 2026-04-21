@@ -151,9 +151,15 @@ Execute the following workflow:
 3. Plan and implement the fix using TDD
 4. Push the branch and open a PR that references the issue
 5. Before signaling DONE, verify the PR is mergeable:
-   - Poll `gh pr checks <PR>` until every check is `completed`; if any
-     conclusion is `failure`/`cancelled`/`timed_out`, investigate, fix, push
-     again, and re-poll.
+   - Wait for CI by running EXACTLY this command (do NOT improvise bash):
+     `ctrlrelay ci wait --pr <PR> --repo {repo} --timeout 600`
+     Exit codes: 0 = all checks passed, 1 = a check failed (investigate,
+     fix, push, then re-run the wait), 2 = hard timeout while CI is still
+     pending (treat as acceptable — hand off and let the orchestrator
+     re-verify). Do NOT write your own `until` / `while` loops around
+     `gh pr checks`; those have been miswritten in the past (inverted
+     semantics, pipes swallowing exit codes) and burned the whole session
+     timeout on PRs that were already green.
    - Run `gh pr view <PR> --json mergeable,mergeStateStatus` — if `mergeable`
      is `CONFLICTING` or `mergeStateStatus` is `DIRTY`, rebase onto the base
      branch, resolve conflicts, and push again.
