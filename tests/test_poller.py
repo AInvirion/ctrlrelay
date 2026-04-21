@@ -213,7 +213,11 @@ class TestIssuePoller:
     ) -> None:
         """Labeled issues pass through when no exclude_labels are configured."""
         mock_github.list_assigned_issues.return_value = [
-            make_issue(1, "Looks operator-y but no exclude configured", labels=[{"name": "manual"}]),
+            make_issue(
+                1,
+                "Looks operator-y but no exclude configured",
+                labels=[{"name": "manual"}],
+            ),
         ]
 
         poller = IssuePoller(
