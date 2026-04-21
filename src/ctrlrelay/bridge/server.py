@@ -267,18 +267,35 @@ class BridgeServer:
                 # this, the reply disappears the instant the session's ASK
                 # socket closes — which is exactly what happens when a
                 # scheduled secops sweep escalates BLOCKED and exits.
-                queued = await self._queue_orphan_reply_as_resume_answer(text)
+                outcome = await self._queue_orphan_reply_as_resume_answer(text)
                 if self._telegram is not None:
                     try:
-                        if queued is not None:
+                        if outcome["status"] == "queued":
+                            row = outcome["row"]
                             await self._telegram.send(
                                 "✅ Answer queued for BLOCKED session "
-                                f"`{queued['session_id']}` "
-                                f"(pipeline={queued['pipeline']}, "
-                                f"repo={queued['repo']}).\n"
+                                f"`{row['session_id']}` "
+                                f"(pipeline={row['pipeline']}, "
+                                f"repo={row['repo']}).\n"
                                 "The pending-resume sweeper will drive it "
                                 "on the next tick — you'll get another "
                                 "message with the result."
+                            )
+                        elif outcome["status"] == "ambiguous":
+                            pending_list = "\n".join(
+                                f"  • `{r['session_id']}` ({r['repo']}): "
+                                f"{(r['question'] or '')[:80]}"
+                                for r in outcome["rows"]
+                            )
+                            await self._telegram.send(
+                                "⚠️ Your reply wasn't routed — multiple "
+                                "BLOCKED sessions are unanswered and your "
+                                "message didn't include a session_id to "
+                                "disambiguate.\n\n"
+                                "Pending:\n"
+                                f"{pending_list}\n\n"
+                                "Reply again with the session_id included "
+                                "(just paste it anywhere in your message)."
                             )
                         else:
                             await self._telegram.send(
@@ -330,27 +347,59 @@ class BridgeServer:
 
     async def _queue_orphan_reply_as_resume_answer(
         self, text: str
-    ) -> dict | None:
+    ) -> dict:
         """Try to route an orphan Telegram reply to a persisted BLOCKED
         session so the pending-resume sweeper can pick it up and drive a
         pipeline resume.
 
-        Returns the pending_resume row (as dict) when the answer was
-        successfully attached, or None when there's no state_db, no
-        unanswered BLOCKED session, or the state_db update raced. DB
-        failures are logged and swallowed — a noisy orphan-reply UX is
-        better than crashing the bridge.
+        Returns a dict with ``status`` set to one of:
+        - ``"queued"`` with ``row`` (dict) — answer was attached.
+        - ``"ambiguous"`` with ``rows`` (list[dict]) — multiple BLOCKED
+          sessions exist and the reply didn't name one, so we refuse to
+          guess. The sender is told which session_ids exist so they can
+          retry with one included.
+        - ``"none"`` — no state_db, no unanswered rows, or DB error.
+
+        Disambiguation rule: if the reply text contains exactly one of
+        the unanswered session_ids as a substring, route to that row.
+        Otherwise, with >1 unanswered rows and no substring match,
+        return ambiguous. With exactly one unanswered row and no
+        substring match, route anyway (single-repo case is unambiguous).
         """
         if self.state_db is None:
-            return None
+            return {"status": "none"}
         try:
-            row = self.state_db.get_oldest_unanswered_pending_resume()
-            if row is None:
-                return None
+            rows = self.state_db.list_unanswered_pending_resumes()
+        except Exception as e:
+            log_event(
+                _logger,
+                "bridge.pending_resume.list_failed",
+                reason=type(e).__name__,
+                error=str(e)[:200],
+            )
+            return {"status": "none"}
+
+        if not rows:
+            return {"status": "none"}
+
+        matched_by_id = [r for r in rows if r["session_id"] in text]
+        if len(matched_by_id) == 1:
+            target = matched_by_id[0]
+        elif len(matched_by_id) > 1:
+            # Multiple session_ids named in the same reply — refuse to
+            # pick one. Let the operator send a single-session reply.
+            return {"status": "ambiguous", "rows": matched_by_id}
+        elif len(rows) == 1:
+            target = rows[0]
+        else:
+            # Multiple unanswered, no session_id hint — can't route safely.
+            return {"status": "ambiguous", "rows": rows}
+
+        try:
             if not self.state_db.answer_pending_resume(
-                row["session_id"], text
+                target["session_id"], text
             ):
-                return None
+                return {"status": "none"}
         except Exception as e:
             log_event(
                 _logger,
@@ -358,14 +407,15 @@ class BridgeServer:
                 reason=type(e).__name__,
                 error=str(e)[:200],
             )
-            return None
+            return {"status": "none"}
+
         log_event(
             _logger,
             "bridge.pending_resume.queued",
-            session_id=row["session_id"],
-            pipeline=row["pipeline"],
-            repo=row["repo"],
+            session_id=target["session_id"],
+            pipeline=target["pipeline"],
+            repo=target["repo"],
             answer_length=len(text),
             answer_hash=hash_text(text),
         )
-        return row
+        return {"status": "queued", "row": target}

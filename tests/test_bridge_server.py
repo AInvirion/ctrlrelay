@@ -242,10 +242,8 @@ class TestBridgeServer:
     async def test_orphan_reply_routes_to_pending_resume(
         self, socket_path, tmp_path,
     ) -> None:
-        """An orphan Telegram reply with a persisted BLOCKED session in
-        pending_resumes should queue the answer there and tell the
-        operator. The sweeper (tested separately) then drives the actual
-        resume."""
+        """With exactly one unanswered BLOCKED session, an orphan reply
+        routes to it unambiguously (no session_id substring needed)."""
         from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.server import BridgeServer
@@ -283,6 +281,114 @@ class TestBridgeServer:
         assert "Answer queued" in sent_text
         assert "secops-owner-r-abc" in sent_text
         assert "owner/r" in sent_text
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_orphan_reply_refuses_to_guess_when_multiple_blocked(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """When two repos are BLOCKED at once and the reply text doesn't
+        name one, refuse to route — FIFO would silently drive the wrong
+        session. This was codex's P1-A finding."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-owner-repoA-111",
+            pipeline="secops", repo="owner/repoA",
+            question="A: merge major bumps?",
+        )
+        db.add_pending_resume(
+            session_id="secops-owner-repoB-222",
+            pipeline="secops", repo="owner/repoB",
+            question="B: defer or merge?",
+        )
+
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123,
+            state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        await server._on_telegram_reply(
+            "merge it", reply_to_message_id=None
+        )
+
+        # Neither row was answered — reply is held back until the
+        # operator disambiguates.
+        assert db.list_pending_resumes_to_execute() == []
+        unanswered = db.list_unanswered_pending_resumes()
+        assert len(unanswered) == 2
+        assert all(r["answer"] is None for r in unanswered)
+
+        # And the operator is told which session_ids are pending.
+        sent_text = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "multiple BLOCKED sessions" in sent_text.lower() or \
+               "multiple" in sent_text
+        assert "secops-owner-repoA-111" in sent_text
+        assert "secops-owner-repoB-222" in sent_text
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_orphan_reply_disambiguates_via_session_id_in_text(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """Operator reply includes the session_id they mean — route to
+        that row, not FIFO. This is how the ambiguous case gets resolved:
+        copy the session_id from the BLOCKED notification and paste it
+        into the reply."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-owner-repoA-111",
+            pipeline="secops", repo="owner/repoA",
+            question="?",
+        )
+        db.add_pending_resume(
+            session_id="secops-owner-repoB-222",
+            pipeline="secops", repo="owner/repoB",
+            question="?",
+        )
+
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123,
+            state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        # Reply names session B explicitly.
+        await server._on_telegram_reply(
+            "For secops-owner-repoB-222: close the PR",
+            reply_to_message_id=None,
+        )
+
+        # Only B was answered; A stays pending.
+        pending = db.list_pending_resumes_to_execute()
+        assert [r["session_id"] for r in pending] == [
+            "secops-owner-repoB-222"
+        ]
+        still_unanswered = [
+            r["session_id"]
+            for r in db.list_unanswered_pending_resumes()
+        ]
+        assert still_unanswered == ["secops-owner-repoA-111"]
 
         db.close()
         await server.stop()

@@ -1425,6 +1425,21 @@ def poller_start(
                             pass
                         continue
 
+                    # Lock-contention is retryable: the 6am secops cron or
+                    # an in-flight dev session holds the repo lock. Leave
+                    # the pending_resumes row as-is so the next sweeper
+                    # tick tries again. Without this guard the operator's
+                    # queued answer is silently dropped.
+                    if not result.success and result.error == (
+                        "Repository locked by another session"
+                    ):
+                        console.print(
+                            "[dim]pending_resume_sweeper: "
+                            f"lock contention on {repo}, will retry "
+                            f"next tick (session={session_id})[/dim]"
+                        )
+                        continue
+
                     try:
                         state_db.mark_pending_resume_resumed(session_id)
                     except Exception:

@@ -281,6 +281,18 @@ class StateDB:
             ).fetchone()
         return dict(row) if row else None
 
+    def list_unanswered_pending_resumes(self) -> list[dict[str, Any]]:
+        """All BLOCKED sessions still awaiting an answer, oldest first.
+        Used by the bridge to disambiguate when multiple repos are blocked
+        at once — FIFO routing would otherwise send the operator's reply
+        about repo B onto repo A."""
+        rows = self._conn.execute(
+            "SELECT * FROM pending_resumes "
+            "WHERE answered_at IS NULL "
+            "ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def answer_pending_resume(self, session_id: str, answer: str) -> bool:
         """Attach an operator's answer to a pending resume, marking it
         ready for the sweeper to execute. Returns True if a row was
