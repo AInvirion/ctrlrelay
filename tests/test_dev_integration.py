@@ -310,6 +310,128 @@ class TestDevPipelineCleanup:
         mock_delete_branch.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_blocked_exit_persists_to_pending_resumes(
+        self, tmp_path: Path
+    ) -> None:
+        """BLOCKED exit must also write a pending_resumes row so a
+        Telegram reply arriving after the session exited can still
+        route to a resume via the pending_resume_sweeper."""
+        from ctrlrelay.core.checkpoint import read_checkpoint
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.core.worktree import WorktreeManager
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        async def spawn(**kwargs):
+            state_file = kwargs["state_file"]
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps({
+                "version": "1",
+                "status": "BLOCKED_NEEDS_INPUT",
+                "session_id": kwargs["session_id"],
+                "timestamp": "2026-04-17T12:00:00Z",
+                "question": "pin or bump typescript?",
+            }))
+            return SessionResult(
+                session_id=kwargs["session_id"],
+                exit_code=0,
+                stdout="",
+                stderr="",
+                state=read_checkpoint(state_file),
+            )
+
+        state_db = StateDB(tmp_path / "state.db")
+        worktree = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        mock_github = AsyncMock(spec=GitHubCLI)
+        mock_github.get_issue.return_value = {
+            "number": 42, "title": "t", "body": "b",
+        }
+        mock_dispatcher = AsyncMock(spec=ClaudeDispatcher)
+        mock_dispatcher.spawn_session.side_effect = spawn
+
+        with (
+            patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock),
+            patch.object(
+                worktree, "create_worktree_with_new_branch",
+                new_callable=AsyncMock,
+            ) as mock_create,
+            patch.object(worktree, "remove_worktree", new_callable=AsyncMock),
+            patch.object(worktree, "delete_branch", new_callable=AsyncMock),
+            patch.object(
+                worktree, "branch_exists_on_remote", new_callable=AsyncMock
+            ) as mock_remote,
+            patch.object(
+                worktree, "branch_exists_locally", new_callable=AsyncMock
+            ) as mock_local,
+            patch.object(worktree, "symlink_context"),
+            patch.object(worktree, "remove_context_symlink"),
+        ):
+            mock_remote.return_value = False
+            mock_local.return_value = False
+            worktree_path = tmp_path / "worktrees" / "wt-42"
+            worktree_path.mkdir(parents=True)
+            mock_create.return_value = worktree_path
+
+            result = await run_dev_issue(
+                repo="owner/repo",
+                issue_number=42,
+                branch_template="fix/issue-{n}",
+                dispatcher=mock_dispatcher,
+                github=mock_github,
+                worktree=worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=None,  # no in-process BLOCKED loop
+                contexts_dir=tmp_path / "contexts",
+            )
+
+        assert result.blocked
+        # The new behavior: pending_resumes has a dev row for this session.
+        unanswered = state_db.list_unanswered_pending_resumes()
+        assert len(unanswered) == 1
+        assert unanswered[0]["session_id"] == result.session_id
+        assert unanswered[0]["pipeline"] == "dev"
+        assert unanswered[0]["repo"] == "owner/repo"
+        assert "pin or bump" in unanswered[0]["question"]
+        state_db.close()
+
+    @pytest.mark.asyncio
+    async def test_resume_dev_from_pending_missing_session_row_errors(
+        self, tmp_path: Path
+    ) -> None:
+        """Defensive: if the pending_resumes row points at a session_id
+        with no matching sessions row (DB tampering, manual cleanup),
+        the resume helper must fail cleanly, not crash. Sweeper then
+        marks it resumed so it doesn't hot-loop."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import resume_dev_from_pending
+
+        state_db = StateDB(tmp_path / "state.db")
+
+        result = await resume_dev_from_pending(
+            session_id="dev-owner-repo-99-deadbeef",
+            repo="owner/repo",
+            answer="merge it",
+            branch_template="fix/issue-{n}",
+            dispatcher=AsyncMock(),
+            github=AsyncMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+        )
+        assert not result.success
+        assert result.error == "session_row_missing"
+        state_db.close()
+
+    @pytest.mark.asyncio
     async def test_pushed_branch_is_preserved_on_failure(
         self, tmp_path: Path
     ) -> None:

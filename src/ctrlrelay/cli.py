@@ -1358,6 +1358,7 @@ def poller_start(
             if not pending:
                 return
 
+            from ctrlrelay.pipelines.dev import resume_dev_from_pending
             from ctrlrelay.pipelines.secops import resume_secops_from_pending
 
             sweeper_transport = None
@@ -1372,17 +1373,14 @@ def poller_start(
                     except Exception:
                         sweeper_transport = None
 
+            repo_cfg_by_name = {r.name: r for r in config.repos}
+
             try:
                 for row in pending:
                     session_id = row["session_id"]
                     repo = row["repo"]
                     pipeline_name = row["pipeline"]
                     answer = row["answer"] or ""
-                    if pipeline_name != "secops":
-                        # dev pipeline resume-from-pending not wired yet —
-                        # leave the row marked-answered so a later sweep
-                        # picks it up once that path lands.
-                        continue
 
                     if sweeper_transport:
                         try:
@@ -1395,18 +1393,68 @@ def poller_start(
                             pass
 
                     try:
-                        result = await resume_secops_from_pending(
-                            session_id=session_id,
-                            repo=repo,
-                            answer=answer,
-                            dispatcher=dispatcher,
-                            github=github,
-                            worktree=worktree,
-                            dashboard=scheduled_dashboard,
-                            state_db=state_db,
-                            transport=sweeper_transport,
-                            contexts_dir=config.paths.contexts,
-                        )
+                        if pipeline_name == "secops":
+                            result = await resume_secops_from_pending(
+                                session_id=session_id,
+                                repo=repo,
+                                answer=answer,
+                                dispatcher=dispatcher,
+                                github=github,
+                                worktree=worktree,
+                                dashboard=scheduled_dashboard,
+                                state_db=state_db,
+                                transport=sweeper_transport,
+                                contexts_dir=config.paths.contexts,
+                            )
+                        elif pipeline_name == "dev":
+                            # Dev resume needs the repo's branch template
+                            # to reconstruct the session's existing branch
+                            # name (fix/issue-<n> by default). If the
+                            # repo fell out of config (rename, removal),
+                            # we can't safely resume — mark resumed so
+                            # the row doesn't hot-loop and log it.
+                            repo_cfg = repo_cfg_by_name.get(repo)
+                            if repo_cfg is None:
+                                console.print(
+                                    "[yellow]pending_resume_sweeper: "
+                                    f"dev resume for {repo} skipped — "
+                                    "repo not in current config. "
+                                    f"Session={session_id}[/yellow]"
+                                )
+                                try:
+                                    state_db.mark_pending_resume_resumed(
+                                        session_id
+                                    )
+                                except Exception:
+                                    pass
+                                continue
+                            result = await resume_dev_from_pending(
+                                session_id=session_id,
+                                repo=repo,
+                                answer=answer,
+                                branch_template=repo_cfg.dev_branch_template,
+                                dispatcher=dispatcher,
+                                github=github,
+                                worktree=worktree,
+                                dashboard=scheduled_dashboard,
+                                state_db=state_db,
+                                transport=sweeper_transport,
+                                contexts_dir=config.paths.contexts,
+                            )
+                        else:
+                            console.print(
+                                "[yellow]pending_resume_sweeper: "
+                                f"unknown pipeline '{pipeline_name}' "
+                                f"for session {session_id} — marking "
+                                "resumed to avoid hot-loop[/yellow]"
+                            )
+                            try:
+                                state_db.mark_pending_resume_resumed(
+                                    session_id
+                                )
+                            except Exception:
+                                pass
+                            continue
                     except Exception as e:
                         if sweeper_transport:
                             try:

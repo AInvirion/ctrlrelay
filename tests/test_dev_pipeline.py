@@ -941,9 +941,19 @@ class TestRunDevIssueVerification:
             contexts_dir=tmp_path / "contexts",
         )
 
-        assert not result.blocked
+        # New behavior (codex P1 fix): transport failure during the
+        # in-process BLOCKED loop preserves blocked=True so the outer
+        # persistence-on-blocked branch fires. A permanently-wedged
+        # session would otherwise lose the operator's late reply.
+        assert result.blocked
         assert not result.success
         assert "bridge down" in (result.error or "")
+        # And the row is in pending_resumes ready for an orphan reply.
+        unanswered = state_db.list_unanswered_pending_resumes()
+        assert len(unanswered) == 1
+        assert unanswered[0]["pipeline"] == "dev"
+        assert unanswered[0]["repo"] == "owner/repo"
+        state_db.close()
 
     @pytest.mark.asyncio
     async def test_run_dev_issue_does_not_retry_on_ci_timeout(

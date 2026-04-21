@@ -236,6 +236,17 @@ class StateDB:
         value = row["agent_session_id"]
         return value if value else None
 
+    def get_session_row(self, session_id: str) -> dict[str, Any] | None:
+        """Full sessions-row snapshot, used when the pending-resume
+        sweeper needs pipeline-specific context (issue_number for dev,
+        worktree_path for sanity checks, etc.) that isn't mirrored into
+        pending_resumes."""
+        row = self._conn.execute(
+            "SELECT * FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     # Pending resumes (BLOCKED sessions awaiting an operator answer)
 
     def add_pending_resume(
@@ -317,11 +328,26 @@ class StateDB:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def mark_pending_resume_resumed(self, session_id: str) -> None:
+    def mark_pending_resume_resumed(self, session_id: str) -> bool:
         """Mark a pending resume as executed so the sweeper doesn't pick
-        it up again."""
-        self._conn.execute(
-            "UPDATE pending_resumes SET resumed_at = ? WHERE session_id = ?",
+        it up again.
+
+        Guarded on ``answered_at IS NOT NULL``: during a resume that
+        re-blocks, the pipeline inserts a FRESH pending_resumes row
+        (via ``add_pending_resume`` which is INSERT OR REPLACE,
+        clearing answer/answered_at/resumed_at). If the sweeper then
+        blindly stamped ``resumed_at`` on that fresh unanswered row,
+        the next operator reply would set ``answered_at`` but leave
+        ``resumed_at`` populated, hiding the row from
+        ``list_pending_resumes_to_execute`` forever and permanently
+        wedging the session. The guard makes this a no-op when the
+        row has been refreshed.
+
+        Returns True iff a row was updated."""
+        cursor = self._conn.execute(
+            "UPDATE pending_resumes SET resumed_at = ? "
+            "WHERE session_id = ? AND answered_at IS NOT NULL",
             (int(time.time()), session_id),
         )
         self._conn.commit()
+        return cursor.rowcount > 0

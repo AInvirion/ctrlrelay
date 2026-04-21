@@ -31,6 +31,22 @@ AGENT_CLAIM_COMMENT = (
 _logger = get_logger("pipeline.dev")
 
 
+def _question_for_persist(session_id: str, result: PipelineResult) -> str:
+    """Return a non-empty question string for pending_resumes storage.
+
+    Mirrors the synthesized prompt the in-process BLOCKED loop uses
+    when ``result.question`` is empty — without this, a BLOCKED exit
+    with no question text would skip persistence and the session
+    would become unresumable via Telegram."""
+    q = (result.question or "").strip()
+    if q:
+        return q
+    return (
+        f"Session {session_id} is blocked but did not include a "
+        "question. Reply with guidance to resume."
+    )
+
+
 @dataclass
 class DevPipeline:
     """Dev pipeline for implementing issues and opening PRs."""
@@ -474,14 +490,21 @@ async def run_dev_issue(
                     issue_number=issue_number,
                 )
             except Exception as e:
-                # Transport failed (bridge down, timeout, etc.) — give up
-                # cleanly and fall through to the normal blocked cleanup.
+                # Transport failed (bridge down, timeout, etc.). The
+                # session IS still blocked — we just couldn't reach the
+                # operator. Preserve blocked=True so the outer
+                # persistence-on-blocked branch fires and writes a
+                # pending_resumes row. Operator replying later via
+                # Telegram then routes through the sweeper. Setting
+                # blocked=False here (the prior behavior) wedged the
+                # session permanently — codex P1.
                 result = PipelineResult(
                     success=False,
-                    blocked=False,
+                    blocked=True,
                     session_id=session_id,
-                    summary=f"Blocked session abandoned: {e}",
+                    summary=f"Blocked session deferred (transport): {e}",
                     error=str(e),
+                    question=question,
                     outputs=result.outputs,
                 )
                 break
@@ -507,6 +530,30 @@ async def run_dev_issue(
             (status, result.summary, int(time.time()), session_id),
         )
         state_db.commit()
+
+        # Persist BLOCKED so a Telegram reply arriving AFTER this session
+        # exits (max_blocked_rounds exhausted, or transport unavailable
+        # during the session) still routes to a resume. The per-minute
+        # pending_resume_sweeper drains these rows by calling
+        # resume_dev_from_pending below.
+        if result.blocked:
+            try:
+                state_db.add_pending_resume(
+                    session_id=session_id,
+                    pipeline="dev",
+                    repo=repo,
+                    question=_question_for_persist(session_id, result),
+                )
+            except Exception as e:
+                log_event(
+                    _logger,
+                    "dev.pending_resume.insert_failed",
+                    session_id=session_id,
+                    repo=repo,
+                    issue_number=issue_number,
+                    error_type=type(e).__name__,
+                    error=str(e)[:200],
+                )
 
         # Push event to dashboard
         if dashboard and result.success:
@@ -587,3 +634,252 @@ async def run_dev_issue(
 
     finally:
         state_db.release_lock(repo, session_id)
+
+
+async def resume_dev_from_pending(
+    session_id: str,
+    repo: str,
+    answer: str,
+    branch_template: str,
+    dispatcher: AgentAdapter,
+    github: GitHubCLI,
+    worktree: WorktreeManager,
+    dashboard: DashboardClient | None,
+    state_db: StateDB,
+    transport: Transport | None,
+    contexts_dir: Path,
+    max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
+    max_fix_attempts: int = DEFAULT_MAX_FIX_ATTEMPTS,
+    pr_verifier: PRVerifier | None = None,
+) -> PipelineResult:
+    """Resume a BLOCKED dev session using an answer that arrived via
+    Telegram after ``run_dev_issue`` exited.
+
+    Unlike secops, the dev pipeline keeps its worktree + branch alive on
+    BLOCKED exits (so resume doesn't have to re-clone/re-apply). We try
+    to reuse the stored worktree_path first; if it's missing (manual
+    cleanup, daemon restart lost the mount, etc.) we fall back to
+    ``create_worktree_with_new_branch`` which handles existing-branch
+    reuse.
+
+    Caller is responsible for flipping the pending_resumes row
+    ``resumed_at`` after this returns — except in the lock-contention
+    case, which is retryable; we surface it via
+    ``error == "Repository locked by another session"``.
+    """
+    session_row = state_db.get_session_row(session_id)
+    if session_row is None:
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=(
+                f"Cannot resume dev session {session_id}: row missing "
+                "from sessions table"
+            ),
+            error="session_row_missing",
+        )
+    issue_number = session_row.get("issue_number")
+    if issue_number is None:
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=(
+                f"Cannot resume dev session {session_id}: issue_number "
+                "missing on sessions row"
+            ),
+            error="session_issue_number_missing",
+        )
+
+    branch_name = branch_template.replace("{n}", str(issue_number))
+
+    if not state_db.acquire_lock(repo, session_id):
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=f"Could not acquire lock for {repo} to resume dev",
+            error="Repository locked by another session",
+        )
+
+    worktree_path: Path | None = None
+
+    try:
+        await worktree.ensure_bare_repo(repo)
+
+        # Prefer re-using the existing worktree left alive by the BLOCKED
+        # cleanup rule ("BLOCKED → keep both"). That preserves the
+        # session's in-progress commits / uncommitted work without
+        # another fetch round-trip.
+        stored_worktree = session_row.get("worktree_path")
+        if stored_worktree:
+            candidate = Path(stored_worktree)
+            if candidate.exists() and (candidate / ".git").exists():
+                worktree_path = candidate
+
+        if worktree_path is None:
+            worktree_path = await worktree.create_worktree_with_new_branch(
+                repo=repo,
+                session_id=session_id,
+                new_branch=branch_name,
+            )
+
+        context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
+        if context_path.exists():
+            worktree.symlink_context(worktree_path, context_path)
+
+        state_file = worktree_path / ".ctrlrelay" / "state.json"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Fetch issue context again so the resumed prompt has the same
+        # metadata the first run did — avoids the agent hallucinating
+        # details from stale state.
+        issue = await github.get_issue(repo, int(issue_number))
+
+        ctx = PipelineContext(
+            session_id=session_id,
+            repo=repo,
+            worktree_path=worktree_path,
+            context_path=context_path,
+            state_file=state_file,
+            issue_number=int(issue_number),
+            extra={
+                "issue_title": issue.get("title", ""),
+                "issue_body": issue.get("body", ""),
+                "branch_name": branch_name,
+            },
+        )
+
+        state_db.execute(
+            "UPDATE sessions SET status = ?, ended_at = NULL WHERE id = ?",
+            ("running", session_id),
+        )
+        state_db.commit()
+
+        pipeline = DevPipeline(
+            dispatcher=dispatcher,
+            github=github,
+            worktree=worktree,
+            dashboard=dashboard,
+            state_db=state_db,
+            transport=transport,
+        )
+
+        # Feed the operator's answer as the resume prompt. If the agent
+        # re-blocks (common for multi-step decisions), the same
+        # in-process BLOCKED loop that run_dev_issue uses kicks in here
+        # — transport.ask() waits on the live socket — so the operator
+        # can have a back-and-forth exchange on the resume path too.
+        result = await pipeline.resume(ctx, answer)
+
+        rounds = 0
+        while (
+            result.blocked
+            and transport is not None
+            and rounds < max_blocked_rounds
+        ):
+            question = (result.question or "").strip() or (
+                f"Session {session_id} is blocked but did not include a "
+                "question. Reply with guidance to resume."
+            )
+            try:
+                next_answer = await transport.ask(
+                    question,
+                    session_id=session_id,
+                    repo=repo,
+                    issue_number=int(issue_number),
+                )
+            except Exception as e:
+                # Keep blocked=True so outer persistence branch fires
+                # and the sweeper can pick this up again when the
+                # operator's next Telegram reply arrives. Same
+                # reasoning as run_dev_issue's loop — transport
+                # failure is not the same as a resolved session.
+                result = PipelineResult(
+                    success=False,
+                    blocked=True,
+                    session_id=session_id,
+                    summary=(
+                        f"Blocked session deferred during resume "
+                        f"(transport): {e}"
+                    ),
+                    error=str(e),
+                    question=question,
+                    outputs=result.outputs,
+                )
+                break
+            rounds += 1
+            result = await pipeline.resume(ctx, next_answer)
+
+        # Verify PR once the agent says DONE, matching run_dev_issue.
+        if result.success and result.outputs.get("pr_number") is not None:
+            verifier = pr_verifier or PRVerifier(github=github)
+            result = await _verify_and_fix_pr(
+                pipeline=pipeline,
+                ctx=ctx,
+                result=result,
+                verifier=verifier,
+                max_attempts=max_fix_attempts,
+            )
+
+        status = "done" if result.success else (
+            "blocked" if result.blocked else "failed"
+        )
+        state_db.execute(
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
+            "WHERE id = ?",
+            (status, result.summary, int(time.time()), session_id),
+        )
+        state_db.commit()
+
+        if result.blocked:
+            try:
+                state_db.add_pending_resume(
+                    session_id=session_id,
+                    pipeline="dev",
+                    repo=repo,
+                    question=_question_for_persist(session_id, result),
+                )
+            except Exception as e:
+                log_event(
+                    _logger,
+                    "dev.pending_resume.reblock_insert_failed",
+                    session_id=session_id,
+                    repo=repo,
+                    issue_number=issue_number,
+                    error_type=type(e).__name__,
+                    error=str(e)[:200],
+                )
+
+        return result
+
+    except Exception as e:
+        state_db.execute(
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
+            "WHERE id = ?",
+            ("failed", f"Resume error: {e}", int(time.time()), session_id),
+        )
+        state_db.commit()
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=f"Error resuming dev session {session_id} on {repo}",
+            error=str(e),
+        )
+
+    finally:
+        # Intentionally leave the worktree in place — matches
+        # run_dev_issue's "BLOCKED → keep both" contract and makes the
+        # worktree available for a third resume if the second one
+        # re-blocks. A follow-up can add teardown for the DONE/FAILED
+        # outcomes (small disk leak, not a correctness issue; operator
+        # can run `git worktree prune` in the bare repo to reclaim).
+        try:
+            state_db.release_lock(repo, session_id)
+        except Exception as lock_exc:
+            log_event(
+                _logger,
+                "dev.resume.cleanup.lock_release_failed",
+                session_id=session_id,
+                repo=repo,
+                error_type=type(lock_exc).__name__,
+                error=str(lock_exc)[:200],
+            )
