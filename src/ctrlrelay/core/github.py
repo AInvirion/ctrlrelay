@@ -193,6 +193,25 @@ class GitHubCLI:
         )
         return json.loads(output) if output.strip() else []
 
+    async def list_assignment_events(
+        self,
+        repo: str,
+        issue_number: int,
+    ) -> list[dict[str, Any]]:
+        """List ``assigned`` events for an issue in chronological order.
+
+        Returns the GitHub issue-events payload filtered to ``event == "assigned"``.
+        Each entry includes ``actor`` (who performed the assignment) and
+        ``assignee`` (who was assigned). Used by the poller to verify that the
+        most recent self-assignment was actually performed by the operator.
+        """
+        output = await self._run_gh(
+            "api",
+            f"/repos/{repo}/issues/{issue_number}/events",
+            "--jq", '[.[] | select(.event=="assigned")]',
+        )
+        return json.loads(output) if output.strip() else []
+
     async def get_issue(
         self,
         repo: str,

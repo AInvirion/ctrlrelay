@@ -29,10 +29,23 @@ def state_file(tmp_path: Path) -> Path:
     return tmp_path / "poller_state.json"
 
 
+def make_assigned_event(actor_login: str, assignee_login: str) -> dict:
+    return {
+        "event": "assigned",
+        "actor": {"login": actor_login},
+        "assignee": {"login": assignee_login},
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+
+
 @pytest.fixture
 def mock_github() -> MagicMock:
     gh = MagicMock()
     gh.list_assigned_issues = AsyncMock()
+    # Default: every issue was self-assigned by "alice" so the filter is a no-op.
+    gh.list_assignment_events = AsyncMock(
+        return_value=[make_assigned_event("alice", "alice")]
+    )
     return gh
 
 
@@ -158,6 +171,9 @@ class TestIssuePoller:
         mock_github.list_assigned_issues.return_value = [
             {"number": 123, "title": "Fix bug"},
         ]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("testuser", "testuser"),
+        ]
 
         poller = IssuePoller(
             github=mock_github,
@@ -198,6 +214,9 @@ class TestIssuePoller:
 
         mock_github = MagicMock()
         mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("testuser", "testuser")]
+        )
 
         poller = IssuePoller(
             github=mock_github,
@@ -230,6 +249,9 @@ class TestIssuePoller:
 
         mock_github = MagicMock()
         mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("testuser", "testuser")]
+        )
 
         poller = IssuePoller(
             github=mock_github,
@@ -285,6 +307,9 @@ class TestIssuePoller:
 
         mock_github = MagicMock()
         mock_github.list_assigned_issues = AsyncMock(side_effect=flaky_then_fine)
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("testuser", "testuser")]
+        )
 
         poller = IssuePoller(
             github=mock_github,
@@ -334,6 +359,9 @@ class TestIssuePoller:
 
         mock_github = MagicMock()
         mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("testuser", "testuser")]
+        )
 
         poller = IssuePoller(
             github=mock_github,
@@ -370,6 +398,9 @@ class TestIssuePoller:
 
         mock_github = MagicMock()
         mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("testuser", "testuser")]
+        )
 
         poller = IssuePoller(
             github=mock_github,
@@ -410,6 +441,9 @@ class TestIssuePoller:
                 {"number": 2, "title": "second good AFTER the bad one"},
             ]
         )
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("testuser", "testuser")]
+        )
 
         poller = IssuePoller(
             github=mock_github,
@@ -442,6 +476,9 @@ class TestIssuePoller:
         mock_github = MagicMock()
         mock_github.list_assigned_issues = AsyncMock(
             return_value=[{"number": 42, "title": "work to do"}]
+        )
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("testuser", "testuser")]
         )
 
         poller = IssuePoller(
@@ -568,6 +605,9 @@ class TestIssuePoller:
         mock_github.list_assigned_issues = AsyncMock(
             return_value=[{"number": 1, "title": "x"}]
         )
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("testuser", "testuser")]
+        )
 
         poller = IssuePoller(
             github=mock_github,
@@ -612,6 +652,9 @@ class TestIssuePoller:
                 {"number": 2, "title": "second"},
                 {"number": 3, "title": "third"},
             ]
+        )
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("testuser", "testuser")]
         )
 
         poller = IssuePoller(
@@ -698,3 +741,161 @@ class TestUnmarkSeen:
 
         on_disk = json.loads(state_file.read_text())
         assert 55 not in on_disk["seen_issues"].get("owner/repo", [])
+
+
+class TestForeignAssignmentFilter:
+    @pytest.mark.asyncio
+    async def test_self_assigned_issue_is_accepted(
+        self, poller: IssuePoller, mock_github: MagicMock
+    ) -> None:
+        """When the operator self-assigned the issue, it is picked up."""
+        mock_github.list_assigned_issues.return_value = [make_issue(1)]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("alice", "alice"),
+        ]
+
+        results = await poller.poll()
+
+        assert len(results) == 2  # both repos return the same issue
+        assert all(r["issue"]["number"] == 1 for r in results)
+
+    @pytest.mark.asyncio
+    async def test_foreign_assigned_issue_is_filtered(
+        self,
+        poller: IssuePoller,
+        mock_github: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An issue assigned to the operator by someone else is filtered out."""
+        import logging
+
+        mock_github.list_assigned_issues.return_value = [make_issue(1)]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("bob", "alice"),
+        ]
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            results = await poller.poll()
+
+        assert results == []
+        # Must still be marked seen so we don't re-check the same issue every poll
+        assert 1 in poller.seen_issues["owner/repo-a"]
+        assert 1 in poller.seen_issues["owner/repo-b"]
+
+        # Emits a foreign_assignment log event with identifying fields
+        foreign_records = [
+            r for r in caplog.records if r.getMessage() == "poll.issue.foreign_assignment"
+        ]
+        assert len(foreign_records) == 2  # one per repo
+        for rec in foreign_records:
+            assert rec.number == 1
+            assert rec.assigner_login == "bob"
+            assert rec.repo in {"owner/repo-a", "owner/repo-b"}
+
+    @pytest.mark.asyncio
+    async def test_most_recent_assigned_event_wins(
+        self, poller: IssuePoller, mock_github: MagicMock
+    ) -> None:
+        """If the issue was self-assigned first but later re-assigned by
+        someone else, the most recent assigner (bob) is what matters."""
+        mock_github.list_assigned_issues.return_value = [make_issue(1)]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("alice", "alice"),
+            make_assigned_event("bob", "alice"),
+        ]
+
+        results = await poller.poll()
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_ignores_events_for_other_assignees(
+        self, poller: IssuePoller, mock_github: MagicMock
+    ) -> None:
+        """Only `assigned` events where assignee == operator count. A later
+        assignment to someone else on the same issue shouldn't hide an
+        earlier self-assignment of the operator."""
+        mock_github.list_assigned_issues.return_value = [make_issue(1)]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("alice", "alice"),
+            # Irrelevant: someone else was later added as a co-assignee
+            make_assigned_event("bob", "charlie"),
+        ]
+
+        results = await poller.poll()
+
+        assert len(results) == 2
+
+    @pytest.mark.asyncio
+    async def test_bot_assignment_is_filtered(
+        self, poller: IssuePoller, mock_github: MagicMock
+    ) -> None:
+        """Assignment by a GitHub App / bot is treated as foreign."""
+        mock_github.list_assigned_issues.return_value = [make_issue(1)]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("github-actions[bot]", "alice"),
+        ]
+
+        results = await poller.poll()
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_no_assigned_events_is_filtered(
+        self, poller: IssuePoller, mock_github: MagicMock
+    ) -> None:
+        """Defensive: if the issue shows up in `gh issue list --assignee alice`
+        but has no `assigned` events naming alice (odd edge case — e.g. the
+        events endpoint truncated), we refuse to run rather than guess."""
+        mock_github.list_assigned_issues.return_value = [make_issue(1)]
+        mock_github.list_assignment_events.return_value = []
+
+        results = await poller.poll()
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_accept_foreign_assignments_bypasses_filter(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Per-repo opt-in: foreign assignments are accepted when the repo
+        is listed in `accept_foreign_assignments`."""
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a", "owner/repo-b"],
+            state_file=state_file,
+            accept_foreign_assignments={"owner/repo-a"},
+        )
+
+        mock_github.list_assigned_issues.return_value = [make_issue(1)]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("bob", "alice"),
+        ]
+
+        results = await poller.poll()
+
+        # repo-a: opted in → accepts bob's assignment
+        # repo-b: default → filters out bob's assignment
+        assert len(results) == 1
+        assert results[0]["repo"] == "owner/repo-a"
+        assert results[0]["issue"]["number"] == 1
+
+    @pytest.mark.asyncio
+    async def test_filter_runs_once_per_new_issue(
+        self, poller: IssuePoller, mock_github: MagicMock
+    ) -> None:
+        """A filtered issue is marked seen, so the events endpoint is NOT hit
+        again for it on the next poll."""
+        mock_github.list_assigned_issues.return_value = [make_issue(1)]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("bob", "alice"),
+        ]
+
+        await poller.poll()
+        call_count_after_first = mock_github.list_assignment_events.call_count
+
+        await poller.poll()
+
+        # No additional events calls on the second poll — issue is already seen
+        assert mock_github.list_assignment_events.call_count == call_count_after_first

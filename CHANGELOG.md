@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Poller: filter out issues where the most recent assignment to the operator
+  was performed by someone else (e.g. a teammate or a bot). Foreign
+  assignments are logged as `poll.issue.foreign_assignment` and marked seen
+  so they aren't re-checked. Repos can opt back into the old "any assignment
+  counts" behaviour with `automation.accept_foreign_assignments: true`.
+
 ## [0.1.5] - 2026-04-20
 
 The "ready to be open-sourced" release. Apache-2.0 license, AInvirion

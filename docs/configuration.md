@@ -163,6 +163,7 @@ repos:
       codeql_dismiss: ask
       secret_alerts: never
       deploy_after_merge: auto
+      accept_foreign_assignments: false
     code_review: { ... }      # optional
     deploy:      { ... }      # optional
 ```
@@ -189,6 +190,7 @@ and ask the operator), or `never` (skip).
 | `codeql_dismiss` | `ask` | CodeQL alert dismissal. |
 | `secret_alerts` | `never` | Secret-scan alerts. |
 | `deploy_after_merge` | `auto` | Whether to deploy after a merged PR. |
+| `accept_foreign_assignments` | `false` | When `true`, the poller also picks up issues assigned to you by someone else. Default (`false`) runs the dev pipeline only on issues you self-assigned. |
 
 The current secops and dev pipelines read these settings to bias their prompts
 to Claude — they're not enforced by hard-coded checks.
