@@ -8,6 +8,8 @@ from rich.table import Table
 
 from ctrlrelay import __version__
 from ctrlrelay.core.config import ConfigError, load_config
+from ctrlrelay.core.github import GitHubCLI, GitHubError
+from ctrlrelay.core.pr_verifier import PRVerifier
 
 app = typer.Typer(
     name="ctrlrelay",
@@ -724,6 +726,83 @@ def run_dev(
         if result.error:
             console.print(f"  Error: {result.error}")
         raise typer.Exit(1)
+
+
+# CI subcommand group
+# Exists so the dev pipeline has a correct, exit-code-driven helper to wait
+# on PR checks. Claude used to improvise bash `until gh pr checks` loops that
+# were inverted-semantics and swallowed exit codes (see issue #85), burning
+# the whole session timeout on PRs that had already gone green.
+ci_app = typer.Typer(help="CI helpers.")
+app.add_typer(ci_app, name="ci")
+
+
+@ci_app.command("wait")
+def ci_wait(
+    pr: int = typer.Option(..., "--pr", "-p", help="PR number to wait on"),
+    repo: str = typer.Option(..., "--repo", "-r", help="Repository as owner/name"),
+    timeout: int = typer.Option(
+        600,
+        "--timeout",
+        "-t",
+        help="Hard timeout in seconds before giving up (exit 2).",
+    ),
+    interval: int = typer.Option(
+        15,
+        "--interval",
+        "-i",
+        help="Poll interval in seconds.",
+    ),
+) -> None:
+    """Wait for a PR's CI checks to finish.
+
+    Exit codes:
+      0 — all checks passed (or no CI configured)
+      1 — at least one check failed / cancelled / timed_out
+      2 — hard timeout hit while checks were still pending
+    """
+    import asyncio
+
+    github = GitHubCLI()
+    verifier = PRVerifier(
+        github=github,
+        poll_interval=interval,
+        check_timeout=timeout,
+    )
+
+    try:
+        checks = asyncio.run(
+            verifier.wait_for_checks(repo, pr, timeout=timeout)
+        )
+    except GitHubError as e:
+        console.print(f"[red]gh error:[/red] {e}")
+        raise typer.Exit(1)
+
+    pending = [c for c in checks if c.get("bucket") == "pending"]
+    failing = [
+        c for c in checks
+        if c.get("bucket") not in ("pending", "pass", "skipping")
+    ]
+
+    if failing:
+        names = ", ".join(
+            f"{c.get('name', '?')}={c.get('state') or c.get('bucket')}"
+            for c in failing
+        )
+        console.print(f"[red]CI failing:[/red] {names}")
+        raise typer.Exit(1)
+
+    if pending:
+        names = ", ".join(c.get("name", "?") for c in pending)
+        console.print(
+            f"[yellow]CI still running after {timeout}s:[/yellow] {names}"
+        )
+        raise typer.Exit(2)
+
+    if checks:
+        console.print(f"[green]All {len(checks)} check(s) passed.[/green]")
+    else:
+        console.print("[green]No CI checks configured — treating as pass.[/green]")
 
 
 # Poller subcommand group

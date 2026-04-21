@@ -29,6 +29,7 @@ ctrlrelay [--version] <command> ...
 | `ctrlrelay skills ...` | Skill discovery / audit. |
 | `ctrlrelay bridge ...` | Manage the Telegram bridge daemon. |
 | `ctrlrelay run ...` | Run a pipeline interactively. |
+| `ctrlrelay ci ...` | CI helpers used by the dev pipeline prompt. |
 | `ctrlrelay poller ...` | Manage the issue-poller daemon. |
 
 > **Note:** the `repos`, `export`, `import`, `team-export`, `team-import`,
@@ -160,6 +161,35 @@ Runs the secops pipeline across configured repos (or one repo with `--repo`).
 Each repo's run is serialised by the per-repo lock; the overall sweep runs in
 parallel across repos. Reports per-repo success/failure and exits non-zero if
 any repo failed.
+
+## `ctrlrelay ci`
+
+### `ci wait`
+
+```bash
+ctrlrelay ci wait --pr N --repo OWNER/REPO [--timeout 600] [--interval 15]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--pr` / `-p` | — (required) | PR number to wait on. |
+| `--repo` / `-r` | — (required) | Repository as `owner/name`. |
+| `--timeout` / `-t` | `600` | Hard timeout in seconds. |
+| `--interval` / `-i` | `15` | Seconds between polls. |
+
+Polls `gh pr checks` until every check has left the pending bucket (or the
+hard timeout is hit), then exits with:
+
+- **0** — all checks passed (or the repo has no CI configured)
+- **1** — at least one check failed / cancelled / timed_out
+- **2** — hard timeout while checks were still pending
+
+Exists specifically so the dev pipeline's prompt can point Claude at one
+correct command instead of asking it to improvise a bash `until` / `while`
+loop — every attempt at improvising those has been inverted-semantics or
+pipe-swallowed the exit code (see [issue #85][issue-85]).
+
+[issue-85]: https://github.com/AInvirion/ctrlrelay/issues/85
 
 ## `ctrlrelay poller`
 
