@@ -31,6 +31,22 @@ AGENT_CLAIM_COMMENT = (
 _logger = get_logger("pipeline.dev")
 
 
+def _question_for_persist(session_id: str, result: PipelineResult) -> str:
+    """Return a non-empty question string for pending_resumes storage.
+
+    Mirrors the synthesized prompt the in-process BLOCKED loop uses
+    when ``result.question`` is empty — without this, a BLOCKED exit
+    with no question text would skip persistence and the session
+    would become unresumable via Telegram."""
+    q = (result.question or "").strip()
+    if q:
+        return q
+    return (
+        f"Session {session_id} is blocked but did not include a "
+        "question. Reply with guidance to resume."
+    )
+
+
 @dataclass
 class DevPipeline:
     """Dev pipeline for implementing issues and opening PRs."""
@@ -513,13 +529,13 @@ async def run_dev_issue(
         # during the session) still routes to a resume. The per-minute
         # pending_resume_sweeper drains these rows by calling
         # resume_dev_from_pending below.
-        if result.blocked and result.question:
+        if result.blocked:
             try:
                 state_db.add_pending_resume(
                     session_id=session_id,
                     pipeline="dev",
                     repo=repo,
-                    question=result.question,
+                    question=_question_for_persist(session_id, result),
                 )
             except Exception as e:
                 log_event(
@@ -798,13 +814,13 @@ async def resume_dev_from_pending(
         )
         state_db.commit()
 
-        if result.blocked and result.question:
+        if result.blocked:
             try:
                 state_db.add_pending_resume(
                     session_id=session_id,
                     pipeline="dev",
                     repo=repo,
-                    question=result.question,
+                    question=_question_for_persist(session_id, result),
                 )
             except Exception as e:
                 log_event(

@@ -22,6 +22,23 @@ from ctrlrelay.transports.base import Transport
 _logger = get_logger("pipeline.secops")
 
 
+def _question_for_persist(session_id: str, result: PipelineResult) -> str:
+    """Return a non-empty question string for pending_resumes storage.
+
+    When a BLOCKED result includes no question text (rare — the prompt
+    is supposed to make the agent write one), fall back to a synthesized
+    placeholder so the row is still persisted. Without this, the empty
+    question branch would silently skip the persist and the session
+    would become unresumable via Telegram."""
+    q = (result.question or "").strip()
+    if q:
+        return q
+    return (
+        f"Session {session_id} is blocked but did not include a "
+        "question. Reply with guidance to resume."
+    )
+
+
 @dataclass
 class SecopsPipeline:
     """Security operations pipeline for daily triage."""
@@ -268,13 +285,13 @@ async def run_secops_all(
             # session tears down can still be routed to a resume. Without
             # this, the bridge's in-memory `_pending_questions` dies with
             # the ASK socket and the operator's answer lands in a void.
-            if result.blocked and result.question:
+            if result.blocked:
                 try:
                     state_db.add_pending_resume(
                         session_id=session_id,
                         pipeline="secops",
                         repo=repo,
-                        question=result.question,
+                        question=_question_for_persist(session_id, result),
                     )
                 except Exception as e:
                     log_event(
@@ -505,13 +522,13 @@ async def resume_secops_from_pending(
         # If the resume re-blocked (operator answer was ambiguous, agent
         # needs more), refresh the pending_resumes row so a new reply
         # routes to this same session again.
-        if result.blocked and result.question:
+        if result.blocked:
             try:
                 state_db.add_pending_resume(
                     session_id=session_id,
                     pipeline="secops",
                     repo=repo,
-                    question=result.question,
+                    question=_question_for_persist(session_id, result),
                 )
             except Exception as e:
                 log_event(
