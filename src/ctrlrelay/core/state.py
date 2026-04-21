@@ -56,9 +56,31 @@ CREATE TABLE IF NOT EXISTS automation_decisions (
     context TEXT
 );
 
+-- Sessions that exited BLOCKED_NEEDS_INPUT and can be resumed by an
+-- operator reply arriving AFTER the session has already torn down.
+-- Without this, a Telegram reply to a closed session disappears silently
+-- because the bridge's in-memory _pending_questions entry dies with the
+-- session socket. A scheduled sweeper in the poller picks up rows where
+-- answered_at IS NOT NULL AND resumed_at IS NULL and drives the resume.
+CREATE TABLE IF NOT EXISTS pending_resumes (
+    session_id TEXT PRIMARY KEY,
+    pipeline TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    question TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    answer TEXT,
+    answered_at INTEGER,
+    resumed_at INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_repo ON sessions(repo);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_automation_repo ON automation_decisions(repo);
+CREATE INDEX IF NOT EXISTS idx_pending_resumes_unanswered
+    ON pending_resumes(answered_at) WHERE answered_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_pending_resumes_answered_unresumed
+    ON pending_resumes(answered_at, resumed_at)
+    WHERE answered_at IS NOT NULL AND resumed_at IS NULL;
 """
 
 
@@ -213,3 +235,93 @@ class StateDB:
             return None
         value = row["agent_session_id"]
         return value if value else None
+
+    # Pending resumes (BLOCKED sessions awaiting an operator answer)
+
+    def add_pending_resume(
+        self,
+        session_id: str,
+        pipeline: str,
+        repo: str,
+        question: str,
+    ) -> None:
+        """Record that a session exited BLOCKED_NEEDS_INPUT and can be
+        resumed if an operator reply arrives later. Idempotent: re-inserting
+        the same session_id refreshes ``created_at`` and clears any stale
+        answer so a new BLOCKED on the same session_id starts fresh."""
+        self._conn.execute(
+            """INSERT OR REPLACE INTO pending_resumes
+               (session_id, pipeline, repo, question, created_at,
+                answer, answered_at, resumed_at)
+               VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)""",
+            (session_id, pipeline, repo, question, int(time.time())),
+        )
+        self._conn.commit()
+
+    def get_oldest_unanswered_pending_resume(
+        self,
+        pipeline: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the oldest BLOCKED session still awaiting an operator
+        answer, optionally filtered by pipeline. Used by the bridge to
+        route an orphan Telegram reply when there's no in-memory pending
+        question to match against."""
+        if pipeline is None:
+            row = self._conn.execute(
+                "SELECT * FROM pending_resumes "
+                "WHERE answered_at IS NULL "
+                "ORDER BY created_at ASC LIMIT 1"
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM pending_resumes "
+                "WHERE answered_at IS NULL AND pipeline = ? "
+                "ORDER BY created_at ASC LIMIT 1",
+                (pipeline,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_unanswered_pending_resumes(self) -> list[dict[str, Any]]:
+        """All BLOCKED sessions still awaiting an answer, oldest first.
+        Used by the bridge to disambiguate when multiple repos are blocked
+        at once — FIFO routing would otherwise send the operator's reply
+        about repo B onto repo A."""
+        rows = self._conn.execute(
+            "SELECT * FROM pending_resumes "
+            "WHERE answered_at IS NULL "
+            "ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def answer_pending_resume(self, session_id: str, answer: str) -> bool:
+        """Attach an operator's answer to a pending resume, marking it
+        ready for the sweeper to execute. Returns True if a row was
+        updated, False if the session_id was unknown or already answered."""
+        cursor = self._conn.execute(
+            """UPDATE pending_resumes
+               SET answer = ?, answered_at = ?
+               WHERE session_id = ? AND answered_at IS NULL""",
+            (answer, int(time.time()), session_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def list_pending_resumes_to_execute(self) -> list[dict[str, Any]]:
+        """Rows that have been answered by the operator but not yet
+        resumed. Poller's pending-resume sweeper loads these and drives
+        the pipeline resume. Oldest first so FIFO semantics hold."""
+        rows = self._conn.execute(
+            "SELECT * FROM pending_resumes "
+            "WHERE answered_at IS NOT NULL AND resumed_at IS NULL "
+            "ORDER BY answered_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_pending_resume_resumed(self, session_id: str) -> None:
+        """Mark a pending resume as executed so the sweeper doesn't pick
+        it up again."""
+        self._conn.execute(
+            "UPDATE pending_resumes SET resumed_at = ? WHERE session_id = ?",
+            (int(time.time()), session_id),
+        )
+        self._conn.commit()

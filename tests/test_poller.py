@@ -436,6 +436,59 @@ class TestIssuePoller:
         ]
 
     @pytest.mark.asyncio
+    async def test_poll_marks_issues_disabled_repo_and_skips_next_cycle(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A repo whose Issues feature is disabled returns a GitHubError with
+        the specific `has disabled issues` message. That's a permanent state,
+        not a transient failure, so the poller must mark it and not hit the
+        `gh` API again on subsequent cycles.
+        """
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.poller import IssuePoller
+
+        calls: list[str] = []
+
+        async def per_repo(repo: str, *, assignee: str):  # noqa: ARG001
+            calls.append(repo)
+            if repo == "owner/no-issues":
+                raise GitHubError(
+                    "gh failed: the 'owner/no-issues' repository has "
+                    "disabled issues"
+                )
+            return [{"number": 1, "title": "ok"}]
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("testuser", "testuser")]
+        )
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="testuser",
+            repos=["owner/no-issues", "owner/ok"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        with caplog.at_level("INFO"):
+            await poller.poll()
+            await poller.poll()
+
+        # First cycle hits both repos; second cycle skips the disabled one
+        # entirely so only `owner/ok` is called again — proving we're not
+        # re-hitting the API. Three total calls, not four.
+        assert calls == ["owner/no-issues", "owner/ok", "owner/ok"]
+        assert "owner/no-issues" in poller._issues_disabled_repos
+
+        # Log once at detection, not every cycle.
+        disabled_logs = [
+            r for r in caplog.records
+            if "poll.repo.issues_disabled" in r.getMessage()
+        ]
+        assert len(disabled_logs) == 1
+
+    @pytest.mark.asyncio
     async def test_poll_propagates_cancellation(self, tmp_path: Path) -> None:
         """CancelledError MUST propagate so shutdown signals aren't swallowed."""
         import asyncio as _asyncio

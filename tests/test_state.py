@@ -171,3 +171,68 @@ class TestAgentSessionId:
         assert "agent_session_id" in cols
         assert db.get_agent_session_id("old-session") is None
         db.close()
+
+
+class TestPendingResumes:
+    """pending_resumes stores BLOCKED sessions + operator answers so a
+    Telegram reply arriving after a session has torn down still drives a
+    pipeline resume."""
+
+    def test_add_and_fetch_oldest_unanswered(self, tmp_path: Path) -> None:
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-1", pipeline="secops",
+            repo="owner/r1", question="merge or close?",
+        )
+        db.add_pending_resume(
+            session_id="secops-2", pipeline="secops",
+            repo="owner/r2", question="patch or defer?",
+        )
+        row = db.get_oldest_unanswered_pending_resume()
+        assert row is not None
+        assert row["session_id"] == "secops-1"
+        db.close()
+
+    def test_answered_rows_skipped_by_unanswered_fetch(
+        self, tmp_path: Path
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="s1", pipeline="secops",
+            repo="o/r", question="?",
+        )
+        assert db.answer_pending_resume("s1", "merge #286") is True
+        # Already answered — second attempt is a no-op returning False.
+        assert db.answer_pending_resume("s1", "second try") is False
+        assert db.get_oldest_unanswered_pending_resume() is None
+        db.close()
+
+    def test_list_to_execute_returns_answered_not_resumed(
+        self, tmp_path: Path
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume("s1", "secops", "o/a", "?")
+        db.add_pending_resume("s2", "secops", "o/b", "?")
+        db.answer_pending_resume("s1", "merge it")
+        # s2 never answered → not in the execute list.
+        # s1 answered but not resumed → should appear.
+        rows = db.list_pending_resumes_to_execute()
+        assert [r["session_id"] for r in rows] == ["s1"]
+        db.mark_pending_resume_resumed("s1")
+        assert db.list_pending_resumes_to_execute() == []
+        db.close()
+
+    def test_add_is_idempotent_refreshes_row(self, tmp_path: Path) -> None:
+        """Re-inserting the same session_id (a resume that re-blocks) wipes
+        stale answer state so a new Telegram reply routes cleanly."""
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume("s1", "secops", "o/a", "q1")
+        db.answer_pending_resume("s1", "prior answer")
+        # Re-register as a fresh BLOCKED (e.g., resume re-blocked).
+        db.add_pending_resume("s1", "secops", "o/a", "q2 — need more info")
+        row = db.get_oldest_unanswered_pending_resume()
+        assert row is not None
+        assert row["session_id"] == "s1"
+        assert row["question"] == "q2 — need more info"
+        assert row["answer"] is None
+        db.close()

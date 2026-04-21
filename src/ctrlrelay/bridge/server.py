@@ -9,6 +9,7 @@ import stat
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ctrlrelay.bridge.protocol import (
     BridgeMessage,
@@ -19,6 +20,9 @@ from ctrlrelay.bridge.protocol import (
 )
 from ctrlrelay.bridge.telegram_handler import TelegramHandler
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
+
+if TYPE_CHECKING:
+    from ctrlrelay.core.state import StateDB
 
 _logger = get_logger("bridge.server")
 _log = logging.getLogger(__name__)
@@ -53,10 +57,18 @@ class BridgeServer:
         socket_path: Path,
         bot_token: str,
         chat_id: int,
+        state_db: "StateDB | None" = None,
     ) -> None:
         self.socket_path = socket_path
         self.bot_token = bot_token
         self.chat_id = chat_id
+        # Optional: when provided, orphan Telegram replies (no live
+        # _pending_question to match) are routed to the oldest unanswered
+        # BLOCKED session in state_db's pending_resumes table. The poller's
+        # pending-resume sweeper then picks up the answer and drives the
+        # actual pipeline resume. Without state_db, orphan replies still
+        # get a "didn't land" Telegram notice but nothing gets queued.
+        self.state_db = state_db
         self._server: asyncio.Server | None = None
         self._running = False
         self._telegram: TelegramHandler | None = None
@@ -250,6 +262,55 @@ class BridgeServer:
                     "bridge: incoming telegram msg with no pending question; "
                     "text=%r", text[:80],
                 )
+                # Try to route to a persisted BLOCKED session in state_db
+                # so the operator's reply actually drives a resume. Without
+                # this, the reply disappears the instant the session's ASK
+                # socket closes — which is exactly what happens when a
+                # scheduled secops sweep escalates BLOCKED and exits.
+                outcome = await self._queue_orphan_reply_as_resume_answer(text)
+                if self._telegram is not None:
+                    try:
+                        if outcome["status"] == "queued":
+                            row = outcome["row"]
+                            await self._telegram.send(
+                                "✅ Answer queued for BLOCKED session "
+                                f"`{row['session_id']}` "
+                                f"(pipeline={row['pipeline']}, "
+                                f"repo={row['repo']}).\n"
+                                "The pending-resume sweeper will drive it "
+                                "on the next tick — you'll get another "
+                                "message with the result."
+                            )
+                        elif outcome["status"] == "ambiguous":
+                            pending_list = "\n".join(
+                                f"  • `{r['session_id']}` ({r['repo']}): "
+                                f"{(r['question'] or '')[:80]}"
+                                for r in outcome["rows"]
+                            )
+                            await self._telegram.send(
+                                "⚠️ Your reply wasn't routed — multiple "
+                                "BLOCKED sessions are unanswered and your "
+                                "message didn't include a session_id to "
+                                "disambiguate.\n\n"
+                                "Pending:\n"
+                                f"{pending_list}\n\n"
+                                "Reply again with the session_id included "
+                                "(just paste it anywhere in your message)."
+                            )
+                        else:
+                            await self._telegram.send(
+                                "⚠️ Your reply wasn't routed — no active "
+                                "session is waiting on input and no "
+                                "persisted BLOCKED session is unanswered. "
+                                "To act manually, re-run the pipeline, "
+                                "e.g. `ctrlrelay run secops --repo "
+                                "<owner>/<repo>`."
+                            )
+                    except Exception as e:
+                        _log.warning(
+                            "bridge: failed to notify orphan-reply sender: %s",
+                            e,
+                        )
                 return
             self._pending_questions.pop(match.request_id, None)
 
@@ -283,3 +344,78 @@ class BridgeServer:
                 "bridge: failed to deliver ANSWER request_id=%s err=%s",
                 match.request_id, e,
             )
+
+    async def _queue_orphan_reply_as_resume_answer(
+        self, text: str
+    ) -> dict:
+        """Try to route an orphan Telegram reply to a persisted BLOCKED
+        session so the pending-resume sweeper can pick it up and drive a
+        pipeline resume.
+
+        Returns a dict with ``status`` set to one of:
+        - ``"queued"`` with ``row`` (dict) — answer was attached.
+        - ``"ambiguous"`` with ``rows`` (list[dict]) — multiple BLOCKED
+          sessions exist and the reply didn't name one, so we refuse to
+          guess. The sender is told which session_ids exist so they can
+          retry with one included.
+        - ``"none"`` — no state_db, no unanswered rows, or DB error.
+
+        Disambiguation rule: if the reply text contains exactly one of
+        the unanswered session_ids as a substring, route to that row.
+        Otherwise, with >1 unanswered rows and no substring match,
+        return ambiguous. With exactly one unanswered row and no
+        substring match, route anyway (single-repo case is unambiguous).
+        """
+        if self.state_db is None:
+            return {"status": "none"}
+        try:
+            rows = self.state_db.list_unanswered_pending_resumes()
+        except Exception as e:
+            log_event(
+                _logger,
+                "bridge.pending_resume.list_failed",
+                reason=type(e).__name__,
+                error=str(e)[:200],
+            )
+            return {"status": "none"}
+
+        if not rows:
+            return {"status": "none"}
+
+        matched_by_id = [r for r in rows if r["session_id"] in text]
+        if len(matched_by_id) == 1:
+            target = matched_by_id[0]
+        elif len(matched_by_id) > 1:
+            # Multiple session_ids named in the same reply — refuse to
+            # pick one. Let the operator send a single-session reply.
+            return {"status": "ambiguous", "rows": matched_by_id}
+        elif len(rows) == 1:
+            target = rows[0]
+        else:
+            # Multiple unanswered, no session_id hint — can't route safely.
+            return {"status": "ambiguous", "rows": rows}
+
+        try:
+            if not self.state_db.answer_pending_resume(
+                target["session_id"], text
+            ):
+                return {"status": "none"}
+        except Exception as e:
+            log_event(
+                _logger,
+                "bridge.pending_resume.update_failed",
+                reason=type(e).__name__,
+                error=str(e)[:200],
+            )
+            return {"status": "none"}
+
+        log_event(
+            _logger,
+            "bridge.pending_resume.queued",
+            session_id=target["session_id"],
+            pipeline=target["pipeline"],
+            repo=target["repo"],
+            answer_length=len(text),
+            answer_hash=hash_text(text),
+        )
+        return {"status": "queued", "row": target}

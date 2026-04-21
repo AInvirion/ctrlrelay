@@ -21,6 +21,15 @@ def main() -> None:
         help="Environment variable holding the Telegram bot token",
     )
     parser.add_argument("--chat-id", type=int, required=True, help="Telegram chat ID")
+    parser.add_argument(
+        "--state-db",
+        default=None,
+        help=(
+            "Path to the orchestrator state.db. When provided, orphan "
+            "Telegram replies route to persisted BLOCKED sessions in "
+            "pending_resumes. Required for the resume-via-Telegram flow."
+        ),
+    )
     args = parser.parse_args()
 
     bot_token = os.environ.get(args.bot_token_env)
@@ -31,11 +40,17 @@ def main() -> None:
         )
         sys.exit(2)
 
+    state_db = None
+    if args.state_db:
+        from ctrlrelay.core.state import StateDB
+        state_db = StateDB(Path(args.state_db))
+
     socket_path = Path(args.socket_path)
     server = BridgeServer(
         socket_path=socket_path,
         bot_token=bot_token,
         chat_id=args.chat_id,
+        state_db=state_db,
     )
 
     loop = asyncio.new_event_loop()
@@ -63,6 +78,11 @@ def main() -> None:
         pass
     finally:
         loop.close()
+        if state_db is not None:
+            try:
+                state_db.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
