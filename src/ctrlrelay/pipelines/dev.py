@@ -490,14 +490,21 @@ async def run_dev_issue(
                     issue_number=issue_number,
                 )
             except Exception as e:
-                # Transport failed (bridge down, timeout, etc.) — give up
-                # cleanly and fall through to the normal blocked cleanup.
+                # Transport failed (bridge down, timeout, etc.). The
+                # session IS still blocked — we just couldn't reach the
+                # operator. Preserve blocked=True so the outer
+                # persistence-on-blocked branch fires and writes a
+                # pending_resumes row. Operator replying later via
+                # Telegram then routes through the sweeper. Setting
+                # blocked=False here (the prior behavior) wedged the
+                # session permanently — codex P1.
                 result = PipelineResult(
                     success=False,
-                    blocked=False,
+                    blocked=True,
                     session_id=session_id,
-                    summary=f"Blocked session abandoned: {e}",
+                    summary=f"Blocked session deferred (transport): {e}",
                     error=str(e),
+                    question=question,
                     outputs=result.outputs,
                 )
                 break
@@ -781,12 +788,21 @@ async def resume_dev_from_pending(
                     issue_number=int(issue_number),
                 )
             except Exception as e:
+                # Keep blocked=True so outer persistence branch fires
+                # and the sweeper can pick this up again when the
+                # operator's next Telegram reply arrives. Same
+                # reasoning as run_dev_issue's loop — transport
+                # failure is not the same as a resolved session.
                 result = PipelineResult(
                     success=False,
-                    blocked=False,
+                    blocked=True,
                     session_id=session_id,
-                    summary=f"Blocked session abandoned during resume: {e}",
+                    summary=(
+                        f"Blocked session deferred during resume "
+                        f"(transport): {e}"
+                    ),
                     error=str(e),
+                    question=question,
                     outputs=result.outputs,
                 )
                 break
