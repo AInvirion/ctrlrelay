@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-04-21
+
+Extends the resume-via-Telegram flow shipped in v0.1.8 to cover the
+dev pipeline. Plus three correctness fixes to the persistence layer
+that also protect the secops path — caught by four rounds of codex
+review on the PR.
+
+### Added
+
+- **Resume BLOCKED dev sessions via Telegram reply.** A dev session
+  that exits BLOCKED (max_blocked_rounds exhausted, transport
+  unavailable, or transport failing mid-loop) now writes a
+  `pipeline="dev"` row into `pending_resumes`. The per-minute
+  sweeper drains these via the new `resume_dev_from_pending` helper:
+  looks up the session context from the sessions table, reuses the
+  existing worktree (dev's BLOCKED-keep-both cleanup rule already
+  leaves it alive), and calls `DevPipeline.resume()`. Same live
+  in-process loop so the operator can have back-and-forth on the
+  resume path too.
+- **Sweeper dispatches by pipeline.** `row["pipeline"]` selects
+  `resume_secops_from_pending` or `resume_dev_from_pending`.
+  Unknown pipelines or missing repo config mark the row resumed to
+  avoid hot-loops.
+
+### Fixed
+
+- **`mark_pending_resume_resumed` no-ops on refreshed unanswered
+  rows.** When a resume re-blocks, the pipeline inserts a FRESH
+  `pending_resumes` row (clearing answer/answered_at/resumed_at).
+  The sweeper used to blindly stamp `resumed_at` on that fresh row,
+  so the next operator reply set `answered_at` but left `resumed_at`
+  populated, hiding the row from `list_pending_resumes_to_execute`
+  forever. Now guarded on `answered_at IS NOT NULL`. Affected both
+  secops and dev paths.
+- **Empty-question BLOCKED exits now persist.** The persistence
+  guard `if result.blocked and result.question` skipped rows when
+  the agent BLOCKED without question text. New
+  `_question_for_persist` helper synthesizes the same fallback
+  string the in-process loop uses, so empty-question blocks still
+  land in `pending_resumes`. Affected both secops and dev paths.
+- **Transport failure inside BLOCKED loops preserves blocked=True.**
+  `run_dev_issue` and `resume_dev_from_pending` used to convert a
+  failed `transport.ask()` into `success=False, blocked=False`,
+  skipping the outer persistence branch and wedging multi-turn
+  resume sessions when the bridge flaked. Now keeps `blocked=True`
+  with an error note so persistence fires and the session is
+  resumable when the bridge is back.
+
+### Schema
+
+No schema changes. `pending_resumes` table unchanged from v0.1.8;
+all fixes are in the helper methods and pipeline orchestration.
+
+### Operator notes
+
+- Upgrade via `uv tool install ctrlrelay@latest --force`, restart
+  poller and bridge. The sweeper will start picking up
+  pipeline="dev" rows automatically.
+- Dev resume requires the repo's `dev_branch_template` to be in
+  config (it's the standard field that was already there). If a
+  previously-BLOCKED dev session is for a repo that was removed
+  from config, the sweeper logs a skip and marks resumed — manual
+  CLI resume or re-adding the repo is the recovery path.
+
 ## [0.1.8] - 2026-04-21
 
 The "reply to BLOCKED in Telegram and it actually resumes" release.
