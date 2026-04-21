@@ -57,11 +57,3 @@ your reply resumes the same Claude session.
 Everything runs locally. State lives in a SQLite file. Bridge state lives in
 a Unix socket. The Telegram bot is the only outbound dependency, and it's
 optional — `ctrlrelay` will run without it for local testing.
-
----
-
-## Reference
-
-Original design docs and implementation plans now live under
-[Design & history]({{ '/reference/' | relative_url }}). Useful for context;
-not the right entry point if you just want to use the tool.
