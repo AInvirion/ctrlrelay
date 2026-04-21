@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-04-20
+
+Patch release. Fixes one drift bug in how the package reports its own
+version — the `__version__` string was pinned to a literal in
+`__init__.py` and never got bumped alongside releases, so `ctrlrelay
+version` on an installed 0.1.6 wheel still reported `0.1.4`. No API
+or behavior changes.
+
+### Fixed
+
+- **`__version__` now derives from installed metadata** (`closes
+  #94`). `ctrlrelay.__version__` resolves via
+  `importlib.metadata.version("ctrlrelay")` at import time so it
+  tracks the installed wheel's `pyproject.toml` automatically.
+  Source-checkout pytest runs (where no dist-info exists because
+  `pythonpath = ["src"]` is the only mechanism putting the package on
+  `sys.path`) fall back to parsing the sibling `pyproject.toml` with
+  `tomllib` — so the drift-catcher test
+  (`test_version_matches_pyproject`) still sees a real version
+  instead of a `0.0.0+unknown` placeholder.
+
+### Operator notes
+
+- No migration or restart guidance. Upgrade via `uv tool upgrade
+  ctrlrelay` (or `pip install -U ctrlrelay`) and the next `ctrlrelay
+  version` will report `0.1.7`.
+
 ## [0.1.6] - 2026-04-20
 
 The "pipeline reliability + operator control" release. Closes three
