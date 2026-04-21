@@ -250,6 +250,25 @@ class BridgeServer:
                     "bridge: incoming telegram msg with no pending question; "
                     "text=%r", text[:80],
                 )
+                # Tell the operator that the reply didn't land, so they don't
+                # wait for the phantom-answered session to resume. Without
+                # this the orphan-reply just disappears silently — which we
+                # saw on a BLOCKED secops session that had already exited
+                # before the operator's answer arrived.
+                if self._telegram is not None:
+                    try:
+                        await self._telegram.send(
+                            "⚠️ Your reply wasn't routed — no active session "
+                            "is waiting on input right now. The previous "
+                            "BLOCKED session has already exited. To act on "
+                            "it, re-run the pipeline manually, e.g. "
+                            "`ctrlrelay run secops --repo <owner>/<repo>`."
+                        )
+                    except Exception as e:
+                        _log.warning(
+                            "bridge: failed to notify orphan-reply sender: %s",
+                            e,
+                        )
                 return
             self._pending_questions.pop(match.request_id, None)
 

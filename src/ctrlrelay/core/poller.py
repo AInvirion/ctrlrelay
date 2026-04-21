@@ -31,6 +31,16 @@ _TRANSIENT_POLL_ERRORS = (TimeoutError, GitHubError, OSError)
 _REPO_FAILURE_WARN_THRESHOLD = 3
 
 
+def _is_issues_disabled_error(exc: Exception) -> bool:
+    """Detect the specific GitHubError raised when a repo has its Issues
+    feature disabled. This is a permanent state (not a transient API
+    failure), so callers should skip the repo rather than retry it on every
+    poll cycle."""
+    if not isinstance(exc, GitHubError):
+        return False
+    return "has disabled issues" in str(exc).lower()
+
+
 @dataclass
 class IssuePoller:
     """Polls GitHub repos for newly assigned issues.
@@ -63,6 +73,12 @@ class IssuePoller:
     # seed_current(). Not persisted — intentionally resets on daemon
     # restart so an operator fix is exercised before we re-escalate.
     _repo_failure_counts: dict[str, int] = field(default_factory=dict, repr=False)
+    # Repos with GitHub Issues feature disabled — a permanent state, not a
+    # transient fetch error. Populated on first encounter and kept for the
+    # daemon lifetime so we don't spam WARNING logs every 120s cycle.
+    # Resets on daemon restart so a fresh detection still runs if the repo
+    # re-enables issues in the meantime.
+    _issues_disabled_repos: set[str] = field(default_factory=set, repr=False)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -142,6 +158,24 @@ class IssuePoller:
         """Reset the failure counter after a successful repo lookup."""
         self._repo_failure_counts.pop(repo, None)
 
+    def _mark_issues_disabled(self, repo: str) -> None:
+        """Mark a repo as having GitHub Issues disabled. Logged once at INFO
+        level so the operator can see which repos won't be polled; future
+        cycles skip the `gh` call entirely until daemon restart."""
+        if repo in self._issues_disabled_repos:
+            return
+        self._issues_disabled_repos.add(repo)
+        # Any accumulated transient-failure count is meaningless once we've
+        # identified the error as permanent — clear it so the restart counter
+        # starts fresh if the repo ever re-enables issues.
+        self._repo_failure_counts.pop(repo, None)
+        log_event(
+            _logger,
+            "poll.repo.issues_disabled",
+            repo=repo,
+            action="skipping permanently until daemon restart",
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -167,6 +201,10 @@ class IssuePoller:
         new_issues: list[dict[str, Any]] = []
 
         for repo in self.repos:
+            # Repos with GitHub Issues disabled will never return issues; skip
+            # before the `gh` call so we don't log the same error every cycle.
+            if repo in self._issues_disabled_repos:
+                continue
             try:
                 issues = await self.github.list_assigned_issues(
                     repo, assignee=self.username
@@ -174,6 +212,9 @@ class IssuePoller:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if _is_issues_disabled_error(e):
+                    self._mark_issues_disabled(repo)
+                    continue
                 # Transient-ish (TimeoutError/GitHubError/OSError) goes through
                 # the failure counter so persistent misconfig escalates; any
                 # other unexpected exception is logged as a skip too so the
@@ -371,6 +412,8 @@ class IssuePoller:
         treated as new and picked up — that's safer than crashing first-run.
         """
         for repo in self.repos:
+            if repo in self._issues_disabled_repos:
+                continue
             try:
                 issues = await self.github.list_assigned_issues(
                     repo, assignee=self.username
@@ -378,6 +421,9 @@ class IssuePoller:
             except asyncio.CancelledError:
                 raise
             except _TRANSIENT_POLL_ERRORS as e:
+                if _is_issues_disabled_error(e):
+                    self._mark_issues_disabled(repo)
+                    continue
                 self._record_repo_failure(repo, e, phase="seed")
                 continue
             self._clear_repo_failure(repo)

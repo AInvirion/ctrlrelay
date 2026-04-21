@@ -224,9 +224,16 @@ class TestBridgeServer:
         await asyncio.sleep(0.1)  # let server observe disconnect
 
         # Reply arriving now must be dropped cleanly (no exception raised,
-        # no stale question left behind).
+        # no stale question left behind) AND the operator must be told the
+        # reply didn't land — otherwise the message disappears silently and
+        # the user waits forever for a BLOCKED session to resume.
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
         await server._on_telegram_reply("hello", reply_to_message_id=None)
         assert server._pending_questions == {}
+        server._telegram.send.assert_awaited_once()  # type: ignore[attr-defined]
+        sent_text = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "wasn't routed" in sent_text
+        assert "ctrlrelay run secops" in sent_text
 
         await server.stop()
         task.cancel()
