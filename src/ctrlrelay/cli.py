@@ -904,6 +904,10 @@ def poller_start(
             console.print("[yellow]No repos configured.[/yellow]")
             return
 
+        accept_foreign = {
+            r.name for r in config.repos if r.automation.accept_foreign_assignments
+        }
+
         state_file = config.paths.state_db.parent / "poller_state.json"
 
         first_run = not state_file.exists()
@@ -913,6 +917,7 @@ def poller_start(
             username=username,
             repos=repo_names,
             state_file=state_file,
+            accept_foreign_assignments=accept_foreign,
         )
 
         # NOTE: first-run seeding moved into `_main()` so the APScheduler

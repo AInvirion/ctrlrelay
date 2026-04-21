@@ -147,6 +147,7 @@ class AutomationConfig(BaseModel):
     codeql_dismiss: AutomationPolicy = AutomationPolicy.ASK
     secret_alerts: AutomationPolicy = AutomationPolicy.NEVER
     deploy_after_merge: AutomationPolicy = AutomationPolicy.AUTO
+    accept_foreign_assignments: bool = False
 
 
 class RepoConfig(BaseModel):

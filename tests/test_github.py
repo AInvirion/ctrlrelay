@@ -292,6 +292,51 @@ class TestGitHubCLI:
             assert "55" in args
 
     @pytest.mark.asyncio
+    async def test_list_assignment_events(self) -> None:
+        """Should return only 'assigned' events for an issue."""
+        from ctrlrelay.core.github import GitHubCLI
+
+        mock_output = json.dumps([
+            {
+                "event": "assigned",
+                "actor": {"login": "alice"},
+                "assignee": {"login": "alice"},
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "event": "assigned",
+                "actor": {"login": "bob"},
+                "assignee": {"login": "alice"},
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+        ])
+
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.return_value = mock_output
+            gh = GitHubCLI()
+            events = await gh.list_assignment_events("owner/repo", 42)
+
+            assert len(events) == 2
+            assert events[0]["actor"]["login"] == "alice"
+            assert events[1]["actor"]["login"] == "bob"
+
+            args = mock_run.call_args[0]
+            assert "api" in args
+            assert "/repos/owner/repo/issues/42/events" in args
+
+    @pytest.mark.asyncio
+    async def test_list_assignment_events_empty_output(self) -> None:
+        """Should return [] when there are no assignment events."""
+        from ctrlrelay.core.github import GitHubCLI
+
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.return_value = ""
+            gh = GitHubCLI()
+            events = await gh.list_assignment_events("owner/repo", 42)
+
+            assert events == []
+
+    @pytest.mark.asyncio
     async def test_comment_on_issue(self) -> None:
         """Should post a comment on an issue."""
         from ctrlrelay.core.github import GitHubCLI

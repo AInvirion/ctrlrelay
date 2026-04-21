@@ -37,6 +37,11 @@ class IssuePoller:
 
     Maintains a set of seen issue numbers per repo so that only genuinely new
     issues are surfaced on each call to ``poll()``.
+
+    By default, new issues are filtered to those where the most recent
+    ``assigned`` event naming ``username`` was performed by ``username``
+    themselves — i.e. self-assignment only. Repos listed in
+    ``accept_foreign_assignments`` bypass this check.
     """
 
     github: GitHubCLI
@@ -44,6 +49,7 @@ class IssuePoller:
     repos: list[str]
     state_file: Path
     seen_issues: dict[str, set[int]] = field(default_factory=dict)
+    accept_foreign_assignments: set[str] = field(default_factory=set)
     # Per-repo consecutive-skip counter; populated at runtime by poll() /
     # seed_current(). Not persisted — intentionally resets on daemon
     # restart so an operator fix is exercised before we re-escalate.
@@ -195,14 +201,83 @@ class IssuePoller:
                         error=str(e)[:200],
                     )
                     continue
-                if number not in seen_for_repo:
+
+                if number in seen_for_repo:
+                    continue
+
+                # Mark seen before deciding whether to surface the issue so a
+                # filtered (foreign-assigned) issue isn't re-checked every poll.
+                seen_for_repo.add(number)
+
+                try:
+                    accepted = await self._is_self_assigned(repo, number)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Treat any failure to check assignment events as
+                    # foreign-equivalent: don't run the pipeline, but leave
+                    # the issue marked seen so we don't hammer the events
+                    # endpoint on every poll.
+                    log_event(
+                        _logger,
+                        "poll.issue.assignment_check_failed",
+                        repo=repo,
+                        number=number,
+                        reason=type(e).__name__,
+                        error=str(e)[:200],
+                    )
+                    accepted = False
+
+                if accepted:
                     new_issues.append({"repo": repo, "issue": issue})
-                    seen_for_repo.add(number)
 
         # Never propagate a save_state disk failure out of poll() — the
         # caller has work to do with new_issues. Log and move on.
         self._save_state_best_effort()
         return new_issues
+
+    async def _is_self_assigned(self, repo: str, issue_number: int) -> bool:
+        """Check if the most recent ``assigned`` event naming ``self.username``
+        was performed by ``self.username`` themselves.
+
+        Repos in ``accept_foreign_assignments`` short-circuit to ``True``.
+        Foreign assignments (or an empty event list) emit a
+        ``poll.issue.foreign_assignment`` log record and return ``False``.
+        """
+        if repo in self.accept_foreign_assignments:
+            return True
+
+        events = await self.github.list_assignment_events(repo, issue_number)
+        relevant = [
+            e
+            for e in events
+            if (e.get("assignee") or {}).get("login") == self.username
+        ]
+        if not relevant:
+            log_event(
+                _logger,
+                "poll.issue.foreign_assignment",
+                repo=repo,
+                number=issue_number,
+                assigner_login=None,
+                reason="no_self_assignment_event",
+            )
+            return False
+
+        # Events endpoint returns chronological order; the last one wins.
+        latest = relevant[-1]
+        assigner_login = (latest.get("actor") or {}).get("login")
+        if assigner_login == self.username:
+            return True
+
+        log_event(
+            _logger,
+            "poll.issue.foreign_assignment",
+            repo=repo,
+            number=issue_number,
+            assigner_login=assigner_login,
+        )
+        return False
 
     def mark_seen(self, repo: str, issue_number: int) -> None:
         """Mark an issue as seen without triggering a poll.
