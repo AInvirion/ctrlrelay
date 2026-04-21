@@ -592,6 +592,14 @@ def run_secops(
     for result in results:
         status = "[green]OK[/green]" if result.success else "[red]FAIL[/red]"
         console.print(f"  {status} {result.summary}")
+        # Surface the blocking question / error text so an operator
+        # running secops at the CLI doesn't have to dig into state.db
+        # to see what the agent was asking. The scheduler closure
+        # already relays these via Telegram; this is the manual path.
+        if result.blocked and result.question:
+            console.print(f"    [yellow]Question:[/yellow] {result.question}")
+        elif not result.success and result.error:
+            console.print(f"    [red]Error:[/red] {result.error}")
 
     if not all(r.success for r in results):
         raise typer.Exit(1)
