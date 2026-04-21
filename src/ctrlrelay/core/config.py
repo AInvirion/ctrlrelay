@@ -42,12 +42,29 @@ class PathsConfig(BaseModel):
         return v
 
 
-class ClaudeConfig(BaseModel):
-    """Claude CLI configuration."""
+class AgentConfig(BaseModel):
+    """Headless coding-agent configuration.
 
+    ``type`` selects which adapter the dispatcher uses to talk to the
+    agent CLI. Today only ``claude`` is implemented; the field exists
+    so future adapters (e.g. ``codex``, ``opencode``, ``hermes``) can
+    be plugged in without a config schema change. The other fields
+    (``binary``, ``default_timeout_seconds``, ``output_format``) are
+    common across most CLI-driven agents; adapters that need agent-
+    specific knobs can add a nested sub-model later.
+    """
+
+    type: str = "claude"
     binary: str = "claude"
     default_timeout_seconds: int = 1800
     output_format: str = "json"
+
+
+# Backwards-compat alias. Older code and docs reference ``ClaudeConfig``;
+# keep the name importable but have it resolve to the renamed class so
+# `isinstance(cfg, ClaudeConfig)` and `ClaudeConfig(...)` still work.
+# Scheduled for removal once downstream repos migrate.
+ClaudeConfig = AgentConfig
 
 
 class TelegramConfig(BaseModel):
@@ -186,11 +203,40 @@ class Config(BaseModel):
     node_id: str
     timezone: str = "UTC"
     paths: PathsConfig
-    claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     transport: TransportConfig
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
     repos: list[RepoConfig] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_claude_to_agent(cls, data: Any) -> Any:
+        """Accept the legacy ``claude:`` top-level key as an alias for
+        ``agent:``. Emits a ``DeprecationWarning`` so operators see the
+        migration hint in logs. Removed in a future release.
+
+        If both keys are present, ``agent`` wins and ``claude`` is
+        ignored (fail-loud would break supervised daemons; we prefer
+        silent win-on-new-name during the migration window)."""
+        if isinstance(data, dict) and "claude" in data and "agent" not in data:
+            import warnings
+            warnings.warn(
+                "config key 'claude:' is deprecated; rename to 'agent:'. "
+                "See https://github.com/AInvirion/ctrlrelay/blob/main/"
+                "CHANGELOG.md for the migration.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            data["agent"] = data.pop("claude")
+        return data
+
+    @property
+    def claude(self) -> AgentConfig:
+        """Legacy attribute alias so callers still writing
+        ``config.claude.binary`` keep working. New code should prefer
+        ``config.agent.*``."""
+        return self.agent
 
     @field_validator("timezone")
     @classmethod

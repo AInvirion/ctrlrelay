@@ -12,7 +12,12 @@ paths:
   contexts: "~/.ctrlrelay/contexts"
   skills: "~/.ctrlrelay/claude-config/skills"
 
-claude:
+# Headless coding agent. `type` selects the adapter (currently only
+# "claude" is implemented; other backends — codex, opencode, hermes,
+# kiro — are planned). Legacy `claude:` key is still accepted as an
+# alias for backwards compatibility but is deprecated.
+agent:
+  type: "claude"
   binary: "claude"
   default_timeout_seconds: 1800
   output_format: "json"

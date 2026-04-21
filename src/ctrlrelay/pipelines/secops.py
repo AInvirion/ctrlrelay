@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ctrlrelay.core.checkpoint import CheckpointStatus
-from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.state import StateDB
@@ -26,7 +26,7 @@ _logger = get_logger("pipeline.secops")
 class SecopsPipeline:
     """Security operations pipeline for daily triage."""
 
-    dispatcher: ClaudeDispatcher
+    dispatcher: AgentAdapter
     github: GitHubCLI
     worktree: WorktreeManager
     dashboard: DashboardClient | None
@@ -167,7 +167,7 @@ printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
 
 async def run_secops_all(
     repos: list[Any],
-    dispatcher: ClaudeDispatcher,
+    dispatcher: AgentAdapter,
     github: GitHubCLI,
     worktree: WorktreeManager,
     dashboard: DashboardClient | None,

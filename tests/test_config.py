@@ -78,6 +78,92 @@ class TestSchedulesConfig:
             load_config(cfg_path)
 
 
+class TestAgentConfig:
+    """The `agent:` section replaces the legacy `claude:` section.
+    Schema must accept the new key, keep the old one as a deprecated
+    alias, and still expose `config.claude` as a property so existing
+    callers keep working."""
+
+    def test_agent_section_is_accepted(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        import yaml
+
+        sample_config_dict.pop("claude", None)
+        sample_config_dict["agent"] = {
+            "type": "claude",
+            "binary": "/opt/homebrew/bin/claude",
+            "default_timeout_seconds": 600,
+        }
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        config = load_config(cfg_path)
+        assert config.agent.type == "claude"
+        assert str(config.agent.binary) == "/opt/homebrew/bin/claude"
+        assert config.agent.default_timeout_seconds == 600
+
+    def test_legacy_claude_key_is_aliased_to_agent(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """The YAML `claude:` key is migrated to `agent:` at load time
+        with a DeprecationWarning, so pre-migration configs keep
+        working until the operator renames."""
+        import warnings
+
+        import yaml
+
+        sample_config_dict["claude"] = {
+            "binary": "/usr/local/bin/claude",
+            "default_timeout_seconds": 900,
+        }
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            config = load_config(cfg_path)
+
+        assert config.agent.binary == "/usr/local/bin/claude"
+        assert config.agent.default_timeout_seconds == 900
+        # DeprecationWarning must fire so the operator sees the hint.
+        msgs = [str(w.message) for w in captured if issubclass(w.category, DeprecationWarning)]
+        assert any("'claude:' is deprecated" in m for m in msgs), msgs
+
+    def test_claude_property_mirrors_agent(
+        self, sample_config_file: Path
+    ) -> None:
+        """`config.claude` must still work at the Python attribute
+        level — existing callers that haven't migrated stay green."""
+        config = load_config(sample_config_file)
+        assert config.claude is config.agent
+
+
+class TestMakeAgentDispatcher:
+    """The factory is the seam where future agent backends plug in.
+    Today only `claude` is wired up; other types must fail loudly so
+    a config typo doesn't silently fall back to Claude."""
+
+    def test_claude_type_returns_claude_dispatcher(self) -> None:
+        from ctrlrelay.core.config import AgentConfig
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher, make_agent_dispatcher
+
+        cfg = AgentConfig(type="claude", binary="claude", default_timeout_seconds=60)
+        adapter = make_agent_dispatcher(cfg)
+        assert isinstance(adapter, ClaudeDispatcher)
+        assert adapter.default_timeout == 60
+
+    def test_unknown_type_raises_not_implemented_with_hint(self) -> None:
+        from ctrlrelay.core.config import AgentConfig
+        from ctrlrelay.core.dispatcher import make_agent_dispatcher
+
+        cfg = AgentConfig(type="codex")
+        with pytest.raises(NotImplementedError) as excinfo:
+            make_agent_dispatcher(cfg)
+        msg = str(excinfo.value).lower()
+        assert "codex" in msg
+        assert "agentadapter" in msg or "adapter" in msg
+
+
 class TestTimezoneValidation:
     """Regression for codex [P2]: invalid IANA zones must fail at load,
     not at poller startup. Since the scheduler feeds timezone directly
