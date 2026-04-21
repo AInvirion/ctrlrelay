@@ -1,6 +1,6 @@
 [project]
 name = "ctrlrelay"
-version = "0.1.5"
+version = "0.1.6"
 description = "Local-first orchestrator for headless coding agents across multiple GitHub repos"
 readme = "README.md"
 requires-python = ">=3.12"

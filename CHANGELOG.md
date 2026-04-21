@@ -7,33 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-04-20
+
+The "pipeline reliability + operator control" release. Closes three
+failure modes that made the dev pipeline silently misreport its own
+work, plus two new filters that let the operator say which issues the
+agent should actually touch. Net effect: when a session ships a PR,
+the success ping is real; when it blocks or fails, the question
+reaches you; and the agent stops spontaneously opening PRs on issues
+you meant for yourself.
+
 ### Added
 
-- Poller: filter out issues where the most recent assignment to the operator
-  was performed by someone else (e.g. a teammate or a bot). Foreign
-  assignments are logged as `poll.issue.foreign_assignment` and marked seen
-  so they aren't re-checked. Repos can opt back into the old "any assignment
-  counts" behaviour with `automation.accept_foreign_assignments: true`.
-- **Poller exclude-label filter** (`repos[].automation.exclude_labels`): issues
-  carrying any configured label are marked seen, logged as
-  `poll.issue.excluded_by_label`, and skipped by the dev pipeline — lets the
-  operator mark issues as "manual / operator / instruction" without the agent
-  opening off-topic PRs for them. Defaults to `["manual", "operator",
-  "instruction"]`; set to `[]` to disable. Closes #91.
+- **Poller: self-assignment filter** (`closes #79`). Foreign
+  assignments (teammate, bot, or auto-CODEOWNERS) are logged as
+  `poll.issue.foreign_assignment`, marked seen so they don't
+  re-trigger, and **not** handed to the dev pipeline. Old behaviour
+  is opt-in per repo via `automation.accept_foreign_assignments:
+  true`.
+- **Poller: exclude-label filter** (`closes #91`). New
+  `repos[].automation.exclude_labels` list of label names; any issue
+  carrying a match is logged as `poll.issue.excluded_by_label` and
+  skipped. Default value `["manual", "operator", "instruction"]`
+  covers the common "this is a task for me, not the agent" case out
+  of the box — set to `[]` to disable.
+- **`ctrlrelay ci wait --pr <N>`** (`closes #85`). First-class CLI
+  helper that polls a PR's GitHub Actions checks and exits 0 on
+  all-pass, 1 on any fail, 2 on timeout. The dev-pipeline prompt now
+  tells the agent to use this instead of improvising `until gh pr
+  checks` bash loops — which it had been getting wrong, burning the
+  full 30-minute session timeout and surfacing misleading "❌
+  Failed" Telegram notifications for PRs that had actually shipped.
 
 ### Fixed
 
-- **Dispatcher: `--resume` now uses Claude's session UUID, not our composite
-  id** (#83). Newer `claude` CLI versions (v2.0.x+) validate that `--resume
-  <id>` is either a real UUID or a known session title, so passing our
-  `dev-<owner>-<repo>-<issue>-<hex>` composite id hard-failed on every
-  resume — blocked-question answers and post-DONE fix rounds both surfaced
-  as misleading "❌ Failed" notifications. `ClaudeDispatcher` now parses
-  `session_id` out of Claude's JSON stdout, exposes it as
+- **Dispatcher: `--resume` now uses Claude's session UUID, not our
+  composite id** (`closes #83`). Newer `claude` CLI (v2.0.x+)
+  validates that `--resume <id>` is a real UUID or a known session
+  title; our `dev-<owner>-<repo>-<issue>-<hex>` composite id
+  hard-failed every resume. `ClaudeDispatcher` now parses
+  `session_id` from Claude's JSON stdout, exposes it as
   `SessionResult.agent_session_id`, and persists it in a new
-  `sessions.agent_session_id` column so subsequent resumes feed the real
-  UUID. If state_db has no UUID (session predates the fix, or stdout
-  wasn't JSON), pipelines fall back to a fresh spawn rather than failing.
+  `sessions.agent_session_id` column. Sessions predating the fix
+  fall back to a fresh spawn rather than hard-erroring.
+
+### Changed
+
+- **Docs (`SECURITY.md`)**: vulnerability reports now go to
+  `security@ainvirion.com` instead of the personal Gmail that
+  shipped in v0.1.5. Rotate any prior-release reference.
+- **Docs site cleanup** (`closes #81`): retired the stale
+  `docs/reference/` tree (original spec, Phase-by-phase plan docs,
+  Claude-Code project guide) that drifted from what v0.1.5 actually
+  ships and was actively misleading to new readers (and to LLMs
+  writing PRs against this repo). Operator-facing docs (getting
+  started, configuration, bridge, cli, operations, architecture,
+  development) are unchanged.
+
+### Schema migration
+
+State DB sessions table gains a nullable `agent_session_id TEXT`
+column. Runs automatically on daemon start; existing rows backfill
+to NULL and participate in the fresh-spawn fallback above.
+
+### Operator notes
+
+- Default `exclude_labels` means the poller will now **skip** issues
+  you tag with `manual`, `operator`, or `instruction` even though
+  they're still assigned to you. If that's unexpected, either
+  override the list or drop the label.
+- The new `self-assignment filter` will skip issues that a teammate
+  assigns to you. If a team workflow relies on teammate-assignment,
+  flip `automation.accept_foreign_assignments: true` on that repo.
 
 ## [0.1.5] - 2026-04-20
 
