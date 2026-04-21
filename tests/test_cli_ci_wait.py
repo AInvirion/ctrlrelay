@@ -6,11 +6,22 @@ codes — see issue #85). This command replaces that improvisation with a
 first-class helper that has sane exit codes and a hard timeout.
 """
 
+import re
 from unittest.mock import AsyncMock, patch
 
 from typer.testing import CliRunner
 
 runner = CliRunner()
+
+# Typer-with-Rich colorises `--help` on some hosts (CI runners in particular),
+# which splits literal substrings like `--pr` across escape codes. Strip codes
+# before substring assertions so the tests work identically on a plain-TTY
+# dev laptop and the GitHub Actions runner.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(output: str) -> str:
+    return _ANSI.sub("", output)
 
 
 class TestCIWaitCommand:
@@ -21,9 +32,10 @@ class TestCIWaitCommand:
         result = runner.invoke(app, ["ci", "wait", "--help"])
 
         assert result.exit_code == 0
-        assert "--pr" in result.output
-        assert "--repo" in result.output
-        assert "--timeout" in result.output
+        out = _plain(result.output)
+        assert "--pr" in out
+        assert "--repo" in out
+        assert "--timeout" in out
 
     def test_ci_wait_requires_pr_and_repo(self) -> None:
         """Both --pr and --repo are required."""
@@ -86,7 +98,7 @@ class TestCIWaitCommand:
             )
 
         assert result.exit_code == 1, result.output
-        assert "lint" in result.output
+        assert "lint" in _plain(result.output)
 
     def test_ci_wait_exits_2_when_timeout_with_pending(self) -> None:
         """Hard timeout while checks are still pending → exit 2 (distinct from fail)."""
