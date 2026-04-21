@@ -10,6 +10,7 @@ so pipelines can stay agent-agnostic.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 from dataclasses import dataclass, field
@@ -39,13 +40,22 @@ def _find_claude() -> str:
 
 @dataclass
 class SessionResult:
-    """Result of a Claude session."""
+    """Result of a Claude session.
+
+    - ``session_id`` is the orchestrator's composite id (``dev-<owner>-<repo>-
+      <issue>-<hex>``) used as the primary key in state_db.
+    - ``agent_session_id`` is Claude's own session UUID, parsed from the JSON
+      stdout. It's the value that must be passed to ``claude --resume`` on
+      subsequent calls; newer CLI versions reject non-UUID strings.
+      ``None`` when stdout wasn't parseable JSON or didn't include the field.
+    """
 
     session_id: str
     exit_code: int
     state: CheckpointState | None
     stdout: str = ""
     stderr: str = ""
+    agent_session_id: str | None = None
 
     @property
     def success(self) -> bool:
@@ -146,13 +156,37 @@ class ClaudeDispatcher:
             except Exception:
                 pass
 
+        stdout_text = stdout.decode()
+        agent_session_id = _extract_agent_session_id(stdout_text)
+
         return SessionResult(
             session_id=session_id,
             exit_code=proc.returncode or 0,
             state=state,
-            stdout=stdout.decode(),
+            stdout=stdout_text,
             stderr=stderr.decode(),
+            agent_session_id=agent_session_id,
         )
+
+
+def _extract_agent_session_id(stdout_text: str) -> str | None:
+    """Pull Claude's session UUID out of ``claude -p --output-format json``.
+
+    Claude emits a single JSON object on stdout whose ``session_id`` field is
+    the UUID required by ``--resume``. If the output is empty or not JSON
+    (errors, interrupted runs) we return ``None`` and let the caller decide
+    how to fall back.
+    """
+    if not stdout_text.strip():
+        return None
+    try:
+        payload = json.loads(stdout_text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("session_id")
+    return value if isinstance(value, str) and value else None
 
 
 class AgentAdapter(Protocol):

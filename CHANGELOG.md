@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so they aren't re-checked. Repos can opt back into the old "any assignment
   counts" behaviour with `automation.accept_foreign_assignments: true`.
 
+### Fixed
+
+- **Dispatcher: `--resume` now uses Claude's session UUID, not our composite
+  id** (#83). Newer `claude` CLI versions (v2.0.x+) validate that `--resume
+  <id>` is either a real UUID or a known session title, so passing our
+  `dev-<owner>-<repo>-<issue>-<hex>` composite id hard-failed on every
+  resume — blocked-question answers and post-DONE fix rounds both surfaced
+  as misleading "❌ Failed" notifications. `ClaudeDispatcher` now parses
+  `session_id` out of Claude's JSON stdout, exposes it as
+  `SessionResult.agent_session_id`, and persists it in a new
+  `sessions.agent_session_id` column so subsequent resumes feed the real
+  UUID. If state_db has no UUID (session predates the fix, or stdout
+  wasn't JSON), pipelines fall back to a fresh spawn rather than failing.
+
 ## [0.1.5] - 2026-04-20
 
 The "ready to be open-sourced" release. Apache-2.0 license, AInvirion

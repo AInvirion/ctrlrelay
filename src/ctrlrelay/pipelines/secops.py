@@ -43,18 +43,17 @@ class SecopsPipeline:
             state_file=ctx.state_file,
         )
 
-        result = await self.dispatcher.spawn_session(
-            session_id=ctx.session_id,
-            prompt=prompt,
-            working_dir=ctx.worktree_path,
-            state_file=ctx.state_file,
-        )
-
+        result = await self._spawn(ctx, prompt, resume=False)
         return self._session_to_result(result)
 
     async def resume(self, ctx: PipelineContext, answer: str) -> PipelineResult:
         """Resume blocked secops with user answer."""
         prompt = f"User answered: {answer}\n\nContinue from where you left off."
+
+        # Resume uses Claude's own session UUID (captured on the first spawn
+        # and persisted to state_db). Our composite id is not a UUID and will
+        # be rejected by `claude --resume` on v2.0.x+.
+        resume_uuid = self.state_db.get_agent_session_id(ctx.session_id)
 
         log_event(
             _logger,
@@ -63,20 +62,44 @@ class SecopsPipeline:
             repo=ctx.repo,
             issue_number=ctx.issue_number,
             pipeline=self.name,
-            resume_session_id=ctx.session_id,
+            resume_session_id=resume_uuid,
             answer_length=len(answer),
             answer_hash=hash_text(answer),
         )
+
+        result = await self._spawn(ctx, prompt, resume=True)
+        return self._session_to_result(result)
+
+    async def _spawn(
+        self,
+        ctx: PipelineContext,
+        prompt: str,
+        *,
+        resume: bool,
+    ) -> SessionResult:
+        """Centralized dispatcher call: looks up the agent UUID on resume,
+        persists any newly-captured UUID to state_db."""
+        resume_uuid: str | None = None
+        if resume:
+            resume_uuid = self.state_db.get_agent_session_id(ctx.session_id)
 
         result = await self.dispatcher.spawn_session(
             session_id=ctx.session_id,
             prompt=prompt,
             working_dir=ctx.worktree_path,
             state_file=ctx.state_file,
-            resume_session_id=ctx.session_id,
+            resume_session_id=resume_uuid,
         )
 
-        return self._session_to_result(result)
+        if result.agent_session_id:
+            try:
+                self.state_db.set_agent_session_id(
+                    ctx.session_id, result.agent_session_id
+                )
+            except Exception:
+                pass
+
+        return result
 
     def _build_prompt(
         self,

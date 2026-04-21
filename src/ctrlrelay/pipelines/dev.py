@@ -52,18 +52,17 @@ class DevPipeline:
             state_file=ctx.state_file,
         )
 
-        result = await self.dispatcher.spawn_session(
-            session_id=ctx.session_id,
-            prompt=prompt,
-            working_dir=ctx.worktree_path,
-            state_file=ctx.state_file,
-        )
-
+        result = await self._spawn(ctx, prompt, resume=False)
         return self._session_to_result(result)
 
     async def resume(self, ctx: PipelineContext, answer: str) -> PipelineResult:
         """Resume blocked dev session with user answer."""
         prompt = f"User answered: {answer}\n\nContinue from where you left off."
+
+        # Resume uses Claude's own session UUID (captured on the first spawn
+        # and persisted to state_db). Passing our composite id here makes
+        # `claude --resume` reject the call on v2.0.x+ CLI builds.
+        resume_uuid = self.state_db.get_agent_session_id(ctx.session_id)
 
         log_event(
             _logger,
@@ -72,33 +71,55 @@ class DevPipeline:
             repo=ctx.repo,
             issue_number=ctx.issue_number,
             pipeline=self.name,
-            resume_session_id=ctx.session_id,
+            resume_session_id=resume_uuid,
             answer_length=len(answer),
             answer_hash=hash_text(answer),
         )
 
-        result = await self.dispatcher.spawn_session(
-            session_id=ctx.session_id,
-            prompt=prompt,
-            working_dir=ctx.worktree_path,
-            state_file=ctx.state_file,
-            resume_session_id=ctx.session_id,
-        )
-
+        result = await self._spawn(ctx, prompt, resume=True)
         return self._session_to_result(result)
 
     async def request_fix(
         self, ctx: PipelineContext, fix_instructions: str
     ) -> PipelineResult:
         """Resume the session with a fix request (failing CI or merge conflict)."""
+        result = await self._spawn(ctx, fix_instructions, resume=True)
+        return self._session_to_result(result)
+
+    async def _spawn(
+        self,
+        ctx: PipelineContext,
+        prompt: str,
+        *,
+        resume: bool,
+    ) -> SessionResult:
+        """Centralized dispatcher call: looks up the agent UUID on resume,
+        persists any newly-captured UUID to state_db."""
+        resume_uuid: str | None = None
+        if resume:
+            # If state_db has no stored UUID (session predates the capture, or
+            # first spawn didn't emit JSON) we fall back to a fresh session —
+            # better than hard-failing with `claude --resume <composite-id>`.
+            resume_uuid = self.state_db.get_agent_session_id(ctx.session_id)
+
         result = await self.dispatcher.spawn_session(
             session_id=ctx.session_id,
-            prompt=fix_instructions,
+            prompt=prompt,
             working_dir=ctx.worktree_path,
             state_file=ctx.state_file,
-            resume_session_id=ctx.session_id,
+            resume_session_id=resume_uuid,
         )
-        return self._session_to_result(result)
+
+        if result.agent_session_id:
+            try:
+                self.state_db.set_agent_session_id(
+                    ctx.session_id, result.agent_session_id
+                )
+            except Exception:
+                # state_db write failures must not mask the session result.
+                pass
+
+        return result
 
     def _build_prompt(
         self,

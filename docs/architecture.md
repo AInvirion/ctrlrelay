@@ -70,14 +70,19 @@ is the only place ctrlrelay calls out to Claude Code.
 - **Environment additions:** `CTRLRELAY_SESSION_ID` and `CTRLRELAY_STATE_FILE`
   are the only contract between dispatcher and child. Anything else the agent
   needs (issue body, PR rules, etc.) goes into the prompt.
-- **Result:** `SessionResult(session_id, exit_code, state, stdout, stderr)`.
-  `state` is the parsed `CheckpointState` if a state file was written, else
-  `None`. The wrapper exposes `.success`, `.blocked`, `.failed` properties for
-  pattern-matching pipelines.
-- **Resume:** `resume_session_id` translates to `--resume <id>`, which has
-  Claude rejoin the same conversation history. ctrlrelay sets the resume id to
-  the same session id it spawned with, so a single dev-pipeline session can
-  span many `BLOCKED → answer → resume` round-trips.
+- **Result:** `SessionResult(session_id, exit_code, state, stdout, stderr,
+  agent_session_id)`. `session_id` is our composite orchestrator id;
+  `agent_session_id` is Claude's own UUID, parsed from the JSON stdout and
+  the value `--resume` actually expects. `state` is the parsed
+  `CheckpointState` if a state file was written, else `None`. The wrapper
+  exposes `.success`, `.blocked`, `.failed` properties for pattern-matching
+  pipelines.
+- **Resume:** `resume_session_id` translates to `--resume <id>`. Pipelines
+  look up Claude's UUID (persisted as `sessions.agent_session_id` by the
+  prior spawn) and pass it through — newer `claude` CLI builds reject
+  non-UUID values. If state_db has no UUID (session predates capture or
+  stdout wasn't JSON), the spawn falls back to a fresh session rather than
+  hard-failing.
 
 The dispatcher does NOT proxy or wrap the Claude session — it shells out the
 same way you'd shell out to `gh` or `git`. This is deliberate.
@@ -90,15 +95,16 @@ SQLite, single file at `paths.state_db`.
 
 | Table | Columns | Notes |
 |---|---|---|
-| `sessions` | `id`, `pipeline`, `repo`, `issue_number`, `worktree_path`, `status`, `blocked_question`, `started_at`, `ended_at`, `claude_exit_code`, `summary` | Indexed on `repo` and `status`. One row per pipeline run. |
+| `sessions` | `id`, `pipeline`, `repo`, `issue_number`, `worktree_path`, `status`, `blocked_question`, `started_at`, `ended_at`, `claude_exit_code`, `summary`, `agent_session_id` | Indexed on `repo` and `status`. One row per pipeline run. `agent_session_id` stores Claude's own UUID for `--resume`. |
 | `repo_locks` | `repo` (PK), `session_id`, `acquired_at` | Acquired with `acquire_lock`, released in the pipeline's `finally`. |
 | `github_cursor` | `repo`, `last_checked_at`, `last_seen_issue_update` | Bounds GitHub API calls in the poller. |
 | `telegram_pending` | `request_id`, `session_id`, `question`, `asked_at`, `answered_at`, `answer` | Outstanding bridge questions. |
 | `automation_decisions` | `id`, `repo`, `operation`, `policy`, `item_id`, `decision`, `decided_by`, `decided_at`, `context` | Audit trail for `ask`-policy decisions. |
 
 Methods on `StateDB`: `acquire_lock`, `release_lock`, `get_lock_holder`,
-`list_locks`, plus raw `execute` / `commit`. The pipeline code uses raw SQL
-for the `sessions` table on purpose — kept thin and grep-able.
+`list_locks`, `set_agent_session_id`, `get_agent_session_id`, plus raw
+`execute` / `commit`. The pipeline code uses raw SQL for the `sessions`
+table on purpose — kept thin and grep-able.
 
 ## Worktree lifecycle
 

@@ -86,3 +86,88 @@ class TestRepoLocks:
         holder = db.get_lock_holder("owner/repo")
         assert holder is None
         db.close()
+
+
+class TestAgentSessionId:
+    """The sessions table persists the agent (Claude) session UUID separately
+    from our composite orchestrator id, so resumes can feed the real UUID to
+    `claude --resume`."""
+
+    def test_sessions_table_has_agent_session_id_column(self, tmp_path: Path) -> None:
+        db = StateDB(tmp_path / "state.db")
+        cols = {
+            row[1]
+            for row in db.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        assert "agent_session_id" in cols
+        db.close()
+
+    def test_set_and_get_agent_session_id_roundtrip(self, tmp_path: Path) -> None:
+        import time as _time
+
+        db = StateDB(tmp_path / "state.db")
+        session_id = "dev-owner-repo-1-deadbeef"
+        agent_uuid = "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
+
+        db.execute(
+            """INSERT INTO sessions
+               (id, pipeline, repo, status, started_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (session_id, "dev", "owner/repo", "running", int(_time.time())),
+        )
+        db.commit()
+
+        assert db.get_agent_session_id(session_id) is None
+
+        db.set_agent_session_id(session_id, agent_uuid)
+        assert db.get_agent_session_id(session_id) == agent_uuid
+
+        db.close()
+
+    def test_get_agent_session_id_returns_none_for_missing_session(
+        self, tmp_path: Path
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        assert db.get_agent_session_id("nope") is None
+        db.close()
+
+    def test_agent_session_id_migrates_onto_existing_db(self, tmp_path: Path) -> None:
+        """Opening a pre-existing database written by an older version should
+        transparently add the `agent_session_id` column (backfilled to NULL)."""
+        import sqlite3
+
+        db_path = tmp_path / "state.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                pipeline TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                issue_number INTEGER,
+                worktree_path TEXT,
+                status TEXT NOT NULL,
+                blocked_question TEXT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                claude_exit_code INTEGER,
+                summary TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("old-session", "dev", "owner/repo", "done", 1),
+        )
+        conn.commit()
+        conn.close()
+
+        db = StateDB(db_path)
+        cols = {
+            row[1]
+            for row in db.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        assert "agent_session_id" in cols
+        assert db.get_agent_session_id("old-session") is None
+        db.close()
