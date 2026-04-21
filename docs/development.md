@@ -56,6 +56,29 @@ The Telegram bridge tests stub the network — no real bot token is required to
 run the suite. Tests that exercise the dev / secops pipelines use the
 `file_mock` transport so they stay hermetic.
 
+## End-to-end install check
+
+Before cutting a release (or any time you want to confirm a fresh build
+actually installs and runs), use the helper script in `scripts/`. It
+builds the sdist + wheel from the current tree, installs the wheel into
+a throw-away venv, and exercises the installed `ctrlrelay` binary
+(`version`, `--help`, `config validate`):
+
+```bash
+# Build, install into a temp venv, smoke-test the CLI:
+scripts/e2e_install_check.sh
+
+# Or, if you already have a built wheel, point the script at it:
+WHEEL=dist/ctrlrelay-0.1.5-py3-none-any.whl scripts/e2e_install_check.sh
+
+# Run the same check via pytest (gated, so the default suite stays fast):
+CTRLRELAY_E2E=1 pytest tests/test_e2e_install.py
+```
+
+The CI `build.yml` workflow runs the same check (`e2e-install` job)
+against the wheel produced by the build job, so a green PR guarantees
+the published artifact is installable.
+
 ## Linting
 
 ```bash
@@ -118,7 +141,7 @@ ctrlrelay/
 ├── tests/                       # pytest suites (one file per module)
 ├── config/                      # Example orchestrator.yaml
 ├── docs/                        # This Jekyll site
-├── scripts/                     # Shell helpers (./sync wrapper, manifest)
+├── scripts/                     # Shell helpers (e2e install check, ...)
 ├── claude-config/               # Git-tracked Claude Code config (export/import)
 ├── codex-config/                # Git-tracked Codex CLI config
 └── mcp-servers/                 # MCP servers (codex-reviewer, ...)

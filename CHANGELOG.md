@@ -14,6 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assignments are logged as `poll.issue.foreign_assignment` and marked seen
   so they aren't re-checked. Repos can opt back into the old "any assignment
   counts" behaviour with `automation.accept_foreign_assignments: true`.
+- End-to-end install check (#87). New `scripts/e2e_install_check.sh` builds
+  the sdist + wheel from the current tree, installs the wheel into a
+  throw-away venv, and exercises the installed `ctrlrelay` binary
+  (`version`, `--help`, `config validate`). Mirrored as a pytest
+  (`tests/test_e2e_install.py`, gated on `CTRLRELAY_E2E=1`) and as a new
+  `e2e-install` CI job in `build.yml` so every PR proves the published
+  artifact is actually installable.
+
+### Fixed
+
+- Sync `__version__` in `src/ctrlrelay/__init__.py` with the version
+  declared in `pyproject.toml` (was 0.1.3, should have been 0.1.5 since
+  the v0.1.5 release). The e2e install check would have caught this had
+  it existed at release time.
 
 ## [0.1.5] - 2026-04-20
 

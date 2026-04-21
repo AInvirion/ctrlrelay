@@ -2,7 +2,7 @@
 
 from ctrlrelay.core import checkpoint
 
-__version__ = "0.1.3"
+__version__ = "0.1.5"
 
 # Public API
 __all__ = ["__version__", "checkpoint"]
