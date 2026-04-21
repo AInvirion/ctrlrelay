@@ -236,3 +236,36 @@ class TestPendingResumes:
         assert row["question"] == "q2 — need more info"
         assert row["answer"] is None
         db.close()
+
+    def test_mark_resumed_is_noop_on_refreshed_unanswered_row(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P1: a resume that re-blocks ends the sequence:
+           sweeper picks up answered row → pipeline re-blocks →
+           add_pending_resume clears answer/answered_at →
+           sweeper calls mark_pending_resume_resumed.
+        If mark_pending_resume_resumed stamped the freshly-cleared
+        row, the NEXT operator reply would set answered_at but leave
+        resumed_at populated, hiding the row from
+        list_pending_resumes_to_execute forever. Guard on
+        answered_at IS NOT NULL makes it a no-op instead."""
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume("s1", "secops", "o/a", "q1")
+        db.answer_pending_resume("s1", "first answer")
+        # Pipeline re-blocked during the resume and refreshed the row.
+        db.add_pending_resume("s1", "secops", "o/a", "need more info")
+        # Sweeper now blindly calls mark_resumed. Must be a no-op.
+        marked = db.mark_pending_resume_resumed("s1")
+        assert marked is False
+        # Row stays visible to the next orphan-reply routing.
+        unanswered = db.list_unanswered_pending_resumes()
+        assert [r["session_id"] for r in unanswered] == ["s1"]
+        assert unanswered[0]["resumed_at"] is None
+        # And to the next sweeper tick after the operator answers again.
+        db.answer_pending_resume("s1", "second answer")
+        pending = db.list_pending_resumes_to_execute()
+        assert [r["session_id"] for r in pending] == ["s1"]
+        # This time mark_resumed succeeds because answered_at is set.
+        assert db.mark_pending_resume_resumed("s1") is True
+        assert db.list_pending_resumes_to_execute() == []
+        db.close()

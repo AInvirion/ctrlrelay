@@ -834,12 +834,12 @@ async def resume_dev_from_pending(
         )
 
     finally:
-        # Match run_dev_issue's BLOCKED-cleanup rule: keep the worktree +
-        # branch alive on BLOCKED outcomes so a follow-up reply has
-        # somewhere to land. On success, tear down the worktree we (re)
-        # created; on failure with a newly-created worktree, tear it
-        # down so the next attempt starts clean. If we re-used an
-        # existing worktree, leave it for the next resume to inspect.
+        # Intentionally leave the worktree in place — matches
+        # run_dev_issue's "BLOCKED → keep both" contract and makes the
+        # worktree available for a third resume if the second one
+        # re-blocks. A follow-up can add teardown for the DONE/FAILED
+        # outcomes (small disk leak, not a correctness issue; operator
+        # can run `git worktree prune` in the bare repo to reclaim).
         try:
             state_db.release_lock(repo, session_id)
         except Exception as lock_exc:
