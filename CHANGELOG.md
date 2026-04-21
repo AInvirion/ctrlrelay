@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-04-21
+
+Adds a new "task" pipeline for GitHub issues whose outcome is
+information, not code. The dev pipeline still handles issues that
+expect a PR; a label routes the non-PR shape to the new pipeline.
+
+### Added
+
+- **Task pipeline** — `task`-labeled issues route to
+  `src/ctrlrelay/pipelines/task.py` instead of the dev pipeline. The
+  agent runs in a worktree of the repo's default branch, does the
+  work (runs builds, investigates, reads files, queries tools), posts
+  its findings as a GitHub issue comment, and signals DONE. No
+  branch, no PR handoff.
+- **`automation.task_labels`** — per-repo list of labels that route
+  to the task pipeline. Defaults to `["task"]`. Case-insensitive
+  match. `exclude_labels` still wins when both would match — an
+  issue tagged both `manual` and `task` is skipped entirely (manual
+  means "not for the agent").
+- **Telegram notification variant for tasks** — `✅ Task done on #N
+  ({repo}): {summary}` instead of `✅ PR ready: {url}` so empty PR
+  URLs can't sneak through.
+- **Resume-via-Telegram for blocked task sessions** — inherited from
+  the same pending_resumes + sweeper path that powers dev/secops
+  resumes. `resume_task_from_pending` rebuilds a fresh worktree from
+  default branch (task worktrees are ephemeral, no branch state to
+  preserve).
+
+### Fixed
+
+- **Lock leak on worktree-cleanup cancel.** Both `run_task_issue`
+  and `resume_task_from_pending` now wrap `remove_worktree` with
+  `asyncio.wait_for` and release the repo lock early on
+  `CancelledError`. Without this guard a SIGTERM during cleanup
+  would propagate out of the `finally` block before `release_lock`
+  ran, wedging task/dev/secops on that repo until the row was
+  manually cleared.
+
+### Operator notes
+
+- Upgrade via `uv tool install ctrlrelay@latest --force` and
+  restart poller + bridge. No schema changes.
+- To try it: label a GitHub issue with `task` and assign it to
+  yourself. The agent will pick it up on the next poll, run in a
+  default-branch worktree, and post findings as an issue comment.
+  Expect a `✅ Task done` Telegram notification when it finishes.
+- To add more routing labels (e.g., `investigate`, `build-check`):
+  `automation.task_labels: ["task", "investigate", "build-check"]`
+  per repo.
+- Dev pipeline behavior is unchanged — issues without a task label
+  still produce a PR.
+
 ## [0.1.9] - 2026-04-21
 
 Extends the resume-via-Telegram flow shipped in v0.1.8 to cover the
