@@ -236,6 +236,17 @@ class StateDB:
         value = row["agent_session_id"]
         return value if value else None
 
+    def get_session_row(self, session_id: str) -> dict[str, Any] | None:
+        """Full sessions-row snapshot, used when the pending-resume
+        sweeper needs pipeline-specific context (issue_number for dev,
+        worktree_path for sanity checks, etc.) that isn't mirrored into
+        pending_resumes."""
+        row = self._conn.execute(
+            "SELECT * FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     # Pending resumes (BLOCKED sessions awaiting an operator answer)
 
     def add_pending_resume(
