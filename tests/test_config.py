@@ -3,8 +3,9 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
-from ctrlrelay.core.config import Config, ConfigError, load_config
+from ctrlrelay.core.config import AutomationConfig, Config, ConfigError, load_config
 
 
 class TestConfigLoading:
@@ -191,3 +192,57 @@ class TestTimezoneValidation:
         cfg_path.write_text(yaml.dump(sample_config_dict))
         config = load_config(cfg_path)
         assert config.timezone == "America/Santiago"
+
+
+class TestAutomationExcludeLabels:
+    """exclude_labels surfaces per-repo so the poller can skip operator-only issues."""
+
+    def test_default_exclude_labels(self) -> None:
+        """Default covers the common 'not for the agent' keywords from #91."""
+        auto = AutomationConfig()
+        assert auto.exclude_labels == ["manual", "operator", "instruction"]
+
+    def test_exclude_labels_empty_list_is_valid(self) -> None:
+        """Operators can opt out of any default exclusions."""
+        auto = AutomationConfig(exclude_labels=[])
+        assert auto.exclude_labels == []
+
+    def test_config_without_exclude_labels_key_gets_default(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """Legacy configs without exclude_labels load fine and get the default."""
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"dependabot_patch": "auto"},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.repos[0].automation.exclude_labels == [
+            "manual",
+            "operator",
+            "instruction",
+        ]
+
+    def test_exclude_labels_override_from_yaml(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """YAML override wins over the built-in default."""
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"exclude_labels": ["no-agent", "wontfix"]},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.repos[0].automation.exclude_labels == ["no-agent", "wontfix"]

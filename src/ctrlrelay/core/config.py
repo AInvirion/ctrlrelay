@@ -148,6 +148,9 @@ class AutomationConfig(BaseModel):
     secret_alerts: AutomationPolicy = AutomationPolicy.NEVER
     deploy_after_merge: AutomationPolicy = AutomationPolicy.AUTO
     accept_foreign_assignments: bool = False
+    exclude_labels: list[str] = Field(
+        default_factory=lambda: ["manual", "operator", "instruction"]
+    )
 
 
 class RepoConfig(BaseModel):

@@ -164,6 +164,7 @@ repos:
       secret_alerts: never
       deploy_after_merge: auto
       accept_foreign_assignments: false
+      exclude_labels: ["manual", "operator", "instruction"]
     code_review: { ... }      # optional
     deploy:      { ... }      # optional
 ```
@@ -191,9 +192,41 @@ and ask the operator), or `never` (skip).
 | `secret_alerts` | `never` | Secret-scan alerts. |
 | `deploy_after_merge` | `auto` | Whether to deploy after a merged PR. |
 | `accept_foreign_assignments` | `false` | When `true`, the poller also picks up issues assigned to you by someone else. Default (`false`) runs the dev pipeline only on issues you self-assigned. |
+| `exclude_labels` | `["manual", "operator", "instruction"]` | Issue labels that tell the poller "this isn't for the agent". See [exclude_labels](#reposautomationexclude_labels) below. |
 
 The current secops and dev pipelines read these settings to bias their prompts
 to Claude — they're not enforced by hard-coded checks.
+
+### repos[].automation.exclude_labels
+
+Some issues you assign to the operator user aren't code work — they're operator
+tasks (validate a build on your laptop) or pure instructions (document a
+workflow). The dev pipeline has no way to tell these apart from a feature
+request on its own, so it dutifully writes code and opens a PR anyway.
+
+`exclude_labels` gives the operator a short-circuit: any issue carrying one of
+the configured labels is **marked seen** in `poller_state.json` so it doesn't
+re-appear on the next poll, **not handed to the dev pipeline**, and **logged**
+under the `poll.issue.excluded_by_label` event.
+
+```yaml
+repos:
+  - name: "your-org/your-repo"
+    local_path: "~/Projects/your-repo"
+    automation:
+      exclude_labels: ["manual", "operator", "instruction"]
+```
+
+- Default: `["manual", "operator", "instruction"]`. Set to `[]` to disable.
+- Matching is **case-insensitive** (`Manual` matches `manual`).
+- The check runs in the poller, before any dev-pipeline work is scheduled.
+- Apply the label on GitHub; the next poll will pick it up automatically.
+
+If you mislabel and want the agent to take the issue after all, remove the
+label on GitHub **and** delete the issue number from
+`poller_state.json` (or bump the issue so it becomes visible again via some
+other mechanism — the poller treats "seen" as sticky per design, so operator
+input is the source of truth).
 
 ## Example: telegram-enabled config
 
