@@ -35,7 +35,9 @@ Out-of-scope:
 - Misuse scenarios where the attacker already has local shell access on the
   machine running the daemon (the threat model assumes a single-user,
   local-first install).
-- Claude Code / `gh` / `git` itself — those are external tools we shell out to.
+- The headless coding-agent CLI (today: Claude Code), the `gh` CLI,
+  and `git` — those are external tools we shell out to; report issues
+  to their respective projects.
 
 ## Credential handling
 
