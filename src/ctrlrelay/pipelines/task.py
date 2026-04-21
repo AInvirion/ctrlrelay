@@ -22,6 +22,7 @@ Intentionally NOT shared with dev:
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass
@@ -418,6 +419,14 @@ async def run_task_issue(
         # Tear down on every outcome — even BLOCKED, because a task
         # resume will re-create the worktree from scratch anyway
         # (no in-progress branch state to preserve, unlike dev).
+        #
+        # Timeout + CancelledError handling mirrors secops: the repo
+        # lock is shared across task/dev/secops, so a cancel during
+        # `remove_worktree` that skipped release_lock would wedge ALL
+        # three pipelines for that repo until the row was manually
+        # cleared — bad. Release the lock early on cancel and
+        # re-raise; on timeout, log and fall through to the normal
+        # lock release below.
         if worktree_path is not None:
             try:
                 worktree.remove_context_symlink(worktree_path)
@@ -431,7 +440,33 @@ async def run_task_issue(
                     error=str(cleanup_exc)[:200],
                 )
             try:
-                await worktree.remove_worktree(repo, session_id)
+                # Timeout matches secops (130s) — a full worktree prune
+                # can take up to ~120s on a slow volume.
+                await asyncio.wait_for(
+                    worktree.remove_worktree(repo, session_id),
+                    timeout=130.0,
+                )
+            except asyncio.TimeoutError:
+                log_event(
+                    _logger,
+                    "task.cleanup.worktree_timeout",
+                    session_id=session_id,
+                    repo=repo,
+                    worktree_path=str(worktree_path),
+                )
+            except asyncio.CancelledError:
+                log_event(
+                    _logger,
+                    "task.cleanup.worktree_cancelled_mid_shutdown",
+                    session_id=session_id,
+                    repo=repo,
+                    worktree_path=str(worktree_path),
+                )
+                try:
+                    state_db.release_lock(repo, session_id)
+                except Exception:
+                    pass
+                raise
             except Exception as cleanup_exc:
                 log_event(
                     _logger,
@@ -627,13 +662,40 @@ async def resume_task_from_pending(
         )
 
     finally:
+        # Same cancel/timeout handling as run_task_issue's finally —
+        # shared repo lock means a cancel here would wedge
+        # task/dev/secops on this repo if release_lock was skipped.
         if worktree_path is not None:
             try:
                 worktree.remove_context_symlink(worktree_path)
             except Exception:
                 pass
             try:
-                await worktree.remove_worktree(repo, session_id)
+                await asyncio.wait_for(
+                    worktree.remove_worktree(repo, session_id),
+                    timeout=130.0,
+                )
+            except asyncio.TimeoutError:
+                log_event(
+                    _logger,
+                    "task.resume.cleanup.worktree_timeout",
+                    session_id=session_id,
+                    repo=repo,
+                    worktree_path=str(worktree_path),
+                )
+            except asyncio.CancelledError:
+                log_event(
+                    _logger,
+                    "task.resume.cleanup.worktree_cancelled_mid_shutdown",
+                    session_id=session_id,
+                    repo=repo,
+                    worktree_path=str(worktree_path),
+                )
+                try:
+                    state_db.release_lock(repo, session_id)
+                except Exception:
+                    pass
+                raise
             except Exception:
                 pass
         try:
