@@ -22,10 +22,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Create virtual environment
+        # setup-uv@v7 dropped the implicit auto-venv that v5 created via
+        # VIRTUAL_ENV. Ubuntu 24.04's system Python is PEP 668 marked
+        # ("externally managed") so --system also fails. Create our own
+        # venv explicitly; uv exports VIRTUAL_ENV so subsequent uv pip /
+        # uv run steps pick it up automatically.
+        run: uv venv
+
       - name: Install project with dev extras
-        # setup-uv@v5 creates + activates a managed venv via VIRTUAL_ENV;
-        # install into it (no --system) so the subsequent `uv run` steps
-        # see ruff and pytest.
         run: uv pip install -e ".[dev]"
 
       - name: Ruff lint
