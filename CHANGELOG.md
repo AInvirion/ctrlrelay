@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-04-21
+
+The "reply to BLOCKED in Telegram and it actually resumes" release.
+Two operator-visibility fixes surfaced from running a 79-repo secops
+sweep: a noisy log-spam issue and a silently-dropped-reply issue. The
+latter turned into a proper resume flow.
+
+### Added
+
+- **Resume BLOCKED secops via Telegram reply.** When a scheduled
+  secops sweep escalates BLOCKED and exits, the question is now
+  persisted in a new `pending_resumes` table. Replying in Telegram
+  matches against that table and queues the answer; a new per-minute
+  `pending_resume_sweeper` scheduler job inside the poller drains
+  answered rows — re-acquires the repo lock, re-creates the worktree,
+  calls `SecopsPipeline.resume(ctx, answer)`, and Telegrams the
+  result (success / re-blocked / failed). First reply-to-resume
+  round-trip is ≤60s.
+- **Disambiguation when multiple BLOCKED sessions exist.** Replying
+  "merge it" when both `repoA` and `repoB` are blocked used to route
+  to FIFO (wrong repo, possibly destructive). The bridge now refuses
+  to guess: with >1 unanswered BLOCKED sessions it returns a Telegram
+  list of pending session_ids so the operator can reply with one
+  included. Single-BLOCKED case stays unambiguous.
+
+### Fixed
+
+- **Poller log spam on issues-disabled repos.** Repos with GitHub's
+  Issues feature disabled (template repos, signature repos, GitHub
+  Pages sites) returned a permanent `GitHubError(... has disabled
+  issues)` that the poller classified as transient, retrying every
+  120s and escalating to WARNING after 3 cycles. `poll()` and
+  `seed_current()` now detect the specific error, mark the repo in
+  an in-memory permanent-skip set, log once at INFO as
+  `poll.repo.issues_disabled`, and skip the `gh` call on subsequent
+  cycles. Resets on daemon restart.
+- **Orphan Telegram replies silently dropped.** When a BLOCKED
+  session had already torn down (scheduled secops), the bridge's
+  in-memory `_pending_questions` entry died with the ASK socket and
+  the operator's reply disappeared with just an `info` log line. The
+  bridge now replies via Telegram so the failure is visible (and,
+  with the resume flow above, actually lands as an answer).
+- **Pending_resumes rows no longer dropped on sweeper lock
+  contention.** When the per-minute sweeper raced the 6am scheduled
+  secops on the same repo, it used to `mark_pending_resume_resumed`
+  unconditionally and lose the queued answer. The sweeper now detects
+  the specific `"Repository locked by another session"` error and
+  leaves the row pending for the next tick.
+
+### Schema migration
+
+State DB gains a `pending_resumes` table (session_id PK, pipeline,
+repo, question, created_at, answer, answered_at, resumed_at). Two
+partial indexes: `idx_pending_resumes_unanswered` (for orphan-reply
+lookup) and `idx_pending_resumes_answered_unresumed` (for sweeper
+load). Created automatically on daemon start; no backfill needed.
+
+### Operator notes
+
+- Upgrade via `uv tool upgrade ctrlrelay` (or
+  `uv tool install ctrlrelay@latest --force` if pinned), restart
+  poller and bridge so the new sweeper schedules and the bridge
+  sees the new schema.
+- To exercise the resume-via-Telegram path: let a scheduled secops
+  escalate BLOCKED, reply to the Telegram notification with your
+  decision (or a fresh message that mentions the session_id if
+  multiple repos are BLOCKED). Expect a `✅ Answer queued` ack within
+  seconds and a result message within ~1 minute.
+- Dev pipeline resume-via-Telegram is not yet wired; the sweeper
+  skips non-secops rows.
+
 ## [0.1.7] - 2026-04-20
 
 Patch release. Fixes one drift bug in how the package reports its own
