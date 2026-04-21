@@ -1,10 +1,11 @@
 [project]
 name = "ctrlrelay"
 version = "0.1.4"
-description = "Local-first orchestrator for Claude Code across multiple GitHub repos"
+description = "Local-first orchestrator for headless coding agents across multiple GitHub repos"
 readme = "README.md"
 requires-python = ">=3.12"
-license = {text = "MIT"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     {name = "Oscar Valenzuela", email = "oscar.valenzuela.b@gmail.com"}
 ]
@@ -13,7 +14,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.12",
