@@ -306,10 +306,18 @@ def bridge_start(
         console.print(f"Starting bridge on {socket_path}")
         console.print("Press Ctrl+C to stop")
 
+        # Open the state DB so the bridge can route orphan Telegram replies
+        # to persisted BLOCKED sessions in pending_resumes. Both daemons
+        # share ~/.ctrlrelay/state.db — SQLite's WAL mode handles concurrent
+        # readers/writers for the low contention we see here.
+        from ctrlrelay.core.state import StateDB
+        state_db = StateDB(config.paths.state_db)
+
         server = BridgeServer(
             socket_path=socket_path,
             bot_token=bot_token,
             chat_id=telegram_config.chat_id,
+            state_db=state_db,
         )
 
         loop = asyncio.new_event_loop()
@@ -340,6 +348,10 @@ def bridge_start(
                 pass
         finally:
             loop.close()
+            try:
+                state_db.close()
+            except Exception:
+                pass
             pid_file.unlink(missing_ok=True)
     else:
         # Pass the token via environment, never argv. Putting it on the command
@@ -354,6 +366,8 @@ def bridge_start(
             telegram_config.bot_token_env,
             "--chat-id",
             str(telegram_config.chat_id),
+            "--state-db",
+            str(config.paths.state_db),
         ]
         proc = subprocess.Popen(
             cmd,
@@ -1321,6 +1335,132 @@ def poller_start(
                     except Exception:
                         pass
 
+        async def _run_pending_resume_sweeper() -> None:
+            """Drain pending_resumes rows that an operator answered via
+            Telegram while the original BLOCKED session had already torn
+            down.
+
+            Runs every minute inside the poller. For each answered row
+            it acquires the repo lock, re-creates a worktree, calls
+            ``SecopsPipeline.resume(ctx, answer)`` via the shared
+            ``resume_secops_from_pending`` helper, then marks the row
+            resumed and fans out a Telegram notification with the result
+            so the operator knows whether the resume landed.
+            """
+            try:
+                pending = state_db.list_pending_resumes_to_execute()
+            except Exception as e:
+                console.print(
+                    f"[yellow]pending_resume_sweeper: list failed ({e})"
+                    f"[/yellow]"
+                )
+                return
+            if not pending:
+                return
+
+            from ctrlrelay.pipelines.secops import resume_secops_from_pending
+
+            sweeper_transport = None
+            if config.transport.type.value == "telegram" and config.transport.telegram:
+                from ctrlrelay.transports import SocketTransport
+                sock = config.transport.telegram.socket_path.expanduser().resolve()
+                if sock.exists():
+                    try:
+                        candidate = SocketTransport(sock)
+                        await candidate.connect()
+                        sweeper_transport = candidate
+                    except Exception:
+                        sweeper_transport = None
+
+            try:
+                for row in pending:
+                    session_id = row["session_id"]
+                    repo = row["repo"]
+                    pipeline_name = row["pipeline"]
+                    answer = row["answer"] or ""
+                    if pipeline_name != "secops":
+                        # dev pipeline resume-from-pending not wired yet —
+                        # leave the row marked-answered so a later sweep
+                        # picks it up once that path lands.
+                        continue
+
+                    if sweeper_transport:
+                        try:
+                            await sweeper_transport.send(
+                                f"🔁 Resuming BLOCKED session "
+                                f"`{session_id}` on {repo} with your "
+                                f"answer..."
+                            )
+                        except Exception:
+                            pass
+
+                    try:
+                        result = await resume_secops_from_pending(
+                            session_id=session_id,
+                            repo=repo,
+                            answer=answer,
+                            dispatcher=dispatcher,
+                            github=github,
+                            worktree=worktree,
+                            dashboard=scheduled_dashboard,
+                            state_db=state_db,
+                            transport=sweeper_transport,
+                            contexts_dir=config.paths.contexts,
+                        )
+                    except Exception as e:
+                        if sweeper_transport:
+                            try:
+                                await sweeper_transport.send(
+                                    f"❌ Resume of `{session_id}` on "
+                                    f"{repo} crashed: {e}"
+                                )
+                            except Exception:
+                                pass
+                        # Mark resumed so the sweeper doesn't hot-loop the
+                        # same broken row. Operator can inspect via the
+                        # sessions table.
+                        try:
+                            state_db.mark_pending_resume_resumed(session_id)
+                        except Exception:
+                            pass
+                        continue
+
+                    try:
+                        state_db.mark_pending_resume_resumed(session_id)
+                    except Exception:
+                        pass
+
+                    if sweeper_transport:
+                        try:
+                            if result.success:
+                                await sweeper_transport.send(
+                                    f"✅ Resume succeeded on {repo}\n"
+                                    f"Session: `{session_id}`\n"
+                                    f"\n{result.summary}"
+                                )
+                            elif result.blocked:
+                                q = result.question or "(no question text)"
+                                await sweeper_transport.send(
+                                    f"⏸️ Resume re-blocked on {repo}\n"
+                                    f"Session: `{session_id}`\n"
+                                    f"\n{q}"
+                                )
+                            else:
+                                err = result.error or result.summary
+                                await sweeper_transport.send(
+                                    f"❌ Resume failed on {repo}\n"
+                                    f"Session: `{session_id}`\n"
+                                    f"\n{err}"
+                                )
+                        except Exception:
+                            pass
+            finally:
+                if sweeper_transport:
+                    try:
+                        await sweeper_transport.close()
+                    except Exception:
+                        pass
+
         async def _main() -> None:
             # Register + start the scheduler FIRST, before any potentially
             # slow startup work. Otherwise a 6am fire that lands during
@@ -1333,10 +1473,20 @@ def poller_start(
                 cron_expr=config.schedules.secops_cron,
                 func=_run_scheduled_secops,
             )
+            # Drain answered pending_resumes every minute so a Telegram
+            # reply to a BLOCKED session turns into an actual pipeline
+            # resume within ~60s, not 24h (the next scheduled secops
+            # cron). Cheap: no-ops when the pending_resumes table is empty.
+            scheduler.add_cron_job(
+                name="pending_resume_sweeper",
+                cron_expr="* * * * *",
+                func=_run_pending_resume_sweeper,
+            )
             scheduler.start()
             console.print(
                 f"[dim]Scheduler: secops cron={config.schedules.secops_cron} "
-                f"tz={config.timezone}[/dim]"
+                f"tz={config.timezone} | "
+                f"pending_resume_sweeper=every 1m[/dim]"
             )
 
             # Now the slow startup: first-run seeding (one gh call per

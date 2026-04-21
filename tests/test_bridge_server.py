@@ -239,6 +239,56 @@ class TestBridgeServer:
         task.cancel()
 
     @pytest.mark.asyncio
+    async def test_orphan_reply_routes_to_pending_resume(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """An orphan Telegram reply with a persisted BLOCKED session in
+        pending_resumes should queue the answer there and tell the
+        operator. The sweeper (tested separately) then drives the actual
+        resume."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-owner-r-abc",
+            pipeline="secops",
+            repo="owner/r",
+            question="merge major bumps?",
+        )
+
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123,
+            state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        await server._on_telegram_reply(
+            "merge #286, close the others", reply_to_message_id=None
+        )
+
+        # Answer was persisted against the BLOCKED session...
+        rows = db.list_pending_resumes_to_execute()
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "secops-owner-r-abc"
+        assert rows[0]["answer"] == "merge #286, close the others"
+
+        # ...and the operator got told, not silently dropped.
+        server._telegram.send.assert_awaited_once()  # type: ignore[attr-defined]
+        sent_text = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "Answer queued" in sent_text
+        assert "secops-owner-r-abc" in sent_text
+        assert "owner/r" in sent_text
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
     async def test_client_disconnect_during_response_write_is_silent(
         self, socket_path, caplog,
     ) -> None:

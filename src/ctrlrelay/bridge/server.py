@@ -9,6 +9,7 @@ import stat
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ctrlrelay.bridge.protocol import (
     BridgeMessage,
@@ -19,6 +20,9 @@ from ctrlrelay.bridge.protocol import (
 )
 from ctrlrelay.bridge.telegram_handler import TelegramHandler
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
+
+if TYPE_CHECKING:
+    from ctrlrelay.core.state import StateDB
 
 _logger = get_logger("bridge.server")
 _log = logging.getLogger(__name__)
@@ -53,10 +57,18 @@ class BridgeServer:
         socket_path: Path,
         bot_token: str,
         chat_id: int,
+        state_db: "StateDB | None" = None,
     ) -> None:
         self.socket_path = socket_path
         self.bot_token = bot_token
         self.chat_id = chat_id
+        # Optional: when provided, orphan Telegram replies (no live
+        # _pending_question to match) are routed to the oldest unanswered
+        # BLOCKED session in state_db's pending_resumes table. The poller's
+        # pending-resume sweeper then picks up the answer and drives the
+        # actual pipeline resume. Without state_db, orphan replies still
+        # get a "didn't land" Telegram notice but nothing gets queued.
+        self.state_db = state_db
         self._server: asyncio.Server | None = None
         self._running = False
         self._telegram: TelegramHandler | None = None
@@ -250,20 +262,33 @@ class BridgeServer:
                     "bridge: incoming telegram msg with no pending question; "
                     "text=%r", text[:80],
                 )
-                # Tell the operator that the reply didn't land, so they don't
-                # wait for the phantom-answered session to resume. Without
-                # this the orphan-reply just disappears silently — which we
-                # saw on a BLOCKED secops session that had already exited
-                # before the operator's answer arrived.
+                # Try to route to a persisted BLOCKED session in state_db
+                # so the operator's reply actually drives a resume. Without
+                # this, the reply disappears the instant the session's ASK
+                # socket closes — which is exactly what happens when a
+                # scheduled secops sweep escalates BLOCKED and exits.
+                queued = await self._queue_orphan_reply_as_resume_answer(text)
                 if self._telegram is not None:
                     try:
-                        await self._telegram.send(
-                            "⚠️ Your reply wasn't routed — no active session "
-                            "is waiting on input right now. The previous "
-                            "BLOCKED session has already exited. To act on "
-                            "it, re-run the pipeline manually, e.g. "
-                            "`ctrlrelay run secops --repo <owner>/<repo>`."
-                        )
+                        if queued is not None:
+                            await self._telegram.send(
+                                "✅ Answer queued for BLOCKED session "
+                                f"`{queued['session_id']}` "
+                                f"(pipeline={queued['pipeline']}, "
+                                f"repo={queued['repo']}).\n"
+                                "The pending-resume sweeper will drive it "
+                                "on the next tick — you'll get another "
+                                "message with the result."
+                            )
+                        else:
+                            await self._telegram.send(
+                                "⚠️ Your reply wasn't routed — no active "
+                                "session is waiting on input and no "
+                                "persisted BLOCKED session is unanswered. "
+                                "To act manually, re-run the pipeline, "
+                                "e.g. `ctrlrelay run secops --repo "
+                                "<owner>/<repo>`."
+                            )
                     except Exception as e:
                         _log.warning(
                             "bridge: failed to notify orphan-reply sender: %s",
@@ -302,3 +327,45 @@ class BridgeServer:
                 "bridge: failed to deliver ANSWER request_id=%s err=%s",
                 match.request_id, e,
             )
+
+    async def _queue_orphan_reply_as_resume_answer(
+        self, text: str
+    ) -> dict | None:
+        """Try to route an orphan Telegram reply to a persisted BLOCKED
+        session so the pending-resume sweeper can pick it up and drive a
+        pipeline resume.
+
+        Returns the pending_resume row (as dict) when the answer was
+        successfully attached, or None when there's no state_db, no
+        unanswered BLOCKED session, or the state_db update raced. DB
+        failures are logged and swallowed — a noisy orphan-reply UX is
+        better than crashing the bridge.
+        """
+        if self.state_db is None:
+            return None
+        try:
+            row = self.state_db.get_oldest_unanswered_pending_resume()
+            if row is None:
+                return None
+            if not self.state_db.answer_pending_resume(
+                row["session_id"], text
+            ):
+                return None
+        except Exception as e:
+            log_event(
+                _logger,
+                "bridge.pending_resume.update_failed",
+                reason=type(e).__name__,
+                error=str(e)[:200],
+            )
+            return None
+        log_event(
+            _logger,
+            "bridge.pending_resume.queued",
+            session_id=row["session_id"],
+            pipeline=row["pipeline"],
+            repo=row["repo"],
+            answer_length=len(text),
+            answer_hash=hash_text(text),
+        )
+        return row

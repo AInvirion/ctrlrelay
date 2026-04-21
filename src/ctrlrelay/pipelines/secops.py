@@ -264,6 +264,28 @@ async def run_secops_all(
             state_db.commit()
             session_final_state_written = True
 
+            # Persist BLOCKED so a Telegram reply arriving after this
+            # session tears down can still be routed to a resume. Without
+            # this, the bridge's in-memory `_pending_questions` dies with
+            # the ASK socket and the operator's answer lands in a void.
+            if result.blocked and result.question:
+                try:
+                    state_db.add_pending_resume(
+                        session_id=session_id,
+                        pipeline="secops",
+                        repo=repo,
+                        question=result.question,
+                    )
+                except Exception as e:
+                    log_event(
+                        _logger,
+                        "secops.pending_resume.insert_failed",
+                        session_id=session_id,
+                        repo=repo,
+                        error_type=type(e).__name__,
+                        error=str(e)[:200],
+                    )
+
             if dashboard and result.success:
                 await dashboard.push_event(EventPayload(
                     level="info",
@@ -400,3 +422,170 @@ async def run_secops_all(
                 )
 
     return results
+
+
+async def resume_secops_from_pending(
+    session_id: str,
+    repo: str,
+    answer: str,
+    dispatcher: AgentAdapter,
+    github: GitHubCLI,
+    worktree: WorktreeManager,
+    dashboard: DashboardClient | None,
+    state_db: StateDB,
+    transport: Transport | None,
+    contexts_dir: Path,
+) -> PipelineResult:
+    """Resume a BLOCKED secops session using an answer that arrived via
+    Telegram after the original session had already torn down.
+
+    Mirrors ``run_secops_all``'s per-repo lifecycle (lock → worktree →
+    resume → cleanup) but targets a single session that's already got a
+    row in ``sessions`` (status='blocked') and a ``pending_resumes`` row
+    ready for ``mark_pending_resume_resumed``. Caller is responsible for
+    flipping the pending_resumes row after this returns.
+    """
+    pipeline = SecopsPipeline(
+        dispatcher=dispatcher,
+        github=github,
+        worktree=worktree,
+        dashboard=dashboard,
+        state_db=state_db,
+        transport=transport,
+    )
+
+    if not state_db.acquire_lock(repo, session_id):
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=f"Could not acquire lock for {repo} to resume",
+            error="Repository locked by another session",
+        )
+
+    worktree_path: Path | None = None
+    try:
+        await worktree.ensure_bare_repo(repo)
+        worktree_path = await worktree.create_worktree(repo, session_id)
+
+        context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
+        if context_path.exists():
+            worktree.symlink_context(worktree_path, context_path)
+
+        state_file = worktree_path / ".ctrlrelay" / "state.json"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+
+        ctx = PipelineContext(
+            session_id=session_id,
+            repo=repo,
+            worktree_path=worktree_path,
+            context_path=context_path,
+            state_file=state_file,
+        )
+
+        # Flip the session back to running so an observer sees progress,
+        # not a stale 'blocked' row while the resume is in flight.
+        state_db.execute(
+            "UPDATE sessions SET status = ?, ended_at = NULL WHERE id = ?",
+            ("running", session_id),
+        )
+        state_db.commit()
+
+        result = await pipeline.resume(ctx, answer)
+
+        status = "done" if result.success else (
+            "blocked" if result.blocked else "failed"
+        )
+        state_db.execute(
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
+            "WHERE id = ?",
+            (status, result.summary, int(time.time()), session_id),
+        )
+        state_db.commit()
+
+        # If the resume re-blocked (operator answer was ambiguous, agent
+        # needs more), refresh the pending_resumes row so a new reply
+        # routes to this same session again.
+        if result.blocked and result.question:
+            try:
+                state_db.add_pending_resume(
+                    session_id=session_id,
+                    pipeline="secops",
+                    repo=repo,
+                    question=result.question,
+                )
+            except Exception as e:
+                log_event(
+                    _logger,
+                    "secops.pending_resume.reblock_insert_failed",
+                    session_id=session_id,
+                    repo=repo,
+                    error_type=type(e).__name__,
+                    error=str(e)[:200],
+                )
+
+        return result
+
+    except Exception as e:
+        state_db.execute(
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
+            "WHERE id = ?",
+            ("failed", f"Resume error: {e}", int(time.time()), session_id),
+        )
+        state_db.commit()
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=f"Error resuming {repo}",
+            error=str(e),
+        )
+
+    finally:
+        # Same cleanup pattern as run_secops_all: symlink → worktree →
+        # lock, bounded timeouts, log-don't-crash.
+        if worktree_path is not None:
+            try:
+                worktree.remove_context_symlink(worktree_path)
+            except Exception as cleanup_exc:
+                log_event(
+                    _logger,
+                    "secops.resume.cleanup.symlink_failed",
+                    session_id=session_id,
+                    repo=repo,
+                    error_type=type(cleanup_exc).__name__,
+                    error=str(cleanup_exc)[:200],
+                )
+            try:
+                await asyncio.wait_for(
+                    worktree.remove_worktree(repo, session_id),
+                    timeout=130.0,
+                )
+            except asyncio.TimeoutError:
+                log_event(
+                    _logger,
+                    "secops.resume.cleanup.worktree_timeout",
+                    session_id=session_id,
+                    repo=repo,
+                    worktree_path=str(worktree_path),
+                )
+            except Exception as cleanup_exc:
+                log_event(
+                    _logger,
+                    "secops.resume.cleanup.worktree_failed",
+                    session_id=session_id,
+                    repo=repo,
+                    worktree_path=str(worktree_path),
+                    error_type=type(cleanup_exc).__name__,
+                    error=str(cleanup_exc)[:200],
+                )
+
+        try:
+            state_db.release_lock(repo, session_id)
+        except Exception as lock_exc:
+            log_event(
+                _logger,
+                "secops.resume.cleanup.lock_release_failed",
+                session_id=session_id,
+                repo=repo,
+                error_type=type(lock_exc).__name__,
+                error=str(lock_exc)[:200],
+            )
