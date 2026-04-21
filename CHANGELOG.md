@@ -7,27 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-04-20
+
+The "ready to be open-sourced" release. Apache-2.0 license, AInvirion
+governance files, CLA Assistant wired against the org's reusable
+workflow, PyPI publish workflow via Trusted Publishing (OIDC, no
+secret rotation). Plus the foundation for plugging in alternative
+coding-agent backends (Codex, OpenCode, Hermes, Kiro …) in follow-up
+PRs without touching pipelines or callers. **First release published
+to PyPI.**
+
 ### Added
 
-- **Multi-agent config surface.** The top-level config section
-  renamed from `claude:` to `agent:` and gained a `type:` field
-  selecting which backend adapter the dispatcher uses. Today the
-  only implemented type is `"claude"`; `codex`, `opencode`, `hermes`,
-  `kiro`, etc. are planned. The new `AgentAdapter` protocol (in
-  `src/ctrlrelay/core/dispatcher.py`) defines the seam every backend
-  must satisfy, and `make_agent_dispatcher()` is the factory that
-  routes by `type`. Unknown types fail loudly at daemon startup
-  with a pointer to the adapter interface so a config typo doesn't
-  silently fall back to Claude.
+- **Multi-agent config surface** (#73). Top-level config section
+  renamed `claude:` → `agent:` with a new `type:` field selecting
+  the backend adapter. Today only `"claude"` is implemented; the
+  new `AgentAdapter` protocol in `src/ctrlrelay/core/dispatcher.py`
+  defines the seam, and `make_agent_dispatcher()` is the factory.
+  Unknown `type` values raise `NotImplementedError` at daemon
+  startup with a clear hint instead of silently falling back.
+- **PyPI publish workflow** (#64). New `.github/workflows/publish.yml`
+  fires on `release: published` and ships sdist + wheel to PyPI via
+  OIDC Trusted Publishing — no API tokens stored as GitHub secrets.
+  Gated by a `pypi` GitHub Environment so each release pauses for
+  manual approval.
+- **AInvirion OSS governance files** (#65). `CODE_OF_CONDUCT.md`,
+  `CONTRIBUTING.md` (Python-adapted), `.github/PULL_REQUEST_TEMPLATE.md`,
+  `.github/ISSUE_TEMPLATE/{bug_report,feature_request}.md`,
+  `.github/dependabot.yml` (github-actions + pip ecosystems weekly),
+  and `.github/workflows/cla.yml` (delegates to AInvirion's org-wide
+  reusable CLA Assistant workflow).
+- **`SECURITY.md`** with private-advisory reporting flow + SLA
+  targets (#63).
+- **Per-repo Telegram notifications for scheduled secops** (#74).
+  Scheduled-sweep starts emit a 🔄 message; each blocked / failed
+  result fans out a per-repo message with the actual question
+  (or error) and session id; final aggregate summary kept for
+  at-a-glance scan. Fixes the previous "⏸️ Scheduled secops: 2
+  run(s) blocked on user input" with no repo names or question
+  text.
+- **CLI surfaces blocking question** (#75). `ctrlrelay run secops`
+  now prints `Question:` (yellow) when blocked and `Error:` (red)
+  when failed-but-not-blocked, mirroring the scheduled-path
+  Telegram fan-out.
+- **`[project.urls]`** in `pyproject.toml` — Homepage, Documentation,
+  Repository, Issues, Changelog (PyPI sidebar links). Broader
+  classifiers (Python 3.13 + 3.14, macOS + Linux, Systems
+  Administration, Git) (#63).
 
 ### Changed
 
-- **`claude:` config key is deprecated.** The legacy `claude:`
-  top-level YAML key is still accepted as an alias (with a
-  `DeprecationWarning` at load time), and the Python attribute
-  `config.claude` still works via a property that mirrors
-  `config.agent`. Both will be removed in a future release; rename
-  the key in your `orchestrator.yaml` at your convenience.
+- **License: MIT → Apache-2.0** (#65). Matches the AInvirion OSS
+  template. Includes `Copyright (c) 2026 AInvirion LLC. All Rights
+  Reserved.` Wheel metadata: `License-Expression: Apache-2.0`,
+  `License-File: LICENSE`.
+- **README repositioned for multi-agent** (#65). Tagline changed
+  from "Local-first orchestrator for Claude Code…" to
+  "…for headless coding agents…". New "Roadmap" section calls out
+  Codex / OpenCode / Hermes / Kiro as planned backends.
+  Prerequisites adds the `codex` CLI as an optional dependency for
+  the secops review step (was undocumented).
+- **`claude:` config key deprecated** (#73). The legacy YAML key
+  is still accepted as an alias (with a `DeprecationWarning` at
+  load), and `config.claude` works as a Python property mirroring
+  `config.agent`. Both removed in a future release; rename your
+  `orchestrator.yaml` at your convenience.
+- **CI workflow uses an explicit venv** (#68). `setup-uv` v5 → v7
+  required this — v7 dropped the implicit auto-venv and Ubuntu's
+  PEP-668 system Python refuses `--system`. Added a `uv venv`
+  step before `uv pip install`.
+
+### Removed
+
+- **Tracked operator state**: `config/orchestrator.yaml` and
+  `repos.manifest` (#63). Both contained personal Telegram
+  `chat_id`, private-org repo lists, and local paths. Untracked
+  via `git rm --cached`; only the `.example` ships publicly. Both
+  added to `.gitignore`.
+- **`uv.lock`** (#66). AInvirion Python-SDK convention: libraries
+  published to PyPI don't pin a resolver lock; consumers resolve
+  against declared ranges in `pyproject.toml`.
+
+### Security audit
+
+`git log --all` was scanned for Telegram bot tokens, AWS access
+keys, GitHub PATs, and Slack tokens — **zero matches, ever**. The
+live bot token only lives in `~/Library/LaunchAgents/*.plist`,
+outside the repo. No history rewrite needed.
+
+### Dependency updates
+
+Six GitHub Actions bumps from Dependabot, all major versions:
+`actions/checkout` 4 → 6 (#71), `actions/upload-artifact` 4 → 7
+(#69, paired with), `actions/download-artifact` 4 → 8 (#67),
+`actions/configure-pages` 5 → 6 (#72), `actions/deploy-pages`
+4 → 5 (#70), `astral-sh/setup-uv` 5 → 7 (#68).
 
 ## [0.1.4] - 2026-04-20
 
