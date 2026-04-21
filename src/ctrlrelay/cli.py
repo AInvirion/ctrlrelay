@@ -1102,19 +1102,53 @@ def poller_start(
                 return
 
             repo_config = repo_configs[0]
+
+            # Route by label: task_labels → task pipeline (report-only,
+            # no PR), otherwise dev pipeline. Case-insensitive match on
+            # the issue's label names. exclude_labels was already
+            # applied in poller.poll() so any issue reaching
+            # handle_issue is a candidate.
+            issue_labels = {
+                (lbl.get("name") or "").lower()
+                for lbl in (issue.get("labels") or [])
+            }
+            task_labels_lower = {
+                lbl.lower() for lbl in repo_config.automation.task_labels
+            }
+            is_task = bool(issue_labels & task_labels_lower)
+
             try:
-                result = await run_dev_issue(
-                    repo=repo,
-                    issue_number=issue_number,
-                    branch_template=repo_config.dev_branch_template,
-                    dispatcher=dispatcher,
-                    github=github,
-                    worktree=worktree,
-                    dashboard=None,
-                    state_db=state_db,
-                    transport=connected_transport,
-                    contexts_dir=config.paths.contexts,
-                )
+                if is_task:
+                    from ctrlrelay.pipelines.task import run_task_issue
+                    console.print(
+                        f"[dim]#{issue_number} routed to task "
+                        f"pipeline (matched labels: "
+                        f"{sorted(issue_labels & task_labels_lower)})[/dim]"
+                    )
+                    result = await run_task_issue(
+                        repo=repo,
+                        issue_number=issue_number,
+                        dispatcher=dispatcher,
+                        github=github,
+                        worktree=worktree,
+                        dashboard=None,
+                        state_db=state_db,
+                        transport=connected_transport,
+                        contexts_dir=config.paths.contexts,
+                    )
+                else:
+                    result = await run_dev_issue(
+                        repo=repo,
+                        issue_number=issue_number,
+                        branch_template=repo_config.dev_branch_template,
+                        dispatcher=dispatcher,
+                        github=github,
+                        worktree=worktree,
+                        dashboard=None,
+                        state_db=state_db,
+                        transport=connected_transport,
+                        contexts_dir=config.paths.contexts,
+                    )
 
                 # Lock-conflict retry hook. The poller marks issues seen
                 # BEFORE handle_issue runs, so a failed attempt would
@@ -1179,8 +1213,16 @@ def poller_start(
                 if connected_transport:
                     try:
                         if result.success:
-                            pr_url = result.outputs.get("pr_url", "")
-                            await transport.send(f"✅ PR ready: {pr_url}")
+                            if is_task:
+                                await transport.send(
+                                    f"✅ Task done on #{issue_number} "
+                                    f"({repo}): {result.summary}"
+                                )
+                            else:
+                                pr_url = result.outputs.get("pr_url", "")
+                                await transport.send(
+                                    f"✅ PR ready: {pr_url}"
+                                )
                         elif result.blocked:
                             await transport.send(
                                 f"⏸️ Blocked on #{issue_number}: {result.question}"
@@ -1360,6 +1402,7 @@ def poller_start(
 
             from ctrlrelay.pipelines.dev import resume_dev_from_pending
             from ctrlrelay.pipelines.secops import resume_secops_from_pending
+            from ctrlrelay.pipelines.task import resume_task_from_pending
 
             sweeper_transport = None
             if config.transport.type.value == "telegram" and config.transport.telegram:
@@ -1433,6 +1476,19 @@ def poller_start(
                                 repo=repo,
                                 answer=answer,
                                 branch_template=repo_cfg.dev_branch_template,
+                                dispatcher=dispatcher,
+                                github=github,
+                                worktree=worktree,
+                                dashboard=scheduled_dashboard,
+                                state_db=state_db,
+                                transport=sweeper_transport,
+                                contexts_dir=config.paths.contexts,
+                            )
+                        elif pipeline_name == "task":
+                            result = await resume_task_from_pending(
+                                session_id=session_id,
+                                repo=repo,
+                                answer=answer,
                                 dispatcher=dispatcher,
                                 github=github,
                                 worktree=worktree,

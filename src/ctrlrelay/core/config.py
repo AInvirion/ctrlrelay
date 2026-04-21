@@ -151,6 +151,14 @@ class AutomationConfig(BaseModel):
     exclude_labels: list[str] = Field(
         default_factory=lambda: ["manual", "operator", "instruction"]
     )
+    # Labels that route an issue to the task pipeline (run a command /
+    # investigate / report findings via issue comment) instead of the
+    # dev pipeline (branch + PR). Matching is case-insensitive; the
+    # first matching label wins. If both exclude_labels and
+    # task_labels match the same issue, exclude_labels takes
+    # precedence so "not for the agent at all" overrides "agent does
+    # this but differently".
+    task_labels: list[str] = Field(default_factory=lambda: ["task"])
 
 
 class RepoConfig(BaseModel):
