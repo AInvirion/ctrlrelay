@@ -518,7 +518,7 @@ def run_secops(
     """Run secops pipeline on configured repos."""
     import asyncio
 
-    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+    from ctrlrelay.core.dispatcher import make_agent_dispatcher
     from ctrlrelay.core.github import GitHubCLI
     from ctrlrelay.core.state import StateDB
     from ctrlrelay.core.worktree import WorktreeManager
@@ -545,10 +545,7 @@ def run_secops(
         return
 
     db = StateDB(config.paths.state_db)
-    dispatcher = ClaudeDispatcher(
-        claude_binary=config.claude.binary,
-        default_timeout=config.claude.default_timeout_seconds,
-    )
+    dispatcher = make_agent_dispatcher(config.agent)
     github = GitHubCLI()
     worktree = WorktreeManager(
         worktrees_dir=config.paths.worktrees,
@@ -624,7 +621,7 @@ def run_dev(
     """Run dev pipeline for a GitHub issue."""
     import asyncio
 
-    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+    from ctrlrelay.core.dispatcher import make_agent_dispatcher
     from ctrlrelay.core.github import GitHubCLI
     from ctrlrelay.core.state import StateDB
     from ctrlrelay.core.worktree import WorktreeManager
@@ -660,10 +657,7 @@ def run_dev(
     branch_template = repo_config.dev_branch_template
 
     db = StateDB(config.paths.state_db)
-    dispatcher = ClaudeDispatcher(
-        claude_binary=config.claude.binary,
-        default_timeout=config.claude.default_timeout_seconds,
-    )
+    dispatcher = make_agent_dispatcher(config.agent)
     github = GitHubCLI()
     worktree = WorktreeManager(
         worktrees_dir=config.paths.worktrees,
@@ -850,7 +844,7 @@ def poller_start(
 
     pid_file.write_text(str(os.getpid()))
     try:
-        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+        from ctrlrelay.core.dispatcher import make_agent_dispatcher
         from ctrlrelay.core.github import GitHubCLI
         from ctrlrelay.core.poller import IssuePoller, run_poll_loop
         from ctrlrelay.core.scheduler import make_scheduler
@@ -920,10 +914,7 @@ def poller_start(
         # grace only catches up on fires that happened AFTER registration.
 
         state_db = StateDB(config.paths.state_db)
-        dispatcher = ClaudeDispatcher(
-            claude_binary=config.claude.binary,
-            default_timeout=config.claude.default_timeout_seconds,
-        )
+        dispatcher = make_agent_dispatcher(config.agent)
         worktree = WorktreeManager(
             worktrees_dir=config.paths.worktrees,
             bare_repos_dir=config.paths.bare_repos,

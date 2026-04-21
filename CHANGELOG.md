@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-agent config surface.** The top-level config section
+  renamed from `claude:` to `agent:` and gained a `type:` field
+  selecting which backend adapter the dispatcher uses. Today the
+  only implemented type is `"claude"`; `codex`, `opencode`, `hermes`,
+  `kiro`, etc. are planned. The new `AgentAdapter` protocol (in
+  `src/ctrlrelay/core/dispatcher.py`) defines the seam every backend
+  must satisfy, and `make_agent_dispatcher()` is the factory that
+  routes by `type`. Unknown types fail loudly at daemon startup
+  with a pointer to the adapter interface so a config typo doesn't
+  silently fall back to Claude.
+
+### Changed
+
+- **`claude:` config key is deprecated.** The legacy `claude:`
+  top-level YAML key is still accepted as an alias (with a
+  `DeprecationWarning` at load time), and the Python attribute
+  `config.claude` still works via a property that mirrors
+  `config.agent`. Both will be removed in a future release; rename
+  the key in your `orchestrator.yaml` at your convenience.
+
 ## [0.1.4] - 2026-04-20
 
 Big day: daemon UX, a security fix, and the scheduler finally lands. The

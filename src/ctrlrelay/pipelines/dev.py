@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ctrlrelay.core.checkpoint import CheckpointStatus
-from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier, VerificationResult
@@ -35,7 +35,7 @@ _logger = get_logger("pipeline.dev")
 class DevPipeline:
     """Dev pipeline for implementing issues and opening PRs."""
 
-    dispatcher: ClaudeDispatcher
+    dispatcher: AgentAdapter
     github: GitHubCLI
     worktree: WorktreeManager
     dashboard: DashboardClient | None
@@ -316,7 +316,7 @@ async def run_dev_issue(
     repo: str,
     issue_number: int,
     branch_template: str,
-    dispatcher: ClaudeDispatcher,
+    dispatcher: AgentAdapter,
     github: GitHubCLI,
     worktree: WorktreeManager,
     dashboard: DashboardClient | None,

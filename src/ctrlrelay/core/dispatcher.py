@@ -1,4 +1,11 @@
-"""Claude subprocess dispatcher for ctrlrelay."""
+"""Headless coding-agent subprocess dispatcher for ctrlrelay.
+
+Today the only concrete adapter is :class:`ClaudeDispatcher` (wraps
+``claude -p``). The :func:`make_agent_dispatcher` factory is the seam
+where additional backends (Codex, OpenCode, Hermes, Kiro, …) will plug
+in: each adapter must expose the same async ``spawn_session`` shape
+so pipelines can stay agent-agnostic.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +14,12 @@ import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 
 from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
+
+if TYPE_CHECKING:
+    from ctrlrelay.core.config import AgentConfig
 
 
 def _find_claude() -> str:
@@ -142,3 +153,50 @@ class ClaudeDispatcher:
             stdout=stdout.decode(),
             stderr=stderr.decode(),
         )
+
+
+class AgentAdapter(Protocol):
+    """Protocol every coding-agent adapter must satisfy.
+
+    An adapter is a thin wrapper over an agent CLI that handles:
+    spawning the subprocess, passing the prompt and state-file path,
+    enforcing the timeout, and translating the checkpoint JSON the
+    agent writes into a :class:`SessionResult`.
+
+    Pipelines (dev, secops) only ever interact with this protocol —
+    they never import concrete adapters — so adding a new backend
+    means implementing this and registering it in
+    :func:`make_agent_dispatcher`.
+    """
+
+    async def spawn_session(
+        self,
+        session_id: str,
+        prompt: str,
+        working_dir: Path,
+        state_file: Path,
+        timeout: int | None = None,
+        resume_session_id: str | None = None,
+    ) -> SessionResult:
+        ...
+
+
+def make_agent_dispatcher(agent_config: "AgentConfig") -> AgentAdapter:
+    """Build an adapter for the configured ``agent.type``.
+
+    Raises :class:`NotImplementedError` with a clear error message if
+    the configured type has no adapter — makes a typo surface loudly
+    at daemon startup instead of silently falling back to Claude.
+    """
+    t = agent_config.type
+    if t == "claude":
+        return ClaudeDispatcher(
+            claude_binary=agent_config.binary,
+            default_timeout=agent_config.default_timeout_seconds,
+        )
+    raise NotImplementedError(
+        f"agent.type={t!r} has no adapter yet. Implement one that "
+        "satisfies the AgentAdapter protocol in "
+        "src/ctrlrelay/core/dispatcher.py and register it here, then "
+        "open a PR. Supported today: 'claude'."
+    )
