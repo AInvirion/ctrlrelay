@@ -34,3 +34,6 @@ config/orchestrator.yaml
 # local list of repos to clone; no reason to track it publicly.
 repos.manifest
 
+
+# Lock file — not committed per AInvirion Python-SDK convention.
+uv.lock
