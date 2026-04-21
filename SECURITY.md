@@ -14,7 +14,7 @@ us a private channel to triage the report and lets you get credit in the
 published advisory when we release a fix.
 
 If you cannot use GitHub for any reason, email
-`oscar.valenzuela.b@gmail.com` with the subject line
+`security@ainvirion.com` with the subject line
 `ctrlrelay: security report`.
 
 We aim to acknowledge reports within **72 hours** and ship a fix or
