@@ -140,11 +140,17 @@ class TestDevPipeline:
 
     @pytest.mark.asyncio
     async def test_request_fix_resumes_session_with_instructions(self, tmp_path: Path) -> None:
-        """request_fix should resume the session using the provided fix prompt."""
+        """request_fix should resume the session using the agent (Claude) UUID
+        looked up from state_db, not our composite session id."""
+        import time as _time
+
         from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
         from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.state import StateDB
         from ctrlrelay.pipelines.base import PipelineContext
         from ctrlrelay.pipelines.dev import DevPipeline
+
+        agent_uuid = "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
 
         mock_dispatcher = AsyncMock()
         mock_dispatcher.spawn_session.return_value = SessionResult(
@@ -152,6 +158,7 @@ class TestDevPipeline:
             exit_code=0,
             stdout="",
             stderr="",
+            agent_session_id=agent_uuid,
             state=CheckpointState(
                 version="1",
                 status=CheckpointStatus.DONE,
@@ -162,12 +169,21 @@ class TestDevPipeline:
             ),
         )
 
+        state_db = StateDB(tmp_path / "state.db")
+        state_db.execute(
+            """INSERT INTO sessions (id, pipeline, repo, status, started_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("dev-123", "dev", "owner/repo", "running", int(_time.time())),
+        )
+        state_db.set_agent_session_id("dev-123", agent_uuid)
+        state_db.commit()
+
         pipeline = DevPipeline(
             dispatcher=mock_dispatcher,
             github=MagicMock(),
             worktree=MagicMock(),
             dashboard=None,
-            state_db=MagicMock(),
+            state_db=state_db,
             transport=None,
         )
 
@@ -186,8 +202,139 @@ class TestDevPipeline:
 
         assert result.success
         call_kwargs = mock_dispatcher.spawn_session.call_args.kwargs
-        assert call_kwargs["resume_session_id"] == "dev-123"
+        assert call_kwargs["resume_session_id"] == agent_uuid
         assert call_kwargs["prompt"] == fix_prompt
+        state_db.close()
+
+    @pytest.mark.asyncio
+    async def test_request_fix_skips_resume_when_no_agent_uuid(
+        self, tmp_path: Path
+    ) -> None:
+        """If state_db has no agent UUID (e.g. session predates the fix),
+        request_fix should fall back to a fresh spawn (no --resume) rather
+        than hard-failing with `claude --resume <composite-id>`."""
+        import time as _time
+
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.dev import DevPipeline
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="dev-123",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            agent_session_id=None,
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.DONE,
+                session_id="dev-123",
+                timestamp="2026-04-17T12:00:00Z",
+                summary="ok",
+                outputs={},
+            ),
+        )
+
+        state_db = StateDB(tmp_path / "state.db")
+        state_db.execute(
+            """INSERT INTO sessions (id, pipeline, repo, status, started_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("dev-123", "dev", "owner/repo", "running", int(_time.time())),
+        )
+        state_db.commit()
+
+        pipeline = DevPipeline(
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+        )
+
+        ctx = PipelineContext(
+            session_id="dev-123",
+            repo="owner/repo",
+            worktree_path=tmp_path,
+            context_path=tmp_path / "CLAUDE.md",
+            state_file=tmp_path / "state.json",
+            issue_number=123,
+            extra={},
+        )
+
+        await pipeline.request_fix(ctx, "fix it")
+
+        call_kwargs = mock_dispatcher.spawn_session.call_args.kwargs
+        assert call_kwargs["resume_session_id"] is None
+        state_db.close()
+
+    @pytest.mark.asyncio
+    async def test_run_persists_agent_session_id_to_state_db(
+        self, tmp_path: Path
+    ) -> None:
+        """After a spawn_session that returns an agent UUID, the pipeline
+        must persist it to state_db so future resumes can look it up."""
+        import time as _time
+
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.dev import DevPipeline
+
+        agent_uuid = "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="dev-123",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            agent_session_id=agent_uuid,
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.DONE,
+                session_id="dev-123",
+                timestamp="2026-04-17T12:00:00Z",
+                summary="ok",
+                outputs={"pr_number": 42, "pr_url": "https://github.com/o/r/pull/42"},
+            ),
+        )
+
+        state_db = StateDB(tmp_path / "state.db")
+        state_db.execute(
+            """INSERT INTO sessions (id, pipeline, repo, status, started_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("dev-123", "dev", "owner/repo", "running", int(_time.time())),
+        )
+        state_db.commit()
+
+        pipeline = DevPipeline(
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+        )
+
+        ctx = PipelineContext(
+            session_id="dev-123",
+            repo="owner/repo",
+            worktree_path=tmp_path,
+            context_path=tmp_path / "CLAUDE.md",
+            state_file=tmp_path / "state.json",
+            issue_number=123,
+            extra={},
+        )
+
+        await pipeline.run(ctx)
+
+        assert state_db.get_agent_session_id("dev-123") == agent_uuid
+        state_db.close()
 
     @pytest.mark.asyncio
     async def test_run_dev_issue_posts_claim_comment(self, tmp_path: Path) -> None:
@@ -378,7 +525,11 @@ class TestRunDevIssueVerification:
     """Verifies run_dev_issue waits for CI and checks mergeability before DONE."""
 
     @staticmethod
-    def _make_done_state(session_id: str = "dev-123", pr_number: int = 42):
+    def _make_done_state(
+        session_id: str = "dev-123",
+        pr_number: int = 42,
+        agent_session_id: str | None = "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10",
+    ):
         from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
         from ctrlrelay.core.dispatcher import SessionResult
 
@@ -387,6 +538,7 @@ class TestRunDevIssueVerification:
             exit_code=0,
             stdout="",
             stderr="",
+            agent_session_id=agent_session_id,
             state=CheckpointState(
                 version="1",
                 status=CheckpointStatus.DONE,
@@ -488,7 +640,10 @@ class TestRunDevIssueVerification:
         # Claude invoked twice: initial + fix request
         assert mock_dispatcher.spawn_session.call_count == 2
         fix_call = mock_dispatcher.spawn_session.call_args_list[1].kwargs
-        assert fix_call["resume_session_id"] == fix_call["session_id"]
+        # Resume must use Claude's UUID, not our composite id — newer claude
+        # CLI versions reject non-UUID strings passed to --resume.
+        assert fix_call["resume_session_id"] == "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
+        assert fix_call["resume_session_id"] != fix_call["session_id"]
         assert "ci" in fix_call["prompt"].lower() or "check" in fix_call["prompt"].lower()
 
     @pytest.mark.asyncio
@@ -534,6 +689,8 @@ class TestRunDevIssueVerification:
         assert mock_dispatcher.spawn_session.call_count == 2
         fix_call = mock_dispatcher.spawn_session.call_args_list[1].kwargs
         assert "conflict" in fix_call["prompt"].lower()
+        assert fix_call["resume_session_id"] == "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
+        assert fix_call["resume_session_id"] != fix_call["session_id"]
 
     @pytest.mark.asyncio
     async def test_run_dev_issue_blocked_asks_transport_and_resumes(
@@ -548,12 +705,14 @@ class TestRunDevIssueVerification:
         from ctrlrelay.core.state import StateDB
         from ctrlrelay.pipelines.dev import run_dev_issue
 
+        agent_uuid = "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
         # 1st spawn = BLOCKED with a question. 2nd spawn (resume) = DONE.
         blocked = SessionResult(
             session_id="dev-123",
             exit_code=0,
             stdout="",
             stderr="",
+            agent_session_id=agent_uuid,
             state=CheckpointState(
                 version="1",
                 status=CheckpointStatus.BLOCKED_NEEDS_INPUT,
@@ -567,6 +726,7 @@ class TestRunDevIssueVerification:
             exit_code=0,
             stdout="",
             stderr="",
+            agent_session_id=agent_uuid,
             state=CheckpointState(
                 version="1",
                 status=CheckpointStatus.DONE,
@@ -624,7 +784,10 @@ class TestRunDevIssueVerification:
         # Dispatcher was called twice: initial run + resume-with-answer.
         assert mock_dispatcher.spawn_session.call_count == 2
         resume_kwargs = mock_dispatcher.spawn_session.await_args_list[1].kwargs
-        assert resume_kwargs["resume_session_id"] == resume_kwargs["session_id"]
+        # Resume must use Claude's UUID captured on the first spawn, not our
+        # composite id (newer claude CLI rejects non-UUID --resume values).
+        assert resume_kwargs["resume_session_id"] == agent_uuid
+        assert resume_kwargs["resume_session_id"] != resume_kwargs["session_id"]
         assert "pin to 2.4.1" in resume_kwargs["prompt"]
 
         # Final result is the DONE state.

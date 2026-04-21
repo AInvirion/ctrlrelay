@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at INTEGER NOT NULL,
     ended_at INTEGER,
     claude_exit_code INTEGER,
-    summary TEXT
+    summary TEXT,
+    agent_session_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS repo_locks (
@@ -80,7 +81,25 @@ class StateDB:
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Apply in-place schema additions to databases written by older versions.
+
+        SQLite's ``CREATE TABLE IF NOT EXISTS`` preserves the *existing* shape
+        if the table was created by a prior version, so additive column bumps
+        need a guarded ALTER. We check ``PRAGMA table_info`` and only ALTER
+        when the column is missing.
+        """
+        existing = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "agent_session_id" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN agent_session_id TEXT"
+            )
 
     def close(self) -> None:
         """Close the database connection."""
@@ -165,3 +184,32 @@ class StateDB:
         """
         rows = self._conn.execute("SELECT * FROM repo_locks").fetchall()
         return [dict(row) for row in rows]
+
+    # Agent session ids
+
+    def set_agent_session_id(self, session_id: str, agent_session_id: str) -> None:
+        """Persist Claude's session UUID against our composite session id.
+
+        ``agent_session_id`` is what ``claude --resume`` needs — our
+        composite id fails validation on newer CLI versions.
+        """
+        self._conn.execute(
+            "UPDATE sessions SET agent_session_id = ? WHERE id = ?",
+            (agent_session_id, session_id),
+        )
+        self._conn.commit()
+
+    def get_agent_session_id(self, session_id: str) -> str | None:
+        """Fetch Claude's session UUID for a given composite session id.
+
+        Returns ``None`` if the row is missing or the column was never set
+        (sessions that predate the agent-uuid capture).
+        """
+        row = self._conn.execute(
+            "SELECT agent_session_id FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        value = row["agent_session_id"]
+        return value if value else None

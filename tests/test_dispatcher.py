@@ -133,6 +133,130 @@ class TestClaudeDispatcher:
             assert result.state.outputs["merged_prs"] == [1, 2, 3]
 
     @pytest.mark.asyncio
+    async def test_spawn_session_captures_agent_session_id_from_json(
+        self, tmp_path: Path
+    ) -> None:
+        """Should parse Claude's session_id UUID out of JSON stdout and attach
+        it to the returned SessionResult as agent_session_id."""
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+        dispatcher = ClaudeDispatcher(claude_binary="claude")
+
+        agent_uuid = "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
+        payload = json.dumps({
+            "type": "result",
+            "session_id": agent_uuid,
+            "result": "ok",
+        }).encode()
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (payload, b"")
+        mock_proc.returncode = 0
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "version": "1",
+            "status": "DONE",
+            "session_id": "dev-o-r-1-abc",
+            "timestamp": "2026-04-20T00:00:00Z",
+            "summary": "ok",
+        }))
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await dispatcher.spawn_session(
+                session_id="dev-o-r-1-abc",
+                prompt="x",
+                working_dir=tmp_path,
+                state_file=state_file,
+            )
+
+        assert result.agent_session_id == agent_uuid
+        # Composite id still lives on .session_id for orchestrator bookkeeping.
+        assert result.session_id == "dev-o-r-1-abc"
+
+    @pytest.mark.asyncio
+    async def test_spawn_session_agent_session_id_none_when_stdout_not_json(
+        self, tmp_path: Path
+    ) -> None:
+        """If Claude didn't emit JSON (e.g. error output), agent_session_id is None."""
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+        dispatcher = ClaudeDispatcher(claude_binary="claude")
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"not json at all", b"")
+        mock_proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await dispatcher.spawn_session(
+                session_id="sid",
+                prompt="x",
+                working_dir=tmp_path,
+                state_file=tmp_path / "state.json",
+            )
+
+        assert result.agent_session_id is None
+
+    @pytest.mark.asyncio
+    async def test_spawn_session_passes_resume_session_id_verbatim(
+        self, tmp_path: Path
+    ) -> None:
+        """--resume must receive whatever resume_session_id we pass — the
+        dispatcher does not substitute our composite id."""
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+        dispatcher = ClaudeDispatcher(claude_binary="claude")
+
+        agent_uuid = "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"{}", b"")
+        mock_proc.returncode = 0
+
+        with patch(
+            "asyncio.create_subprocess_exec", return_value=mock_proc
+        ) as mock_exec:
+            await dispatcher.spawn_session(
+                session_id="dev-o-r-1-abc",
+                prompt="x",
+                working_dir=tmp_path,
+                state_file=tmp_path / "state.json",
+                resume_session_id=agent_uuid,
+            )
+
+        argv = mock_exec.call_args.args
+        assert "--resume" in argv
+        assert argv[argv.index("--resume") + 1] == agent_uuid
+        # Never our composite id.
+        assert "dev-o-r-1-abc" not in argv
+
+    @pytest.mark.asyncio
+    async def test_spawn_session_no_resume_flag_when_none(
+        self, tmp_path: Path
+    ) -> None:
+        """Fresh spawns (resume_session_id=None) must not include --resume."""
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+        dispatcher = ClaudeDispatcher(claude_binary="claude")
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"{}", b"")
+        mock_proc.returncode = 0
+
+        with patch(
+            "asyncio.create_subprocess_exec", return_value=mock_proc
+        ) as mock_exec:
+            await dispatcher.spawn_session(
+                session_id="dev-o-r-1-abc",
+                prompt="x",
+                working_dir=tmp_path,
+                state_file=tmp_path / "state.json",
+            )
+
+        argv = mock_exec.call_args.args
+        assert "--resume" not in argv
+
+    @pytest.mark.asyncio
     async def test_spawn_session_parses_blocked_state(self, tmp_path: Path) -> None:
         """Should parse BLOCKED_NEEDS_INPUT checkpoint state."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
