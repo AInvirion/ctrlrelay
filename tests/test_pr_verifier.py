@@ -100,6 +100,74 @@ class TestPRVerifier:
         assert checks[0]["bucket"] == "pass"
 
     @pytest.mark.asyncio
+    async def test_wait_for_checks_fails_closed_when_every_poll_errors(
+        self,
+    ) -> None:
+        """Codex P1 on PR #108: if every gh call fails up to the
+        deadline, returning empty `[]` would be misread by the caller
+        as "no CI configured" and silently greenlight the PR while
+        GitHub was actually down. wait_for_checks must raise the last
+        transient error instead of returning empty when no successful
+        read ever happened."""
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.pr_verifier import PRVerifier
+
+        # Always-fail callable so the loop never exhausts the mock
+        # (a side_effect list would StopIteration once spent).
+        async def always_fail(*_args, **_kwargs):
+            raise GitHubError("gh failed: HTTP 503 Service Unavailable")
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks = AsyncMock(side_effect=always_fail)
+
+        # Tiny poll_interval keeps the test fast while still bounded
+        # by the wall-clock deadline.
+        verifier = PRVerifier(github=mock_github, poll_interval=0.01)
+
+        with pytest.raises(GitHubError) as exc_info:
+            await verifier.wait_for_checks(
+                "owner/repo", 42, timeout=0.2
+            )
+        assert "503" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_wait_for_checks_succeeds_after_transient_then_recovery(
+        self,
+    ) -> None:
+        """The fail-closed guard only fires when no successful read
+        ever happened. Once a poll returns checks, even if subsequent
+        polls fail, the most recent successful state wins on deadline."""
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.pr_verifier import PRVerifier
+
+        call_count = 0
+
+        async def flaky(*_args, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return [
+                    {"name": "ci", "state": "IN_PROGRESS",
+                     "bucket": "pending"},
+                ]
+            # Then errors forever until the deadline.
+            raise GitHubError("gh failed: HTTP 503")
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks = AsyncMock(side_effect=flaky)
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0.01)
+        checks = await verifier.wait_for_checks(
+            "owner/repo", 42, timeout=0.2
+        )
+
+        # Had a successful read — return what we last saw, no raise.
+        assert checks == [
+            {"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"}
+        ]
+        assert call_count >= 2  # at least the pending + one error
+
+    @pytest.mark.asyncio
     async def test_wait_for_checks_treats_gh_error_as_pending(self) -> None:
         """Same retry-on-transient behavior for GitHubError — covers the
         case where `gh` exits non-zero (rate limit back-off, brief auth
