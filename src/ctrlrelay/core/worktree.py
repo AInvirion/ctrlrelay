@@ -568,11 +568,43 @@ class WorktreeManager:
         await self._run_git("push", "-u", "origin", branch, cwd=worktree_path)
 
     async def ensure_bare_repo(self, repo: str) -> Path:
-        """Ensure bare repo exists, cloning if needed."""
+        """Ensure bare repo exists, cloning if needed.
+
+        Uses an explicit refspec on fetch instead of relying on
+        ``remote.origin.fetch`` config. Some bare clones in the wild
+        have the refspec missing or empty; ``git fetch --all`` is a
+        silent no-op in that case, so repeated calls never update
+        ``refs/heads/*``. Worktrees created from that stale bare
+        then check out commits days or weeks behind origin —
+        exactly what we saw today when a task-pipeline run reported
+        test counts from a commit that was two weeks old.
+
+        Refspec: ``refs/heads/*:refs/heads/*`` (no leading ``+``).
+        Fast-forward-only on purpose — codex caught this on the
+        first pass: a force update would clobber the dev pipeline's
+        ``create_worktree_with_new_branch`` reuse path, which keeps
+        local-ahead-of-origin commits when a prior session pushed
+        partial work. Non-force semantics give us the right
+        behavior in all three cases:
+
+        - Local branch BEHIND origin (default-branch case, the bug
+          we're fixing): fast-forward applies, local catches up.
+        - Local branch AHEAD of origin (unpushed dev work): fetch
+          refuses to rewind, local stays as-is, dev's reuse logic
+          gets to inspect divergence and decide.
+        - Local and origin equal: no-op.
+
+        ``--prune`` drops refs that no longer exist on origin so
+        deleted branches don't linger forever.
+        """
         bare_path = self._get_bare_repo_path(repo)
 
         if bare_path.exists():
-            await self._run_git("fetch", "--all", cwd=bare_path)
+            await self._run_git(
+                "fetch", "--prune", "origin",
+                "refs/heads/*:refs/heads/*",
+                cwd=bare_path,
+            )
         else:
             await self._run_git(
                 "clone", "--bare",

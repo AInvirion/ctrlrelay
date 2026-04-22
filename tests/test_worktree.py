@@ -53,6 +53,50 @@ class TestWorktreeManager:
             assert any("clone" in str(c) and "--bare" in str(c) for c in calls)
 
     @pytest.mark.asyncio
+    async def test_ensure_bare_repo_fetches_with_explicit_refspec(
+        self, tmp_path: Path
+    ) -> None:
+        """When the bare already exists, fetch must use an explicit
+        refspec — some bare clones have no remote.origin.fetch config
+        so `git fetch --all` is a silent no-op. Without explicit
+        refspec we saw a task-pipeline run report test counts from a
+        commit two weeks behind origin. The fix writes
+        ``refs/heads/*:refs/heads/*`` directly so ``refs/heads/main``
+        stays in sync regardless of config state. Non-force on
+        purpose so dev's branch-reuse path can still preserve
+        unpushed local commits — see assertion below."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        # Pre-create the bare so ensure_bare_repo takes the fetch branch.
+        bare = manager._get_bare_repo_path("owner/repo")
+        bare.mkdir(parents=True)
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.return_value = ""
+            await manager.ensure_bare_repo("owner/repo")
+
+        assert mock_git.await_count == 1
+        args = mock_git.await_args.args
+        # Must be a fetch, not --all, with the explicit refspec.
+        assert args[0] == "fetch"
+        assert "origin" in args
+        # Non-force refspec on purpose: codex P1 — a force fetch
+        # would destroy unpushed local commits in the dev pipeline's
+        # branch-reuse flow. Fast-forward-only fixes the stale-
+        # default-branch case while leaving divergent dev branches
+        # for the reuse logic to handle.
+        assert "refs/heads/*:refs/heads/*" in args
+        assert "+refs/heads/*:refs/heads/*" not in args
+        assert "--prune" in args
+        # Explicit refspec must win over the bare `--all` that used to
+        # silently no-op on refspec-less repos.
+        assert "--all" not in args
+
+    @pytest.mark.asyncio
     async def test_remove_worktree(self, tmp_path: Path) -> None:
         """Should remove worktree and prune."""
         from ctrlrelay.core.worktree import WorktreeManager
