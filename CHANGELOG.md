@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-04-22
+
+Patch release. Closes #90 — three related polish items on the
+`ctrlrelay ci wait` helper / `PRVerifier.wait_for_checks` polling
+loop, plus a fail-closed safety fix caught by codex on the PR.
+
+### Fixed
+
+- **Short timeouts now honored.** `wait_for_checks` used to block
+  the full `poll_interval` before noticing a shorter `--timeout`
+  budget was over. Repro: `ctrlrelay ci wait --timeout 1
+  --interval 15` returned in ~15s instead of ~1s. Now the per-
+  iteration sleep is capped at the remaining wall-clock deadline.
+- **Transient `gh` errors no longer leak as tracebacks.**
+  `asyncio.TimeoutError` from a hung `gh` subprocess used to
+  surface as an unhandled Python stack trace. The polling loop now
+  catches it (and `GitHubError`) inside the loop, logs
+  `pr_verifier.transient_gh_error`, and retries the next tick.
+- **Persistent `gh` failures now fail closed** (codex P1). If
+  every poll errors up to the deadline and no successful read ever
+  happened, `wait_for_checks` raises the last transient error
+  instead of returning `[]`. Without this, the empty list was
+  misread by callers as "no CI configured" and silently
+  greenlighted PRs while GitHub was down.
+- **Wall-clock deadline.** Switched from accumulated-sleep elapsed
+  tracking to a monotonic `loop.time()` deadline, which is correct
+  even with `poll_interval=0` and unaffected by wall-clock jumps.
+
+### Operator notes
+
+- Upgrade via `uv tool install ctrlrelay@latest --force` and
+  restart poller + bridge. No schema or config changes.
+- `ctrlrelay ci wait --pr <N> --timeout <s>` invocations with
+  short timeouts will now return promptly. Existing dev-pipeline
+  PR verification calls behave identically except in the
+  GitHub-fully-down scenario, where they will now surface a clean
+  failure instead of silently passing.
+
 ## [0.1.11] - 2026-04-22
 
 Patch release. Fixes a stale-bare-repo bug that caused worktrees
