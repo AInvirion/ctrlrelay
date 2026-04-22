@@ -6,7 +6,10 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from ctrlrelay.core.github import GitHubCLI
+from ctrlrelay.core.github import GitHubCLI, GitHubError
+from ctrlrelay.core.obs import get_logger, log_event
+
+_logger = get_logger("core.pr_verifier")
 
 # `gh pr checks --json bucket` returns one of: pass, fail, pending, skipping, cancel.
 # Treat skipping as pass (skipped jobs don't block a merge) and everything except
@@ -68,25 +71,75 @@ class PRVerifier:
         `gh pr create` so a single empty read is ambiguous — the repo might
         have no CI, or CI just hasn't registered yet. We require
         `_EMPTY_CHECKS_CONFIRM_POLLS` consecutive empty reads separated by
-        `poll_interval` before concluding "no CI configured"."""
+        `poll_interval` before concluding "no CI configured".
+
+        Transient `gh` failures (subprocess timeout, GitHubError) are
+        treated as "still pending" and retried on the next iteration —
+        a flaky network or a GitHub rate-limit back-off shouldn't abort
+        the wait. The outer `limit` deadline is the safety net.
+
+        Sleep cap: when called with `timeout < poll_interval` the loop
+        used to block the full `poll_interval` before noticing the
+        deadline (issue #90). Now caps `sleep` at `max(0, limit -
+        elapsed)` so a 1-second timeout with a 15-second interval
+        returns within ~1 second.
+        """
         limit = self.check_timeout if timeout is None else timeout
-        elapsed = 0
+        loop = asyncio.get_event_loop()
+        # Wall-clock deadline (monotonic) so the loop terminates even
+        # if `poll_interval` is 0 and every poll errors — accumulating
+        # sleep durations would loop forever in that case because
+        # max(0, 0) is still 0.
+        deadline = loop.time() + limit
         empty_streak = 0
         checks: list[dict[str, Any]] = []
+        had_successful_read = False
+        last_transient_error: Exception | None = None
         while True:
-            checks = await self.github.get_pr_checks(repo, pr_number)
-            if not checks:
-                empty_streak += 1
-                if empty_streak >= _EMPTY_CHECKS_CONFIRM_POLLS:
-                    return checks
+            try:
+                checks = await self.github.get_pr_checks(repo, pr_number)
+            except (GitHubError, asyncio.TimeoutError) as e:
+                # Transient gh failure — treat as still-pending, retry
+                # on next iteration. Unconditional re-raise of
+                # asyncio.TimeoutError used to surface as an ugly
+                # traceback in `ctrlrelay ci wait` (issue #90).
+                last_transient_error = e
+                log_event(
+                    _logger,
+                    "pr_verifier.transient_gh_error",
+                    repo=repo,
+                    pr_number=pr_number,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                )
             else:
-                empty_streak = 0
-                if all(c.get("bucket") not in _PENDING_BUCKETS for c in checks):
-                    return checks
-            if elapsed >= limit:
+                had_successful_read = True
+                last_transient_error = None
+                if not checks:
+                    empty_streak += 1
+                    if empty_streak >= _EMPTY_CHECKS_CONFIRM_POLLS:
+                        return checks
+                else:
+                    empty_streak = 0
+                    if all(
+                        c.get("bucket") not in _PENDING_BUCKETS
+                        for c in checks
+                    ):
+                        return checks
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # Fail closed if every poll failed: an empty `checks`
+                # list would be misread as "no CI configured" and the
+                # caller would silently greenlight the PR while
+                # GitHub was actually unavailable. Surface the last
+                # transient error so the CLI / verify() can react —
+                # the widened except clause in `ci_wait` catches it
+                # cleanly. (Codex P1 caught on the first PR pass.)
+                if not had_successful_read and last_transient_error is not None:
+                    raise last_transient_error
                 return checks
-            await asyncio.sleep(self.poll_interval)
-            elapsed += self.poll_interval
+            sleep_for = min(self.poll_interval, remaining)
+            await asyncio.sleep(sleep_for)
 
     async def verify(
         self,

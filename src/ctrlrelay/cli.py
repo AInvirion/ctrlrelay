@@ -788,9 +788,15 @@ def ci_wait(
         checks = asyncio.run(
             verifier.wait_for_checks(repo, pr, timeout=timeout)
         )
-    except GitHubError as e:
-        console.print(f"[red]gh error:[/red] {e}")
-        raise typer.Exit(1)
+    except (GitHubError, asyncio.TimeoutError) as e:
+        # wait_for_checks already retries transient errors internally;
+        # this except is defense-in-depth for any leak past the retry
+        # window (e.g. repeated timeouts that exhaust the deadline
+        # mid-call). Surface a clean message instead of a traceback.
+        console.print(
+            f"[red]gh error ({type(e).__name__}):[/red] {e}"
+        )
+        raise typer.Exit(1) from e
 
     pending = [c for c in checks if c.get("bucket") == "pending"]
     failing = [
