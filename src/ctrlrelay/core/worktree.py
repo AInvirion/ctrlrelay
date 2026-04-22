@@ -579,19 +579,30 @@ class WorktreeManager:
         exactly what we saw today when a task-pipeline run reported
         test counts from a commit that was two weeks old.
 
-        ``+refs/heads/*:refs/heads/*`` writes remote branch heads
-        directly to local branch refs (the standard bare-clone
-        convention). The leading ``+`` force-updates so a non-fast-
-        forward rewind on origin is reflected instead of silently
-        ignored. ``--prune`` drops refs that no longer exist on
-        origin so deleted branches don't linger forever.
+        Refspec: ``refs/heads/*:refs/heads/*`` (no leading ``+``).
+        Fast-forward-only on purpose — codex caught this on the
+        first pass: a force update would clobber the dev pipeline's
+        ``create_worktree_with_new_branch`` reuse path, which keeps
+        local-ahead-of-origin commits when a prior session pushed
+        partial work. Non-force semantics give us the right
+        behavior in all three cases:
+
+        - Local branch BEHIND origin (default-branch case, the bug
+          we're fixing): fast-forward applies, local catches up.
+        - Local branch AHEAD of origin (unpushed dev work): fetch
+          refuses to rewind, local stays as-is, dev's reuse logic
+          gets to inspect divergence and decide.
+        - Local and origin equal: no-op.
+
+        ``--prune`` drops refs that no longer exist on origin so
+        deleted branches don't linger forever.
         """
         bare_path = self._get_bare_repo_path(repo)
 
         if bare_path.exists():
             await self._run_git(
                 "fetch", "--prune", "origin",
-                "+refs/heads/*:refs/heads/*",
+                "refs/heads/*:refs/heads/*",
                 cwd=bare_path,
             )
         else:

@@ -82,7 +82,13 @@ class TestWorktreeManager:
         # Must be a fetch, not --all, with the explicit refspec.
         assert args[0] == "fetch"
         assert "origin" in args
-        assert "+refs/heads/*:refs/heads/*" in args
+        # Non-force refspec on purpose: codex P1 — a force fetch
+        # would destroy unpushed local commits in the dev pipeline's
+        # branch-reuse flow. Fast-forward-only fixes the stale-
+        # default-branch case while leaving divergent dev branches
+        # for the reuse logic to handle.
+        assert "refs/heads/*:refs/heads/*" in args
+        assert "+refs/heads/*:refs/heads/*" not in args
         assert "--prune" in args
         # Explicit refspec must win over the bare `--all` that used to
         # silently no-op on refspec-less repos.
