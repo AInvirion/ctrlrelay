@@ -61,8 +61,10 @@ class TestWorktreeManager:
         so `git fetch --all` is a silent no-op. Without explicit
         refspec we saw a task-pipeline run report test counts from a
         commit two weeks behind origin. The fix writes
-        ``+refs/heads/*:refs/heads/*`` directly so ``refs/heads/main``
-        stays in sync regardless of config state."""
+        ``refs/heads/*:refs/heads/*`` directly so ``refs/heads/main``
+        stays in sync regardless of config state. Non-force on
+        purpose so dev's branch-reuse path can still preserve
+        unpushed local commits — see assertion below."""
         from ctrlrelay.core.worktree import WorktreeManager
 
         manager = WorktreeManager(
