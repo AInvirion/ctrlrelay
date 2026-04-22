@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-04-22
+
+Patch release. Fixes a stale-bare-repo bug that caused worktrees
+to check out commits days or weeks behind origin — caught by the
+v0.1.10 task pipeline e2e test, where the agent reported pytest
+counts from a two-week-old commit.
+
+### Fixed
+
+- **`ensure_bare_repo` uses an explicit fetch refspec.** Previous
+  `git fetch --all` was a silent no-op on bare clones with no
+  `remote.origin.fetch` config (a state several real bare clones
+  in the wild were in). The new explicit
+  `refs/heads/*:refs/heads/*` refspec writes remote branch heads
+  directly to local refs regardless of config state. Non-force on
+  purpose: dev pipeline's branch-reuse path needs to preserve
+  unpushed-local commits, which a force fetch would clobber
+  (codex P1 caught on the first PR pass).
+
+### Operator notes
+
+- Upgrade via `uv tool install ctrlrelay@latest --force` and
+  restart poller + bridge. No schema changes.
+- One-time cleanup (already done on the maintainer's box): if you
+  have existing bare clones that may be stale, run from
+  `~/.ctrlrelay/repos`:
+  ```bash
+  for b in *.git; do
+    git --git-dir="$b" fetch --prune origin 'refs/heads/*:refs/heads/*'
+  done
+  ```
+  Subsequent ensure_bare_repo calls will keep them current.
+
 ## [0.1.10] - 2026-04-21
 
 Adds a new "task" pipeline for GitHub issues whose outcome is
