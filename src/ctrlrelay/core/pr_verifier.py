@@ -6,7 +6,10 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from ctrlrelay.core.github import GitHubCLI
+from ctrlrelay.core.github import GitHubCLI, GitHubError
+from ctrlrelay.core.obs import get_logger, log_event
+
+_logger = get_logger("core.pr_verifier")
 
 # `gh pr checks --json bucket` returns one of: pass, fail, pending, skipping, cancel.
 # Treat skipping as pass (skipped jobs don't block a merge) and everything except
@@ -68,25 +71,58 @@ class PRVerifier:
         `gh pr create` so a single empty read is ambiguous — the repo might
         have no CI, or CI just hasn't registered yet. We require
         `_EMPTY_CHECKS_CONFIRM_POLLS` consecutive empty reads separated by
-        `poll_interval` before concluding "no CI configured"."""
+        `poll_interval` before concluding "no CI configured".
+
+        Transient `gh` failures (subprocess timeout, GitHubError) are
+        treated as "still pending" and retried on the next iteration —
+        a flaky network or a GitHub rate-limit back-off shouldn't abort
+        the wait. The outer `limit` deadline is the safety net.
+
+        Sleep cap: when called with `timeout < poll_interval` the loop
+        used to block the full `poll_interval` before noticing the
+        deadline (issue #90). Now caps `sleep` at `max(0, limit -
+        elapsed)` so a 1-second timeout with a 15-second interval
+        returns within ~1 second.
+        """
         limit = self.check_timeout if timeout is None else timeout
         elapsed = 0
         empty_streak = 0
         checks: list[dict[str, Any]] = []
         while True:
-            checks = await self.github.get_pr_checks(repo, pr_number)
-            if not checks:
-                empty_streak += 1
-                if empty_streak >= _EMPTY_CHECKS_CONFIRM_POLLS:
-                    return checks
+            try:
+                checks = await self.github.get_pr_checks(repo, pr_number)
+            except (GitHubError, asyncio.TimeoutError) as e:
+                # Transient gh failure — treat as still-pending, retry
+                # on next iteration. Unconditional re-raise of
+                # asyncio.TimeoutError used to surface as an ugly
+                # traceback in `ctrlrelay ci wait` (issue #90).
+                log_event(
+                    _logger,
+                    "pr_verifier.transient_gh_error",
+                    repo=repo,
+                    pr_number=pr_number,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                )
             else:
-                empty_streak = 0
-                if all(c.get("bucket") not in _PENDING_BUCKETS for c in checks):
-                    return checks
+                if not checks:
+                    empty_streak += 1
+                    if empty_streak >= _EMPTY_CHECKS_CONFIRM_POLLS:
+                        return checks
+                else:
+                    empty_streak = 0
+                    if all(
+                        c.get("bucket") not in _PENDING_BUCKETS
+                        for c in checks
+                    ):
+                        return checks
             if elapsed >= limit:
                 return checks
-            await asyncio.sleep(self.poll_interval)
-            elapsed += self.poll_interval
+            sleep_for = min(
+                self.poll_interval, max(0, limit - elapsed)
+            )
+            await asyncio.sleep(sleep_for)
+            elapsed += sleep_for
 
     async def verify(
         self,

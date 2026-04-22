@@ -1,5 +1,7 @@
 """Tests for PR verification (CI checks + mergeability)."""
 
+import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -40,6 +42,83 @@ class TestPRVerifier:
         checks = await verifier.wait_for_checks("owner/repo", 42, timeout=5)
 
         assert mock_github.get_pr_checks.call_count == 3
+        assert checks[0]["bucket"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_checks_honors_timeout_shorter_than_poll_interval(
+        self,
+    ) -> None:
+        """Issue #90.1: timeout < poll_interval used to block the full
+        poll_interval before noticing it was over budget. Now the sleep
+        is capped at the remaining deadline so a 0.5s timeout with a
+        15s interval returns within ~0.5s."""
+        from ctrlrelay.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks.return_value = [
+            {"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"},
+        ]
+
+        verifier = PRVerifier(github=mock_github, poll_interval=15)
+        start = time.monotonic()
+        checks = await verifier.wait_for_checks(
+            "owner/repo", 42, timeout=1
+        )
+        elapsed = time.monotonic() - start
+
+        # Permissive upper bound — actual sleep should be ~1s, not 15s.
+        # 5s is well under the broken 15s and well over the expected 1s.
+        assert elapsed < 5, (
+            f"wait_for_checks blocked {elapsed:.1f}s on a 1s timeout — "
+            "sleep cap regression"
+        )
+        assert checks[0]["bucket"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_checks_treats_gh_timeout_as_pending(self) -> None:
+        """Issue #90.2: an asyncio.TimeoutError from the underlying gh
+        subprocess used to escape as an unhandled exception out of
+        wait_for_checks. Now it's logged and the loop retries — same
+        treatment as a transient GitHubError."""
+        from ctrlrelay.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        # First call: gh subprocess hangs and times out. Second call:
+        # checks come back green. Without the fix, the first
+        # TimeoutError would propagate and never reach the second call.
+        mock_github.get_pr_checks.side_effect = [
+            asyncio.TimeoutError("gh subprocess hung"),
+            [{"name": "ci", "state": "SUCCESS", "bucket": "pass"}],
+        ]
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        checks = await verifier.wait_for_checks(
+            "owner/repo", 42, timeout=10
+        )
+
+        assert mock_github.get_pr_checks.call_count == 2
+        assert checks[0]["bucket"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_checks_treats_gh_error_as_pending(self) -> None:
+        """Same retry-on-transient behavior for GitHubError — covers the
+        case where `gh` exits non-zero (rate limit back-off, brief auth
+        glitch, network blip)."""
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.pr_verifier import PRVerifier
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_checks.side_effect = [
+            GitHubError("gh failed: HTTP 502"),
+            [{"name": "ci", "state": "SUCCESS", "bucket": "pass"}],
+        ]
+
+        verifier = PRVerifier(github=mock_github, poll_interval=0)
+        checks = await verifier.wait_for_checks(
+            "owner/repo", 42, timeout=10
+        )
+
+        assert mock_github.get_pr_checks.call_count == 2
         assert checks[0]["bucket"] == "pass"
 
     @pytest.mark.asyncio
