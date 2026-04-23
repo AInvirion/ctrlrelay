@@ -321,6 +321,113 @@ class TestPRWatches:
         assert [r["started_at"] for r in rows] == [100, 200]
         db.close()
 
+    def test_set_pr_watch_cleanup_phase_persists_value(
+        self, tmp_path: Path
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42, issue_number=77,
+            session_id="sess-1", pr_url="u",
+        )
+        db.set_pr_watch_cleanup_phase("owner/r1", 42, "commented")
+        assert db.get_pr_watch_cleanup_phase("owner/r1", 42) == "commented"
+        db.set_pr_watch_cleanup_phase("owner/r1", 42, "closed")
+        assert db.get_pr_watch_cleanup_phase("owner/r1", 42) == "closed"
+        db.set_pr_watch_cleanup_phase("owner/r1", 42, "notified")
+        assert db.get_pr_watch_cleanup_phase("owner/r1", 42) == "notified"
+        db.close()
+
+    def test_get_pr_watch_cleanup_phase_returns_none_for_fresh_row(
+        self, tmp_path: Path
+    ) -> None:
+        """A freshly-added watch has no phase yet — get() must return
+        None so handle_merge_with_retry starts from the beginning."""
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42, issue_number=77,
+            session_id=None, pr_url=None,
+        )
+        assert db.get_pr_watch_cleanup_phase("owner/r1", 42) is None
+        db.close()
+
+    def test_get_pr_watch_cleanup_phase_returns_none_for_missing_row(
+        self, tmp_path: Path
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        assert db.get_pr_watch_cleanup_phase("owner/r1", 42) is None
+        db.close()
+
+    def test_set_pr_watch_cleanup_phase_rejects_unknown_value(
+        self, tmp_path: Path
+    ) -> None:
+        """Invalid phases would break resume semantics — fail loudly
+        rather than writing a value that rehydration will interpret
+        as 'nothing done yet'."""
+        import pytest
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42, issue_number=77,
+            session_id=None, pr_url=None,
+        )
+        with pytest.raises(ValueError):
+            db.set_pr_watch_cleanup_phase("owner/r1", 42, "bogus")
+        db.close()
+
+    def test_add_pr_watch_preserves_cleanup_phase_on_conflict(
+        self, tmp_path: Path
+    ) -> None:
+        """Rehydrate path: the re-insert in pr_watch_task must not
+        clobber the stored cleanup_phase. Otherwise a resumed watcher
+        would re-run every step the prior run already completed."""
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42, issue_number=77,
+            session_id="sess-1", pr_url="u1",
+        )
+        db.set_pr_watch_cleanup_phase("owner/r1", 42, "closed")
+        # Rehydrate simulates pr_watch_task re-adding its row. The
+        # phase must survive — that's the whole point of durable
+        # resume.
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42, issue_number=77,
+            session_id="sess-2", pr_url="u2",
+        )
+        assert db.get_pr_watch_cleanup_phase("owner/r1", 42) == "closed"
+        db.close()
+
+    def test_cleanup_phase_column_added_to_preexisting_pr_watches(
+        self, tmp_path: Path
+    ) -> None:
+        """Older DBs created by the first cut of PR #111 have a
+        pr_watches table without cleanup_phase. Migration must ALTER
+        it in, otherwise set_pr_watch_cleanup_phase raises on an
+        OperationalError and resume-after-restart breaks."""
+        import sqlite3
+        db_path = tmp_path / "state.db"
+        # Simulate the OLD schema: pr_watches without cleanup_phase.
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE pr_watches (
+                repo TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                session_id TEXT,
+                issue_number INTEGER NOT NULL,
+                pr_url TEXT,
+                started_at INTEGER NOT NULL,
+                PRIMARY KEY (repo, pr_number)
+            )"""
+        )
+        conn.commit()
+        conn.close()
+        # Re-opening via StateDB should run _migrate and add the col.
+        db = StateDB(db_path)
+        cols = {
+            row[1]
+            for row in db.execute("PRAGMA table_info(pr_watches)").fetchall()
+        }
+        assert "cleanup_phase" in cols
+        db.close()
+
     def test_pr_watches_table_added_to_preexisting_db(
         self, tmp_path: Path
     ) -> None:

@@ -30,6 +30,35 @@ _HANDLE_MERGE_RETRY_ATTEMPTS = 5
 _HANDLE_MERGE_RETRY_BASE_DELAY = 5  # seconds; doubled each attempt
 
 
+def _stamp_phase(
+    state_db: StateDB | None,
+    repo: str,
+    pr_number: int,
+    phase: str,
+    session_id: str | None,
+    issue_number: int,
+) -> None:
+    """Best-effort persist the current cleanup phase. Called after
+    each side effect succeeds so a resumed watcher can skip work
+    already done. A DB failure must never abort the cleanup loop —
+    the alternative is abandoning a known-merged PR because SQLite
+    had a transient hiccup. Worst case with a swallowed failure is
+    a duplicate comment on the narrow restart window; best case
+    (DB healthy, which is essentially always) resume is exact."""
+    if state_db is None:
+        return
+    try:
+        state_db.set_pr_watch_cleanup_phase(repo, pr_number, phase)
+    except Exception as e:
+        log_event(
+            _logger, "dev.pr.watch_persist_failed",
+            session_id=session_id, repo=repo,
+            issue_number=issue_number, pr_number=pr_number,
+            reason=type(e).__name__, error=str(e)[:200],
+            phase=f"stamp:{phase}",
+        )
+
+
 async def handle_merge(
     repo: str,
     pr_number: int,
@@ -85,34 +114,47 @@ async def _handle_merge_with_retry(
     github: GitHubCLI,
     transport_factory: Callable[[], Awaitable[Transport | None]] | None,
     session_id: str | None,
+    state_db: StateDB | None = None,
 ) -> None:
     """Run the post-merge close + notify steps with per-step idempotent
     retry, rebuilding the transport on each attempt so a bridge restart
     mid-retry doesn't permanently break the notification.
 
-    Idempotency: ``github.close_issue`` is called at most once even
-    across retries — if it succeeds but the notification step later
-    fails, subsequent attempts skip the close so we don't post
-    duplicate "Closed by PR #N" comments.
+    Idempotency within a single call: each side-effect is gated by its
+    own local flag so retries don't duplicate work.
+
+    Idempotency across restarts: when ``state_db`` is supplied, each
+    completed step stamps a ``cleanup_phase`` on the ``pr_watches``
+    row (commented → closed → notified). On entry we read the phase
+    and pre-set the local flags so a rehydrated watcher resumes from
+    where the prior process left off instead of re-posting the close
+    comment or re-firing the Telegram notification.
 
     Transport rebuild: ``transport_factory`` is invoked INSIDE each
-    attempt. If the bridge socket drops between the watcher start and
-    a merge several days later, or during a retry, the next attempt
-    gets a fresh connection.
+    attempt so a bridge restart mid-retry gets a fresh socket.
 
     On final exhaustion, raises the last exception; pr_watch_task's
     outer handler logs it as dev.pr.watch_failed.
     """
-    # Split the post-merge work into three independent steps with
-    # their own idempotency flags. close_issue() in the github layer
-    # is NOT atomic — it posts a comment then runs `gh issue close`.
-    # If the close fails after the comment succeeded, a retry that
-    # called close_issue again would post a DUPLICATE comment.
-    # Tracking each sub-step separately ensures every side-effect
-    # runs at most once across retries.
     comment_posted = False
     issue_closed = False
     notification_sent = False
+    if state_db is not None:
+        # Rehydration: skip every step the prior process already
+        # completed. The phase is monotonic (commented → closed →
+        # notified) so higher phases imply all lower phases done.
+        try:
+            prior_phase = state_db.get_pr_watch_cleanup_phase(
+                repo, pr_number
+            )
+        except Exception:
+            prior_phase = None
+        if prior_phase in ("commented", "closed", "notified"):
+            comment_posted = True
+        if prior_phase in ("closed", "notified"):
+            issue_closed = True
+        if prior_phase == "notified":
+            notification_sent = True
     last_exc: Exception | None = None
     delay = _HANDLE_MERGE_RETRY_BASE_DELAY
     comment = f"Closed by PR #{pr_number}"
@@ -148,14 +190,20 @@ async def _handle_merge_with_retry(
             if not comment_posted:
                 await github.comment_on_issue(repo, issue_number, comment)
                 comment_posted = True
+                _stamp_phase(state_db, repo, pr_number, "commented",
+                             session_id, issue_number)
             if not issue_closed:
                 await github._run_gh(
                     "issue", "close", str(issue_number), "--repo", repo,
                 )
                 issue_closed = True
+                _stamp_phase(state_db, repo, pr_number, "closed",
+                             session_id, issue_number)
             if not notification_sent and transport is not None:
                 await transport.send(notification)
                 notification_sent = True
+                _stamp_phase(state_db, repo, pr_number, "notified",
+                             session_id, issue_number)
 
             # Done when either: we sent the notification this round, OR
             # the factory returned None meaning no channel was ever
@@ -293,6 +341,7 @@ async def pr_watch_task(
                 issue_number=issue_number, github=github,
                 transport_factory=transport_factory,
                 session_id=session_id,
+                state_db=state_db,
             )
         # Drop the durable row only AFTER post-merge cleanup fully
         # completes (merged path) or after we've given up on timeout.

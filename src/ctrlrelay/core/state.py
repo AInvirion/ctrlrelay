@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS pr_watches (
     issue_number INTEGER NOT NULL,
     pr_url TEXT,
     started_at INTEGER NOT NULL,
+    cleanup_phase TEXT,
     PRIMARY KEY (repo, pr_number)
 );
 
@@ -143,6 +144,17 @@ class StateDB:
         if "agent_session_id" not in existing:
             self._conn.execute(
                 "ALTER TABLE sessions ADD COLUMN agent_session_id TEXT"
+            )
+
+        pr_watches_cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(pr_watches)"
+            ).fetchall()
+        }
+        if pr_watches_cols and "cleanup_phase" not in pr_watches_cols:
+            self._conn.execute(
+                "ALTER TABLE pr_watches ADD COLUMN cleanup_phase TEXT"
             )
 
     def close(self) -> None:
@@ -440,3 +452,52 @@ class StateDB:
             "SELECT * FROM pr_watches ORDER BY started_at ASC"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # Valid post-merge cleanup phases, in monotonic progression. Each
+    # phase stamps *after* its side effect has succeeded, so if the
+    # poller is killed mid-cleanup and rehydrates later, the resumed
+    # handle_merge can skip every step the prior run already completed.
+    _PR_WATCH_CLEANUP_PHASES = frozenset(
+        {"commented", "closed", "notified"}
+    )
+
+    def set_pr_watch_cleanup_phase(
+        self, repo: str, pr_number: int, phase: str
+    ) -> None:
+        """Stamp a durable marker that a given post-merge cleanup step
+        has succeeded for this watch. Caller must invoke AFTER the
+        side effect completes so a process kill between the stamp and
+        the next step never leaves us claiming work we didn't do.
+
+        Validated: ``phase`` must be one of the known monotonic values
+        (``commented`` / ``closed`` / ``notified``). An invalid value
+        raises rather than silently corrupting resume semantics.
+        """
+        if phase not in self._PR_WATCH_CLEANUP_PHASES:
+            raise ValueError(
+                f"invalid pr_watches cleanup_phase: {phase!r}; "
+                f"expected one of {sorted(self._PR_WATCH_CLEANUP_PHASES)}"
+            )
+        self._conn.execute(
+            "UPDATE pr_watches SET cleanup_phase = ? "
+            "WHERE repo = ? AND pr_number = ?",
+            (phase, repo, pr_number),
+        )
+        self._conn.commit()
+
+    def get_pr_watch_cleanup_phase(
+        self, repo: str, pr_number: int
+    ) -> str | None:
+        """Read the persisted cleanup phase for a watch, used by
+        rehydration so handle_merge can skip completed steps. Returns
+        None when the row is missing or the phase column is NULL
+        (fresh watch that never reached cleanup)."""
+        row = self._conn.execute(
+            "SELECT cleanup_phase FROM pr_watches "
+            "WHERE repo = ? AND pr_number = ?",
+            (repo, pr_number),
+        ).fetchone()
+        if row is None:
+            return None
+        value = row["cleanup_phase"]
+        return value if value else None

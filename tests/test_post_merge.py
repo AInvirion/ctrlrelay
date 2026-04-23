@@ -868,6 +868,189 @@ class TestPRWatchTaskPersistence:
         db.close()
 
     @pytest.mark.asyncio
+    async def test_phase_stamped_after_each_cleanup_step(
+        self, tmp_path: Path
+    ) -> None:
+        """Each post-merge side effect must stamp a durable phase AFTER
+        the effect succeeds, so a rehydrated watcher knows exactly
+        what's left to do. Without this the codex P2 replay bug
+        returns: crash between comment and close → restart posts a
+        duplicate comment."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+
+        sent_messages: list[str] = []
+
+        class FakeTransport:
+            async def send(self, msg):
+                sent_messages.append(msg)
+
+            async def close(self):
+                pass
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        async def factory():
+            return FakeTransport()
+
+        outcome = await pr_watch_task(
+            repo="owner/repo", issue_number=77,
+            pr_url="https://github.com/owner/repo/pull/42",
+            pr_number=42, session_id="sess-1",
+            github=mock_github, transport_factory=factory,
+            poll_interval=0, timeout=5, state_db=db,
+        )
+        assert outcome["merged"] is True
+        # Row was removed on clean completion — can't read phase from
+        # a deleted row, but we can assert each side effect ran once:
+        assert mock_github.comment_on_issue.call_count == 1
+        assert mock_github._run_gh.call_count == 1  # the issue close
+        assert len(sent_messages) == 1
+        assert db.list_pr_watches() == []
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_rehydrate_from_commented_phase_skips_comment(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2 fix: if the prior run posted the close comment but
+        crashed before closing the issue, the rehydrated watcher must
+        NOT post a duplicate comment. It should pick up from the close
+        step."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+        # Simulate state left by a crashed prior run: row exists with
+        # phase='commented' (comment was posted, then process died).
+        db.add_pr_watch(
+            repo="owner/repo", pr_number=42, issue_number=77,
+            session_id="prev-sess",
+            pr_url="https://github.com/owner/repo/pull/42",
+        )
+        db.set_pr_watch_cleanup_phase("owner/repo", 42, "commented")
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        async def factory():
+            return None  # no transport configured
+
+        outcome = await pr_watch_task(
+            repo="owner/repo", issue_number=77,
+            pr_url="https://github.com/owner/repo/pull/42",
+            pr_number=42, session_id="sess-new",
+            github=mock_github, transport_factory=factory,
+            poll_interval=0, timeout=5, state_db=db,
+        )
+        assert outcome["merged"] is True
+        # Comment was already posted by the prior run — must NOT be
+        # re-posted.
+        assert mock_github.comment_on_issue.call_count == 0
+        # Issue close SHOULD run (that's the step that failed before).
+        assert mock_github._run_gh.call_count == 1
+        assert db.list_pr_watches() == []
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_rehydrate_from_closed_phase_skips_comment_and_close(
+        self, tmp_path: Path
+    ) -> None:
+        """If the prior run closed the issue but died before
+        notification, the rehydrated watcher must re-send only the
+        notification. No duplicate comment, no re-close on an
+        already-closed issue."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/repo", pr_number=42, issue_number=77,
+            session_id="prev-sess",
+            pr_url="https://github.com/owner/repo/pull/42",
+        )
+        db.set_pr_watch_cleanup_phase("owner/repo", 42, "closed")
+
+        sent_messages: list[str] = []
+
+        class FakeTransport:
+            async def send(self, msg):
+                sent_messages.append(msg)
+
+            async def close(self):
+                pass
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        async def factory():
+            return FakeTransport()
+
+        outcome = await pr_watch_task(
+            repo="owner/repo", issue_number=77,
+            pr_url="https://github.com/owner/repo/pull/42",
+            pr_number=42, session_id="sess-new",
+            github=mock_github, transport_factory=factory,
+            poll_interval=0, timeout=5, state_db=db,
+        )
+        assert outcome["merged"] is True
+        assert mock_github.comment_on_issue.call_count == 0
+        assert mock_github._run_gh.call_count == 0
+        assert len(sent_messages) == 1
+        assert db.list_pr_watches() == []
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_rehydrate_from_notified_phase_skips_all_steps(
+        self, tmp_path: Path
+    ) -> None:
+        """Narrow terminal window: prior run completed every step but
+        crashed before remove_pr_watch. Rehydrate must recognize the
+        work is done and just drop the row — no duplicate anything."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/repo", pr_number=42, issue_number=77,
+            session_id="prev-sess",
+            pr_url="https://github.com/owner/repo/pull/42",
+        )
+        db.set_pr_watch_cleanup_phase("owner/repo", 42, "notified")
+
+        sent_messages: list[str] = []
+
+        class FakeTransport:
+            async def send(self, msg):
+                sent_messages.append(msg)
+
+            async def close(self):
+                pass
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        async def factory():
+            return FakeTransport()
+
+        outcome = await pr_watch_task(
+            repo="owner/repo", issue_number=77,
+            pr_url="https://github.com/owner/repo/pull/42",
+            pr_number=42, session_id="sess-new",
+            github=mock_github, transport_factory=factory,
+            poll_interval=0, timeout=5, state_db=db,
+        )
+        assert outcome["merged"] is True
+        assert mock_github.comment_on_issue.call_count == 0
+        assert mock_github._run_gh.call_count == 0
+        assert sent_messages == []
+        assert db.list_pr_watches() == []
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_state_db_optional_no_op_when_absent(self) -> None:
         """Legacy callers can still pass no state_db; the watcher must
         work in-memory-only just like before."""
