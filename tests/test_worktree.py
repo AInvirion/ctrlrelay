@@ -868,14 +868,12 @@ class TestWorktreeManager:
         ]
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            # Probe is now deferred until AFTER ls-remote confirms the
-            # branch is on origin (no open same-repo PR can exist for a
-            # local-only branch). Sequence: show-ref → worktree list →
-            # ls-remote (on_remote=True) → probe raises.
+            # Probe runs BEFORE ls-remote (branch-deleted-PR-still-open
+            # is a real failure mode). Sequence: show-ref → worktree
+            # list → probe raises.
             mock_git.side_effect = [
                 "",        # show-ref (branch exists)
                 "",        # worktree list --porcelain (no live checkout)
-                "abc\trefs/heads/fix/issue-13\n",  # ls-remote (on origin)
             ]
             with pytest.raises(WorktreeError, match="#42") as exc_info:
                 await manager.create_worktree_with_new_branch(
@@ -964,17 +962,16 @@ class TestWorktreeManager:
         assert created_fresh is False
 
     @pytest.mark.asyncio
-    async def test_reuse_skips_pr_probe_for_local_only_branch(
+    async def test_reuse_probes_open_pr_even_for_local_only_branch(
         self, tmp_path: Path
     ) -> None:
-        """Codex P2 round-6 on #113: a branch that exists only in the
-        bare (not on origin) cannot back an open same-repo PR. Running
-        the probe unconditionally would let a flaky gh block safe
-        local-only retries (e.g. prior session died before push, or
-        merged PR auto-deleted the remote). Probe must be gated on
-        on-remote."""
-        from ctrlrelay.core.github import GitHubError
-        from ctrlrelay.core.worktree import WorktreeManager
+        """Codex P1 round-7 on #113: GitHub can keep a same-repo PR
+        open after its head branch is deleted on origin. If we skip
+        the probe for local-only branches, a retry would push the
+        branch back to origin and re-attach this session's commits
+        to the reviewer-owned PR. The probe therefore runs BEFORE
+        the on-remote gate, not after."""
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
@@ -983,41 +980,45 @@ class TestWorktreeManager:
         bare = tmp_path / "repos" / "owner-repo.git"
         bare.mkdir(parents=True)
 
+        # An open PR for this branch exists even though the head
+        # branch was deleted on origin (stale-merged-but-PR-still-
+        # open scenario).
         mock_github = AsyncMock()
-        # Probe would fail if called — but it MUST NOT be called.
-        mock_github.list_prs.side_effect = GitHubError(
-            "gh should not have been invoked for local-only branch"
-        )
+        mock_github.list_prs.return_value = [
+            {
+                "number": 88,
+                "headRefName": "fix/issue-42",
+                "headRepositoryOwner": {"login": "owner"},
+                "headRepository": {"name": "repo"},
+            },
+        ]
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            # ls-remote returns empty → local-only. _branch_is_fully_merged
-            # returns False (unpushed work) so we take the reuse path.
+            # Only the first two calls are reached — probe raises
+            # before ls-remote runs.
             mock_git.side_effect = [
-                "",     # show-ref (branch exists)
-                "",     # worktree list (no live checkout)
-                "",     # ls-remote (NOT on origin)
-                "",     # _branch_is_fully_merged's cherry call → "" = has commits
-                "+a",   # cherry output has a line not starting with "-" → unpushed
-                "",     # worktree add (without -b)
+                "",  # show-ref (branch exists)
+                "",  # worktree list (no live checkout)
             ]
-            # Short-circuit _branch_is_fully_merged rather than mock-
-            # chaining every git call: patch it directly to False.
-            with patch.object(
-                manager, "_branch_is_fully_merged",
-                new_callable=AsyncMock,
-            ) as mock_merged:
-                mock_merged.return_value = False
-                wt, created_fresh = await manager.create_worktree_with_new_branch(
+            with pytest.raises(WorktreeError, match="#88"):
+                await manager.create_worktree_with_new_branch(
                     repo="owner/repo",
-                    session_id="retry-local-only",
+                    session_id="retry-hijack-risk",
                     new_branch="fix/issue-42",
                     github=mock_github,
                 )
 
-        assert "retry-local-only" in str(wt)
-        assert created_fresh is False
-        # Probe was gated by on-remote=False — never called.
-        mock_github.list_prs.assert_not_awaited()
+        # Probe MUST be called for local-only branches too.
+        mock_github.list_prs.assert_awaited_once()
+        # No ls-remote / fetch / add — probe aborted before any
+        # ref-touching operation.
+        mutating_calls = [
+            c for c in mock_git.call_args_list
+            if "ls-remote" in c[0]
+            or "fetch" in c[0]
+            or ("worktree" in c[0] and "add" in c[0])
+        ]
+        assert mutating_calls == []
 
     @pytest.mark.asyncio
     async def test_reuse_refuses_open_pr_with_casing_mismatch(
@@ -1051,7 +1052,6 @@ class TestWorktreeManager:
             mock_git.side_effect = [
                 "",  # show-ref
                 "",  # worktree list
-                "abc\trefs/heads/fix/issue-13\n",  # ls-remote (on origin)
             ]
             with pytest.raises(WorktreeError, match="#17"):
                 await manager.create_worktree_with_new_branch(
@@ -1195,13 +1195,9 @@ class TestWorktreeManager:
         worktree_mod._PR_PROBE_RETRY_SLEEP_SECONDS = 0.0
         try:
             with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-                # Probe runs only when branch is on origin (that's when
-                # a same-repo PR could be backing it). Seed ls-remote
-                # to return the branch so we reach the probe path.
                 mock_git.side_effect = [
                     "",  # show-ref
                     "",  # worktree list
-                    "abc\trefs/heads/fix/issue-1\n",  # ls-remote
                 ]
                 with pytest.raises(
                     WorktreeError, match="backs an open PR"

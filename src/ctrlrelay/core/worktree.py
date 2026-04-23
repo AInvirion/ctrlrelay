@@ -216,6 +216,20 @@ class WorktreeManager:
                     "`git worktree remove` in the bare repo before retrying."
                 )
 
+            # Issue #52: probe for an open same-repo PR BEFORE any ref
+            # mutation. Must run for BOTH on-remote and local-only
+            # branches — GitHub can keep a PR open after its head
+            # branch is deleted, and our next push would recreate
+            # origin/<branch>, re-attaching this session's commits to
+            # the reviewer-owned PR (codex round-7). Fail-closed on
+            # probe error is the correct trade-off: a flaky gh can
+            # delay recovery, but a missed probe silently hijacks a
+            # PR. See _refuse_if_branch_backs_open_pr.
+            if github is not None:
+                await self._refuse_if_branch_backs_open_pr(
+                    github, repo, new_branch,
+                )
+
             # Remote presence has to be KNOWN to take either sync-to-origin
             # or stale-merged branches. branch_exists_on_remote is
             # fail-closed (returns True on timeout/auth error) which is
@@ -229,26 +243,12 @@ class WorktreeManager:
                     bare_path, new_branch,
                 )
             except Exception:
-                # Local-only (ref isn't on origin), so no open PR can be
-                # backing it — skip the open-PR probe entirely. This
-                # also means a flaky `gh` doesn't block otherwise-safe
-                # local recovery paths (issue #52 codex P2 round-6).
                 await self._worktree_add_with_stale_cleanup(
                     bare_path, worktree_path, new_branch,
                 )
                 return worktree_path, False
 
             if on_remote:
-                # Issue #52: branch is on origin, so a same-repo PR
-                # could be backing it. Probe MUST run before any ref
-                # mutation and before `gh pr create` later; otherwise
-                # the push below would hijack the reviewer's branch.
-                # Fail-closed on probe error — see
-                # _refuse_if_branch_backs_open_pr for the rationale.
-                if github is not None:
-                    await self._refuse_if_branch_backs_open_pr(
-                        github, repo, new_branch,
-                    )
                 # Remote exists → sync local to remote head (preserving
                 # unpushed ahead-of-origin commits) and reuse.
                 await self._sync_reused_branch_to_origin(bare_path, new_branch)
