@@ -1034,7 +1034,12 @@ class TestWorktreeManager:
             worktrees_dir=tmp_path / "worktrees",
             bare_repos_dir=tmp_path / "repos",
         )
-        bare = tmp_path / "repos" / "owner-repo.git"
+        # Bare dir name derives from the repo string verbatim — the
+        # code does `repo.replace("/", "-")` without lowering, so the
+        # "Owner/Repo" config produces "Owner-Repo.git" on disk. On
+        # Linux (case-sensitive FS) this must match exactly; macOS
+        # would accept either casing.
+        bare = tmp_path / "repos" / "Owner-Repo.git"
         bare.mkdir(parents=True)
 
         # Config says "Owner/Repo"; API returns lowercase.
