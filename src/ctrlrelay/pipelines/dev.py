@@ -24,15 +24,35 @@ DEFAULT_MAX_FIX_ATTEMPTS = 3
 DEFAULT_MAX_BLOCKED_ROUNDS = 5
 
 # Reacquire policy for the repo lock after the unlocked verification phase.
-# Verification only releases the lock because CI polling doesn't touch git;
-# when we need to run `request_fix` (which spawns claude + writes worktree)
-# we must get it back. Contention here is expected to be brief — another
-# session doing its own git-op phase — so a small retry budget with a
-# short sleep is enough to avoid a spurious failure. If we still can't
-# get it after the budget is exhausted, surface a clear typed error.
-_REACQUIRE_LOCK_ATTEMPTS = 6
+# Verification releases the lock because CI polling doesn't touch git; when
+# we need to run `request_fix` (which spawns claude + writes worktree) we
+# must get it back. Contention here is NOT necessarily brief — a peer
+# session may be running its own full claude pass on another issue in the
+# same repo, which can take tens of minutes. A short retry budget would
+# spuriously fail healthy same-repo parallelism; bound the wait at roughly
+# one hour, long enough to outlast a normal peer run and short enough to
+# escape a stuck/SIGKILL'd peer whose lock row is lingering.
+# Tests monkey-patch these to speed contention scenarios without changing
+# the call sites.
+_REACQUIRE_LOCK_ATTEMPTS = 720
 _REACQUIRE_LOCK_SLEEP_SECONDS = 5.0
+# Log progress periodically so an operator watching can see we're alive
+# and waiting, not hung. At 5s cadence this fires ~every 5 minutes.
+_REACQUIRE_PROGRESS_LOG_EVERY = 60
+
+# Two distinct error messages so callers can tell which phase of the
+# pipeline hit contention:
+#   INITIAL  — nothing started, safe to retry from scratch (cli un-marks
+#              the issue so the next poll picks it up).
+#   DURING_VERIFY — a PR already exists; re-running from scratch would
+#                   launch a duplicate dev pass against the open PR.
+#                   cli leaves the issue marked seen and only spawns the
+#                   PR merge watcher so the existing PR still auto-closes
+#                   on merge.
 _LOCK_CONTENDED_ERROR = "Repository locked by another session"
+_LOCK_CONTENDED_DURING_VERIFY_ERROR = (
+    "Repo lock reacquire contended during PR verification"
+)
 
 
 class _RepoLockHandle:
@@ -56,19 +76,37 @@ class _RepoLockHandle:
         self.held = False
 
     def release(self) -> None:
-        """Release the lock if we hold it. Safe to call multiple times
-        and safe to call from a ``finally`` that ran before acquire
-        succeeded."""
+        """Release the lock if we hold it. Idempotent and safe to call
+        from a ``finally`` block that may run before acquire ever
+        succeeded.
+
+        If the underlying DELETE raises (e.g. transient
+        ``database is locked`` from SQLite), we keep ``held=True`` so
+        subsequent release attempts retry. Flipping held=False after a
+        failed DELETE would wedge the repo: our stale row stays in
+        ``repo_locks`` rejecting peer acquires while our own code
+        believes the lock is free and tries to proceed.
+
+        The exception is logged and swallowed (release must not leak
+        exceptions from a finally path, where it would mask the
+        original error the caller was unwinding)."""
         if not self.held:
             return
         try:
             self.state_db.release_lock(self.repo, self.session_id)
-        finally:
-            # Even if the DELETE raised, mark released so a later call
-            # doesn't try again. A retained `held=True` after a failed
-            # release would have the outer ``finally`` issue a second
-            # DELETE anyway — not useful.
-            self.held = False
+        except Exception as e:
+            log_event(
+                _logger,
+                "dev.lock.release_failed",
+                session_id=self.session_id,
+                repo=self.repo,
+                reason=type(e).__name__,
+                error=str(e)[:200],
+            )
+            # Don't flip held — a later call (outer finally, etc.) will
+            # retry the DELETE once the transient condition clears.
+            return
+        self.held = False
 
     async def reacquire(
         self,
@@ -80,12 +118,11 @@ class _RepoLockHandle:
         success, False if contention persists past the retry budget.
 
         Retry budget: ``attempts`` INSERT tries separated by
-        ``sleep_seconds`` of sleep. Default 6×5s = up to 30s wait,
-        which is an order of magnitude longer than any pure-git phase
-        held by a peer session. If the peer is stuck in its own
-        verification phase we'd wait a very long time otherwise — but
-        that peer also releases before verify, so the remaining
-        git-held window is short by construction.
+        ``sleep_seconds`` of sleep. Default 720×5s ≈ 1 hour. That's
+        long enough to outlast a peer running its own full dev pass
+        on another issue in the same repo (claude + CI can take
+        tens of minutes), and short enough to escape a stuck or
+        SIGKILL'd peer whose lock row never got cleaned up.
 
         Defaults resolve at call time (``None`` sentinel) so tests can
         monkey-patch the module constants to speed up contention
@@ -105,6 +142,18 @@ class _RepoLockHandle:
             if self.state_db.acquire_lock(self.repo, self.session_id):
                 self.held = True
                 return True
+            # Surface a heartbeat every N attempts so an operator
+            # tailing logs during a long peer hold can tell the
+            # session is waiting, not wedged.
+            if attempt > 0 and attempt % _REACQUIRE_PROGRESS_LOG_EVERY == 0:
+                log_event(
+                    _logger,
+                    "dev.lock.reacquire_waiting",
+                    session_id=self.session_id,
+                    repo=self.repo,
+                    attempt=attempt,
+                    max_attempts=effective_attempts,
+                )
             if attempt < effective_attempts - 1:
                 await asyncio.sleep(effective_sleep)
         return False
@@ -457,7 +506,7 @@ async def _verify_and_fix_pr(
                         "but could not re-acquire repo lock after "
                         f"{_REACQUIRE_LOCK_ATTEMPTS} attempts"
                     ),
-                    error=_LOCK_CONTENDED_ERROR,
+                    error=_LOCK_CONTENDED_DURING_VERIFY_ERROR,
                     outputs=result.outputs,
                 )
 

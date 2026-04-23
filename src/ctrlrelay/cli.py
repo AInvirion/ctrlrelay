@@ -1235,10 +1235,10 @@ def poller_start(
                 # Lock-conflict retry hook. The poller marks issues seen
                 # BEFORE handle_issue runs, so a failed attempt would
                 # permanently drop the issue. If run_dev_issue couldn't
-                # acquire the per-repo lock (common when a scheduled
-                # secops sweep is mid-run on the same repo), un-mark the
-                # issue so the next poll picks it up. Any other failure
-                # still stays seen — those aren't transient.
+                # acquire the per-repo lock up front (common when a
+                # scheduled secops sweep is mid-run on the same repo),
+                # un-mark the issue so the next poll picks it up. Any
+                # other failure still stays seen — those aren't transient.
                 if (
                     not result.success
                     and not result.blocked
@@ -1260,6 +1260,28 @@ def poller_start(
                         except Exception:
                             pass
                     return
+
+                # Lock-contended DURING PR verification (issue #29): the
+                # PR already exists, so un-marking the issue would make
+                # the next poll launch a fresh dev pass against the open
+                # PR — duplicate work and merge-conflict territory.
+                # Leave the issue marked seen and fall through so the
+                # merge watcher still spawns for the existing PR and the
+                # operator still gets a notification.
+                if (
+                    not result.success
+                    and not result.blocked
+                    and result.error
+                    and "reacquire contended during pr verification"
+                    in result.error.lower()
+                ):
+                    pr_num_str = result.outputs.get("pr_number", "?")
+                    console.print(
+                        f"[yellow]#{issue_number} in {repo}: lock "
+                        f"contention during PR verification — leaving "
+                        f"seen (PR #{pr_num_str} already open). Merge "
+                        "watcher still spawns.[/yellow]"
+                    )
 
                 # Spawn the PR watcher FIRST, before any best-effort
                 # notification. The poller has already marked this issue

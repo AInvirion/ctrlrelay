@@ -1379,9 +1379,16 @@ class TestRunDevIssueLockReleaseDuringVerify:
             dev_mod._REACQUIRE_LOCK_SLEEP_SECONDS = monkey_sleep
 
         assert not result.success
-        # Clear typed error so the caller / sweeper can distinguish
-        # "lock race lost, retry later" from "code actually broken".
-        assert result.error == dev_mod._LOCK_CONTENDED_ERROR
+        # Post-verify contention uses a DISTINCT error string from the
+        # initial acquire failure: the PR already exists, and if cli
+        # saw the same "Repository locked..." string it'd unmark the
+        # issue and a future poll would launch a duplicate dev pass.
+        assert result.error == dev_mod._LOCK_CONTENDED_DURING_VERIFY_ERROR
+        assert result.error != dev_mod._LOCK_CONTENDED_ERROR
+        # cli.handle_issue keys its "retry from scratch" branch on the
+        # substring below. This error must NOT match it — otherwise the
+        # whole point of the distinct string is lost.
+        assert "locked by another session" not in result.error.lower()
         # Dispatcher called exactly once — initial spawn only, never
         # got as far as request_fix because we couldn't reacquire.
         assert mock_dispatcher.spawn_session.call_count == 1
@@ -1460,3 +1467,95 @@ class TestRunDevIssueLockReleaseDuringVerify:
         # Lock table must be clean — no leaked row from this session.
         assert state_db.get_lock_holder("owner/repo") is None
         state_db.close()
+
+
+class TestRepoLockHandleReleaseSafety:
+    """_RepoLockHandle.release() must not flip held=False when the
+    underlying DELETE raised — otherwise our stale lock row stays in
+    repo_locks while our code thinks the lock is free, wedging every
+    peer session until someone cleans up manually (codex P2)."""
+
+    def test_release_keeps_held_true_when_db_raises(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import _RepoLockHandle
+
+        real = StateDB(tmp_path / "state.db")
+
+        class FlakyDB:
+            """Proxy that raises once on release, then delegates."""
+            def __init__(self, inner: StateDB):
+                self.inner = inner
+                self.release_calls = 0
+
+            def acquire_lock(self, *a, **kw):
+                return self.inner.acquire_lock(*a, **kw)
+
+            def release_lock(self, *a, **kw):
+                self.release_calls += 1
+                if self.release_calls == 1:
+                    raise RuntimeError("transient sqlite hiccup")
+                return self.inner.release_lock(*a, **kw)
+
+            def get_lock_holder(self, *a, **kw):
+                return self.inner.get_lock_holder(*a, **kw)
+
+        flaky = FlakyDB(real)
+        handle = _RepoLockHandle(flaky, "owner/repo", "sess-A")
+        assert flaky.acquire_lock("owner/repo", "sess-A") is True
+        handle.held = True
+
+        # First release raises inside release_lock. held must stay True
+        # so the caller knows the row may still be present.
+        handle.release()
+        assert handle.held is True, (
+            "held must stay True after a failed release — otherwise the "
+            "stale repo_locks row wedges peer sessions"
+        )
+
+        # Second release succeeds and clears held.
+        handle.release()
+        assert handle.held is False
+        assert flaky.release_calls == 2
+        assert real.get_lock_holder("owner/repo") is None
+        real.close()
+
+    def test_release_is_idempotent_when_not_held(
+        self, tmp_path: Path
+    ) -> None:
+        """Safe to call from a finally that ran before acquire ever
+        succeeded — no DB round-trip, no exceptions."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import _RepoLockHandle
+
+        db = StateDB(tmp_path / "state.db")
+        handle = _RepoLockHandle(db, "owner/repo", "sess-A")
+        # Never acquired.
+        handle.release()
+        handle.release()
+        assert handle.held is False
+        db.close()
+
+
+class TestRepoLockHandleReacquireBudget:
+    """The default reacquire budget must be generous enough that a
+    healthy peer session running a full claude pass doesn't cause a
+    spurious contention failure (codex P1)."""
+
+    def test_default_budget_outlasts_typical_peer_run(self) -> None:
+        """A peer claude run can take 10-30 minutes. The default budget
+        must comfortably exceed that — otherwise same-repo parallelism
+        deterministically fails whenever a peer is mid-run."""
+        from ctrlrelay.pipelines import dev as dev_mod
+
+        total_seconds = (
+            dev_mod._REACQUIRE_LOCK_ATTEMPTS
+            * dev_mod._REACQUIRE_LOCK_SLEEP_SECONDS
+        )
+        # >= 30 minutes. Change-detector test: if someone knocks this
+        # back toward the old 30s cap, they need to justify why.
+        assert total_seconds >= 30 * 60, (
+            f"Reacquire budget of {total_seconds}s is too short to "
+            "outlast a normal peer claude run (10-30 min)"
+        )
