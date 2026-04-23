@@ -139,6 +139,7 @@ class TestDevPipelineCleanup:
         create_side_effect=None,
         created_fresh: bool = True,
         branch_existed_before: bool | None = None,
+        stale_recreate_flag_set: bool = False,
     ):
         """Run the dev pipeline with a stub dispatcher behavior, returning
         (result, mocks) so tests can assert on cleanup calls.
@@ -173,6 +174,12 @@ class TestDevPipelineCleanup:
             worktrees_dir=tmp_path / "worktrees",
             bare_repos_dir=tmp_path / "repos",
         )
+        # Simulate "helper entered stale-merged recreate path" so the
+        # exception cleanup can recognize the leftover ref as ours
+        # even though create_worktree_with_new_branch was mocked to
+        # raise and never set created_fresh=True.
+        if stale_recreate_flag_set:
+            worktree._last_stale_recreate_attempted = True
 
         mock_github = AsyncMock(spec=GitHubCLI)
         mock_github.get_issue.return_value = {
@@ -544,6 +551,54 @@ class TestDevPipelineCleanup:
         # git would refuse to delete the branch that's still "checked out".
         mock_remove_wt.assert_awaited_once()
         # we owned the branch, so it must be deleted
+        mock_delete_branch.assert_awaited_once()
+        assert mock_delete_branch.await_args.args[1] == "fix/issue-13"
+
+    @pytest.mark.asyncio
+    async def test_stale_recreate_partial_failure_cleans_up_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2 round-4 on #113. The branch existed before the
+        call (stale-merged leftover), so ``branch_existed_before``
+        snapshots True. create_worktree_with_new_branch commits to
+        the delete+recreate path, flips the worktree-level stale
+        flag, deletes the old ref, and then `git worktree add -b`
+        raises partway. No ``created_fresh`` signal because the
+        helper never returned.
+
+        Without the stale-recreate flag, cleanup would read
+        ``we_own_branch = False or False or not True = False`` and
+        skip delete_branch, leaking a partial ref into the next
+        retry. With the flag, ownership is correctly attributed to
+        this session and the branch gets deleted."""
+
+        async def create_partial_fail(**kwargs):
+            raise RuntimeError(
+                "worktree add -b failed after stale-merged recreate "
+                "deleted the old ref"
+            )
+
+        async def spawn(**kwargs):
+            raise AssertionError("spawn should not be reached")
+
+        result, mock_remove_wt, mock_delete_branch = await self._run(
+            tmp_path,
+            spawn,
+            create_side_effect=create_partial_fail,
+            # Branch existed before the call — classic stale-merged
+            # leftover from a prior merged PR whose remote branch
+            # was auto-deleted.
+            branch_existed_before=True,
+            created_fresh=False,
+            # Helper committed to the stale-recreate path before
+            # raising, so this session owns whatever ref is on disk.
+            stale_recreate_flag_set=True,
+        )
+
+        assert not result.success
+        mock_remove_wt.assert_awaited_once()
+        # Despite branch_existed_before=True, the stale-recreate
+        # flag marks ownership as ours → delete must run.
         mock_delete_branch.assert_awaited_once()
         assert mock_delete_branch.await_args.args[1] == "fix/issue-13"
 

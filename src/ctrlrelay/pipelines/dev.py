@@ -969,15 +969,28 @@ async def run_dev_issue(
                 await worktree.remove_worktree(repo, session_id)
             except Exception:
                 pass
-            # Exception path ownership: created_fresh covers the normal
-            # return-and-fail case (issue #51). For partial failures of
-            # ``git worktree add -b`` that crash AFTER the branch ref was
-            # registered but BEFORE create_worktree_with_new_branch
-            # returns, created_fresh is still False (the default), so we
-            # fall back to the pre-call snapshot: if the branch did not
-            # exist before this run, the leftover ref must have been
-            # created by us.
-            we_own_branch = created_fresh or not branch_existed_before
+            # Exception path ownership: three signals, ordered by
+            # reliability.
+            # 1. created_fresh covers the normal return-and-fail case
+            #    (issue #51).
+            # 2. worktree._last_stale_recreate_attempted covers the
+            #    stale-merged delete+recreate path (issue #51 codex
+            #    round-4): the helper destroyed the old ref before
+            #    `git worktree add -b`, so anything on disk with this
+            #    branch name is ours regardless of what the pre-call
+            #    snapshot said.
+            # 3. Pre-call snapshot (`not branch_existed_before`) is
+            #    the fallback for partial failures of the plain
+            #    fresh-branch path where the helper raises before
+            #    setting created_fresh.
+            stale_recreate_attempted = getattr(
+                worktree, "_last_stale_recreate_attempted", False,
+            )
+            we_own_branch = (
+                created_fresh
+                or stale_recreate_attempted
+                or not branch_existed_before
+            )
             if we_own_branch:
                 try:
                     has_remote = await worktree.branch_exists_on_remote(

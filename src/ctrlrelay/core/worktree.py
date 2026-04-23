@@ -29,6 +29,17 @@ class WorktreeManager:
         self.bare_repos_dir = Path(self.bare_repos_dir)
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
         self.bare_repos_dir.mkdir(parents=True, exist_ok=True)
+        # Signal for callers doing exception-path cleanup: when
+        # create_worktree_with_new_branch enters the stale-merged
+        # delete+recreate path, the old local ref is destroyed before
+        # the final `git worktree add -b` runs. If that add raises
+        # partway, the caller's pre-call branch_existed_before
+        # snapshot says "branch existed, not ours" — wrong. Flipping
+        # this flag to True the moment we commit to the recreate path
+        # lets run_dev_issue's exception cleanup recognize that any
+        # ref left behind belongs to this session regardless of how
+        # the caller classified the branch pre-call.
+        self._last_stale_recreate_attempted = False
 
     async def _run_git(
         self,
@@ -160,6 +171,10 @@ class WorktreeManager:
         number and a concrete operator action. The probe runs BEFORE
         any ref mutations so a concurrent PR is surfaced cleanly.
         """
+        # Reset the stale-recreate flag for every fresh call so a
+        # prior session's state doesn't leak into this one's cleanup.
+        self._last_stale_recreate_attempted = False
+
         bare_path = self._get_bare_repo_path(repo)
         worktree_path = self._get_worktree_path(repo, session_id)
 
@@ -231,6 +246,14 @@ class WorktreeManager:
             #       content not represented in the default branch — reuse
             #       so the operator's work isn't silently dropped.
             if await self._branch_is_fully_merged(repo, new_branch):
+                # Commit to the delete+recreate path. From here on,
+                # any ref left on disk — whether the old one we just
+                # deleted, a partial one `worktree add -b` wrote
+                # before crashing, or the successfully recreated one
+                # — belongs to THIS session. Flip the flag BEFORE
+                # the delete so even an exception in update-ref
+                # leaves the right signal for cleanup.
+                self._last_stale_recreate_attempted = True
                 try:
                     await self._run_git(
                         "update-ref", "-d", f"refs/heads/{new_branch}",
