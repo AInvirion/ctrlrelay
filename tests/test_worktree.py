@@ -857,7 +857,12 @@ class TestWorktreeManager:
 
         mock_github = AsyncMock()
         mock_github.list_prs.return_value = [
-            {"number": 42, "headRefName": "fix/issue-13"},
+            {
+                "number": 42,
+                "headRefName": "fix/issue-13",
+                # Same owner as the target repo — this IS ours.
+                "headRepositoryOwner": {"login": "owner"},
+            },
         ]
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
@@ -899,6 +904,58 @@ class TestWorktreeManager:
             f"no ref mutation allowed when branch backs an open PR; "
             f"got {mutating_calls}"
         )
+
+    @pytest.mark.asyncio
+    async def test_reuse_ignores_fork_pr_with_same_branch_name(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2 on #113: ``gh pr list --head`` filters on branch
+        name alone and can't scope to ``<owner>:<branch>``. An
+        unrelated contributor's fork PR using the same branch name
+        (e.g. another ``fix/issue-13``) must NOT block our reuse —
+        only a PR whose head lives in the target repo's owner veto.
+        """
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        mock_github = AsyncMock()
+        # A single PR from a fork with the same branch name. We're
+        # "owner/repo"; the fork lives under "someforker".
+        mock_github.list_prs.return_value = [
+            {
+                "number": 99,
+                "headRefName": "fix/issue-5",
+                "headRepositoryOwner": {"login": "someforker"},
+            },
+        ]
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",                                      # show-ref
+                "",                                      # worktree list
+                "abc\trefs/heads/fix/issue-5\n",         # ls-remote
+                "",                                      # fetch scratch
+                "",                                      # merge-base local→remote
+                "",                                      # update-ref refs/heads
+                "",                                      # update-ref -d scratch
+                "",                                      # worktree add
+            ]
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="retry-fork",
+                new_branch="fix/issue-5",
+                github=mock_github,
+            )
+
+        # Reuse proceeded: fork PR doesn't veto.
+        assert "retry-fork" in str(wt)
+        assert created_fresh is False
 
     @pytest.mark.asyncio
     async def test_reuse_proceeds_when_no_open_pr(

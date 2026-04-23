@@ -267,6 +267,13 @@ class WorktreeManager:
         open PR on ``repo``. Skips silently on probe failure so a flaky
         GitHub API doesn't wedge every retry — the existing reuse path
         and later ``gh pr create`` call still provide defense in depth.
+
+        ``gh pr list --head`` filters by branch name only, so a PR from
+        a fork using the same branch name (e.g. another contributor's
+        ``fix/issue-13``) would appear in the result and wrongly block
+        our reuse. Filter client-side on headRepositoryOwner.login so
+        only PRs whose head lives in the same repo we're about to
+        push to can veto reuse.
         """
         try:
             prs = await github.list_prs(repo, state="open", head=branch)
@@ -277,9 +284,15 @@ class WorktreeManager:
             # exists" — noisier than we'd like, but not a correctness
             # regression.
             return
-        if not prs:
+        target_owner = repo.split("/", 1)[0]
+        same_repo_prs = [
+            p for p in prs
+            if (p.get("headRepositoryOwner") or {}).get("login")
+            == target_owner
+        ]
+        if not same_repo_prs:
             return
-        pr_number = prs[0].get("number")
+        pr_number = same_repo_prs[0].get("number")
         raise WorktreeError(
             f"Branch {branch!r} already has open PR #{pr_number} on "
             f"{repo!r} — close or merge it before retrying this issue."

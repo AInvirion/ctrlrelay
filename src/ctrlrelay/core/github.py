@@ -83,7 +83,10 @@ class GitHubCLI:
             "--repo", repo,
             "--state", state,
             "--limit", str(limit),
-            "--json", "number,title,author,labels,headRefName,mergeable,reviewDecision",
+            "--json", (
+                "number,title,author,labels,headRefName,mergeable,"
+                "reviewDecision,headRepositoryOwner"
+            ),
         ]
         if head is not None:
             args.extend(["--head", head])
