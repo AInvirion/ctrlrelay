@@ -173,6 +173,176 @@ class TestAgentSessionId:
         db.close()
 
 
+class TestPRWatches:
+    """pr_watches stores in-flight merge watchers so a poller restart
+    rehydrates them. Rows are written on `dev.pr.watching` and removed
+    on the terminal merged / timed-out events only — a cancellation
+    (shutdown) deliberately leaves the row behind."""
+
+    def test_pr_watches_table_is_created(self, tmp_path: Path) -> None:
+        db = StateDB(tmp_path / "state.db")
+        tables = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        table_names = {row[0] for row in tables}
+        assert "pr_watches" in table_names
+        db.close()
+
+    def test_pr_watches_schema_has_expected_columns(self, tmp_path: Path) -> None:
+        """Acceptance: (session_id, repo, issue_number, pr_number, pr_url,
+        started_at)."""
+        db = StateDB(tmp_path / "state.db")
+        cols = {
+            row[1]
+            for row in db.execute("PRAGMA table_info(pr_watches)").fetchall()
+        }
+        expected = {
+            "session_id", "repo", "issue_number", "pr_number",
+            "pr_url", "started_at",
+        }
+        assert expected.issubset(cols)
+        db.close()
+
+    def test_add_and_list_pr_watch(self, tmp_path: Path) -> None:
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42,
+            issue_number=77, session_id="sess-1",
+            pr_url="https://github.com/owner/r1/pull/42",
+        )
+        rows = db.list_pr_watches()
+        assert len(rows) == 1
+        assert rows[0]["repo"] == "owner/r1"
+        assert rows[0]["pr_number"] == 42
+        assert rows[0]["issue_number"] == 77
+        assert rows[0]["session_id"] == "sess-1"
+        assert rows[0]["pr_url"] == "https://github.com/owner/r1/pull/42"
+        assert rows[0]["started_at"] > 0
+        db.close()
+
+    def test_remove_pr_watch_returns_true_when_present(
+        self, tmp_path: Path
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42,
+            issue_number=77, session_id=None, pr_url=None,
+        )
+        assert db.remove_pr_watch("owner/r1", 42) is True
+        assert db.list_pr_watches() == []
+        db.close()
+
+    def test_remove_pr_watch_returns_false_when_missing(
+        self, tmp_path: Path
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        assert db.remove_pr_watch("owner/r1", 42) is False
+        db.close()
+
+    def test_add_pr_watch_is_idempotent_on_repo_pr_number(
+        self, tmp_path: Path
+    ) -> None:
+        """Re-inserting the same (repo, pr_number) refreshes the row
+        rather than raising — covers the rehydrate → re-spawn path
+        where the existing task re-inserts."""
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42, issue_number=77,
+            session_id="sess-1", pr_url="u1", started_at=1000,
+        )
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42, issue_number=77,
+            session_id="sess-2", pr_url="u2", started_at=2000,
+        )
+        rows = db.list_pr_watches()
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "sess-2"
+        assert rows[0]["pr_url"] == "u2"
+        assert rows[0]["started_at"] == 2000
+        db.close()
+
+    def test_list_pr_watches_oldest_first(self, tmp_path: Path) -> None:
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=1, issue_number=10,
+            session_id=None, pr_url=None, started_at=200,
+        )
+        db.add_pr_watch(
+            repo="owner/r2", pr_number=2, issue_number=20,
+            session_id=None, pr_url=None, started_at=100,
+        )
+        rows = db.list_pr_watches()
+        assert [r["started_at"] for r in rows] == [100, 200]
+        db.close()
+
+    def test_pr_watches_table_added_to_preexisting_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Acceptance: an older state.db lacking the pr_watches table
+        must transparently gain it when opened by the new code. The
+        existing schema pattern is CREATE TABLE IF NOT EXISTS, so just
+        re-opening the DB should add the table without disturbing
+        existing rows."""
+        import sqlite3
+
+        db_path = tmp_path / "state.db"
+        # Simulate a pre-pr_watches DB: create the sessions table only,
+        # with an existing session row we want to see survive the open.
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                pipeline TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                issue_number INTEGER,
+                worktree_path TEXT,
+                status TEXT NOT NULL,
+                blocked_question TEXT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                claude_exit_code INTEGER,
+                summary TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("old-session", "dev", "owner/repo", "done", 1),
+        )
+        conn.commit()
+        # Sanity check: the old DB has no pr_watches table.
+        assert conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='pr_watches'"
+        ).fetchone() is None
+        conn.close()
+
+        # Open with the new StateDB — migration/creation must add the
+        # table and not clobber the existing session row.
+        db = StateDB(db_path)
+        table_names = {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "pr_watches" in table_names
+        # Existing sessions row intact.
+        row = db.execute(
+            "SELECT id FROM sessions WHERE id = ?", ("old-session",)
+        ).fetchone()
+        assert row is not None
+        # And the new table works.
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=1, issue_number=1,
+            session_id=None, pr_url=None,
+        )
+        assert len(db.list_pr_watches()) == 1
+        db.close()
+
+
 class TestPendingResumes:
     """pending_resumes stores BLOCKED sessions + operator answers so a
     Telegram reply arriving after a session has torn down still drives a

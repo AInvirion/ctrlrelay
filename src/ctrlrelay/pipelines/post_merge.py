@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.pr_watcher import PRWatcher
+from ctrlrelay.core.state import StateDB
 from ctrlrelay.transports.base import Transport
 
 _logger = get_logger("pipelines.post_merge")
@@ -205,6 +206,7 @@ async def pr_watch_task(
     transport_factory: Callable[[], Awaitable[Transport | None]] | None = None,
     poll_interval: int = 60,
     timeout: int = DEFAULT_PR_WATCH_TIMEOUT,
+    state_db: StateDB | None = None,
 ) -> dict[str, Any]:
     """Background-safe wrapper around the merge watcher that emits
     structured ``dev.pr.*`` events and manages a transport LAZILY —
@@ -218,6 +220,15 @@ async def pr_watch_task(
     A raising factory is logged and skipped (merge detection proceeds
     without the notification channel rather than aborting the close).
 
+    ``state_db`` persists the watcher across poller restarts: a row is
+    inserted on ``dev.pr.watching`` and removed on the terminal
+    ``dev.pr.merged`` / ``dev.pr.watch_timeout`` events. It is NOT
+    removed on ``dev.pr.watch_cancelled`` — a cancellation during
+    shutdown must leave the row behind so the next poller startup can
+    rehydrate the watcher. StateDB I/O is best-effort: a disk failure
+    is swallowed so it can never prevent merge detection from
+    continuing in-memory.
+
     Returns a dict describing the outcome:
       {"merged": bool, "timed_out": bool, "cancelled": bool, "failed": str|None}
     """
@@ -225,6 +236,29 @@ async def pr_watch_task(
         "merged": False, "timed_out": False,
         "cancelled": False, "failed": None,
     }
+
+    # Persist the watch before any long-running work so a crash between
+    # `dev.pr.watching` and the first poll doesn't lose the row.
+    # Idempotent: a rehydrated task calling this again just refreshes
+    # started_at, which is fine.
+    if state_db is not None:
+        try:
+            state_db.add_pr_watch(
+                repo=repo, pr_number=pr_number,
+                issue_number=issue_number,
+                session_id=session_id,
+                pr_url=pr_url,
+            )
+        except Exception as e:
+            # Never let a state_db failure kill the watcher — degrade
+            # to in-memory-only and log so ops can see the durability
+            # gap.
+            log_event(
+                _logger, "dev.pr.watch_persist_failed",
+                session_id=session_id, repo=repo,
+                issue_number=issue_number, pr_number=pr_number,
+                reason=type(e).__name__, error=str(e)[:200],
+            )
 
     log_event(
         _logger, "dev.pr.watching",
@@ -249,6 +283,22 @@ async def pr_watch_task(
             session_id=session_id, repo=repo, issue_number=issue_number,
             pr_number=pr_number,
         )
+        # Terminal state: merge or timeout. Drop the durable row so
+        # future poller startups don't rehydrate this watcher. We
+        # remove BEFORE handle_merge so an exhausted retry loop can't
+        # leave a ghost row that would be rehydrated on next startup
+        # and try the same permanently-broken cleanup forever.
+        if state_db is not None:
+            try:
+                state_db.remove_pr_watch(repo, pr_number)
+            except Exception as e:
+                log_event(
+                    _logger, "dev.pr.watch_persist_failed",
+                    session_id=session_id, repo=repo,
+                    issue_number=issue_number, pr_number=pr_number,
+                    reason=type(e).__name__, error=str(e)[:200],
+                    phase="remove",
+                )
         if merged:
             # Defer transport construction to inside the retry loop so
             # each attempt gets a fresh connection — a bridge restart
@@ -267,6 +317,10 @@ async def pr_watch_task(
             session_id=session_id, repo=repo, issue_number=issue_number,
             pr_number=pr_number,
         )
+        # Deliberately DO NOT remove the pr_watches row on cancellation.
+        # Cancellation is the shutdown signal — the next poller startup
+        # must rehydrate this watcher or the PR's post-merge automation
+        # is lost for the remainder of its 7-day window.
         raise
     except Exception as e:
         outcome["failed"] = type(e).__name__

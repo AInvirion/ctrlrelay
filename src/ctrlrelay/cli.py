@@ -1208,6 +1208,7 @@ def poller_start(
                                 session_id=result.session_id,
                                 github=github,
                                 transport_factory=_watch_transport_factory,
+                                state_db=state_db,
                             )
                         )
                         pr_watch_tasks.add(task)
@@ -1622,6 +1623,42 @@ def poller_start(
                     "[/dim]"
                 )
                 await poller.seed_current()
+
+            # Rehydrate PR watchers that survived the previous shutdown.
+            # A launchd kickstart / crash / redeploy cancels in-memory
+            # asyncio tasks; without this step, any PR sitting in review
+            # across a restart would silently lose its post-merge
+            # automation for the remainder of its 7-day watch window.
+            # Runs BEFORE run_poll_loop so watchers are live before the
+            # first poll interval elapses.
+            try:
+                surviving = state_db.list_pr_watches()
+            except Exception as e:
+                console.print(
+                    f"[yellow]pr_watches rehydrate: list failed ({e}) — "
+                    "skipping[/yellow]"
+                )
+                surviving = []
+            if surviving:
+                console.print(
+                    f"[dim]Rehydrating {len(surviving)} PR watcher(s) "
+                    "from state.db[/dim]"
+                )
+                for row in surviving:
+                    task = asyncio.create_task(
+                        pr_watch_task(
+                            repo=row["repo"],
+                            issue_number=row["issue_number"],
+                            pr_url=row["pr_url"] or "",
+                            pr_number=row["pr_number"],
+                            session_id=row.get("session_id"),
+                            github=github,
+                            transport_factory=_watch_transport_factory,
+                            state_db=state_db,
+                        )
+                    )
+                    pr_watch_tasks.add(task)
+                    task.add_done_callback(pr_watch_tasks.discard)
 
             try:
                 await run_poll_loop(

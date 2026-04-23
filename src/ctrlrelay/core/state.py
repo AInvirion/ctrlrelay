@@ -73,6 +73,28 @@ CREATE TABLE IF NOT EXISTS pending_resumes (
     resumed_at INTEGER
 );
 
+-- In-flight PR merge watchers that must survive a poller restart. Without
+-- this, a launchd kickstart / crash / redeploy / reboot cancels the
+-- in-memory asyncio watcher tasks and any PR that gets merged afterwards
+-- silently loses its post-merge automation (issue close + Telegram ping)
+-- for the remainder of the 7-day watch window. Poller startup rehydrates
+-- one `pr_watch_task` per surviving row before `run_poll_loop` enters its
+-- main loop. Rows are inserted on `dev.pr.watching` and deleted on the
+-- terminal `dev.pr.merged` / `dev.pr.watch_timeout` events only — a
+-- `dev.pr.watch_cancelled` (shutdown-driven cancellation, not operator
+-- intent) deliberately leaves the row in place so the next startup
+-- resumes the watch. `pr_number` is the unique row key because we watch
+-- at most one PR per (repo, pr_number).
+CREATE TABLE IF NOT EXISTS pr_watches (
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    session_id TEXT,
+    issue_number INTEGER NOT NULL,
+    pr_url TEXT,
+    started_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, pr_number)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_repo ON sessions(repo);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_automation_repo ON automation_decisions(repo);
@@ -351,3 +373,49 @@ class StateDB:
         )
         self._conn.commit()
         return cursor.rowcount > 0
+
+    # PR watches (durable, cross-restart)
+
+    def add_pr_watch(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        issue_number: int,
+        session_id: str | None,
+        pr_url: str | None,
+        started_at: int | None = None,
+    ) -> None:
+        """Record an in-flight merge watcher so a poller restart can
+        rehydrate it. Idempotent on ``(repo, pr_number)`` — re-inserting
+        the same PR refreshes ``started_at`` and any metadata (useful
+        when the same PR is re-spawned for any reason).
+        """
+        ts = int(time.time()) if started_at is None else int(started_at)
+        self._conn.execute(
+            """INSERT OR REPLACE INTO pr_watches
+               (repo, pr_number, session_id, issue_number, pr_url, started_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (repo, pr_number, session_id, issue_number, pr_url, ts),
+        )
+        self._conn.commit()
+
+    def remove_pr_watch(self, repo: str, pr_number: int) -> bool:
+        """Delete a PR watch row after a terminal outcome (merge
+        detected, or watch window expired). Returns True iff a row was
+        deleted so callers can tell whether the row was still present."""
+        cursor = self._conn.execute(
+            "DELETE FROM pr_watches WHERE repo = ? AND pr_number = ?",
+            (repo, pr_number),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def list_pr_watches(self) -> list[dict[str, Any]]:
+        """Return all surviving PR watches, oldest first. Called by the
+        poller at startup (before ``run_poll_loop``) to rehydrate any
+        watchers cancelled by the previous shutdown."""
+        rows = self._conn.execute(
+            "SELECT * FROM pr_watches ORDER BY started_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -664,3 +665,307 @@ class TestPRWatchTask:
         assert any(
             "dev.pr.watch_failed" in r.getMessage() for r in caplog.records
         )
+
+
+class TestPRWatchTaskPersistence:
+    """pr_watch_task must round-trip the pr_watches state_db table so
+    the watcher survives a poller restart. Row written on spawn,
+    removed on merged / timed_out, LEFT BEHIND on cancel."""
+
+    @pytest.mark.asyncio
+    async def test_row_written_on_spawn(self, tmp_path: Path) -> None:
+        """Acceptance: spawn writes a row keyed by (repo, pr_number)
+        with all the columns from the issue body."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        async def factory():
+            return None
+
+        # Capture the row DURING the watch by observing it after run.
+        outcome = await pr_watch_task(
+            repo="owner/repo",
+            issue_number=77,
+            pr_url="https://github.com/owner/repo/pull/42",
+            pr_number=42,
+            session_id="sess-1",
+            github=mock_github,
+            transport_factory=factory,
+            poll_interval=0,
+            timeout=5,
+            state_db=db,
+        )
+        assert outcome["merged"] is True
+        # Merged → row removed. The write DID happen — we verify that
+        # in the cancel test. Here we assert the terminal cleanup.
+        assert db.list_pr_watches() == []
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_row_removed_on_merge(self, tmp_path: Path) -> None:
+        """dev.pr.merged is terminal: row must be dropped so the next
+        poller startup doesn't rehydrate a watcher that already did its
+        job."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+        # Seed a stale row for this PR to simulate a restart scenario —
+        # the row must be gone after the merge completes.
+        db.add_pr_watch(
+            repo="owner/repo", pr_number=42, issue_number=77,
+            session_id="prev-sess",
+            pr_url="https://github.com/owner/repo/pull/42",
+        )
+        assert len(db.list_pr_watches()) == 1
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        async def factory():
+            return None
+
+        outcome = await pr_watch_task(
+            repo="owner/repo", issue_number=77,
+            pr_url="https://github.com/owner/repo/pull/42",
+            pr_number=42, session_id="sess-1",
+            github=mock_github, transport_factory=factory,
+            poll_interval=0, timeout=5, state_db=db,
+        )
+        assert outcome["merged"] is True
+        assert db.list_pr_watches() == []
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_row_removed_on_timeout(self, tmp_path: Path) -> None:
+        """dev.pr.watch_timeout is terminal: the PR sat in review past
+        the watch window; we're giving up. Drop the row so a restart
+        doesn't resurrect the same dead watcher."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "OPEN"}
+
+        async def factory():
+            return None
+
+        outcome = await pr_watch_task(
+            repo="owner/repo", issue_number=77,
+            pr_url="https://github.com/owner/repo/pull/42",
+            pr_number=42, session_id="sess-1",
+            github=mock_github, transport_factory=factory,
+            poll_interval=0, timeout=0,  # immediate timeout
+            state_db=db,
+        )
+        assert outcome["timed_out"] is True
+        assert db.list_pr_watches() == []
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_row_kept_on_cancellation(self, tmp_path: Path) -> None:
+        """Acceptance: dev.pr.watch_cancelled must LEAVE the row
+        behind. Cancellation is what a poller shutdown does to every
+        in-flight watcher; if we deleted the row here, the next startup
+        couldn't rehydrate and the PR's post-merge automation would
+        silently vanish for the rest of the 7-day window."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+
+        sleep_event = asyncio.Event()
+
+        async def slow_get_state(*_a, **_kw):
+            await sleep_event.wait()
+            return {"state": "OPEN"}
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.side_effect = slow_get_state
+
+        async def factory():
+            return None
+
+        async def run():
+            return await pr_watch_task(
+                repo="owner/repo", issue_number=77,
+                pr_url="https://github.com/owner/repo/pull/42",
+                pr_number=42, session_id="sess-1",
+                github=mock_github, transport_factory=factory,
+                poll_interval=0, timeout=60, state_db=db,
+            )
+
+        task = asyncio.create_task(run())
+        # Yield so the task gets to add_pr_watch and into the watcher.
+        await asyncio.sleep(0)
+        # At this point the row MUST already be persisted — that's
+        # what makes rehydration possible on the next startup.
+        rows = db.list_pr_watches()
+        assert len(rows) == 1
+        assert rows[0]["repo"] == "owner/repo"
+        assert rows[0]["pr_number"] == 42
+        assert rows[0]["issue_number"] == 77
+        assert rows[0]["session_id"] == "sess-1"
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Cancellation must have LEFT the row behind.
+        rows = db.list_pr_watches()
+        assert len(rows) == 1
+        assert rows[0]["pr_number"] == 42
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_state_db_optional_no_op_when_absent(self) -> None:
+        """Legacy callers can still pass no state_db; the watcher must
+        work in-memory-only just like before."""
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        async def factory():
+            return None
+
+        outcome = await pr_watch_task(
+            repo="owner/repo", issue_number=77,
+            pr_url="", pr_number=42, session_id=None,
+            github=mock_github, transport_factory=factory,
+            poll_interval=0, timeout=5,
+            state_db=None,
+        )
+        assert outcome["merged"] is True
+
+
+class TestPollerRestartRehydration:
+    """Integration acceptance: start poller, spawn watcher, kill poller,
+    start poller again, verify the watcher is respawned and the merge
+    still fires handle_merge.
+
+    We simulate the restart at the pr_watch_task level: StateDB is the
+    durability boundary and `cli.py` just reads list_pr_watches() and
+    spawns a task per row. Exercising the full launchd-path would
+    require subprocessing the CLI; the list_pr_watches → pr_watch_task
+    loop is the actual rehydration surface that must hold."""
+
+    @pytest.mark.asyncio
+    async def test_kill_then_restart_still_fires_handle_merge(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db_path = tmp_path / "state.db"
+
+        # --- Poller "run 1": spawn the watcher, then "crash" mid-watch. ---
+        db1 = StateDB(db_path)
+
+        sleep_event = asyncio.Event()
+        # Run 1: PR is still OPEN when the crash happens.
+        async def run1_get_state(*_a, **_kw):
+            await sleep_event.wait()
+            return {"state": "OPEN"}
+
+        mock_github_run1 = AsyncMock()
+        mock_github_run1.get_pr_state.side_effect = run1_get_state
+
+        async def factory_run1():
+            return None
+
+        async def runner1():
+            return await pr_watch_task(
+                repo="owner/repo", issue_number=77,
+                pr_url="https://github.com/owner/repo/pull/42",
+                pr_number=42, session_id="sess-1",
+                github=mock_github_run1,
+                transport_factory=factory_run1,
+                poll_interval=0, timeout=60,
+                state_db=db1,
+            )
+
+        task1 = asyncio.create_task(runner1())
+        # Yield so the row is persisted and the watcher enters its loop.
+        await asyncio.sleep(0)
+        assert len(db1.list_pr_watches()) == 1
+
+        # Simulate a poller shutdown: cancel the asyncio task + close
+        # the connection (launchd kickstart / crash / redeploy).
+        task1.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task1
+        db1.close()
+
+        # Row SURVIVED the restart — this is the durability claim.
+        db2 = StateDB(db_path)
+        surviving = db2.list_pr_watches()
+        assert len(surviving) == 1
+        row = surviving[0]
+        assert row["repo"] == "owner/repo"
+        assert row["pr_number"] == 42
+        assert row["issue_number"] == 77
+        assert row["session_id"] == "sess-1"
+        assert row["pr_url"] == "https://github.com/owner/repo/pull/42"
+
+        # --- Poller "run 2": rehydrate watcher, PR is now merged, handle_merge fires. ---
+        mock_github_run2 = AsyncMock()
+        mock_github_run2.get_pr_state.return_value = {"state": "MERGED"}
+
+        sent_messages: list[str] = []
+
+        class FakeTransport:
+            async def send(self, msg):
+                sent_messages.append(msg)
+
+            async def close(self):
+                pass
+
+        async def factory_run2():
+            return FakeTransport()
+
+        with caplog.at_level(
+            logging.INFO, logger="ctrlrelay.pipelines.post_merge"
+        ):
+            # This mirrors what cli.py does on startup: one
+            # asyncio.create_task per row, same kwargs as the original
+            # spawn plus the preserved state_db.
+            outcome = await pr_watch_task(
+                repo=row["repo"],
+                issue_number=row["issue_number"],
+                pr_url=row["pr_url"] or "",
+                pr_number=row["pr_number"],
+                session_id=row.get("session_id"),
+                github=mock_github_run2,
+                transport_factory=factory_run2,
+                poll_interval=0,
+                timeout=5,
+                state_db=db2,
+            )
+
+        # The rehydrated watcher MUST detect the merge and close the issue.
+        assert outcome["merged"] is True
+        assert outcome["failed"] is None
+        mock_github_run2.comment_on_issue.assert_called_once_with(
+            "owner/repo", 77, "Closed by PR #42",
+        )
+        # `gh issue close` ran via _run_gh.
+        close_calls = [
+            c for c in mock_github_run2._run_gh.call_args_list
+            if c.args[:2] == ("issue", "close")
+        ]
+        assert len(close_calls) == 1
+        # Telegram notification fired.
+        assert any(
+            "closed after PR #42 merged" in m for m in sent_messages
+        )
+        # Terminal outcome → row was cleaned up on run 2.
+        assert db2.list_pr_watches() == []
+        db2.close()
