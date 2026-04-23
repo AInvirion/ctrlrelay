@@ -314,10 +314,37 @@ async def pr_watch_task(
         pr_number=pr_number, pr_url=pr_url,
     )
     try:
-        watcher = PRWatcher(github=github, poll_interval=poll_interval)
-        merged = await watcher.wait_for_merge(
-            repo=repo, pr_number=pr_number, timeout=timeout,
-        )
+        # Rehydration shortcut: if the prior process already observed
+        # the merge (any cleanup_phase stamped), skip wait_for_merge
+        # entirely and resume cleanup. Re-running wait_for_merge here
+        # would let a transient GH error or a brief rehydrate window
+        # log dev.pr.watch_timeout and delete the row, permanently
+        # dropping the remaining close/notify steps — exactly the
+        # failure the phase tracking is supposed to prevent.
+        resuming_cleanup = False
+        if state_db is not None:
+            try:
+                prior_phase = state_db.get_pr_watch_cleanup_phase(
+                    repo, pr_number
+                )
+            except Exception:
+                prior_phase = None
+            if prior_phase is not None:
+                resuming_cleanup = True
+
+        if resuming_cleanup:
+            merged = True
+            log_event(
+                _logger, "dev.pr.watch_resumed",
+                session_id=session_id, repo=repo,
+                issue_number=issue_number, pr_number=pr_number,
+                cleanup_phase=prior_phase,
+            )
+        else:
+            watcher = PRWatcher(github=github, poll_interval=poll_interval)
+            merged = await watcher.wait_for_merge(
+                repo=repo, pr_number=pr_number, timeout=timeout,
+            )
         # Record merge detection BEFORE running the post-merge handler,
         # so an exhausted retry loop (e.g. permanent bridge outage) still
         # leaves `outcome["merged"] = True`. The merge really did happen;

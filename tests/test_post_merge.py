@@ -1051,6 +1051,65 @@ class TestPRWatchTaskPersistence:
         db.close()
 
     @pytest.mark.asyncio
+    async def test_rehydrate_with_phase_skips_wait_for_merge(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P1 round-4: when cleanup_phase is persisted, the prior
+        process already observed the merge. Re-running wait_for_merge
+        on rehydrate is unsafe — a transient GH error or an elapsed
+        deadline could log watch_timeout and delete the row, losing
+        the remaining cleanup work. The watcher must trust the phase
+        and go straight to _handle_merge_with_retry.
+
+        We verify by mocking get_pr_state to return OPEN (as if GH
+        briefly lied during rehydrate) — cleanup must still complete."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/repo", pr_number=42, issue_number=77,
+            session_id="prev-sess",
+            pr_url="https://github.com/owner/repo/pull/42",
+        )
+        db.set_pr_watch_cleanup_phase("owner/repo", 42, "closed")
+
+        sent_messages: list[str] = []
+
+        class FakeTransport:
+            async def send(self, msg):
+                sent_messages.append(msg)
+
+            async def close(self):
+                pass
+
+        mock_github = AsyncMock()
+        # GH says the PR is still OPEN — would normally fool
+        # wait_for_merge into timing out. The phase shortcut must
+        # trust the persisted state instead.
+        mock_github.get_pr_state.return_value = {"state": "OPEN"}
+
+        async def factory():
+            return FakeTransport()
+
+        outcome = await pr_watch_task(
+            repo="owner/repo", issue_number=77,
+            pr_url="https://github.com/owner/repo/pull/42",
+            pr_number=42, session_id="sess-new",
+            github=mock_github, transport_factory=factory,
+            poll_interval=0, timeout=60, state_db=db,
+        )
+        assert outcome["merged"] is True
+        # wait_for_merge MUST NOT have been called — trust the phase.
+        assert mock_github.get_pr_state.call_count == 0
+        # Cleanup picked up from closed → only notification sent.
+        assert mock_github.comment_on_issue.call_count == 0
+        assert mock_github._run_gh.call_count == 0
+        assert len(sent_messages) == 1
+        assert db.list_pr_watches() == []
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_expired_row_with_phase_still_completes_cleanup(
         self, tmp_path: Path
     ) -> None:
