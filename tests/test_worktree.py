@@ -961,6 +961,47 @@ class TestWorktreeManager:
         assert created_fresh is False
 
     @pytest.mark.asyncio
+    async def test_reuse_refuses_open_pr_with_casing_mismatch(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2 round-3 on #113: GitHub owner/repo names are
+        case-insensitive. Config may be ``Owner/Repo`` while the API
+        returns ``owner/repo``; exact equality misses the match and
+        the veto is silently skipped. Normalize both sides."""
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        # Config says "Owner/Repo"; API returns lowercase.
+        mock_github = AsyncMock()
+        mock_github.list_prs.return_value = [
+            {
+                "number": 17,
+                "headRefName": "fix/issue-13",
+                "headRepositoryOwner": {"login": "owner"},
+                "headRepository": {"name": "repo"},
+            },
+        ]
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",  # show-ref
+                "",  # worktree list
+            ]
+            with pytest.raises(WorktreeError, match="#17"):
+                await manager.create_worktree_with_new_branch(
+                    repo="Owner/Repo",
+                    session_id="retry-case",
+                    new_branch="fix/issue-13",
+                    github=mock_github,
+                )
+
+    @pytest.mark.asyncio
     async def test_reuse_ignores_same_owner_fork_pr(
         self, tmp_path: Path
     ) -> None:

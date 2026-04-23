@@ -286,12 +286,22 @@ class WorktreeManager:
             # regression.
             return
         target_owner, _, target_name = repo.partition("/")
-        same_repo_prs = [
-            p for p in prs
-            if (p.get("headRepositoryOwner") or {}).get("login")
-            == target_owner
-            and (p.get("headRepository") or {}).get("name") == target_name
-        ]
+        # GitHub owner/repo names are case-insensitive: config may say
+        # "Owner/Repo" while the API returns "owner/repo". Normalize
+        # both sides before comparing so a case mismatch doesn't let
+        # a colliding PR slip past the veto.
+        target_owner_lc = target_owner.lower()
+        target_name_lc = target_name.lower()
+
+        def _same_repo(pr: dict) -> bool:
+            owner = (pr.get("headRepositoryOwner") or {}).get("login") or ""
+            name = (pr.get("headRepository") or {}).get("name") or ""
+            return (
+                owner.lower() == target_owner_lc
+                and name.lower() == target_name_lc
+            )
+
+        same_repo_prs = [p for p in prs if _same_repo(p)]
         if not same_repo_prs:
             return
         pr_number = same_repo_prs[0].get("number")
