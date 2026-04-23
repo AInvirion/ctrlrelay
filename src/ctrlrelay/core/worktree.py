@@ -268,12 +268,13 @@ class WorktreeManager:
         GitHub API doesn't wedge every retry — the existing reuse path
         and later ``gh pr create`` call still provide defense in depth.
 
-        ``gh pr list --head`` filters by branch name only, so a PR from
-        a fork using the same branch name (e.g. another contributor's
-        ``fix/issue-13``) would appear in the result and wrongly block
-        our reuse. Filter client-side on headRepositoryOwner.login so
-        only PRs whose head lives in the same repo we're about to
-        push to can veto reuse.
+        ``gh pr list --head`` filters by branch name only, so PRs from
+        unrelated repos (external forks, same-owner forks like
+        ``acme/repo-fork`` targeting ``acme/repo``) with the same
+        branch name would appear in the result and wrongly block
+        our reuse. Filter client-side on the FULL head repo identity
+        (owner + name) so only PRs whose head actually lives in the
+        repo we're about to push to can veto reuse.
         """
         try:
             prs = await github.list_prs(repo, state="open", head=branch)
@@ -284,11 +285,12 @@ class WorktreeManager:
             # exists" — noisier than we'd like, but not a correctness
             # regression.
             return
-        target_owner = repo.split("/", 1)[0]
+        target_owner, _, target_name = repo.partition("/")
         same_repo_prs = [
             p for p in prs
             if (p.get("headRepositoryOwner") or {}).get("login")
             == target_owner
+            and (p.get("headRepository") or {}).get("name") == target_name
         ]
         if not same_repo_prs:
             return

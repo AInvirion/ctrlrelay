@@ -860,8 +860,10 @@ class TestWorktreeManager:
             {
                 "number": 42,
                 "headRefName": "fix/issue-13",
-                # Same owner as the target repo — this IS ours.
+                # Same owner AND same repo name as the target — this
+                # is the PR we're about to collide with.
                 "headRepositoryOwner": {"login": "owner"},
+                "headRepository": {"name": "repo"},
             },
         ]
 
@@ -932,6 +934,7 @@ class TestWorktreeManager:
                 "number": 99,
                 "headRefName": "fix/issue-5",
                 "headRepositoryOwner": {"login": "someforker"},
+                "headRepository": {"name": "repo"},
             },
         ]
 
@@ -955,6 +958,57 @@ class TestWorktreeManager:
 
         # Reuse proceeded: fork PR doesn't veto.
         assert "retry-fork" in str(wt)
+        assert created_fresh is False
+
+    @pytest.mark.asyncio
+    async def test_reuse_ignores_same_owner_fork_pr(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2 round-2 on #113: same-owner forks (``acme/repo-fork``
+        targeting ``acme/repo``) must also not veto reuse. Matching
+        on headRepositoryOwner.login alone conflated them; the filter
+        must also check headRepository.name."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "acme-repo.git"
+        bare.mkdir(parents=True)
+
+        mock_github = AsyncMock()
+        # Same owner but a different repo name (a fork under the same
+        # org). The branch name collides but the PR has nothing to
+        # do with our base repo.
+        mock_github.list_prs.return_value = [
+            {
+                "number": 77,
+                "headRefName": "fix/issue-5",
+                "headRepositoryOwner": {"login": "acme"},
+                "headRepository": {"name": "repo-fork"},
+            },
+        ]
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            mock_git.side_effect = [
+                "",                                      # show-ref
+                "",                                      # worktree list
+                "abc\trefs/heads/fix/issue-5\n",         # ls-remote
+                "",                                      # fetch scratch
+                "",                                      # merge-base
+                "",                                      # update-ref refs/heads
+                "",                                      # update-ref -d scratch
+                "",                                      # worktree add
+            ]
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
+                repo="acme/repo",
+                session_id="retry-same-owner-fork",
+                new_branch="fix/issue-5",
+                github=mock_github,
+            )
+
+        assert "retry-same-owner-fork" in str(wt)
         assert created_fresh is False
 
     @pytest.mark.asyncio
