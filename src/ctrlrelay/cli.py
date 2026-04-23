@@ -1058,6 +1058,51 @@ def poller_start(
         # handle_issue and aren't garbage-collected. Cleared via
         # done_callback as each task terminates.
         pr_watch_tasks: set[asyncio.Task] = set()
+        # Dedup key: only ONE watcher may run for a given (repo, pr_number)
+        # at a time. Without this, two spawn paths (rehydration + a
+        # handle_issue re-run after corrupted poller state) can race
+        # through _handle_merge_with_retry and duplicate the close
+        # comment / notification. Entries removed via done_callback
+        # below, paired with the task's removal from pr_watch_tasks.
+        active_pr_watches: set[tuple[str, int]] = set()
+
+        def _spawn_pr_watch(
+            *,
+            repo: str,
+            issue_number: int,
+            pr_url: str,
+            pr_number: int,
+            session_id: str | None,
+            timeout: int | None = None,
+        ) -> asyncio.Task | None:
+            """Start a pr_watch_task for (repo, pr_number) unless one is
+            already running for the same key. Returns the task on spawn,
+            None if a duplicate was suppressed."""
+            key = (repo, pr_number)
+            if key in active_pr_watches:
+                return None
+            active_pr_watches.add(key)
+            kwargs: dict = dict(
+                repo=repo,
+                issue_number=issue_number,
+                pr_url=pr_url,
+                pr_number=pr_number,
+                session_id=session_id,
+                github=github,
+                transport_factory=_watch_transport_factory,
+                state_db=state_db,
+            )
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            task = asyncio.create_task(pr_watch_task(**kwargs))
+            pr_watch_tasks.add(task)
+
+            def _on_done(t: asyncio.Task) -> None:
+                pr_watch_tasks.discard(t)
+                active_pr_watches.discard(key)
+
+            task.add_done_callback(_on_done)
+            return task
 
         async def _watch_transport_factory():
             """Build a fresh connected SocketTransport for a single watcher,
@@ -1202,20 +1247,13 @@ def poller_start(
                     except (TypeError, ValueError):
                         pr_number = None
                     if pr_number is not None:
-                        task = asyncio.create_task(
-                            pr_watch_task(
-                                repo=repo,
-                                issue_number=issue_number,
-                                pr_url=pr_url_str,
-                                pr_number=pr_number,
-                                session_id=result.session_id,
-                                github=github,
-                                transport_factory=_watch_transport_factory,
-                                state_db=state_db,
-                            )
+                        _spawn_pr_watch(
+                            repo=repo,
+                            issue_number=issue_number,
+                            pr_url=pr_url_str,
+                            pr_number=pr_number,
+                            session_id=result.session_id,
                         )
-                        pr_watch_tasks.add(task)
-                        task.add_done_callback(pr_watch_tasks.discard)
 
                 # Send result notification — best-effort. A failed send
                 # must NOT prevent the merge watcher (spawned above)
@@ -1673,21 +1711,14 @@ def poller_start(
                         DEFAULT_PR_WATCH_TIMEOUT - elapsed,
                         rehydrate_min_timeout,
                     )
-                    task = asyncio.create_task(
-                        pr_watch_task(
-                            repo=row["repo"],
-                            issue_number=row["issue_number"],
-                            pr_url=row["pr_url"] or "",
-                            pr_number=row["pr_number"],
-                            session_id=row.get("session_id"),
-                            github=github,
-                            transport_factory=_watch_transport_factory,
-                            state_db=state_db,
-                            timeout=remaining,
-                        )
+                    _spawn_pr_watch(
+                        repo=row["repo"],
+                        issue_number=row["issue_number"],
+                        pr_url=row["pr_url"] or "",
+                        pr_number=row["pr_number"],
+                        session_id=row.get("session_id"),
+                        timeout=remaining,
                     )
-                    pr_watch_tasks.add(task)
-                    task.add_done_callback(pr_watch_tasks.discard)
 
             try:
                 await run_poll_loop(
