@@ -1074,13 +1074,41 @@ def poller_start(
             pr_number: int,
             session_id: str | None,
             timeout: int | None = None,
+            skip_initial_persist: bool = False,
         ) -> asyncio.Task | None:
             """Start a pr_watch_task for (repo, pr_number) unless one is
             already running for the same key. Returns the task on spawn,
-            None if a duplicate was suppressed."""
+            None if a duplicate was suppressed.
+
+            The pr_watches row is persisted SYNCHRONOUSLY before the
+            coroutine is scheduled. asyncio.create_task only queues the
+            coroutine — its body doesn't execute until the loop next
+            yields, so a shutdown between create_task and the first
+            await inside pr_watch_task would otherwise lose the row
+            entirely (no rehydrate after restart). Writing first closes
+            that gap.
+
+            ``skip_initial_persist`` is for rehydration: the row
+            already exists in pr_watches (that's how we know to spawn),
+            and re-writing it would be harmless but wasteful.
+            """
             key = (repo, pr_number)
             if key in active_pr_watches:
                 return None
+            if state_db is not None and not skip_initial_persist:
+                try:
+                    state_db.add_pr_watch(
+                        repo=repo, pr_number=pr_number,
+                        issue_number=issue_number,
+                        session_id=session_id,
+                        pr_url=pr_url,
+                    )
+                except Exception:
+                    # Persist failure is logged inside pr_watch_task on
+                    # its own attempt; don't abort the spawn here, the
+                    # watcher can still run in-memory like the legacy
+                    # pre-persistence code did.
+                    pass
             active_pr_watches.add(key)
             kwargs: dict = dict(
                 repo=repo,
@@ -1682,8 +1710,27 @@ def poller_start(
                 surviving = []
             if surviving:
                 import time as _time
+                # Respect the operator's current config: if a repo was
+                # removed from `repos:`, skip respawning its watchers
+                # even if old rows linger in pr_watches. Treating the
+                # config as the source of truth matches how the rest
+                # of the poller behaves; silently driving close/notify
+                # on a now-unconfigured repo would be surprising.
+                configured_repos = {r.name for r in config.repos}
+                orphaned = [
+                    r for r in surviving if r["repo"] not in configured_repos
+                ]
+                if orphaned:
+                    console.print(
+                        f"[yellow]pr_watches: {len(orphaned)} row(s) "
+                        "for repos no longer in config — leaving "
+                        "dormant[/yellow]"
+                    )
+                active = [
+                    r for r in surviving if r["repo"] in configured_repos
+                ]
                 console.print(
-                    f"[dim]Rehydrating {len(surviving)} PR watcher(s) "
+                    f"[dim]Rehydrating {len(active)} PR watcher(s) "
                     "from state.db[/dim]"
                 )
                 now = int(_time.time())
@@ -1701,7 +1748,7 @@ def poller_start(
                 # wait_for_merge entirely — see pr_watch_task — so
                 # this headroom only affects phase=NULL rehydrates.)
                 rehydrate_min_timeout = 300
-                for row in surviving:
+                for row in active:
                     # Honor the original watch deadline: subtract time
                     # already spent watching from the default 7-day
                     # timeout. Without this, every restart resets the
@@ -1718,6 +1765,7 @@ def poller_start(
                         pr_number=row["pr_number"],
                         session_id=row.get("session_id"),
                         timeout=remaining,
+                        skip_initial_persist=True,
                     )
 
             try:
