@@ -31,13 +31,23 @@ class GitHubCLI:
     gh_binary: str = field(default_factory=_find_gh)
     timeout: int = 60
 
-    async def _run_gh(self, *args: str) -> str:
+    async def _run_gh(
+        self, *args: str, timeout: int | None = None,
+    ) -> str:
         """Run gh command and return stdout; raise GitHubError on non-zero.
+
+        ``timeout`` overrides ``self.timeout`` for one call — useful
+        for probes (like the open-PR check in worktree reuse) that
+        shouldn't inherit the full 60s default when any delay holds
+        the repo lock.
 
         Kills the child and waits for it to reap on timeout so a
         long-running daemon (e.g. 7-day PR-watch loop that retries on
         TimeoutError) doesn't leak subprocesses while the network hangs.
         """
+        effective_timeout = (
+            self.timeout if timeout is None else timeout
+        )
         cmd = [self.gh_binary, *args]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -46,7 +56,7 @@ class GitHubCLI:
         )
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=self.timeout
+                proc.communicate(), timeout=effective_timeout
             )
         except asyncio.TimeoutError:
             # Reap the hung child so we don't accumulate zombies across
@@ -69,15 +79,34 @@ class GitHubCLI:
         repo: str,
         state: str = "open",
         limit: int = 100,
+        head: str | None = None,
+        timeout: int | None = None,
     ) -> list[dict[str, Any]]:
-        """List pull requests for a repository."""
-        output = await self._run_gh(
+        """List pull requests for a repository.
+
+        When ``head`` is given, restrict the result to PRs whose head
+        branch is ``head`` (passed to ``gh pr list --head``). Used by
+        the dev pipeline's worktree reuse path to refuse a branch that
+        still backs an open PR (issue #52).
+
+        ``timeout`` overrides the default per call so the reuse probe
+        can bound latency — the probe holds the repo lock, so a full
+        default-timeout hang would stall every other session on the
+        same repo.
+        """
+        args = [
             "pr", "list",
             "--repo", repo,
             "--state", state,
             "--limit", str(limit),
-            "--json", "number,title,author,labels,headRefName,mergeable,reviewDecision",
-        )
+            "--json", (
+                "number,title,author,labels,headRefName,mergeable,"
+                "reviewDecision,headRepositoryOwner,headRepository"
+            ),
+        ]
+        if head is not None:
+            args.extend(["--head", head])
+        output = await self._run_gh(*args, timeout=timeout)
         return json.loads(output) if output.strip() else []
 
     async def list_security_alerts(

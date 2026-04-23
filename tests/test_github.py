@@ -27,6 +27,45 @@ class TestGitHubCLI:
             mock_run.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_list_prs_passes_head_filter(self) -> None:
+        """Issue #52: the worktree reuse path uses ``list_prs(head=...)``
+        to probe whether a branch still backs an open PR. ``head`` must
+        be forwarded to ``gh pr list --head`` so the filter narrows
+        server-side to that one branch."""
+        from ctrlrelay.core.github import GitHubCLI
+
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.return_value = json.dumps([
+                {"number": 42, "headRefName": "fix/issue-13"},
+            ])
+            gh = GitHubCLI()
+            prs = await gh.list_prs(
+                "owner/repo", state="open", head="fix/issue-13",
+            )
+
+            assert len(prs) == 1
+            assert prs[0]["number"] == 42
+            args = mock_run.call_args.args
+            assert "--head" in args
+            assert "fix/issue-13" in args
+            assert "--state" in args
+            assert "open" in args
+
+    @pytest.mark.asyncio
+    async def test_list_prs_without_head_omits_flag(self) -> None:
+        """Unfiltered ``list_prs`` must not pass ``--head`` at all — an
+        empty head would make gh return no PRs, silently breaking
+        existing callers (poller, dashboard) that enumerate all PRs."""
+        from ctrlrelay.core.github import GitHubCLI
+
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.return_value = "[]"
+            gh = GitHubCLI()
+            await gh.list_prs("owner/repo", state="open")
+            args = mock_run.call_args.args
+            assert "--head" not in args
+
+    @pytest.mark.asyncio
     async def test_list_security_alerts(self) -> None:
         """Should fetch Dependabot alerts."""
         from ctrlrelay.core.github import GitHubCLI

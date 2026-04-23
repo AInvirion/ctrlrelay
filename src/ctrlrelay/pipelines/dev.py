@@ -624,9 +624,29 @@ async def run_dev_issue(
     lock.held = True
 
     worktree_path: Path | None = None
-    # Pessimistic default: if we never got far enough to check, assume the
-    # branch was pre-existing so cleanup never clobbers unrelated state.
-    branch_preexisted = True
+    # Ownership signal: True when THIS session created the branch (either
+    # from default or via the stale-merged delete+recreate path). False
+    # when we reused an existing branch. Stays False until
+    # create_worktree_with_new_branch returns so the exception-path
+    # cleanup can't accidentally delete a pre-existing branch belonging
+    # to another session. Issue #51: a pre-call snapshot of
+    # branch_exists_locally goes stale the moment the worktree helper
+    # detects a stale fully-merged local branch, deletes it, and
+    # recreates it — so the flag has to come out of the helper itself.
+    created_fresh = False
+    # Pre-call snapshot of branch_exists_locally, used ONLY by the
+    # exception-cleanup path to handle partial failures of
+    # ``git worktree add -b`` that register the branch ref before the
+    # directory setup crashes — in that case the helper raises before
+    # returning created_fresh=True, so the snapshot is our only
+    # signal that the leftover ref belongs to this session. Pessimistic
+    # default (True) so we never delete a branch on a path that
+    # didn't even get far enough to probe. The #51 fix (stale snapshot
+    # after delete+recreate) doesn't apply here because the
+    # delete+recreate path runs entirely INSIDE the helper and only
+    # takes effect on successful return, where ``created_fresh``
+    # wins over this snapshot.
+    branch_existed_before = True
 
     try:
         # Get issue details
@@ -647,18 +667,32 @@ async def run_dev_issue(
                 body=AGENT_CLAIM_COMMENT,
             )
 
-        # Snapshot branch ownership BEFORE we try to create it. If the ref
-        # already exists in the bare repo, it came from another run (possibly
-        # a prior DONE session whose PR is still open) and we must not touch
-        # it. If it does not exist here, any ref we see later belongs to us —
-        # even if `git worktree add -b` fails partway through and leaves the
-        # ref behind without a usable worktree.
+        # Issue #51: ownership is signaled by ``created_fresh`` returned
+        # from create_worktree_with_new_branch. True when this call
+        # created the branch from default OR went through the
+        # stale-merged delete+recreate path — either way THIS session
+        # owns the resulting ref and cleanup on failure should delete it.
+        #
+        # Issue #52: pass the GitHubCLI so the reuse path can refuse a
+        # branch that still backs an open PR (prior DONE session whose
+        # PR is unmerged, or any external source). Without this, we'd
+        # silently check out the reviewer's already-reviewed branch and
+        # either hijack the PR or hit "A pull request already exists"
+        # on `gh pr create` at the end.
         await worktree.ensure_bare_repo(repo)
-        branch_preexisted = await worktree.branch_exists_locally(repo, branch_name)
-        worktree_path = await worktree.create_worktree_with_new_branch(
+        # Snapshot for the exception-path cleanup only (see
+        # ``branch_existed_before`` comment at the top of this function).
+        # We still need this because ``git worktree add -b`` can register
+        # the branch ref before the directory step crashes, and the
+        # helper raises before it can return ``created_fresh=True``.
+        branch_existed_before = await worktree.branch_exists_locally(
+            repo, branch_name,
+        )
+        worktree_path, created_fresh = await worktree.create_worktree_with_new_branch(
             repo=repo,
             session_id=session_id,
             new_branch=branch_name,
+            github=github,
         )
 
         # Symlink context
@@ -867,9 +901,10 @@ async def run_dev_issue(
         #   DONE    -> remove worktree, keep branch (the open PR references it)
         #   BLOCKED -> keep both (user may resume the session)
         #   FAILED  -> remove worktree AND delete branch so the next retry can
-        #              re-create `fix/issue-<n>` cleanly — BUT only if the
-        #              branch did not pre-exist (we own it) and it was never
-        #              pushed (no recoverable work on origin).
+        #              re-create `fix/issue-<n>` cleanly — BUT only if this
+        #              session created the branch (``created_fresh`` — see
+        #              issue #51) and it was never pushed (no recoverable
+        #              work on origin).
         #
         # Cleanup mutates the shared bare repo (worktree metadata, branch
         # refs) so it runs only when we hold the lock. If reacquire above
@@ -883,7 +918,7 @@ async def run_dev_issue(
                 worktree.remove_context_symlink(worktree_path)
                 await worktree.remove_worktree(repo, session_id)
                 if (
-                    not branch_preexisted
+                    created_fresh
                     and not await worktree.branch_exists_on_remote(
                         repo, branch_name
                     )
@@ -899,16 +934,19 @@ async def run_dev_issue(
         )
         state_db.commit()
 
-        # Best-effort cleanup so a retry isn't blocked by leftover state. Only
-        # touch the branch if it didn't pre-exist (we own it) AND origin has
-        # no copy (no recoverable work to orphan). Covers partial failures of
-        # `git worktree add -b` that create the ref before the directory setup
-        # crashes. If we're mid-verify the lock may be released — try to get
-        # it back for the cleanup. Uses the SHORT cleanup budget (not the
-        # fix-path one): a transient exception inside verifier.verify raising
-        # through while a peer holds the lock would otherwise stall the
-        # serial poll cycle for the full hour-long fix budget just to
-        # report the failure.
+        # Best-effort cleanup so a retry isn't blocked by leftover state.
+        # Only touch the branch if THIS session created it (issue #51 —
+        # ``created_fresh``) AND origin has no copy (no recoverable work
+        # to orphan). Covers partial failures of `git worktree add -b`
+        # that create the ref before the directory setup crashes, and
+        # the stale-merged delete+recreate path where the branch now on
+        # disk was put there by this very call. If we're mid-verify the
+        # lock may be released — try to get it back for the cleanup.
+        # Uses the SHORT cleanup budget (not the fix-path one): a
+        # transient exception inside verifier.verify raising through
+        # while a peer holds the lock would otherwise stall the serial
+        # poll cycle for the full hour-long fix budget just to report
+        # the failure.
         if not lock.held:
             try:
                 await lock.reacquire(
@@ -931,7 +969,31 @@ async def run_dev_issue(
                 await worktree.remove_worktree(repo, session_id)
             except Exception:
                 pass
-            if not branch_preexisted:
+            # Exception path ownership: three signals, ordered by
+            # reliability.
+            # 1. created_fresh covers the normal return-and-fail case
+            #    (issue #51).
+            # 2. StaleRecreatePartialFailureError signals the helper
+            #    destroyed the old ref before `git worktree add -b`,
+            #    so anything on disk with this branch name is ours
+            #    regardless of what the pre-call snapshot said. The
+            #    signal is per-call (exception attribute) so
+            #    concurrent sessions on the shared WorktreeManager
+            #    can't clobber each other's ownership state.
+            # 3. Pre-call snapshot (`not branch_existed_before`) is
+            #    the fallback for partial failures of the plain
+            #    fresh-branch path where the helper raises before
+            #    setting created_fresh.
+            from ctrlrelay.core.worktree import StaleRecreatePartialFailureError
+            stale_recreate_attempted = isinstance(
+                e, StaleRecreatePartialFailureError,
+            )
+            we_own_branch = (
+                created_fresh
+                or stale_recreate_attempted
+                or not branch_existed_before
+            )
+            if we_own_branch:
                 try:
                     has_remote = await worktree.branch_exists_on_remote(
                         repo, branch_name
@@ -1043,7 +1105,16 @@ async def resume_dev_from_pending(
                 worktree_path = candidate
 
         if worktree_path is None:
-            worktree_path = await worktree.create_worktree_with_new_branch(
+            # Resume path: the branch should already exist (BLOCKED
+            # sessions preserve both worktree and branch). We discard
+            # ``created_fresh`` here — cleanup semantics don't apply to
+            # resume, which never deletes the branch on exit; the
+            # original run_dev_issue is the single owner of that
+            # decision. Don't pass ``github`` either: an open PR for a
+            # mid-BLOCKED session is possible (claude opened the PR and
+            # blocked on a review question) and refusing reuse would
+            # wedge the resume path.
+            worktree_path, _ = await worktree.create_worktree_with_new_branch(
                 repo=repo,
                 session_id=session_id,
                 new_branch=branch_name,
