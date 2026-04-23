@@ -1660,27 +1660,26 @@ def poller_start(
                             pass
                         continue
 
-                    # Lock-contention is retryable: the 6am secops cron or
-                    # an in-flight dev session holds the repo lock. Leave
-                    # the pending_resumes row as-is so the next sweeper
-                    # tick tries again. Without this guard the operator's
-                    # queued answer is silently dropped.
+                    # Lock-contention at the INITIAL acquire step is
+                    # retryable: the 6am secops cron or an in-flight
+                    # dev session holds the repo lock, we never got
+                    # to pipeline.resume so the operator's answer is
+                    # still intact. Leave the pending_resumes row and
+                    # let the next sweeper tick try again.
                     #
-                    # Two distinct strings both mean "lock contended":
-                    # the initial-acquire message (secops / peer dev
-                    # holds it outright) AND the post-verify message
-                    # (resume_dev_from_pending went into _verify_and_fix_pr,
-                    # needed another fix round, and lost the reacquire
-                    # race). Without the second string, a resume hitting
-                    # contention mid-verify would be marked consumed and
-                    # the operator's answer silently dropped.
-                    lock_contended_strings = (
-                        "Repository locked by another session",
-                        "Repo lock reacquire contended during PR verification",
-                    )
-                    if (
-                        not result.success
-                        and result.error in lock_contended_strings
+                    # The OTHER lock-contended error
+                    # ("Repo lock reacquire contended during PR
+                    # verification") is NOT retryable here: it fires
+                    # only after pipeline.resume consumed the answer
+                    # and advanced the agent session. Replaying the
+                    # same answer on the next tick would double-apply
+                    # side effects on the PR (duplicate commit, dup
+                    # notification) or fail because the agent session
+                    # is already DONE. Fall through to mark the row
+                    # consumed; operator can provide a new answer if
+                    # the PR still needs work after the peer releases.
+                    if not result.success and result.error == (
+                        "Repository locked by another session"
                     ):
                         console.print(
                             "[dim]pending_resume_sweeper: "
