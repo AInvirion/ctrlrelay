@@ -51,6 +51,15 @@ _REACQUIRE_PROGRESS_LOG_EVERY = 60
 _REACQUIRE_CLEANUP_ATTEMPTS = 3
 _REACQUIRE_CLEANUP_SLEEP_SECONDS = 1.0
 
+# Release-lock retry policy for transient SQLite errors. The final
+# release() call in run_dev_issue's outer finally is the last chance
+# to clean up; if that raises and we silently returned, the repo_locks
+# row would linger forever. Short retry loop handles the common
+# transient case; exhausted retries emit a loud wedged event so ops
+# can reclaim manually.
+_RELEASE_RETRY_ATTEMPTS = 3
+_RELEASE_RETRY_SLEEP_SECONDS = 0.5
+
 # Two distinct error messages so callers can tell which phase of the
 # pipeline hit contention:
 #   INITIAL  — nothing started, safe to retry from scratch (cli un-marks
@@ -91,33 +100,58 @@ class _RepoLockHandle:
         from a ``finally`` block that may run before acquire ever
         succeeded.
 
-        If the underlying DELETE raises (e.g. transient
-        ``database is locked`` from SQLite), we keep ``held=True`` so
-        subsequent release attempts retry. Flipping held=False after a
-        failed DELETE would wedge the repo: our stale row stays in
-        ``repo_locks`` rejecting peer acquires while our own code
-        believes the lock is free and tries to proceed.
+        Retries the DELETE a few times on transient failures (SQLite
+        ``database is locked``, etc.). The outer ``finally`` is the
+        last-chance call — if THAT raised and we silently returned,
+        the ``repo_locks`` row would linger forever, wedging every
+        future acquire on this repo until manual DB cleanup.
 
-        The exception is logged and swallowed (release must not leak
-        exceptions from a finally path, where it would mask the
-        original error the caller was unwinding)."""
+        After exhausting retries we emit a ``dev.lock.release_wedged``
+        critical-level event naming the repo + session so an operator
+        can reclaim the lock row. held is left True so an outer
+        retry (if any) still has a chance.
+
+        The inner retry's exception is swallowed only after the
+        wedged event fires — release must not leak exceptions from a
+        finally path where it would mask the caller's original error."""
         if not self.held:
             return
-        try:
-            self.state_db.release_lock(self.repo, self.session_id)
-        except Exception as e:
-            log_event(
-                _logger,
-                "dev.lock.release_failed",
-                session_id=self.session_id,
-                repo=self.repo,
-                reason=type(e).__name__,
-                error=str(e)[:200],
-            )
-            # Don't flip held — a later call (outer finally, etc.) will
-            # retry the DELETE once the transient condition clears.
+        last_exc: Exception | None = None
+        for attempt in range(1, _RELEASE_RETRY_ATTEMPTS + 1):
+            try:
+                self.state_db.release_lock(self.repo, self.session_id)
+            except Exception as e:
+                last_exc = e
+                log_event(
+                    _logger,
+                    "dev.lock.release_failed",
+                    session_id=self.session_id,
+                    repo=self.repo,
+                    attempt=attempt,
+                    max_attempts=_RELEASE_RETRY_ATTEMPTS,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                )
+                if attempt < _RELEASE_RETRY_ATTEMPTS:
+                    time.sleep(_RELEASE_RETRY_SLEEP_SECONDS)
+                continue
+            self.held = False
             return
-        self.held = False
+        # All retries exhausted. The row is presumed still present;
+        # alert loudly so it doesn't silently wedge the repo.
+        log_event(
+            _logger,
+            "dev.lock.release_wedged",
+            session_id=self.session_id,
+            repo=self.repo,
+            reason=type(last_exc).__name__ if last_exc else "unknown",
+            error=str(last_exc)[:200] if last_exc else "",
+            operator_action=(
+                "DELETE FROM repo_locks WHERE repo = ? AND session_id = ? "
+                "manually, or restart the poller after confirming the "
+                "session is not live."
+            ),
+        )
 
     async def reacquire(
         self,
@@ -737,18 +771,25 @@ async def run_dev_issue(
             )
 
         # Reacquire the lock for the post-verify cleanup phase (remove
-        # worktree / delete branch). Uses the SHORT cleanup budget, not
-        # the fix-path budget: cleanup is best-effort, and run_poll_loop
-        # awaits handlers serially — blocking here for an hour would
-        # stall the whole poll cycle AND delay the PR merge watcher
-        # spawn (which happens in cli.handle_issue after we return).
-        # If we can't get the lock back in a few seconds, log and skip
-        # cleanup; the session still returns its verified result.
+        # worktree / delete branch). Usually SHORT budget (cleanup is
+        # best-effort, run_poll_loop awaits handlers serially).
+        #
+        # EXCEPT for the verify-contention error: that path signals
+        # "PR needs another fix round that we couldn't enter," cli
+        # will un-mark the issue for retry, and a fresh run would
+        # fail at create_worktree if this one left the worktree
+        # registered. Retry success DEPENDS on cleanup here, so use
+        # the full fix budget — accepting a possible long wait in
+        # this rare double-contention case beats deterministically
+        # wedging the issue.
         if not lock.held:
-            reacquired = await lock.reacquire(
-                attempts=_REACQUIRE_CLEANUP_ATTEMPTS,
-                sleep_seconds=_REACQUIRE_CLEANUP_SLEEP_SECONDS,
-            )
+            if result.error == _LOCK_CONTENDED_DURING_VERIFY_ERROR:
+                reacquired = await lock.reacquire()  # full fix budget
+            else:
+                reacquired = await lock.reacquire(
+                    attempts=_REACQUIRE_CLEANUP_ATTEMPTS,
+                    sleep_seconds=_REACQUIRE_CLEANUP_SLEEP_SECONDS,
+                )
             if not reacquired:
                 log_event(
                     _logger,

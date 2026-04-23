@@ -1480,16 +1480,19 @@ class TestRepoLockHandleReleaseSafety:
     repo_locks while our code thinks the lock is free, wedging every
     peer session until someone cleans up manually (codex P2)."""
 
-    def test_release_keeps_held_true_when_db_raises(
+    def test_release_retries_transient_db_errors(
         self, tmp_path: Path
     ) -> None:
+        """A single transient DB hiccup must not leak the lock.
+        release() retries internally; the second attempt succeeds
+        and held flips to False."""
         from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines import dev as dev_mod
         from ctrlrelay.pipelines.dev import _RepoLockHandle
 
         real = StateDB(tmp_path / "state.db")
 
         class FlakyDB:
-            """Proxy that raises once on release, then delegates."""
             def __init__(self, inner: StateDB):
                 self.inner = inner
                 self.release_calls = 0
@@ -1511,19 +1514,62 @@ class TestRepoLockHandleReleaseSafety:
         assert flaky.acquire_lock("owner/repo", "sess-A") is True
         handle.held = True
 
-        # First release raises inside release_lock. held must stay True
-        # so the caller knows the row may still be present.
-        handle.release()
-        assert handle.held is True, (
-            "held must stay True after a failed release — otherwise the "
-            "stale repo_locks row wedges peer sessions"
-        )
+        orig_sleep = dev_mod._RELEASE_RETRY_SLEEP_SECONDS
+        dev_mod._RELEASE_RETRY_SLEEP_SECONDS = 0.0
+        try:
+            handle.release()
+        finally:
+            dev_mod._RELEASE_RETRY_SLEEP_SECONDS = orig_sleep
 
-        # Second release succeeds and clears held.
-        handle.release()
         assert handle.held is False
         assert flaky.release_calls == 2
         assert real.get_lock_holder("owner/repo") is None
+        real.close()
+
+    def test_release_keeps_held_true_after_exhausted_retries(
+        self, tmp_path: Path
+    ) -> None:
+        """If every retry fails, held must stay True so any outer
+        retry still has a chance. The wedged event tells ops."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines import dev as dev_mod
+        from ctrlrelay.pipelines.dev import _RepoLockHandle
+
+        real = StateDB(tmp_path / "state.db")
+
+        class AlwaysFailingDB:
+            def __init__(self, inner: StateDB):
+                self.inner = inner
+                self.release_calls = 0
+
+            def acquire_lock(self, *a, **kw):
+                return self.inner.acquire_lock(*a, **kw)
+
+            def release_lock(self, *a, **kw):
+                self.release_calls += 1
+                raise RuntimeError("persistent sqlite wedge")
+
+            def get_lock_holder(self, *a, **kw):
+                return self.inner.get_lock_holder(*a, **kw)
+
+        flaky = AlwaysFailingDB(real)
+        handle = _RepoLockHandle(flaky, "owner/repo", "sess-A")
+        assert flaky.acquire_lock("owner/repo", "sess-A") is True
+        handle.held = True
+
+        orig_sleep = dev_mod._RELEASE_RETRY_SLEEP_SECONDS
+        dev_mod._RELEASE_RETRY_SLEEP_SECONDS = 0.0
+        try:
+            handle.release()
+        finally:
+            dev_mod._RELEASE_RETRY_SLEEP_SECONDS = orig_sleep
+
+        assert handle.held is True, (
+            "held must stay True after exhausted release retries — the "
+            "stale repo_locks row presumably still exists; clearing "
+            "held would hide that from any outer retry"
+        )
+        assert flaky.release_calls == dev_mod._RELEASE_RETRY_ATTEMPTS
         real.close()
 
     def test_release_is_idempotent_when_not_held(
