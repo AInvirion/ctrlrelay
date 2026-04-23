@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass
@@ -21,6 +22,186 @@ from ctrlrelay.transports.base import Transport
 
 DEFAULT_MAX_FIX_ATTEMPTS = 3
 DEFAULT_MAX_BLOCKED_ROUNDS = 5
+
+# Reacquire policy for the repo lock after the unlocked verification phase.
+# Verification releases the lock because CI polling doesn't touch git; when
+# we need to run `request_fix` (which spawns claude + writes worktree) we
+# must get it back. Contention here is NOT necessarily brief — a peer
+# session may be running its own full claude pass on another issue in the
+# same repo, which can take tens of minutes. A short retry budget would
+# spuriously fail healthy same-repo parallelism; bound the wait at roughly
+# one hour, long enough to outlast a normal peer run and short enough to
+# escape a stuck/SIGKILL'd peer whose lock row is lingering.
+# Tests monkey-patch these to speed contention scenarios without changing
+# the call sites.
+_REACQUIRE_LOCK_ATTEMPTS = 720
+_REACQUIRE_LOCK_SLEEP_SECONDS = 5.0
+# Log progress periodically so an operator watching can see we're alive
+# and waiting, not hung. At 5s cadence this fires ~every 5 minutes.
+_REACQUIRE_PROGRESS_LOG_EVERY = 60
+
+# Post-verify CLEANUP (worktree rm, branch delete) is best-effort — if
+# a peer grabs the lock while we're polling CI and we can't get it back
+# fast, skipping cleanup is fine (next run / operator reclaims). Don't
+# use the fix-path budget here: run_poll_loop awaits handlers serially,
+# so waiting an hour for cleanup would stall the whole poll cycle AND
+# delay the merge-watcher spawn that happens after run_dev_issue
+# returns. Three quick retries cover a fleeting hiccup; anything longer
+# belongs elsewhere.
+_REACQUIRE_CLEANUP_ATTEMPTS = 3
+_REACQUIRE_CLEANUP_SLEEP_SECONDS = 1.0
+
+# Release-lock retry policy for transient SQLite errors. The final
+# release() call in run_dev_issue's outer finally is the last chance
+# to clean up; if that raises and we silently returned, the repo_locks
+# row would linger forever. Short retry loop handles the common
+# transient case; exhausted retries emit a loud wedged event so ops
+# can reclaim manually.
+_RELEASE_RETRY_ATTEMPTS = 3
+_RELEASE_RETRY_SLEEP_SECONDS = 0.5
+
+# Two distinct error messages so callers can tell which phase of the
+# pipeline hit contention:
+#   INITIAL  — nothing started, safe to retry from scratch (cli un-marks
+#              the issue so the next poll picks it up).
+#   DURING_VERIFY — a PR already exists; re-running from scratch would
+#                   launch a duplicate dev pass against the open PR.
+#                   cli leaves the issue marked seen and only spawns the
+#                   PR merge watcher so the existing PR still auto-closes
+#                   on merge.
+_LOCK_CONTENDED_ERROR = "Repository locked by another session"
+_LOCK_CONTENDED_DURING_VERIFY_ERROR = (
+    "Repo lock reacquire contended during PR verification"
+)
+
+
+class _RepoLockHandle:
+    """Tracks whether this session currently holds the repo lock and
+    allows release/reacquire around phases that don't need exclusive git
+    access (PR CI verification is pure `gh` polling — see issue #29).
+    The ``finally`` block at the end of ``run_dev_issue`` calls
+    ``release`` regardless; calling it twice is a no-op because
+    ``StateDB.release_lock`` is idempotent (deletes rows, rowcount=0 the
+    second time). Tracking ``held`` locally lets the pipeline decide
+    whether worktree/branch cleanup is safe to attempt on error paths."""
+
+    __slots__ = ("state_db", "repo", "session_id", "held")
+
+    def __init__(self, state_db: StateDB, repo: str, session_id: str) -> None:
+        self.state_db = state_db
+        self.repo = repo
+        self.session_id = session_id
+        # Starts False; run_dev_issue wraps its initial acquire call and
+        # flips this to True on success.
+        self.held = False
+
+    def release(self) -> None:
+        """Release the lock if we hold it. Idempotent and safe to call
+        from a ``finally`` block that may run before acquire ever
+        succeeded.
+
+        Retries the DELETE a few times on transient failures (SQLite
+        ``database is locked``, etc.). The outer ``finally`` is the
+        last-chance call — if THAT raised and we silently returned,
+        the ``repo_locks`` row would linger forever, wedging every
+        future acquire on this repo until manual DB cleanup.
+
+        After exhausting retries we emit a ``dev.lock.release_wedged``
+        critical-level event naming the repo + session so an operator
+        can reclaim the lock row. held is left True so an outer
+        retry (if any) still has a chance.
+
+        The inner retry's exception is swallowed only after the
+        wedged event fires — release must not leak exceptions from a
+        finally path where it would mask the caller's original error."""
+        if not self.held:
+            return
+        last_exc: Exception | None = None
+        for attempt in range(1, _RELEASE_RETRY_ATTEMPTS + 1):
+            try:
+                self.state_db.release_lock(self.repo, self.session_id)
+            except Exception as e:
+                last_exc = e
+                log_event(
+                    _logger,
+                    "dev.lock.release_failed",
+                    session_id=self.session_id,
+                    repo=self.repo,
+                    attempt=attempt,
+                    max_attempts=_RELEASE_RETRY_ATTEMPTS,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                )
+                if attempt < _RELEASE_RETRY_ATTEMPTS:
+                    time.sleep(_RELEASE_RETRY_SLEEP_SECONDS)
+                continue
+            self.held = False
+            return
+        # All retries exhausted. The row is presumed still present;
+        # alert loudly so it doesn't silently wedge the repo.
+        log_event(
+            _logger,
+            "dev.lock.release_wedged",
+            session_id=self.session_id,
+            repo=self.repo,
+            reason=type(last_exc).__name__ if last_exc else "unknown",
+            error=str(last_exc)[:200] if last_exc else "",
+            operator_action=(
+                "DELETE FROM repo_locks WHERE repo = ? AND session_id = ? "
+                "manually, or restart the poller after confirming the "
+                "session is not live."
+            ),
+        )
+
+    async def reacquire(
+        self,
+        *,
+        attempts: int | None = None,
+        sleep_seconds: float | None = None,
+    ) -> bool:
+        """Try to re-grab the lock after a release. Returns True on
+        success, False if contention persists past the retry budget.
+
+        Retry budget: ``attempts`` INSERT tries separated by
+        ``sleep_seconds`` of sleep. Default 720×5s ≈ 1 hour. That's
+        long enough to outlast a peer running its own full dev pass
+        on another issue in the same repo (claude + CI can take
+        tens of minutes), and short enough to escape a stuck or
+        SIGKILL'd peer whose lock row never got cleaned up.
+
+        Defaults resolve at call time (``None`` sentinel) so tests can
+        monkey-patch the module constants to speed up contention
+        scenarios without threading kwargs through every caller.
+        """
+        if self.held:
+            return True
+        effective_attempts = (
+            _REACQUIRE_LOCK_ATTEMPTS if attempts is None else attempts
+        )
+        effective_sleep = (
+            _REACQUIRE_LOCK_SLEEP_SECONDS
+            if sleep_seconds is None
+            else sleep_seconds
+        )
+        for attempt in range(max(1, effective_attempts)):
+            if self.state_db.acquire_lock(self.repo, self.session_id):
+                self.held = True
+                return True
+            # Surface a heartbeat every N attempts so an operator
+            # tailing logs during a long peer hold can tell the
+            # session is waiting, not wedged.
+            if attempt > 0 and attempt % _REACQUIRE_PROGRESS_LOG_EVERY == 0:
+                log_event(
+                    _logger,
+                    "dev.lock.reacquire_waiting",
+                    session_id=self.session_id,
+                    repo=self.repo,
+                    attempt=attempt,
+                    max_attempts=effective_attempts,
+                )
+            if attempt < effective_attempts - 1:
+                await asyncio.sleep(effective_sleep)
+        return False
 
 AGENT_CLAIM_MARKER = "<!-- ctrlrelay:claimed -->"
 AGENT_CLAIM_COMMENT = (
@@ -302,20 +483,78 @@ async def _verify_and_fix_pr(
     result: PipelineResult,
     verifier: PRVerifier,
     max_attempts: int,
+    lock_handle: _RepoLockHandle | None = None,
 ) -> PipelineResult:
-    """Loop: verify CI+mergeability, ask Claude to fix, re-verify."""
+    """Loop: verify CI+mergeability, ask Claude to fix, re-verify.
+
+    Lock discipline (issue #29): the verify phase is pure `gh` polling
+    and holds no git state, so callers pass a ``lock_handle`` whose
+    repo lock we release before each ``verifier.verify`` call and
+    reacquire before each ``request_fix`` call (which spawns claude
+    and writes to the worktree). This lets peer sessions targeting
+    the same repo run their own git-op phases while we wait on CI.
+
+    If reacquire fails after the retry budget, we surface a clear
+    failed result rather than silently running ``request_fix``
+    without the lock — another session may be mutating the shared
+    bare repo and our claude process could corrupt its state.
+    Cancellation during the unlocked phase is safe: the lock_handle
+    tracks ``held=False`` so the outer ``finally`` no-ops its release.
+    """
     pr_number_raw = result.outputs.get("pr_number")
     if pr_number_raw is None:
         return result
     pr_number = int(pr_number_raw)
 
-    verification = await verifier.verify(ctx.repo, pr_number)
+    async def _run_verify() -> VerificationResult:
+        """Release the lock around the pure-gh polling window, then
+        hand the lock back to the caller on return. Reacquire is
+        deferred to just before the fix path so peer sessions get the
+        widest possible window."""
+        if lock_handle is not None:
+            lock_handle.release()
+        try:
+            return await verifier.verify(ctx.repo, pr_number)
+        except asyncio.CancelledError:
+            # Intentionally leave held=False so the outer finally's
+            # release_lock is a no-op; the row is already gone. Re-raise
+            # to let the cancellation propagate.
+            raise
+
+    verification = await _run_verify()
     # If CI is simply slow (timed_out) we hand the PR off rather than asking
     # Claude to "fix" something that isn't broken.
     if verification.timed_out:
         return result
     attempts = 0
     while not verification.ready and attempts < max_attempts:
+        # Reacquire before request_fix — claude spawns inside the
+        # worktree and pushes to the shared bare repo. If we can't
+        # get the lock back in a reasonable window, bail cleanly
+        # rather than racing another session.
+        if lock_handle is not None and not lock_handle.held:
+            reacquired = await lock_handle.reacquire()
+            if not reacquired:
+                log_event(
+                    _logger,
+                    "dev.verify.lock_reacquire_contended",
+                    session_id=result.session_id,
+                    repo=ctx.repo,
+                    pr_number=pr_number,
+                    attempts=_REACQUIRE_LOCK_ATTEMPTS,
+                )
+                return PipelineResult(
+                    success=False,
+                    session_id=result.session_id,
+                    summary=(
+                        f"PR #{pr_number} verification found work to do "
+                        "but could not re-acquire repo lock after "
+                        f"{_REACQUIRE_LOCK_ATTEMPTS} attempts"
+                    ),
+                    error=_LOCK_CONTENDED_DURING_VERIFY_ERROR,
+                    outputs=result.outputs,
+                )
+
         fix_prompt = _build_fix_prompt(pr_number, verification)
         fix_result = await pipeline.request_fix(ctx, fix_prompt)
         attempts += 1
@@ -335,7 +574,7 @@ async def _verify_and_fix_pr(
             )
 
         result = fix_result
-        verification = await verifier.verify(ctx.repo, pr_number)
+        verification = await _run_verify()
         if verification.timed_out:
             # Same rule after a fix round: slow CI isn't a Claude task.
             return result
@@ -374,6 +613,7 @@ async def run_dev_issue(
     session_id = f"dev-{repo.replace('/', '-')}-{issue_number}-{uuid.uuid4().hex[:8]}"
     branch_name = branch_template.replace("{n}", str(issue_number))
 
+    lock = _RepoLockHandle(state_db, repo, session_id)
     if not state_db.acquire_lock(repo, session_id):
         return PipelineResult(
             success=False,
@@ -381,6 +621,7 @@ async def run_dev_issue(
             summary=f"Could not acquire lock for {repo}",
             error="Repository locked by another session",
         )
+    lock.held = True
 
     worktree_path: Path | None = None
     # Pessimistic default: if we never got far enough to check, assume the
@@ -513,6 +754,11 @@ async def run_dev_issue(
 
         # Verify PR is green & conflict-free before handing off. Resume the
         # session with a fix request if either is broken, up to max_fix_attempts.
+        #
+        # Issue #29: the lock handle is passed in so the verifier releases
+        # the repo lock during its CI-polling window (can be up to 30 min)
+        # and reacquires before any request_fix. Peer sessions targeting
+        # the same repo can now run their own git-op phases while we wait.
         if result.success and result.outputs.get("pr_number") is not None:
             verifier = pr_verifier or PRVerifier(github=github)
             result = await _verify_and_fix_pr(
@@ -521,7 +767,55 @@ async def run_dev_issue(
                 result=result,
                 verifier=verifier,
                 max_attempts=max_fix_attempts,
+                lock_handle=lock,
             )
+
+        # Reacquire the lock for the post-verify cleanup phase (remove
+        # worktree / delete branch). Usually SHORT budget (cleanup is
+        # best-effort, run_poll_loop awaits handlers serially).
+        #
+        # EXCEPT for the verify-contention error: that path signals
+        # "PR needs another fix round that we couldn't enter," cli
+        # will un-mark the issue for retry, and a fresh run would
+        # fail at create_worktree if this one left the worktree
+        # registered. Retry success DEPENDS on cleanup here, so use
+        # the full fix budget — accepting a possible long wait in
+        # this rare double-contention case beats deterministically
+        # wedging the issue.
+        if not lock.held:
+            if result.error == _LOCK_CONTENDED_DURING_VERIFY_ERROR:
+                reacquired = await lock.reacquire()  # full fix budget
+            else:
+                reacquired = await lock.reacquire(
+                    attempts=_REACQUIRE_CLEANUP_ATTEMPTS,
+                    sleep_seconds=_REACQUIRE_CLEANUP_SLEEP_SECONDS,
+                )
+            if not reacquired:
+                log_event(
+                    _logger,
+                    "dev.cleanup.lock_reacquire_contended",
+                    session_id=session_id,
+                    repo=repo,
+                    issue_number=issue_number,
+                )
+                # Signal to cli.handle_issue that the worktree was NOT
+                # torn down so the caller can skip any "unmark for
+                # retry" logic. A fresh dev run against this issue
+                # would fail at `create_worktree_with_new_branch`
+                # because the abandoned worktree is still registered
+                # on the bare repo. Requires operator cleanup (or the
+                # next poller restart, which prunes stale worktrees).
+                merged_outputs = dict(result.outputs)
+                merged_outputs["cleanup_deferred"] = True
+                result = PipelineResult(
+                    success=result.success,
+                    session_id=result.session_id,
+                    summary=result.summary,
+                    blocked=result.blocked,
+                    question=result.question,
+                    error=result.error,
+                    outputs=merged_outputs,
+                )
 
         # Update session status
         status = "done" if result.success else ("blocked" if result.blocked else "failed")
@@ -576,16 +870,25 @@ async def run_dev_issue(
         #              re-create `fix/issue-<n>` cleanly — BUT only if the
         #              branch did not pre-exist (we own it) and it was never
         #              pushed (no recoverable work on origin).
-        if result.success:
-            worktree.remove_context_symlink(worktree_path)
-            await worktree.remove_worktree(repo, session_id)
-        elif not result.blocked:
-            worktree.remove_context_symlink(worktree_path)
-            await worktree.remove_worktree(repo, session_id)
-            if not branch_preexisted and not await worktree.branch_exists_on_remote(
-                repo, branch_name
-            ):
-                await worktree.delete_branch(repo, branch_name)
+        #
+        # Cleanup mutates the shared bare repo (worktree metadata, branch
+        # refs) so it runs only when we hold the lock. If reacquire above
+        # failed, skip it and let the next retry / operator reclaim — the
+        # verified result is already final either way.
+        if lock.held:
+            if result.success:
+                worktree.remove_context_symlink(worktree_path)
+                await worktree.remove_worktree(repo, session_id)
+            elif not result.blocked:
+                worktree.remove_context_symlink(worktree_path)
+                await worktree.remove_worktree(repo, session_id)
+                if (
+                    not branch_preexisted
+                    and not await worktree.branch_exists_on_remote(
+                        repo, branch_name
+                    )
+                ):
+                    await worktree.delete_branch(repo, branch_name)
 
         return result
 
@@ -600,30 +903,46 @@ async def run_dev_issue(
         # touch the branch if it didn't pre-exist (we own it) AND origin has
         # no copy (no recoverable work to orphan). Covers partial failures of
         # `git worktree add -b` that create the ref before the directory setup
-        # crashes.
-        if worktree_path is not None:
+        # crashes. If we're mid-verify the lock may be released — try to get
+        # it back for the cleanup. Uses the SHORT cleanup budget (not the
+        # fix-path one): a transient exception inside verifier.verify raising
+        # through while a peer holds the lock would otherwise stall the
+        # serial poll cycle for the full hour-long fix budget just to
+        # report the failure.
+        if not lock.held:
             try:
-                worktree.remove_context_symlink(worktree_path)
+                await lock.reacquire(
+                    attempts=_REACQUIRE_CLEANUP_ATTEMPTS,
+                    sleep_seconds=_REACQUIRE_CLEANUP_SLEEP_SECONDS,
+                )
             except Exception:
                 pass
-        # Always attempt remove_worktree + prune — handles the case where
-        # `git worktree add -b` registered worktree metadata before the dir
-        # step failed, leaving worktree_path unassigned but metadata in the
-        # bare repo that would prevent the branch from being deleted.
-        try:
-            await worktree.remove_worktree(repo, session_id)
-        except Exception:
-            pass
-        if not branch_preexisted:
-            try:
-                has_remote = await worktree.branch_exists_on_remote(repo, branch_name)
-            except Exception:
-                has_remote = True
-            if not has_remote:
+        if lock.held:
+            if worktree_path is not None:
                 try:
-                    await worktree.delete_branch(repo, branch_name)
+                    worktree.remove_context_symlink(worktree_path)
                 except Exception:
                     pass
+            # Always attempt remove_worktree + prune — handles the case where
+            # `git worktree add -b` registered worktree metadata before the dir
+            # step failed, leaving worktree_path unassigned but metadata in the
+            # bare repo that would prevent the branch from being deleted.
+            try:
+                await worktree.remove_worktree(repo, session_id)
+            except Exception:
+                pass
+            if not branch_preexisted:
+                try:
+                    has_remote = await worktree.branch_exists_on_remote(
+                        repo, branch_name
+                    )
+                except Exception:
+                    has_remote = True
+                if not has_remote:
+                    try:
+                        await worktree.delete_branch(repo, branch_name)
+                    except Exception:
+                        pass
 
         return PipelineResult(
             success=False,
@@ -633,7 +952,13 @@ async def run_dev_issue(
         )
 
     finally:
-        state_db.release_lock(repo, session_id)
+        # Safe even if we already released inside `_verify_and_fix_pr` —
+        # the handle's `release` is idempotent (no-op when held=False)
+        # and StateDB.release_lock is itself idempotent (DELETE with
+        # rowcount=0 is a valid outcome). This also covers
+        # CancelledError: if cancellation arrives during the unlocked
+        # verify window, held is already False, so no stray DELETE runs.
+        lock.release()
 
 
 async def resume_dev_from_pending(
@@ -692,6 +1017,7 @@ async def resume_dev_from_pending(
 
     branch_name = branch_template.replace("{n}", str(issue_number))
 
+    lock = _RepoLockHandle(state_db, repo, session_id)
     if not state_db.acquire_lock(repo, session_id):
         return PipelineResult(
             success=False,
@@ -699,6 +1025,7 @@ async def resume_dev_from_pending(
             summary=f"Could not acquire lock for {repo} to resume dev",
             error="Repository locked by another session",
         )
+    lock.held = True
 
     worktree_path: Path | None = None
 
@@ -810,6 +1137,8 @@ async def resume_dev_from_pending(
             result = await pipeline.resume(ctx, next_answer)
 
         # Verify PR once the agent says DONE, matching run_dev_issue.
+        # The lock handle is threaded through so the verifier releases
+        # the repo lock during its CI-polling window (issue #29).
         if result.success and result.outputs.get("pr_number") is not None:
             verifier = pr_verifier or PRVerifier(github=github)
             result = await _verify_and_fix_pr(
@@ -818,6 +1147,7 @@ async def resume_dev_from_pending(
                 result=result,
                 verifier=verifier,
                 max_attempts=max_fix_attempts,
+                lock_handle=lock,
             )
 
         status = "done" if result.success else (
@@ -872,8 +1202,13 @@ async def resume_dev_from_pending(
         # re-blocks. A follow-up can add teardown for the DONE/FAILED
         # outcomes (small disk leak, not a correctness issue; operator
         # can run `git worktree prune` in the bare repo to reclaim).
+        #
+        # ``lock.release`` is idempotent, so this is a no-op if the
+        # verify phase already released and never reacquired (CI-only
+        # path with no fix attempts + no cleanup work). Matches issue
+        # #29's release-during-verify semantics.
         try:
-            state_db.release_lock(repo, session_id)
+            lock.release()
         except Exception as lock_exc:
             log_event(
                 _logger,

@@ -1235,10 +1235,10 @@ def poller_start(
                 # Lock-conflict retry hook. The poller marks issues seen
                 # BEFORE handle_issue runs, so a failed attempt would
                 # permanently drop the issue. If run_dev_issue couldn't
-                # acquire the per-repo lock (common when a scheduled
-                # secops sweep is mid-run on the same repo), un-mark the
-                # issue so the next poll picks it up. Any other failure
-                # still stays seen — those aren't transient.
+                # acquire the per-repo lock up front (common when a
+                # scheduled secops sweep is mid-run on the same repo),
+                # un-mark the issue so the next poll picks it up. Any
+                # other failure still stays seen — those aren't transient.
                 if (
                     not result.success
                     and not result.blocked
@@ -1260,6 +1260,68 @@ def poller_start(
                         except Exception:
                             pass
                     return
+
+                # Lock-contended DURING PR verification (issue #29): the
+                # PR already exists AND verification decided it wasn't
+                # ready (_verify_and_fix_pr only returns this error from
+                # the "need to run request_fix but couldn't reacquire"
+                # path). Two sub-cases based on whether run_dev_issue's
+                # cleanup reacquire succeeded:
+                #
+                # (a) Cleanup clean (lock reclaimed, worktree torn down):
+                #     un-mark the issue so the next poll retries the fix.
+                #     run_dev_issue's branch-reuse path handles
+                #     "issue already has a branch / PR" (#51, #52).
+                #
+                # (b) Cleanup deferred (peer still holds lock; worktree
+                #     NOT removed): un-marking would make the next poll
+                #     call create_worktree_with_new_branch and fail
+                #     with "already checked out" because the abandoned
+                #     worktree metadata is still registered. Leave the
+                #     issue seen and log an operator-actionable warning;
+                #     a poller restart (or `git worktree prune`) will
+                #     clear the stale entry.
+                #
+                # Either way the merge watcher still spawns below so
+                # the existing PR's auto-close works if a human merges.
+                if (
+                    not result.success
+                    and not result.blocked
+                    and result.error
+                    and "reacquire contended during pr verification"
+                    in result.error.lower()
+                ):
+                    pr_num_str = result.outputs.get("pr_number", "?")
+                    cleanup_deferred = bool(
+                        result.outputs.get("cleanup_deferred")
+                    )
+                    if cleanup_deferred:
+                        console.print(
+                            f"[red]#{issue_number} in {repo}: lock "
+                            "contention during PR verification AND "
+                            "cleanup could not reclaim the lock after "
+                            "the full fix budget (~1 hour). A peer "
+                            "session is wedged. Operator action: "
+                            "identify the peer holding the lock on "
+                            f"repo_locks for {repo} (via `sqlite3 "
+                            "state.db 'SELECT * FROM repo_locks'`), "
+                            "investigate/kill it, then `git worktree "
+                            "remove --force` on the session's "
+                            "worktree directory before re-assigning "
+                            f"issue #{issue_number}. "
+                            f"PR #{pr_num_str} already exists on "
+                            "GitHub and is being watched for merge."
+                            "[/red]"
+                        )
+                    else:
+                        poller.unmark_seen(repo, issue_number)
+                        console.print(
+                            f"[yellow]#{issue_number} in {repo}: lock "
+                            "contention during PR verification — "
+                            f"un-marking for retry (PR #{pr_num_str} "
+                            "needs another fix round). Merge watcher "
+                            "still spawns.[/yellow]"
+                        )
 
                 # Spawn the PR watcher FIRST, before any best-effort
                 # notification. The poller has already marked this issue
@@ -1605,11 +1667,12 @@ def poller_start(
                             pass
                         continue
 
-                    # Lock-contention is retryable: the 6am secops cron or
-                    # an in-flight dev session holds the repo lock. Leave
-                    # the pending_resumes row as-is so the next sweeper
-                    # tick tries again. Without this guard the operator's
-                    # queued answer is silently dropped.
+                    # Lock-contention at the INITIAL acquire step is
+                    # retryable: the 6am secops cron or an in-flight
+                    # dev session holds the repo lock, we never got
+                    # to pipeline.resume so the operator's answer is
+                    # still intact. Leave the pending_resumes row and
+                    # let the next sweeper tick try again.
                     if not result.success and result.error == (
                         "Repository locked by another session"
                     ):
@@ -1617,6 +1680,48 @@ def poller_start(
                             "[dim]pending_resume_sweeper: "
                             f"lock contention on {repo}, will retry "
                             f"next tick (session={session_id})[/dim]"
+                        )
+                        continue
+
+                    # The OTHER lock-contended error fires only AFTER
+                    # pipeline.resume consumed the operator's answer
+                    # and advanced the agent session to DONE: replaying
+                    # the same answer would double-apply side effects
+                    # on the PR or fail because the agent session is
+                    # already finalized. BUT just marking the row
+                    # consumed strands the workflow — the PR needs
+                    # another fix round and nothing would trigger it.
+                    # Re-insert a fresh pending_resumes row with a
+                    # synthetic prompt so a new operator reply can
+                    # attach via the bridge and drive the next round.
+                    if not result.success and result.error == (
+                        "Repo lock reacquire contended during PR verification"
+                    ):
+                        pr_num = result.outputs.get("pr_number", "?")
+                        synthetic_question = (
+                            f"Post-verify lock contention on {repo} "
+                            f"while resuming session {session_id} "
+                            f"(PR #{pr_num}). The prior answer was "
+                            "consumed; reply with new guidance to "
+                            "retry the fix round once the peer "
+                            "session releases."
+                        )
+                        try:
+                            state_db.add_pending_resume(
+                                session_id=session_id,
+                                pipeline=pipeline_name,
+                                repo=repo,
+                                question=synthetic_question,
+                            )
+                        except Exception:
+                            pass
+                        console.print(
+                            f"[yellow]pending_resume_sweeper: "
+                            f"verify contention on {repo} (session="
+                            f"{session_id}); prior answer consumed, "
+                            "fresh pending_resumes row inserted so a "
+                            "new operator reply can drive the retry."
+                            "[/yellow]"
                         )
                         continue
 
