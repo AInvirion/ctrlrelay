@@ -1299,12 +1299,19 @@ def poller_start(
                         console.print(
                             f"[red]#{issue_number} in {repo}: lock "
                             "contention during PR verification AND "
-                            "cleanup could not reclaim the lock. "
-                            f"Worktree for PR #{pr_num_str} is still "
-                            "registered; retry would fail at "
-                            "create_worktree. Operator action: "
-                            "`git worktree prune` in the bare repo "
-                            "or restart the poller.[/red]"
+                            "cleanup could not reclaim the lock after "
+                            "the full fix budget (~1 hour). A peer "
+                            "session is wedged. Operator action: "
+                            "identify the peer holding the lock on "
+                            f"repo_locks for {repo} (via `sqlite3 "
+                            "state.db 'SELECT * FROM repo_locks'`), "
+                            "investigate/kill it, then `git worktree "
+                            "remove --force` on the session's "
+                            "worktree directory before re-assigning "
+                            f"issue #{issue_number}. "
+                            f"PR #{pr_num_str} already exists on "
+                            "GitHub and is being watched for merge."
+                            "[/red]"
                         )
                     else:
                         poller.unmark_seen(repo, issue_number)
@@ -1666,18 +1673,6 @@ def poller_start(
                     # to pipeline.resume so the operator's answer is
                     # still intact. Leave the pending_resumes row and
                     # let the next sweeper tick try again.
-                    #
-                    # The OTHER lock-contended error
-                    # ("Repo lock reacquire contended during PR
-                    # verification") is NOT retryable here: it fires
-                    # only after pipeline.resume consumed the answer
-                    # and advanced the agent session. Replaying the
-                    # same answer on the next tick would double-apply
-                    # side effects on the PR (duplicate commit, dup
-                    # notification) or fail because the agent session
-                    # is already DONE. Fall through to mark the row
-                    # consumed; operator can provide a new answer if
-                    # the PR still needs work after the peer releases.
                     if not result.success and result.error == (
                         "Repository locked by another session"
                     ):
@@ -1685,6 +1680,48 @@ def poller_start(
                             "[dim]pending_resume_sweeper: "
                             f"lock contention on {repo}, will retry "
                             f"next tick (session={session_id})[/dim]"
+                        )
+                        continue
+
+                    # The OTHER lock-contended error fires only AFTER
+                    # pipeline.resume consumed the operator's answer
+                    # and advanced the agent session to DONE: replaying
+                    # the same answer would double-apply side effects
+                    # on the PR or fail because the agent session is
+                    # already finalized. BUT just marking the row
+                    # consumed strands the workflow — the PR needs
+                    # another fix round and nothing would trigger it.
+                    # Re-insert a fresh pending_resumes row with a
+                    # synthetic prompt so a new operator reply can
+                    # attach via the bridge and drive the next round.
+                    if not result.success and result.error == (
+                        "Repo lock reacquire contended during PR verification"
+                    ):
+                        pr_num = result.outputs.get("pr_number", "?")
+                        synthetic_question = (
+                            f"Post-verify lock contention on {repo} "
+                            f"while resuming session {session_id} "
+                            f"(PR #{pr_num}). The prior answer was "
+                            "consumed; reply with new guidance to "
+                            "retry the fix round once the peer "
+                            "session releases."
+                        )
+                        try:
+                            state_db.add_pending_resume(
+                                session_id=session_id,
+                                pipeline=pipeline_name,
+                                repo=repo,
+                                question=synthetic_question,
+                            )
+                        except Exception:
+                            pass
+                        console.print(
+                            f"[yellow]pending_resume_sweeper: "
+                            f"verify contention on {repo} (session="
+                            f"{session_id}); prior answer consumed, "
+                            "fresh pending_resumes row inserted so a "
+                            "new operator reply can drive the retry."
+                            "[/yellow]"
                         )
                         continue
 
