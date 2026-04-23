@@ -18,6 +18,12 @@ if TYPE_CHECKING:
 # gh is genuinely down. Three quick attempts strike a balance.
 _PR_PROBE_RETRY_ATTEMPTS = 3
 _PR_PROBE_RETRY_SLEEP_SECONDS = 1.0
+# Per-call gh timeout for the open-PR probe. This probe holds the repo
+# lock, so inheriting GitHubCLI's 60s default would let a hung gh
+# process block other sessions on the same repo for up to ~3 minutes
+# (3 attempts × 60s) before failing closed. 10s is plenty for a
+# single pr-list call with --head filter against GitHub.
+_PR_PROBE_TIMEOUT_SECONDS = 10
 
 
 class WorktreeError(Exception):
@@ -210,18 +216,6 @@ class WorktreeManager:
                     "`git worktree remove` in the bare repo before retrying."
                 )
 
-            # Issue #52: if this branch still backs an open PR (prior DONE
-            # session whose PR is unmerged, or any external source),
-            # refuse reuse. Reusing would either hijack the reviewer's
-            # already-reviewed branch or trip "A pull request already
-            # exists" later at `gh pr create`. Refuse loudly with a
-            # concrete operator action. Probe is BEFORE any ref
-            # mutations so we never half-modify a PR-backed branch.
-            if github is not None:
-                await self._refuse_if_branch_backs_open_pr(
-                    github, repo, new_branch,
-                )
-
             # Remote presence has to be KNOWN to take either sync-to-origin
             # or stale-merged branches. branch_exists_on_remote is
             # fail-closed (returns True on timeout/auth error) which is
@@ -235,12 +229,26 @@ class WorktreeManager:
                     bare_path, new_branch,
                 )
             except Exception:
+                # Local-only (ref isn't on origin), so no open PR can be
+                # backing it — skip the open-PR probe entirely. This
+                # also means a flaky `gh` doesn't block otherwise-safe
+                # local recovery paths (issue #52 codex P2 round-6).
                 await self._worktree_add_with_stale_cleanup(
                     bare_path, worktree_path, new_branch,
                 )
                 return worktree_path, False
 
             if on_remote:
+                # Issue #52: branch is on origin, so a same-repo PR
+                # could be backing it. Probe MUST run before any ref
+                # mutation and before `gh pr create` later; otherwise
+                # the push below would hijack the reviewer's branch.
+                # Fail-closed on probe error — see
+                # _refuse_if_branch_backs_open_pr for the rationale.
+                if github is not None:
+                    await self._refuse_if_branch_backs_open_pr(
+                        github, repo, new_branch,
+                    )
                 # Remote exists → sync local to remote head (preserving
                 # unpushed ahead-of-origin commits) and reuse.
                 await self._sync_reused_branch_to_origin(bare_path, new_branch)
@@ -334,6 +342,7 @@ class WorktreeManager:
             try:
                 prs = await github.list_prs(
                     repo, state="open", head=branch,
+                    timeout=_PR_PROBE_TIMEOUT_SECONDS,
                 )
                 last_exc = None
                 break
