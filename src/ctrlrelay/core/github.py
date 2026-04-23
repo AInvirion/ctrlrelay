@@ -69,15 +69,25 @@ class GitHubCLI:
         repo: str,
         state: str = "open",
         limit: int = 100,
+        head: str | None = None,
     ) -> list[dict[str, Any]]:
-        """List pull requests for a repository."""
-        output = await self._run_gh(
+        """List pull requests for a repository.
+
+        When ``head`` is given, restrict the result to PRs whose head
+        branch is ``head`` (passed to ``gh pr list --head``). Used by
+        the dev pipeline's worktree reuse path to refuse a branch that
+        still backs an open PR (issue #52).
+        """
+        args = [
             "pr", "list",
             "--repo", repo,
             "--state", state,
             "--limit", str(limit),
             "--json", "number,title,author,labels,headRefName,mergeable,reviewDecision",
-        )
+        ]
+        if head is not None:
+            args.extend(["--head", head])
+        output = await self._run_gh(*args)
         return json.loads(output) if output.strip() else []
 
     async def list_security_alerts(

@@ -6,6 +6,10 @@ import asyncio
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ctrlrelay.core.github import GitHubCLI
 
 
 class WorktreeError(Exception):
@@ -121,7 +125,8 @@ class WorktreeManager:
         session_id: str,
         new_branch: str,
         base_branch: str | None = None,
-    ) -> Path:
+        github: GitHubCLI | None = None,
+    ) -> tuple[Path, bool]:
         """Create a worktree for ``new_branch``.
 
         If ``new_branch`` already exists in the bare repo — e.g. because a
@@ -135,6 +140,25 @@ class WorktreeManager:
 
         When we have to fall back to a brand-new branch, it's cut from
         ``base_branch`` (default: the repo's default branch).
+
+        Returns ``(worktree_path, created_fresh)`` where ``created_fresh``
+        is True when THIS call either created a brand-new branch from
+        ``base_branch`` or detected a stale fully-merged local branch,
+        deleted it, and recreated it. Callers use this flag to decide
+        whether cleanup on session failure should delete the branch
+        (issue #51): a pre-snapshotted ``branch_exists_locally`` check
+        goes stale the moment we delete+recreate, so the ownership
+        signal has to come from the function that performed the
+        mutation.
+
+        When ``github`` is provided and the branch already exists locally,
+        probe GitHub for an open PR with ``new_branch`` as head. If one
+        exists, refuse to reuse the branch — the reviewer's already-
+        reviewed work must not be hijacked by a fresh session, and
+        ``gh pr create`` would later fail with "A pull request already
+        exists" (issue #52). Raises :class:`WorktreeError` with the PR
+        number and a concrete operator action. The probe runs BEFORE
+        any ref mutations so a concurrent PR is surfaced cleanly.
         """
         bare_path = self._get_bare_repo_path(repo)
         worktree_path = self._get_worktree_path(repo, session_id)
@@ -157,6 +181,18 @@ class WorktreeManager:
                     "`git worktree remove` in the bare repo before retrying."
                 )
 
+            # Issue #52: if this branch still backs an open PR (prior DONE
+            # session whose PR is unmerged, or any external source),
+            # refuse reuse. Reusing would either hijack the reviewer's
+            # already-reviewed branch or trip "A pull request already
+            # exists" later at `gh pr create`. Refuse loudly with a
+            # concrete operator action. Probe is BEFORE any ref
+            # mutations so we never half-modify a PR-backed branch.
+            if github is not None:
+                await self._refuse_if_branch_backs_open_pr(
+                    github, repo, new_branch,
+                )
+
             # Remote presence has to be KNOWN to take either sync-to-origin
             # or stale-merged branches. branch_exists_on_remote is
             # fail-closed (returns True on timeout/auth error) which is
@@ -173,7 +209,7 @@ class WorktreeManager:
                 await self._worktree_add_with_stale_cleanup(
                     bare_path, worktree_path, new_branch,
                 )
-                return worktree_path
+                return worktree_path, False
 
             if on_remote:
                 # Remote exists → sync local to remote head (preserving
@@ -182,7 +218,7 @@ class WorktreeManager:
                 await self._worktree_add_with_stale_cleanup(
                     bare_path, worktree_path, new_branch,
                 )
-                return worktree_path
+                return worktree_path, False
 
             # Local-only (confirmed). Distinguish between:
             #   (a) stale-merged: the prior PR was merged (any strategy) and
@@ -202,12 +238,15 @@ class WorktreeManager:
                     )
                 except Exception:
                     pass
-                # Fall through to the fresh-branch creation below.
+                # Fall through to the fresh-branch creation below. The
+                # delete+recreate path is the exact scenario issue #51
+                # covers: the branch that now exists was created by THIS
+                # session, so cleanup on failure must treat it as ours.
             else:
                 await self._worktree_add_with_stale_cleanup(
                     bare_path, worktree_path, new_branch,
                 )
-                return worktree_path
+                return worktree_path, False
 
         if base_branch is None:
             base_branch = await self.get_default_branch(repo)
@@ -219,7 +258,32 @@ class WorktreeManager:
             base_branch,
             cwd=bare_path,
         )
-        return worktree_path
+        return worktree_path, True
+
+    async def _refuse_if_branch_backs_open_pr(
+        self, github: GitHubCLI, repo: str, branch: str,
+    ) -> None:
+        """Issue #52: raise WorktreeError if ``branch`` is the head of an
+        open PR on ``repo``. Skips silently on probe failure so a flaky
+        GitHub API doesn't wedge every retry — the existing reuse path
+        and later ``gh pr create`` call still provide defense in depth.
+        """
+        try:
+            prs = await github.list_prs(repo, state="open", head=branch)
+        except Exception:
+            # Probe failure: don't block reuse on a transient gh/network
+            # error. If a PR really does exist, the subsequent
+            # `gh pr create` would fail with "A pull request already
+            # exists" — noisier than we'd like, but not a correctness
+            # regression.
+            return
+        if not prs:
+            return
+        pr_number = prs[0].get("number")
+        raise WorktreeError(
+            f"Branch {branch!r} already has open PR #{pr_number} on "
+            f"{repo!r} — close or merge it before retrying this issue."
+        )
 
     async def _worktree_add_with_stale_cleanup(
         self, bare_path: Path, worktree_path: Path, branch: str,

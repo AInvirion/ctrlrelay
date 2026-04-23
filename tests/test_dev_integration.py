@@ -93,7 +93,7 @@ class TestDevIntegration:
 
             worktree_path = tmp_path / "worktrees" / "test-worktree"
             worktree_path.mkdir(parents=True)
-            mock_create.return_value = worktree_path
+            mock_create.return_value = (worktree_path, True)
 
             result = await run_dev_issue(
                 repo="owner/repo",
@@ -137,7 +137,8 @@ class TestDevPipelineCleanup:
         *,
         branch_on_remote: bool = False,
         create_side_effect=None,
-        branch_preexists_locally: bool = False,
+        created_fresh: bool = True,
+        branch_existed_before: bool | None = None,
     ):
         """Run the dev pipeline with a stub dispatcher behavior, returning
         (result, mocks) so tests can assert on cleanup calls.
@@ -147,6 +148,18 @@ class TestDevPipelineCleanup:
           has it (must preserve).
         - `create_side_effect`: if set, overrides create_worktree_with_new_branch
           to simulate setup failure before the branch is created.
+        - `created_fresh`: the ownership flag returned from
+          create_worktree_with_new_branch (issue #51). True when this
+          session created the branch (fresh from default or via
+          delete+recreate of a stale merged local branch); False when
+          we reused an existing branch.
+        - `branch_existed_before`: value returned by the pre-call
+          ``branch_exists_locally`` snapshot. When None (default),
+          derives from ``not created_fresh`` to match the typical
+          pairing: fresh creations imply "didn't exist before", reuses
+          imply "did". Override explicitly when exercising
+          partial-create cleanup (branch_existed_before=False while
+          create_worktree raises).
         """
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
         from ctrlrelay.core.github import GitHubCLI
@@ -193,14 +206,24 @@ class TestDevPipelineCleanup:
         ):
 
             mock_remote.return_value = branch_on_remote
-            mock_local.return_value = branch_preexists_locally
+            # branch_exists_locally is used by run_dev_issue only for the
+            # pre-call snapshot that backs the exception-path cleanup
+            # fallback (see run_dev_issue.branch_existed_before). The
+            # normal FAILED path keys off the returned ``created_fresh``
+            # from create_worktree_with_new_branch (issue #51).
+            effective_existed_before = (
+                (not created_fresh)
+                if branch_existed_before is None
+                else branch_existed_before
+            )
+            mock_local.return_value = effective_existed_before
 
             if create_side_effect is not None:
                 mock_create.side_effect = create_side_effect
             else:
                 worktree_path = tmp_path / "worktrees" / "wt-13"
                 worktree_path.mkdir(parents=True)
-                mock_create.return_value = worktree_path
+                mock_create.return_value = (worktree_path, created_fresh)
 
             from ctrlrelay.core.pr_verifier import VerificationResult
             mock_pr_verifier = AsyncMock()
@@ -374,7 +397,7 @@ class TestDevPipelineCleanup:
             mock_local.return_value = False
             worktree_path = tmp_path / "worktrees" / "wt-42"
             worktree_path.mkdir(parents=True)
-            mock_create.return_value = worktree_path
+            mock_create.return_value = (worktree_path, True)
 
             result = await run_dev_issue(
                 repo="owner/repo",
@@ -470,7 +493,11 @@ class TestDevPipelineCleanup:
             tmp_path,
             spawn,
             create_side_effect=create_boom,
-            branch_preexists_locally=True,
+            # Branch existed before the call; create_worktree raised
+            # before returning, so no ``created_fresh`` signal is
+            # available. The helper's default (False) combined with
+            # branch_existed_before=True means cleanup must NOT delete.
+            created_fresh=False,
         )
 
         assert not result.success
@@ -503,7 +530,12 @@ class TestDevPipelineCleanup:
             tmp_path,
             spawn,
             create_side_effect=create_partial_fail,
-            branch_preexists_locally=False,  # this run introduced the ref
+            # This run introduced the ref, but create_worktree raised
+            # before returning ``created_fresh=True``. Force
+            # branch_existed_before=False so the exception-path
+            # fallback correctly treats the leftover ref as ours.
+            created_fresh=False,
+            branch_existed_before=False,
         )
 
         assert not result.success
@@ -546,3 +578,66 @@ class TestDevPipelineCleanup:
         assert result.success
         mock_remove_wt.assert_awaited_once()
         mock_delete_branch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_with_created_fresh_deletes_branch_even_if_preexisting_locally(
+        self, tmp_path: Path
+    ) -> None:
+        """Issue #51 regression: the branch ref may have existed locally
+        before the call (leftover from a prior merged PR whose remote
+        was auto-deleted), but create_worktree_with_new_branch detected
+        it as stale-merged, deleted it, and recreated from default. The
+        ref now on disk was created by THIS session, so a FAILED
+        cleanup MUST delete it — even though a pre-call
+        ``branch_exists_locally`` snapshot would have said "True".
+
+        Before #51 fix: run_dev_issue snapshotted
+        ``branch_preexisted = branch_exists_locally()`` BEFORE the call
+        and keyed cleanup on ``not branch_preexisted``. Cleanup skipped
+        delete_branch, partial commits from this session leaked into
+        the next retry's reuse path and got classified as
+        "local-only with unique commits"."""
+        from ctrlrelay.core.checkpoint import read_checkpoint
+        from ctrlrelay.core.dispatcher import SessionResult
+
+        async def spawn(**kwargs):
+            state_file = kwargs["state_file"]
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps({
+                "version": "1",
+                "status": "FAILED",
+                "session_id": kwargs["session_id"],
+                "timestamp": "2026-04-17T12:00:00Z",
+                "error": "claude gave up mid-retry",
+            }))
+            return SessionResult(
+                session_id=kwargs["session_id"],
+                exit_code=1,
+                stdout="",
+                stderr="",
+                state=read_checkpoint(state_file),
+            )
+
+        # The scenario: branch_exists_locally says True (stale merged
+        # ref from the previous session), but the helper detected it as
+        # fully-merged, deleted the ref, and recreated fresh → returns
+        # created_fresh=True. Cleanup must key on created_fresh, not
+        # on the stale pre-call snapshot. Force both flags so the OR
+        # combining them exercises the #51 semantic: with the old
+        # ``not branch_preexisted`` cleanup gate, this scenario would
+        # incorrectly skip delete_branch.
+        result, mock_remove_wt, mock_delete_branch = await self._run(
+            tmp_path,
+            spawn,
+            branch_on_remote=False,
+            created_fresh=True,
+            branch_existed_before=True,
+        )
+
+        assert not result.success
+        assert not result.blocked
+        mock_remove_wt.assert_awaited_once()
+        # The key assertion: delete_branch ran even though the branch
+        # "existed before" the call. created_fresh wins.
+        mock_delete_branch.assert_awaited_once()
+        assert mock_delete_branch.await_args.args[1] == "fix/issue-13"

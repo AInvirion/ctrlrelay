@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Branch ownership signal survives delete+recreate** (closes #51).
+  `create_worktree_with_new_branch` now returns `(path, created_fresh)`
+  so the caller knows whether THIS session created the branch (fresh
+  from default, or via the stale-merged delete+recreate path). Before
+  #51, `run_dev_issue` snapshotted `branch_preexisted` BEFORE the
+  call; the snapshot went stale the moment the helper detected a
+  fully-merged local branch and deleted+recreated it. A FAILED
+  cleanup would then skip `delete_branch` and leak partial commits
+  into the next retry.
+- **Refuse reuse when branch still backs an open PR** (closes #52).
+  `create_worktree_with_new_branch` now probes GitHub (via
+  `GitHubCLI.list_prs(head=...)`) before reusing an existing local
+  branch. If an open PR still backs it (prior DONE session whose PR
+  is unmerged, or any external source), raises `WorktreeError` with
+  the PR number and a concrete operator action instead of silently
+  hijacking the reviewer's already-reviewed branch or tripping
+  "A pull request already exists" at `gh pr create`.
+
 ## [0.1.12] - 2026-04-22
 
 Patch release. Closes #90 — three related polish items on the

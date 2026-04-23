@@ -134,7 +134,7 @@ class TestWorktreeManager:
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.return_value = ""
 
-            worktree_path = await manager.create_worktree_with_new_branch(
+            worktree_path, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="sess-456",
                 new_branch="feature/my-branch",
@@ -143,6 +143,10 @@ class TestWorktreeManager:
 
             assert worktree_path.parent == tmp_path / "worktrees"
             assert "sess-456" in str(worktree_path)
+            # Fresh-branch path must signal ownership to the caller so
+            # run_dev_issue's FAILED cleanup can delete the branch
+            # (issue #51).
+            assert created_fresh is True
 
             # Verify -b flag was used with the new branch name
             call_args = mock_git.call_args
@@ -190,13 +194,17 @@ class TestWorktreeManager:
                 "",                                  # worktree add
             ]
 
-            wt = await manager.create_worktree_with_new_branch(
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="retry-1",
                 new_branch="fix/issue-5",
             )
 
         assert "retry-1" in str(wt)
+        # Reuse path: branch existed, we did NOT create it. Cleanup on
+        # failure must NOT delete this branch — the prior PR may still
+        # reference it (issue #51).
+        assert created_fresh is False
 
         # Fetch goes into the dedicated scratch ref, NOT overwriting refs/heads.
         fetch_calls = [c for c in mock_git.call_args_list if "fetch" in c[0]]
@@ -271,13 +279,15 @@ class TestWorktreeManager:
                 "",                                  # worktree add (reuse as-is)
             ]
 
-            wt = await manager.create_worktree_with_new_branch(
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="retry-ahead",
                 new_branch="fix/issue-9",
             )
 
         assert "retry-ahead" in str(wt)
+        # Reused an existing branch (unpushed commits preserved) → not fresh.
+        assert created_fresh is False
         # CRITICAL: no update-ref that touches refs/heads/fix/issue-9 ran.
         refs_heads_updates = [
             c for c in mock_git.call_args_list
@@ -355,13 +365,15 @@ class TestWorktreeManager:
                 WorktreeError("gh ls-remote auth"),  # strict ls-remote raises
                 "",                                  # worktree add (reuse as-is)
             ]
-            wt = await manager.create_worktree_with_new_branch(
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="retry-probe-fail",
                 new_branch="fix/issue-77",
             )
 
         assert "retry-probe-fail" in str(wt)
+        # Probe failed → reuse local as-is, nothing was freshly created.
+        assert created_fresh is False
         # No ref mutation happened — nothing to the live branch.
         mutating = [
             c for c in mock_git.call_args_list
@@ -406,13 +418,15 @@ class TestWorktreeManager:
                 "",                                  # worktree add (proceed)
             ]
 
-            wt = await manager.create_worktree_with_new_branch(
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="retry-timeout",
                 new_branch="fix/issue-42",
             )
 
         assert "retry-timeout" in str(wt)
+        # Fetch timeout → reuse local as-is, not a fresh creation.
+        assert created_fresh is False
         # Worktree add must still have been called.
         worktree_add_calls = [
             c for c in mock_git.call_args_list
@@ -525,13 +539,16 @@ class TestWorktreeManager:
                 stale_porcelain,                         # porcelain probe for stale entry
                 "",                                      # worktree add (retry succeeds)
             ]
-            wt = await manager.create_worktree_with_new_branch(
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="retry-after-crash",
                 new_branch="fix/issue-99",
             )
 
         assert "retry-after-crash" in str(wt)
+        # Cherry returned "unique" → reuse path (local-only with unpushed
+        # work). Created_fresh stays False.
+        assert created_fresh is False
         # No repo-wide `git worktree prune` was called.
         prune_calls = [
             c for c in mock_git.call_args_list
@@ -648,13 +665,15 @@ class TestWorktreeManager:
                 "+ abc unique\n",                        # cherry: unique → reuse
                 "",                                      # worktree add (reuse)
             ]
-            wt = await manager.create_worktree_with_new_branch(
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="retry-after-crash",
                 new_branch="fix/issue-88",
             )
 
         assert "retry-after-crash" in str(wt)
+        # Prunable stanza was correctly ignored; reuse path fires → not fresh.
+        assert created_fresh is False
         # Reuse must have happened — no `already checked out` error raised.
         worktree_add = [
             c for c in mock_git.call_args_list
@@ -688,13 +707,15 @@ class TestWorktreeManager:
                 "+ abc123 unpushed\n+ def456 more\n",    # cherry default branch — all unique
                 "",                                      # worktree add (reuse)
             ]
-            wt = await manager.create_worktree_with_new_branch(
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="retry-keep",
                 new_branch="fix/issue-9",
             )
 
         assert "retry-keep" in str(wt)
+        # Unique commits → reused, not freshly created.
+        assert created_fresh is False
         # No delete + no fresh-branch creation.
         delete_calls = [
             c for c in mock_git.call_args_list
@@ -738,13 +759,20 @@ class TestWorktreeManager:
                 "refs/heads/main\n",                     # get_default_branch (2nd, for fresh path)
                 "",                                      # worktree add -b
             ]
-            wt = await manager.create_worktree_with_new_branch(
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="rerun-merged",
                 new_branch="fix/issue-7",
             )
 
         assert "rerun-merged" in str(wt)
+        # Issue #51 regression: the branch in the repo AFTER this call
+        # was created by THIS session (we deleted the stale merged local
+        # ref and recreated from default). Cleanup on FAILED must treat
+        # it as ours. Before #51 fix, run_dev_issue snapshotted
+        # branch_preexisted=True before the call and incorrectly skipped
+        # delete_branch, leaking partial commits into the next retry.
+        assert created_fresh is True
         # update-ref -d refs/heads/<branch> was called.
         delete_calls = [
             c for c in mock_git.call_args_list
@@ -789,13 +817,14 @@ class TestWorktreeManager:
                 "refs/heads/main\n",     # get_default_branch (fresh path)
                 "",                      # worktree add -b
             ]
-            await manager.create_worktree_with_new_branch(
+            _wt, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="s",
                 new_branch="fix/issue-x",
             )
 
-        # Path took the stale-merged branch (delete + recreate).
+        # Path took the stale-merged branch (delete + recreate) → fresh.
+        assert created_fresh is True
         delete_calls = [
             c for c in mock_git.call_args_list
             if "update-ref" in c[0] and "-d" in c[0]
@@ -806,6 +835,166 @@ class TestWorktreeManager:
             if "worktree" in c[0] and "add" in c[0]
         ]
         assert "-b" in worktree_add_calls[0][0]
+
+    @pytest.mark.asyncio
+    async def test_reuse_refuses_branch_backing_open_pr(
+        self, tmp_path: Path
+    ) -> None:
+        """Issue #52: if ``new_branch`` already exists locally AND still
+        backs an open PR on GitHub (prior DONE session whose PR wasn't
+        merged, or any external source), the reuse path must refuse
+        before any ref mutation. Running Claude on the reviewer's
+        already-reviewed branch would hijack the PR or later trip
+        ``gh pr create``'s "A pull request already exists"."""
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        mock_github = AsyncMock()
+        mock_github.list_prs.return_value = [
+            {"number": 42, "headRefName": "fix/issue-13"},
+        ]
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            # show-ref (branch exists) + worktree list (no live checkout).
+            # Probe happens BEFORE ls-remote / cherry — nothing else runs.
+            mock_git.side_effect = [
+                "",        # show-ref (branch exists)
+                "",        # worktree list --porcelain (no live checkout)
+            ]
+            with pytest.raises(WorktreeError, match="#42") as exc_info:
+                await manager.create_worktree_with_new_branch(
+                    repo="owner/repo",
+                    session_id="retry-13",
+                    new_branch="fix/issue-13",
+                    github=mock_github,
+                )
+
+        # Error message names the branch and gives a concrete action.
+        msg = str(exc_info.value)
+        assert "fix/issue-13" in msg
+        assert "open PR #42" in msg
+        assert "close or merge" in msg.lower() or "close" in msg.lower()
+
+        # GitHub was asked with state=open and head filter.
+        mock_github.list_prs.assert_awaited_once()
+        kwargs = mock_github.list_prs.await_args.kwargs
+        assert kwargs.get("state") == "open"
+        assert kwargs.get("head") == "fix/issue-13"
+
+        # No ref mutation or worktree add happened — the refusal is
+        # BEFORE any branch touches.
+        mutating_calls = [
+            c for c in mock_git.call_args_list
+            if "update-ref" in c[0]
+            or ("worktree" in c[0] and "add" in c[0])
+            or "fetch" in c[0]
+        ]
+        assert mutating_calls == [], (
+            f"no ref mutation allowed when branch backs an open PR; "
+            f"got {mutating_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reuse_proceeds_when_no_open_pr(
+        self, tmp_path: Path
+    ) -> None:
+        """Issue #52 happy path: the branch exists locally but has NO
+        open PR on GitHub (prior PR was merged OR the branch is a local
+        leftover from a session that died before pushing). Reuse must
+        proceed normally — the open-PR probe is a filter, not a
+        blanket block on reused branches."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        mock_github = AsyncMock()
+        mock_github.list_prs.return_value = []  # no open PR
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            # Happy-case reuse: branch exists locally, no open PR, remote
+            # has the branch → sync + reuse (no -b).
+            mock_git.side_effect = [
+                "",                                      # show-ref
+                "",                                      # worktree list
+                "abc\trefs/heads/fix/issue-5\n",         # ls-remote
+                "",                                      # fetch scratch
+                "",                                      # merge-base local→remote (ok)
+                "",                                      # update-ref refs/heads
+                "",                                      # update-ref -d scratch
+                "",                                      # worktree add
+            ]
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="retry-clean",
+                new_branch="fix/issue-5",
+                github=mock_github,
+            )
+
+        assert "retry-clean" in str(wt)
+        # Reused existing branch; not a fresh creation.
+        assert created_fresh is False
+        mock_github.list_prs.assert_awaited_once()
+        # Normal reuse path: worktree add WITHOUT -b.
+        worktree_add = [
+            c for c in mock_git.call_args_list
+            if "worktree" in c[0] and "add" in c[0]
+        ]
+        assert len(worktree_add) == 1
+        assert "-b" not in worktree_add[0][0]
+
+    @pytest.mark.asyncio
+    async def test_reuse_survives_pr_probe_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """Issue #52: if the PR probe itself fails (transient gh/network
+        error), don't wedge the retry — the later ``gh pr create`` is
+        defence in depth. This keeps a flaky GitHub API from blocking
+        every retry on every issue."""
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        mock_github = AsyncMock()
+        mock_github.list_prs.side_effect = GitHubError("network timeout")
+
+        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+            # Happy-case reuse path after the probe swallowed the failure.
+            mock_git.side_effect = [
+                "",                                      # show-ref
+                "",                                      # worktree list
+                "abc\trefs/heads/fix/issue-1\n",         # ls-remote
+                "",                                      # fetch scratch
+                "",                                      # merge-base local→remote
+                "",                                      # update-ref refs/heads
+                "",                                      # update-ref -d scratch
+                "",                                      # worktree add
+            ]
+            wt, created_fresh = await manager.create_worktree_with_new_branch(
+                repo="owner/repo",
+                session_id="retry-probe-flaky",
+                new_branch="fix/issue-1",
+                github=mock_github,
+            )
+
+        assert "retry-probe-flaky" in str(wt)
+        assert created_fresh is False
 
     @pytest.mark.asyncio
     async def test_create_worktree_with_new_branch_uses_default_branch(
@@ -822,13 +1011,14 @@ class TestWorktreeManager:
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
             mock_git.side_effect = ["refs/heads/main\n", ""]
 
-            worktree_path = await manager.create_worktree_with_new_branch(
+            worktree_path, created_fresh = await manager.create_worktree_with_new_branch(
                 repo="owner/repo",
                 session_id="sess-789",
                 new_branch="feature/auto-base",
             )
 
             assert worktree_path is not None
+            assert created_fresh is True
             # First call: symbolic-ref HEAD (default branch probe).
             first_call_args = mock_git.call_args_list[0][0]
             assert "symbolic-ref" in first_call_args
