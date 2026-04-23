@@ -1,5 +1,6 @@
 """Tests for dev pipeline."""
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1075,3 +1076,387 @@ class TestRunDevIssueVerification:
         assert mock_dispatcher.spawn_session.call_count == 3
         assert result.error is not None
         assert result.outputs.get("pr_number") == 42
+
+
+class TestRunDevIssueLockReleaseDuringVerify:
+    """Issue #29: the repo lock is released while PR CI verification is
+    polling GitHub (pure `gh` traffic, no git access), then reacquired
+    before any ``request_fix`` call (which spawns claude and mutates the
+    worktree). These tests exercise the release/reacquire boundary and
+    verify peer sessions aren't blocked during the wait."""
+
+    @pytest.mark.asyncio
+    async def test_lock_released_during_verify_allows_concurrent_session(
+        self, tmp_path: Path
+    ) -> None:
+        """While session A is in _verify_and_fix_pr's polling window,
+        session B must be able to acquire the repo lock for its own
+        git work. After A finishes verification it returns without
+        needing the lock back (CI passed → no fix needed)."""
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.pr_verifier import VerificationResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="dev-a",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.DONE,
+                session_id="dev-a",
+                timestamp="2026-04-17T12:00:00Z",
+                summary="PR #42 opened",
+                outputs={
+                    "pr_url": "https://github.com/o/r/pull/42",
+                    "pr_number": 42,
+                },
+            ),
+        )
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree_with_new_branch.return_value = (
+            tmp_path / "worktree"
+        )
+        mock_worktree.symlink_context = MagicMock()
+        mock_worktree.remove_context_symlink = MagicMock()
+
+        mock_github = AsyncMock()
+        mock_github.get_issue.return_value = {
+            "number": 1, "title": "x", "body": "y", "comments": [],
+        }
+
+        state_db = StateDB(tmp_path / "state.db")
+
+        peer_session_id = "dev-peer-session"
+        peer_acquired: list[bool] = []
+
+        mock_pr_verifier = AsyncMock()
+
+        async def verify_checks_peer_can_acquire(*_args, **_kwargs):
+            # During the verify call, simulate a peer session trying to
+            # acquire the repo lock. Before #29 this would fail because
+            # run_dev_issue held the lock for the entire run.
+            peer_acquired.append(
+                state_db.acquire_lock("owner/repo", peer_session_id)
+            )
+            if peer_acquired[-1]:
+                # Release so run_dev_issue can reacquire for cleanup.
+                state_db.release_lock("owner/repo", peer_session_id)
+            return VerificationResult(ready=True)
+
+        mock_pr_verifier.verify.side_effect = verify_checks_peer_can_acquire
+
+        result = await run_dev_issue(
+            repo="owner/repo",
+            issue_number=1,
+            branch_template="fix/issue-{n}",
+            dispatcher=mock_dispatcher,
+            github=mock_github,
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+            pr_verifier=mock_pr_verifier,
+        )
+
+        assert result.success
+        # Peer was tried exactly once and SUCCEEDED — proving the lock
+        # was released during verify.
+        assert peer_acquired == [True]
+        # Session A's lock is gone after run completes.
+        assert state_db.get_lock_holder("owner/repo") is None
+        state_db.close()
+
+    @pytest.mark.asyncio
+    async def test_lock_reacquired_before_request_fix(
+        self, tmp_path: Path
+    ) -> None:
+        """When verification fails and request_fix is needed, the lock
+        must be held again for the claude-spawn phase."""
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.pr_verifier import VerificationResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        session_id_a = "dev-a"
+        agent_uuid = "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
+
+        done_state = SessionResult(
+            session_id=session_id_a,
+            exit_code=0,
+            stdout="",
+            stderr="",
+            agent_session_id=agent_uuid,
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.DONE,
+                session_id=session_id_a,
+                timestamp="2026-04-17T12:00:00Z",
+                summary="PR #42",
+                outputs={
+                    "pr_url": "https://github.com/o/r/pull/42",
+                    "pr_number": 42,
+                },
+            ),
+        )
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = done_state
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree_with_new_branch.return_value = (
+            tmp_path / "worktree"
+        )
+        mock_worktree.symlink_context = MagicMock()
+        mock_worktree.remove_context_symlink = MagicMock()
+
+        mock_github = AsyncMock()
+        mock_github.get_issue.return_value = {
+            "number": 1, "title": "x", "body": "y", "comments": [],
+        }
+
+        state_db = StateDB(tmp_path / "state.db")
+
+        holders_during_fix: list[str | None] = []
+
+        async def fix_spawn(*_args, **kwargs):
+            # Capture lock holder during the fix spawn to prove we hold
+            # it across the claude-invocation window.
+            holders_during_fix.append(
+                state_db.get_lock_holder("owner/repo")
+            )
+            return done_state
+
+        verify_calls = 0
+
+        async def verify(*_args, **_kwargs):
+            nonlocal verify_calls
+            verify_calls += 1
+            if verify_calls == 1:
+                return VerificationResult(
+                    ready=False,
+                    reason="ci failed",
+                    failing_checks=[
+                        {"name": "ci", "state": "FAILURE", "bucket": "fail"}
+                    ],
+                )
+            return VerificationResult(ready=True)
+
+        # First spawn = the initial run; second spawn = the fix round.
+        mock_dispatcher.spawn_session.side_effect = [done_state, None]
+
+        async def spawn_side_effect(*args, **kwargs):
+            if mock_dispatcher.spawn_session.call_count == 1:
+                return done_state
+            return await fix_spawn(*args, **kwargs)
+
+        mock_dispatcher.spawn_session.side_effect = spawn_side_effect
+
+        mock_pr_verifier = AsyncMock()
+        mock_pr_verifier.verify.side_effect = verify
+
+        result = await run_dev_issue(
+            repo="owner/repo",
+            issue_number=1,
+            branch_template="fix/issue-{n}",
+            dispatcher=mock_dispatcher,
+            github=mock_github,
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+            pr_verifier=mock_pr_verifier,
+        )
+
+        assert result.success
+        # fix_spawn ran once and the lock was held by THIS session at
+        # the moment request_fix invoked the dispatcher.
+        assert len(holders_during_fix) == 1
+        # session_id is generated internally as
+        # dev-owner-repo-1-<hex8>; just assert SOMEONE (i.e. this
+        # session) holds it rather than nothing.
+        assert holders_during_fix[0] is not None
+        assert holders_during_fix[0].startswith("dev-owner-repo-1-")
+        # Lock fully released when the run is done.
+        assert state_db.get_lock_holder("owner/repo") is None
+        state_db.close()
+
+    @pytest.mark.asyncio
+    async def test_lock_reacquire_fails_when_contended(
+        self, tmp_path: Path
+    ) -> None:
+        """If verification finds work to do but a peer holds the lock
+        forever, we must surface a typed error rather than run
+        request_fix without exclusive access."""
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.pr_verifier import VerificationResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines import dev as dev_mod
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="dev-a",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.DONE,
+                session_id="dev-a",
+                timestamp="2026-04-17T12:00:00Z",
+                summary="PR #42",
+                outputs={
+                    "pr_url": "https://github.com/o/r/pull/42",
+                    "pr_number": 42,
+                },
+            ),
+        )
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree_with_new_branch.return_value = (
+            tmp_path / "worktree"
+        )
+        mock_worktree.symlink_context = MagicMock()
+        mock_worktree.remove_context_symlink = MagicMock()
+
+        mock_github = AsyncMock()
+        mock_github.get_issue.return_value = {
+            "number": 1, "title": "x", "body": "y", "comments": [],
+        }
+
+        state_db = StateDB(tmp_path / "state.db")
+
+        async def verify(*_args, **_kwargs):
+            # Returns not-ready so run_dev_issue has to reacquire the
+            # lock before request_fix. Simulates a peer grabbing the
+            # lock immediately after we release.
+            holder = state_db.get_lock_holder("owner/repo")
+            if holder is None:
+                state_db.acquire_lock("owner/repo", "peer-session-blocking")
+            return VerificationResult(
+                ready=False,
+                reason="ci failed",
+                failing_checks=[
+                    {"name": "ci", "state": "FAILURE", "bucket": "fail"}
+                ],
+            )
+
+        mock_pr_verifier = AsyncMock()
+        mock_pr_verifier.verify.side_effect = verify
+
+        # Zero sleep so the test runs instantly; small attempt budget
+        # so we fail fast after a handful of contention misses.
+        monkey_attempts = dev_mod._REACQUIRE_LOCK_ATTEMPTS
+        monkey_sleep = dev_mod._REACQUIRE_LOCK_SLEEP_SECONDS
+        dev_mod._REACQUIRE_LOCK_ATTEMPTS = 2
+        dev_mod._REACQUIRE_LOCK_SLEEP_SECONDS = 0.0
+
+        try:
+            result = await run_dev_issue(
+                repo="owner/repo",
+                issue_number=1,
+                branch_template="fix/issue-{n}",
+                dispatcher=mock_dispatcher,
+                github=mock_github,
+                worktree=mock_worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+                pr_verifier=mock_pr_verifier,
+            )
+        finally:
+            dev_mod._REACQUIRE_LOCK_ATTEMPTS = monkey_attempts
+            dev_mod._REACQUIRE_LOCK_SLEEP_SECONDS = monkey_sleep
+
+        assert not result.success
+        # Clear typed error so the caller / sweeper can distinguish
+        # "lock race lost, retry later" from "code actually broken".
+        assert result.error == dev_mod._LOCK_CONTENDED_ERROR
+        # Dispatcher called exactly once — initial spawn only, never
+        # got as far as request_fix because we couldn't reacquire.
+        assert mock_dispatcher.spawn_session.call_count == 1
+        # Peer lock is still there (we never touched it).
+        assert state_db.get_lock_holder("owner/repo") == "peer-session-blocking"
+        state_db.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_during_verify_does_not_leak_lock(
+        self, tmp_path: Path
+    ) -> None:
+        """If asyncio.CancelledError arrives during the unlocked verify
+        phase, the finally block must not hold any lock AND must not
+        re-acquire one that was never released gracefully."""
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="dev-a",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            state=CheckpointState(
+                version="1",
+                status=CheckpointStatus.DONE,
+                session_id="dev-a",
+                timestamp="2026-04-17T12:00:00Z",
+                summary="PR #42",
+                outputs={
+                    "pr_url": "https://github.com/o/r/pull/42",
+                    "pr_number": 42,
+                },
+            ),
+        )
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree_with_new_branch.return_value = (
+            tmp_path / "worktree"
+        )
+        mock_worktree.symlink_context = MagicMock()
+        mock_worktree.remove_context_symlink = MagicMock()
+
+        mock_github = AsyncMock()
+        mock_github.get_issue.return_value = {
+            "number": 1, "title": "x", "body": "y", "comments": [],
+        }
+
+        state_db = StateDB(tmp_path / "state.db")
+
+        async def verify(*_args, **_kwargs):
+            # Confirm lock was released before raising cancellation.
+            assert state_db.get_lock_holder("owner/repo") is None
+            raise asyncio.CancelledError()
+
+        mock_pr_verifier = AsyncMock()
+        mock_pr_verifier.verify.side_effect = verify
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_dev_issue(
+                repo="owner/repo",
+                issue_number=1,
+                branch_template="fix/issue-{n}",
+                dispatcher=mock_dispatcher,
+                github=mock_github,
+                worktree=mock_worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+                pr_verifier=mock_pr_verifier,
+            )
+
+        # Lock table must be clean — no leaked row from this session.
+        assert state_db.get_lock_holder("owner/repo") is None
+        state_db.close()
