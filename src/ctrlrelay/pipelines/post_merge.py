@@ -283,22 +283,6 @@ async def pr_watch_task(
             session_id=session_id, repo=repo, issue_number=issue_number,
             pr_number=pr_number,
         )
-        # Terminal state: merge or timeout. Drop the durable row so
-        # future poller startups don't rehydrate this watcher. We
-        # remove BEFORE handle_merge so an exhausted retry loop can't
-        # leave a ghost row that would be rehydrated on next startup
-        # and try the same permanently-broken cleanup forever.
-        if state_db is not None:
-            try:
-                state_db.remove_pr_watch(repo, pr_number)
-            except Exception as e:
-                log_event(
-                    _logger, "dev.pr.watch_persist_failed",
-                    session_id=session_id, repo=repo,
-                    issue_number=issue_number, pr_number=pr_number,
-                    reason=type(e).__name__, error=str(e)[:200],
-                    phase="remove",
-                )
         if merged:
             # Defer transport construction to inside the retry loop so
             # each attempt gets a fresh connection — a bridge restart
@@ -310,6 +294,24 @@ async def pr_watch_task(
                 transport_factory=transport_factory,
                 session_id=session_id,
             )
+        # Drop the durable row only AFTER post-merge cleanup fully
+        # completes (merged path) or after we've given up on timeout.
+        # If _handle_merge_with_retry raises — retries exhausted, bridge
+        # permanently broken — the except Exception branch below owns
+        # the row lifecycle and leaves it so the next poller startup
+        # rehydrates and retries cleanup. wait_for_merge returns True
+        # immediately on rehydrate since the PR is already merged.
+        if state_db is not None:
+            try:
+                state_db.remove_pr_watch(repo, pr_number)
+            except Exception as e:
+                log_event(
+                    _logger, "dev.pr.watch_persist_failed",
+                    session_id=session_id, repo=repo,
+                    issue_number=issue_number, pr_number=pr_number,
+                    reason=type(e).__name__, error=str(e)[:200],
+                    phase="remove",
+                )
     except asyncio.CancelledError:
         outcome["cancelled"] = True
         log_event(

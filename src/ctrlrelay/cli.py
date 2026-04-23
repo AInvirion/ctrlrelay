@@ -958,7 +958,10 @@ def poller_start(
         from ctrlrelay.core.state import StateDB
         from ctrlrelay.core.worktree import WorktreeManager
         from ctrlrelay.pipelines.dev import run_dev_issue
-        from ctrlrelay.pipelines.post_merge import pr_watch_task
+        from ctrlrelay.pipelines.post_merge import (
+            DEFAULT_PR_WATCH_TIMEOUT,
+            pr_watch_task,
+        )
         from ctrlrelay.pipelines.secops import run_secops_all
 
         # Build a DashboardClient if configured BEFORE the gh probe runs,
@@ -1640,11 +1643,30 @@ def poller_start(
                 )
                 surviving = []
             if surviving:
+                import time as _time
                 console.print(
                     f"[dim]Rehydrating {len(surviving)} PR watcher(s) "
                     "from state.db[/dim]"
                 )
+                now = int(_time.time())
                 for row in surviving:
+                    # Honor the original watch deadline: subtract time
+                    # already spent watching from the default 7-day
+                    # timeout. Without this, every restart resets the
+                    # clock and abandoned PRs never time out.
+                    elapsed = max(0, now - int(row["started_at"]))
+                    remaining = DEFAULT_PR_WATCH_TIMEOUT - elapsed
+                    if remaining <= 0:
+                        # Watch window elapsed while the poller was down.
+                        # Drop the row instead of respawning a watcher
+                        # that would fire a timeout on its first poll.
+                        try:
+                            state_db.remove_pr_watch(
+                                row["repo"], row["pr_number"]
+                            )
+                        except Exception:
+                            pass
+                        continue
                     task = asyncio.create_task(
                         pr_watch_task(
                             repo=row["repo"],
@@ -1655,6 +1677,7 @@ def poller_start(
                             github=github,
                             transport_factory=_watch_transport_factory,
                             state_db=state_db,
+                            timeout=remaining,
                         )
                     )
                     pr_watch_tasks.add(task)

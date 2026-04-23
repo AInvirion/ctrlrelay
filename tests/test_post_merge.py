@@ -825,6 +825,49 @@ class TestPRWatchTaskPersistence:
         db.close()
 
     @pytest.mark.asyncio
+    async def test_row_kept_when_handle_merge_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """P1 regression (codex review on PR #111): if post-merge cleanup
+        fails (retries exhausted, bridge permanently dead), the durable
+        row MUST stay so the next poller startup re-runs handle_merge.
+        If the row is deleted before cleanup finishes, a shutdown in the
+        window between merge detection and issue close silently loses
+        the close + notify — exactly the bug persistence was meant to
+        prevent."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines import post_merge as pm
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+        mock_github._run_gh.side_effect = RuntimeError("gh unreachable")
+
+        async def factory():
+            return None
+
+        orig = pm._HANDLE_MERGE_RETRY_BASE_DELAY
+        pm._HANDLE_MERGE_RETRY_BASE_DELAY = 0
+        try:
+            outcome = await pr_watch_task(
+                repo="owner/repo", issue_number=77,
+                pr_url="https://github.com/owner/repo/pull/42",
+                pr_number=42, session_id="sess-1",
+                github=mock_github, transport_factory=factory,
+                poll_interval=0, timeout=5, state_db=db,
+            )
+        finally:
+            pm._HANDLE_MERGE_RETRY_BASE_DELAY = orig
+        assert outcome["merged"] is True
+        assert outcome["failed"] is not None
+        rows = db.list_pr_watches()
+        assert len(rows) == 1
+        assert rows[0]["pr_number"] == 42
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_state_db_optional_no_op_when_absent(self) -> None:
         """Legacy callers can still pass no state_db; the watcher must
         work in-memory-only just like before."""

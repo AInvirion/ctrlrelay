@@ -261,6 +261,52 @@ class TestPRWatches:
         assert rows[0]["started_at"] == 2000
         db.close()
 
+    def test_add_pr_watch_preserves_started_at_on_conflict_without_explicit_ts(
+        self, tmp_path: Path
+    ) -> None:
+        """Production rehydrate path: re-inserting the same PR without
+        supplying ``started_at`` must preserve the original row's
+        timestamp. Otherwise every poller restart resets the 7-day
+        deadline and abandoned PRs never time out (codex P2 on PR #111)."""
+        db = StateDB(tmp_path / "state.db")
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42, issue_number=77,
+            session_id="sess-1", pr_url="u1", started_at=1000,
+        )
+        # Re-insert WITHOUT started_at, simulating the rehydrated
+        # pr_watch_task calling add_pr_watch again on spawn. Metadata
+        # updates, timestamp does not.
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42, issue_number=77,
+            session_id="sess-2", pr_url="u2",
+        )
+        rows = db.list_pr_watches()
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "sess-2"
+        assert rows[0]["pr_url"] == "u2"
+        assert rows[0]["started_at"] == 1000
+        db.close()
+
+    def test_add_pr_watch_without_started_at_new_row_uses_now(
+        self, tmp_path: Path
+    ) -> None:
+        """New inserts (no existing row) still get ``now()`` when the
+        caller omits ``started_at``. Regression guard for the conflict
+        path so it doesn't accidentally break initial inserts."""
+        import time
+
+        db = StateDB(tmp_path / "state.db")
+        before = int(time.time())
+        db.add_pr_watch(
+            repo="owner/r1", pr_number=42, issue_number=77,
+            session_id="sess-1", pr_url="u1",
+        )
+        after = int(time.time())
+        rows = db.list_pr_watches()
+        assert len(rows) == 1
+        assert before <= rows[0]["started_at"] <= after
+        db.close()
+
     def test_list_pr_watches_oldest_first(self, tmp_path: Path) -> None:
         db = StateDB(tmp_path / "state.db")
         db.add_pr_watch(

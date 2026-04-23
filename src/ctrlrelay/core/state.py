@@ -387,17 +387,38 @@ class StateDB:
         started_at: int | None = None,
     ) -> None:
         """Record an in-flight merge watcher so a poller restart can
-        rehydrate it. Idempotent on ``(repo, pr_number)`` — re-inserting
-        the same PR refreshes ``started_at`` and any metadata (useful
-        when the same PR is re-spawned for any reason).
+        rehydrate it. Idempotent on ``(repo, pr_number)``.
+
+        When ``started_at`` is None (production path, including the
+        rehydrate re-insert), a new row gets ``now()`` and an existing
+        row keeps its original ``started_at``. Preserving the original
+        timestamp is load-bearing: if every rehydrate refreshed it, the
+        7-day watch deadline would reset on every poller restart and
+        abandoned PRs would never time out.
+
+        When ``started_at`` is explicit (tests, seed flows), the row
+        is overwritten outright.
         """
-        ts = int(time.time()) if started_at is None else int(started_at)
-        self._conn.execute(
-            """INSERT OR REPLACE INTO pr_watches
-               (repo, pr_number, session_id, issue_number, pr_url, started_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (repo, pr_number, session_id, issue_number, pr_url, ts),
-        )
+        if started_at is None:
+            self._conn.execute(
+                """INSERT INTO pr_watches
+                   (repo, pr_number, session_id, issue_number, pr_url, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(repo, pr_number) DO UPDATE SET
+                       session_id = excluded.session_id,
+                       issue_number = excluded.issue_number,
+                       pr_url = excluded.pr_url""",
+                (repo, pr_number, session_id, issue_number, pr_url,
+                 int(time.time())),
+            )
+        else:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO pr_watches
+                   (repo, pr_number, session_id, issue_number, pr_url, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (repo, pr_number, session_id, issue_number, pr_url,
+                 int(started_at)),
+            )
         self._conn.commit()
 
     def remove_pr_watch(self, repo: str, pr_number: int) -> bool:
