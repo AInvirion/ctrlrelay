@@ -973,18 +973,20 @@ async def run_dev_issue(
             # reliability.
             # 1. created_fresh covers the normal return-and-fail case
             #    (issue #51).
-            # 2. worktree._last_stale_recreate_attempted covers the
-            #    stale-merged delete+recreate path (issue #51 codex
-            #    round-4): the helper destroyed the old ref before
-            #    `git worktree add -b`, so anything on disk with this
-            #    branch name is ours regardless of what the pre-call
-            #    snapshot said.
+            # 2. StaleRecreatePartialFailureError signals the helper
+            #    destroyed the old ref before `git worktree add -b`,
+            #    so anything on disk with this branch name is ours
+            #    regardless of what the pre-call snapshot said. The
+            #    signal is per-call (exception attribute) so
+            #    concurrent sessions on the shared WorktreeManager
+            #    can't clobber each other's ownership state.
             # 3. Pre-call snapshot (`not branch_existed_before`) is
             #    the fallback for partial failures of the plain
             #    fresh-branch path where the helper raises before
             #    setting created_fresh.
-            stale_recreate_attempted = getattr(
-                worktree, "_last_stale_recreate_attempted", False,
+            from ctrlrelay.core.worktree import StaleRecreatePartialFailureError
+            stale_recreate_attempted = isinstance(
+                e, StaleRecreatePartialFailureError,
             )
             we_own_branch = (
                 created_fresh

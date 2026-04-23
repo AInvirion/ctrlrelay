@@ -1106,15 +1106,18 @@ class TestWorktreeManager:
         assert "-b" not in worktree_add[0][0]
 
     @pytest.mark.asyncio
-    async def test_reuse_survives_pr_probe_failure(
+    async def test_reuse_refuses_when_pr_probe_fails_closed(
         self, tmp_path: Path
     ) -> None:
-        """Issue #52: if the PR probe itself fails (transient gh/network
-        error), don't wedge the retry — the later ``gh pr create`` is
-        defence in depth. This keeps a flaky GitHub API from blocking
-        every retry on every issue."""
+        """Codex P1 round-5 on #113: the open-PR probe must fail
+        CLOSED, not open. The dev pipeline pushes to the branch
+        BEFORE `gh pr create`, so silently reusing on probe failure
+        would let a push hijack an existing PR before any later
+        error surfaces. Retry a few times for transient hiccups,
+        then refuse with a clear message."""
+        from ctrlrelay.core import worktree as worktree_mod
         from ctrlrelay.core.github import GitHubError
-        from ctrlrelay.core.worktree import WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
 
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
@@ -1126,27 +1129,90 @@ class TestWorktreeManager:
         mock_github = AsyncMock()
         mock_github.list_prs.side_effect = GitHubError("network timeout")
 
-        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            # Happy-case reuse path after the probe swallowed the failure.
-            mock_git.side_effect = [
-                "",                                      # show-ref
-                "",                                      # worktree list
-                "abc\trefs/heads/fix/issue-1\n",         # ls-remote
-                "",                                      # fetch scratch
-                "",                                      # merge-base local→remote
-                "",                                      # update-ref refs/heads
-                "",                                      # update-ref -d scratch
-                "",                                      # worktree add
-            ]
-            wt, created_fresh = await manager.create_worktree_with_new_branch(
-                repo="owner/repo",
-                session_id="retry-probe-flaky",
-                new_branch="fix/issue-1",
-                github=mock_github,
-            )
+        # Shrink the probe sleep so the test runs fast without
+        # changing the retry count (that's part of the behavior).
+        orig_sleep = worktree_mod._PR_PROBE_RETRY_SLEEP_SECONDS
+        worktree_mod._PR_PROBE_RETRY_SLEEP_SECONDS = 0.0
+        try:
+            with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+                mock_git.side_effect = [
+                    "",  # show-ref
+                    "",  # worktree list
+                ]
+                with pytest.raises(
+                    WorktreeError, match="backs an open PR"
+                ):
+                    await manager.create_worktree_with_new_branch(
+                        repo="owner/repo",
+                        session_id="retry-probe-flaky",
+                        new_branch="fix/issue-1",
+                        github=mock_github,
+                    )
+        finally:
+            worktree_mod._PR_PROBE_RETRY_SLEEP_SECONDS = orig_sleep
 
-        assert "retry-probe-flaky" in str(wt)
+        # Probe retried the configured number of times before raising.
+        assert mock_github.list_prs.await_count == (
+            worktree_mod._PR_PROBE_RETRY_ATTEMPTS
+        )
+
+    @pytest.mark.asyncio
+    async def test_reuse_survives_transient_probe_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P1 round-5: a single transient probe failure is
+        recovered by retry — the operator shouldn't see WorktreeError
+        every time gh has a blip. Second attempt succeeds with no
+        open PR, reuse proceeds."""
+        from ctrlrelay.core import worktree as worktree_mod
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+
+        call_count = {"n": 0}
+
+        async def flaky_list_prs(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise GitHubError("transient blip")
+            return []
+
+        mock_github = AsyncMock()
+        mock_github.list_prs.side_effect = flaky_list_prs
+
+        orig_sleep = worktree_mod._PR_PROBE_RETRY_SLEEP_SECONDS
+        worktree_mod._PR_PROBE_RETRY_SLEEP_SECONDS = 0.0
+        try:
+            with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
+                mock_git.side_effect = [
+                    "",                                      # show-ref
+                    "",                                      # worktree list
+                    "abc\trefs/heads/fix/issue-1\n",         # ls-remote
+                    "",                                      # fetch scratch
+                    "",                                      # merge-base
+                    "",                                      # update-ref
+                    "",                                      # update-ref -d
+                    "",                                      # worktree add
+                ]
+                wt, created_fresh = await manager.create_worktree_with_new_branch(
+                    repo="owner/repo",
+                    session_id="retry-transient",
+                    new_branch="fix/issue-1",
+                    github=mock_github,
+                )
+        finally:
+            worktree_mod._PR_PROBE_RETRY_SLEEP_SECONDS = orig_sleep
+
+        assert "retry-transient" in str(wt)
         assert created_fresh is False
+        # Retried exactly twice (first raised, second returned []).
+        assert call_count["n"] == 2
 
     @pytest.mark.asyncio
     async def test_create_worktree_with_new_branch_uses_default_branch(

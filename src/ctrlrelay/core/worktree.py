@@ -12,8 +12,30 @@ if TYPE_CHECKING:
     from ctrlrelay.core.github import GitHubCLI
 
 
+# Open-PR probe (issue #52) retries a handful of times before failing
+# closed. Transient gh/network errors are common enough that one-shot
+# failure would be noisy; but infinite retry would block retries when
+# gh is genuinely down. Three quick attempts strike a balance.
+_PR_PROBE_RETRY_ATTEMPTS = 3
+_PR_PROBE_RETRY_SLEEP_SECONDS = 1.0
+
+
 class WorktreeError(Exception):
     """Raised when worktree operations fail."""
+
+
+class StaleRecreatePartialFailureError(WorktreeError):
+    """Raised when `create_worktree_with_new_branch` had committed to the
+    stale-merged delete+recreate path (destroying the old local ref)
+    and then the subsequent `git worktree add -b` failed partway. The
+    exception signals to the caller that any leftover ref on disk was
+    introduced by THIS session, so run_dev_issue's FAILED-path cleanup
+    must delete it regardless of the pre-call branch_existed_before
+    snapshot — the old ref is gone and anything present now is ours.
+
+    Scoped to the exception path so concurrent sessions can't clobber
+    each other's ownership state (instance-level flags on the shared
+    WorktreeManager were racy under concurrent run_dev_issue calls)."""
 
 
 @dataclass
@@ -29,17 +51,6 @@ class WorktreeManager:
         self.bare_repos_dir = Path(self.bare_repos_dir)
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
         self.bare_repos_dir.mkdir(parents=True, exist_ok=True)
-        # Signal for callers doing exception-path cleanup: when
-        # create_worktree_with_new_branch enters the stale-merged
-        # delete+recreate path, the old local ref is destroyed before
-        # the final `git worktree add -b` runs. If that add raises
-        # partway, the caller's pre-call branch_existed_before
-        # snapshot says "branch existed, not ours" — wrong. Flipping
-        # this flag to True the moment we commit to the recreate path
-        # lets run_dev_issue's exception cleanup recognize that any
-        # ref left behind belongs to this session regardless of how
-        # the caller classified the branch pre-call.
-        self._last_stale_recreate_attempted = False
 
     async def _run_git(
         self,
@@ -171,9 +182,12 @@ class WorktreeManager:
         number and a concrete operator action. The probe runs BEFORE
         any ref mutations so a concurrent PR is surfaced cleanly.
         """
-        # Reset the stale-recreate flag for every fresh call so a
-        # prior session's state doesn't leak into this one's cleanup.
-        self._last_stale_recreate_attempted = False
+        # Per-call flag: tracks whether we committed to the stale-merged
+        # delete+recreate path. Must stay local to this coroutine call —
+        # placing it on self would race under concurrent sessions sharing
+        # the WorktreeManager instance (one session's start-of-call reset
+        # would clobber another's in-progress signal).
+        entered_stale_recreate = False
 
         bare_path = self._get_bare_repo_path(repo)
         worktree_path = self._get_worktree_path(repo, session_id)
@@ -250,10 +264,11 @@ class WorktreeManager:
                 # any ref left on disk — whether the old one we just
                 # deleted, a partial one `worktree add -b` wrote
                 # before crashing, or the successfully recreated one
-                # — belongs to THIS session. Flip the flag BEFORE
-                # the delete so even an exception in update-ref
-                # leaves the right signal for cleanup.
-                self._last_stale_recreate_attempted = True
+                # — belongs to THIS session. Flip the local flag
+                # BEFORE the delete so even an exception in
+                # update-ref still surfaces StaleRecreatePartialFailureError
+                # to the caller.
+                entered_stale_recreate = True
                 try:
                     await self._run_git(
                         "update-ref", "-d", f"refs/heads/{new_branch}",
@@ -274,22 +289,36 @@ class WorktreeManager:
         if base_branch is None:
             base_branch = await self.get_default_branch(repo)
 
-        await self._run_git(
-            "worktree", "add",
-            "-b", new_branch,
-            str(worktree_path),
-            base_branch,
-            cwd=bare_path,
-        )
+        try:
+            await self._run_git(
+                "worktree", "add",
+                "-b", new_branch,
+                str(worktree_path),
+                base_branch,
+                cwd=bare_path,
+            )
+        except Exception as e:
+            # If we destroyed the old stale-merged ref on the way here,
+            # re-raise as StaleRecreatePartialFailureError so the caller
+            # knows any leftover ref belongs to this session. Without
+            # this signal, a pre-call branch_existed_before=True
+            # snapshot would misclassify the leftover as "not ours"
+            # and leak it into the next retry (issue #51).
+            if entered_stale_recreate:
+                raise StaleRecreatePartialFailureError(str(e)) from e
+            raise
         return worktree_path, True
 
     async def _refuse_if_branch_backs_open_pr(
         self, github: GitHubCLI, repo: str, branch: str,
     ) -> None:
         """Issue #52: raise WorktreeError if ``branch`` is the head of an
-        open PR on ``repo``. Skips silently on probe failure so a flaky
-        GitHub API doesn't wedge every retry — the existing reuse path
-        and later ``gh pr create`` call still provide defense in depth.
+        open PR on ``repo``. Probe is fail-closed (on repeated probe
+        error, we refuse reuse): the dev workflow pushes to the shared
+        branch BEFORE calling ``gh pr create``, so relying on the
+        later create to catch a PR-backed branch is unsafe — a
+        transient ``gh`` error would let the push hijack the existing
+        PR before any failure surfaces.
 
         ``gh pr list --head`` filters by branch name only, so PRs from
         unrelated repos (external forks, same-owner forks like
@@ -299,15 +328,29 @@ class WorktreeManager:
         (owner + name) so only PRs whose head actually lives in the
         repo we're about to push to can veto reuse.
         """
-        try:
-            prs = await github.list_prs(repo, state="open", head=branch)
-        except Exception:
-            # Probe failure: don't block reuse on a transient gh/network
-            # error. If a PR really does exist, the subsequent
-            # `gh pr create` would fail with "A pull request already
-            # exists" — noisier than we'd like, but not a correctness
-            # regression.
-            return
+        last_exc: Exception | None = None
+        prs: list | None = None
+        for attempt in range(_PR_PROBE_RETRY_ATTEMPTS):
+            try:
+                prs = await github.list_prs(
+                    repo, state="open", head=branch,
+                )
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                if attempt < _PR_PROBE_RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(_PR_PROBE_RETRY_SLEEP_SECONDS)
+        if prs is None:
+            raise WorktreeError(
+                f"Could not determine whether branch {branch!r} on "
+                f"{repo!r} backs an open PR (gh probe failed after "
+                f"{_PR_PROBE_RETRY_ATTEMPTS} attempts: "
+                f"{type(last_exc).__name__ if last_exc else 'unknown'}). "
+                "Refusing reuse to avoid hijacking an open PR. Retry "
+                "once gh is reachable, or delete the branch manually "
+                "if you're certain no PR is open."
+            ) from last_exc
         target_owner, _, target_name = repo.partition("/")
         # GitHub owner/repo names are case-insensitive: config may say
         # "Owner/Repo" while the API returns "owner/repo". Normalize
