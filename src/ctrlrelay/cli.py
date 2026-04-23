@@ -1649,15 +1649,20 @@ def poller_start(
                     "from state.db[/dim]"
                 )
                 now = int(_time.time())
-                # Always spawn at least one poll cycle's worth of watch
-                # even for rows that exceeded the 7-day window while the
-                # poller was down. Age alone is not enough to drop: the
-                # PR may have merged just before the deadline, or a
-                # prior run may have crashed mid-cleanup (cleanup_phase
-                # populated). Giving every row a brief window means
-                # wait_for_merge runs at least once so those cases
-                # actually complete instead of being silently discarded.
-                rehydrate_min_timeout = 60
+                # Always spawn with enough headroom for SEVERAL poll
+                # attempts even on rows past the 7-day window. A
+                # single-poll window (grace == poll_interval) would
+                # expire the instant the first gh call has a transient
+                # failure, logging watch_timeout and permanently
+                # dropping the row. 5 minutes against the default 60s
+                # poll_interval lets wait_for_merge retry through a
+                # handful of hiccups and still covers a PR that merges
+                # right after the restart. Abandoned-row cost is 5 min
+                # of extra polling, which is negligible.
+                # (Rehydrated rows with cleanup_phase set bypass
+                # wait_for_merge entirely — see pr_watch_task — so
+                # this headroom only affects phase=NULL rehydrates.)
+                rehydrate_min_timeout = 300
                 for row in surviving:
                     # Honor the original watch deadline: subtract time
                     # already spent watching from the default 7-day
