@@ -757,6 +757,24 @@ async def run_dev_issue(
                     repo=repo,
                     issue_number=issue_number,
                 )
+                # Signal to cli.handle_issue that the worktree was NOT
+                # torn down so the caller can skip any "unmark for
+                # retry" logic. A fresh dev run against this issue
+                # would fail at `create_worktree_with_new_branch`
+                # because the abandoned worktree is still registered
+                # on the bare repo. Requires operator cleanup (or the
+                # next poller restart, which prunes stale worktrees).
+                merged_outputs = dict(result.outputs)
+                merged_outputs["cleanup_deferred"] = True
+                result = PipelineResult(
+                    success=result.success,
+                    session_id=result.session_id,
+                    summary=result.summary,
+                    blocked=result.blocked,
+                    question=result.question,
+                    error=result.error,
+                    outputs=merged_outputs,
+                )
 
         # Update session status
         status = "done" if result.success else ("blocked" if result.blocked else "failed")

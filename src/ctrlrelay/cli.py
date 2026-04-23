@@ -1265,17 +1265,25 @@ def poller_start(
                 # PR already exists AND verification decided it wasn't
                 # ready (_verify_and_fix_pr only returns this error from
                 # the "need to run request_fix but couldn't reacquire"
-                # path). Just spawning the merge watcher and leaving
-                # the issue seen would strand a known-broken PR forever,
-                # because nothing else would retry the fix round.
+                # path). Two sub-cases based on whether run_dev_issue's
+                # cleanup reacquire succeeded:
                 #
-                # Un-mark the issue so the next poll picks it up again.
-                # run_dev_issue's branch-reuse path handles "issue
-                # already has a branch / PR" (see issues #51, #52) —
-                # imperfect but functional. Still spawn the merge
-                # watcher below so the existing PR's auto-close works
-                # if it happens to get merged by a human before the
-                # retry round lands.
+                # (a) Cleanup clean (lock reclaimed, worktree torn down):
+                #     un-mark the issue so the next poll retries the fix.
+                #     run_dev_issue's branch-reuse path handles
+                #     "issue already has a branch / PR" (#51, #52).
+                #
+                # (b) Cleanup deferred (peer still holds lock; worktree
+                #     NOT removed): un-marking would make the next poll
+                #     call create_worktree_with_new_branch and fail
+                #     with "already checked out" because the abandoned
+                #     worktree metadata is still registered. Leave the
+                #     issue seen and log an operator-actionable warning;
+                #     a poller restart (or `git worktree prune`) will
+                #     clear the stale entry.
+                #
+                # Either way the merge watcher still spawns below so
+                # the existing PR's auto-close works if a human merges.
                 if (
                     not result.success
                     and not result.blocked
@@ -1284,13 +1292,29 @@ def poller_start(
                     in result.error.lower()
                 ):
                     pr_num_str = result.outputs.get("pr_number", "?")
-                    poller.unmark_seen(repo, issue_number)
-                    console.print(
-                        f"[yellow]#{issue_number} in {repo}: lock "
-                        f"contention during PR verification — un-marking "
-                        f"for retry (PR #{pr_num_str} needs another "
-                        "fix round). Merge watcher still spawns.[/yellow]"
+                    cleanup_deferred = bool(
+                        result.outputs.get("cleanup_deferred")
                     )
+                    if cleanup_deferred:
+                        console.print(
+                            f"[red]#{issue_number} in {repo}: lock "
+                            "contention during PR verification AND "
+                            "cleanup could not reclaim the lock. "
+                            f"Worktree for PR #{pr_num_str} is still "
+                            "registered; retry would fail at "
+                            "create_worktree. Operator action: "
+                            "`git worktree prune` in the bare repo "
+                            "or restart the poller.[/red]"
+                        )
+                    else:
+                        poller.unmark_seen(repo, issue_number)
+                        console.print(
+                            f"[yellow]#{issue_number} in {repo}: lock "
+                            "contention during PR verification — "
+                            f"un-marking for retry (PR #{pr_num_str} "
+                            "needs another fix round). Merge watcher "
+                            "still spawns.[/yellow]"
+                        )
 
                 # Spawn the PR watcher FIRST, before any best-effort
                 # notification. The poller has already marked this issue

@@ -1389,6 +1389,11 @@ class TestRunDevIssueLockReleaseDuringVerify:
         # substring below. This error must NOT match it — otherwise the
         # whole point of the distinct string is lost.
         assert "locked by another session" not in result.error.lower()
+        # Peer still holds the lock, so cleanup reacquire also failed.
+        # The outputs flag tells cli the worktree is still registered
+        # and a fresh retry would fail at create_worktree — cli uses
+        # this to decide whether to unmark the issue.
+        assert result.outputs.get("cleanup_deferred") is True
         # Dispatcher called exactly once — initial spawn only, never
         # got as far as request_fix because we couldn't reacquire.
         assert mock_dispatcher.spawn_session.call_count == 1
