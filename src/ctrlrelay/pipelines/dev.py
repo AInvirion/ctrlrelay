@@ -40,6 +40,17 @@ _REACQUIRE_LOCK_SLEEP_SECONDS = 5.0
 # and waiting, not hung. At 5s cadence this fires ~every 5 minutes.
 _REACQUIRE_PROGRESS_LOG_EVERY = 60
 
+# Post-verify CLEANUP (worktree rm, branch delete) is best-effort — if
+# a peer grabs the lock while we're polling CI and we can't get it back
+# fast, skipping cleanup is fine (next run / operator reclaims). Don't
+# use the fix-path budget here: run_poll_loop awaits handlers serially,
+# so waiting an hour for cleanup would stall the whole poll cycle AND
+# delay the merge-watcher spawn that happens after run_dev_issue
+# returns. Three quick retries cover a fleeting hiccup; anything longer
+# belongs elsewhere.
+_REACQUIRE_CLEANUP_ATTEMPTS = 3
+_REACQUIRE_CLEANUP_SLEEP_SECONDS = 1.0
+
 # Two distinct error messages so callers can tell which phase of the
 # pipeline hit contention:
 #   INITIAL  — nothing started, safe to retry from scratch (cli un-marks
@@ -726,14 +737,18 @@ async def run_dev_issue(
             )
 
         # Reacquire the lock for the post-verify cleanup phase (remove
-        # worktree / delete branch). If verification passed with no fix
-        # needed, we'd have released the lock inside ``_verify_and_fix_pr``
-        # and never reacquired. If the lock is contended during cleanup
-        # we log and skip the worktree/branch removal — the session
-        # still returns the verified result so the caller sees success;
-        # a later retry / operator will reclaim the leftovers.
+        # worktree / delete branch). Uses the SHORT cleanup budget, not
+        # the fix-path budget: cleanup is best-effort, and run_poll_loop
+        # awaits handlers serially — blocking here for an hour would
+        # stall the whole poll cycle AND delay the PR merge watcher
+        # spawn (which happens in cli.handle_issue after we return).
+        # If we can't get the lock back in a few seconds, log and skip
+        # cleanup; the session still returns its verified result.
         if not lock.held:
-            reacquired = await lock.reacquire()
+            reacquired = await lock.reacquire(
+                attempts=_REACQUIRE_CLEANUP_ATTEMPTS,
+                sleep_seconds=_REACQUIRE_CLEANUP_SLEEP_SECONDS,
+            )
             if not reacquired:
                 log_event(
                     _logger,

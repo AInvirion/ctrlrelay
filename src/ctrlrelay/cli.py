@@ -1632,8 +1632,22 @@ def poller_start(
                     # the pending_resumes row as-is so the next sweeper
                     # tick tries again. Without this guard the operator's
                     # queued answer is silently dropped.
-                    if not result.success and result.error == (
-                        "Repository locked by another session"
+                    #
+                    # Two distinct strings both mean "lock contended":
+                    # the initial-acquire message (secops / peer dev
+                    # holds it outright) AND the post-verify message
+                    # (resume_dev_from_pending went into _verify_and_fix_pr,
+                    # needed another fix round, and lost the reacquire
+                    # race). Without the second string, a resume hitting
+                    # contention mid-verify would be marked consumed and
+                    # the operator's answer silently dropped.
+                    lock_contended_strings = (
+                        "Repository locked by another session",
+                        "Repo lock reacquire contended during PR verification",
+                    )
+                    if (
+                        not result.success
+                        and result.error in lock_contended_strings
                     ):
                         console.print(
                             "[dim]pending_resume_sweeper: "

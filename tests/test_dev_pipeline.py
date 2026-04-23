@@ -1541,7 +1541,9 @@ class TestRepoLockHandleReleaseSafety:
 class TestRepoLockHandleReacquireBudget:
     """The default reacquire budget must be generous enough that a
     healthy peer session running a full claude pass doesn't cause a
-    spurious contention failure (codex P1)."""
+    spurious contention failure (codex P1). Cleanup uses a SEPARATE
+    short budget so a contended cleanup doesn't stall the serial
+    poller for an hour (codex P1 round-2)."""
 
     def test_default_budget_outlasts_typical_peer_run(self) -> None:
         """A peer claude run can take 10-30 minutes. The default budget
@@ -1559,3 +1561,29 @@ class TestRepoLockHandleReacquireBudget:
             f"Reacquire budget of {total_seconds}s is too short to "
             "outlast a normal peer claude run (10-30 min)"
         )
+
+    def test_cleanup_budget_is_short_so_poller_does_not_stall(self) -> None:
+        """Cleanup reacquire budget must stay small. run_poll_loop
+        awaits handlers serially and spawns the PR watcher AFTER
+        run_dev_issue returns; if cleanup waited the full fix-path
+        budget, a single contended cleanup would delay every other
+        repo's polling by up to an hour and hold back the watcher
+        for a PR that already passed verification."""
+        from ctrlrelay.pipelines import dev as dev_mod
+
+        cleanup_seconds = (
+            dev_mod._REACQUIRE_CLEANUP_ATTEMPTS
+            * dev_mod._REACQUIRE_CLEANUP_SLEEP_SECONDS
+        )
+        # Cap at 30s: anything longer would meaningfully stall the poll.
+        assert cleanup_seconds <= 30, (
+            f"Cleanup reacquire budget of {cleanup_seconds}s is too "
+            "long; would stall the serial poll cycle"
+        )
+        # And it must be MUCH shorter than the fix-path budget — if
+        # someone lazily equated them in a refactor, this catches it.
+        fix_seconds = (
+            dev_mod._REACQUIRE_LOCK_ATTEMPTS
+            * dev_mod._REACQUIRE_LOCK_SLEEP_SECONDS
+        )
+        assert cleanup_seconds < fix_seconds / 10
