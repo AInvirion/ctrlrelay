@@ -958,7 +958,10 @@ def poller_start(
         from ctrlrelay.core.state import StateDB
         from ctrlrelay.core.worktree import WorktreeManager
         from ctrlrelay.pipelines.dev import run_dev_issue
-        from ctrlrelay.pipelines.post_merge import pr_watch_task
+        from ctrlrelay.pipelines.post_merge import (
+            DEFAULT_PR_WATCH_TIMEOUT,
+            pr_watch_task,
+        )
         from ctrlrelay.pipelines.secops import run_secops_all
 
         # Build a DashboardClient if configured BEFORE the gh probe runs,
@@ -1055,6 +1058,79 @@ def poller_start(
         # handle_issue and aren't garbage-collected. Cleared via
         # done_callback as each task terminates.
         pr_watch_tasks: set[asyncio.Task] = set()
+        # Dedup key: only ONE watcher may run for a given (repo, pr_number)
+        # at a time. Without this, two spawn paths (rehydration + a
+        # handle_issue re-run after corrupted poller state) can race
+        # through _handle_merge_with_retry and duplicate the close
+        # comment / notification. Entries removed via done_callback
+        # below, paired with the task's removal from pr_watch_tasks.
+        active_pr_watches: set[tuple[str, int]] = set()
+
+        def _spawn_pr_watch(
+            *,
+            repo: str,
+            issue_number: int,
+            pr_url: str,
+            pr_number: int,
+            session_id: str | None,
+            timeout: int | None = None,
+            skip_initial_persist: bool = False,
+        ) -> asyncio.Task | None:
+            """Start a pr_watch_task for (repo, pr_number) unless one is
+            already running for the same key. Returns the task on spawn,
+            None if a duplicate was suppressed.
+
+            The pr_watches row is persisted SYNCHRONOUSLY before the
+            coroutine is scheduled. asyncio.create_task only queues the
+            coroutine — its body doesn't execute until the loop next
+            yields, so a shutdown between create_task and the first
+            await inside pr_watch_task would otherwise lose the row
+            entirely (no rehydrate after restart). Writing first closes
+            that gap.
+
+            ``skip_initial_persist`` is for rehydration: the row
+            already exists in pr_watches (that's how we know to spawn),
+            and re-writing it would be harmless but wasteful.
+            """
+            key = (repo, pr_number)
+            if key in active_pr_watches:
+                return None
+            if state_db is not None and not skip_initial_persist:
+                try:
+                    state_db.add_pr_watch(
+                        repo=repo, pr_number=pr_number,
+                        issue_number=issue_number,
+                        session_id=session_id,
+                        pr_url=pr_url,
+                    )
+                except Exception:
+                    # Persist failure is logged inside pr_watch_task on
+                    # its own attempt; don't abort the spawn here, the
+                    # watcher can still run in-memory like the legacy
+                    # pre-persistence code did.
+                    pass
+            active_pr_watches.add(key)
+            kwargs: dict = dict(
+                repo=repo,
+                issue_number=issue_number,
+                pr_url=pr_url,
+                pr_number=pr_number,
+                session_id=session_id,
+                github=github,
+                transport_factory=_watch_transport_factory,
+                state_db=state_db,
+            )
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            task = asyncio.create_task(pr_watch_task(**kwargs))
+            pr_watch_tasks.add(task)
+
+            def _on_done(t: asyncio.Task) -> None:
+                pr_watch_tasks.discard(t)
+                active_pr_watches.discard(key)
+
+            task.add_done_callback(_on_done)
+            return task
 
         async def _watch_transport_factory():
             """Build a fresh connected SocketTransport for a single watcher,
@@ -1199,19 +1275,13 @@ def poller_start(
                     except (TypeError, ValueError):
                         pr_number = None
                     if pr_number is not None:
-                        task = asyncio.create_task(
-                            pr_watch_task(
-                                repo=repo,
-                                issue_number=issue_number,
-                                pr_url=pr_url_str,
-                                pr_number=pr_number,
-                                session_id=result.session_id,
-                                github=github,
-                                transport_factory=_watch_transport_factory,
-                            )
+                        _spawn_pr_watch(
+                            repo=repo,
+                            issue_number=issue_number,
+                            pr_url=pr_url_str,
+                            pr_number=pr_number,
+                            session_id=result.session_id,
                         )
-                        pr_watch_tasks.add(task)
-                        task.add_done_callback(pr_watch_tasks.discard)
 
                 # Send result notification — best-effort. A failed send
                 # must NOT prevent the merge watcher (spawned above)
@@ -1622,6 +1692,81 @@ def poller_start(
                     "[/dim]"
                 )
                 await poller.seed_current()
+
+            # Rehydrate PR watchers that survived the previous shutdown.
+            # A launchd kickstart / crash / redeploy cancels in-memory
+            # asyncio tasks; without this step, any PR sitting in review
+            # across a restart would silently lose its post-merge
+            # automation for the remainder of its 7-day watch window.
+            # Runs BEFORE run_poll_loop so watchers are live before the
+            # first poll interval elapses.
+            try:
+                surviving = state_db.list_pr_watches()
+            except Exception as e:
+                console.print(
+                    f"[yellow]pr_watches rehydrate: list failed ({e}) — "
+                    "skipping[/yellow]"
+                )
+                surviving = []
+            if surviving:
+                import time as _time
+                # Respect the operator's current config: if a repo was
+                # removed from `repos:`, skip respawning its watchers
+                # even if old rows linger in pr_watches. Treating the
+                # config as the source of truth matches how the rest
+                # of the poller behaves; silently driving close/notify
+                # on a now-unconfigured repo would be surprising.
+                configured_repos = {r.name for r in config.repos}
+                orphaned = [
+                    r for r in surviving if r["repo"] not in configured_repos
+                ]
+                if orphaned:
+                    console.print(
+                        f"[yellow]pr_watches: {len(orphaned)} row(s) "
+                        "for repos no longer in config — leaving "
+                        "dormant[/yellow]"
+                    )
+                active = [
+                    r for r in surviving if r["repo"] in configured_repos
+                ]
+                console.print(
+                    f"[dim]Rehydrating {len(active)} PR watcher(s) "
+                    "from state.db[/dim]"
+                )
+                now = int(_time.time())
+                # Always spawn with enough headroom for SEVERAL poll
+                # attempts even on rows past the 7-day window. A
+                # single-poll window (grace == poll_interval) would
+                # expire the instant the first gh call has a transient
+                # failure, logging watch_timeout and permanently
+                # dropping the row. 5 minutes against the default 60s
+                # poll_interval lets wait_for_merge retry through a
+                # handful of hiccups and still covers a PR that merges
+                # right after the restart. Abandoned-row cost is 5 min
+                # of extra polling, which is negligible.
+                # (Rehydrated rows with cleanup_phase set bypass
+                # wait_for_merge entirely — see pr_watch_task — so
+                # this headroom only affects phase=NULL rehydrates.)
+                rehydrate_min_timeout = 300
+                for row in active:
+                    # Honor the original watch deadline: subtract time
+                    # already spent watching from the default 7-day
+                    # timeout. Without this, every restart resets the
+                    # clock and abandoned PRs never time out.
+                    elapsed = max(0, now - int(row["started_at"]))
+                    remaining = max(
+                        DEFAULT_PR_WATCH_TIMEOUT - elapsed,
+                        rehydrate_min_timeout,
+                    )
+                    _spawn_pr_watch(
+                        repo=row["repo"],
+                        issue_number=row["issue_number"],
+                        pr_url=row["pr_url"] or "",
+                        pr_number=row["pr_number"],
+                        session_id=row.get("session_id"),
+                        timeout=remaining,
+                        skip_initial_persist=True,
+                    )
 
             try:
                 await run_poll_loop(
