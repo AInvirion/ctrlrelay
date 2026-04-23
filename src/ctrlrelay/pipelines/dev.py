@@ -845,11 +845,17 @@ async def run_dev_issue(
         # no copy (no recoverable work to orphan). Covers partial failures of
         # `git worktree add -b` that create the ref before the directory setup
         # crashes. If we're mid-verify the lock may be released — try to get
-        # it back for the cleanup. If reacquire fails, skip (the next retry
-        # will reclaim).
+        # it back for the cleanup. Uses the SHORT cleanup budget (not the
+        # fix-path one): a transient exception inside verifier.verify raising
+        # through while a peer holds the lock would otherwise stall the
+        # serial poll cycle for the full hour-long fix budget just to
+        # report the failure.
         if not lock.held:
             try:
-                await lock.reacquire()
+                await lock.reacquire(
+                    attempts=_REACQUIRE_CLEANUP_ATTEMPTS,
+                    sleep_seconds=_REACQUIRE_CLEANUP_SLEEP_SECONDS,
+                )
             except Exception:
                 pass
         if lock.held:
