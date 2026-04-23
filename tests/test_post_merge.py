@@ -1051,6 +1051,62 @@ class TestPRWatchTaskPersistence:
         db.close()
 
     @pytest.mark.asyncio
+    async def test_expired_row_with_phase_still_completes_cleanup(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2 round-3: rehydration must not discard a row just
+        because its 7-day watch window elapsed. If the prior run was
+        mid-cleanup (phase populated) or the PR merged just before the
+        deadline, spawning a short-window watcher finishes the job.
+        Dropping the row by age alone silently loses the post-merge
+        automation — exactly what persistence was supposed to prevent."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.post_merge import pr_watch_task
+
+        db = StateDB(tmp_path / "state.db")
+        # Seed an "expired" row (started_at 8 days ago) with cleanup
+        # mid-flight — prior run posted the comment + closed the issue
+        # but died before notifying.
+        db.add_pr_watch(
+            repo="owner/repo", pr_number=42, issue_number=77,
+            session_id="prev-sess",
+            pr_url="https://github.com/owner/repo/pull/42",
+            started_at=1,  # deep in the past
+        )
+        db.set_pr_watch_cleanup_phase("owner/repo", 42, "closed")
+
+        sent_messages: list[str] = []
+
+        class FakeTransport:
+            async def send(self, msg):
+                sent_messages.append(msg)
+
+            async def close(self):
+                pass
+
+        mock_github = AsyncMock()
+        mock_github.get_pr_state.return_value = {"state": "MERGED"}
+
+        async def factory():
+            return FakeTransport()
+
+        # Simulate cli.py rehydration passing the minimum grace timeout
+        # even though DEFAULT_PR_WATCH_TIMEOUT - elapsed is negative.
+        outcome = await pr_watch_task(
+            repo="owner/repo", issue_number=77,
+            pr_url="https://github.com/owner/repo/pull/42",
+            pr_number=42, session_id="sess-new",
+            github=mock_github, transport_factory=factory,
+            poll_interval=0, timeout=60, state_db=db,
+        )
+        assert outcome["merged"] is True
+        assert mock_github.comment_on_issue.call_count == 0
+        assert mock_github._run_gh.call_count == 0
+        assert len(sent_messages) == 1
+        assert db.list_pr_watches() == []
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_state_db_optional_no_op_when_absent(self) -> None:
         """Legacy callers can still pass no state_db; the watcher must
         work in-memory-only just like before."""

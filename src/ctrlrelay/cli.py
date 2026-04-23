@@ -1649,24 +1649,25 @@ def poller_start(
                     "from state.db[/dim]"
                 )
                 now = int(_time.time())
+                # Always spawn at least one poll cycle's worth of watch
+                # even for rows that exceeded the 7-day window while the
+                # poller was down. Age alone is not enough to drop: the
+                # PR may have merged just before the deadline, or a
+                # prior run may have crashed mid-cleanup (cleanup_phase
+                # populated). Giving every row a brief window means
+                # wait_for_merge runs at least once so those cases
+                # actually complete instead of being silently discarded.
+                rehydrate_min_timeout = 60
                 for row in surviving:
                     # Honor the original watch deadline: subtract time
                     # already spent watching from the default 7-day
                     # timeout. Without this, every restart resets the
                     # clock and abandoned PRs never time out.
                     elapsed = max(0, now - int(row["started_at"]))
-                    remaining = DEFAULT_PR_WATCH_TIMEOUT - elapsed
-                    if remaining <= 0:
-                        # Watch window elapsed while the poller was down.
-                        # Drop the row instead of respawning a watcher
-                        # that would fire a timeout on its first poll.
-                        try:
-                            state_db.remove_pr_watch(
-                                row["repo"], row["pr_number"]
-                            )
-                        except Exception:
-                            pass
-                        continue
+                    remaining = max(
+                        DEFAULT_PR_WATCH_TIMEOUT - elapsed,
+                        rehydrate_min_timeout,
+                    )
                     task = asyncio.create_task(
                         pr_watch_task(
                             repo=row["repo"],
