@@ -16,14 +16,23 @@ def make_issue(
     number: int,
     title: str = "Test issue",
     labels: list[dict] | list[str] | None = None,
+    assignees: list[dict] | list[str] | None = None,
 ) -> dict:
+    # Normalize assignees to the {"login": ...} shape gh returns, while
+    # tolerating plain strings for test ergonomics.
+    resolved_assignees: list[dict] = []
+    for a in assignees or []:
+        if isinstance(a, dict):
+            resolved_assignees.append(a)
+        else:
+            resolved_assignees.append({"login": str(a)})
     return {
         "number": number,
         "title": title,
         "state": "open",
         "body": "",
         "labels": labels or [],
-        "assignees": [],
+        "assignees": resolved_assignees,
         "createdAt": "2026-01-01T00:00:00Z",
         "updatedAt": "2026-01-01T00:00:00Z",
     }
@@ -1123,3 +1132,315 @@ class TestForeignAssignmentFilter:
 
         # No additional events calls on the second poll — issue is already seen
         assert mock_github.list_assignment_events.call_count == call_count_after_first
+
+
+class TestIncludeLabelsFilter:
+    """Per-repo include_labels opts issues into the dev pipeline by label
+    rather than assignment. See #80. Behavior contract:
+
+    - Empty / missing ``include_labels`` preserves the pre-#80 query
+      (``--assignee <user>``) and the pre-#80 self-assignment filter.
+    - A configured list drops ``--assignee`` on that repo's ``gh`` query
+      and accepts any issue matching ``(include_label OR assignee)``.
+    - Matching is case-insensitive.
+    - Label-matched issues bypass the self-assignment event check.
+    - Issue labeled AND assigned is processed exactly once per cycle.
+    - Mixed repos apply their own include_labels independently.
+    """
+
+    @pytest.mark.asyncio
+    async def test_gh_query_drops_assignee_only_when_include_labels_configured(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Per-repo: repo A (opted in) fetches unfiltered; repo B keeps
+        the cheap --assignee query. The plumbing must be per-repo to
+        avoid over-fetching on repos that never configured label
+        triggers."""
+        mock_github.list_assigned_issues.return_value = []
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a", "owner/repo-b"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        await poller.poll()
+
+        calls = mock_github.list_assigned_issues.await_args_list
+        by_repo = {c.args[0]: c.kwargs.get("assignee") for c in calls}
+        assert by_repo == {
+            "owner/repo-a": None,       # include_labels configured → no server filter
+            "owner/repo-b": "alice",    # default path preserved
+        }
+
+    @pytest.mark.asyncio
+    async def test_label_matched_unassigned_issue_is_accepted(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Issue with matching include_label and no assignee → accepted.
+        This is the primary use case: a teammate labels an issue safe
+        for the bot, no need for the operator to self-assign."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(1, "Safe to hand off", labels=[{"name": "ctrlrelay:auto"}]),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+
+        assert [r["issue"]["number"] for r in results] == [1]
+        # The self-assignment event check MUST NOT be consulted — the
+        # label is its own trust signal.
+        mock_github.list_assignment_events.assert_not_called()
+        # And the issue is now marked seen so the next poll doesn't
+        # re-handoff the same work.
+        assert 1 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
+    async def test_unlabeled_unassigned_issue_is_dropped(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """An issue with neither the allow-list label nor assignment to
+        the operator is dropped AND NOT marked seen — the issue might
+        later get labeled or assigned and should still surface then."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(42, "unrelated issue"),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+
+        assert results == []
+        # Intentionally NOT seen: the next poll should still reconsider
+        # this issue if someone labels or assigns it.
+        assert 42 not in poller.seen_issues.get("owner/repo-a", set())
+
+    @pytest.mark.asyncio
+    async def test_assigned_without_label_still_accepted_in_label_mode(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Enabling include_labels must NOT regress the assignment path:
+        an issue assigned to the operator (no allow-list label) still
+        runs through the pre-#80 self-assignment event check."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(7, "Assigned to me", assignees=["alice"]),
+        ]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("alice", "alice"),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+
+        assert [r["issue"]["number"] for r in results] == [7]
+        # Self-assignment event endpoint was hit — assignment path
+        # retains its trust check.
+        mock_github.list_assignment_events.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_label_plus_assigned_deduped_to_one(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """An issue that matches BOTH triggers (label + assignee) must
+        be returned exactly once, not duplicated in new_issues or
+        double-added to seen_issues. Regression guard for the naive
+        two-query merge alternative."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(
+                99,
+                "Labeled AND assigned",
+                labels=[{"name": "ctrlrelay:auto"}],
+                assignees=["alice"],
+            ),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+
+        assert [r["issue"]["number"] for r in results] == [99]
+        # seen_issues is a set — but verify the intent: single occurrence.
+        assert poller.seen_issues["owner/repo-a"] == {99}
+        # Label wins, so self-assignment event check is skipped (cheaper
+        # + same outcome — the label is the opt-in).
+        mock_github.list_assignment_events.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_include_label_match_is_case_insensitive(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Mirrors exclude_labels semantics: ``CtrlRelay:Auto`` matches
+        ``ctrlrelay:auto``. Operators shouldn't have to worry about the
+        exact casing their teammates apply on GitHub."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(3, "Case differs", labels=[{"name": "CtrlRelay:Auto"}]),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+
+        assert [r["issue"]["number"] for r in results] == [3]
+
+    @pytest.mark.asyncio
+    async def test_exclude_label_wins_over_include_label(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """If an issue carries both an exclude and include label, the
+        exclude precedent from #91 holds: the operator explicitly opted
+        OUT, that beats the opt-IN label."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(
+                5,
+                "Conflicting labels",
+                labels=[{"name": "manual"}, {"name": "ctrlrelay:auto"}],
+            ),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            exclude_labels_by_repo={"owner/repo-a": ["manual"]},
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+
+        assert results == []
+        assert 5 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_repos_apply_own_include_labels(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Repo A has include_labels; repo B doesn't. The same payload
+        (labeled-but-unassigned issue) is accepted on A and dropped on
+        B. Per-repo config must NOT leak across repos."""
+        async def per_repo(repo: str, *, assignee):
+            # Repo A was fetched without --assignee (include_labels
+            # mode); repo B got the usual --assignee=alice filter and
+            # therefore returns empty because the issue isn't assigned
+            # to alice.
+            if repo == "owner/repo-a":
+                assert assignee is None, "include_labels mode drops --assignee"
+                return [
+                    make_issue(
+                        10,
+                        "Labeled on repo A",
+                        labels=[{"name": "ctrlrelay:auto"}],
+                    ),
+                ]
+            assert assignee == "alice", "pre-#80 repos keep --assignee filter"
+            return []
+
+        mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a", "owner/repo-b"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+
+        assert [(r["repo"], r["issue"]["number"]) for r in results] == [
+            ("owner/repo-a", 10),
+        ]
+        assert poller.seen_issues["owner/repo-a"] == {10}
+        # repo-b is empty — but the important check is that seen_issues
+        # doesn't even have a stray entry for a repo that saw no
+        # triggers.
+        assert poller.seen_issues.get("owner/repo-b", set()) == set()
+
+    @pytest.mark.asyncio
+    async def test_empty_include_labels_preserves_pre_80_behavior(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """include_labels_by_repo={} for a repo (or missing) must
+        result in the exact same ``gh issue list --assignee ...``
+        query and self-assignment event check as the pre-#80 path.
+        Guard against accidental behavior change for operators who
+        never opted in."""
+        mock_github.list_assigned_issues.return_value = [make_issue(1)]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("alice", "alice"),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            # Explicitly empty — same as missing.
+            include_labels_by_repo={"owner/repo-a": []},
+        )
+
+        results = await poller.poll()
+
+        # Server filtered by --assignee, self-assignment event check ran.
+        call = mock_github.list_assigned_issues.await_args
+        assert call.kwargs.get("assignee") == "alice"
+        mock_github.list_assignment_events.assert_called_once()
+        assert [r["issue"]["number"] for r in results] == [1]
+
+    @pytest.mark.asyncio
+    async def test_include_label_emits_structured_log(
+        self,
+        mock_github: MagicMock,
+        state_file: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Label-triggered acceptance gets its own log event so
+        operators can audit which issues the bot picked up and why."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(11, "t", labels=[{"name": "ctrlrelay:auto"}]),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.poller"):
+            await poller.poll()
+
+        records = [
+            r for r in caplog.records
+            if r.getMessage() == "poll.issue.included_by_label"
+        ]
+        assert len(records) == 1
+        rec = records[0]
+        assert rec.repo == "owner/repo-a"
+        assert rec.issue_number == 11
+        assert rec.matched_label == "ctrlrelay:auto"

@@ -45,9 +45,12 @@ are on the roadmap (see [Roadmap](#roadmap)).
 
 ## Features
 
-- **Issue poller.** Detects issues assigned to you across every
-  configured repo, spawns a dev session in a dedicated git worktree,
-  and opens a PR.
+- **Issue poller.** Detects issues across every configured repo
+  (either assigned to you, or carrying a configurable opt-in label like
+  `ctrlrelay:auto`), spawns a dev session in a dedicated git worktree,
+  and opens a PR. Label triggers let a teammate without rights on your
+  account flag an issue as safe for the bot to pick up —
+  see [`include_labels`][docs-config].
 - **Telegram bridge.** When a session hits a blocking question, the
   bridge relays it to you as a DM and resumes the session once you
   reply.
