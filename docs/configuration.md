@@ -265,11 +265,14 @@ repos:
   pipeline spawn.
 - `exclude_labels` always wins over `include_labels` on the same issue: an
   explicit "not for the agent" opt-OUT beats the generic label opt-IN.
-- When a repo configures `include_labels`, the poller's per-repo `gh issue
-  list` call drops `--assignee` and fetches all open issues, then applies the
-  OR filter client-side. Repos without `include_labels` keep the cheaper
-  `--assignee`-filtered query, so enabling the feature on one repo does not
-  over-fetch on the others.
+- When a repo configures `include_labels`, the poller runs **targeted**
+  queries per cycle: the existing `gh issue list --assignee <user>` plus
+  one `gh issue list --label <L>` call per configured label. Results merge
+  by issue number. This keeps the label path scale-safe on busy repos
+  where an unfiltered fetch would silently cap at gh's `--limit` and miss
+  labeled issues on later pages. Repos without `include_labels` run only
+  the cheap `--assignee` query, so enabling the feature on one repo does
+  not add API calls on the others.
 - The event log entry for a label-triggered acceptance is
   `poll.issue.included_by_label`, alongside the existing
   `poll.issue.excluded_by_label` for exclusions.

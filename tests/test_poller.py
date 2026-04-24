@@ -56,6 +56,9 @@ def make_assigned_event(actor_login: str, assignee_login: str) -> dict:
 def mock_github() -> MagicMock:
     gh = MagicMock()
     gh.list_assigned_issues = AsyncMock()
+    # Default: no labeled issues on any repo. Tests that enable
+    # include_labels set a return value (or side_effect) per test.
+    gh.list_issues_by_label = AsyncMock(return_value=[])
     # Default: every issue was self-assigned by "alice" so the filter is a no-op.
     gh.list_assignment_events = AsyncMock(
         return_value=[make_assigned_event("alice", "alice")]
@@ -1140,8 +1143,11 @@ class TestIncludeLabelsFilter:
 
     - Empty / missing ``include_labels`` preserves the pre-#80 query
       (``--assignee <user>``) and the pre-#80 self-assignment filter.
-    - A configured list drops ``--assignee`` on that repo's ``gh`` query
-      and accepts any issue matching ``(include_label OR assignee)``.
+    - A configured list runs TARGETED queries: the existing assignee
+      query plus one ``list_issues_by_label`` call per configured
+      label; results are merged by issue number. This keeps the
+      label-trigger path scale-safe on busy repos (the first cut
+      fetched all open issues and silently capped at --limit).
     - Matching is case-insensitive.
     - Label-matched issues bypass the self-assignment event check.
     - Issue labeled AND assigned is processed exactly once per cycle.
@@ -1149,13 +1155,13 @@ class TestIncludeLabelsFilter:
     """
 
     @pytest.mark.asyncio
-    async def test_gh_query_drops_assignee_only_when_include_labels_configured(
+    async def test_targeted_queries_only_on_include_labels_repos(
         self, mock_github: MagicMock, state_file: Path
     ) -> None:
-        """Per-repo: repo A (opted in) fetches unfiltered; repo B keeps
-        the cheap --assignee query. The plumbing must be per-repo to
-        avoid over-fetching on repos that never configured label
-        triggers."""
+        """Per-repo: repo A (opted in) runs assignee + per-label
+        targeted queries; repo B keeps just the assignee query. The
+        plumbing must be per-repo to avoid extra gh calls on repos
+        that never configured label triggers."""
         mock_github.list_assigned_issues.return_value = []
         poller = IssuePoller(
             github=mock_github,
@@ -1167,12 +1173,20 @@ class TestIncludeLabelsFilter:
 
         await poller.poll()
 
-        calls = mock_github.list_assigned_issues.await_args_list
-        by_repo = {c.args[0]: c.kwargs.get("assignee") for c in calls}
+        assignee_calls = mock_github.list_assigned_issues.await_args_list
+        by_repo = {c.args[0]: c.kwargs.get("assignee") for c in assignee_calls}
+        # Both repos still hit the assignee query (targeted, cheap).
         assert by_repo == {
-            "owner/repo-a": None,       # include_labels configured → no server filter
-            "owner/repo-b": "alice",    # default path preserved
+            "owner/repo-a": "alice",
+            "owner/repo-b": "alice",
         }
+        # Only repo-a runs the label query, and only for its
+        # configured label.
+        label_calls = mock_github.list_issues_by_label.await_args_list
+        assert [
+            (c.args[0], c.kwargs.get("label"))
+            for c in label_calls
+        ] == [("owner/repo-a", "ctrlrelay:auto")]
 
     @pytest.mark.asyncio
     async def test_label_matched_unassigned_issue_is_accepted(
@@ -1181,7 +1195,8 @@ class TestIncludeLabelsFilter:
         """Issue with matching include_label and no assignee → accepted.
         This is the primary use case: a teammate labels an issue safe
         for the bot, no need for the operator to self-assign."""
-        mock_github.list_assigned_issues.return_value = [
+        mock_github.list_assigned_issues.return_value = []
+        mock_github.list_issues_by_label.return_value = [
             make_issue(1, "Safe to hand off", labels=[{"name": "ctrlrelay:auto"}]),
         ]
         poller = IssuePoller(
@@ -1207,11 +1222,13 @@ class TestIncludeLabelsFilter:
         self, mock_github: MagicMock, state_file: Path
     ) -> None:
         """An issue with neither the allow-list label nor assignment to
-        the operator is dropped AND NOT marked seen — the issue might
-        later get labeled or assigned and should still surface then."""
-        mock_github.list_assigned_issues.return_value = [
-            make_issue(42, "unrelated issue"),
-        ]
+        the operator doesn't appear in the targeted queries → no
+        surface. Trivially safe under the targeted-query design (gh's
+        own filters do the filtering), but we still keep this test as
+        a regression guard in case someone reintroduces an unfiltered
+        fetch in a later change."""
+        mock_github.list_assigned_issues.return_value = []
+        mock_github.list_issues_by_label.return_value = []
         poller = IssuePoller(
             github=mock_github,
             username="alice",
@@ -1223,8 +1240,6 @@ class TestIncludeLabelsFilter:
         results = await poller.poll()
 
         assert results == []
-        # Intentionally NOT seen: the next poll should still reconsider
-        # this issue if someone labels or assigns it.
         assert 42 not in poller.seen_issues.get("owner/repo-a", set())
 
     @pytest.mark.asyncio
@@ -1237,6 +1252,7 @@ class TestIncludeLabelsFilter:
         mock_github.list_assigned_issues.return_value = [
             make_issue(7, "Assigned to me", assignees=["alice"]),
         ]
+        mock_github.list_issues_by_label.return_value = []
         mock_github.list_assignment_events.return_value = [
             make_assigned_event("alice", "alice"),
         ]
@@ -1261,16 +1277,20 @@ class TestIncludeLabelsFilter:
     ) -> None:
         """An issue that matches BOTH triggers (label + assignee) must
         be returned exactly once, not duplicated in new_issues or
-        double-added to seen_issues. Regression guard for the naive
-        two-query merge alternative."""
-        mock_github.list_assigned_issues.return_value = [
-            make_issue(
-                99,
-                "Labeled AND assigned",
-                labels=[{"name": "ctrlrelay:auto"}],
-                assignees=["alice"],
-            ),
-        ]
+        double-added to seen_issues. The targeted-query merge
+        explicitly dedupes by issue number so the same row coming
+        from both --assignee and --label resolves to one entry."""
+        labeled_and_assigned = make_issue(
+            99,
+            "Labeled AND assigned",
+            labels=[{"name": "ctrlrelay:auto"}],
+            assignees=["alice"],
+        )
+        # Both queries return the SAME issue — gh's --assignee and
+        # --label overlap when the issue has both attributes. The
+        # merge keys on issue number so only one survives.
+        mock_github.list_assigned_issues.return_value = [labeled_and_assigned]
+        mock_github.list_issues_by_label.return_value = [labeled_and_assigned]
         poller = IssuePoller(
             github=mock_github,
             username="alice",
@@ -1294,8 +1314,11 @@ class TestIncludeLabelsFilter:
     ) -> None:
         """Mirrors exclude_labels semantics: ``CtrlRelay:Auto`` matches
         ``ctrlrelay:auto``. Operators shouldn't have to worry about the
-        exact casing their teammates apply on GitHub."""
-        mock_github.list_assigned_issues.return_value = [
+        exact casing their teammates apply on GitHub. (gh's server-side
+        label filter is case-insensitive too; this test exercises the
+        client-side match that runs after the targeted query returns.)"""
+        mock_github.list_assigned_issues.return_value = []
+        mock_github.list_issues_by_label.return_value = [
             make_issue(3, "Case differs", labels=[{"name": "CtrlRelay:Auto"}]),
         ]
         poller = IssuePoller(
@@ -1317,13 +1340,13 @@ class TestIncludeLabelsFilter:
         """If an issue carries both an exclude and include label, the
         exclude precedent from #91 holds: the operator explicitly opted
         OUT, that beats the opt-IN label."""
-        mock_github.list_assigned_issues.return_value = [
-            make_issue(
-                5,
-                "Conflicting labels",
-                labels=[{"name": "manual"}, {"name": "ctrlrelay:auto"}],
-            ),
-        ]
+        conflicting = make_issue(
+            5,
+            "Conflicting labels",
+            labels=[{"name": "manual"}, {"name": "ctrlrelay:auto"}],
+        )
+        mock_github.list_assigned_issues.return_value = []
+        mock_github.list_issues_by_label.return_value = [conflicting]
         poller = IssuePoller(
             github=mock_github,
             username="alice",
@@ -1345,13 +1368,14 @@ class TestIncludeLabelsFilter:
         """Repo A has include_labels; repo B doesn't. The same payload
         (labeled-but-unassigned issue) is accepted on A and dropped on
         B. Per-repo config must NOT leak across repos."""
-        async def per_repo(repo: str, *, assignee):
-            # Repo A was fetched without --assignee (include_labels
-            # mode); repo B got the usual --assignee=alice filter and
-            # therefore returns empty because the issue isn't assigned
-            # to alice.
-            if repo == "owner/repo-a":
-                assert assignee is None, "include_labels mode drops --assignee"
+        # Both repos get their own assignee query (targeted). Only
+        # repo A gets a label query — repo B never opted in.
+        async def assignee_per_repo(repo: str, *, assignee):
+            assert assignee == "alice"
+            return []
+
+        async def label_per_repo(repo: str, *, label):
+            if repo == "owner/repo-a" and label == "ctrlrelay:auto":
                 return [
                     make_issue(
                         10,
@@ -1359,10 +1383,10 @@ class TestIncludeLabelsFilter:
                         labels=[{"name": "ctrlrelay:auto"}],
                     ),
                 ]
-            assert assignee == "alice", "pre-#80 repos keep --assignee filter"
             return []
 
-        mock_github.list_assigned_issues = AsyncMock(side_effect=per_repo)
+        mock_github.list_assigned_issues = AsyncMock(side_effect=assignee_per_repo)
+        mock_github.list_issues_by_label = AsyncMock(side_effect=label_per_repo)
         poller = IssuePoller(
             github=mock_github,
             username="alice",
@@ -1377,10 +1401,15 @@ class TestIncludeLabelsFilter:
             ("owner/repo-a", 10),
         ]
         assert poller.seen_issues["owner/repo-a"] == {10}
-        # repo-b is empty — but the important check is that seen_issues
-        # doesn't even have a stray entry for a repo that saw no
-        # triggers.
+        # repo-b never runs a label query AND its assignee query
+        # returned empty — no surface, no seen entries.
         assert poller.seen_issues.get("owner/repo-b", set()) == set()
+        # And repo-b never touched list_issues_by_label at all.
+        label_repos_touched = {
+            c.args[0]
+            for c in mock_github.list_issues_by_label.await_args_list
+        }
+        assert "owner/repo-b" not in label_repos_touched
 
     @pytest.mark.asyncio
     async def test_empty_include_labels_preserves_pre_80_behavior(
@@ -1421,7 +1450,8 @@ class TestIncludeLabelsFilter:
     ) -> None:
         """Label-triggered acceptance gets its own log event so
         operators can audit which issues the bot picked up and why."""
-        mock_github.list_assigned_issues.return_value = [
+        mock_github.list_assigned_issues.return_value = []
+        mock_github.list_issues_by_label.return_value = [
             make_issue(11, "t", labels=[{"name": "ctrlrelay:auto"}]),
         ]
         poller = IssuePoller(
