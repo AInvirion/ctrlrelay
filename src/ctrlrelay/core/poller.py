@@ -647,9 +647,26 @@ class IssuePoller:
                         )
                     except asyncio.CancelledError:
                         raise
-                    except Exception:
-                        # Can't determine now — skip; first poll will
-                        # re-evaluate properly.
+                    except Exception as e:
+                        # Timeline API flaked during seed (codex P1
+                        # round-3). We can't tell self vs foreign
+                        # right now. Safe-default is to SEED the
+                        # issue: otherwise the first poll treats
+                        # pre-existing assigned backlog as new work
+                        # and may spin up pipelines for it. Missing
+                        # a post-startup label trigger for this
+                        # single issue is the acceptable loss; the
+                        # operator can re-apply the label after the
+                        # API recovers.
+                        log_event(
+                            _logger,
+                            "poll.seed.assignment_check_failed",
+                            repo=repo,
+                            issue_number=number,
+                            reason=type(e).__name__,
+                            error=str(e)[:200],
+                        )
+                        seen_for_repo.add(number)
                         continue
                     if self_assigned:
                         seen_for_repo.add(number)

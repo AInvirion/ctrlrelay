@@ -1567,6 +1567,41 @@ class TestIncludeLabelsFilter:
         assert 100 not in seen
 
     @pytest.mark.asyncio
+    async def test_seed_conservatively_seeds_when_events_api_flakes(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Codex P1 round-3 on #115: if the timeline/events API fails
+        transiently during seed_current, we must NOT leave the issue
+        unseeded. The first poll would then treat a pre-existing
+        assigned-backlog issue as new work and spin up a pipeline for
+        it. Seed conservatively (treat as self-assigned-for-seeding)
+        so backlog stays quiet; a later label addition can still
+        trigger once the API recovers."""
+        from ctrlrelay.core.github import GitHubError
+
+        assigned_backlog = make_issue(
+            55, "pre-existing backlog", assignees=["alice"],
+        )
+        mock_github.list_assigned_issues.return_value = [assigned_backlog]
+        mock_github.list_issues_by_label.return_value = []
+        # Timeline lookup fails — transient GH outage during startup.
+        mock_github.list_assignment_events = AsyncMock(
+            side_effect=GitHubError("API down"),
+        )
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        await poller.seed_current()
+        # Conservative seed: backlog is marked seen so first poll
+        # doesn't treat it as new work.
+        assert 55 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
     async def test_include_label_emits_structured_log(
         self,
         mock_github: MagicMock,
