@@ -1636,6 +1636,42 @@ class TestIncludeLabelsFilter:
         assert 77 in poller.seen_issues["owner/repo-a"]
 
     @pytest.mark.asyncio
+    async def test_seed_isolates_per_label_query_failures(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Codex P2 round-5 on #115: the per-label failure isolation
+        in poll() must also apply in seed_current(). Otherwise one
+        flaky label query during startup drops the assignee-backlog
+        seed, and the first successful poll spins up pipelines for
+        pre-existing issues that should have been seen."""
+        from ctrlrelay.core.github import GitHubError
+
+        assigned_self = make_issue(
+            11, "self-assigned pre-startup", assignees=["alice"],
+        )
+        mock_github.list_assigned_issues.return_value = [assigned_self]
+        # Label query raises on startup.
+        mock_github.list_issues_by_label = AsyncMock(
+            side_effect=GitHubError("label index flaky"),
+        )
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("alice", "alice"),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        await poller.seed_current()
+        # Assignee-backlog is still seeded despite the label query
+        # failing — pre-existing self-assigned work doesn't get
+        # treated as new on the first poll.
+        assert 11 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
     async def test_seed_conservatively_seeds_when_events_api_flakes(
         self, mock_github: MagicMock, state_file: Path
     ) -> None:
