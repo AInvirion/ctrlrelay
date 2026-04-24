@@ -284,6 +284,16 @@ repos:
   issues to always run dev, make sure `include_labels` and
   `task_labels` are disjoint (e.g. label opt-ins with
   `ctrlrelay:auto` and task runs with `task:<topic>`).
+- **Upgrade path**: enabling `include_labels` on a repo that was
+  already running the poller does NOT retroactively re-evaluate
+  issues already in `poller_state.json`. Any foreign-assigned issue
+  that pre-dates the config change won't be picked up via a later
+  label addition. Only brand-new issues (after the config change) or
+  issues you re-open will go through the label trigger. If you need
+  to re-evaluate pre-existing issues on a specific repo, stop the
+  poller, remove that repo's entry from `poller_state.json` under
+  `seen_issues`, and restart. (A fully automatic migration would
+  risk re-running pipelines for issues the bot had already handled.)
 
 Trust model: anyone with triage permission on a repo can apply a label. That
 matches the trust model ctrlrelay already uses — the operator configures which
