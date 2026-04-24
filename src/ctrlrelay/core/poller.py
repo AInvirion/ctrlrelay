@@ -632,9 +632,28 @@ class IssuePoller:
                         except (KeyError, TypeError, ValueError):
                             pass
                     for label in include_labels:
-                        labeled = await self.github.list_issues_by_label(
-                            repo, label=label,
-                        )
+                        try:
+                            labeled = await self.github.list_issues_by_label(
+                                repo, label=label,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as label_e:
+                            # Isolate per-label failures in seed too
+                            # (codex P2 round-5). Otherwise one flaky
+                            # label query would abort the repo's seed,
+                            # leaving the already-fetched assignee
+                            # backlog un-seeded — which the first
+                            # poll would then treat as new work.
+                            log_event(
+                                _logger,
+                                "poll.seed.label_query_failed",
+                                repo=repo,
+                                label=label,
+                                reason=type(label_e).__name__,
+                                error=str(label_e)[:200],
+                            )
+                            continue
                         for i in labeled:
                             try:
                                 by_number.setdefault(int(i["number"]), i)
