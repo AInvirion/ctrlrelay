@@ -1567,6 +1567,75 @@ class TestIncludeLabelsFilter:
         assert 100 not in seen
 
     @pytest.mark.asyncio
+    async def test_events_check_failure_marks_seen_even_in_include_labels_mode(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Codex P2 round-4 on #115: an events-API exception during
+        poll should mark the issue seen even on include_labels repos,
+        so we don't retry forever during a GitHub outage. Tradeoff
+        with the round-2 "foreign-assigned stays unmarked" fix is
+        intentional — confirmed-foreign and transient-failure are
+        different cases."""
+        from ctrlrelay.core.github import GitHubError
+
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(66, "assigned", assignees=["alice"]),
+        ]
+        mock_github.list_issues_by_label.return_value = []
+        mock_github.list_assignment_events = AsyncMock(
+            side_effect=GitHubError("events endpoint 502"),
+        )
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+        assert results == []
+        # Despite include_labels being configured, the transient
+        # failure marks the issue seen — otherwise every poll during
+        # the outage would retry the same /events call.
+        assert 66 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
+    async def test_label_query_failure_does_not_starve_assignee_path(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Codex P2 round-4 on #115: a transient failure on one
+        label query must NOT drop the already-fetched assignee
+        issues. Previously the whole repo was discarded if any
+        targeted query failed."""
+        from ctrlrelay.core.github import GitHubError
+
+        assigned_self = make_issue(
+            77, "self-assigned", assignees=["alice"],
+        )
+        mock_github.list_assigned_issues.return_value = [assigned_self]
+        # Label query fails transiently.
+        mock_github.list_issues_by_label = AsyncMock(
+            side_effect=GitHubError("search index 503"),
+        )
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("alice", "alice"),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+        # The self-assigned issue still flows — the label query's
+        # failure is isolated.
+        assert [r["issue"]["number"] for r in results] == [77]
+        assert 77 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
     async def test_seed_conservatively_seeds_when_events_api_flakes(
         self, mock_github: MagicMock, state_file: Path
     ) -> None:
