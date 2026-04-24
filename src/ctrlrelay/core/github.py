@@ -207,19 +207,33 @@ class GitHubCLI:
     async def list_assigned_issues(
         self,
         repo: str,
-        assignee: str,
+        assignee: str | None,
         state: str = "open",
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """List issues assigned to a user."""
-        output = await self._run_gh(
+        """List issues for a repo, optionally filtered by assignee.
+
+        When ``assignee`` is ``None`` the ``--assignee`` flag is dropped
+        and all open issues are returned. The poller uses this mode for
+        repos that configure ``include_labels`` so it can apply an
+        OR-match (assigned-to-operator OR carries an allow-list label)
+        client-side without needing a second ``gh`` call. The name is
+        kept for backwards compatibility with the pre-#80 call sites;
+        behavior when ``assignee`` is a string is unchanged.
+        """
+        args = [
             "issue", "list",
             "--repo", repo,
-            "--assignee", assignee,
             "--state", state,
             "--limit", str(limit),
             "--json", "number,title,state,body,labels,assignees,createdAt,updatedAt",
-        )
+        ]
+        if assignee is not None:
+            # Insert before ``--state`` to keep the existing call signature
+            # shape when assignee is set (makes recorded gh invocations in
+            # fixtures / audit logs visually diff-clean).
+            args[4:4] = ["--assignee", assignee]
+        output = await self._run_gh(*args)
         return json.loads(output) if output.strip() else []
 
     async def list_assignment_events(

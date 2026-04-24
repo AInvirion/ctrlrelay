@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -687,3 +687,243 @@ class TestDevPipelineCleanup:
         # "existed before" the call. created_fresh wins.
         mock_delete_branch.assert_awaited_once()
         assert mock_delete_branch.await_args.args[1] == "fix/issue-13"
+
+
+class TestLabelTriggeredDevPipelineE2E:
+    """Issue #80 e2e: a label-triggered, unassigned issue must flow
+    through the full dev pipeline the same way an assigned issue does.
+
+    Mirrors the shape of ``test_full_dev_flow_with_mocked_claude`` above
+    but drives entry from ``poller.poll()`` — which is where the new
+    filter lives — rather than calling ``run_dev_issue`` directly. If
+    any wire in the chain (config → CLI wiring → poller filter →
+    run_poll_loop → handler → run_dev_issue) is broken, this test
+    catches it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_label_triggered_issue_flows_through_full_dev_pipeline(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.checkpoint import read_checkpoint
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+        from ctrlrelay.core.pr_verifier import VerificationResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.core.worktree import WorktreeManager
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        # ---- Arrange: state, worktree, github, dispatcher ----
+        state_db = StateDB(tmp_path / "state.db")
+        worktree = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare_path = tmp_path / "repos" / "owner-repo.git"
+        bare_path.mkdir(parents=True)
+        (bare_path / "HEAD").write_text("ref: refs/heads/main\n")
+
+        # Mocked gh: the `gh issue list` payload returns a
+        # label-matched, UNASSIGNED issue — the #80 primary use case.
+        labeled_issue = {
+            "number": 321,
+            "title": "Team-labeled issue",
+            "state": "open",
+            "body": "Teammate labeled as safe to automate",
+            "labels": [{"name": "ctrlrelay:auto"}],
+            "assignees": [],
+            "createdAt": "2026-04-22T00:00:00Z",
+            "updatedAt": "2026-04-22T00:00:00Z",
+        }
+        mock_github = MagicMock(spec=GitHubCLI)
+        mock_github.list_assigned_issues = AsyncMock(return_value=[labeled_issue])
+        # Fail LOUD if the label path ever consults the assignment
+        # events endpoint — the label is its own trust signal per #80.
+        mock_github.list_assignment_events = AsyncMock(
+            side_effect=AssertionError(
+                "assignment events must NOT be fetched for label-triggered issues"
+            )
+        )
+        mock_github.get_issue = AsyncMock(
+            return_value={
+                "number": 321,
+                "title": "Team-labeled issue",
+                "body": "Teammate labeled as safe to automate",
+            }
+        )
+        mock_github.get_pr_checks = AsyncMock(
+            return_value=[
+                {"name": "ci", "status": "completed", "conclusion": "success"},
+            ]
+        )
+        mock_github.get_pr_state = AsyncMock(
+            return_value={
+                "number": 88,
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        # Mock dispatcher: write DONE checkpoint with a PR url.
+        mock_dispatcher = AsyncMock(spec=ClaudeDispatcher)
+
+        async def mock_spawn_session(**kwargs):
+            state_file = kwargs["state_file"]
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps({
+                "version": "1",
+                "status": "DONE",
+                "session_id": kwargs["session_id"],
+                "timestamp": "2026-04-22T12:00:00Z",
+                "summary": "PR #88 opened for issue #321",
+                "outputs": {
+                    "pr_url": "https://github.com/owner/repo/pull/88",
+                    "pr_number": 88,
+                },
+            }))
+            return SessionResult(
+                session_id=kwargs["session_id"],
+                exit_code=0,
+                stdout="",
+                stderr="",
+                state=read_checkpoint(state_file),
+            )
+
+        mock_dispatcher.spawn_session.side_effect = mock_spawn_session
+
+        mock_pr_verifier = AsyncMock()
+        mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
+
+        # ---- Build poller with include_labels wired through, same as
+        # the CLI does in ``ctrlrelay poller start``. ----
+        poller_state_file = tmp_path / "poller_state.json"
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo"],
+            state_file=poller_state_file,
+            include_labels_by_repo={"owner/repo": ["ctrlrelay:auto"]},
+        )
+
+        handled: list[tuple[str, int, object]] = []
+
+        async def handler(repo: str, issue: dict) -> None:
+            # Mirror the CLI's handle_issue → run_dev_issue hop so we
+            # exercise the same spawn path an assigned issue would.
+            with (
+                patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock),
+                patch.object(
+                    worktree,
+                    "create_worktree_with_new_branch",
+                    new_callable=AsyncMock,
+                ) as mock_create,
+                patch.object(worktree, "remove_worktree", new_callable=AsyncMock),
+                patch.object(worktree, "symlink_context"),
+                patch.object(worktree, "remove_context_symlink"),
+            ):
+                worktree_path = tmp_path / "worktrees" / f"wt-{issue['number']}"
+                worktree_path.mkdir(parents=True)
+                mock_create.return_value = (worktree_path, True)
+
+                result = await run_dev_issue(
+                    repo=repo,
+                    issue_number=issue["number"],
+                    branch_template="fix/issue-{n}",
+                    dispatcher=mock_dispatcher,
+                    github=mock_github,
+                    worktree=worktree,
+                    dashboard=None,
+                    state_db=state_db,
+                    transport=None,
+                    contexts_dir=tmp_path / "contexts",
+                    pr_verifier=mock_pr_verifier,
+                )
+
+            handled.append((repo, issue["number"], result))
+
+        # ---- Act: one poll-loop iteration ----
+        await run_poll_loop(
+            poller=poller,
+            handler=handler,
+            interval=0,
+            max_iterations=1,
+        )
+
+        # ---- Assert ----
+        # 1. Handler ran for the label-matched issue.
+        assert len(handled) == 1
+        repo, issue_number, result = handled[0]
+        assert (repo, issue_number) == ("owner/repo", 321)
+
+        # 2. run_dev_issue succeeded with the PR outputs — same
+        # downstream orchestration as an assigned issue would yield.
+        assert result.success
+        assert result.outputs["pr_number"] == 88
+
+        # 3. seen_issues recorded the issue EXACTLY ONCE per repo.
+        assert poller.seen_issues["owner/repo"] == {321}
+
+        # 4. Poller dropped --assignee on the gh query (include_labels
+        # mode is what enables the fetch-all-then-filter approach).
+        call = mock_github.list_assigned_issues.await_args
+        assert call.kwargs.get("assignee") is None
+
+        # 5. list_assignment_events was NOT called — the label is the
+        # trust signal; the self-assignment check is skipped.
+        mock_github.list_assignment_events.assert_not_called()
+
+        # 6. sessions row persisted — same bookkeeping as the assignment
+        # path (regression guard: if handle_issue fell off the rails,
+        # the sessions row would be missing).
+        rows = state_db.execute("SELECT * FROM sessions").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["status"] == "done"
+        assert rows[0]["issue_number"] == 321
+
+        state_db.close()
+
+    @pytest.mark.asyncio
+    async def test_label_matched_issue_not_duplicated_across_polls(
+        self, tmp_path: Path
+    ) -> None:
+        """Dedup regression: after a label-triggered issue is handled,
+        a second poll cycle (GitHub still returning the same labeled
+        issue until the operator closes or relabels it) must NOT
+        re-invoke the handler."""
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+
+        labeled_issue = {
+            "number": 777,
+            "title": "sticky label",
+            "state": "open",
+            "body": "",
+            "labels": [{"name": "ctrlrelay:auto"}],
+            "assignees": [],
+            "createdAt": "2026-04-22T00:00:00Z",
+            "updatedAt": "2026-04-22T00:00:00Z",
+        }
+        mock_github = MagicMock(spec=GitHubCLI)
+        mock_github.list_assigned_issues = AsyncMock(return_value=[labeled_issue])
+        mock_github.list_assignment_events = AsyncMock(return_value=[])
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo"],
+            state_file=tmp_path / "poller_state.json",
+            include_labels_by_repo={"owner/repo": ["ctrlrelay:auto"]},
+        )
+
+        handler = AsyncMock()
+
+        # Two back-to-back iterations with the same upstream payload.
+        await run_poll_loop(
+            poller=poller, handler=handler, interval=0, max_iterations=2,
+        )
+
+        # Handler fires once — not twice — because seen_issues dedupes
+        # across cycles even though the upstream label remained.
+        assert handler.await_count == 1
