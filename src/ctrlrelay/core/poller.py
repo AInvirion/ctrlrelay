@@ -25,6 +25,16 @@ _logger = get_logger("core.poller")
 # misconfiguration visible even though it's technically skipped here.
 _TRANSIENT_POLL_ERRORS = (TimeoutError, GitHubError, OSError)
 
+# Seed-time retry policy for the per-label include-labels query. A
+# seed-time failure here (not retried) would leak pre-existing
+# labeled backlog as "new work" on the first healthy poll. 3 × 2s
+# handles typical network blips without adding meaningful startup
+# latency. A persistent failure past the retry budget falls back to
+# the existing per-label isolation (log + continue), so assignee-
+# triggered backlog and other labels still seed cleanly.
+_SEED_LABEL_RETRY_ATTEMPTS = 3
+_SEED_LABEL_RETRY_SLEEP_SECONDS = 2.0
+
 # After this many consecutive per-repo failures, escalate log level to
 # WARNING so a persistent misconfiguration (expired auth, renamed repo,
 # revoked access) stops hiding behind routine "transient" skip logs.
@@ -238,6 +248,14 @@ class IssuePoller:
             # later pages in a busy repo (codex P1 on the first cut).
             include_labels = self.include_labels_by_repo.get(repo, [])
             include_lowered = {label.lower() for label in include_labels}
+            # Tracks issue numbers that came from the server-side
+            # assignee query. Used in the poll loop below to trust
+            # the server filter rather than re-deriving is_assigned
+            # from the returned JSON (codex P2 round-8). A payload
+            # with a missing/empty assignees field from the assignee
+            # query is still a confirmed assignee hit — gh wouldn't
+            # have returned it otherwise.
+            assignee_trigger_numbers: set[int] = set()
             try:
                 if include_lowered:
                     by_number: dict[int, dict[str, Any]] = {}
@@ -252,11 +270,11 @@ class IssuePoller:
                     )
                     for i in assignee_issues:
                         try:
-                            by_number[int(i["number"])] = i
+                            num = int(i["number"])
                         except Exception:
-                            # Malformed entry; let the per-issue guard
-                            # below log it on the next loop pass.
-                            pass
+                            continue
+                        by_number[num] = i
+                        assignee_trigger_numbers.add(num)
                     for label in include_labels:
                         try:
                             labeled = await self.github.list_issues_by_label(
@@ -381,7 +399,19 @@ class IssuePoller:
                 # truncated responses).
                 label_match = self._matched_include_label(issue, include_lowered)
                 if include_lowered:
-                    is_assigned = self._issue_is_assigned_to(issue, self.username)
+                    # Trust the server-side --assignee filter: an
+                    # issue returned from that query IS assigned,
+                    # even if the payload's assignees field is
+                    # sparse (codex P2 round-8). Only fall back to
+                    # the client-side JSON check for issues that
+                    # only came from the label query, since those
+                    # were not filtered by assignee.
+                    if number in assignee_trigger_numbers:
+                        is_assigned = True
+                    else:
+                        is_assigned = self._issue_is_assigned_to(
+                            issue, self.username,
+                        )
                     if label_match is None and not is_assigned:
                         # Defensive: a targeted query should never
                         # return an issue that matches neither trigger,
@@ -632,26 +662,47 @@ class IssuePoller:
                         except (KeyError, TypeError, ValueError):
                             pass
                     for label in include_labels:
-                        try:
-                            labeled = await self.github.list_issues_by_label(
-                                repo, label=label,
-                            )
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as label_e:
-                            # Isolate per-label failures in seed too
-                            # (codex P2 round-5). Otherwise one flaky
-                            # label query would abort the repo's seed,
-                            # leaving the already-fetched assignee
-                            # backlog un-seeded — which the first
-                            # poll would then treat as new work.
+                        # Retry label query on transient failure during
+                        # seed (codex P2 round-8). If we give up here
+                        # and the query never succeeds, pre-existing
+                        # labeled issues wouldn't be in seen_issues,
+                        # and the first healthy poll would open
+                        # pipelines for backlog. 3 × 2s handles typical
+                        # network blips; a persistent failure still
+                        # falls through to the per-label log + continue.
+                        labeled = None
+                        label_err: Exception | None = None
+                        for attempt in range(_SEED_LABEL_RETRY_ATTEMPTS):
+                            try:
+                                labeled = await self.github.list_issues_by_label(
+                                    repo, label=label,
+                                )
+                                label_err = None
+                                break
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as label_e:
+                                label_err = label_e
+                                if attempt < _SEED_LABEL_RETRY_ATTEMPTS - 1:
+                                    await asyncio.sleep(
+                                        _SEED_LABEL_RETRY_SLEEP_SECONDS,
+                                    )
+                        if labeled is None:
+                            # All retries exhausted. Isolate the
+                            # failure so the assignee backlog + any
+                            # successful label queries still seed
+                            # cleanly; continue to the next label.
                             log_event(
                                 _logger,
                                 "poll.seed.label_query_failed",
                                 repo=repo,
                                 label=label,
-                                reason=type(label_e).__name__,
-                                error=str(label_e)[:200],
+                                attempts=_SEED_LABEL_RETRY_ATTEMPTS,
+                                reason=(
+                                    type(label_err).__name__
+                                    if label_err else "unknown"
+                                ),
+                                error=str(label_err)[:200] if label_err else "",
                             )
                             continue
                         for i in labeled:
