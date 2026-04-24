@@ -241,6 +241,12 @@ class IssuePoller:
             try:
                 if include_lowered:
                     by_number: dict[int, dict[str, Any]] = {}
+                    # Assignee query is the baseline — any failure
+                    # here is treated as a repo-level failure (same
+                    # as non-include-labels repos). Label queries
+                    # below are isolated per-label so one flaky
+                    # label filter doesn't starve the assignee
+                    # path (codex P2 round-4).
                     assignee_issues = await self.github.list_assigned_issues(
                         repo, assignee=self.username,
                     )
@@ -252,9 +258,29 @@ class IssuePoller:
                             # below log it on the next loop pass.
                             pass
                     for label in include_labels:
-                        labeled = await self.github.list_issues_by_label(
-                            repo, label=label,
-                        )
+                        try:
+                            labeled = await self.github.list_issues_by_label(
+                                repo, label=label,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as label_e:
+                            # Isolate per-label failures so one bad
+                            # label query doesn't drop the whole
+                            # repo's intake. Log and continue — the
+                            # assignee-triggered issues we already
+                            # fetched still flow through the normal
+                            # pipeline; the missed label query will
+                            # be retried on the next poll cycle.
+                            log_event(
+                                _logger,
+                                "poll.repo.label_query_failed",
+                                repo=repo,
+                                label=label,
+                                reason=type(label_e).__name__,
+                                error=str(label_e)[:200],
+                            )
+                            continue
                         for i in labeled:
                             try:
                                 by_number.setdefault(int(i["number"]), i)
@@ -388,6 +414,7 @@ class IssuePoller:
 
                 # Assignment-only path: run the self-assignment event
                 # check exactly as before.
+                events_check_failed = False
                 try:
                     accepted = await self._is_self_assigned(repo, number)
                 except asyncio.CancelledError:
@@ -406,22 +433,32 @@ class IssuePoller:
                         error=str(e)[:200],
                     )
                     accepted = False
+                    events_check_failed = True
 
                 if accepted:
                     # Self-assigned: admit and mark seen.
                     seen_for_repo.add(number)
                     new_issues.append({"repo": repo, "issue": issue})
-                elif not include_lowered:
-                    # Foreign-assigned on a pre-#80 (assignment-only)
-                    # repo: mark seen so we don't re-check events every
-                    # poll for the same issue. Pre-#80 semantics.
+                elif events_check_failed:
+                    # Transient events-API failure (codex P2 round-4).
+                    # Mark seen regardless of include_labels to avoid
+                    # retry churn during an outage — would otherwise
+                    # hit /issues/{n}/events every poll until the API
+                    # recovers. Tradeoff: if a teammate later adds an
+                    # opt-in label while this issue is in seen_for_repo,
+                    # the label won't re-trigger this specific issue.
+                    # That's narrow enough to accept; re-applying the
+                    # label after the API recovers is the workaround.
                     seen_for_repo.add(number)
-                # On include_labels repos, foreign-assigned issues are
-                # INTENTIONALLY NOT marked seen (codex P1 round-2 fix
-                # for #80): a teammate may later add an opt-in label,
-                # and the next poll needs to pick it up. The cost is
-                # one extra events-check per foreign-assigned issue
-                # per poll — bounded by the operator's own assignment
+                elif not include_lowered:
+                    # Confirmed foreign-assigned on a pre-#80 repo:
+                    # mark seen to avoid re-checking events every poll.
+                    seen_for_repo.add(number)
+                # Confirmed foreign on include_labels repos is
+                # INTENTIONALLY left unmarked (codex P1 round-2 fix)
+                # so a later label addition can still trigger. The
+                # cost is one events check per poll per foreign
+                # issue — bounded by the operator's own assignment
                 # count, which is typically small.
 
         # Never propagate a save_state disk failure out of poll() — the
