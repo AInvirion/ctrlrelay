@@ -737,7 +737,11 @@ class TestLabelTriggeredDevPipelineE2E:
             "updatedAt": "2026-04-22T00:00:00Z",
         }
         mock_github = MagicMock(spec=GitHubCLI)
-        mock_github.list_assigned_issues = AsyncMock(return_value=[labeled_issue])
+        # Targeted queries: assignee path returns nothing (issue has no
+        # assignee), label path returns the labeled issue. The poller
+        # merges them by number so the label path is the sole trigger.
+        mock_github.list_assigned_issues = AsyncMock(return_value=[])
+        mock_github.list_issues_by_label = AsyncMock(return_value=[labeled_issue])
         # Fail LOUD if the label path ever consults the assignment
         # events endpoint — the label is its own trust signal per #80.
         mock_github.list_assignment_events = AsyncMock(
@@ -865,10 +869,13 @@ class TestLabelTriggeredDevPipelineE2E:
         # 3. seen_issues recorded the issue EXACTLY ONCE per repo.
         assert poller.seen_issues["owner/repo"] == {321}
 
-        # 4. Poller dropped --assignee on the gh query (include_labels
-        # mode is what enables the fetch-all-then-filter approach).
-        call = mock_github.list_assigned_issues.await_args
-        assert call.kwargs.get("assignee") is None
+        # 4. Poller ran targeted queries: assignee (still scoped to
+        # the operator — small, safe) AND the per-label query. That
+        # combination is what's scale-safe on busy repos.
+        assignee_call = mock_github.list_assigned_issues.await_args
+        assert assignee_call.kwargs.get("assignee") == "alice"
+        label_calls = mock_github.list_issues_by_label.await_args_list
+        assert [c.kwargs.get("label") for c in label_calls] == ["ctrlrelay:auto"]
 
         # 5. list_assignment_events was NOT called — the label is the
         # trust signal; the self-assignment check is skipped.
@@ -906,7 +913,8 @@ class TestLabelTriggeredDevPipelineE2E:
             "updatedAt": "2026-04-22T00:00:00Z",
         }
         mock_github = MagicMock(spec=GitHubCLI)
-        mock_github.list_assigned_issues = AsyncMock(return_value=[labeled_issue])
+        mock_github.list_assigned_issues = AsyncMock(return_value=[])
+        mock_github.list_issues_by_label = AsyncMock(return_value=[labeled_issue])
         mock_github.list_assignment_events = AsyncMock(return_value=[])
 
         poller = IssuePoller(

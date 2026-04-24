@@ -227,19 +227,44 @@ class IssuePoller:
             # before the `gh` call so we don't log the same error every cycle.
             if repo in self._issues_disabled_repos:
                 continue
-            # Per-repo include-labels decides whether we can keep the
-            # pre-#80 ``--assignee`` server-side filter (no include-labels
-            # configured → cheap assigned-only query) or need to fetch all
-            # open issues and OR-match client-side. Deciding per-repo
-            # avoids over-fetching on repos that haven't opted into the
-            # label trigger even when some OTHER repo has.
+            # Per-repo include-labels controls the fetch strategy. With
+            # no include-labels configured we keep the pre-#80
+            # ``--assignee`` server-side filter (cheap, small result).
+            # With include-labels configured we run one TARGETED query
+            # per trigger — the assignee query plus one
+            # ``--label <L>`` query per configured label — and merge by
+            # issue number. An unfiltered ``gh issue list`` would cap at
+            # --limit (default 100) and silently miss labeled issues on
+            # later pages in a busy repo (codex P1 on the first cut).
             include_labels = self.include_labels_by_repo.get(repo, [])
             include_lowered = {label.lower() for label in include_labels}
-            query_assignee = None if include_lowered else self.username
             try:
-                issues = await self.github.list_assigned_issues(
-                    repo, assignee=query_assignee
-                )
+                if include_lowered:
+                    by_number: dict[int, dict[str, Any]] = {}
+                    assignee_issues = await self.github.list_assigned_issues(
+                        repo, assignee=self.username,
+                    )
+                    for i in assignee_issues:
+                        try:
+                            by_number[int(i["number"])] = i
+                        except Exception:
+                            # Malformed entry; let the per-issue guard
+                            # below log it on the next loop pass.
+                            pass
+                    for label in include_labels:
+                        labeled = await self.github.list_issues_by_label(
+                            repo, label=label,
+                        )
+                        for i in labeled:
+                            try:
+                                by_number.setdefault(int(i["number"]), i)
+                            except Exception:
+                                pass
+                    issues = list(by_number.values())
+                else:
+                    issues = await self.github.list_assigned_issues(
+                        repo, assignee=self.username,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -317,10 +342,11 @@ class IssuePoller:
                 #      signal — no self-assignment check needed.
                 #   2. assignment to operator: pre-#80 path, still needs
                 #      the self-assignment event check.
-                # If neither applies on a repo that fetched all open
-                # issues (include_labels configured), we skip WITHOUT
-                # marking seen — a later label-add or assignment should
-                # still surface the issue. On repos without
+                # With targeted queries (assignee + per-label) every
+                # issue surfaced here already matched at least one
+                # trigger, but we keep the is_assigned check so the
+                # label-match branch below still knows when to skip the
+                # self-assignment event lookup. On repos without
                 # include_labels, the server already filtered to the
                 # assignee, so every issue that makes it here is
                 # assignment-triggered — we skip the client-side
@@ -331,9 +357,12 @@ class IssuePoller:
                 if include_lowered:
                     is_assigned = self._issue_is_assigned_to(issue, self.username)
                     if label_match is None and not is_assigned:
-                        # Unrelated issue surfaced by the no-assignee
-                        # fetch — leave untouched so future triggers can
-                        # still pick it up.
+                        # Defensive: a targeted query should never
+                        # return an issue that matches neither trigger,
+                        # but if gh's label filter ever has a quirk
+                        # (renamed labels, case, pagination), we'd
+                        # rather leave the issue unmarked than
+                        # swallow it permanently.
                         continue
                 else:
                     # Server-side ``--assignee`` already filtered; by
@@ -529,10 +558,10 @@ class IssuePoller:
         (or label matches) as new. Only issues assigned / labeled AFTER
         this seed will trigger handlers.
 
-        Repos with ``include_labels`` configured fetch all open issues
-        (same query shape poll() uses for them) and mark both the
-        assigned-to-operator and label-matched issues seen, so neither
-        trigger surprises the operator on first boot. Other repos keep
+        Repos with ``include_labels`` configured seed BOTH the assignee
+        result and each label's targeted result (matching the poll()
+        fetch strategy — see poll() for why an unfiltered issue list
+        can silently cap at --limit on busy repos). Other repos keep
         the cheap ``--assignee`` query.
 
         Failure mode: if a per-repo lookup fails transiently, the seed skips
@@ -544,12 +573,31 @@ class IssuePoller:
             if repo in self._issues_disabled_repos:
                 continue
             include_labels = self.include_labels_by_repo.get(repo, [])
-            include_lowered = {label.lower() for label in include_labels}
-            query_assignee = None if include_lowered else self.username
             try:
-                issues = await self.github.list_assigned_issues(
-                    repo, assignee=query_assignee
-                )
+                if include_labels:
+                    by_number: dict[int, dict[str, Any]] = {}
+                    assignee_issues = await self.github.list_assigned_issues(
+                        repo, assignee=self.username,
+                    )
+                    for i in assignee_issues:
+                        try:
+                            by_number[int(i["number"])] = i
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                    for label in include_labels:
+                        labeled = await self.github.list_issues_by_label(
+                            repo, label=label,
+                        )
+                        for i in labeled:
+                            try:
+                                by_number.setdefault(int(i["number"]), i)
+                            except (KeyError, TypeError, ValueError):
+                                pass
+                    issues = list(by_number.values())
+                else:
+                    issues = await self.github.list_assigned_issues(
+                        repo, assignee=self.username,
+                    )
             except asyncio.CancelledError:
                 raise
             except _TRANSIENT_POLL_ERRORS as e:
@@ -561,17 +609,10 @@ class IssuePoller:
             self._clear_repo_failure(repo)
             seen_for_repo = self.seen_issues.setdefault(repo, set())
             for issue in issues:
-                # In assigned-only mode every issue was filtered by
-                # the server — all of them should seed. In include-label
-                # mode we must only seed issues that currently match one
-                # of the triggers; unrelated issues pulled in by the
-                # broader query shouldn't be suppressed forever.
-                if include_lowered:
-                    if (
-                        self._matched_include_label(issue, include_lowered) is None
-                        and not self._issue_is_assigned_to(issue, self.username)
-                    ):
-                        continue
+                # Targeted queries in include-label mode already
+                # guarantee every issue here matches at least one
+                # trigger (assignee or a configured label), so we
+                # can seed unconditionally.
                 try:
                     seen_for_repo.add(int(issue["number"]))
                 except (KeyError, TypeError, ValueError):

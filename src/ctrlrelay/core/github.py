@@ -214,12 +214,11 @@ class GitHubCLI:
         """List issues for a repo, optionally filtered by assignee.
 
         When ``assignee`` is ``None`` the ``--assignee`` flag is dropped
-        and all open issues are returned. The poller uses this mode for
-        repos that configure ``include_labels`` so it can apply an
-        OR-match (assigned-to-operator OR carries an allow-list label)
-        client-side without needing a second ``gh`` call. The name is
-        kept for backwards compatibility with the pre-#80 call sites;
-        behavior when ``assignee`` is a string is unchanged.
+        and all open issues are returned. Prefer :meth:`list_issues_by_label`
+        for label-triggered polling — the unfiltered call caps at
+        ``limit`` (default 100) and silently drops anything past that in
+        a busy repo. The poller uses the assignee path + per-label
+        targeted queries and merges results by issue number.
         """
         args = [
             "issue", "list",
@@ -233,6 +232,38 @@ class GitHubCLI:
             # shape when assignee is set (makes recorded gh invocations in
             # fixtures / audit logs visually diff-clean).
             args[4:4] = ["--assignee", assignee]
+        output = await self._run_gh(*args)
+        return json.loads(output) if output.strip() else []
+
+    async def list_issues_by_label(
+        self,
+        repo: str,
+        label: str,
+        state: str = "open",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List open issues carrying a specific label.
+
+        Issued per label in ``include_labels`` (issue #80): a single
+        ``gh issue list --label`` call filters server-side, so the
+        result is bounded by the number of issues wearing that label
+        rather than by total open issues in the repo. That keeps the
+        label-triggered poll path scale-safe on large repos, where
+        fetching all open issues (pre-codex-review behavior) would
+        silently cap at 100 and miss labeled issues on later pages.
+
+        gh CLI treats ``--label foo --label bar`` as AND; the poller
+        therefore runs one call per label and dedupes by issue number
+        at the caller.
+        """
+        args = [
+            "issue", "list",
+            "--repo", repo,
+            "--label", label,
+            "--state", state,
+            "--limit", str(limit),
+            "--json", "number,title,state,body,labels,assignees,createdAt,updatedAt",
+        ]
         output = await self._run_gh(*args)
         return json.loads(output) if output.strip() else []
 
