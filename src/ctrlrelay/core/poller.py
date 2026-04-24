@@ -370,14 +370,12 @@ class IssuePoller:
                     # assignment-triggered.
                     is_assigned = True
 
-                # Mark seen before deciding whether to surface the issue so a
-                # filtered (foreign-assigned) issue isn't re-checked every poll.
-                # Set-add is idempotent: a label+assigned issue still lands
-                # in the set exactly once, and the ``new_issues`` branch below
-                # is OR-gated so it only fires once for the same issue.
-                seen_for_repo.add(number)
-
                 if label_match is not None:
+                    # Label match bypasses the self-assignment check; the
+                    # operator's config choice is the trust boundary.
+                    # Mark seen so the same label-triggered issue isn't
+                    # re-surfaced on every poll.
+                    seen_for_repo.add(number)
                     log_event(
                         _logger,
                         "poll.issue.included_by_label",
@@ -385,8 +383,6 @@ class IssuePoller:
                         issue_number=number,
                         matched_label=label_match,
                     )
-                    # Label match bypasses the self-assignment check; the
-                    # operator's config choice is the trust boundary.
                     new_issues.append({"repo": repo, "issue": issue})
                     continue
 
@@ -412,7 +408,21 @@ class IssuePoller:
                     accepted = False
 
                 if accepted:
+                    # Self-assigned: admit and mark seen.
+                    seen_for_repo.add(number)
                     new_issues.append({"repo": repo, "issue": issue})
+                elif not include_lowered:
+                    # Foreign-assigned on a pre-#80 (assignment-only)
+                    # repo: mark seen so we don't re-check events every
+                    # poll for the same issue. Pre-#80 semantics.
+                    seen_for_repo.add(number)
+                # On include_labels repos, foreign-assigned issues are
+                # INTENTIONALLY NOT marked seen (codex P1 round-2 fix
+                # for #80): a teammate may later add an opt-in label,
+                # and the next poll needs to pick it up. The cost is
+                # one extra events-check per foreign-assigned issue
+                # per poll — bounded by the operator's own assignment
+                # count, which is typically small.
 
         # Never propagate a save_state disk failure out of poll() — the
         # caller has work to do with new_issues. Log and move on.
@@ -608,18 +618,46 @@ class IssuePoller:
                 continue
             self._clear_repo_failure(repo)
             seen_for_repo = self.seen_issues.setdefault(repo, set())
+            include_lowered = {label.lower() for label in include_labels}
             for issue in issues:
-                # Targeted queries in include-label mode already
-                # guarantee every issue here matches at least one
-                # trigger (assignee or a configured label), so we
-                # can seed unconditionally.
                 try:
-                    seen_for_repo.add(int(issue["number"]))
+                    number = int(issue["number"])
                 except (KeyError, TypeError, ValueError):
                     # Malformed entries shouldn't abort the seed —
                     # poll() has its own per-issue guard and will log
                     # them on the next cycle.
                     continue
+                if include_lowered:
+                    # #80 codex P1 round-2: in include_labels mode we
+                    # only seed issues that are CURRENTLY a genuine
+                    # trigger. Foreign-assigned issues without an
+                    # opt-in label must NOT be seeded — a teammate
+                    # may add the label later and the next poll needs
+                    # to surface it. Label-matched and self-assigned
+                    # are seeded so first-poll doesn't flood.
+                    label_match = self._matched_include_label(
+                        issue, include_lowered,
+                    )
+                    if label_match is not None:
+                        seen_for_repo.add(number)
+                        continue
+                    try:
+                        self_assigned = await self._is_self_assigned(
+                            repo, number,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # Can't determine now — skip; first poll will
+                        # re-evaluate properly.
+                        continue
+                    if self_assigned:
+                        seen_for_repo.add(number)
+                else:
+                    # Pre-#80 behavior: server-side --assignee already
+                    # filtered, seed everything so first poll doesn't
+                    # flood.
+                    seen_for_repo.add(number)
         self._save_state_best_effort()
 
 
