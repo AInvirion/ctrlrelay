@@ -240,7 +240,7 @@ class GitHubCLI:
         repo: str,
         label: str,
         state: str = "open",
-        limit: int = 100,
+        limit: int = 1000,
     ) -> list[dict[str, Any]]:
         """List open issues carrying a specific label.
 
@@ -251,6 +251,15 @@ class GitHubCLI:
         label-triggered poll path scale-safe on large repos, where
         fetching all open issues (pre-codex-review behavior) would
         silently cap at 100 and miss labeled issues on later pages.
+
+        ``limit`` defaults to 1000 (vs the 100 default on
+        ``list_assigned_issues``) because an opt-in label can, in
+        principle, wear many more issues than a single user is
+        assigned to. gh paginates internally up to ``--limit`` so one
+        call covers the realistic range. If a repo ever has >1000
+        open issues sharing the same opt-in label, the operator will
+        need a larger limit or more granular labels — it's a
+        configuration smell at that scale.
 
         gh CLI treats ``--label foo --label bar`` as AND; the poller
         therefore runs one call per label and dedupes by issue number

@@ -1442,6 +1442,131 @@ class TestIncludeLabelsFilter:
         assert [r["issue"]["number"] for r in results] == [1]
 
     @pytest.mark.asyncio
+    async def test_foreign_assigned_not_marked_seen_so_later_label_triggers(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Codex P1 round-2 on #115: in include_labels mode, an issue
+        that's currently foreign-assigned-without-label must NOT be
+        marked seen. Otherwise a teammate adding an opt-in label on
+        the NEXT poll cycle would be silently ignored because the
+        seen-check would short-circuit.
+
+        Poll 1: issue is foreign-assigned, no label → dropped, NOT seen.
+        Poll 2: teammate added the label → issue appears in label query
+        → seen-check passes → surfaced as label-triggered."""
+        # Poll 1: issue appears in assignee query (assigned to alice by
+        # someone else), has no label.
+        foreign_no_label = make_issue(
+            42, "foreign-assigned", assignees=["alice"],
+        )
+        mock_github.list_assigned_issues.return_value = [foreign_no_label]
+        mock_github.list_issues_by_label.return_value = []
+        # Assignment events show bob assigned alice (foreign).
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("alice", "bob"),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+        assert results == []
+        # CRITICAL: issue must NOT be in seen_for_repo, so poll 2 can
+        # re-evaluate it when a label is added.
+        assert 42 not in poller.seen_issues.get("owner/repo-a", set())
+
+        # Poll 2: teammate added the label. Assignee query still
+        # returns the issue; label query now also returns it.
+        labeled = make_issue(
+            42, "foreign-assigned", assignees=["alice"],
+            labels=[{"name": "ctrlrelay:auto"}],
+        )
+        mock_github.list_assigned_issues.return_value = [labeled]
+        mock_github.list_issues_by_label.return_value = [labeled]
+
+        results = await poller.poll()
+        assert [r["issue"]["number"] for r in results] == [42]
+        # Now seen (processed once).
+        assert 42 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
+    async def test_pre_80_repos_still_mark_foreign_assigned_seen(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Migration guard: repos WITHOUT include_labels keep the
+        pre-#80 foreign-assignment dedup. Otherwise we'd re-check the
+        assignment-events endpoint every poll for every foreign
+        assignment in every repo, which is unnecessary traffic when
+        the operator hasn't opted into label triggers at all."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(7, "foreign-assigned", assignees=["alice"]),
+        ]
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("alice", "bob"),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            # No include_labels configured → pre-#80 semantics.
+        )
+
+        await poller.poll()
+        # Foreign-assigned IS marked seen on pre-#80 repos.
+        assert 7 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
+    async def test_seed_only_currently_eligible_in_include_labels_mode(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Codex P1 round-2 on #115: seed_current must only persist
+        issues that CURRENTLY trigger a rule. A foreign-assigned issue
+        with no opt-in label should NOT be seeded; otherwise a later
+        label addition can never surface it (the seed already consumed
+        the number)."""
+        foreign_no_label = make_issue(
+            100, "not triggered", assignees=["alice"],
+        )
+        labeled_unassigned = make_issue(
+            200, "team-labeled", labels=[{"name": "ctrlrelay:auto"}],
+        )
+        self_assigned = make_issue(
+            300, "self-assigned", assignees=["alice"],
+        )
+
+        # Both targeted queries return their respective matches.
+        mock_github.list_assigned_issues.return_value = [
+            foreign_no_label, self_assigned,
+        ]
+        mock_github.list_issues_by_label.return_value = [labeled_unassigned]
+        # #100 foreign (bob assigned alice); #300 self-assigned.
+        mock_github.list_assignment_events.side_effect = [
+            [make_assigned_event("alice", "bob")],     # #100
+            [make_assigned_event("alice", "alice")],   # #300
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        await poller.seed_current()
+        seen = poller.seen_issues["owner/repo-a"]
+        # 200 (label-matched) and 300 (self-assigned) seeded.
+        assert 200 in seen
+        assert 300 in seen
+        # 100 (foreign, no label) NOT seeded — a later label add
+        # must be free to trigger.
+        assert 100 not in seen
+
+    @pytest.mark.asyncio
     async def test_include_label_emits_structured_log(
         self,
         mock_github: MagicMock,
