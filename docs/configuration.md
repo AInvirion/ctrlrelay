@@ -276,6 +276,14 @@ repos:
 - The event log entry for a label-triggered acceptance is
   `poll.issue.included_by_label`, alongside the existing
   `poll.issue.excluded_by_label` for exclusions.
+- **Interaction with `task_labels`**: `include_labels` opts an issue
+  into the poller's consideration set. Once surfaced, the usual
+  routing still applies — if the same issue also carries a
+  `task_labels` label, it runs through the **task** pipeline (report-
+  only, no PR), not the dev pipeline. If you want label-triggered
+  issues to always run dev, make sure `include_labels` and
+  `task_labels` are disjoint (e.g. label opt-ins with
+  `ctrlrelay:auto` and task runs with `task:<topic>`).
 
 Trust model: anyone with triage permission on a repo can apply a label. That
 matches the trust model ctrlrelay already uses — the operator configures which
