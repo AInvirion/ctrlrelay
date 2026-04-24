@@ -33,7 +33,12 @@ and restart on failure — the unit examples below already do this.
 Save plist files under `~/Library/LaunchAgents/`. Use the **absolute** path to
 `ctrlrelay` (run `which ctrlrelay` to find it) — launchd's PATH is minimal.
 
-`~/Library/LaunchAgents/com.ainvirion.ctrlrelay-bridge.plist`:
+The job labels below use `com.example.ctrlrelay-*` as a placeholder. Pick a
+reverse-DNS prefix you own (e.g. `com.yourname.ctrlrelay-*`) and use it
+consistently across the filename, the `<Label>` value, and the `launchctl`
+commands so `launchctl list` output is unambiguous.
+
+`~/Library/LaunchAgents/com.example.ctrlrelay-bridge.plist`:
 
 {% raw %}
 ```xml
@@ -42,7 +47,7 @@ Save plist files under `~/Library/LaunchAgents/`. Use the **absolute** path to
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.ainvirion.ctrlrelay-bridge</string>
+    <string>com.example.ctrlrelay-bridge</string>
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/ctrlrelay</string>
@@ -72,7 +77,7 @@ Save plist files under `~/Library/LaunchAgents/`. Use the **absolute** path to
 ```
 {% endraw %}
 
-`~/Library/LaunchAgents/com.ainvirion.ctrlrelay-poller.plist`:
+`~/Library/LaunchAgents/com.example.ctrlrelay-poller.plist`:
 
 {% raw %}
 ```xml
@@ -81,7 +86,7 @@ Save plist files under `~/Library/LaunchAgents/`. Use the **absolute** path to
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.ainvirion.ctrlrelay-poller</string>
+    <string>com.example.ctrlrelay-poller</string>
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/ctrlrelay</string>
@@ -122,16 +127,16 @@ Create the log directory and load the agents:
 
 ```bash
 mkdir -p ~/.ctrlrelay/logs
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ainvirion.ctrlrelay-bridge.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ainvirion.ctrlrelay-poller.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.ctrlrelay-bridge.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.ctrlrelay-poller.plist
 ```
 
 Manage them:
 
 ```bash
 launchctl list | grep ctrlrelay          # check loaded
-launchctl bootout gui/$(id -u)/com.ainvirion.ctrlrelay-poller    # stop
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ainvirion.ctrlrelay-poller.plist  # start
+launchctl bootout gui/$(id -u)/com.example.ctrlrelay-poller    # stop
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.ctrlrelay-poller.plist  # start
 ```
 
 ### Linux — systemd
