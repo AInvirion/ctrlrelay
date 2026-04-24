@@ -1636,6 +1636,71 @@ class TestIncludeLabelsFilter:
         assert 77 in poller.seen_issues["owner/repo-a"]
 
     @pytest.mark.asyncio
+    async def test_migration_clears_seen_issues_on_first_enable(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Codex P2 round-6 on #115: when an operator adds
+        include_labels to a repo that already has persisted
+        seen_issues, pre-existing foreign-assigned entries would
+        permanently block label triggers on those issue numbers.
+        The one-shot migration clears seen_issues for such repos on
+        daemon startup so the next poll re-evaluates everything."""
+        import json as _json
+
+        # Simulate pre-#80 state: seen_issues has foreign-assigned
+        # numbers; no include_labels_migrated record yet.
+        state_file.write_text(_json.dumps({
+            "seen_issues": {"owner/repo-a": [100, 200, 300]},
+            "last_poll": "2026-04-17T00:00:00+00:00",
+        }))
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            # First enable: include_labels freshly added to config.
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        # Migration cleared the repo's seen_issues.
+        assert poller.seen_issues.get("owner/repo-a", set()) == set()
+        assert "owner/repo-a" in poller.include_labels_migrated
+        # State persisted — next daemon startup reads the migration
+        # flag and skips re-clearing.
+        persisted = _json.loads(state_file.read_text())
+        assert persisted["include_labels_migrated"] == ["owner/repo-a"]
+
+    @pytest.mark.asyncio
+    async def test_migration_is_idempotent_across_restarts(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Once migrated, a repo's later polls can re-populate
+        seen_issues under the new semantics. A subsequent daemon
+        restart must NOT re-clear those entries (the migration
+        already ran)."""
+        import json as _json
+
+        # Simulate post-migration state: repo is already in migrated
+        # set and has accumulated new seen_issues under the new rules.
+        state_file.write_text(_json.dumps({
+            "seen_issues": {"owner/repo-a": [55]},
+            "include_labels_migrated": ["owner/repo-a"],
+            "last_poll": "2026-04-20T00:00:00+00:00",
+        }))
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        # No re-migration: seen_issues preserved.
+        assert poller.seen_issues["owner/repo-a"] == {55}
+
+    @pytest.mark.asyncio
     async def test_seed_isolates_per_label_query_failures(
         self, mock_github: MagicMock, state_file: Path
     ) -> None:

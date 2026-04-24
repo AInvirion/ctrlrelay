@@ -81,6 +81,14 @@ class IssuePoller:
     repos: list[str]
     state_file: Path
     seen_issues: dict[str, set[int]] = field(default_factory=dict)
+    # Repos whose seen_issues have already been re-evaluated once
+    # after include_labels was first enabled. Persisted so the
+    # migration only runs once per repo (codex P2 round-6 on #115).
+    # An operator enabling include_labels on a repo that already has
+    # a populated poller_state.json would otherwise have pre-seen
+    # foreign-assigned issues silently miss label triggers — the
+    # migration clears those entries so the next poll re-evaluates.
+    include_labels_migrated: set[str] = field(default_factory=set)
     accept_foreign_assignments: set[str] = field(default_factory=set)
     exclude_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
     include_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
@@ -97,6 +105,47 @@ class IssuePoller:
 
     def __post_init__(self) -> None:
         self._load_state()
+        self._migrate_for_include_labels()
+
+    def _migrate_for_include_labels(self) -> None:
+        """One-shot per-repo migration when include_labels is first
+        enabled on a repo that already has persisted seen_issues.
+
+        Pre-#80 polls marked foreign-assigned issues seen to avoid
+        re-checking the events endpoint every cycle. Once the operator
+        enables include_labels for that repo, we want those
+        foreign-assigned issues to be re-evaluated so that a teammate
+        labeling one with the opt-in label surfaces it. Clear the
+        repo's seen_issues once, mark the repo migrated, and persist
+        both. Subsequent daemon startups skip the migration because
+        the repo is already in ``include_labels_migrated``.
+        """
+        migrated_now: list[str] = []
+        for repo, labels in self.include_labels_by_repo.items():
+            if not labels:
+                continue
+            if repo in self.include_labels_migrated:
+                continue
+            # Clear so the first poll re-evaluates everything. The
+            # assignee query still returns the small operator-scoped
+            # set; events check confirms self- vs foreign-assignment;
+            # label query catches any opt-in label adds that happened
+            # before this migration.
+            self.seen_issues.pop(repo, None)
+            self.include_labels_migrated.add(repo)
+            migrated_now.append(repo)
+        if migrated_now:
+            log_event(
+                _logger,
+                "poll.state.include_labels_migrated",
+                repos=sorted(migrated_now),
+            )
+            # Best-effort persist; next normal save catches up if
+            # this fails transiently.
+            try:
+                self._save_state()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # State persistence
@@ -110,9 +159,13 @@ class IssuePoller:
             data = json.loads(self.state_file.read_text())
             raw = data.get("seen_issues", {})
             self.seen_issues = {repo: set(numbers) for repo, numbers in raw.items()}
+            migrated = data.get("include_labels_migrated", [])
+            if isinstance(migrated, list):
+                self.include_labels_migrated = set(migrated)
         except (json.JSONDecodeError, OSError):
             # Corrupt or unreadable state — start fresh
             self.seen_issues = {}
+            self.include_labels_migrated = set()
 
     def _save_state(self) -> None:
         """Persist seen issues and a ``last_poll`` timestamp to the state file."""
@@ -120,6 +173,7 @@ class IssuePoller:
             "seen_issues": {
                 repo: sorted(numbers) for repo, numbers in self.seen_issues.items()
             },
+            "include_labels_migrated": sorted(self.include_labels_migrated),
             "last_poll": datetime.now(timezone.utc).isoformat(),
         }
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
