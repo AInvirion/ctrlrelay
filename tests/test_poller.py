@@ -1644,16 +1644,63 @@ class TestIncludeLabelsFilter:
         flaky label query during startup drops the assignee-backlog
         seed, and the first successful poll spins up pipelines for
         pre-existing issues that should have been seen."""
+        from ctrlrelay.core import poller as poller_mod
         from ctrlrelay.core.github import GitHubError
 
         assigned_self = make_issue(
             11, "self-assigned pre-startup", assignees=["alice"],
         )
         mock_github.list_assigned_issues.return_value = [assigned_self]
-        # Label query raises on startup.
+        # Label query raises on startup (on all retries).
         mock_github.list_issues_by_label = AsyncMock(
             side_effect=GitHubError("label index flaky"),
         )
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("alice", "alice"),
+        ]
+        # Don't actually sleep through the retry budget in tests.
+        orig_sleep = poller_mod._SEED_LABEL_RETRY_SLEEP_SECONDS
+        poller_mod._SEED_LABEL_RETRY_SLEEP_SECONDS = 0.0
+        try:
+            poller = IssuePoller(
+                github=mock_github,
+                username="alice",
+                repos=["owner/repo-a"],
+                state_file=state_file,
+                include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+            )
+            await poller.seed_current()
+        finally:
+            poller_mod._SEED_LABEL_RETRY_SLEEP_SECONDS = orig_sleep
+        # Assignee-backlog is still seeded despite the label query
+        # failing — pre-existing self-assigned work doesn't get
+        # treated as new on the first poll.
+        assert 11 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
+    async def test_assignee_query_result_trusted_even_with_sparse_json(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Codex P2 round-8 on #115: an issue returned by the
+        server-side --assignee query IS an assignee match, even if
+        the returned JSON has an empty or missing assignees field
+        (gh sometimes returns sparse payloads). Re-deriving
+        is_assigned from the JSON in include_labels mode previously
+        dropped those valid matches. Trust the server filter instead."""
+        # Sparse JSON: no assignees field at all. gh wouldn't have
+        # returned this from an --assignee filter unless the issue
+        # IS assigned to us; the field just didn't populate.
+        sparse_assignee = {
+            "number": 33,
+            "title": "returned by --assignee query",
+            "state": "open",
+            "body": "",
+            "labels": [],
+            "createdAt": "2026-04-22T00:00:00Z",
+            "updatedAt": "2026-04-22T00:00:00Z",
+        }
+        mock_github.list_assigned_issues.return_value = [sparse_assignee]
+        mock_github.list_issues_by_label.return_value = []
         mock_github.list_assignment_events.return_value = [
             make_assigned_event("alice", "alice"),
         ]
@@ -1665,11 +1712,56 @@ class TestIncludeLabelsFilter:
             include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
         )
 
-        await poller.seed_current()
-        # Assignee-backlog is still seeded despite the label query
-        # failing — pre-existing self-assigned work doesn't get
-        # treated as new on the first poll.
-        assert 11 in poller.seen_issues["owner/repo-a"]
+        results = await poller.poll()
+        # Issue flows through: sparse JSON doesn't cause a false drop.
+        assert [r["issue"]["number"] for r in results] == [33]
+        assert 33 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
+    async def test_seed_label_query_retries_before_giving_up(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Codex P2 round-8 on #115: transient label-query failures
+        during seed must retry before giving up, so a brief GitHub
+        blip doesn't leak pre-existing labeled backlog to the first
+        healthy poll. Here the first attempt raises and the second
+        succeeds — the label-triggered issue ends up seeded."""
+        from ctrlrelay.core import poller as poller_mod
+        from ctrlrelay.core.github import GitHubError
+
+        call_count = {"n": 0}
+        labeled = make_issue(
+            88, "pre-existing labeled", labels=[{"name": "ctrlrelay:auto"}],
+        )
+
+        async def flaky_label_query(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise GitHubError("transient 503")
+            return [labeled]
+
+        mock_github.list_assigned_issues.return_value = []
+        mock_github.list_issues_by_label = AsyncMock(side_effect=flaky_label_query)
+
+        # Speed up the retry sleep so the test runs fast.
+        orig_sleep = poller_mod._SEED_LABEL_RETRY_SLEEP_SECONDS
+        poller_mod._SEED_LABEL_RETRY_SLEEP_SECONDS = 0.0
+        try:
+            poller = IssuePoller(
+                github=mock_github,
+                username="alice",
+                repos=["owner/repo-a"],
+                state_file=state_file,
+                include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+            )
+            await poller.seed_current()
+        finally:
+            poller_mod._SEED_LABEL_RETRY_SLEEP_SECONDS = orig_sleep
+
+        # Retry succeeded, labeled issue is seeded. First poll won't
+        # treat it as new work.
+        assert 88 in poller.seen_issues["owner/repo-a"]
+        assert call_count["n"] == 2
 
     @pytest.mark.asyncio
     async def test_seed_conservatively_seeds_when_events_api_flakes(
