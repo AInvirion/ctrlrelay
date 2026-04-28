@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -161,6 +162,9 @@ class AutomationConfig(BaseModel):
     task_labels: list[str] = Field(default_factory=lambda: ["task"])
 
 
+_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
 class RepoConfig(BaseModel):
     """Configuration for a single repository."""
 
@@ -170,6 +174,19 @@ class RepoConfig(BaseModel):
     deploy: DeployConfig | None = None
     code_review: CodeReviewConfig = Field(default_factory=CodeReviewConfig)
     dev_branch_template: str = "fix/issue-{n}"
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        # GitHub-shaped owner/repo. Rejects "..", empty segments, extra slashes,
+        # and shell metacharacters — `name` ends up in derived filesystem paths
+        # and remote URLs, so a malicious manifest must not escape DEST.
+        if not _REPO_NAME_RE.match(v):
+            raise ValueError(
+                f"repo name {v!r} must match 'owner/repo' "
+                f"(letters, digits, '.', '_', '-')"
+            )
+        return v
 
     @field_validator("local_path", mode="before")
     @classmethod
