@@ -25,6 +25,16 @@ _logger = get_logger("core.poller")
 # misconfiguration visible even though it's technically skipped here.
 _TRANSIENT_POLL_ERRORS = (TimeoutError, GitHubError, OSError)
 
+# Seed-time retry policy for the per-label include-labels query. A
+# seed-time failure here (not retried) would leak pre-existing
+# labeled backlog as "new work" on the first healthy poll. 3 × 2s
+# handles typical network blips without adding meaningful startup
+# latency. A persistent failure past the retry budget falls back to
+# the existing per-label isolation (log + continue), so assignee-
+# triggered backlog and other labels still seed cleanly.
+_SEED_LABEL_RETRY_ATTEMPTS = 3
+_SEED_LABEL_RETRY_SLEEP_SECONDS = 2.0
+
 # After this many consecutive per-repo failures, escalate log level to
 # WARNING so a persistent misconfiguration (expired auth, renamed repo,
 # revoked access) stops hiding behind routine "transient" skip logs.
@@ -60,6 +70,20 @@ class IssuePoller:
     pipeline. The exclusion check runs BEFORE the assignment-event lookup
     so it short-circuits the extra ``gh`` call for excluded issues.
     Matching is case-insensitive.
+
+    ``include_labels_by_repo`` is the opt-in complement (see #80). When a
+    repo has any include-labels configured, the poller drops the
+    ``--assignee`` filter on that repo's ``gh`` query and instead fetches
+    all open issues, then accepts any issue that **either** is assigned
+    to the operator (the pre-#80 behavior) **or** carries at least one of
+    the configured labels. Matching is case-insensitive. Label-matched
+    issues skip the self-assignment event check — the label itself is
+    the trust signal that the operator opted into by configuring it.
+    An issue that both carries a matching label and is assigned to the
+    operator is accepted exactly once (not duplicated in ``new_issues``
+    or ``seen_issues``). A repo with an empty / missing ``include_labels``
+    keeps the pre-#80 ``--assignee``-filtered query so we don't
+    over-fetch.
     """
 
     github: GitHubCLI
@@ -69,6 +93,7 @@ class IssuePoller:
     seen_issues: dict[str, set[int]] = field(default_factory=dict)
     accept_foreign_assignments: set[str] = field(default_factory=set)
     exclude_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
+    include_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
     # Per-repo consecutive-skip counter; populated at runtime by poll() /
     # seed_current(). Not persisted — intentionally resets on daemon
     # restart so an operator fix is exercised before we re-escalate.
@@ -197,6 +222,13 @@ class IssuePoller:
         marked seen and dropped before the assignment-event check runs, so
         operator-only / instruction-only issues never reach the dev pipeline
         and we don't pay a second ``gh`` call for them.
+
+        Repos configured with ``include_labels_by_repo[repo]`` skip the
+        server-side ``--assignee`` filter and fetch all open issues, then
+        accept any that either (a) match one of the include-labels or
+        (b) are assigned to the operator. Issues matching neither are
+        left alone (NOT marked seen) so a later label-add or assignment
+        will still surface them. See #80.
         """
         new_issues: list[dict[str, Any]] = []
 
@@ -205,10 +237,78 @@ class IssuePoller:
             # before the `gh` call so we don't log the same error every cycle.
             if repo in self._issues_disabled_repos:
                 continue
+            # Per-repo include-labels controls the fetch strategy. With
+            # no include-labels configured we keep the pre-#80
+            # ``--assignee`` server-side filter (cheap, small result).
+            # With include-labels configured we run one TARGETED query
+            # per trigger — the assignee query plus one
+            # ``--label <L>`` query per configured label — and merge by
+            # issue number. An unfiltered ``gh issue list`` would cap at
+            # --limit (default 100) and silently miss labeled issues on
+            # later pages in a busy repo (codex P1 on the first cut).
+            include_labels = self.include_labels_by_repo.get(repo, [])
+            include_lowered = {label.lower() for label in include_labels}
+            # Tracks issue numbers that came from the server-side
+            # assignee query. Used in the poll loop below to trust
+            # the server filter rather than re-deriving is_assigned
+            # from the returned JSON (codex P2 round-8). A payload
+            # with a missing/empty assignees field from the assignee
+            # query is still a confirmed assignee hit — gh wouldn't
+            # have returned it otherwise.
+            assignee_trigger_numbers: set[int] = set()
             try:
-                issues = await self.github.list_assigned_issues(
-                    repo, assignee=self.username
-                )
+                if include_lowered:
+                    by_number: dict[int, dict[str, Any]] = {}
+                    # Assignee query is the baseline — any failure
+                    # here is treated as a repo-level failure (same
+                    # as non-include-labels repos). Label queries
+                    # below are isolated per-label so one flaky
+                    # label filter doesn't starve the assignee
+                    # path (codex P2 round-4).
+                    assignee_issues = await self.github.list_assigned_issues(
+                        repo, assignee=self.username,
+                    )
+                    for i in assignee_issues:
+                        try:
+                            num = int(i["number"])
+                        except Exception:
+                            continue
+                        by_number[num] = i
+                        assignee_trigger_numbers.add(num)
+                    for label in include_labels:
+                        try:
+                            labeled = await self.github.list_issues_by_label(
+                                repo, label=label,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as label_e:
+                            # Isolate per-label failures so one bad
+                            # label query doesn't drop the whole
+                            # repo's intake. Log and continue — the
+                            # assignee-triggered issues we already
+                            # fetched still flow through the normal
+                            # pipeline; the missed label query will
+                            # be retried on the next poll cycle.
+                            log_event(
+                                _logger,
+                                "poll.repo.label_query_failed",
+                                repo=repo,
+                                label=label,
+                                reason=type(label_e).__name__,
+                                error=str(label_e)[:200],
+                            )
+                            continue
+                        for i in labeled:
+                            try:
+                                by_number.setdefault(int(i["number"]), i)
+                            except Exception:
+                                pass
+                    issues = list(by_number.values())
+                else:
+                    issues = await self.github.list_assigned_issues(
+                        repo, assignee=self.username,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -280,10 +380,71 @@ class IssuePoller:
                     )
                     continue
 
-                # Mark seen before deciding whether to surface the issue so a
-                # filtered (foreign-assigned) issue isn't re-checked every poll.
-                seen_for_repo.add(number)
+                # Two positive triggers, checked in this order:
+                #   1. include-label match (#80): the operator opted this
+                #      label into the pipeline, so the label IS the trust
+                #      signal — no self-assignment check needed.
+                #   2. assignment to operator: pre-#80 path, still needs
+                #      the self-assignment event check.
+                # With targeted queries (assignee + per-label) every
+                # issue surfaced here already matched at least one
+                # trigger, but we keep the is_assigned check so the
+                # label-match branch below still knows when to skip the
+                # self-assignment event lookup. On repos without
+                # include_labels, the server already filtered to the
+                # assignee, so every issue that makes it here is
+                # assignment-triggered — we skip the client-side
+                # assignment check to preserve pre-#80 behavior (some
+                # payloads don't include ``assignees`` in fixtures or
+                # truncated responses).
+                label_match = self._matched_include_label(issue, include_lowered)
+                if include_lowered:
+                    # Trust the server-side --assignee filter: an
+                    # issue returned from that query IS assigned,
+                    # even if the payload's assignees field is
+                    # sparse (codex P2 round-8). Only fall back to
+                    # the client-side JSON check for issues that
+                    # only came from the label query, since those
+                    # were not filtered by assignee.
+                    if number in assignee_trigger_numbers:
+                        is_assigned = True
+                    else:
+                        is_assigned = self._issue_is_assigned_to(
+                            issue, self.username,
+                        )
+                    if label_match is None and not is_assigned:
+                        # Defensive: a targeted query should never
+                        # return an issue that matches neither trigger,
+                        # but if gh's label filter ever has a quirk
+                        # (renamed labels, case, pagination), we'd
+                        # rather leave the issue unmarked than
+                        # swallow it permanently.
+                        continue
+                else:
+                    # Server-side ``--assignee`` already filtered; by
+                    # construction every issue reaching here is
+                    # assignment-triggered.
+                    is_assigned = True
 
+                if label_match is not None:
+                    # Label match bypasses the self-assignment check; the
+                    # operator's config choice is the trust boundary.
+                    # Mark seen so the same label-triggered issue isn't
+                    # re-surfaced on every poll.
+                    seen_for_repo.add(number)
+                    log_event(
+                        _logger,
+                        "poll.issue.included_by_label",
+                        repo=repo,
+                        issue_number=number,
+                        matched_label=label_match,
+                    )
+                    new_issues.append({"repo": repo, "issue": issue})
+                    continue
+
+                # Assignment-only path: run the self-assignment event
+                # check exactly as before.
+                events_check_failed = False
                 try:
                     accepted = await self._is_self_assigned(repo, number)
                 except asyncio.CancelledError:
@@ -302,9 +463,33 @@ class IssuePoller:
                         error=str(e)[:200],
                     )
                     accepted = False
+                    events_check_failed = True
 
                 if accepted:
+                    # Self-assigned: admit and mark seen.
+                    seen_for_repo.add(number)
                     new_issues.append({"repo": repo, "issue": issue})
+                elif events_check_failed:
+                    # Transient events-API failure (codex P2 round-4).
+                    # Mark seen regardless of include_labels to avoid
+                    # retry churn during an outage — would otherwise
+                    # hit /issues/{n}/events every poll until the API
+                    # recovers. Tradeoff: if a teammate later adds an
+                    # opt-in label while this issue is in seen_for_repo,
+                    # the label won't re-trigger this specific issue.
+                    # That's narrow enough to accept; re-applying the
+                    # label after the API recovers is the workaround.
+                    seen_for_repo.add(number)
+                elif not include_lowered:
+                    # Confirmed foreign-assigned on a pre-#80 repo:
+                    # mark seen to avoid re-checking events every poll.
+                    seen_for_repo.add(number)
+                # Confirmed foreign on include_labels repos is
+                # INTENTIONALLY left unmarked (codex P1 round-2 fix)
+                # so a later label addition can still trigger. The
+                # cost is one events check per poll per foreign
+                # issue — bounded by the operator's own assignment
+                # count, which is typically small.
 
         # Never propagate a save_state disk failure out of poll() — the
         # caller has work to do with new_issues. Log and move on.
@@ -376,6 +561,49 @@ class IssuePoller:
                 return name
         return None
 
+    @staticmethod
+    def _matched_include_label(
+        issue: dict[str, Any], include_lowered: set[str]
+    ) -> str | None:
+        """Return the first issue label that matches ``include_lowered``.
+
+        Mirrors ``_matched_exclude_label`` — shares the string/dict
+        tolerance and case-insensitive matching so operators can rely on
+        identical semantics between the exclude and include knobs. The
+        returned value is the label's original casing for logging. See
+        #80.
+        """
+        if not include_lowered:
+            return None
+        for label in issue.get("labels") or []:
+            if isinstance(label, dict):
+                name = label.get("name", "")
+            else:
+                name = str(label)
+            if name and name.lower() in include_lowered:
+                return name
+        return None
+
+    @staticmethod
+    def _issue_is_assigned_to(issue: dict[str, Any], username: str) -> bool:
+        """Check whether ``username`` is listed in the issue's assignees.
+
+        The ``gh issue list`` payload returns assignees as
+        ``[{"login": "...", ...}]``. When we drop ``--assignee`` from the
+        server-side query (include_labels mode) we need this to detect
+        the pre-#80 assignment trigger client-side. Case-sensitive
+        compare — GitHub logins are themselves case-preserving but
+        case-insensitive for matching; the server-side filter
+        historically uses exact login compare, so we match that.
+        """
+        if not username:
+            return False
+        for a in issue.get("assignees") or []:
+            login = (a or {}).get("login") if isinstance(a, dict) else str(a)
+            if login == username:
+                return True
+        return False
+
     def mark_seen(self, repo: str, issue_number: int) -> None:
         """Mark an issue as seen without triggering a poll.
 
@@ -401,10 +629,17 @@ class IssuePoller:
             self._save_state_best_effort()
 
     async def seed_current(self) -> None:
-        """Seed seen_issues with all currently assigned issues.
+        """Seed seen_issues with all currently-triggered issues.
 
         Call this on first startup to avoid treating existing assignments
-        as new. Only issues assigned AFTER this seed will trigger handlers.
+        (or label matches) as new. Only issues assigned / labeled AFTER
+        this seed will trigger handlers.
+
+        Repos with ``include_labels`` configured seed BOTH the assignee
+        result and each label's targeted result (matching the poll()
+        fetch strategy — see poll() for why an unfiltered issue list
+        can silently cap at --limit on busy repos). Other repos keep
+        the cheap ``--assignee`` query.
 
         Failure mode: if a per-repo lookup fails transiently, the seed skips
         that repo and logs ``poll.repo.skipped``. The consequence is that on
@@ -414,10 +649,72 @@ class IssuePoller:
         for repo in self.repos:
             if repo in self._issues_disabled_repos:
                 continue
+            include_labels = self.include_labels_by_repo.get(repo, [])
             try:
-                issues = await self.github.list_assigned_issues(
-                    repo, assignee=self.username
-                )
+                if include_labels:
+                    by_number: dict[int, dict[str, Any]] = {}
+                    assignee_issues = await self.github.list_assigned_issues(
+                        repo, assignee=self.username,
+                    )
+                    for i in assignee_issues:
+                        try:
+                            by_number[int(i["number"])] = i
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                    for label in include_labels:
+                        # Retry label query on transient failure during
+                        # seed (codex P2 round-8). If we give up here
+                        # and the query never succeeds, pre-existing
+                        # labeled issues wouldn't be in seen_issues,
+                        # and the first healthy poll would open
+                        # pipelines for backlog. 3 × 2s handles typical
+                        # network blips; a persistent failure still
+                        # falls through to the per-label log + continue.
+                        labeled = None
+                        label_err: Exception | None = None
+                        for attempt in range(_SEED_LABEL_RETRY_ATTEMPTS):
+                            try:
+                                labeled = await self.github.list_issues_by_label(
+                                    repo, label=label,
+                                )
+                                label_err = None
+                                break
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as label_e:
+                                label_err = label_e
+                                if attempt < _SEED_LABEL_RETRY_ATTEMPTS - 1:
+                                    await asyncio.sleep(
+                                        _SEED_LABEL_RETRY_SLEEP_SECONDS,
+                                    )
+                        if labeled is None:
+                            # All retries exhausted. Isolate the
+                            # failure so the assignee backlog + any
+                            # successful label queries still seed
+                            # cleanly; continue to the next label.
+                            log_event(
+                                _logger,
+                                "poll.seed.label_query_failed",
+                                repo=repo,
+                                label=label,
+                                attempts=_SEED_LABEL_RETRY_ATTEMPTS,
+                                reason=(
+                                    type(label_err).__name__
+                                    if label_err else "unknown"
+                                ),
+                                error=str(label_err)[:200] if label_err else "",
+                            )
+                            continue
+                        for i in labeled:
+                            try:
+                                by_number.setdefault(int(i["number"]), i)
+                            except (KeyError, TypeError, ValueError):
+                                pass
+                    issues = list(by_number.values())
+                else:
+                    issues = await self.github.list_assigned_issues(
+                        repo, assignee=self.username,
+                    )
             except asyncio.CancelledError:
                 raise
             except _TRANSIENT_POLL_ERRORS as e:
@@ -428,8 +725,63 @@ class IssuePoller:
                 continue
             self._clear_repo_failure(repo)
             seen_for_repo = self.seen_issues.setdefault(repo, set())
+            include_lowered = {label.lower() for label in include_labels}
             for issue in issues:
-                seen_for_repo.add(issue["number"])
+                try:
+                    number = int(issue["number"])
+                except (KeyError, TypeError, ValueError):
+                    # Malformed entries shouldn't abort the seed —
+                    # poll() has its own per-issue guard and will log
+                    # them on the next cycle.
+                    continue
+                if include_lowered:
+                    # #80 codex P1 round-2: in include_labels mode we
+                    # only seed issues that are CURRENTLY a genuine
+                    # trigger. Foreign-assigned issues without an
+                    # opt-in label must NOT be seeded — a teammate
+                    # may add the label later and the next poll needs
+                    # to surface it. Label-matched and self-assigned
+                    # are seeded so first-poll doesn't flood.
+                    label_match = self._matched_include_label(
+                        issue, include_lowered,
+                    )
+                    if label_match is not None:
+                        seen_for_repo.add(number)
+                        continue
+                    try:
+                        self_assigned = await self._is_self_assigned(
+                            repo, number,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        # Timeline API flaked during seed (codex P1
+                        # round-3). We can't tell self vs foreign
+                        # right now. Safe-default is to SEED the
+                        # issue: otherwise the first poll treats
+                        # pre-existing assigned backlog as new work
+                        # and may spin up pipelines for it. Missing
+                        # a post-startup label trigger for this
+                        # single issue is the acceptable loss; the
+                        # operator can re-apply the label after the
+                        # API recovers.
+                        log_event(
+                            _logger,
+                            "poll.seed.assignment_check_failed",
+                            repo=repo,
+                            issue_number=number,
+                            reason=type(e).__name__,
+                            error=str(e)[:200],
+                        )
+                        seen_for_repo.add(number)
+                        continue
+                    if self_assigned:
+                        seen_for_repo.add(number)
+                else:
+                    # Pre-#80 behavior: server-side --assignee already
+                    # filtered, seed everything so first poll doesn't
+                    # flood.
+                    seen_for_repo.add(number)
         self._save_state_best_effort()
 
 
