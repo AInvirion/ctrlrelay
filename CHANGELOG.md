@@ -7,25 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-27
+
+Minor release. Adds bulk repo operations driven by
+`config/orchestrator.yaml`, plus a batch of dev-pipeline correctness
+fixes (worktree ownership, PR-CI lock contention, watcher
+persistence) and a docs cleanup.
+
+### Added
+
+- **`ctrlrelay repos clone-all/pull-all/status`** (closes #117).
+  Stand up an isolated workspace from the orchestrator manifest in
+  one command:
+
+  ```
+  ctrlrelay repos clone-all ~/code/myproject [--filter ORG] [--dry-run]
+  ctrlrelay repos pull-all  ~/code/myproject [--filter ORG] [--dry-run]
+  ctrlrelay repos status    ~/code/myproject [--filter ORG]
+  ```
+
+  Each repo lands at `DEST/<org>/<repo>` derived from the `name:`
+  field; remote is `git@github.com:{name}.git`. The configured
+  `local_path` is ignored when `DEST` is passed, so existing
+  `~/Projects/...` checkouts stay untouched. Replaces the legacy
+  `bkp/sync` shell scripts that broke when the manifest was
+  archived during the rewrite.
+- **`RepoConfig.name` validator.** Repo names are now validated
+  against `^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$` at config load.
+  Rejects `..`, extra slashes, and shell metacharacters before they
+  reach a clone target — defense in depth for the new bulk
+  commands.
+
 ### Fixed
 
+- **Watchers persist across poller restarts** (closes #57). Adds
+  a `pr_watches` state-db table so in-flight merge watchers
+  survive launchd kickstart, crashes, and reboots. Before this,
+  any PR sitting in review across a poller restart silently lost
+  its post-merge automation (issue auto-close + Telegram
+  notification) for the rest of its 7-day window. The poller now
+  rehydrates surviving rows on startup and spawns one watcher
+  task per row.
+- **Repo lock released during PR CI verification** (closes #29).
+  `run_dev_issue` used to hold the per-repo lock through the
+  `PRVerifier.wait_for_checks` polling window — a pure `gh` poll
+  that can run for up to 30 minutes — which made every peer
+  session targeting the same repo report "Repository locked by
+  another session" while no git work was in flight. The lock is
+  now released before `verify`, reacquired only if a `request_fix`
+  follow-up needs to spawn an agent against the worktree, and
+  released again on cleanup. `CancelledError` during the unlocked
+  window propagates without leaking a lock row.
 - **Branch ownership signal survives delete+recreate** (closes #51).
-  `create_worktree_with_new_branch` now returns `(path, created_fresh)`
-  so the caller knows whether THIS session created the branch (fresh
-  from default, or via the stale-merged delete+recreate path). Before
-  #51, `run_dev_issue` snapshotted `branch_preexisted` BEFORE the
-  call; the snapshot went stale the moment the helper detected a
-  fully-merged local branch and deleted+recreated it. A FAILED
-  cleanup would then skip `delete_branch` and leak partial commits
-  into the next retry.
+  `create_worktree_with_new_branch` now returns
+  `(path, created_fresh)` so the caller knows whether THIS session
+  created the branch (fresh from default, or via the stale-merged
+  delete+recreate path). Before #51, `run_dev_issue` snapshotted
+  `branch_preexisted` BEFORE the call; the snapshot went stale the
+  moment the helper detected a fully-merged local branch and
+  deleted+recreated it. A FAILED cleanup would then skip
+  `delete_branch` and leak partial commits into the next retry.
 - **Refuse reuse when branch still backs an open PR** (closes #52).
   `create_worktree_with_new_branch` now probes GitHub (via
   `GitHubCLI.list_prs(head=...)`) before reusing an existing local
-  branch. If an open PR still backs it (prior DONE session whose PR
-  is unmerged, or any external source), raises `WorktreeError` with
-  the PR number and a concrete operator action instead of silently
-  hijacking the reviewer's already-reviewed branch or tripping
-  "A pull request already exists" at `gh pr create`.
+  branch. If an open PR still backs it (prior DONE session whose
+  PR is unmerged, or any external source), raises `WorktreeError`
+  with the PR number and a concrete operator action instead of
+  silently hijacking the reviewer's already-reviewed branch or
+  tripping "A pull request already exists" at `gh pr create`.
+- **`pull-all` checks subprocess return codes.** `git status`
+  failure no longer treats an empty stdout as "clean" and proceeds
+  to pull a corrupt repo. `git fetch` failure on a dirty tree is
+  now reported as `failed` instead of silently being counted as
+  `dirty — fetched only`.
+- **`status` no longer crashes on edge cases.** `git rev-list`
+  parsing wrapped in a helper that returns 0 on any non-zero
+  return code or non-numeric output, instead of raising on
+  `int(ahead)`.
+
+### Changed
+
+- **Docs use `com.example.*` placeholder for launchd labels**
+  (closes #23). The launchd plist examples and `launchctl`
+  commands no longer hard-code `com.ainvirion.ctrlrelay-*` as the
+  job label. Anyone copying the docs verbatim picked up that label
+  too, which is fine until two forks of the project share a
+  machine. Swapped to `com.example.ctrlrelay-*` with a one-line
+  note directing readers to use a reverse-DNS prefix they own.
+
+### Operator notes
+
+- Upgrade via `uv tool install ctrlrelay@latest --force` and
+  restart poller + bridge.
+  No schema or config changes — the new `pr_watches` state-db
+  table is created idempotently on first start.
+- New workflow: `ctrlrelay repos clone-all ~/code/myproject` to
+  stand up a fresh workspace, `repos pull-all` to refresh it.
+  Existing `~/Projects/...` checkouts are not touched.
 
 ## [0.1.12] - 2026-04-22
 
