@@ -53,7 +53,11 @@ class TestCloneAllDryRun:
     def test_remote_uses_ssh_github_convention(self, repos_config: Path, tmp_path: Path) -> None:
         result = runner.invoke(
             app,
-            ["repos", "clone-all", str(tmp_path / "ws"), "--config", str(repos_config), "--dry-run"],
+            [
+                "repos", "clone-all", str(tmp_path / "ws"),
+                "--config", str(repos_config),
+                "--dry-run",
+            ],
         )
         assert "git@github.com:AInvirion/aiproxyguard.git" in result.output
         assert "git@github.com:SemClone/binarysniffer.git" in result.output
