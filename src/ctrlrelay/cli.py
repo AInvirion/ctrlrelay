@@ -2059,5 +2059,227 @@ def status(
         db.close()
 
 
+repos_app = typer.Typer(help="Bulk repo operations across the orchestrator manifest.")
+app.add_typer(repos_app, name="repos")
+
+
+def _iter_repos(config_path: str, filter_str: str | None):
+    """Yield (name, org, repo, remote) tuples for repos in the orchestrator config."""
+    try:
+        config = load_config(config_path)
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+    needle = filter_str.lower() if filter_str else None
+    for r in config.repos:
+        if needle and needle not in r.name.lower():
+            continue
+        if "/" not in r.name:
+            console.print(
+                f"[yellow]skip[/yellow] {r.name} — name must be 'org/repo'"
+            )
+            continue
+        org, repo = r.name.split("/", 1)
+        remote = f"git@github.com:{r.name}.git"
+        yield r.name, org, repo, remote
+
+
+@repos_app.command("clone-all")
+def repos_clone_all(
+    dest: Path = typer.Argument(..., help="Workspace root (e.g. ~/code/myproject)"),
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml", "--config", "-c", help="Path to orchestrator.yaml"
+    ),
+    filter_str: str | None = typer.Option(
+        None, "--filter", "-f", help="Substring filter on repo name (e.g. 'AInvirion')"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show actions without running"),
+) -> None:
+    """Clone every configured repo into DEST/<org>/<repo>."""
+    import subprocess
+
+    root = Path(dest).expanduser().resolve()
+    cloned = skipped = failed = 0
+
+    for name, org, repo, remote in _iter_repos(config_path, filter_str):
+        target = root / org / repo
+        if (target / ".git").exists():
+            console.print(f"[dim]✓ {name} (already cloned)[/dim]")
+            skipped += 1
+            continue
+        if target.exists() and any(target.iterdir()):
+            console.print(f"[yellow]skip[/yellow] {name} — {target} exists and is not empty")
+            skipped += 1
+            continue
+        if dry_run:
+            console.print(f"[blue]would clone[/blue] {remote} → {target}")
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["git", "clone", "--quiet", remote, str(target)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            console.print(f"[green]cloned[/green] {name}")
+            cloned += 1
+        else:
+            console.print(f"[red]failed[/red] {name}: {result.stderr.strip()}")
+            failed += 1
+
+    if not dry_run:
+        console.print(
+            f"\n[bold]{cloned} cloned, {skipped} skipped, {failed} failed[/bold]"
+        )
+    if failed:
+        raise typer.Exit(1)
+
+
+@repos_app.command("pull-all")
+def repos_pull_all(
+    dest: Path = typer.Argument(..., help="Workspace root to pull (must already be cloned)"),
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml", "--config", "-c", help="Path to orchestrator.yaml"
+    ),
+    filter_str: str | None = typer.Option(
+        None, "--filter", "-f", help="Substring filter on repo name"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show actions without running"),
+) -> None:
+    """Fast-forward pull every cloned repo under DEST/<org>/<repo>."""
+    import subprocess
+
+    root = Path(dest).expanduser().resolve()
+    pulled = skipped = dirty = failed = 0
+
+    for name, org, repo, _remote in _iter_repos(config_path, filter_str):
+        target = root / org / repo
+        if not (target / ".git").exists():
+            console.print(f"[dim]– {name} (not cloned)[/dim]")
+            skipped += 1
+            continue
+        if dry_run:
+            console.print(f"[blue]would pull[/blue] {target}")
+            continue
+        # Refuse to pull a dirty tree — fetch only.
+        porcelain = subprocess.run(
+            ["git", "-C", str(target), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+        )
+        if porcelain.returncode != 0:
+            console.print(
+                f"[red]failed[/red] {name}: git status — {porcelain.stderr.strip()}"
+            )
+            failed += 1
+            continue
+        if porcelain.stdout.strip():
+            fetched = subprocess.run(
+                ["git", "-C", str(target), "fetch", "--quiet"],
+                capture_output=True,
+                text=True,
+            )
+            if fetched.returncode != 0:
+                console.print(
+                    f"[red]failed[/red] {name}: fetch — {fetched.stderr.strip()}"
+                )
+                failed += 1
+            else:
+                console.print(f"[yellow]dirty[/yellow] {name} — fetched only")
+                dirty += 1
+            continue
+        result = subprocess.run(
+            ["git", "-C", str(target), "pull", "--ff-only", "--quiet"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            console.print(f"[green]pulled[/green] {name}")
+            pulled += 1
+        else:
+            console.print(f"[red]failed[/red] {name}: {result.stderr.strip()}")
+            failed += 1
+
+    if not dry_run:
+        console.print(
+            f"\n[bold]{pulled} pulled, {dirty} dirty, {skipped} skipped, "
+            f"{failed} failed[/bold]"
+        )
+    if failed:
+        raise typer.Exit(1)
+
+
+@repos_app.command("status")
+def repos_status(
+    dest: Path = typer.Argument(..., help="Workspace root to inspect"),
+    config_path: str = typer.Option(
+        "config/orchestrator.yaml", "--config", "-c", help="Path to orchestrator.yaml"
+    ),
+    filter_str: str | None = typer.Option(
+        None, "--filter", "-f", help="Substring filter on repo name"
+    ),
+) -> None:
+    """Show clean/dirty/ahead/behind for every repo under DEST/<org>/<repo>."""
+    import subprocess
+
+    root = Path(dest).expanduser().resolve()
+    table = Table(title=f"Repo status — {root}")
+    table.add_column("Repo", style="cyan")
+    table.add_column("Branch", style="blue")
+    table.add_column("State")
+    table.add_column("Ahead/Behind", justify="right")
+
+    for name, org, repo, _remote in _iter_repos(config_path, filter_str):
+        target = root / org / repo
+        if not (target / ".git").exists():
+            table.add_row(name, "-", "[red]not cloned[/red]", "")
+            continue
+        branch = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        porcelain = subprocess.run(
+            ["git", "-C", str(target), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        state = "[yellow]dirty[/yellow]" if porcelain else "[green]clean[/green]"
+
+        upstream = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--abbrev-ref", "@{upstream}"],
+            capture_output=True,
+            text=True,
+        )
+        ahead_behind = ""
+        if upstream.returncode == 0:
+            def _count(spec: str) -> int:
+                proc = subprocess.run(
+                    ["git", "-C", str(target), "rev-list", "--count", spec],
+                    capture_output=True,
+                    text=True,
+                )
+                if proc.returncode != 0:
+                    return 0
+                try:
+                    return int(proc.stdout.strip() or "0")
+                except ValueError:
+                    return 0
+
+            ahead_n = _count("@{upstream}..HEAD")
+            behind_n = _count("HEAD..@{upstream}")
+            parts = []
+            if ahead_n > 0:
+                parts.append(f"[green]+{ahead_n}[/green]")
+            if behind_n > 0:
+                parts.append(f"[red]-{behind_n}[/red]")
+            ahead_behind = " ".join(parts)
+
+        table.add_row(name, branch or "-", state, ahead_behind)
+
+    console.print(table)
+
+
 if __name__ == "__main__":
     app()
