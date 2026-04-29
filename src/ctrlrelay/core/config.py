@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from enum import Enum
 from pathlib import Path
@@ -9,6 +10,10 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+CONFIG_FILENAME = "orchestrator.yaml"
+CONFIG_SUBDIR = "config"
+CONFIG_ENV_VAR = "CTRLRELAY_CONFIG"
 
 
 class ConfigError(Exception):
@@ -284,6 +289,58 @@ class Config(BaseModel):
         except ZoneInfoNotFoundError as e:
             raise ValueError(f"unknown timezone {v!r}: {e}") from e
         return v
+
+
+def _xdg_config_home() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg).expanduser()
+    return Path.home() / ".config"
+
+
+def default_config_search_paths() -> list[Path]:
+    """Ordered list of locations searched when no --config is supplied.
+
+    Order: $CTRLRELAY_CONFIG, then ./config/orchestrator.yaml walking up from
+    cwd to filesystem root, then $XDG_CONFIG_HOME/ctrlrelay/orchestrator.yaml
+    (defaulting to ~/.config/ctrlrelay/orchestrator.yaml).
+    """
+    paths: list[Path] = []
+
+    env = os.environ.get(CONFIG_ENV_VAR)
+    if env:
+        paths.append(Path(env).expanduser())
+
+    cwd = Path.cwd().resolve()
+    for parent in [cwd, *cwd.parents]:
+        paths.append(parent / CONFIG_SUBDIR / CONFIG_FILENAME)
+
+    paths.append(_xdg_config_home() / "ctrlrelay" / CONFIG_FILENAME)
+
+    return paths
+
+
+def resolve_config_path(explicit: Path | str | None = None) -> Path:
+    """Resolve the orchestrator.yaml path.
+
+    If ``explicit`` is given, it is returned as-is (the caller decides how to
+    handle a missing file). Otherwise, the first existing path among the
+    defaults is returned. If nothing exists, raises ConfigError listing the
+    locations searched so users know where to put the file.
+    """
+    if explicit is not None:
+        return Path(explicit).expanduser()
+
+    candidates = default_config_search_paths()
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    searched = "\n  ".join(str(p) for p in candidates)
+    raise ConfigError(
+        "No orchestrator.yaml found. Set $CTRLRELAY_CONFIG, pass --config, "
+        "or place the file at one of:\n  " + searched
+    )
 
 
 def load_config(path: Path | str) -> Config:
