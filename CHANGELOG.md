@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-28
+
+Patch release. Fixes a long-standing UX bug where `ctrlrelay` could
+only be invoked from a directory containing `config/orchestrator.yaml`.
+
+### Fixed
+
+- **`--config` now auto-discovers `orchestrator.yaml`.** Every CLI
+  command previously hardcoded a relative `config/orchestrator.yaml`
+  default, so running `ctrlrelay status` (or any other subcommand)
+  from `/tmp`, `$HOME`, or anywhere outside the project root failed
+  with `Config file not found: config/orchestrator.yaml`. The CLI
+  now resolves the config in this order:
+
+  1. The path passed to `--config` / `-c`, if any.
+  2. `$CTRLRELAY_CONFIG` (a new environment variable).
+  3. `./config/orchestrator.yaml`, walking up from the current
+     working directory to the filesystem root — matches how `git`
+     and `uv` find their config.
+  4. `$XDG_CONFIG_HOME/ctrlrelay/orchestrator.yaml` (defaults to
+     `~/.config/ctrlrelay/orchestrator.yaml`).
+
+  When nothing matches, the error now lists every location searched
+  so it's clear where to drop the file or which env var to set.
+  Daemon spawn paths (`ctrlrelay poller start` re-exec under
+  `--foreground`) pass the *resolved* absolute path to the child so
+  the daemon doesn't break when launchd starts it from `/`.
+
 ## [0.2.0] - 2026-04-27
 
 Minor release. Adds bulk repo operations driven by

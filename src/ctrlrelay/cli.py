@@ -7,7 +7,7 @@ from rich.console import Console
 from rich.table import Table
 
 from ctrlrelay import __version__
-from ctrlrelay.core.config import ConfigError, load_config
+from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.pr_verifier import PRVerifier
 
@@ -39,6 +39,15 @@ def main(
     """ctrlrelay orchestrator CLI."""
 
 
+def _resolve_config_or_exit(config_path: str | None) -> Path:
+    """Resolve --config (or auto-discover) and exit with a friendly error if missing."""
+    try:
+        return resolve_config_path(config_path)
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+
 # Subcommand groups
 config_app = typer.Typer(help="Configuration commands.")
 app.add_typer(config_app, name="config")
@@ -46,15 +55,15 @@ app.add_typer(config_app, name="config")
 
 @config_app.command("validate")
 def config_validate(
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """Validate orchestrator.yaml configuration."""
-    path = Path(config_path)
+    path = _resolve_config_or_exit(config_path)
 
     if not path.exists():
         console.print(f"[red]Error:[/red] Config file not found: {path}")
@@ -75,15 +84,15 @@ def config_validate(
 
 @config_app.command("repos")
 def config_repos(
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """List configured repositories."""
-    path = Path(config_path)
+    path = _resolve_config_or_exit(config_path)
 
     try:
         config = load_config(path)
@@ -112,13 +121,13 @@ skills_app = typer.Typer(help="Skill management commands.")
 app.add_typer(skills_app, name="skills")
 
 
-def _resolve_skills_dir(skills_path: str | None, config_path: str) -> Path:
+def _resolve_skills_dir(skills_path: str | None, config_path: str | None) -> Path:
     """Resolve skills directory from flag or config."""
     if skills_path is not None:
         skills_dir = Path(skills_path).expanduser().resolve()
     else:
         try:
-            config = load_config(config_path)
+            config = load_config(resolve_config_path(config_path))
             skills_dir = config.paths.skills.expanduser().resolve()
         except ConfigError as e:
             console.print(f"[red]Error loading config:[/red] {e}")
@@ -140,11 +149,11 @@ def skills_audit(
         "-p",
         help="Path to skills directory (default: from config)",
     ),
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """Audit skills for orchestrator readiness."""
@@ -176,11 +185,11 @@ def skills_list(
         "-p",
         help="Path to skills directory (default: from config)",
     ),
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """List available skills."""
@@ -209,10 +218,10 @@ bridge_app = typer.Typer(help="Telegram bridge commands.")
 app.add_typer(bridge_app, name="bridge")
 
 
-def _get_socket_path(config_path: str) -> Path:
+def _get_socket_path(config_path: str | None) -> Path:
     """Get socket path from config."""
     try:
-        config = load_config(config_path)
+        config = load_config(resolve_config_path(config_path))
         if config.transport.telegram:
             return config.transport.telegram.socket_path.expanduser().resolve()
     except ConfigError:
@@ -227,11 +236,11 @@ def _get_bridge_pid_file(socket_path: Path) -> Path:
 
 @bridge_app.command("start")
 def bridge_start(
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
     foreground: bool = typer.Option(
         False,
@@ -251,7 +260,7 @@ def bridge_start(
     import sys
 
     try:
-        config = load_config(config_path)
+        config = load_config(resolve_config_path(config_path))
     except ConfigError as e:
         console.print(f"[red]Error loading config:[/red] {e}")
         raise typer.Exit(1)
@@ -400,11 +409,11 @@ def bridge_start(
 
 @bridge_app.command("stop")
 def bridge_stop(
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """Stop the Telegram bridge."""
@@ -433,11 +442,11 @@ def bridge_stop(
 
 @bridge_app.command("status")
 def bridge_status(
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """Check bridge status."""
@@ -477,11 +486,11 @@ def bridge_test(
         "-m",
         help="Message to send",
     ),
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """Send a test message to verify bridge is working."""
@@ -518,11 +527,11 @@ app.add_typer(run_app, name="run")
 
 @run_app.command("secops")
 def run_secops(
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
     repo: str = typer.Option(
         None,
@@ -541,7 +550,7 @@ def run_secops(
     from ctrlrelay.dashboard.client import DashboardClient
     from ctrlrelay.pipelines.secops import run_secops_all
 
-    path = Path(config_path)
+    path = _resolve_config_or_exit(config_path)
 
     try:
         config = load_config(path)
@@ -635,11 +644,11 @@ def run_dev(
         "-r",
         help="Run on specific repo only",
     ),
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """Run dev pipeline for a GitHub issue."""
@@ -651,7 +660,7 @@ def run_dev(
     from ctrlrelay.core.worktree import WorktreeManager
     from ctrlrelay.pipelines.dev import run_dev_issue
 
-    path = Path(config_path)
+    path = _resolve_config_or_exit(config_path)
 
     try:
         config = load_config(path)
@@ -830,10 +839,10 @@ poller_app = typer.Typer(help="Issue poller commands.")
 app.add_typer(poller_app, name="poller")
 
 
-def _get_poller_pid_file(config_path: str) -> Path:
+def _get_poller_pid_file(config_path: str | None) -> Path:
     """Get PID file path for poller process."""
     try:
-        config = load_config(config_path)
+        config = load_config(resolve_config_path(config_path))
         return config.paths.state_db.parent / "poller.pid"
     except ConfigError:
         pass
@@ -842,11 +851,11 @@ def _get_poller_pid_file(config_path: str) -> Path:
 
 @poller_app.command("start")
 def poller_start(
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
     foreground: bool = typer.Option(
         False,
@@ -873,13 +882,15 @@ def poller_start(
     import subprocess
     import sys
 
+    resolved_config = _resolve_config_or_exit(config_path)
+
     try:
-        config = load_config(Path(config_path))
+        config = load_config(resolved_config)
     except ConfigError as e:
         console.print(f"[red]Error loading config:[/red] {e}")
         raise typer.Exit(1)
 
-    pid_file = _get_poller_pid_file(config_path)
+    pid_file = _get_poller_pid_file(str(resolved_config))
     if pid_file.exists():
         try:
             pid = int(pid_file.read_text().strip())
@@ -903,7 +914,7 @@ def poller_start(
             "poller",
             "start",
             "--config",
-            config_path,
+            str(resolved_config),
             "--interval",
             str(interval),
             "--foreground",
@@ -1917,11 +1928,11 @@ def poller_start(
 
 @poller_app.command("stop")
 def poller_stop(
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """Stop the issue poller."""
@@ -1949,11 +1960,11 @@ def poller_stop(
 
 @poller_app.command("status")
 def poller_status(
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """Check poller status."""
@@ -1982,18 +1993,18 @@ def version() -> None:
 
 @app.command("status")
 def status(
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml",
+    config_path: str | None = typer.Option(
+        None,
         "--config",
         "-c",
-        help="Path to orchestrator.yaml",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
     """Show orchestrator status and active sessions."""
     from ctrlrelay.core.state import StateDB
 
     try:
-        config = load_config(config_path)
+        config = load_config(resolve_config_path(config_path))
     except ConfigError as e:
         console.print(f"[red]Error loading config:[/red] {e}")
         raise typer.Exit(1)
@@ -2063,10 +2074,10 @@ repos_app = typer.Typer(help="Bulk repo operations across the orchestrator manif
 app.add_typer(repos_app, name="repos")
 
 
-def _iter_repos(config_path: str, filter_str: str | None):
+def _iter_repos(config_path: str | None, filter_str: str | None):
     """Yield (name, org, repo, remote) tuples for repos in the orchestrator config."""
     try:
-        config = load_config(config_path)
+        config = load_config(resolve_config_path(config_path))
     except ConfigError as e:
         console.print(f"[red]Error loading config:[/red] {e}")
         raise typer.Exit(1)
@@ -2088,8 +2099,11 @@ def _iter_repos(config_path: str, filter_str: str | None):
 @repos_app.command("clone-all")
 def repos_clone_all(
     dest: Path = typer.Argument(..., help="Workspace root (e.g. ~/code/myproject)"),
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml", "--config", "-c", help="Path to orchestrator.yaml"
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
     filter_str: str | None = typer.Option(
         None, "--filter", "-f", help="Substring filter on repo name (e.g. 'AInvirion')"
@@ -2139,8 +2153,11 @@ def repos_clone_all(
 @repos_app.command("pull-all")
 def repos_pull_all(
     dest: Path = typer.Argument(..., help="Workspace root to pull (must already be cloned)"),
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml", "--config", "-c", help="Path to orchestrator.yaml"
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
     filter_str: str | None = typer.Option(
         None, "--filter", "-f", help="Substring filter on repo name"
@@ -2213,8 +2230,11 @@ def repos_pull_all(
 @repos_app.command("status")
 def repos_status(
     dest: Path = typer.Argument(..., help="Workspace root to inspect"),
-    config_path: str = typer.Option(
-        "config/orchestrator.yaml", "--config", "-c", help="Path to orchestrator.yaml"
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
     filter_str: str | None = typer.Option(
         None, "--filter", "-f", help="Substring filter on repo name"

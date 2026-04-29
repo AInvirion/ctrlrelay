@@ -5,7 +5,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from ctrlrelay.core.config import AutomationConfig, Config, ConfigError, load_config
+from ctrlrelay.core.config import (
+    AutomationConfig,
+    Config,
+    ConfigError,
+    load_config,
+    resolve_config_path,
+)
 
 
 class TestConfigLoading:
@@ -246,3 +252,69 @@ class TestAutomationExcludeLabels:
         config = load_config(cfg_path)
 
         assert config.repos[0].automation.exclude_labels == ["no-agent", "wontfix"]
+
+
+class TestResolveConfigPath:
+    def test_explicit_path_returned_as_is(self, tmp_path: Path) -> None:
+        """An explicit --config value is returned even if it doesn't exist (caller validates)."""
+        target = tmp_path / "anywhere.yaml"
+        assert resolve_config_path(target) == target
+        assert resolve_config_path(str(target)) == target
+
+    def test_env_var_takes_precedence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """$CTRLRELAY_CONFIG wins over cwd-walk-up and home dir."""
+        env_target = tmp_path / "env.yaml"
+        env_target.write_text("version: '1'\n")
+        monkeypatch.setenv("CTRLRELAY_CONFIG", str(env_target))
+        monkeypatch.chdir(tmp_path)
+        # Even with a config/orchestrator.yaml in cwd, env wins.
+        cwd_cfg = tmp_path / "config" / "orchestrator.yaml"
+        cwd_cfg.parent.mkdir()
+        cwd_cfg.write_text("version: '1'\n")
+
+        assert resolve_config_path(None) == env_target
+
+    def test_walks_up_from_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When run from a subdir, finds config/orchestrator.yaml in an ancestor."""
+        monkeypatch.delenv("CTRLRELAY_CONFIG", raising=False)
+        cfg = tmp_path / "config" / "orchestrator.yaml"
+        cfg.parent.mkdir()
+        cfg.write_text("version: '1'\n")
+        deep = tmp_path / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        monkeypatch.chdir(deep)
+
+        assert resolve_config_path(None) == cfg
+
+    def test_falls_back_to_xdg_config_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no env var and no cwd-walk-up hit, uses $XDG_CONFIG_HOME/ctrlrelay/."""
+        monkeypatch.delenv("CTRLRELAY_CONFIG", raising=False)
+        xdg = tmp_path / "xdg"
+        cfg = xdg / "ctrlrelay" / "orchestrator.yaml"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("version: '1'\n")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+        empty_cwd = tmp_path / "empty"
+        empty_cwd.mkdir()
+        monkeypatch.chdir(empty_cwd)
+
+        assert resolve_config_path(None) == cfg
+
+    def test_raises_when_nothing_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No env var, no cwd hit, no XDG hit → ConfigError lists searched paths."""
+        monkeypatch.delenv("CTRLRELAY_CONFIG", raising=False)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "nope"))
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+
+        with pytest.raises(ConfigError, match="No orchestrator.yaml found"):
+            resolve_config_path(None)
