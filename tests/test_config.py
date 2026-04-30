@@ -318,3 +318,99 @@ class TestResolveConfigPath:
 
         with pytest.raises(ConfigError, match="No orchestrator.yaml found"):
             resolve_config_path(None)
+
+
+class TestAutomationIncludeLabels:
+    """include_labels opts issues INTO the dev pipeline by label, bypassing
+    the assignment filter. Default [] preserves today's assignment-only
+    behavior — that's the compat contract from issue #80."""
+
+    def test_default_include_labels_is_empty(self) -> None:
+        """Default preserves pre-#80 behavior: assignment-only trigger."""
+        auto = AutomationConfig()
+        assert auto.include_labels == []
+
+    def test_include_labels_override_accepts_list(self) -> None:
+        """Explicit list of label strings is accepted verbatim."""
+        auto = AutomationConfig(include_labels=["ctrlrelay:auto", "good-first-issue"])
+        assert auto.include_labels == ["ctrlrelay:auto", "good-first-issue"]
+
+    def test_config_without_include_labels_key_defaults_to_empty(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """Legacy configs without include_labels load and get [] — no
+        behavior change for operators who haven't opted in."""
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"dependabot_patch": "auto"},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.repos[0].automation.include_labels == []
+
+    def test_include_labels_from_yaml(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """YAML ``include_labels: [...]`` is plumbed through to the
+        resolved AutomationConfig so the CLI can pass it to the poller."""
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"include_labels": ["ctrlrelay:auto"]},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.repos[0].automation.include_labels == ["ctrlrelay:auto"]
+
+    def test_include_labels_rejects_non_list(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """A scalar value (common mistake: forgetting list brackets) must
+        fail loudly at config load time rather than silently coerce."""
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"include_labels": "ctrlrelay:auto"},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        with pytest.raises(ConfigError, match="include_labels"):
+            load_config(cfg_path)
+
+    def test_mixed_repos_with_and_without_include_labels(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """Two repos in the same config: A opts in, B doesn't. Each keeps
+        its own list — the config surface is per-repo, not global."""
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo-a",
+                "local_path": "~/Projects/repo-a",
+                "automation": {"include_labels": ["ctrlrelay:auto"]},
+            },
+            {
+                "name": "owner/repo-b",
+                "local_path": "~/Projects/repo-b",
+            },
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.repos[0].automation.include_labels == ["ctrlrelay:auto"]
+        assert config.repos[1].automation.include_labels == []

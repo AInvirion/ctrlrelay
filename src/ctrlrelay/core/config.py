@@ -157,6 +157,14 @@ class AutomationConfig(BaseModel):
     exclude_labels: list[str] = Field(
         default_factory=lambda: ["manual", "operator", "instruction"]
     )
+    # Labels that opt an issue INTO the dev pipeline regardless of
+    # assignment. This is the team-coordination knob: a teammate can
+    # label an issue (e.g. ``ctrlrelay:auto``) and the bot picks it up
+    # on the next poll without needing the operator to self-assign.
+    # Default ``[]`` preserves today's behavior (assignment-only).
+    # Matching is case-insensitive. An issue that is both labeled AND
+    # assigned is processed exactly once — not duplicated. See #80.
+    include_labels: list[str] = Field(default_factory=list)
     # Labels that route an issue to the task pipeline (run a command /
     # investigate / report findings via issue comment) instead of the
     # dev pipeline (branch + PR). Matching is case-insensitive; the

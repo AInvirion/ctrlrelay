@@ -193,6 +193,7 @@ and ask the operator), or `never` (skip).
 | `deploy_after_merge` | `auto` | Whether to deploy after a merged PR. |
 | `accept_foreign_assignments` | `false` | When `true`, the poller also picks up issues assigned to you by someone else. Default (`false`) runs the dev pipeline only on issues you self-assigned. |
 | `exclude_labels` | `["manual", "operator", "instruction"]` | Issue labels that tell the poller "this isn't for the agent". See [exclude_labels](#reposautomationexclude_labels) below. |
+| `include_labels` | `[]` | Issue labels that opt an issue **into** the dev pipeline regardless of who is (or isn't) assigned. See [include_labels](#reposautomationinclude_labels) below. |
 
 The current secops and dev pipelines read these settings to bias their prompts
 to Claude — they're not enforced by hard-coded checks.
@@ -227,6 +228,79 @@ label on GitHub **and** delete the issue number from
 `poller_state.json` (or bump the issue so it becomes visible again via some
 other mechanism — the poller treats "seen" as sticky per design, so operator
 input is the source of truth).
+
+### repos[].automation.include_labels
+
+Out of the box, an issue enters the dev pipeline only when it's assigned to
+the configured GitHub user (and, with the pre-#79 self-assignment filter, only
+when *you* were the one who assigned it). That works for a personal to-do
+list; it doesn't cover the "team-coordinated" workflow where a teammate without
+rights on your account wants to say "this issue is safe for the agent to take
+a shot at."
+
+`include_labels` is the opt-in complement to `exclude_labels`. Any issue
+carrying one of the configured labels is handed to the dev pipeline,
+**regardless of assignment**. The label itself is the trust signal — you opt
+in by configuring the label; anyone with triage permission on the repo can
+then flag an issue for the bot.
+
+```yaml
+repos:
+  - name: "your-org/your-repo"
+    local_path: "~/Projects/your-repo"
+    automation:
+      include_labels: ["ctrlrelay:auto"]
+```
+
+- Default: `[]`. An empty list preserves the pre-#80 assignment-only trigger
+  — no behavior change for operators who haven't opted in.
+- Matching is **case-insensitive** (`CtrlRelay:Auto` matches `ctrlrelay:auto`).
+- An issue is accepted when **either** (a) it's assigned to the configured
+  user (subject to the self-assignment filter from #79 and
+  `accept_foreign_assignments`) **or** (b) it carries any label in
+  `include_labels`. A label match **skips** the self-assignment check — the
+  operator's config choice is the trust boundary.
+- Dedup: an issue that is **both** labeled and assigned is picked up exactly
+  once per poll cycle — no duplicate entries in `seen_issues` and no double
+  pipeline spawn.
+- `exclude_labels` always wins over `include_labels` on the same issue: an
+  explicit "not for the agent" opt-OUT beats the generic label opt-IN.
+- When a repo configures `include_labels`, the poller runs **targeted**
+  queries per cycle: the existing `gh issue list --assignee <user>` plus
+  one `gh issue list --label <L>` call per configured label. Results merge
+  by issue number. This keeps the label path scale-safe on busy repos
+  where an unfiltered fetch would silently cap at gh's `--limit` and miss
+  labeled issues on later pages. Repos without `include_labels` run only
+  the cheap `--assignee` query, so enabling the feature on one repo does
+  not add API calls on the others.
+- The event log entry for a label-triggered acceptance is
+  `poll.issue.included_by_label`, alongside the existing
+  `poll.issue.excluded_by_label` for exclusions.
+- **Interaction with `task_labels`**: `include_labels` opts an issue
+  into the poller's consideration set. Once surfaced, the usual
+  routing still applies — if the same issue also carries a
+  `task_labels` label, it runs through the **task** pipeline (report-
+  only, no PR), not the dev pipeline. If you want label-triggered
+  issues to always run dev, make sure `include_labels` and
+  `task_labels` are disjoint (e.g. label opt-ins with
+  `ctrlrelay:auto` and task runs with `task:<topic>`).
+- **Upgrade path**: enabling `include_labels` on a repo that was
+  already running the poller does NOT retroactively re-evaluate
+  issues already in `poller_state.json`. Any foreign-assigned issue
+  that pre-dates the config change won't be picked up via a later
+  label addition. Only brand-new issues (after the config change) or
+  issues you re-open will go through the label trigger. If you need
+  to re-evaluate pre-existing issues on a specific repo, stop the
+  poller, remove that repo's entry from `poller_state.json` under
+  `seen_issues`, and restart. (A fully automatic migration would
+  risk re-running pipelines for issues the bot had already handled.)
+
+Trust model: anyone with triage permission on a repo can apply a label. That
+matches the trust model ctrlrelay already uses — the operator configures which
+repos and which labels trigger the pipeline; a hostile collaborator with
+triage access was already able to push branches and trigger CI, so allowing
+them to opt an issue into the dev pipeline is a narrower extension, not a new
+vector.
 
 ## Example: telegram-enabled config
 

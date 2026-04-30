@@ -207,19 +207,73 @@ class GitHubCLI:
     async def list_assigned_issues(
         self,
         repo: str,
-        assignee: str,
+        assignee: str | None,
         state: str = "open",
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """List issues assigned to a user."""
-        output = await self._run_gh(
+        """List issues for a repo, optionally filtered by assignee.
+
+        When ``assignee`` is ``None`` the ``--assignee`` flag is dropped
+        and all open issues are returned. Prefer :meth:`list_issues_by_label`
+        for label-triggered polling — the unfiltered call caps at
+        ``limit`` (default 100) and silently drops anything past that in
+        a busy repo. The poller uses the assignee path + per-label
+        targeted queries and merges results by issue number.
+        """
+        args = [
             "issue", "list",
             "--repo", repo,
-            "--assignee", assignee,
             "--state", state,
             "--limit", str(limit),
             "--json", "number,title,state,body,labels,assignees,createdAt,updatedAt",
-        )
+        ]
+        if assignee is not None:
+            # Insert before ``--state`` to keep the existing call signature
+            # shape when assignee is set (makes recorded gh invocations in
+            # fixtures / audit logs visually diff-clean).
+            args[4:4] = ["--assignee", assignee]
+        output = await self._run_gh(*args)
+        return json.loads(output) if output.strip() else []
+
+    async def list_issues_by_label(
+        self,
+        repo: str,
+        label: str,
+        state: str = "open",
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """List open issues carrying a specific label.
+
+        Issued per label in ``include_labels`` (issue #80): a single
+        ``gh issue list --label`` call filters server-side, so the
+        result is bounded by the number of issues wearing that label
+        rather than by total open issues in the repo. That keeps the
+        label-triggered poll path scale-safe on large repos, where
+        fetching all open issues (pre-codex-review behavior) would
+        silently cap at 100 and miss labeled issues on later pages.
+
+        ``limit`` defaults to 1000 (vs the 100 default on
+        ``list_assigned_issues``) because an opt-in label can, in
+        principle, wear many more issues than a single user is
+        assigned to. gh paginates internally up to ``--limit`` so one
+        call covers the realistic range. If a repo ever has >1000
+        open issues sharing the same opt-in label, the operator will
+        need a larger limit or more granular labels — it's a
+        configuration smell at that scale.
+
+        gh CLI treats ``--label foo --label bar`` as AND; the poller
+        therefore runs one call per label and dedupes by issue number
+        at the caller.
+        """
+        args = [
+            "issue", "list",
+            "--repo", repo,
+            "--label", label,
+            "--state", state,
+            "--limit", str(limit),
+            "--json", "number,title,state,body,labels,assignees,createdAt,updatedAt",
+        ]
+        output = await self._run_gh(*args)
         return json.loads(output) if output.strip() else []
 
     async def list_assignment_events(

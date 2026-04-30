@@ -1028,6 +1028,9 @@ def poller_start(
         exclude_labels_by_repo = {
             r.name: list(r.automation.exclude_labels) for r in config.repos
         }
+        include_labels_by_repo = {
+            r.name: list(r.automation.include_labels) for r in config.repos
+        }
 
         poller = IssuePoller(
             github=github,
@@ -1036,6 +1039,7 @@ def poller_start(
             state_file=state_file,
             accept_foreign_assignments=accept_foreign,
             exclude_labels_by_repo=exclude_labels_by_repo,
+            include_labels_by_repo=include_labels_by_repo,
         )
 
         # NOTE: first-run seeding moved into `_main()` so the APScheduler
