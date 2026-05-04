@@ -14,7 +14,8 @@ restart after a config change, and how to inspect runtime state.
 
 ## Long-lived services
 
-ctrlrelay ships with no service files — you write your own. The two daemons:
+ctrlrelay generates platform-appropriate service unit files for you with
+`ctrlrelay install`. The two daemons it manages:
 
 | Service | Command | Why you want it running |
 |---|---|---|
@@ -26,17 +27,36 @@ Both should restart on failure and on login.
 `ctrlrelay bridge start` and `ctrlrelay poller start` daemonize by default
 (fork, write a PID file, return to the shell). Under a process supervisor
 (launchd, systemd) pass `--foreground` so the supervisor can track the PID
-and restart on failure — the unit examples below already do this.
+and restart on failure — the templates below already do this.
 
 ### macOS — launchd
 
-Save plist files under `~/Library/LaunchAgents/`. Use the **absolute** path to
-`ctrlrelay` (run `which ctrlrelay` to find it) — launchd's PATH is minimal.
+Recommended: let `ctrlrelay install launchd` render the plists for you.
+It substitutes `${USER}`, `${HOME}`, the absolute `ctrlrelay` path,
+your working directory, and (when exported) `CTRLRELAY_TELEGRAM_TOKEN`
+into the in-package templates and writes them to
+`~/Library/LaunchAgents/`.
 
-The job labels below use `com.example.ctrlrelay-*` as a placeholder. Pick a
-reverse-DNS prefix you own (e.g. `com.yourname.ctrlrelay-*`) and use it
-consistently across the filename, the `<Label>` value, and the `launchctl`
-commands so `launchctl list` output is unambiguous.
+```bash
+export CTRLRELAY_TELEGRAM_TOKEN=your-bot-token
+ctrlrelay install launchd \
+  --workdir ~/Projects/ctrlrelay \
+  --label-prefix com.yourname \
+  --poller-interval 300
+
+# Then load the agents:
+mkdir -p ~/.ctrlrelay/logs
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yourname.ctrlrelay-bridge.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yourname.ctrlrelay-poller.plist
+```
+
+Pick a reverse-DNS `--label-prefix` you own (e.g. `com.yourname`); it
+flows into both the filename and the `<Label>` value so `launchctl
+list` output is unambiguous. Pass `--dry-run` first to see what would
+be written; pass `--force` to overwrite a previously installed plist.
+
+If you'd rather hand-write the plists, here are the full templates the
+installer uses.
 
 `~/Library/LaunchAgents/com.example.ctrlrelay-bridge.plist`:
 
@@ -123,15 +143,8 @@ commands so `launchctl list` output is unambiguous.
 ```
 {% endraw %}
 
-Create the log directory and load the agents:
-
-```bash
-mkdir -p ~/.ctrlrelay/logs
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.ctrlrelay-bridge.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.ctrlrelay-poller.plist
-```
-
-Manage them:
+Whether you used `ctrlrelay install launchd` or hand-wrote the plists,
+manage the agents with:
 
 ```bash
 launchctl list | grep ctrlrelay          # check loaded
@@ -141,7 +154,30 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.ctrlrelay-po
 
 ### Linux — systemd
 
-Save unit files under `~/.config/systemd/user/`.
+Recommended: `ctrlrelay install systemd` renders the user unit files
+for you (no root needed) and writes them to `~/.config/systemd/user/`.
+
+```bash
+export CTRLRELAY_TELEGRAM_TOKEN=your-bot-token
+ctrlrelay install systemd \
+  --workdir ~/Projects/ctrlrelay \
+  --poller-interval 300
+
+# Then enable and start:
+mkdir -p ~/.ctrlrelay/logs
+systemctl --user daemon-reload
+systemctl --user enable --now ctrlrelay-bridge.service
+systemctl --user enable --now ctrlrelay-poller.service
+```
+
+To survive logout (start at boot, stop at shutdown):
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+If you'd rather hand-write the units, here are the full templates the
+installer uses. Save under `~/.config/systemd/user/`.
 
 `~/.config/systemd/user/ctrlrelay-bridge.service`:
 
@@ -190,22 +226,8 @@ StandardError=append:%h/.ctrlrelay/logs/poller.error.log
 WantedBy=default.target
 ```
 
-Enable and start:
-
-```bash
-mkdir -p ~/.ctrlrelay/logs
-systemctl --user daemon-reload
-systemctl --user enable --now ctrlrelay-bridge.service
-systemctl --user enable --now ctrlrelay-poller.service
-```
-
-To survive logout (start at boot, stop at shutdown):
-
-```bash
-sudo loginctl enable-linger "$USER"
-```
-
-Check status / logs:
+Once written, enable and start with the same `systemctl --user enable
+--now` commands shown earlier in the section. Check status / logs:
 
 ```bash
 systemctl --user status ctrlrelay-poller

@@ -57,16 +57,20 @@ cp config/orchestrator.yaml.example config/orchestrator.yaml
 
 Open `config/orchestrator.yaml` and edit at least:
 
-- `node_id` — a label for this machine (free-form string).
 - `timezone` — your local IANA timezone.
 - `repos[].name` — the `owner/repo` slug of a repository you can push to.
 - `repos[].local_path` — where the local clone lives (or will live) on disk.
+  *Or* set `paths.repo_root` to a workspace root and let the path be
+  derived as `${repo_root}/${owner}/${repo}` (recommended for >1 repo).
+
+`node_id` is optional — when omitted it defaults to your machine's
+hostname (`socket.gethostname()`). Set it explicitly only if the
+hostname is meaningless (CI runners, containers).
 
 A minimal working config:
 
 ```yaml
 version: "1"
-node_id: "my-laptop"
 timezone: "America/New_York"
 
 paths:
@@ -102,7 +106,7 @@ You should see something like:
 
 ```
 ✓ Config valid: config/orchestrator.yaml
-  Node ID: my-laptop
+  Node ID: your-hostname.local
   Timezone: America/New_York
   Transport: file_mock
   Repos: 1
