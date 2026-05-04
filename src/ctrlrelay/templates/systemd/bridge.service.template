@@ -6,6 +6,10 @@ After=network-online.target
 Type=simple
 WorkingDirectory=${WORKDIR}
 Environment=CTRLRELAY_TELEGRAM_TOKEN=${CTRLRELAY_TELEGRAM_TOKEN}
+# Without PYTHONUNBUFFERED, ctrlrelay's stdout sits in Python's stdio
+# buffer instead of flushing line-by-line, making `tail -f` and
+# `journalctl -f` lag noticeably.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=${CTRLRELAY_BIN} bridge start --foreground
 Restart=always
 RestartSec=5

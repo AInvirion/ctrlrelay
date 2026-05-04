@@ -18,7 +18,12 @@
         <key>CTRLRELAY_TELEGRAM_TOKEN</key>
         <string>${CTRLRELAY_TELEGRAM_TOKEN}</string>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Without PYTHONUNBUFFERED, ctrlrelay's stdout sits in Python's
+             stdio buffer instead of flushing line-by-line, making
+             `tail -f ~/.ctrlrelay/logs/poller.log` lag noticeably. -->
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
     </dict>
     <key>WorkingDirectory</key>
     <string>${WORKDIR}</string>
