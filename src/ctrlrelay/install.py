@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
-
 _TEMPLATE_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 

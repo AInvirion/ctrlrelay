@@ -15,16 +15,13 @@ out of docs and hand-edit /Users/$ME/... paths. Coverage focuses on:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
 
 from ctrlrelay.cli import app
 from ctrlrelay.install import (
-    RenderedUnit,
     render_launchd,
     render_systemd,
     write_units,
