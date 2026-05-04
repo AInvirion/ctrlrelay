@@ -1,0 +1,21 @@
+[Unit]
+Description=ctrlrelay issue poller
+After=network-online.target ctrlrelay-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=${WORKDIR}
+Environment=CTRLRELAY_TELEGRAM_TOKEN=${CTRLRELAY_TELEGRAM_TOKEN}
+ExecStart=${CTRLRELAY_BIN} poller start --foreground --interval ${POLLER_INTERVAL}
+Restart=always
+RestartSec=5
+# Give the in-process scheduler time to drain a running secops sweep
+# on stop (worktree cleanup can take ~120s). systemd's default
+# TimeoutStopSec is 90s, which would SIGKILL the poller mid-cleanup
+# and leak git worktree admin state.
+TimeoutStopSec=180
+StandardOutput=append:%h/.ctrlrelay/logs/poller.log
+StandardError=append:%h/.ctrlrelay/logs/poller.error.log
+
+[Install]
+WantedBy=default.target

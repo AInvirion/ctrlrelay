@@ -2305,5 +2305,139 @@ def repos_status(
     console.print(table)
 
 
+install_app = typer.Typer(
+    help="Generate launchd / systemd unit files from in-package templates."
+)
+app.add_typer(install_app, name="install")
+
+
+def _print_install_summary(
+    units: list, written: list, dry_run: bool
+) -> None:
+    from ctrlrelay.install import RenderedUnit  # local to avoid CLI import cost
+
+    for unit in units:
+        assert isinstance(unit, RenderedUnit)
+        marker = "would write" if dry_run else "wrote"
+        path_str = (
+            f"[green]{marker}[/green] {unit.target_path}"
+            if not dry_run or unit.target_path in written
+            else f"[yellow]{marker}[/yellow] {unit.target_path}"
+        )
+        console.print(path_str)
+        if unit.unresolved:
+            console.print(
+                f"  [yellow]warning:[/yellow] unresolved template variables: "
+                f"{', '.join('${'+v+'}' for v in unit.unresolved)}"
+            )
+            if "CTRLRELAY_TELEGRAM_TOKEN" in unit.unresolved:
+                console.print(
+                    "  [dim]hint: export CTRLRELAY_TELEGRAM_TOKEN before "
+                    "re-running, or edit the file by hand.[/dim]"
+                )
+
+
+@install_app.command("launchd")
+def install_launchd(
+    workdir: Path = typer.Option(
+        Path.cwd(),
+        "--workdir",
+        "-w",
+        help="Service WorkingDirectory (defaults to current directory).",
+    ),
+    label_prefix: str = typer.Option(
+        "com.ctrlrelay",
+        "--label-prefix",
+        help="Reverse-DNS prefix for the launchd Label and filename.",
+    ),
+    poller_interval: int = typer.Option(
+        300, "--poller-interval", help="Poller --interval seconds."
+    ),
+    target_dir: Path | None = typer.Option(
+        None,
+        "--target-dir",
+        help="Where to write plists (default: ~/Library/LaunchAgents).",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite existing plists if present."
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print what would be written without touching the filesystem.",
+    ),
+) -> None:
+    """Render and install bridge + poller plists for macOS launchd.
+
+    After running, load the agents with:
+      launchctl bootstrap gui/$(id -u) <plist-path>
+    """
+    from ctrlrelay.install import render_launchd, write_units
+
+    units = render_launchd(
+        workdir=workdir,
+        label_prefix=label_prefix,
+        poller_interval=poller_interval,
+        target_dir=target_dir,
+    )
+    written: list[Path] = []
+    if not dry_run:
+        try:
+            written = write_units(units, overwrite=force)
+        except FileExistsError as e:
+            console.print(f"[red]error:[/red] {e}")
+            raise typer.Exit(1)
+    _print_install_summary(units, written, dry_run)
+
+
+@install_app.command("systemd")
+def install_systemd(
+    workdir: Path = typer.Option(
+        Path.cwd(),
+        "--workdir",
+        "-w",
+        help="Service WorkingDirectory (defaults to current directory).",
+    ),
+    poller_interval: int = typer.Option(
+        300, "--poller-interval", help="Poller --interval seconds."
+    ),
+    target_dir: Path | None = typer.Option(
+        None,
+        "--target-dir",
+        help="Where to write units (default: ~/.config/systemd/user).",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite existing unit files if present."
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print what would be written without touching the filesystem.",
+    ),
+) -> None:
+    """Render and install bridge + poller systemd user units (Linux).
+
+    After running, enable with:
+      systemctl --user daemon-reload
+      systemctl --user enable --now ctrlrelay-bridge.service
+      systemctl --user enable --now ctrlrelay-poller.service
+    """
+    from ctrlrelay.install import render_systemd, write_units
+
+    units = render_systemd(
+        workdir=workdir,
+        poller_interval=poller_interval,
+        target_dir=target_dir,
+    )
+    written: list[Path] = []
+    if not dry_run:
+        try:
+            written = write_units(units, overwrite=force)
+        except FileExistsError as e:
+            console.print(f"[red]error:[/red] {e}")
+            raise typer.Exit(1)
+    _print_install_summary(units, written, dry_run)
+
+
 if __name__ == "__main__":
     app()

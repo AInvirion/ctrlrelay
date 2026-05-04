@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL_PREFIX}.ctrlrelay-poller</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CTRLRELAY_BIN}</string>
+        <string>poller</string>
+        <string>start</string>
+        <string>--foreground</string>
+        <string>--interval</string>
+        <string>${POLLER_INTERVAL}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CTRLRELAY_TELEGRAM_TOKEN</key>
+        <string>${CTRLRELAY_TELEGRAM_TOKEN}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>${WORKDIR}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Give the in-process scheduler time to drain a running secops
+         sweep on stop (worktree cleanup can take ~120s). launchd's
+         default ExitTimeOut is 20s, which would SIGKILL mid-cleanup. -->
+    <key>ExitTimeOut</key>
+    <integer>180</integer>
+    <key>StandardOutPath</key>
+    <string>${HOME}/.ctrlrelay/logs/poller.log</string>
+    <key>StandardErrorPath</key>
+    <string>${HOME}/.ctrlrelay/logs/poller.error.log</string>
+</dict>
+</plist>
