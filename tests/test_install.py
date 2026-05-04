@@ -101,6 +101,18 @@ class TestRenderLaunchd:
             assert "${CTRLRELAY_TELEGRAM_TOKEN}" in u.content
             assert "CTRLRELAY_TELEGRAM_TOKEN" in u.unresolved
 
+    def test_pythonunbuffered_set_in_both_units(
+        self, workdir: Path, target_dir: Path
+    ) -> None:
+        # PYTHONUNBUFFERED=1 is load-bearing for live log tailing under
+        # launchd — without it, Python buffers stdout and `tail -f` lags
+        # by minutes. Both bridge and poller need it; assert so the
+        # template can't quietly drop it again.
+        units = render_launchd(workdir=workdir, target_dir=target_dir)
+        for u in units:
+            assert "<key>PYTHONUNBUFFERED</key>" in u.content
+            assert "<string>1</string>" in u.content
+
     def test_poller_interval_is_substituted(
         self, workdir: Path, target_dir: Path
     ) -> None:
@@ -119,6 +131,15 @@ class TestRenderSystemd:
         units = render_systemd(workdir=workdir, target_dir=target_dir)
         names = sorted(u.target_path.name for u in units)
         assert names == ["ctrlrelay-bridge.service", "ctrlrelay-poller.service"]
+
+    def test_pythonunbuffered_set_in_both_units(
+        self, workdir: Path, target_dir: Path
+    ) -> None:
+        # Same buffering concern as the launchd plists — journalctl -f
+        # also waits on stdio buffers if PYTHONUNBUFFERED is unset.
+        units = render_systemd(workdir=workdir, target_dir=target_dir)
+        for u in units:
+            assert "Environment=PYTHONUNBUFFERED=1" in u.content
 
     def test_systemd_units_have_install_section(
         self, workdir: Path, target_dir: Path
