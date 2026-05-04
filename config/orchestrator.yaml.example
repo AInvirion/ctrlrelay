@@ -2,7 +2,9 @@
 # Copy to orchestrator.yaml and customize
 
 version: "1"
-node_id: "my-machine"
+# node_id defaults to socket.gethostname() when omitted. Set explicitly
+# only if the hostname is meaningless (CI runners, containers).
+# node_id: "studio-mac"
 timezone: "America/Santiago"
 
 paths:
@@ -11,6 +13,13 @@ paths:
   bare_repos: "~/.ctrlrelay/repos"
   contexts: "~/.ctrlrelay/contexts"
   skills: "~/.ctrlrelay/claude-config/skills"
+  # Optional. When set, repo entries below can omit local_path and have
+  # it derived as ${repo_root}/${owner_aliases.get(owner, owner)}/${repo}.
+  # Per-repo local_path always wins as override.
+  # repo_root: "~/Projects"
+  # owner_aliases:
+  #   AInvirion: AINVIRION       # GitHub owner -> on-disk folder name
+  #   SemClone: SEMCL.ONE
 
 # Headless coding agent. `type` selects the adapter (currently only
 # "claude" is implemented; other backends — codex, opencode, hermes,
@@ -46,6 +55,7 @@ schedules:
 repos: []
   # Example repo configuration:
   # - name: "owner/repo"
+  #   # Optional when paths.repo_root is set; otherwise required.
   #   local_path: "~/Projects/repo"
   #   automation:
   #     dependabot_patch: auto
