@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL_PREFIX}.ctrlrelay-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CTRLRELAY_BIN}</string>
+        <string>bridge</string>
+        <string>start</string>
+        <string>--foreground</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CTRLRELAY_TELEGRAM_TOKEN</key>
+        <string>${CTRLRELAY_TELEGRAM_TOKEN}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>${WORKDIR}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${HOME}/.ctrlrelay/logs/bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>${HOME}/.ctrlrelay/logs/bridge.error.log</string>
+</dict>
+</plist>

@@ -1,0 +1,16 @@
+[Unit]
+Description=ctrlrelay Telegram bridge
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${WORKDIR}
+Environment=CTRLRELAY_TELEGRAM_TOKEN=${CTRLRELAY_TELEGRAM_TOKEN}
+ExecStart=${CTRLRELAY_BIN} bridge start --foreground
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/.ctrlrelay/logs/bridge.log
+StandardError=append:%h/.ctrlrelay/logs/bridge.error.log
+
+[Install]
+WantedBy=default.target
