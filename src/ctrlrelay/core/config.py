@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -39,8 +40,20 @@ class PathsConfig(BaseModel):
     bare_repos: Path
     contexts: Path
     skills: Path
+    # Optional default root for repo clones. Combined with ``owner_aliases``
+    # this lets ``RepoConfig.local_path`` be derived as
+    # ``${repo_root}/${owner_aliases.get(owner, owner)}/${repo_name}``
+    # instead of being hand-written for every repo. When unset, every
+    # repo entry must declare its own ``local_path`` (legacy behaviour).
+    repo_root: Path | None = None
+    # Map of GitHub owner -> on-disk folder name. Useful when the local
+    # tree groups repos under a vanity name that differs from the org
+    # slug (e.g. SemClone repos living under ~/Projects/SEMCL.ONE/).
+    # Lookup falls through to the literal owner name if not present.
+    owner_aliases: dict[str, str] = Field(default_factory=dict)
 
-    @field_validator("*", mode="before")
+    @field_validator("state_db", "worktrees", "bare_repos", "contexts", "skills",
+                     "repo_root", mode="before")
     @classmethod
     def expand_path(cls, v: Any) -> Any:
         if isinstance(v, str):
@@ -174,7 +187,11 @@ class RepoConfig(BaseModel):
     """Configuration for a single repository."""
 
     name: str
-    local_path: Path
+    # Optional. When unset, the parent ``Config`` derives a default from
+    # ``paths.repo_root`` + ``paths.owner_aliases`` + the repo name. An
+    # explicit ``local_path`` here always wins as an override for repos
+    # that don't follow the convention (nested clones, renamed dirs).
+    local_path: Path | None = None
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     deploy: DeployConfig | None = None
     code_review: CodeReviewConfig = Field(default_factory=CodeReviewConfig)
@@ -245,6 +262,20 @@ class Config(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def default_node_id_to_hostname(cls, data: Any) -> Any:
+        # When ``node_id`` is missing, null, or blank, default to the
+        # machine's hostname so a stock orchestrator.yaml is portable
+        # across machines without an explicit per-node edit. Done in a
+        # before-validator (rather than a Field default_factory) so
+        # explicit empty strings also fall back, not just omitted keys.
+        if isinstance(data, dict):
+            v = data.get("node_id")
+            if v is None or (isinstance(v, str) and not v.strip()):
+                data["node_id"] = socket.gethostname()
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def migrate_claude_to_agent(cls, data: Any) -> Any:
         """Accept the legacy ``claude:`` top-level key as an alias for
         ``agent:``. Emits a ``DeprecationWarning`` so operators see the
@@ -271,6 +302,28 @@ class Config(BaseModel):
         ``config.claude.binary`` keep working. New code should prefer
         ``config.agent.*``."""
         return self.agent
+
+    @model_validator(mode="after")
+    def derive_repo_local_paths(self) -> "Config":
+        # Fill in ``RepoConfig.local_path`` for any repo that omitted it,
+        # using ``paths.repo_root`` and the optional ``paths.owner_aliases``
+        # map. This keeps ``orchestrator.yaml`` short on machines whose
+        # local layout follows a convention, while still requiring an
+        # explicit value when no convention is configured.
+        for repo in self.repos:
+            if repo.local_path is not None:
+                continue
+            if self.paths.repo_root is None:
+                raise ValueError(
+                    f"repo {repo.name!r} has no local_path and "
+                    "paths.repo_root is unset; either declare a "
+                    "local_path on the repo entry or set paths.repo_root "
+                    "to enable convention-based defaults"
+                )
+            owner, _, repo_name = repo.name.partition("/")
+            owner_dir = self.paths.owner_aliases.get(owner, owner)
+            repo.local_path = self.paths.repo_root / owner_dir / repo_name
+        return self
 
     @field_validator("timezone")
     @classmethod

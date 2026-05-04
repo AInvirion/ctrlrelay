@@ -42,6 +42,120 @@ class TestConfigLoading:
             load_config(incomplete)
 
 
+class TestNodeIdDefault:
+    """A stock orchestrator.yaml is meant to be portable across machines.
+    Forcing every operator to set node_id explicitly defeats that — so an
+    omitted, null, or empty node_id falls back to socket.gethostname()
+    rather than failing validation."""
+
+    def test_omitted_node_id_falls_back_to_hostname(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        import socket
+
+        sample_config_dict.pop("node_id", None)
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        config = load_config(cfg_path)
+        assert config.node_id == socket.gethostname()
+
+    def test_empty_node_id_falls_back_to_hostname(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        import socket
+
+        sample_config_dict["node_id"] = ""
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        config = load_config(cfg_path)
+        assert config.node_id == socket.gethostname()
+
+    def test_explicit_node_id_wins_over_hostname(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        sample_config_dict["node_id"] = "ci-runner-7"
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        config = load_config(cfg_path)
+        assert config.node_id == "ci-runner-7"
+
+
+class TestRepoLocalPathDerivation:
+    """When ``paths.repo_root`` is set, individual repo entries can omit
+    ``local_path`` and have it derived as
+    ``${repo_root}/${owner_aliases.get(owner, owner)}/${repo}``. Lets a
+    machine-specific convention live in one place rather than being
+    repeated 70 times. Per-repo override still wins."""
+
+    def test_repo_without_local_path_derives_from_repo_root(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        sample_config_dict["paths"]["repo_root"] = "/srv/code"
+        sample_config_dict["repos"] = [{"name": "AInvirion/foo"}]
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        config = load_config(cfg_path)
+        assert config.repos[0].local_path == Path("/srv/code/AInvirion/foo")
+
+    def test_owner_aliases_remap_folder_name(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        sample_config_dict["paths"]["repo_root"] = "/srv/code"
+        sample_config_dict["paths"]["owner_aliases"] = {
+            "AInvirion": "AINVIRION",
+            "SemClone": "SEMCL.ONE",
+        }
+        sample_config_dict["repos"] = [
+            {"name": "AInvirion/foo"},
+            {"name": "SemClone/bar"},
+            {"name": "personal/baz"},  # no alias -> literal owner
+        ]
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        config = load_config(cfg_path)
+        assert config.repos[0].local_path == Path("/srv/code/AINVIRION/foo")
+        assert config.repos[1].local_path == Path("/srv/code/SEMCL.ONE/bar")
+        assert config.repos[2].local_path == Path("/srv/code/personal/baz")
+
+    def test_explicit_local_path_overrides_derivation(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        sample_config_dict["paths"]["repo_root"] = "/srv/code"
+        sample_config_dict["repos"] = [
+            {"name": "AInvirion/foo", "local_path": "/elsewhere/foo-checkout"},
+        ]
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        config = load_config(cfg_path)
+        assert config.repos[0].local_path == Path("/elsewhere/foo-checkout")
+
+    def test_missing_local_path_without_repo_root_fails_loud(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        # Convention-based defaults require paths.repo_root. Without it,
+        # an omitted local_path must surface a clear error at load time
+        # rather than crashing later when poller hits a None path.
+        sample_config_dict["paths"].pop("repo_root", None)
+        sample_config_dict["repos"] = [{"name": "AInvirion/foo"}]
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        with pytest.raises(ConfigError, match="local_path"):
+            load_config(cfg_path)
+
+    def test_repo_root_expands_tilde(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        import os
+
+        sample_config_dict["paths"]["repo_root"] = "~/Projects"
+        sample_config_dict["repos"] = [{"name": "AInvirion/foo"}]
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+        config = load_config(cfg_path)
+        home = Path(os.path.expanduser("~"))
+        assert config.repos[0].local_path == home / "Projects" / "AInvirion" / "foo"
+
+
 class TestConfigPaths:
     def test_paths_expand_tilde(self, sample_config_file: Path) -> None:
         """Path fields should expand ~ to home directory."""
