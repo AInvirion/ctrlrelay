@@ -726,12 +726,22 @@ class PersonalizationManager:
 
     def _ensure_working_branch(self) -> None:
         """Make sure HEAD is on ``working_branch``, creating it from
-        ``main_branch`` if it doesn't exist locally yet.
+        ``main_branch`` if it doesn't exist on origin or locally.
+
+        Refreshes remote-tracking refs first via ``git fetch origin``
+        so an existing-but-stale checkout doesn't miss a per-node
+        branch that was created on origin after this clone last
+        fetched. Codex pass 16 caught this P1: without the fetch,
+        ``init`` on a stale clone would branch off main, then
+        ``push`` would later fetch and force-with-lease over commits
+        that only lived on the remote per-node branch.
         """
         current = self._current_branch()
         if current == self.working_branch:
             return
-        # Does the working branch exist locally?
+        # Local branch already present? Just check it out — even if
+        # origin has a divergent copy we'll handle it on push (the
+        # rebase/lease logic is built for exactly that).
         existing = self._git_capturing(
             "show-ref", "--verify", "--quiet",
             f"refs/heads/{self.working_branch}",
@@ -740,13 +750,20 @@ class PersonalizationManager:
         if existing.returncode == 0:
             self._git("checkout", self.working_branch)
             return
-        # Try origin/<working_branch> first (another machine of ours).
+        # Refresh remote-tracking refs so the next show-ref reflects
+        # what origin actually has, not what we last knew. Best-
+        # effort — a fetch failure (offline, auth) shouldn't block
+        # branching off the local main; later push will surface the
+        # network/auth error properly.
+        self._git_capturing("fetch", "origin", "--prune", check=False)
         existing_remote = self._git_capturing(
             "show-ref", "--verify", "--quiet",
             f"refs/remotes/origin/{self.working_branch}",
             check=False,
         )
         if existing_remote.returncode == 0:
+            # Adopt the remote per-node branch instead of clobbering
+            # it later.
             self._git(
                 "checkout", "-b", self.working_branch,
                 f"origin/{self.working_branch}",

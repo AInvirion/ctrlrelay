@@ -1233,6 +1233,43 @@ class TestPushDeletionAndContention:
         result = mgr.push(message="partial")
         assert result.success, result.summary
 
+    def test_init_adopts_per_node_branch_created_after_clone(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        """A's init created ``origin/personalization/machine-a``.
+        B clones the repo BEFORE A pushes, then later runs
+        ``personalization init`` again. Init must adopt
+        ``origin/personalization/machine-b`` if it now exists on
+        origin (created by A pushing on machine-b's behalf, or by a
+        previous fleet sync), not branch off main and clobber it on
+        the next push. Codex pass 16 caught this P1.
+        """
+        # Step 1: Pre-create origin/personalization/machine-b on the
+        # remote with a marker commit.
+        seed = tmp_path / "seed-b"
+        _git("clone", str(remote_bare), str(seed), cwd=tmp_path)
+        _git("config", "user.email", "x@x", cwd=seed)
+        _git("config", "user.name", "Seed-B", cwd=seed)
+        _git("checkout", "-b", "personalization/machine-b", cwd=seed)
+        (seed / "marker.md").write_text("seeded for machine-b\n")
+        _git("add", "marker.md", cwd=seed)
+        _git("commit", "-m", "machine-b seed", cwd=seed)
+        _git("push", "-u", "origin", "personalization/machine-b", cwd=seed)
+
+        # Step 2: B clones AFTER seed pushed.
+        b_checkout = tmp_path / "machine-b" / "personalization"
+        b_config = _config_for(b_checkout, remote_bare, node_id="machine-b")
+        b_mgr = PersonalizationManager(b_config)
+        _patch_remote_url(b_mgr, str(remote_bare))
+        b_mgr.init()
+
+        # Init should have adopted the per-node branch — the marker
+        # file should be reachable from HEAD.
+        head = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=b_checkout).strip()
+        assert head == "personalization/machine-b"
+        assert (b_checkout / "marker.md").exists()
+        assert (b_checkout / "marker.md").read_text() == "seeded for machine-b\n"
+
     def test_init_works_with_non_default_main_branch(
         self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
     ) -> None:
