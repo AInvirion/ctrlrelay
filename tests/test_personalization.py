@@ -1579,6 +1579,37 @@ class TestManagerErrors:
         msg = mgr.status()
         assert "does not exist" in msg
 
+    def test_status_works_on_unborn_head(
+        self,
+        tmp_path: Path,
+        tmp_path_factory: pytest.TempPathFactory,
+        remote_bare: Path,
+    ) -> None:
+        """Codex pass 19: a clone of a brand-new empty repo has
+        ``.git`` but no commits — rev-parse HEAD errors. status
+        must detect unborn HEAD and emit the friendly pre-init
+        message.
+        """
+        # Clone an empty bare repo manually to produce unborn HEAD.
+        empty_base = tmp_path_factory.mktemp("unborn")
+        empty_bare = _git_init_bare(empty_base / "empty.git")
+
+        checkout = tmp_path / "personalization"
+        _git("clone", str(empty_bare), str(checkout), cwd=tmp_path)
+        # Sanity: no commits.
+        rv = _run_git(
+            ("rev-parse", "--verify", "HEAD"),
+            cwd=checkout,
+            check=False,
+        )
+        assert rv.returncode != 0  # confirms unborn
+
+        config = _config_for(checkout, remote_bare, node_id="machine-x")
+        mgr = PersonalizationManager(config)
+        msg = mgr.status()
+        assert "unborn HEAD" in msg
+        assert "init" in msg
+
     def test_status_works_when_checkout_dir_exists_without_git(
         self, tmp_path: Path, remote_bare: Path
     ) -> None:

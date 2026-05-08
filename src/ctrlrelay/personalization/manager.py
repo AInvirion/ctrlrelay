@@ -295,6 +295,21 @@ class PersonalizationManager:
                 f"checkout_path {self.checkout_path} exists but is not a "
                 "git checkout yet; run `ctrlrelay personalization init`"
             )
+        # Unborn HEAD (clone of an empty repo, or interrupted init
+        # right after ``git clone``): ``rev-parse HEAD`` and
+        # ``rev-parse --abbrev-ref HEAD`` would both error. Detect
+        # and return the same friendly message instead of letting
+        # the error escape (Codex pass 19).
+        unborn = self._git_capturing(
+            "rev-parse", "--verify", "--quiet", "HEAD",
+            check=False,
+        )
+        if unborn.returncode != 0:
+            return (
+                f"checkout at {self.checkout_path} has unborn HEAD (no "
+                "commits yet); run `ctrlrelay personalization init` to "
+                "bootstrap"
+            )
 
         lines: list[str] = []
         lines.append(f"checkout: {self.checkout_path}")
