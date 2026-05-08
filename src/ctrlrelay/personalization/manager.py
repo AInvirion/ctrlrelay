@@ -267,11 +267,23 @@ class PersonalizationManager:
     def status(self) -> str:
         """Return a human-readable summary of working-tree state +
         symlink correctness. Read-only; does not fetch from origin.
+
+        Safe to run before ``init`` — the same path checks ``init``
+        uses to decide whether to clone (missing dir / empty dir /
+        non-checkout) all return a friendly "run init" message
+        instead of raising. Codex pass 14 caught the gap where an
+        existing non-checkout (e.g. empty dir or stray files) would
+        fall through to ``git rev-parse`` and traceback.
         """
         if not self.checkout_path.exists():
             return (
                 f"checkout_path {self.checkout_path} does not exist; "
                 "run `ctrlrelay personalization init`"
+            )
+        if not (self.checkout_path / ".git").exists():
+            return (
+                f"checkout_path {self.checkout_path} exists but is not a "
+                "git checkout yet; run `ctrlrelay personalization init`"
             )
 
         lines: list[str] = []

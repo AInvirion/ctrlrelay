@@ -1423,6 +1423,24 @@ class TestManagerErrors:
         msg = mgr.status()
         assert "does not exist" in msg
 
+    def test_status_works_when_checkout_dir_exists_without_git(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        """``status`` must remain safe when ``checkout_path`` exists
+        but isn't a git checkout (empty dir created by provisioning,
+        a previous interrupted init that ran ``mkdir`` only, etc.).
+        Codex pass 14 finding: this previously fell through to
+        ``git rev-parse`` and surfaced a traceback through the CLI.
+        """
+        checkout = tmp_path / "personalization"
+        checkout.mkdir()  # exists, no .git
+        # Throw a stray file in too — should still be safe.
+        (checkout / "stray").write_text("x\n")
+        config = _config_for(checkout, remote_bare, node_id="machine-a")
+        mgr = PersonalizationManager(config)
+        msg = mgr.status()
+        assert "not a git checkout" in msg
+
     def test_push_before_init_errors(self, tmp_path: Path, remote_bare: Path) -> None:
         checkout = tmp_path / "personalization"
         config = _config_for(checkout, remote_bare, node_id="machine-a")
