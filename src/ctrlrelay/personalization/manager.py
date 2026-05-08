@@ -146,6 +146,16 @@ class PersonalizationManager:
                         f"and is not a clone of {self.cfg.repo}; back it up "
                         "or remove it before running init"
                     )
+                # Force origin to our canonical URL. The owner/repo
+                # match in ``_is_existing_checkout_ours`` accepts any
+                # host whose trailing path equals our configured repo
+                # (Codex pass 18 caught this) — a malicious clone of
+                # ``https://evil.example/<owner>/<repo>.git`` would
+                # otherwise have init keep using that origin for the
+                # subsequent fetch/push and tunnel personalization
+                # data outside the user's intended remote. No-op if
+                # origin already points at the canonical URL.
+                self._git("remote", "set-url", "origin", self.repo_url)
                 # Same repo already there — converge to the right
                 # branch and re-wire. Useful when ``init`` is re-run
                 # after a config change. ``_bootstrap_main_if_empty``

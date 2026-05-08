@@ -1417,6 +1417,57 @@ class TestManagerErrors:
         with pytest.raises(PersonalizationError, match="not a clone"):
             mgr.init()
 
+    def test_init_resets_origin_when_existing_clone_points_at_foreign_host(
+        self,
+        tmp_path: Path,
+        tmp_path_factory: pytest.TempPathFactory,
+    ) -> None:
+        """Codex pass 18: ``_is_existing_checkout_ours`` matches on
+        owner/repo only, so a malicious clone of
+        ``https://evil.example/<owner>/<repo>.git`` would otherwise
+        keep that origin and tunnel personalization data outside the
+        intended remote. Init must reset origin to the canonical
+        ``self.repo_url``.
+        """
+        # Spin up a fake foreign bare repo with the matching tail.
+        foreign_base = tmp_path_factory.mktemp("foreign")
+        foreign_bare = _git_init_bare(foreign_base / "victim.git")
+        seed = foreign_base / "seed"
+        _git_init_with_initial_commit(seed, remote_url=str(foreign_bare))
+
+        # Pre-populate checkout_path with a clone of the foreign bare,
+        # but rewrite origin to look like the configured repo's tail
+        # via a github-shaped malicious URL. Then init must redirect.
+        checkout = tmp_path / "personalization"
+        _git("clone", str(foreign_bare), str(checkout), cwd=tmp_path)
+        # Simulate origin pointing at a non-github host with a
+        # matching tail.
+        _git(
+            "remote", "set-url", "origin",
+            "https://evil.example/test/dotclaude.git",
+            cwd=checkout,
+        )
+
+        # Spin up the LEGITIMATE bare we'll redirect to.
+        legit_base = tmp_path_factory.mktemp("legit")
+        legit_bare = _git_init_bare(legit_base / "legit.git")
+        legit_seed = legit_base / "seed"
+        _git_init_with_initial_commit(legit_seed, remote_url=str(legit_bare))
+
+        config = _config_for(checkout, legit_bare, node_id="machine-x")
+        mgr = PersonalizationManager(config)
+        _patch_remote_url(mgr, str(legit_bare))
+        # init should detect the URL match by tail (acme-style
+        # check) AND reset origin to the canonical URL — verified
+        # below.
+        mgr.init()
+        actual_origin = _git(
+            "remote", "get-url", "origin", cwd=checkout
+        ).strip()
+        assert actual_origin == str(legit_bare)
+        # No stale "evil.example" reference left over.
+        assert "evil.example" not in actual_origin
+
     def test_init_clones_into_empty_directory(
         self, tmp_path: Path, remote_bare: Path
     ) -> None:
@@ -1502,10 +1553,15 @@ class TestManagerErrors:
             "remote", "set-url", "origin", str(bare), cwd=checkout
         )
         mgr = PersonalizationManager(cfg)
-        # Override the URL extraction since our local bare path
-        # doesn't have an ``owner/repo`` shape — patch the regex
-        # check to recognize this as ours for test purposes.
+        # Override URL handling for the test:
+        #   - ``_is_existing_checkout_ours`` would extract a github-
+        #     shaped owner/repo from origin and compare; our local
+        #     bare path doesn't fit. Force True.
+        #   - ``repo_url`` is what init's origin-reset (Codex pass
+        #     18 fix) writes back. Point it at the local bare so the
+        #     reset doesn't redirect us at github.com.
         mgr._is_existing_checkout_ours = lambda: True  # type: ignore[method-assign]
+        mgr.repo_url = str(bare)
         summary = mgr.init()
         assert "personalization/machine-recover" in summary
         # Bootstrap ran: README on main, our per-machine branch
