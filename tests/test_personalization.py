@@ -581,6 +581,173 @@ class TestPushPullIntegration:
         assert not (b_checkout / ".git" / "rebase-apply").exists()
 
 
+class TestPushDeletionAndContention:
+    """Regressions for the three Codex-review findings."""
+
+    def test_push_stages_tracked_file_deletion(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        """A configured single-file source that was previously committed
+        and is then deleted in the working tree must have its deletion
+        staged and pushed. Earlier the missing-source filter skipped
+        deletions, leaving a tombstone-only-on-this-machine and a
+        stale file forever on the remote.
+        """
+        a_checkout = tmp_path / "machine-a" / "personalization"
+        a_config = _config_for(a_checkout, remote_bare, node_id="machine-a")
+        a_mgr = PersonalizationManager(a_config)
+        _patch_remote_url(a_mgr, str(remote_bare))
+        a_mgr.init()
+
+        # Add and push a file.
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "CLAUDE.md").write_text("v1\n")
+        a_mgr.wire_symlinks()
+        first = a_mgr.push(message="add v1")
+        assert first.success, first.summary
+
+        # Delete it and push the deletion.
+        (a_checkout / "global" / "CLAUDE.md").unlink()
+        deletion = a_mgr.push(message="delete it")
+        assert deletion.success, deletion.summary
+
+        # Verify on a second machine that the file is gone.
+        b_checkout = tmp_path / "machine-b" / "personalization"
+        b_config = _config_for(b_checkout, remote_bare, node_id="machine-b")
+        b_mgr = PersonalizationManager(b_config)
+        _patch_remote_url(b_mgr, str(remote_bare))
+        b_mgr.init()
+        b_mgr.pull()
+        assert not (b_checkout / "global" / "CLAUDE.md").exists()
+
+    def test_push_succeeds_after_concurrent_main_advance(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        """If origin/main advances between our fetch and our FF-push
+        (a non-conflicting concurrent push from another machine), the
+        retry loop must rebase onto the new tip and try again rather
+        than reporting a hollow success.
+        """
+        # Use a DIRECTORY path so multiple files match the configured
+        # source. The default ``_config_for`` only configures a single
+        # file; that wouldn't stage A's and B's distinct sibling files.
+        def _dir_config(checkout: Path, node_id: str) -> Config:
+            return Config.model_validate({
+                "version": "1",
+                "node_id": node_id,
+                "timezone": "UTC",
+                "paths": {
+                    "state_db": "/tmp/state.db",
+                    "worktrees": "/tmp/worktrees",
+                    "bare_repos": "/tmp/bare",
+                    "contexts": "/tmp/contexts",
+                    "skills": "/tmp/skills",
+                },
+                "transport": {
+                    "type": "file_mock",
+                    "file_mock": {"inbox": "/tmp/in", "outbox": "/tmp/out"},
+                },
+                "dashboard": {"enabled": False},
+                "personalization": {
+                    "repo": "test/dotclaude",
+                    "checkout_path": str(checkout),
+                    "paths": [
+                        {
+                            "source": "global/",
+                            "target": str(checkout.parent / "fake-home/global") + "/",
+                        },
+                    ],
+                },
+                "repos": [],
+            })
+
+        a_checkout = tmp_path / "machine-a" / "personalization"
+        b_checkout = tmp_path / "machine-b" / "personalization"
+        a_mgr = PersonalizationManager(_dir_config(a_checkout, "machine-a"))
+        b_mgr = PersonalizationManager(_dir_config(b_checkout, "machine-b"))
+        _patch_remote_url(a_mgr, str(remote_bare))
+        _patch_remote_url(b_mgr, str(remote_bare))
+        a_mgr.init()
+        b_mgr.init()
+
+        # A and B touch DIFFERENT files under the configured dir (no
+        # rebase conflict). Both pushes commit; B races A on FF.
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "from-a.md").write_text("a\n")
+        (b_checkout / "global").mkdir()
+        (b_checkout / "global" / "from-b.md").write_text("b\n")
+
+        result_a = a_mgr.push(message="from-a")
+        assert result_a.success
+        result_b = b_mgr.push(message="from-b")
+        assert result_b.success, result_b.summary
+
+        # Verify origin/main contains both commits — i.e. B's push
+        # actually landed on main, not just on the per-machine branch.
+        c_checkout = tmp_path / "machine-c" / "personalization"
+        c_mgr = PersonalizationManager(_dir_config(c_checkout, "machine-c"))
+        _patch_remote_url(c_mgr, str(remote_bare))
+        c_mgr.init()
+        c_mgr.pull()
+        assert (c_checkout / "global" / "from-a.md").exists()
+        assert (c_checkout / "global" / "from-b.md").exists()
+
+    def test_init_works_with_non_default_main_branch(
+        self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        """When ``personalization.main_branch`` is not the repo's
+        default (which after ``git clone`` is the only locally-
+        checked-out branch), init must branch from ``origin/<main>``,
+        not the bare name.
+        """
+        # Build a remote whose default is "main" but which also has a
+        # "develop" branch carrying initial content.
+        base = tmp_path_factory.mktemp("alt-main")
+        bare = _git_init_bare(base / "alt.git")
+        seed = base / "seed"
+        _git_init_with_initial_commit(seed, remote_url=str(bare))
+        # Create a 'develop' branch with its own commit and push it.
+        _git("checkout", "-b", "develop", cwd=seed)
+        (seed / "develop-marker.md").write_text("on develop\n")
+        _git("add", "develop-marker.md", cwd=seed)
+        _git("commit", "-m", "develop init", cwd=seed)
+        _git("push", "-u", "origin", "develop", cwd=seed)
+
+        checkout = tmp_path / "personalization"
+        cfg = Config.model_validate({
+            "version": "1",
+            "node_id": "machine-x",
+            "timezone": "UTC",
+            "paths": {
+                "state_db": "/tmp/state.db",
+                "worktrees": "/tmp/worktrees",
+                "bare_repos": "/tmp/bare",
+                "contexts": "/tmp/contexts",
+                "skills": "/tmp/skills",
+            },
+            "transport": {
+                "type": "file_mock",
+                "file_mock": {"inbox": "/tmp/in", "outbox": "/tmp/out"},
+            },
+            "dashboard": {"enabled": False},
+            "personalization": {
+                "repo": "test/dotclaude",
+                "checkout_path": str(checkout),
+                "main_branch": "develop",
+                "paths": [],
+            },
+            "repos": [],
+        })
+        mgr = PersonalizationManager(cfg)
+        mgr.repo_url = str(bare)
+        mgr.init()
+        # On the per-machine branch...
+        head = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=checkout).strip()
+        assert head == "personalization/machine-x"
+        # ...and reachable from develop's content (the marker file).
+        assert (checkout / "develop-marker.md").exists()
+
+
 class TestManagerErrors:
     def test_init_rejected_when_path_exists_and_not_ours(
         self, tmp_path: Path, remote_bare: Path

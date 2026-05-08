@@ -203,22 +203,38 @@ class PersonalizationManager:
             results.append(self._apply_symlink(plan))
         return results
 
+    # Bounded retries for the rebase + branch-push + FF-push cycle on
+    # FF rejection. Codex review caught the earlier silent-success-on-
+    # FF-rejection bug: if origin/main moved between our fetch and our
+    # FF-push, the per-machine branch lands on the remote but main
+    # stays at the racing machine's commit. Retrying refetches the new
+    # main, rebases on top, and tries again. Cap is small because the
+    # fleet should be ~3-5 machines and a hot loop here usually means
+    # a deeper problem (auth, branch protection, network) that won't
+    # fix itself.
+    _PUSH_MAX_ATTEMPTS = 3
+
     def push(self, message: str | None = None) -> PushResult:
         """Commit working-tree changes on the per-machine branch, then
         rebase onto ``origin/<main>`` and push. On rebase conflict,
         abort the rebase and return a ``PushResult`` listing the
         conflict files; the working tree is left in its pre-rebase
         state so the operator can resolve manually.
+
+        On a successful per-branch push but rejected FF of main
+        (concurrent push from another node), retries the cycle up to
+        ``_PUSH_MAX_ATTEMPTS`` times. Returns ``success=False`` if the
+        cycle never lands main — silently reporting success would
+        leave this node's commit reachable only via
+        ``origin/personalization/<node>``, never on main, which other
+        machines wouldn't see.
         """
         self._require_checkout()
         self._ensure_working_branch()
 
-        # Stage and commit if dirty. We add only paths declared in the
-        # config (their actual on-disk location inside the checkout),
-        # not ``-A``, so a stray test artifact in the checkout doesn't
-        # ride along into the personalization repo.
-        added = self._stage_configured_paths()
-        if added:
+        # Stage and commit once up-front; the commit object stays the
+        # same across retries, only the rebase base shifts.
+        if self._stage_configured_paths():
             commit_msg = message or "personalization: sync from {}".format(
                 self.working_branch
             )
@@ -226,83 +242,86 @@ class PersonalizationManager:
                 self._git("commit", "-m", commit_msg)
             except _GitError as e:
                 # ``git commit`` exits 1 with "nothing to commit" when
-                # the staged set turns out to be a no-op (e.g. the
-                # working tree only has whitespace differences that
-                # aren't actually staged). Treat as a no-op.
-                if "nothing to commit" in (e.stdout + e.stderr).lower():
-                    pass
-                else:
+                # the staged set turns out to be a no-op (e.g. only
+                # mode-bit churn). Treat as a no-op so push is
+                # idempotent.
+                if "nothing to commit" not in (e.stdout + e.stderr).lower():
                     raise
 
-        # Fetch and try to fast-forward main locally so the rebase
-        # base is current. Failures here are not fatal — we'll surface
-        # them as part of the rebase attempt.
-        try:
-            self._git("fetch", "origin", "--prune")
-        except _GitError as e:
-            return PushResult(
-                success=False,
-                summary=f"fetch failed: {e.stderr.strip() or e.stdout.strip()}",
-            )
+        last_summary = ""
+        for attempt in range(1, self._PUSH_MAX_ATTEMPTS + 1):
+            try:
+                self._git("fetch", "origin", "--prune")
+            except _GitError as e:
+                return PushResult(
+                    success=False,
+                    summary=f"fetch failed: {e.stderr.strip() or e.stdout.strip()}",
+                )
 
-        # Rebase the working branch onto origin/<main>. ``--keep-base``
-        # is intentional: if origin/<main> hasn't moved relative to the
-        # last rebase point, no commits get rewritten.
-        rebase = self._git_capturing(
-            "rebase", f"origin/{self.main_branch}",
-            check=False,
-        )
-        if rebase.returncode != 0:
-            # Detect conflict and abort cleanly.
-            unmerged = self._git("diff", "--name-only", "--diff-filter=U").strip()
-            self._git_capturing("rebase", "--abort", check=False)
-            files = tuple(unmerged.splitlines()) if unmerged else ()
-            return PushResult(
-                success=False,
-                summary=(
-                    "rebase onto origin/{main} hit conflicts; aborted. "
-                    "Resolve the listed files in the checkout, commit, then "
-                    "re-run push."
-                ).format(main=self.main_branch),
-                conflict_files=files,
+            rebase = self._git_capturing(
+                "rebase", f"origin/{self.main_branch}",
+                check=False,
             )
+            if rebase.returncode != 0:
+                unmerged = self._git(
+                    "diff", "--name-only", "--diff-filter=U"
+                ).strip()
+                self._git_capturing("rebase", "--abort", check=False)
+                files = tuple(unmerged.splitlines()) if unmerged else ()
+                return PushResult(
+                    success=False,
+                    summary=(
+                        "rebase onto origin/{main} hit conflicts; aborted. "
+                        "Resolve the listed files in the checkout, commit, "
+                        "then re-run push."
+                    ).format(main=self.main_branch),
+                    conflict_files=files,
+                )
 
-        # Push the working branch, then FF the remote main from it.
-        try:
-            self._git("push", "origin", self.working_branch)
-        except _GitError as e:
-            return PushResult(
-                success=False,
-                summary=(
-                    f"push of {self.working_branch} failed: "
-                    f"{e.stderr.strip() or e.stdout.strip()}"
-                ),
+            try:
+                self._git("push", "origin", self.working_branch)
+            except _GitError as e:
+                return PushResult(
+                    success=False,
+                    summary=(
+                        f"push of {self.working_branch} failed: "
+                        f"{e.stderr.strip() or e.stdout.strip()}"
+                    ),
+                )
+
+            ff_push = self._git_capturing(
+                "push", "origin",
+                f"{self.working_branch}:{self.main_branch}",
+                check=False,
             )
-
-        # FF-push main: only succeeds if origin/<main> hasn't moved
-        # since our fetch. If another machine raced us, this push is
-        # rejected — that's fine, the next machine that pushes will
-        # pick up our commits via origin/<branch> and FF then. No
-        # force-push, ever.
-        ff_push = self._git_capturing(
-            "push", "origin",
-            f"{self.working_branch}:{self.main_branch}",
-            check=False,
-        )
-        ff_note = ""
-        if ff_push.returncode != 0:
-            ff_note = (
-                f"; note: could not FF origin/{self.main_branch} "
-                "(another machine may have pushed first; their commits "
-                "will be picked up on the next pull)"
+            if ff_push.returncode == 0:
+                return PushResult(
+                    success=True,
+                    summary=(
+                        f"pushed {self.working_branch} and fast-forwarded "
+                        f"origin/{self.main_branch}"
+                        + (
+                            f" (after {attempt} attempts)"
+                            if attempt > 1 else ""
+                        )
+                    ),
+                )
+            # FF rejected — another machine pushed to main between our
+            # fetch and our push. Loop and try again on top of the new
+            # tip. Capture the last error message in case we exhaust
+            # the retry budget.
+            last_summary = (
+                ff_push.stderr.strip() or ff_push.stdout.strip()
+                or "fast-forward of origin/main rejected"
             )
 
         return PushResult(
-            success=True,
+            success=False,
             summary=(
-                f"pushed {self.working_branch}; "
-                f"{'fast-forwarded' if not ff_note else 'did not fast-forward'} "
-                f"origin/{self.main_branch}{ff_note}"
+                f"push of {self.working_branch} succeeded but origin/"
+                f"{self.main_branch} could not be fast-forwarded after "
+                f"{self._PUSH_MAX_ATTEMPTS} attempts ({last_summary}); "
+                "another node is racing pushes — re-run push to retry"
             ),
         )
 
@@ -516,40 +535,63 @@ class PersonalizationManager:
                 f"origin/{self.working_branch}",
             )
             return
-        # Brand new — branch off main.
-        self._git("checkout", "-b", self.working_branch, self.main_branch)
+        # Brand new — branch off origin's main. ``origin/<main>``
+        # rather than the bare local name so a non-default
+        # ``main_branch`` (e.g. ``develop``) works on a fresh clone:
+        # ``git clone`` only checks out the repository's default
+        # branch locally, so ``git checkout -b ... develop`` would
+        # fail with "did not match any file(s) known to git". The
+        # remote ref is always present after ``fetch``/``clone``.
+        self._git(
+            "checkout", "-b", self.working_branch,
+            f"origin/{self.main_branch}",
+        )
 
     def _current_branch(self) -> str:
         return self._git("rev-parse", "--abbrev-ref", "HEAD").strip()
 
     def _stage_configured_paths(self) -> bool:
-        """``git add`` only the on-disk locations of configured sources.
+        """``git add -A`` each on-disk location of configured sources.
 
-        Returns True if anything got staged. The selective staging
-        keeps ad-hoc cruft a user might have dropped in the checkout
-        out of the personalization repo's history.
+        Returns True if anything got staged. Selective staging keeps
+        ad-hoc cruft a user dropped in the checkout out of the sync
+        repo's history.
+
+        Uses ``git add -A`` per-path so tracked-file *deletions* are
+        also staged (Codex review caught this: filtering on
+        ``Path.exists()`` would otherwise leave a file the operator
+        deleted in the checkout sitting on the remote forever).
+
+        Tolerates ``pathspec did not match any files`` for paths that
+        are neither in the working tree nor tracked — typical for a
+        project_scoped entry whose source dir was never populated on
+        any machine.
         """
         rels: list[str] = []
         for entry in self.cfg.paths:
-            # Source paths can carry placeholders, which would expand
-            # to per-repo subdirs. Stage each *resolved* source that
-            # actually exists. ``git add -- <missing>`` exits 128 with
-            # ``pathspec did not match any files``, so pre-filtering
-            # is required to keep ``push`` a no-op when the working
-            # tree is clean.
             for plan in self._plan_for_entry(entry):
-                if not plan.source.exists():
-                    continue
                 try:
                     rel = plan.source.relative_to(self.checkout_path)
                 except ValueError:
-                    # Source escaped the checkout — config bug, but
-                    # don't crash on push; surface in status.
                     continue
                 rels.append(str(rel))
         if not rels:
             return False
-        self._git("add", "--", *rels)
+
+        for rel in rels:
+            result = self._git_capturing("add", "-A", "--", rel, check=False)
+            if result.returncode != 0:
+                # ``did not match`` is the benign case: path is
+                # neither in the working tree nor in the index.
+                # Anything else is a real error and should propagate.
+                if "did not match" in (result.stderr + result.stdout):
+                    continue
+                raise _GitError(
+                    args=("add", "-A", "--", rel),
+                    returncode=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
         staged = self._git("diff", "--cached", "--name-only").strip()
         return bool(staged)
 
