@@ -146,9 +146,63 @@ class PersonalizationManager:
 
         self.checkout_path.parent.mkdir(parents=True, exist_ok=True)
         self._git_global("clone", self.repo_url, str(self.checkout_path))
+        self._bootstrap_main_if_empty()
         self._ensure_working_branch()
         results = self.wire_symlinks()
         return self._format_init_summary(results, cloned=True)
+
+    def _bootstrap_main_if_empty(self) -> None:
+        """Create an initial commit on ``main_branch`` if the cloned
+        repo has none yet.
+
+        A brand-new GitHub repo (no commits, no default branch) clones
+        with an "unborn HEAD" — ``origin/<main>`` doesn't exist, so
+        ``_ensure_working_branch`` would later fail trying to branch
+        from it. To make ``init`` the natural bootstrap path, we
+        detect this state, write a tiny ``README.md``, commit it on
+        ``main_branch``, and push. After this the rest of init
+        proceeds normally.
+
+        We only act when ``origin/<main_branch>`` is missing — an
+        existing remote branch (whether the user's default or one
+        they created) is left alone.
+        """
+        # If origin/<main_branch> already exists, nothing to bootstrap.
+        existing_remote = self._git_capturing(
+            "show-ref", "--verify", "--quiet",
+            f"refs/remotes/origin/{self.main_branch}",
+            check=False,
+        )
+        if existing_remote.returncode == 0:
+            return
+
+        # Configure user identity if not already set on this clone —
+        # ``git commit`` errors out without one. Only override when
+        # missing so the operator's global config still wins on
+        # machines where they've set it.
+        if not self._git_capturing(
+            "config", "--get", "user.email", check=False
+        ).stdout.strip():
+            self._git("config", "user.email", "ctrlrelay@local")
+        if not self._git_capturing(
+            "config", "--get", "user.name", check=False
+        ).stdout.strip():
+            self._git("config", "user.name", "ctrlrelay")
+
+        readme = self.checkout_path / "README.md"
+        if not readme.exists():
+            readme.write_text(
+                "# personalization\n\n"
+                "Managed by ctrlrelay personalization sync. "
+                "See `ctrlrelay personalization --help`.\n"
+            )
+        self._git("checkout", "-b", self.main_branch)
+        self._git("add", "README.md")
+        self._git(
+            "commit", "-m",
+            "personalization: bootstrap empty repo",
+        )
+        self._git("push", "-u", "origin", self.main_branch)
 
     def status(self) -> str:
         """Return a human-readable summary of working-tree state +

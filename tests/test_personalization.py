@@ -778,6 +778,55 @@ class TestPushDeletionAndContention:
         assert (c_checkout / "phantom.md").exists()
         assert (c_checkout / "global" / "CLAUDE.md").read_text() == "rev1\n"
 
+    def test_init_bootstraps_empty_repo(
+        self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        """A brand-new GitHub-style empty bare repo (no commits) must
+        be initable: clone leaves unborn HEAD, then init seeds main
+        with a README commit, pushes, and proceeds normally.
+        """
+        base = tmp_path_factory.mktemp("empty")
+        bare = _git_init_bare(base / "empty.git")  # bare, no commits
+
+        checkout = tmp_path / "personalization"
+        cfg = Config.model_validate({
+            "version": "1",
+            "node_id": "machine-empty",
+            "timezone": "UTC",
+            "paths": {
+                "state_db": "/tmp/state.db",
+                "worktrees": "/tmp/worktrees",
+                "bare_repos": "/tmp/bare",
+                "contexts": "/tmp/contexts",
+                "skills": "/tmp/skills",
+            },
+            "transport": {
+                "type": "file_mock",
+                "file_mock": {"inbox": "/tmp/in", "outbox": "/tmp/out"},
+            },
+            "dashboard": {"enabled": False},
+            "personalization": {
+                "repo": "test/empty",
+                "checkout_path": str(checkout),
+                "paths": [],
+            },
+            "repos": [],
+        })
+        mgr = PersonalizationManager(cfg)
+        mgr.repo_url = str(bare)
+        summary = mgr.init()
+        assert "personalization/machine-empty" in summary
+        # README seeded and committed on main.
+        assert (checkout / "README.md").exists()
+        # On the per-machine branch, with main reachable from origin.
+        head = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=checkout).strip()
+        assert head == "personalization/machine-empty"
+        # origin has main pushed.
+        remote_main = _git(
+            "ls-remote", str(bare), "main", cwd=checkout
+        ).strip()
+        assert remote_main, "origin/main should exist after bootstrap"
+
     def test_init_works_with_non_default_main_branch(
         self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
     ) -> None:
