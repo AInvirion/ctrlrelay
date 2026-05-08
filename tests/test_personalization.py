@@ -213,6 +213,41 @@ class TestPersonalizationConfig:
         with pytest.raises(ConfigError, match="project_scoped"):
             load_config(path)
 
+    @pytest.mark.parametrize("bad_source", [
+        "../secret",        # parent escape
+        "foo/../etc",       # buried parent escape
+        "/etc/passwd",      # absolute
+    ])
+    def test_source_path_escape_rejected(
+        self, tmp_path: Path, bad_source: str
+    ) -> None:
+        """``source`` must stay inside the personalization checkout —
+        ``..`` segments and absolute paths would let a config wire
+        symlinks pointing outside the repo and crash later in ``git
+        add`` (Codex pass 8 finding).
+        """
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "paths": [
+                {"source": bad_source, "target": "~/safe"},
+            ],
+        })))
+        with pytest.raises(ConfigError):
+            load_config(path)
+
+    def test_target_dotdot_rejected(self, tmp_path: Path) -> None:
+        """``..`` in target is also rejected for auditability."""
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "paths": [
+                {"source": "global/CLAUDE.md", "target": "~/.claude/../etc"},
+            ],
+        })))
+        with pytest.raises(ConfigError):
+            load_config(path)
+
     def test_dir_vs_file_mismatch_rejected(self, tmp_path: Path) -> None:
         path = tmp_path / "cfg.yaml"
         path.write_text(yaml.dump(_base_config_dict({
@@ -277,6 +312,8 @@ class TestPersonalizationConfig:
         "caret^here",    # caret — git ref-illegal
         "with/slash",    # slash inside a single component
         "",              # empty
+        "trailing.",     # trailing dot — git rejects (Codex pass 8)
+        "foo.lock",      # .lock suffix — reserved by git
     ])
     def test_main_branch_rejects_git_unsafe_chars(
         self, tmp_path: Path, bad: str

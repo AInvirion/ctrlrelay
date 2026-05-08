@@ -232,20 +232,19 @@ _GIT_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 def _is_safe_git_ref_component(value: str) -> bool:
     """Return True iff ``value`` is safe as part of a git branch/ref name.
 
-    Stricter than ``git check-ref-format --branch`` on purpose: the
-    config's documented allow-list is exactly ``letters, digits, '.',
-    '_', '-'`` (the same set we use for repo names) plus the rule that
-    ``..`` and a leading ``-``/``.`` are disallowed. Earlier validators
-    used a denylist for shell metacharacters which silently accepted
-    things git later rejects (Codex review pass 7 caught e.g.
-    ``main_branch: "main:backup"`` and ``node_id: "foo..bar"`` slipping
-    through). Doing this as an explicit allow-list keeps the config
-    error synchronous with load and avoids late git failures during
-    ``init``/``push``.
+    Allow-list: ``letters, digits, '.', '_', '-'`` (Codex pass 7).
+    Plus the structural rules ``git check-ref-format --branch``
+    enforces — no leading ``-``/``.``, no ``..``, no trailing ``.``,
+    no ``.lock`` suffix (Codex pass 8 caught the trailing-``.``
+    case slipping through). Doing this as an explicit allow-list
+    keeps the config error synchronous with load and avoids late git
+    failures during ``init``/``push``.
     """
     if not value:
         return False
     if value.startswith("-") or value.startswith("."):
+        return False
+    if value.endswith(".") or value.endswith(".lock"):
         return False
     if ".." in value:
         return False
@@ -314,6 +313,26 @@ class PersonalizationPath(BaseModel):
                     "placeholders but project_scoped is false; either set "
                     "project_scoped: true or remove the placeholders"
                 )
+
+        # ``source`` is documented as a path inside the personalization
+        # repo (joined to ``checkout_path`` at wire time). Reject ``..``
+        # segments and absolute paths so an entry can't escape the
+        # checkout, e.g. ``source: ../secret`` (Codex pass 8 caught
+        # this). Also reject ``..`` in target — if a target uses ``..``
+        # we may still wire a symlink, but it makes auditing harder
+        # for no upside.
+        if self.source.startswith("/"):
+            raise ValueError(
+                f"personalization path source {self.source!r} must be "
+                "relative to the personalization checkout, not absolute"
+            )
+        for side, value in (("source", self.source), ("target", self.target)):
+            for segment in value.split("/"):
+                if segment == "..":
+                    raise ValueError(
+                        f"personalization path {side} {value!r} contains "
+                        "'..' segment; paths must not escape their root"
+                    )
 
         # File-vs-dir agreement: if one side ends with '/', the other must too.
         src_is_dir = self.source.endswith("/")
