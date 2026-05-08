@@ -346,9 +346,23 @@ class PersonalizationManager:
         self._require_checkout()
         self._ensure_working_branch()
 
+        # Reset the index to HEAD before staging. This unstages any
+        # ad-hoc ``git add`` the operator (or an interrupted previous
+        # run) left in the index, ensuring:
+        #   1. our commit's pathspec scope matches the actual diff,
+        #   2. ``git rebase`` doesn't refuse with "Your index contains
+        #      uncommitted changes". Working-tree changes are
+        #      preserved (mixed reset is index-only); the operator's
+        #      out-of-allowlist files stay on disk and can be staged/
+        #      committed by them manually after push completes. This
+        #      pairs with the pathspec-scoped commit (Codex pass 12)
+        #      to make the allowlist a hard guarantee.
+        self._git("reset", "--mixed")
+
         # Stage and commit once up-front; the commit object stays the
         # same across retries, only the rebase base shifts.
-        if self._stage_configured_paths():
+        configured_pathspecs = self._stage_configured_paths()
+        if configured_pathspecs:
             # ``git commit`` errors with "Author identity unknown" if
             # neither global nor local user.email/user.name is set.
             # Bootstrap already does this for the empty-repo path;
@@ -358,8 +372,16 @@ class PersonalizationManager:
             commit_msg = message or "personalization: sync from {}".format(
                 self.working_branch
             )
+            # ``-- <pathspecs>`` constrains the commit to ONLY the
+            # allowlisted paths. Anything an operator manually staged
+            # outside the allowlist (Codex pass 12 finding — e.g.
+            # interrupted run, ad-hoc ``git add``) stays in the
+            # index but does NOT enter the personalization repo's
+            # history.
             try:
-                self._git("commit", "-m", commit_msg)
+                self._git(
+                    "commit", "-m", commit_msg, "--", *configured_pathspecs
+                )
             except _GitError as e:
                 # ``git commit`` exits 1 with "nothing to commit" when
                 # the staged set turns out to be a no-op (e.g. only
@@ -738,22 +760,26 @@ class PersonalizationManager:
         ).returncode == 0
         return not is_ancestor
 
-    def _stage_configured_paths(self) -> bool:
-        """``git add -A`` each on-disk location of configured sources.
+    def _stage_configured_paths(self) -> list[str]:
+        """``git add -A`` each on-disk location of configured sources
+        and return the pathspecs that should bound the subsequent
+        ``git commit``.
 
-        Returns True if anything got staged. Selective staging keeps
-        ad-hoc cruft a user dropped in the checkout out of the sync
-        repo's history.
-
-        Uses ``git add -A`` per-path so tracked-file *deletions* are
-        also staged (Codex review caught this: filtering on
-        ``Path.exists()`` would otherwise leave a file the operator
-        deleted in the checkout sitting on the remote forever).
+        The returned list is non-empty whenever the configured paths
+        produced ANY staged change — including tracked-file deletions
+        (Codex review pass 1 finding: filtering on ``Path.exists()``
+        would otherwise leave deletions out of the commit). The
+        caller MUST scope ``git commit`` to these pathspecs (Codex
+        pass 12 finding) so anything an operator pre-staged outside
+        the allowlist (manual ``git add``, interrupted run) does not
+        ride along into the personalization repo's history.
 
         Tolerates ``pathspec did not match any files`` for paths that
         are neither in the working tree nor tracked — typical for a
         project_scoped entry whose source dir was never populated on
         any machine.
+
+        Returns ``[]`` when nothing in the allowlist changed.
         """
         rels: list[str] = []
         for entry in self.cfg.paths:
@@ -764,7 +790,7 @@ class PersonalizationManager:
                     continue
                 rels.append(str(rel))
         if not rels:
-            return False
+            return []
 
         for rel in rels:
             result = self._git_capturing("add", "-A", "--", rel, check=False)
@@ -780,8 +806,14 @@ class PersonalizationManager:
                     stdout=result.stdout,
                     stderr=result.stderr,
                 )
-        staged = self._git("diff", "--cached", "--name-only").strip()
-        return bool(staged)
+        # Only return the pathspecs if SOMETHING in the allowlist
+        # actually has staged changes. Pre-staged files outside the
+        # allowlist won't show up here because we restrict the diff
+        # to the configured pathspecs.
+        diff = self._git(
+            "diff", "--cached", "--name-only", "--", *rels
+        ).strip()
+        return rels if diff else []
 
     def _plan_for_entry(self, entry: PersonalizationPath) -> list[SymlinkPlan]:
         if entry.project_scoped:

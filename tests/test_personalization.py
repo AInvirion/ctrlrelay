@@ -1100,6 +1100,41 @@ class TestPushDeletionAndContention:
         assert (verify / "advance.md").exists()
         assert (verify / "global" / "CLAUDE.md").read_text() == "rev2\n"
 
+    def test_push_does_not_commit_pre_staged_outside_allowlist(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        """If something is pre-staged in the index OUTSIDE the
+        configured allowlist (operator manually ran ``git add``, an
+        interrupted previous run, etc.), push must NOT commit it.
+        Codex pass 12 finding: an unscoped ``git commit`` would
+        publish unrelated/private files alongside legitimate
+        configured changes. The commit must be scoped to the
+        configured pathspecs.
+        """
+        a_checkout = tmp_path / "machine-a" / "personalization"
+        a_config = _config_for(a_checkout, remote_bare, node_id="machine-a")
+        a_mgr = PersonalizationManager(a_config)
+        _patch_remote_url(a_mgr, str(remote_bare))
+        a_mgr.init()
+
+        # Allowlisted change (will be committed):
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "CLAUDE.md").write_text("public\n")
+
+        # NON-allowlisted file pre-staged (must NOT be committed):
+        (a_checkout / "secrets.txt").write_text("leak-me-not\n")
+        _git("add", "secrets.txt", cwd=a_checkout)
+
+        result = a_mgr.push(message="legit-change")
+        assert result.success, result.summary
+
+        # Verify on a fresh clone that secrets.txt did NOT travel.
+        verify = tmp_path / "verify"
+        _git("clone", str(remote_bare), str(verify), cwd=tmp_path)
+        assert (verify / "global" / "CLAUDE.md").exists()
+        assert (verify / "global" / "CLAUDE.md").read_text() == "public\n"
+        assert not (verify / "secrets.txt").exists()
+
     def test_init_works_with_non_default_main_branch(
         self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
     ) -> None:
