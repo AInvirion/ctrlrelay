@@ -1223,6 +1223,87 @@ class TestManagerErrors:
         mgr.init()
         assert (checkout / ".git").exists()
 
+    def test_init_recovers_existing_empty_clone(
+        self,
+        tmp_path: Path,
+        tmp_path_factory: pytest.TempPathFactory,
+    ) -> None:
+        """If checkout_path is already a clone of the configured repo
+        but the remote is still empty (e.g. the user manually cloned
+        and then ran init, or a previous init was interrupted right
+        after ``git clone``), the converge-existing path must
+        bootstrap rather than blow up trying to rev-parse an unborn
+        HEAD. Codex pass 10 finding.
+        """
+        base = tmp_path_factory.mktemp("empty-clone")
+        bare = _git_init_bare(base / "empty.git")
+        # Manually clone (no commits) — simulates the interrupted state.
+        checkout = tmp_path / "personalization"
+        _git("clone", str(bare), str(checkout), cwd=tmp_path)
+
+        cfg = Config.model_validate({
+            "version": "1",
+            "node_id": "machine-recover",
+            "timezone": "UTC",
+            "paths": {
+                "state_db": "/tmp/state.db",
+                "worktrees": "/tmp/worktrees",
+                "bare_repos": "/tmp/bare",
+                "contexts": "/tmp/contexts",
+                "skills": "/tmp/skills",
+            },
+            "transport": {
+                "type": "file_mock",
+                "file_mock": {"inbox": "/tmp/in", "outbox": "/tmp/out"},
+            },
+            "dashboard": {"enabled": False},
+            "personalization": {
+                "repo": "test/empty",
+                "checkout_path": str(checkout),
+                "paths": [],
+            },
+            "repos": [],
+        })
+        # Spoof the origin URL to satisfy ``_is_existing_checkout_ours``.
+        _git(
+            "remote", "set-url", "origin",
+            "https://github.com/test/empty.git",
+            cwd=checkout,
+        )
+        # ...but real fetch/clone target is the local bare.
+        # We re-set origin AGAIN to the local bare so push/clone in
+        # bootstrap can actually reach it. The is-ours check uses the
+        # parsed owner/repo from the URL, so we use a dual approach:
+        # set the remote URL to the local path and also set a
+        # ``url.<base>.insteadOf`` rewrite so the OWNER/REPO check
+        # still passes. Simpler: set the URL to a github-shaped URL
+        # via insteadOf and let the actual operations follow it to
+        # the local bare. But _is_existing_checkout_ours reads
+        # remote.origin.url directly — it doesn't follow insteadOf.
+        # So set origin to the local bare path AND ensure the
+        # checkout-ours check considers it ours by virtue of the
+        # config repo being a sentinel that matches the local URL
+        # tail. Simplest: override the URL parsing for the test. The
+        # cleanest approach is to set origin to an URL whose tail
+        # matches "test/empty" (the configured repo) and use a git
+        # ``url.X.insteadOf`` rewrite so operations against that URL
+        # transparently go to the bare.
+        _git(
+            "remote", "set-url", "origin", str(bare), cwd=checkout
+        )
+        mgr = PersonalizationManager(cfg)
+        # Override the URL extraction since our local bare path
+        # doesn't have an ``owner/repo`` shape — patch the regex
+        # check to recognize this as ours for test purposes.
+        mgr._is_existing_checkout_ours = lambda: True  # type: ignore[method-assign]
+        summary = mgr.init()
+        assert "personalization/machine-recover" in summary
+        # Bootstrap ran: README on main, our per-machine branch
+        # branched off main.
+        assert (checkout / "README.md").exists()
+        head = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=checkout).strip()
+        assert head == "personalization/machine-recover"
+
     def test_status_works_before_init(self, tmp_path: Path, remote_bare: Path) -> None:
         # status should not raise when the checkout doesn't exist yet —
         # it should print a friendly message that a wired CLI can show.
@@ -1238,3 +1319,52 @@ class TestManagerErrors:
         mgr = PersonalizationManager(config)
         with pytest.raises(PersonalizationError, match="no checkout"):
             mgr.push()
+
+
+class TestCLI:
+    """Smoke tests for the Typer wrappers around the manager. Verifies
+    that ``personalization push`` / ``pull`` (Codex pass 10 finding)
+    catch ``PersonalizationError`` and exit cleanly instead of
+    propagating a traceback."""
+
+    def test_push_before_init_returns_exit_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "checkout_path": str(tmp_path / "checkout"),  # absent → error
+            "paths": [],
+        })))
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["personalization", "push", "--config", str(cfg_path)],
+        )
+        assert result.exit_code == 1
+        # No traceback in output; the manager's actionable message wins.
+        assert "Traceback" not in result.output
+        assert "no checkout" in result.output.lower()
+
+    def test_pull_before_init_returns_exit_1(self, tmp_path: Path) -> None:
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "checkout_path": str(tmp_path / "checkout"),
+            "paths": [],
+        })))
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["personalization", "pull", "--config", str(cfg_path)],
+        )
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output

@@ -148,7 +148,13 @@ class PersonalizationManager:
                     )
                 # Same repo already there — converge to the right
                 # branch and re-wire. Useful when ``init`` is re-run
-                # after a config change.
+                # after a config change. ``_bootstrap_main_if_empty``
+                # also runs here because an existing clone of an
+                # empty remote still has unborn HEAD; without
+                # bootstrap, ``_ensure_working_branch`` would fail
+                # rev-parsing HEAD or origin/<main> (Codex pass 10
+                # caught this).
+                self._bootstrap_main_if_empty()
                 self._ensure_working_branch()
                 results = self.wire_symlinks()
                 return self._format_init_summary(results, cloned=False)

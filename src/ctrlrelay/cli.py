@@ -2083,8 +2083,14 @@ def personalization_push(
     the conflicting files are listed; resolve them in the checkout (the
     target of any symlinked path), commit manually, and re-run push.
     """
+    from ctrlrelay.personalization.manager import PersonalizationError
+
     mgr = _make_personalization_manager(config_path)
-    result = mgr.push(message=message)
+    try:
+        result = mgr.push(message=message)
+    except PersonalizationError as e:
+        console.print(f"[red]Push failed:[/red] {e}")
+        raise typer.Exit(1)
     console.print(result.summary)
     if result.conflict_files:
         console.print("[yellow]conflicts:[/yellow]")
@@ -2104,8 +2110,14 @@ def personalization_pull(
     ),
 ) -> None:
     """Fetch + rebase the local working branch and re-wire symlinks."""
+    from ctrlrelay.personalization.manager import PersonalizationError
+
     mgr = _make_personalization_manager(config_path)
-    result = mgr.pull()
+    try:
+        result = mgr.pull()
+    except PersonalizationError as e:
+        console.print(f"[red]Pull failed:[/red] {e}")
+        raise typer.Exit(1)
     console.print(result.summary)
     if result.conflict_files:
         console.print("[yellow]conflicts:[/yellow]")
