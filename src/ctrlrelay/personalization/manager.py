@@ -984,6 +984,15 @@ def _run_git(
     """
     env = os.environ.copy()
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    # Treat all pathspecs as LITERAL filenames — never as git
+    # pathspec magic (``:(top)``, ``:(glob)``, ``:!exclude``, etc.).
+    # A config ``source: ":(top)secrets.txt"`` (or any other
+    # magic prefix) would otherwise let ``git add -- <rel>`` reach
+    # outside the intended allowlist (Codex pass 17 caught this).
+    # Forced on the env so every subprocess invoked via ``_run_git``
+    # gets the protection — manager-side validators already reject
+    # ``:`` in sources but defense-in-depth here is cheap.
+    env["GIT_LITERAL_PATHSPECS"] = "1"
     proc = subprocess.run(
         ["git", *args],
         cwd=str(cwd) if cwd else None,

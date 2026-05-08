@@ -334,6 +334,19 @@ class PersonalizationPath(BaseModel):
                 "${HOME}; sources are paths inside the personalization "
                 "checkout and cannot reference the user's home directory"
             )
+        # Reject git pathspec magic prefixes/characters (Codex pass
+        # 17). ``:(top)`` / ``:!`` / leading ``:`` would otherwise
+        # let ``git add -- <rel>`` interpret the config value as
+        # a pathspec rather than a literal filename and reach
+        # outside the allowlist. ``GIT_LITERAL_PATHSPECS=1`` in the
+        # subprocess env is the defense-in-depth, but failing config
+        # load surfaces operator typos earlier.
+        if ":" in self.source:
+            raise ValueError(
+                f"personalization path source {self.source!r} contains "
+                "':'; ':' is reserved by git for pathspec magic and "
+                "cannot appear in a configured source path"
+            )
         for side, value in (("source", self.source), ("target", self.target)):
             for segment in value.split("/"):
                 if segment == "..":

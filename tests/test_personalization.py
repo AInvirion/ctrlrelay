@@ -253,6 +253,29 @@ class TestPersonalizationConfig:
         with pytest.raises(ConfigError, match="HOME"):
             load_config(path)
 
+    @pytest.mark.parametrize("bad_source", [
+        ":(top)secrets.txt",   # pathspec magic
+        ":(glob)*.md",
+        ":!exclude",
+        ":hidden",
+    ])
+    def test_pathspec_magic_in_source_rejected(
+        self, tmp_path: Path, bad_source: str
+    ) -> None:
+        """Codex pass 17: ``:`` introduces git pathspec magic. A
+        configured source with magic could let ``git add -- <rel>``
+        bypass the allowlist; reject at config load.
+        """
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "paths": [
+                {"source": bad_source, "target": "~/safe"},
+            ],
+        })))
+        with pytest.raises(ConfigError):
+            load_config(path)
+
     def test_target_dotdot_rejected(self, tmp_path: Path) -> None:
         """``..`` in target is also rejected for auditability."""
         path = tmp_path / "cfg.yaml"
