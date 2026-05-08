@@ -39,6 +39,7 @@ Design choices that are easy to miss in review:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -132,17 +133,25 @@ class PersonalizationManager:
         Returns a human-readable summary.
         """
         if self.checkout_path.exists():
-            if not self._is_existing_checkout_ours():
-                raise PersonalizationError(
-                    f"checkout_path {self.checkout_path} already exists and is not a "
-                    f"clone of {self.cfg.repo}; back it up or remove it before "
-                    "running init"
-                )
-            # Same repo already there — converge to the right branch and
-            # re-wire. Useful when ``init`` is re-run after a config change.
-            self._ensure_working_branch()
-            results = self.wire_symlinks()
-            return self._format_init_summary(results, cloned=False)
+            # An empty directory is fine — ``git clone <url> <empty-dir>``
+            # works. Treat as not-yet-cloned and fall through.
+            is_empty_dir = (
+                self.checkout_path.is_dir()
+                and not any(self.checkout_path.iterdir())
+            )
+            if not is_empty_dir:
+                if not self._is_existing_checkout_ours():
+                    raise PersonalizationError(
+                        f"checkout_path {self.checkout_path} already exists "
+                        f"and is not a clone of {self.cfg.repo}; back it up "
+                        "or remove it before running init"
+                    )
+                # Same repo already there — converge to the right
+                # branch and re-wire. Useful when ``init`` is re-run
+                # after a config change.
+                self._ensure_working_branch()
+                results = self.wire_symlinks()
+                return self._format_init_summary(results, cloned=False)
 
         self.checkout_path.parent.mkdir(parents=True, exist_ok=True)
         self._git_global("clone", self.repo_url, str(self.checkout_path))
@@ -602,17 +611,39 @@ class PersonalizationManager:
 
     # ----- internals: git helpers --------------------------------------------
 
+    # Parses owner/repo out of any common GitHub remote URL shape:
+    #   https://github.com/owner/repo(.git)?
+    #   git@github.com:owner/repo(.git)?
+    #   git://github.com/owner/repo(.git)?
+    #   ssh://git@github.com/owner/repo(.git)?
+    # Captures the LAST owner/repo before an optional ``.git`` /
+    # trailing slash. Anchored at end so a matching prefix earlier in
+    # the URL doesn't false-positive.
+    _ORIGIN_OWNER_REPO_RE = re.compile(
+        r"[/:]([^/:]+/[^/:]+?)(?:\.git)?/?\s*\Z"
+    )
+
     def _is_existing_checkout_ours(self) -> bool:
+        """Return True iff ``checkout_path`` is a clone of exactly
+        ``self.cfg.repo``.
+
+        The earlier substring-based check accepted prefix matches
+        (config ``acme/dot`` would accept origin ``acme/dotfiles``)
+        and could let init wire symlinks against the wrong repo.
+        Now we extract the trailing ``owner/repo`` from the origin
+        URL and compare exactly (case-insensitive — GitHub itself is
+        case-insensitive on these).
+        """
         if not (self.checkout_path / ".git").exists():
             return False
         try:
             origin = self._git("remote", "get-url", "origin").strip()
         except _GitError:
             return False
-        # Be permissive about the URL form (https vs ssh) but require
-        # the owner/repo to match.
-        owner_repo = self.cfg.repo.lower()
-        return owner_repo in origin.lower()
+        match = self._ORIGIN_OWNER_REPO_RE.search(origin)
+        if not match:
+            return False
+        return match.group(1).lower() == self.cfg.repo.lower()
 
     def _ensure_working_branch(self) -> None:
         """Make sure HEAD is on ``working_branch``, creating it from

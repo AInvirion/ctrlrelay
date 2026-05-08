@@ -21,18 +21,20 @@ personalization repo and stay out of the project's own git history.
 - **Per-project specs and superpower outputs** — write to:
 
   ```
-  <project-parent>/specs/<owner>-<project-name>/<topic>.md
+  <project-parent>/specs/<owner>--<project-name>/<topic>.md
   ```
 
-  The `<owner>-<project-name>` flat slug matches the `${PROJECT}` placeholder
-  in `orchestrator.yaml` (e.g. `AInvirion-ctrlrelay`), so the file lands inside
-  the directory ctrlrelay symlinks into the personalization repo. Using the
-  bare repo name (e.g. just `ctrlrelay`) instead would write outside the
-  symlinked dir and the artifact would never sync.
+  The `<owner>--<project-name>` (DOUBLE hyphen) flat slug matches the
+  `${PROJECT}` placeholder in `orchestrator.yaml` (e.g.
+  `AInvirion--ctrlrelay`), so the file lands inside the directory ctrlrelay
+  symlinks into the personalization repo. Double hyphen avoids collisions
+  like `a-b/c` vs `a/b-c` flattening to the same single-hyphen string.
+  Using the bare repo name (e.g. just `ctrlrelay`) instead would write
+  outside the symlinked dir and the artifact would never sync.
 
   Example: working in `~/Projects/AINVIRION/ctrlrelay`, a feature spec for
   "personalization-sync" goes in
-  `~/Projects/AINVIRION/specs/AInvirion-ctrlrelay/personalization-sync.md`.
+  `~/Projects/AINVIRION/specs/AInvirion--ctrlrelay/personalization-sync.md`.
   Never inside the project repo itself — keeps the project's `git status`
   and PR diff clean and avoids leaking instructions/strategy notes if the
   repo is shared or made public.

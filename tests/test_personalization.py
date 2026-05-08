@@ -117,10 +117,14 @@ class TestResolveTemplate:
 
 class TestProjectSlug:
     def test_simple(self) -> None:
-        assert project_slug("AInvirion/ctrlrelay") == "AInvirion-ctrlrelay"
+        assert project_slug("AInvirion/ctrlrelay") == "AInvirion--ctrlrelay"
 
-    def test_idempotent_on_already_flat(self) -> None:
-        assert project_slug("AInvirion-ctrlrelay") == "AInvirion-ctrlrelay"
+    def test_no_collision_between_hyphenated_pairs(self) -> None:
+        # Codex pass 6 finding: single-hyphen flattening collides for
+        # ``a-b/c`` and ``a/b-c``. Double-hyphen separator avoids it.
+        assert project_slug("a-b/c") != project_slug("a/b-c")
+        assert project_slug("a-b/c") == "a-b--c"
+        assert project_slug("a/b-c") == "a--b-c"
 
 
 # ---------- Layer 2: config loading ------------------------------------------
@@ -399,7 +403,9 @@ class TestSymlinkWiring:
         not_cloned = tmp_path / "not_cloned"  # deliberately not created
 
         # Source dir exists in checkout for the cloned repo only.
-        (empty_checkout / "claude-memory" / "owner-cloned").mkdir(parents=True)
+        # ``project_slug("owner/cloned")`` is ``"owner--cloned"`` —
+        # double-hyphen separator (collision-free).
+        (empty_checkout / "claude-memory" / "owner--cloned").mkdir(parents=True)
 
         config = _build_config(
             checkout_path=empty_checkout,
@@ -1012,6 +1018,76 @@ class TestManagerErrors:
         _patch_remote_url(mgr, str(remote_bare))
         with pytest.raises(PersonalizationError, match="back it up"):
             mgr.init()
+
+    def test_init_rejects_prefix_matched_existing_clone(
+        self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        """Earlier ``_is_existing_checkout_ours`` used ``in`` against
+        the origin URL — so if config repo was ``acme/dot`` and the
+        existing clone's origin was ``acme/dotfiles``, init would
+        wrongly converge against the foreign clone. Codex pass 6
+        caught this.
+        """
+        base = tmp_path_factory.mktemp("dotfiles")
+        bare = _git_init_bare(base / "dotfiles.git")
+        seed = base / "seed"
+        _git_init_with_initial_commit(seed, remote_url=str(bare))
+
+        # Pre-existing clone of acme/dotfiles at the configured path.
+        checkout = tmp_path / "personalization"
+        _git("clone", str(bare), str(checkout), cwd=tmp_path)
+        # Rewrite origin to the prefix-collision URL so the check has
+        # something to match against (test uses local bare; we
+        # spoof the remote name).
+        _git(
+            "remote", "set-url", "origin",
+            "https://github.com/acme/dotfiles.git",
+            cwd=checkout,
+        )
+
+        cfg = Config.model_validate({
+            "version": "1",
+            "node_id": "machine-x",
+            "timezone": "UTC",
+            "paths": {
+                "state_db": "/tmp/state.db",
+                "worktrees": "/tmp/worktrees",
+                "bare_repos": "/tmp/bare",
+                "contexts": "/tmp/contexts",
+                "skills": "/tmp/skills",
+            },
+            "transport": {
+                "type": "file_mock",
+                "file_mock": {"inbox": "/tmp/in", "outbox": "/tmp/out"},
+            },
+            "dashboard": {"enabled": False},
+            "personalization": {
+                # Config repo is prefix of the existing clone's repo.
+                "repo": "acme/dot",
+                "checkout_path": str(checkout),
+                "paths": [],
+            },
+            "repos": [],
+        })
+        mgr = PersonalizationManager(cfg)
+        with pytest.raises(PersonalizationError, match="not a clone"):
+            mgr.init()
+
+    def test_init_clones_into_empty_directory(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        """If checkout_path exists as an empty directory (e.g. created
+        by provisioning), init should clone into it rather than
+        refuse. Codex pass 6 caught this.
+        """
+        checkout = tmp_path / "personalization"
+        checkout.mkdir()  # empty
+        config = _config_for(checkout, remote_bare, node_id="machine-empty-dir")
+        mgr = PersonalizationManager(config)
+        _patch_remote_url(mgr, str(remote_bare))
+        # Should NOT raise: empty dir is fine for clone target.
+        mgr.init()
+        assert (checkout / ".git").exists()
 
     def test_status_works_before_init(self, tmp_path: Path, remote_bare: Path) -> None:
         # status should not raise when the checkout doesn't exist yet —

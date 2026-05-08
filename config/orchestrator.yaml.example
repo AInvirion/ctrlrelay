@@ -70,7 +70,8 @@ schedules:
 #
 # Placeholders allowed in `source` and `target`:
 #   ${HOME}             -- current user's home
-#   ${PROJECT}          -- <owner>-<repo> flat slug (project_scoped only)
+#   ${PROJECT}          -- <owner>--<repo> flat slug (project_scoped only;
+#                          double hyphen avoids collisions like a-b/c vs a/b-c)
 #   ${PROJECT_ENCODED}  -- Claude's path encoding (project_scoped only)
 #   ${PROJECT_LOCAL}    -- absolute path of the repo's local checkout
 #   ${PROJECT_PARENT}   -- parent dir of ${PROJECT_LOCAL}

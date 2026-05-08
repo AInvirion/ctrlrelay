@@ -124,13 +124,20 @@ def resolve_template(template: str, ctx: TemplateContext) -> Path:
     return Path(result).expanduser()
 
 
+_PROJECT_SLUG_SEP = "--"
+
+
 def project_slug(repo_name: str) -> str:
-    """Flatten an ``owner/repo`` string to ``owner-repo``.
+    """Flatten an ``owner/repo`` string to ``owner--repo``.
 
     Used both for the ``${PROJECT}`` placeholder value and for the
     on-disk source-tree directory name inside the personalization
-    repo (e.g. ``claude-memory/AInvirion-ctrlrelay/``). Avoids nested
-    owner subdirectories and avoids collisions across orgs that use
-    the same repo name.
+    repo (e.g. ``claude-memory/AInvirion--ctrlrelay/``). Avoids
+    nested owner subdirectories and, importantly, avoids collisions
+    where ``a-b/c`` and ``a/b-c`` would both flatten to ``a-b-c``
+    under a single-hyphen scheme. Double-hyphen is collision-free
+    for valid GitHub owner/repo pairs because GitHub disallows
+    consecutive hyphens in owner names (Codex review pass 6 caught
+    this).
     """
-    return repo_name.replace("/", "-")
+    return repo_name.replace("/", _PROJECT_SLUG_SEP)
