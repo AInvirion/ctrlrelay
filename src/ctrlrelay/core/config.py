@@ -226,6 +226,216 @@ class RepoConfig(BaseModel):
         return v
 
 
+_GIT_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _is_safe_git_ref_component(value: str) -> bool:
+    """Return True iff ``value`` is safe as part of a git branch/ref name.
+
+    Allow-list: ``letters, digits, '.', '_', '-'`` (Codex pass 7).
+    Plus the structural rules ``git check-ref-format --branch``
+    enforces — no leading ``-``/``.``, no ``..``, no trailing ``.``,
+    no ``.lock`` suffix (Codex pass 8 caught the trailing-``.``
+    case slipping through). Doing this as an explicit allow-list
+    keeps the config error synchronous with load and avoids late git
+    failures during ``init``/``push``.
+    """
+    if not value:
+        return False
+    if value.startswith("-") or value.startswith("."):
+        return False
+    if value.endswith(".") or value.endswith(".lock"):
+        return False
+    if ".." in value:
+        return False
+    return bool(_GIT_BRANCH_NAME_RE.match(value))
+
+
+_ALLOWED_PATH_PLACEHOLDERS = frozenset({
+    "HOME",
+    "PROJECT",
+    "PROJECT_ENCODED",
+    "PROJECT_LOCAL",
+    "PROJECT_PARENT",
+})
+
+_PROJECT_PLACEHOLDERS = frozenset({
+    "PROJECT",
+    "PROJECT_ENCODED",
+    "PROJECT_LOCAL",
+    "PROJECT_PARENT",
+})
+
+_PLACEHOLDER_RE = re.compile(r"\$\{([A-Z_]+)\}")
+
+
+def _extract_placeholders(text: str) -> set[str]:
+    return set(_PLACEHOLDER_RE.findall(text))
+
+
+class PersonalizationPath(BaseModel):
+    """One source-to-target sync entry inside the personalization repo.
+
+    ``source`` is a path inside the personalization repo working tree
+    (e.g. ``global/CLAUDE.md`` or ``claude-memory/${PROJECT}/``).
+    ``target`` is the on-disk symlink destination outside the repo
+    (e.g. ``~/.claude/CLAUDE.md`` or ``${PROJECT_PARENT}/specs/${PROJECT}/``).
+
+    A trailing ``/`` on either side denotes a directory; a missing slash
+    denotes a single file. The two sides must agree — a directory source
+    cannot map to a file target. Validation enforces this at load time.
+
+    ``project_scoped: true`` makes the entry iterate over ``config.repos``
+    at wire-time. A non-project-scoped entry that references project
+    placeholders is rejected: it would resolve to garbage.
+    """
+
+    source: str
+    target: str
+    project_scoped: bool = False
+
+    @model_validator(mode="after")
+    def validate_placeholders_and_shape(self) -> "PersonalizationPath":
+        for side, value in (("source", self.source), ("target", self.target)):
+            if not value:
+                raise ValueError(f"personalization path {side} must not be empty")
+            placeholders = _extract_placeholders(value)
+            unknown = placeholders - _ALLOWED_PATH_PLACEHOLDERS
+            if unknown:
+                raise ValueError(
+                    f"personalization path {side} {value!r} references unknown "
+                    f"placeholders: {sorted(unknown)} "
+                    f"(allowed: {sorted(_ALLOWED_PATH_PLACEHOLDERS)})"
+                )
+            if not self.project_scoped and (placeholders & _PROJECT_PLACEHOLDERS):
+                raise ValueError(
+                    f"personalization path {side} {value!r} uses project "
+                    "placeholders but project_scoped is false; either set "
+                    "project_scoped: true or remove the placeholders"
+                )
+
+        # ``source`` is documented as a path inside the personalization
+        # repo (joined to ``checkout_path`` at wire time). Reject ``..``
+        # segments and absolute paths so an entry can't escape the
+        # checkout, e.g. ``source: ../secret`` (Codex pass 8). Also
+        # reject ``${HOME}`` in source: it's a valid placeholder for
+        # targets, but in source it's nonsensical (would resolve to a
+        # subdir literally named after $HOME, which the wire code
+        # would silently mark as source-missing — Codex pass 11).
+        # Reject ``..`` in target too for auditability.
+        if self.source.startswith("/"):
+            raise ValueError(
+                f"personalization path source {self.source!r} must be "
+                "relative to the personalization checkout, not absolute"
+            )
+        if "${HOME}" in self.source:
+            raise ValueError(
+                f"personalization path source {self.source!r} uses "
+                "${HOME}; sources are paths inside the personalization "
+                "checkout and cannot reference the user's home directory"
+            )
+        # Reject git pathspec magic prefixes/characters (Codex pass
+        # 17). ``:(top)`` / ``:!`` / leading ``:`` would otherwise
+        # let ``git add -- <rel>`` interpret the config value as
+        # a pathspec rather than a literal filename and reach
+        # outside the allowlist. ``GIT_LITERAL_PATHSPECS=1`` in the
+        # subprocess env is the defense-in-depth, but failing config
+        # load surfaces operator typos earlier.
+        if ":" in self.source:
+            raise ValueError(
+                f"personalization path source {self.source!r} contains "
+                "':'; ':' is reserved by git for pathspec magic and "
+                "cannot appear in a configured source path"
+            )
+        for side, value in (("source", self.source), ("target", self.target)):
+            for segment in value.split("/"):
+                if segment == "..":
+                    raise ValueError(
+                        f"personalization path {side} {value!r} contains "
+                        "'..' segment; paths must not escape their root"
+                    )
+
+        # File-vs-dir agreement: if one side ends with '/', the other must too.
+        src_is_dir = self.source.endswith("/")
+        tgt_is_dir = self.target.endswith("/")
+        if src_is_dir != tgt_is_dir:
+            raise ValueError(
+                f"personalization path source {self.source!r} and target "
+                f"{self.target!r} disagree on directory vs file (trailing "
+                "slash must match on both)"
+            )
+        return self
+
+
+class Personalization(BaseModel):
+    """Personalization sync configuration.
+
+    A separate (typically private) GitHub repo holds the operator's
+    cross-machine context: global Claude config, per-project memory,
+    spec/superpower outputs, workspace planning docs. ctrlrelay clones
+    it once per machine and wires symlinks per the ``paths`` list. Per-
+    machine work happens on a ``personalization/<node_id>`` branch that
+    auto-rebases onto ``main_branch`` on push, so concurrent edits across
+    machines never force-push each other's deltas.
+    """
+
+    repo: str
+    checkout_path: Path = Field(
+        default_factory=lambda: Path("~/.ctrlrelay/personalization").expanduser()
+    )
+    # Branch name on the remote that holds the canonical state. ``push``
+    # rebases the per-node working branch onto this; ``pull`` resets the
+    # local copy of this branch to match origin so a fresh wire reflects
+    # what the rest of the fleet has agreed on.
+    main_branch: str = "main"
+    # Per-machine working branch is ``personalization/<node_id>``. When
+    # unset, the parent ``Config`` substitutes its top-level ``node_id``
+    # (which itself defaults to ``socket.gethostname()``).
+    node_id: str | None = None
+    paths: list[PersonalizationPath] = Field(default_factory=list)
+
+    @field_validator("repo")
+    @classmethod
+    def validate_repo(cls, v: str) -> str:
+        if not _REPO_NAME_RE.match(v):
+            raise ValueError(
+                f"personalization repo {v!r} must match 'owner/repo' "
+                f"(letters, digits, '.', '_', '-')"
+            )
+        return v
+
+    @field_validator("checkout_path", mode="before")
+    @classmethod
+    def expand_checkout_path(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return Path(v).expanduser()
+        return v
+
+    @field_validator("main_branch")
+    @classmethod
+    def validate_main_branch(cls, v: str) -> str:
+        if not _is_safe_git_ref_component(v):
+            raise ValueError(
+                f"invalid main_branch {v!r} "
+                "(allowed: letters, digits, '.', '_', '-'; no leading "
+                "'-' or '.', no '..')"
+            )
+        return v
+
+    @field_validator("node_id")
+    @classmethod
+    def validate_node_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not _is_safe_git_ref_component(v):
+            raise ValueError(
+                f"invalid personalization node_id {v!r} "
+                "(used as a git branch component; allowed: letters, "
+                "digits, '.', '_', '-'; no leading '-' or '.', no '..')"
+            )
+        return v
+
+
 class SchedulesConfig(BaseModel):
     """Cron schedules for background jobs run by the poller daemon.
 
@@ -266,6 +476,7 @@ class Config(BaseModel):
     transport: TransportConfig
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
+    personalization: Personalization | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
 
     @model_validator(mode="before")
@@ -310,6 +521,52 @@ class Config(BaseModel):
         ``config.claude.binary`` keep working. New code should prefer
         ``config.agent.*``."""
         return self.agent
+
+    def personalization_branch(self) -> str | None:
+        """Per-machine working branch name for personalization sync.
+
+        Falls back to the top-level ``node_id`` when ``personalization.node_id``
+        is unset. Returns ``None`` if personalization isn't configured.
+
+        ``validate_effective_personalization_node_id`` ensures the
+        effective node id is git-branch-safe at load time, so this
+        property never returns a name git would reject.
+        """
+        if self.personalization is None:
+            return None
+        node = self.personalization.node_id or self.node_id
+        return f"personalization/{node}"
+
+    @model_validator(mode="after")
+    def validate_effective_personalization_node_id(self) -> "Config":
+        """Reject configs where the EFFECTIVE personalization node_id
+        (after fallback to top-level ``node_id`` / hostname) is not
+        safe as part of a git branch name.
+
+        ``Personalization.node_id`` is already validated when set
+        explicitly, but the fallback path takes the top-level
+        ``node_id`` whose constraints are looser (it's used for
+        non-git purposes too — dashboard identity, etc.). Without
+        this check, a host whose ``socket.gethostname()`` returns
+        ``"Oscar's MacBook"`` would load fine and only fail later
+        when ``ctrlrelay personalization init`` shells out to
+        ``git checkout -b personalization/Oscar's MacBook``.
+        """
+        if self.personalization is None:
+            return self
+        if self.personalization.node_id is not None:
+            # Already validated by Personalization.validate_node_id.
+            return self
+        if not _is_safe_git_ref_component(self.node_id):
+            raise ValueError(
+                f"effective personalization node_id {self.node_id!r} (from "
+                "top-level node_id) is not safe as part of a git branch "
+                "name; either set personalization.node_id explicitly to a "
+                "branch-safe value (letters, digits, '.', '_', '-'; no "
+                "leading '-' or '.', no '..') or change the top-level "
+                "node_id"
+            )
+        return self
 
     @model_validator(mode="after")
     def derive_repo_local_paths(self) -> "Config":

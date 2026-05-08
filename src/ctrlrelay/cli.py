@@ -1989,6 +1989,144 @@ def poller_status(
     raise typer.Exit(1)
 
 
+personalization_app = typer.Typer(help="Personalization sync (cross-machine operator state).")
+app.add_typer(personalization_app, name="personalization")
+
+
+def _load_config_or_exit(config_path: str | None):
+    """Resolve --config and load it, mapping ConfigError to a typer.Exit."""
+    path = _resolve_config_or_exit(config_path)
+    try:
+        return load_config(path)
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+
+def _make_personalization_manager(config_path: str | None):
+    """Return a configured PersonalizationManager or exit with a helpful error."""
+    from ctrlrelay.personalization import PersonalizationManager
+    from ctrlrelay.personalization.manager import PersonalizationError
+
+    config = _load_config_or_exit(config_path)
+    if config.personalization is None:
+        console.print(
+            "[red]Error:[/red] No personalization config in orchestrator.yaml. "
+            "Add a `personalization:` section (see config/orchestrator.yaml.example) "
+            "and re-run."
+        )
+        raise typer.Exit(1)
+    try:
+        return PersonalizationManager(config)
+    except PersonalizationError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@personalization_app.command("init")
+def personalization_init(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+) -> None:
+    """Clone the personalization repo and wire symlinks.
+
+    Idempotent: re-running on a machine that already cloned the repo
+    converges branch + symlinks rather than failing.
+    """
+    from ctrlrelay.personalization.manager import PersonalizationError
+
+    mgr = _make_personalization_manager(config_path)
+    try:
+        summary = mgr.init()
+    except PersonalizationError as e:
+        console.print(f"[red]Init failed:[/red] {e}")
+        raise typer.Exit(1)
+    console.print(summary)
+
+
+@personalization_app.command("status")
+def personalization_status(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+) -> None:
+    """Show working-tree state and per-symlink correctness. Read-only."""
+    mgr = _make_personalization_manager(config_path)
+    console.print(mgr.status())
+
+
+@personalization_app.command("push")
+def personalization_push(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+    message: str | None = typer.Option(
+        None,
+        "--message",
+        "-m",
+        help="Commit message override (default: auto-generated from branch name).",
+    ),
+) -> None:
+    """Commit, rebase onto main, and push. Aborts the rebase on conflict.
+
+    On conflict the working tree is restored to its pre-rebase state and
+    the conflicting files are listed; resolve them in the checkout (the
+    target of any symlinked path), commit manually, and re-run push.
+    """
+    from ctrlrelay.personalization.manager import PersonalizationError
+
+    mgr = _make_personalization_manager(config_path)
+    try:
+        result = mgr.push(message=message)
+    except PersonalizationError as e:
+        console.print(f"[red]Push failed:[/red] {e}")
+        raise typer.Exit(1)
+    console.print(result.summary)
+    if result.conflict_files:
+        console.print("[yellow]conflicts:[/yellow]")
+        for f in result.conflict_files:
+            console.print(f"  {f}")
+    if not result.success:
+        raise typer.Exit(1)
+
+
+@personalization_app.command("pull")
+def personalization_pull(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+) -> None:
+    """Fetch + rebase the local working branch and re-wire symlinks."""
+    from ctrlrelay.personalization.manager import PersonalizationError
+
+    mgr = _make_personalization_manager(config_path)
+    try:
+        result = mgr.pull()
+    except PersonalizationError as e:
+        console.print(f"[red]Pull failed:[/red] {e}")
+        raise typer.Exit(1)
+    console.print(result.summary)
+    if result.conflict_files:
+        console.print("[yellow]conflicts:[/yellow]")
+        for f in result.conflict_files:
+            console.print(f"  {f}")
+    if not result.success:
+        raise typer.Exit(1)
+
+
 @app.command("version")
 def version() -> None:
     """Print the package version."""

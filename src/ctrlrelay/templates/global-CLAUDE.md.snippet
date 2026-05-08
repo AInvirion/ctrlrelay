@@ -1,0 +1,61 @@
+<!--
+  Append the block below to your global ~/.claude/CLAUDE.md. It establishes
+  a filing convention for spec docs and superpower outputs that pairs with
+  ctrlrelay's personalization sync — Claude writes to predictable paths,
+  ctrlrelay's `paths` config picks them up by default, and nothing pollutes
+  the project's own git repo.
+
+  The placeholders below (<project>, <project-parent>, <workspace>) are
+  illustrative for human readers. Claude resolves them from the cwd it
+  was launched in; ctrlrelay's `${PROJECT}`, `${PROJECT_PARENT}`, etc.
+  resolve them from `RepoConfig.local_path` at symlink-time.
+-->
+
+## Filing convention for generated artifacts
+
+When you produce artifacts that should outlive a single conversation (spec
+docs, design notes, superpower definitions, multi-step plans, runbooks),
+follow these paths so they sync across machines via ctrlrelay's
+personalization repo and stay out of the project's own git history.
+
+- **Per-project specs and superpower outputs** — write to:
+
+  ```
+  <project-parent>/specs/<owner>--<project-name>/<topic>.md
+  ```
+
+  The `<owner>--<project-name>` (DOUBLE hyphen) flat slug matches the
+  `${PROJECT}` placeholder in `orchestrator.yaml` (e.g.
+  `AInvirion--ctrlrelay`), so the file lands inside the directory ctrlrelay
+  symlinks into the personalization repo. Double hyphen avoids collisions
+  like `a-b/c` vs `a/b-c` flattening to the same single-hyphen string.
+  Using the bare repo name (e.g. just `ctrlrelay`) instead would write
+  outside the symlinked dir and the artifact would never sync.
+
+  Example: working in `~/Projects/AINVIRION/ctrlrelay`, a feature spec for
+  "personalization-sync" goes in
+  `~/Projects/AINVIRION/specs/AInvirion--ctrlrelay/personalization-sync.md`.
+  Never inside the project repo itself — keeps the project's `git status`
+  and PR diff clean and avoids leaking instructions/strategy notes if the
+  repo is shared or made public.
+
+- **Multi-repo workspace planning docs** — write to:
+
+  ```
+  <workspace>/notes/<topic>.md
+  ```
+
+  Example: `~/Projects/RESEARCH/DMP/notes/RELEASE_ROADMAP.md`. Use this
+  for content that spans several repos under one parent directory.
+
+- **Per-project Claude memory** — keep using
+  `~/.claude/projects/<encoded>/memory/` as you do now; ctrlrelay
+  manages the symlink to the personalization repo.
+
+- **Global Claude config (this file, skills, agents, commands)** —
+  edit normally under `~/.claude/`; ctrlrelay's symlinks make those
+  edits land in the personalization repo for sync.
+
+If you produce an artifact and these paths don't fit, ASK before writing
+it inside a project's source tree. The default answer is "outside the
+project, in the workspace's `specs/` or `notes/`."
