@@ -618,6 +618,24 @@ class PersonalizationManager:
             # safe to run on a partial repo.
             return SymlinkResult(plan=plan, action="skipped-source-missing")
 
+        # Source's actual on-disk type must match what the config says
+        # (trailing slash → dir, no slash → file). A directory entry
+        # accidentally present as a regular file (or vice versa)
+        # would otherwise wire a symlink that breaks downstream
+        # consumers (Codex pass 15). Refuse loudly with a hint.
+        actual_is_dir = plan.source.is_dir()
+        if plan.is_dir != actual_is_dir:
+            expected = "directory" if plan.is_dir else "file"
+            actual = "directory" if actual_is_dir else "file"
+            return SymlinkResult(
+                plan=plan,
+                action="skipped-source-type-mismatch",
+                detail=(
+                    f"config declares {expected} (target/source trailing "
+                    f"slash) but on-disk source is a {actual}"
+                ),
+            )
+
         # Ensure parent dir of target exists.
         plan.target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -650,6 +668,10 @@ class PersonalizationManager:
         """Read-only counterpart to ``_apply_symlink`` for ``status``."""
         if not plan.source.exists():
             return "source-missing"
+        if plan.is_dir != plan.source.is_dir():
+            expected = "directory" if plan.is_dir else "file"
+            actual = "directory" if plan.source.is_dir() else "file"
+            return f"source-type-mismatch (config={expected}, on-disk={actual})"
         if plan.target.is_symlink():
             current = plan.target.readlink()
             if current == plan.source or self._same_resolved(current, plan.source):
@@ -909,7 +931,15 @@ class PersonalizationManager:
 # Module-level helpers (kept outside the class so tests can patch them)
 
 
-class _GitError(Exception):
+class _GitError(PersonalizationError):
+    """Raised when a git subprocess invoked by the manager exits non-zero.
+
+    Subclasses ``PersonalizationError`` so the CLI's ``PersonalizationError``
+    handlers catch git failures (auth, network, unborn HEAD reads, etc.)
+    and emit a clean error instead of a traceback. Codex pass 15 caught
+    that bare ``Exception`` made these escape the CLI wrappers.
+    """
+
     def __init__(
         self, args: tuple[str, ...], returncode: int, stdout: str, stderr: str
     ):

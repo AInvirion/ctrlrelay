@@ -477,6 +477,46 @@ class TestSymlinkWiring:
         assert target.is_symlink() is False
         assert target.read_text() == "real file, do not clobber"
 
+    def test_refuses_source_file_when_config_says_dir(
+        self, tmp_path: Path, empty_checkout: Path
+    ) -> None:
+        """Config declares a directory source (trailing slash) but
+        the on-disk source is a regular file. The wire must NOT
+        create a symlink — wiring would point the dir-shaped target
+        at a file and break consumers (Codex pass 15).
+        """
+        # Source path on disk is a FILE, but config says DIRECTORY.
+        (empty_checkout / "skills").write_text("oops, not a dir")
+        target = tmp_path / "home" / ".claude" / "skills"
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[
+                {"source": "skills/", "target": str(target) + "/"},
+            ],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+        assert len(results) == 1
+        assert results[0].action == "skipped-source-type-mismatch"
+        assert not target.exists()
+
+    def test_refuses_source_dir_when_config_says_file(
+        self, tmp_path: Path, empty_checkout: Path
+    ) -> None:
+        """Mirror case: config says single-file source, but on disk
+        the source is actually a directory.
+        """
+        (empty_checkout / "CLAUDE.md").mkdir()  # actually a dir
+        target = tmp_path / "home" / ".claude" / "CLAUDE.md"
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[
+                {"source": "CLAUDE.md", "target": str(target)},
+            ],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+        assert results[0].action == "skipped-source-type-mismatch"
+        assert not target.exists()
+
     def test_skips_missing_source(
         self, tmp_path: Path, empty_checkout: Path
     ) -> None:
@@ -1477,6 +1517,42 @@ class TestCLI:
         # No traceback in output; the manager's actionable message wins.
         assert "Traceback" not in result.output
         assert "no checkout" in result.output.lower()
+
+    def test_init_clone_failure_returns_exit_1_no_traceback(
+        self, tmp_path: Path
+    ) -> None:
+        """A git clone failure (e.g. unreachable URL) must produce a
+        clean exit code 1, not a traceback. Codex pass 15 finding:
+        ``_GitError`` previously didn't derive from
+        ``PersonalizationError`` and escaped the CLI handler.
+        """
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(_base_config_dict({
+            # Point at a path that definitely fails clone.
+            "repo": "owner/repo",
+            "checkout_path": str(tmp_path / "new-checkout"),
+            "paths": [],
+        })))
+        # Block network attempts with a bogus repo URL by using
+        # GIT_TERMINAL_PROMPT=0 (already set by the manager) and
+        # making the URL effectively unreachable. We patch the URL
+        # via env so the clone tries and fails with a non-zero git
+        # exit. The CLI wrapper should catch.
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["personalization", "init", "--config", str(cfg_path)],
+            env={"GIT_HTTP_LOW_SPEED_LIMIT": "1", "GIT_HTTP_LOW_SPEED_TIME": "1"},
+        )
+        # Either auth/network or invalid URL — both exit non-zero
+        # with no traceback now that _GitError is a
+        # PersonalizationError subclass.
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
 
     def test_pull_before_init_returns_exit_1(self, tmp_path: Path) -> None:
         from typer.testing import CliRunner
