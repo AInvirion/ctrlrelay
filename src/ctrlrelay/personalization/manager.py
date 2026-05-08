@@ -377,22 +377,24 @@ class PersonalizationManager:
                     conflict_files=files,
                 )
 
-            # Iteration 1: plain push (creates the per-machine branch
-            # on the remote if missing, FF otherwise).
-            # Iteration 2+: ``--force-with-lease``. After an FF-
-            # rejection on the previous iteration, the rebase that
-            # opens this iteration rewrites our local commit on top
-            # of the new origin/main, so a plain push to the per-
-            # machine branch is non-FF on the remote (Codex review
-            # pass 2 caught this). Lease checks against the local
-            # remote-tracking ref, which the fetch above just
-            # refreshed — so this only force-pushes when WE hold the
-            # only outstanding update. Per-machine branches are by
-            # design owned by exactly one node; an unexpected
-            # concurrent update would still be rejected by the lease,
-            # exactly as intended.
+            # Push the per-machine branch. Use ``--force-with-lease``
+            # whenever the local working branch has diverged from
+            # ``origin/<working_branch>`` (i.e., the rebase rewrote
+            # commits that origin already had). This is BROADER than
+            # just iteration > 1 within this call: if a previous
+            # invocation left ``origin/<working_branch>`` updated but
+            # ``origin/main`` not fast-forwarded (process interrupted,
+            # retry budget exhausted, etc.), the rebase at the top of
+            # this iteration rewrites the local commit and a plain
+            # push is non-FF on the per-machine branch. Codex review
+            # pass 9 caught this state-bridging case. Lease still
+            # protects against an unexpected concurrent update to the
+            # per-machine branch — per-machine branches are owned by
+            # exactly one node by design, so the lease almost always
+            # passes here, but if a stray update slips in we fail
+            # safely instead of clobbering it.
             push_cmd: list[str] = ["push", "origin", self.working_branch]
-            if attempt > 1:
+            if self._working_branch_diverged_from_origin():
                 push_cmd.insert(1, "--force-with-lease")
             try:
                 self._git(*push_cmd)
@@ -687,6 +689,33 @@ class PersonalizationManager:
 
     def _current_branch(self) -> str:
         return self._git("rev-parse", "--abbrev-ref", "HEAD").strip()
+
+    def _working_branch_diverged_from_origin(self) -> bool:
+        """Return True iff ``origin/<working_branch>`` exists and is
+        NOT an ancestor of the local ``working_branch``.
+
+        Used to decide whether the per-machine branch push needs
+        ``--force-with-lease``. Plain push works when:
+          - origin counterpart doesn't exist yet (first push), OR
+          - origin counterpart is an ancestor of local (FF possible).
+        Otherwise the rebase has rewritten commits that origin still
+        has on the per-machine branch and we need a leased force.
+        """
+        remote_exists = self._git_capturing(
+            "show-ref", "--verify", "--quiet",
+            f"refs/remotes/origin/{self.working_branch}",
+            check=False,
+        ).returncode == 0
+        if not remote_exists:
+            return False
+        # ``--is-ancestor A B`` exits 0 when A is ancestor of B (or
+        # equal). If origin is ancestor of local, FF push works.
+        is_ancestor = self._git_capturing(
+            "merge-base", "--is-ancestor",
+            f"origin/{self.working_branch}", self.working_branch,
+            check=False,
+        ).returncode == 0
+        return not is_ancestor
 
     def _stage_configured_paths(self) -> bool:
         """``git add -A`` each on-disk location of configured sources.

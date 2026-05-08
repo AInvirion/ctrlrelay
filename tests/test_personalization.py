@@ -1027,6 +1027,62 @@ class TestPushDeletionAndContention:
         email = _git("config", "--get", "user.email", cwd=checkout).strip()
         assert email == "ctrlrelay@local"
 
+    def test_push_recovers_when_origin_branch_ahead_of_main(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        """A previous invocation may have left
+        ``origin/personalization/<node>`` updated while
+        ``origin/main`` did NOT fast-forward (interrupted, retry
+        budget exhausted, etc.). The next push must rebase locally
+        and force-with-lease the per-machine branch — earlier the
+        first attempt was a plain push that hit non-FF rejection on
+        the per-machine branch and exited before retry-2 engaged
+        force-with-lease. Codex review pass 9 caught this.
+        """
+        # Bring the world into the broken state: A pushes successfully,
+        # then a sidecar advances origin/main, leaving A's local
+        # branch out of date with origin/main but A's branch on origin
+        # still at its old SHA (i.e. origin/personalization/A is
+        # behind both origin/main AND what A's local branch will
+        # become after rebase).
+        a_checkout = tmp_path / "machine-a" / "personalization"
+        a_config = _config_for(a_checkout, remote_bare, node_id="machine-a")
+        a_mgr = PersonalizationManager(a_config)
+        _patch_remote_url(a_mgr, str(remote_bare))
+        a_mgr.init()
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "CLAUDE.md").write_text("rev1\n")
+        first = a_mgr.push(message="rev1")
+        assert first.success, first.summary
+
+        # Sidecar push to advance origin/main without touching A's
+        # per-machine branch. After this:
+        #   origin/main = rev1 + sidecar
+        #   origin/personalization/machine-a = rev1
+        sidecar = tmp_path / "sidecar"
+        _git("clone", str(remote_bare), str(sidecar), cwd=tmp_path)
+        _git("config", "user.email", "x@x", cwd=sidecar)
+        _git("config", "user.name", "Sidecar", cwd=sidecar)
+        (sidecar / "advance.md").write_text("advance\n")
+        _git("add", "advance.md", cwd=sidecar)
+        _git("commit", "-m", "advance main", cwd=sidecar)
+        _git("push", "origin", "main", cwd=sidecar)
+
+        # Now A wants to make another change. With the bug, the
+        # rebase at the start of push() rewrites A's commit, plain
+        # push to per-machine branch is non-FF and fails on attempt
+        # 1, and the function exits before retry-2 can engage
+        # force-with-lease.
+        (a_checkout / "global" / "CLAUDE.md").write_text("rev2\n")
+        result = a_mgr.push(message="rev2")
+        assert result.success, result.summary
+        # All three commits should now be on origin/main: rev1, the
+        # sidecar advance, and rev2.
+        verify = tmp_path / "verify"
+        _git("clone", str(remote_bare), str(verify), cwd=tmp_path)
+        assert (verify / "advance.md").exists()
+        assert (verify / "global" / "CLAUDE.md").read_text() == "rev2\n"
+
     def test_init_works_with_non_default_main_branch(
         self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
     ) -> None:
