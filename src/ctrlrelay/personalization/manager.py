@@ -278,8 +278,25 @@ class PersonalizationManager:
                     conflict_files=files,
                 )
 
+            # Iteration 1: plain push (creates the per-machine branch
+            # on the remote if missing, FF otherwise).
+            # Iteration 2+: ``--force-with-lease``. After an FF-
+            # rejection on the previous iteration, the rebase that
+            # opens this iteration rewrites our local commit on top
+            # of the new origin/main, so a plain push to the per-
+            # machine branch is non-FF on the remote (Codex review
+            # pass 2 caught this). Lease checks against the local
+            # remote-tracking ref, which the fetch above just
+            # refreshed — so this only force-pushes when WE hold the
+            # only outstanding update. Per-machine branches are by
+            # design owned by exactly one node; an unexpected
+            # concurrent update would still be rejected by the lease,
+            # exactly as intended.
+            push_cmd: list[str] = ["push", "origin", self.working_branch]
+            if attempt > 1:
+                push_cmd.insert(1, "--force-with-lease")
             try:
-                self._git("push", "origin", self.working_branch)
+                self._git(*push_cmd)
             except _GitError as e:
                 return PushResult(
                     success=False,

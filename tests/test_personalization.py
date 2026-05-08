@@ -692,6 +692,92 @@ class TestPushDeletionAndContention:
         assert (c_checkout / "global" / "from-a.md").exists()
         assert (c_checkout / "global" / "from-b.md").exists()
 
+    def test_retry_loop_recovers_from_simulated_ff_rejection(
+        self, tmp_path: Path, remote_bare: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Force the FF-push of main to fail once, then succeed. The
+        retry loop must:
+          1. detect the FF rejection,
+          2. fetch the advanced main,
+          3. rebase the local working branch (rewriting commits),
+          4. push the per-machine branch with --force-with-lease
+             (otherwise non-FF on the rewritten branch),
+          5. retry the FF push of main.
+        """
+        a_checkout = tmp_path / "machine-a" / "personalization"
+        a_config = _config_for(a_checkout, remote_bare, node_id="machine-a")
+        a_mgr = PersonalizationManager(a_config)
+        _patch_remote_url(a_mgr, str(remote_bare))
+        a_mgr.init()
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "CLAUDE.md").write_text("rev1\n")
+
+        # Patch ``_git_capturing`` to simulate one FF rejection on the
+        # first ``working_branch:main`` push, then let the retry
+        # succeed normally. We also need to actually advance
+        # origin/main between the first FF and the retry, otherwise
+        # the rebase in iteration 2 is a no-op and the retried push
+        # would be identical to the first attempt (and hit the same
+        # patched failure). Spinning up a "phantom" commit on main is
+        # cheap: push a marker commit to the bare via a sidecar clone.
+        from ctrlrelay.personalization import manager as mgr_module
+
+        ff_attempts = {"n": 0}
+        original = mgr_module.PersonalizationManager._git_capturing
+
+        # Sidecar clone we'll use to inject a concurrent commit.
+        sidecar = tmp_path / "sidecar"
+        _git("clone", str(remote_bare), str(sidecar), cwd=tmp_path)
+        _git("config", "user.email", "x@x", cwd=sidecar)
+        _git("config", "user.name", "Sidecar", cwd=sidecar)
+
+        def patched_git_capturing(self, *args: str, check: bool = True):
+            # Detect the FF push: ``push origin <branch>:<main>``.
+            # The colon-form refspec only appears in the FF push
+            # invocation; all other push paths use a plain branch name.
+            is_ff = (
+                args
+                and args[0] == "push"
+                and any(
+                    isinstance(a, str) and a.endswith(":" + self.main_branch)
+                    for a in args
+                )
+            )
+            if is_ff and ff_attempts["n"] == 0:
+                ff_attempts["n"] += 1
+                # Simulate origin/main having advanced under us:
+                # commit + push from the sidecar so the next fetch
+                # actually sees a new main tip.
+                (sidecar / "phantom.md").write_text("phantom\n")
+                _git("add", "phantom.md", cwd=sidecar)
+                _git("commit", "-m", "phantom advance", cwd=sidecar)
+                _git("push", "origin", "main", cwd=sidecar)
+                # Return a synthetic non-zero exit so the retry path
+                # engages — exactly as if the real push had failed.
+                import subprocess
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=1,
+                    stdout="",
+                    stderr=" ! [rejected]        develop -> main (non-fast-forward)\n",
+                )
+            return original(self, *args, check=check)
+
+        monkeypatch.setattr(
+            mgr_module.PersonalizationManager,
+            "_git_capturing",
+            patched_git_capturing,
+        )
+
+        result = a_mgr.push(message="rev1")
+        assert result.success, result.summary
+        assert "after 2 attempts" in result.summary
+        # And the phantom commit didn't get clobbered.
+        c_checkout = tmp_path / "verify"
+        _git("clone", str(remote_bare), str(c_checkout), cwd=tmp_path)
+        assert (c_checkout / "phantom.md").exists()
+        assert (c_checkout / "global" / "CLAUDE.md").read_text() == "rev1\n"
+
     def test_init_works_with_non_default_main_branch(
         self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
     ) -> None:
