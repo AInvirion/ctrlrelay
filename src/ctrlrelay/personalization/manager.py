@@ -152,22 +152,19 @@ class PersonalizationManager:
         return self._format_init_summary(results, cloned=True)
 
     def _bootstrap_main_if_empty(self) -> None:
-        """Create an initial commit on ``main_branch`` if the cloned
-        repo has none yet.
+        """Create an initial commit on ``main_branch`` ONLY if the
+        remote has zero refs.
 
         A brand-new GitHub repo (no commits, no default branch) clones
-        with an "unborn HEAD" — ``origin/<main>`` doesn't exist, so
-        ``_ensure_working_branch`` would later fail trying to branch
-        from it. To make ``init`` the natural bootstrap path, we
-        detect this state, write a tiny ``README.md``, commit it on
-        ``main_branch``, and push. After this the rest of init
-        proceeds normally.
-
-        We only act when ``origin/<main_branch>`` is missing — an
-        existing remote branch (whether the user's default or one
-        they created) is left alone.
+        with an "unborn HEAD" and ``git ls-remote origin`` is empty —
+        bootstrap is safe and required. But if the remote has commits
+        under a DIFFERENT branch (typical when an existing repo uses
+        ``master`` and ``main_branch`` is misconfigured), we'd
+        otherwise silently create a parallel ``main_branch`` and push
+        it, which is rarely what the user wants. Treat that case as a
+        configuration error and surface it loudly with a hint.
         """
-        # If origin/<main_branch> already exists, nothing to bootstrap.
+        # If origin/<main_branch> already exists, nothing to do.
         existing_remote = self._git_capturing(
             "show-ref", "--verify", "--quiet",
             f"refs/remotes/origin/{self.main_branch}",
@@ -176,19 +173,30 @@ class PersonalizationManager:
         if existing_remote.returncode == 0:
             return
 
-        # Configure user identity if not already set on this clone —
-        # ``git commit`` errors out without one. Only override when
-        # missing so the operator's global config still wins on
-        # machines where they've set it.
-        if not self._git_capturing(
-            "config", "--get", "user.email", check=False
-        ).stdout.strip():
-            self._git("config", "user.email", "ctrlrelay@local")
-        if not self._git_capturing(
-            "config", "--get", "user.name", check=False
-        ).stdout.strip():
-            self._git("config", "user.name", "ctrlrelay")
+        # Distinguish truly-empty from "main_branch is wrong". Truly-
+        # empty: ``ls-remote`` returns no refs. Otherwise some other
+        # branch exists upstream and we should not bootstrap.
+        ls = self._git_capturing("ls-remote", "origin", check=False)
+        # ls-remote prints one ref per line (sha\tref). Empty stdout
+        # ⇒ zero refs ⇒ empty repo.
+        has_refs = bool(ls.stdout.strip())
+        if has_refs:
+            # List the branches the remote actually has so the user
+            # can see what to set ``main_branch`` to.
+            actual = "\n".join(
+                "  " + line.split("\t", 1)[1]
+                for line in ls.stdout.strip().splitlines()
+                if "\t" in line
+            ) or "  (none)"
+            raise PersonalizationError(
+                f"remote {self.cfg.repo} has no branch named "
+                f"'{self.main_branch}', but the repo is not empty. "
+                "Set personalization.main_branch in orchestrator.yaml "
+                "to one of the existing remote refs (or rename the "
+                "remote branch). Existing refs:\n" + actual
+            )
 
+        self._ensure_local_identity()
         readme = self.checkout_path / "README.md"
         if not readme.exists():
             readme.write_text(
@@ -203,6 +211,28 @@ class PersonalizationManager:
             "personalization: bootstrap empty repo",
         )
         self._git("push", "-u", "origin", self.main_branch)
+
+    def _ensure_local_identity(self) -> None:
+        """Ensure ``user.email`` and ``user.name`` are set on this
+        checkout so ``git commit`` doesn't fail with "Author identity
+        unknown".
+
+        Only writes when the value is missing — never overrides an
+        existing setting (operator's global ``~/.gitconfig`` values
+        come through to the cloned repo on default git settings, and
+        we don't want to silently shadow them). Used by both
+        bootstrap and the regular ``push`` commit path so a fresh
+        machine without global identity can still complete the first
+        sync.
+        """
+        if not self._git_capturing(
+            "config", "--get", "user.email", check=False
+        ).stdout.strip():
+            self._git("config", "user.email", "ctrlrelay@local")
+        if not self._git_capturing(
+            "config", "--get", "user.name", check=False
+        ).stdout.strip():
+            self._git("config", "user.name", "ctrlrelay")
 
     def status(self) -> str:
         """Return a human-readable summary of working-tree state +
@@ -289,6 +319,12 @@ class PersonalizationManager:
         # Stage and commit once up-front; the commit object stays the
         # same across retries, only the rebase base shifts.
         if self._stage_configured_paths():
+            # ``git commit`` errors with "Author identity unknown" if
+            # neither global nor local user.email/user.name is set.
+            # Bootstrap already does this for the empty-repo path;
+            # call it here too so a fresh machine cloning a non-empty
+            # personalization repo can complete its first sync.
+            self._ensure_local_identity()
             commit_msg = message or "personalization: sync from {}".format(
                 self.working_branch
             )

@@ -860,6 +860,89 @@ class TestPushDeletionAndContention:
         ).strip()
         assert remote_main, "origin/main should exist after bootstrap"
 
+    def test_init_refuses_when_main_branch_misconfigured(
+        self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        """If the remote has commits but no branch matching
+        ``main_branch`` (typical when the repo is on ``master`` and
+        the user wrote ``main`` in config), init must NOT silently
+        create a parallel ``main`` — it must surface the
+        misconfiguration so the operator can fix the config.
+        """
+        base = tmp_path_factory.mktemp("master-only")
+        bare = _git_init_bare(base / "master-only.git")
+        seed = base / "seed"
+        _git_init_with_initial_commit(seed, remote_url=str(bare))
+        # Push master, then flip the bare repo's HEAD so deleting
+        # ``main`` on it is allowed (a bare repo refuses to delete
+        # the branch its HEAD points at).
+        _git("branch", "-m", "main", "master", cwd=seed)
+        _git("push", "-u", "origin", "master", cwd=seed)
+        _git(
+            "symbolic-ref", "HEAD", "refs/heads/master",
+            cwd=bare,
+        )
+        _git("push", "origin", "--delete", "main", cwd=seed)
+
+        checkout = tmp_path / "personalization"
+        cfg = Config.model_validate({
+            "version": "1",
+            "node_id": "machine-x",
+            "timezone": "UTC",
+            "paths": {
+                "state_db": "/tmp/state.db",
+                "worktrees": "/tmp/worktrees",
+                "bare_repos": "/tmp/bare",
+                "contexts": "/tmp/contexts",
+                "skills": "/tmp/skills",
+            },
+            "transport": {
+                "type": "file_mock",
+                "file_mock": {"inbox": "/tmp/in", "outbox": "/tmp/out"},
+            },
+            "dashboard": {"enabled": False},
+            "personalization": {
+                "repo": "test/master-only",
+                "checkout_path": str(checkout),
+                # Wrong: remote uses "master".
+                "main_branch": "main",
+                "paths": [],
+            },
+            "repos": [],
+        })
+        mgr = PersonalizationManager(cfg)
+        mgr.repo_url = str(bare)
+        with pytest.raises(PersonalizationError, match="not empty"):
+            mgr.init()
+
+    def test_push_sets_local_identity_when_global_missing(
+        self, tmp_path: Path, remote_bare: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fresh machine without global user.email / user.name must
+        still be able to commit on push; the manager configures a
+        fallback identity on the local checkout.
+        """
+        # Force git to ignore any system/global config so we mimic a
+        # truly identity-less machine.
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        monkeypatch.setenv("HOME", str(tmp_path / "fresh-home"))
+        (tmp_path / "fresh-home").mkdir()
+
+        checkout = tmp_path / "personalization"
+        config = _config_for(checkout, remote_bare, node_id="machine-fresh")
+        mgr = PersonalizationManager(config)
+        _patch_remote_url(mgr, str(remote_bare))
+        mgr.init()
+
+        # Make a real change so push has something to commit.
+        (checkout / "global").mkdir()
+        (checkout / "global" / "CLAUDE.md").write_text("hi from fresh\n")
+        result = mgr.push(message="from-fresh-machine")
+        assert result.success, result.summary
+        # Local identity got configured on the checkout.
+        email = _git("config", "--get", "user.email", cwd=checkout).strip()
+        assert email == "ctrlrelay@local"
+
     def test_init_works_with_non_default_main_branch(
         self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
     ) -> None:
