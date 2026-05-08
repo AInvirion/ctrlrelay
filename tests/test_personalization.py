@@ -1,0 +1,612 @@
+"""Tests for personalization sync.
+
+Three layers:
+
+1. ``paths`` — path encoding (matches Claude's actual encoding) +
+   template resolution.
+2. ``manager.wire_symlinks`` — idempotent + replace-stale +
+   refuse-real-file + skip-missing-source.
+3. ``manager.push/pull`` — integration against a tmp bare-repo "remote"
+   and two tmp working checkouts simulating machines A and B. Covers
+   the happy path and the rebase-conflict abort path.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+from ctrlrelay.core.config import (
+    Config,
+    ConfigError,
+    load_config,
+)
+from ctrlrelay.personalization import (
+    PersonalizationManager,
+    TemplateContext,
+    encode_project_path,
+    resolve_template,
+)
+from ctrlrelay.personalization.manager import PersonalizationError, _run_git
+from ctrlrelay.personalization.paths import project_slug
+
+# ---------- Layer 1: path encoding + template resolution ---------------------
+
+
+class TestEncodeProjectPath:
+    def test_simple_absolute_path(self) -> None:
+        assert encode_project_path("/Users/foo/Projects/bar") == "-Users-foo-Projects-bar"
+
+    def test_dot_in_path_becomes_dash(self) -> None:
+        # ``.ctrlrelay`` becomes ``-ctrlrelay``; combined with the
+        # preceding ``/`` you get ``--ctrlrelay``.
+        encoded = encode_project_path("/Users/foo/.ctrlrelay/repos/x")
+        assert encoded == "-Users-foo--ctrlrelay-repos-x"
+
+    def test_underscore_becomes_dash(self) -> None:
+        # Verified against ~/.claude/projects/ on a real install:
+        # ``oscarvalenzuelab/my_lalanotes`` is encoded as
+        # ``oscarvalenzuelab-my-lalanotes``.
+        encoded = encode_project_path("/Users/foo/Projects/my_lalanotes")
+        assert encoded == "-Users-foo-Projects-my-lalanotes"
+
+    def test_existing_hyphen_preserved(self) -> None:
+        encoded = encode_project_path("/Users/foo/Projects/dev-sync")
+        assert encoded == "-Users-foo-Projects-dev-sync"
+
+    def test_dot_in_repo_name(self) -> None:
+        # ``SemClone/semcl.one`` per real install → ``semcl-one``.
+        encoded = encode_project_path("/Users/foo/SEMCL.ONE/semcl.one")
+        assert encoded == "-Users-foo-SEMCL-ONE-semcl-one"
+
+    def test_relative_path_rejected(self) -> None:
+        with pytest.raises(ValueError, match="absolute"):
+            encode_project_path("relative/path")
+
+    def test_tilde_expansion(self) -> None:
+        encoded = encode_project_path("~")
+        # The encoding should start with the encoded form of $HOME.
+        # We don't know the literal home in CI so just assert it
+        # starts with ``-`` and contains no unescaped path separators.
+        assert encoded.startswith("-")
+        assert "/" not in encoded
+
+
+class TestResolveTemplate:
+    def test_home_only_no_project_context(self) -> None:
+        result = resolve_template("${HOME}/.claude/CLAUDE.md", TemplateContext())
+        assert result == Path.home() / ".claude" / "CLAUDE.md"
+
+    def test_tilde_works_too(self) -> None:
+        result = resolve_template("~/.claude/CLAUDE.md", TemplateContext())
+        assert result == Path.home() / ".claude" / "CLAUDE.md"
+
+    def test_project_placeholders(self, tmp_path: Path) -> None:
+        local = tmp_path / "owner" / "repo"
+        ctx = TemplateContext(project="owner-repo", project_local=local)
+        assert resolve_template("${PROJECT}", ctx) == Path("owner-repo")
+        assert resolve_template("${PROJECT_LOCAL}", ctx) == local
+        assert resolve_template("${PROJECT_PARENT}", ctx) == tmp_path / "owner"
+        assert resolve_template("${PROJECT_ENCODED}", ctx) == Path(
+            encode_project_path(local)
+        )
+
+    def test_missing_project_context_raises(self) -> None:
+        with pytest.raises(ValueError, match="project context"):
+            resolve_template("${PROJECT}/foo", TemplateContext())
+
+    def test_combined_placeholders(self, tmp_path: Path) -> None:
+        local = tmp_path / "AInvirion" / "ctrlrelay"
+        ctx = TemplateContext(project="AInvirion-ctrlrelay", project_local=local)
+        result = resolve_template("${PROJECT_PARENT}/specs/${PROJECT}/", ctx)
+        assert result == tmp_path / "AInvirion" / "specs" / "AInvirion-ctrlrelay"
+
+    def test_project_encoded_doesnt_eat_project(self, tmp_path: Path) -> None:
+        # Substitution order must replace ``${PROJECT_ENCODED}`` before
+        # ``${PROJECT}`` so the latter doesn't partially-eat the former.
+        local = tmp_path / "x"
+        ctx = TemplateContext(project="x", project_local=local)
+        # Both placeholders in one template:
+        out = resolve_template("a/${PROJECT_ENCODED}/b/${PROJECT}/c", ctx)
+        assert "${PROJECT" not in str(out)
+
+
+class TestProjectSlug:
+    def test_simple(self) -> None:
+        assert project_slug("AInvirion/ctrlrelay") == "AInvirion-ctrlrelay"
+
+    def test_idempotent_on_already_flat(self) -> None:
+        assert project_slug("AInvirion-ctrlrelay") == "AInvirion-ctrlrelay"
+
+
+# ---------- Layer 2: config loading ------------------------------------------
+
+
+def _base_config_dict(personalization: dict | None = None) -> dict:
+    """Minimal valid orchestrator.yaml dict, optionally with a personalization block."""
+    cfg: dict = {
+        "version": "1",
+        "node_id": "test-node",
+        "timezone": "UTC",
+        "paths": {
+            "state_db": "~/.ctrlrelay/state.db",
+            "worktrees": "~/.ctrlrelay/worktrees",
+            "bare_repos": "~/.ctrlrelay/repos",
+            "contexts": "~/.ctrlrelay/contexts",
+            "skills": "~/.ctrlrelay/skills",
+        },
+        "transport": {
+            "type": "file_mock",
+            "file_mock": {
+                "inbox": "~/.ctrlrelay/inbox.txt",
+                "outbox": "~/.ctrlrelay/outbox.txt",
+            },
+        },
+        "dashboard": {"enabled": False},
+        "repos": [],
+    }
+    if personalization is not None:
+        cfg["personalization"] = personalization
+    return cfg
+
+
+class TestPersonalizationConfig:
+    def test_personalization_optional(self, tmp_path: Path) -> None:
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict()))
+        config = load_config(path)
+        assert config.personalization is None
+        assert config.personalization_branch() is None
+
+    def test_personalization_loads(self, tmp_path: Path) -> None:
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/dotclaude",
+            "paths": [
+                {"source": "global/CLAUDE.md", "target": "~/.claude/CLAUDE.md"},
+            ],
+        })))
+        config = load_config(path)
+        assert config.personalization is not None
+        assert config.personalization.repo == "owner/dotclaude"
+        assert config.personalization_branch() == "personalization/test-node"
+
+    def test_invalid_repo_name(self, tmp_path: Path) -> None:
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "not_a_valid/owner/repo",  # extra slash
+            "paths": [],
+        })))
+        with pytest.raises(ConfigError):
+            load_config(path)
+
+    def test_unknown_placeholder_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "paths": [
+                {"source": "x/${BOGUS}/y", "target": "~/x"},
+            ],
+        })))
+        with pytest.raises(ConfigError, match="unknown placeholders"):
+            load_config(path)
+
+    def test_project_placeholder_without_project_scoped_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "paths": [
+                {"source": "x/${PROJECT}/", "target": "~/x/"},
+                # missing project_scoped: true
+            ],
+        })))
+        with pytest.raises(ConfigError, match="project_scoped"):
+            load_config(path)
+
+    def test_dir_vs_file_mismatch_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "paths": [
+                {"source": "x/", "target": "~/x"},  # source is dir, target file
+            ],
+        })))
+        with pytest.raises(ConfigError, match="directory vs file"):
+            load_config(path)
+
+    def test_main_branch_validates_safe(self, tmp_path: Path) -> None:
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "main_branch": "--exec=evil",
+            "paths": [],
+        })))
+        with pytest.raises(ConfigError):
+            load_config(path)
+
+
+# ---------- Layer 3: symlink wiring ------------------------------------------
+
+
+def _build_config(
+    *,
+    checkout_path: Path,
+    paths: list[dict],
+    repos: list[dict] | None = None,
+) -> Config:
+    """Build a Config object directly (bypassing YAML) for fast tests."""
+    return Config.model_validate({
+        "version": "1",
+        "node_id": "test-node",
+        "timezone": "UTC",
+        "paths": {
+            "state_db": "/tmp/state.db",
+            "worktrees": "/tmp/worktrees",
+            "bare_repos": "/tmp/bare",
+            "contexts": "/tmp/contexts",
+            "skills": "/tmp/skills",
+        },
+        "transport": {
+            "type": "file_mock",
+            "file_mock": {"inbox": "/tmp/in", "outbox": "/tmp/out"},
+        },
+        "dashboard": {"enabled": False},
+        "personalization": {
+            "repo": "owner/dotclaude",
+            "checkout_path": str(checkout_path),
+            "paths": paths,
+        },
+        "repos": repos or [],
+    })
+
+
+@pytest.fixture
+def empty_checkout(tmp_path: Path) -> Path:
+    """A directory pretending to be the personalization checkout. Not a
+    real git repo — symlink wiring tests don't need git, so we skip the
+    cost.
+    """
+    checkout = tmp_path / "personalization"
+    checkout.mkdir()
+    return checkout
+
+
+class TestSymlinkWiring:
+    def test_creates_missing_symlink(self, tmp_path: Path, empty_checkout: Path) -> None:
+        # Source must exist in the checkout for wire to act on it.
+        (empty_checkout / "global").mkdir()
+        (empty_checkout / "global" / "CLAUDE.md").write_text("hi")
+
+        target_dir = tmp_path / "home" / ".claude"
+        target = target_dir / "CLAUDE.md"
+
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[{"source": "global/CLAUDE.md", "target": str(target)}],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+        assert len(results) == 1
+        assert results[0].action == "created"
+        assert target.is_symlink()
+        assert target.readlink() == empty_checkout / "global" / "CLAUDE.md"
+
+    def test_idempotent(self, tmp_path: Path, empty_checkout: Path) -> None:
+        (empty_checkout / "global").mkdir()
+        (empty_checkout / "global" / "CLAUDE.md").write_text("hi")
+        target = tmp_path / "home" / ".claude" / "CLAUDE.md"
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[{"source": "global/CLAUDE.md", "target": str(target)}],
+        )
+        mgr = PersonalizationManager(config)
+        mgr.wire_symlinks()
+        # Second run is a no-op.
+        results = mgr.wire_symlinks()
+        assert results[0].action == "already-correct"
+
+    def test_replaces_wrong_symlink(self, tmp_path: Path, empty_checkout: Path) -> None:
+        (empty_checkout / "global").mkdir()
+        (empty_checkout / "global" / "CLAUDE.md").write_text("hi")
+        target = tmp_path / "home" / ".claude" / "CLAUDE.md"
+        target.parent.mkdir(parents=True)
+        wrong = tmp_path / "wrong"
+        wrong.write_text("wrong")
+        target.symlink_to(wrong)
+
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[{"source": "global/CLAUDE.md", "target": str(target)}],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+        assert results[0].action == "replaced-stale-symlink"
+        assert target.readlink() == empty_checkout / "global" / "CLAUDE.md"
+
+    def test_refuses_real_file_at_target(
+        self, tmp_path: Path, empty_checkout: Path
+    ) -> None:
+        (empty_checkout / "global").mkdir()
+        (empty_checkout / "global" / "CLAUDE.md").write_text("from-checkout")
+        target = tmp_path / "home" / ".claude" / "CLAUDE.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("real file, do not clobber")
+
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[{"source": "global/CLAUDE.md", "target": str(target)}],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+        assert results[0].action == "skipped-real-file-at-target"
+        assert target.is_symlink() is False
+        assert target.read_text() == "real file, do not clobber"
+
+    def test_skips_missing_source(
+        self, tmp_path: Path, empty_checkout: Path
+    ) -> None:
+        target = tmp_path / "home" / ".claude" / "CLAUDE.md"
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[{"source": "global/CLAUDE.md", "target": str(target)}],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+        assert results[0].action == "skipped-source-missing"
+        assert target.exists() is False
+
+    def test_project_scoped_only_wires_existing_repos(
+        self, tmp_path: Path, empty_checkout: Path
+    ) -> None:
+        # Two configured repos — one cloned locally, one not.
+        cloned = tmp_path / "cloned"
+        cloned.mkdir()
+        not_cloned = tmp_path / "not_cloned"  # deliberately not created
+
+        # Source dir exists in checkout for the cloned repo only.
+        (empty_checkout / "claude-memory" / "owner-cloned").mkdir(parents=True)
+
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[
+                {
+                    "source": "claude-memory/${PROJECT}/",
+                    # Explicit trailing slash on the str — pathlib drops it.
+                    "target": str(tmp_path / "claude-projects" / "${PROJECT_ENCODED}") + "/",
+                    "project_scoped": True,
+                },
+            ],
+            repos=[
+                {"name": "owner/cloned", "local_path": str(cloned)},
+                {"name": "owner/not-cloned", "local_path": str(not_cloned)},
+            ],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+        # Only the cloned repo gets a plan; not_cloned is filtered by
+        # the ``local_path.exists()`` gate in ``_plan_project_scoped``.
+        assert len(results) == 1
+        assert results[0].action == "created"
+        assert results[0].plan.repo_name == "owner/cloned"
+
+
+# ---------- Layer 4: integration push/pull -----------------------------------
+
+
+def _git(*args: str, cwd: Path) -> str:
+    return _run_git(args, cwd=cwd, check=True).stdout
+
+
+def _git_init_bare(path: Path) -> Path:
+    path.mkdir(parents=True)
+    _git("init", "--bare", "--initial-branch=main", cwd=path)
+    return path
+
+
+def _git_init_with_initial_commit(path: Path, *, remote_url: str) -> None:
+    """Clone an empty bare repo, create main with one commit, push.
+
+    Some git versions refuse to push a brand-new branch named ``main``
+    to a totally-empty bare repo unless we set the upstream explicitly.
+    Doing this in a helper isolates the dance.
+    """
+    path.mkdir(parents=True)
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    subprocess.run(
+        ["git", "clone", remote_url, str(path)],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    # Pin author so commits are deterministic-enough for assertions.
+    _git("config", "user.email", "test@example.com", cwd=path)
+    _git("config", "user.name", "Test", cwd=path)
+    _git("checkout", "-b", "main", cwd=path)
+    (path / "README.md").write_text("seed\n")
+    _git("add", "README.md", cwd=path)
+    _git("commit", "-m", "seed", cwd=path)
+    _git("push", "-u", "origin", "main", cwd=path)
+
+
+@pytest.fixture
+def remote_bare(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Local bare repo standing in for the GitHub remote."""
+    base = tmp_path_factory.mktemp("remote")
+    bare = _git_init_bare(base / "dotclaude.git")
+    # Seed the bare repo via a sidecar working clone — easier than
+    # constructing the initial commit manually.
+    seed_dir = base / "seed"
+    _git_init_with_initial_commit(seed_dir, remote_url=str(bare))
+    return bare
+
+
+def _config_for(checkout: Path, remote_bare: Path, *, node_id: str) -> Config:
+    """Build a Config whose personalization repo URL points at the
+    local bare repo (so tests don't hit the network).
+    """
+    cfg = Config.model_validate({
+        "version": "1",
+        "node_id": node_id,
+        "timezone": "UTC",
+        "paths": {
+            "state_db": "/tmp/state.db",
+            "worktrees": "/tmp/worktrees",
+            "bare_repos": "/tmp/bare",
+            "contexts": "/tmp/contexts",
+            "skills": "/tmp/skills",
+        },
+        "transport": {
+            "type": "file_mock",
+            "file_mock": {"inbox": "/tmp/in", "outbox": "/tmp/out"},
+        },
+        "dashboard": {"enabled": False},
+        "personalization": {
+            "repo": "test/dotclaude",   # passes the regex; URL is overridden below
+            "checkout_path": str(checkout),
+            "paths": [
+                {
+                    "source": "global/CLAUDE.md",
+                    "target": str(
+                        checkout.parent / "fake-home/.claude/CLAUDE.md"
+                    ),
+                },
+            ],
+        },
+        "repos": [],
+    })
+    return cfg
+
+
+def _patch_remote_url(mgr: PersonalizationManager, url: str) -> None:
+    """Override the GitHub URL with our local bare-repo path so
+    ``init`` clones from the test fixture.
+    """
+    mgr.repo_url = url
+
+
+class TestPushPullIntegration:
+    def test_init_clones_and_creates_per_machine_branch(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        checkout = tmp_path / "personalization"
+        config = _config_for(checkout, remote_bare, node_id="machine-a")
+        mgr = PersonalizationManager(config)
+        _patch_remote_url(mgr, str(remote_bare))
+
+        summary = mgr.init()
+        assert "personalization/machine-a" in summary
+        assert (checkout / ".git").exists()
+        # On the per-machine branch.
+        head = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=checkout).strip()
+        assert head == "personalization/machine-a"
+
+    def test_push_no_changes_is_noop_success(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        checkout = tmp_path / "personalization"
+        config = _config_for(checkout, remote_bare, node_id="machine-a")
+        mgr = PersonalizationManager(config)
+        _patch_remote_url(mgr, str(remote_bare))
+        mgr.init()
+
+        # Nothing to commit — push should still succeed (just pushes
+        # the empty branch update, FF main is a no-op).
+        result = mgr.push(message="empty")
+        assert result.success, result.summary
+
+    def test_push_then_pull_propagates_change(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        # Machine A: init, write content, push.
+        a_checkout = tmp_path / "machine-a" / "personalization"
+        a_config = _config_for(a_checkout, remote_bare, node_id="machine-a")
+        a_mgr = PersonalizationManager(a_config)
+        _patch_remote_url(a_mgr, str(remote_bare))
+        a_mgr.init()
+
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "CLAUDE.md").write_text("from machine-a\n")
+        # Re-wire so the symlink exists and the source is staged on push.
+        a_mgr.wire_symlinks()
+        push_a = a_mgr.push(message="from-a")
+        assert push_a.success, push_a.summary
+
+        # Machine B: init, expect to pick up A's content.
+        b_checkout = tmp_path / "machine-b" / "personalization"
+        b_config = _config_for(b_checkout, remote_bare, node_id="machine-b")
+        b_mgr = PersonalizationManager(b_config)
+        _patch_remote_url(b_mgr, str(remote_bare))
+        b_mgr.init()
+        # Pull rebases B's branch onto origin/main, which now carries A's commit.
+        pull_b = b_mgr.pull()
+        assert pull_b.success, pull_b.summary
+        assert (b_checkout / "global" / "CLAUDE.md").read_text() == "from machine-a\n"
+
+    def test_concurrent_writes_rebase_conflict_aborts_cleanly(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        # Both machines edit the same file before either has pulled.
+        a_checkout = tmp_path / "machine-a" / "personalization"
+        b_checkout = tmp_path / "machine-b" / "personalization"
+        a_config = _config_for(a_checkout, remote_bare, node_id="machine-a")
+        b_config = _config_for(b_checkout, remote_bare, node_id="machine-b")
+        a_mgr = PersonalizationManager(a_config)
+        b_mgr = PersonalizationManager(b_config)
+        _patch_remote_url(a_mgr, str(remote_bare))
+        _patch_remote_url(b_mgr, str(remote_bare))
+        a_mgr.init()
+        b_mgr.init()
+
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "CLAUDE.md").write_text("from-a\n")
+        (b_checkout / "global").mkdir()
+        (b_checkout / "global" / "CLAUDE.md").write_text("from-b\n")
+
+        # A pushes first → wins origin/main.
+        result_a = a_mgr.push()
+        assert result_a.success
+
+        # B pushes — rebase onto origin/main now sees a conflict on
+        # CLAUDE.md. Expect a clean abort with conflict_files reported.
+        result_b = b_mgr.push()
+        assert result_b.success is False
+        assert "conflict" in result_b.summary.lower()
+        assert "global/CLAUDE.md" in result_b.conflict_files
+        # Working tree restored — not in the middle of a rebase.
+        # The file is still there with B's content; rebase aborted.
+        assert (b_checkout / "global" / "CLAUDE.md").read_text() == "from-b\n"
+        # No ``rebase-merge`` directory (which would mean rebase still in progress).
+        assert not (b_checkout / ".git" / "rebase-merge").exists()
+        assert not (b_checkout / ".git" / "rebase-apply").exists()
+
+
+class TestManagerErrors:
+    def test_init_rejected_when_path_exists_and_not_ours(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        checkout = tmp_path / "personalization"
+        checkout.mkdir()
+        (checkout / "stranger").write_text("not a clone")
+
+        config = _config_for(checkout, remote_bare, node_id="machine-a")
+        mgr = PersonalizationManager(config)
+        _patch_remote_url(mgr, str(remote_bare))
+        with pytest.raises(PersonalizationError, match="back it up"):
+            mgr.init()
+
+    def test_status_works_before_init(self, tmp_path: Path, remote_bare: Path) -> None:
+        # status should not raise when the checkout doesn't exist yet —
+        # it should print a friendly message that a wired CLI can show.
+        checkout = tmp_path / "personalization"  # not created
+        config = _config_for(checkout, remote_bare, node_id="machine-a")
+        mgr = PersonalizationManager(config)
+        msg = mgr.status()
+        assert "does not exist" in msg
+
+    def test_push_before_init_errors(self, tmp_path: Path, remote_bare: Path) -> None:
+        checkout = tmp_path / "personalization"
+        config = _config_for(checkout, remote_bare, node_id="machine-a")
+        mgr = PersonalizationManager(config)
+        with pytest.raises(PersonalizationError, match="no checkout"):
+            mgr.push()

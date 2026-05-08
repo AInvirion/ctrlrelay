@@ -52,6 +52,70 @@ dashboard:
 schedules:
   secops_cron: "0 6 * * *"
 
+# Optional: cross-machine personalization sync.
+#
+# A separate (typically PRIVATE) GitHub repo holds the operator's Claude
+# config, per-project memory, spec/superpower outputs, and workspace
+# planning notes — anything that survives across sessions and computers
+# but doesn't belong inside any project's source tree. ctrlrelay clones
+# the repo to `checkout_path` and wires the symlinks in `paths`.
+#
+# Per-machine work happens on a `personalization/<node_id>` branch; push
+# rebases onto `main` (no force-push, ever), so two machines pushing
+# concurrently never overwrite each other's deltas.
+#
+# Slice 1: manual `ctrlrelay personalization init/status/push/pull`.
+# Daemon scheduling, Telegram conflict escalation, and adopt-flow for
+# pre-existing target files are deferred to Slice 2+.
+#
+# Placeholders allowed in `source` and `target`:
+#   ${HOME}             -- current user's home
+#   ${PROJECT}          -- <owner>-<repo> flat slug (project_scoped only)
+#   ${PROJECT_ENCODED}  -- Claude's path encoding (project_scoped only)
+#   ${PROJECT_LOCAL}    -- absolute path of the repo's local checkout
+#   ${PROJECT_PARENT}   -- parent dir of ${PROJECT_LOCAL}
+#
+# personalization:
+#   repo: "oscarvalenzuelab/dotclaude"
+#   # checkout_path: "~/.ctrlrelay/personalization"   # default
+#   # main_branch: "main"                              # default
+#   # node_id: "macbook"   # default: top-level node_id (i.e. hostname)
+#   paths:
+#     # Global Claude config — fixed paths, one entry each so individual
+#     # files can come and go without ripping a whole `~/.claude/` symlink.
+#     - source: "global/CLAUDE.md"
+#       target: "~/.claude/CLAUDE.md"
+#     - source: "global/skills/"
+#       target: "~/.claude/skills/"
+#     - source: "global/agents/"
+#       target: "~/.claude/agents/"
+#     - source: "global/commands/"
+#       target: "~/.claude/commands/"
+#     - source: "global/keybindings.json"
+#       target: "~/.claude/keybindings.json"
+#
+#     # Per-project Claude memory. ${PROJECT_ENCODED} resolves at
+#     # link-time from the repo's local_path, so the same config works
+#     # on machines with different home directories or repo layouts.
+#     - source: "claude-memory/${PROJECT}/"
+#       target: "~/.claude/projects/${PROJECT_ENCODED}/memory/"
+#       project_scoped: true
+#
+#     # Spec / superpower outputs Claude writes per the convention
+#     # documented in templates/global-CLAUDE.md.snippet. Lives next to
+#     # the repo (NOT inside it) so the project's own git history stays
+#     # uncontaminated.
+#     - source: "specs/${PROJECT}/"
+#       target: "${PROJECT_PARENT}/specs/${PROJECT}/"
+#       project_scoped: true
+#
+#     # Workspace-level planning docs (multi-repo workspace, e.g. a
+#     # research project that spans 3 repos under a single parent dir).
+#     # Use one entry per workspace; if you accumulate many, this will
+#     # be promoted to a first-class `workspaces:` config block.
+#     # - source: "workspaces/RESEARCH-DMP/"
+#     #   target: "~/Projects/RESEARCH/DMP/notes/"
+
 repos: []
   # Example repo configuration:
   # - name: "owner/repo"

@@ -226,6 +226,148 @@ class RepoConfig(BaseModel):
         return v
 
 
+_ALLOWED_PATH_PLACEHOLDERS = frozenset({
+    "HOME",
+    "PROJECT",
+    "PROJECT_ENCODED",
+    "PROJECT_LOCAL",
+    "PROJECT_PARENT",
+})
+
+_PROJECT_PLACEHOLDERS = frozenset({
+    "PROJECT",
+    "PROJECT_ENCODED",
+    "PROJECT_LOCAL",
+    "PROJECT_PARENT",
+})
+
+_PLACEHOLDER_RE = re.compile(r"\$\{([A-Z_]+)\}")
+
+
+def _extract_placeholders(text: str) -> set[str]:
+    return set(_PLACEHOLDER_RE.findall(text))
+
+
+class PersonalizationPath(BaseModel):
+    """One source-to-target sync entry inside the personalization repo.
+
+    ``source`` is a path inside the personalization repo working tree
+    (e.g. ``global/CLAUDE.md`` or ``claude-memory/${PROJECT}/``).
+    ``target`` is the on-disk symlink destination outside the repo
+    (e.g. ``~/.claude/CLAUDE.md`` or ``${PROJECT_PARENT}/specs/${PROJECT}/``).
+
+    A trailing ``/`` on either side denotes a directory; a missing slash
+    denotes a single file. The two sides must agree — a directory source
+    cannot map to a file target. Validation enforces this at load time.
+
+    ``project_scoped: true`` makes the entry iterate over ``config.repos``
+    at wire-time. A non-project-scoped entry that references project
+    placeholders is rejected: it would resolve to garbage.
+    """
+
+    source: str
+    target: str
+    project_scoped: bool = False
+
+    @model_validator(mode="after")
+    def validate_placeholders_and_shape(self) -> "PersonalizationPath":
+        for side, value in (("source", self.source), ("target", self.target)):
+            if not value:
+                raise ValueError(f"personalization path {side} must not be empty")
+            placeholders = _extract_placeholders(value)
+            unknown = placeholders - _ALLOWED_PATH_PLACEHOLDERS
+            if unknown:
+                raise ValueError(
+                    f"personalization path {side} {value!r} references unknown "
+                    f"placeholders: {sorted(unknown)} "
+                    f"(allowed: {sorted(_ALLOWED_PATH_PLACEHOLDERS)})"
+                )
+            if not self.project_scoped and (placeholders & _PROJECT_PLACEHOLDERS):
+                raise ValueError(
+                    f"personalization path {side} {value!r} uses project "
+                    "placeholders but project_scoped is false; either set "
+                    "project_scoped: true or remove the placeholders"
+                )
+
+        # File-vs-dir agreement: if one side ends with '/', the other must too.
+        src_is_dir = self.source.endswith("/")
+        tgt_is_dir = self.target.endswith("/")
+        if src_is_dir != tgt_is_dir:
+            raise ValueError(
+                f"personalization path source {self.source!r} and target "
+                f"{self.target!r} disagree on directory vs file (trailing "
+                "slash must match on both)"
+            )
+        return self
+
+
+class Personalization(BaseModel):
+    """Personalization sync configuration.
+
+    A separate (typically private) GitHub repo holds the operator's
+    cross-machine context: global Claude config, per-project memory,
+    spec/superpower outputs, workspace planning docs. ctrlrelay clones
+    it once per machine and wires symlinks per the ``paths`` list. Per-
+    machine work happens on a ``personalization/<node_id>`` branch that
+    auto-rebases onto ``main_branch`` on push, so concurrent edits across
+    machines never force-push each other's deltas.
+    """
+
+    repo: str
+    checkout_path: Path = Field(
+        default_factory=lambda: Path("~/.ctrlrelay/personalization").expanduser()
+    )
+    # Branch name on the remote that holds the canonical state. ``push``
+    # rebases the per-node working branch onto this; ``pull`` resets the
+    # local copy of this branch to match origin so a fresh wire reflects
+    # what the rest of the fleet has agreed on.
+    main_branch: str = "main"
+    # Per-machine working branch is ``personalization/<node_id>``. When
+    # unset, the parent ``Config`` substitutes its top-level ``node_id``
+    # (which itself defaults to ``socket.gethostname()``).
+    node_id: str | None = None
+    paths: list[PersonalizationPath] = Field(default_factory=list)
+
+    @field_validator("repo")
+    @classmethod
+    def validate_repo(cls, v: str) -> str:
+        if not _REPO_NAME_RE.match(v):
+            raise ValueError(
+                f"personalization repo {v!r} must match 'owner/repo' "
+                f"(letters, digits, '.', '_', '-')"
+            )
+        return v
+
+    @field_validator("checkout_path", mode="before")
+    @classmethod
+    def expand_checkout_path(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return Path(v).expanduser()
+        return v
+
+    @field_validator("main_branch")
+    @classmethod
+    def validate_main_branch(cls, v: str) -> str:
+        # Refuse anything that's not a plain branch name. The value is
+        # spliced into ``git`` invocations, so option-like inputs (``--`` or
+        # leading dashes) and shell metacharacters must not get through.
+        if not v or v.startswith("-") or any(c in v for c in " \t\n\\\"'$;|&<>"):
+            raise ValueError(f"invalid main_branch {v!r}")
+        return v
+
+    @field_validator("node_id")
+    @classmethod
+    def validate_node_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not v or v.startswith("-") or any(c in v for c in " \t\n\\\"'$;|&<>/"):
+            raise ValueError(
+                f"invalid personalization node_id {v!r} "
+                "(used as part of a git branch name)"
+            )
+        return v
+
+
 class SchedulesConfig(BaseModel):
     """Cron schedules for background jobs run by the poller daemon.
 
@@ -266,6 +408,7 @@ class Config(BaseModel):
     transport: TransportConfig
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
+    personalization: Personalization | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
 
     @model_validator(mode="before")
@@ -310,6 +453,17 @@ class Config(BaseModel):
         ``config.claude.binary`` keep working. New code should prefer
         ``config.agent.*``."""
         return self.agent
+
+    def personalization_branch(self) -> str | None:
+        """Per-machine working branch name for personalization sync.
+
+        Falls back to the top-level ``node_id`` when ``personalization.node_id``
+        is unset. Returns ``None`` if personalization isn't configured.
+        """
+        if self.personalization is None:
+            return None
+        node = self.personalization.node_id or self.node_id
+        return f"personalization/{node}"
 
     @model_validator(mode="after")
     def derive_repo_local_paths(self) -> "Config":
