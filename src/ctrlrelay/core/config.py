@@ -459,11 +459,48 @@ class Config(BaseModel):
 
         Falls back to the top-level ``node_id`` when ``personalization.node_id``
         is unset. Returns ``None`` if personalization isn't configured.
+
+        ``validate_effective_personalization_node_id`` ensures the
+        effective node id is git-branch-safe at load time, so this
+        property never returns a name git would reject.
         """
         if self.personalization is None:
             return None
         node = self.personalization.node_id or self.node_id
         return f"personalization/{node}"
+
+    @model_validator(mode="after")
+    def validate_effective_personalization_node_id(self) -> "Config":
+        """Reject configs where the EFFECTIVE personalization node_id
+        (after fallback to top-level ``node_id`` / hostname) is not
+        safe as part of a git branch name.
+
+        ``Personalization.node_id`` is already validated when set
+        explicitly, but the fallback path takes the top-level
+        ``node_id`` whose constraints are looser (it's used for
+        non-git purposes too — dashboard identity, etc.). Without
+        this check, a host whose ``socket.gethostname()`` returns
+        ``"Oscar's MacBook"`` would load fine and only fail later
+        when ``ctrlrelay personalization init`` shells out to
+        ``git checkout -b personalization/Oscar's MacBook``.
+        """
+        if self.personalization is None:
+            return self
+        if self.personalization.node_id is not None:
+            # Already validated by Personalization.validate_node_id.
+            return self
+        node = self.node_id
+        if not node or node.startswith("-") or any(
+            c in node for c in " \t\n\\\"'$;|&<>/"
+        ):
+            raise ValueError(
+                f"effective personalization node_id {node!r} (from top-level "
+                "node_id) is not safe as part of a git branch name; either "
+                "set personalization.node_id explicitly to a branch-safe "
+                "value (letters, digits, '.', '_', '-') or change the "
+                "top-level node_id"
+            )
+        return self
 
     @model_validator(mode="after")
     def derive_repo_local_paths(self) -> "Config":

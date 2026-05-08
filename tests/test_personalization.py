@@ -220,6 +220,39 @@ class TestPersonalizationConfig:
         with pytest.raises(ConfigError, match="directory vs file"):
             load_config(path)
 
+    def test_effective_node_id_fallback_validated(self, tmp_path: Path) -> None:
+        """When personalization.node_id is omitted, the top-level
+        node_id is used. If the top-level is not git-branch-safe (e.g.
+        a hostname with spaces), config load must fail upfront rather
+        than letting init/push blow up later.
+        """
+        path = tmp_path / "cfg.yaml"
+        cfg = _base_config_dict({
+            "repo": "owner/repo",
+            "paths": [],
+        })
+        cfg["node_id"] = "Oscar's MacBook"   # spaces and apostrophe
+        path.write_text(yaml.dump(cfg))
+        with pytest.raises(ConfigError, match="not safe"):
+            load_config(path)
+
+    def test_effective_node_id_explicit_overrides_unsafe_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        """An explicit personalization.node_id makes the validation
+        pass even when the top-level is unsafe.
+        """
+        path = tmp_path / "cfg.yaml"
+        cfg = _base_config_dict({
+            "repo": "owner/repo",
+            "node_id": "macbook",
+            "paths": [],
+        })
+        cfg["node_id"] = "Oscar's MacBook"
+        path.write_text(yaml.dump(cfg))
+        config = load_config(path)
+        assert config.personalization_branch() == "personalization/macbook"
+
     def test_main_branch_validates_safe(self, tmp_path: Path) -> None:
         path = tmp_path / "cfg.yaml"
         path.write_text(yaml.dump(_base_config_dict({
