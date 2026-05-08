@@ -143,19 +143,9 @@ class PersonalizationManager:
                 if not self._is_existing_checkout_ours():
                     raise PersonalizationError(
                         f"checkout_path {self.checkout_path} already exists "
-                        f"and is not a clone of {self.cfg.repo}; back it up "
-                        "or remove it before running init"
+                        f"and is not a clone of github.com:{self.cfg.repo}; "
+                        "back it up or remove it before running init"
                     )
-                # Force origin to our canonical URL. The owner/repo
-                # match in ``_is_existing_checkout_ours`` accepts any
-                # host whose trailing path equals our configured repo
-                # (Codex pass 18 caught this) — a malicious clone of
-                # ``https://evil.example/<owner>/<repo>.git`` would
-                # otherwise have init keep using that origin for the
-                # subsequent fetch/push and tunnel personalization
-                # data outside the user's intended remote. No-op if
-                # origin already points at the canonical URL.
-                self._git("remote", "set-url", "origin", self.repo_url)
                 # Same repo already there — converge to the right
                 # branch and re-wire. Useful when ``init`` is re-run
                 # after a config change. ``_bootstrap_main_if_empty``
@@ -715,28 +705,43 @@ class PersonalizationManager:
 
     # ----- internals: git helpers --------------------------------------------
 
-    # Parses owner/repo out of any common GitHub remote URL shape:
+    # Parses host + owner/repo out of any common GitHub remote URL:
     #   https://github.com/owner/repo(.git)?
     #   git@github.com:owner/repo(.git)?
     #   git://github.com/owner/repo(.git)?
     #   ssh://git@github.com/owner/repo(.git)?
-    # Captures the LAST owner/repo before an optional ``.git`` /
-    # trailing slash. Anchored at end so a matching prefix earlier in
-    # the URL doesn't false-positive.
-    _ORIGIN_OWNER_REPO_RE = re.compile(
-        r"[/:]([^/:]+/[^/:]+?)(?:\.git)?/?\s*\Z"
+    # The host capture must be exactly ``github.com`` (case-
+    # insensitive). Owner/repo is captured separately and compared
+    # against ``cfg.repo``. Codex pass 20 caught that an earlier
+    # tail-only match accepted any host; a foreign clone with a
+    # matching tail (``https://evil.example/owner/repo.git``) would
+    # be wired against, leaking personalization data.
+    _ORIGIN_GITHUB_RE = re.compile(
+        r"^(?:"
+        r"https?://(?P<host_https>[^/]+)/"
+        r"|git@(?P<host_ssh>[^:]+):"
+        r"|git://(?P<host_git>[^/]+)/"
+        r"|ssh://(?:git@)?(?P<host_sshurl>[^/]+)/"
+        r")"
+        r"(?P<owner_repo>[^/:]+/[^/:]+?)"
+        r"(?:\.git)?/?\s*\Z",
+        re.IGNORECASE,
     )
 
     def _is_existing_checkout_ours(self) -> bool:
-        """Return True iff ``checkout_path`` is a clone of exactly
-        ``self.cfg.repo``.
+        """Return True iff ``checkout_path`` is a clone of
+        ``github.com:<self.cfg.repo>``.
 
-        The earlier substring-based check accepted prefix matches
-        (config ``acme/dot`` would accept origin ``acme/dotfiles``)
-        and could let init wire symlinks against the wrong repo.
-        Now we extract the trailing ``owner/repo`` from the origin
-        URL and compare exactly (case-insensitive — GitHub itself is
-        case-insensitive on these).
+        Tail-only matching (Codex pass 6 fix) was insufficient: an
+        existing checkout whose origin pointed at a non-github host
+        with the matching ``owner/repo`` tail would still be
+        accepted, and after the origin-URL reset (Codex pass 18 fix)
+        the foreign checkout's working tree / branch contents would
+        get wired into ``~/.claude/`` and friends. Now we require
+        the host to be ``github.com`` exactly. Anything else is
+        treated as not-ours and ``init`` refuses, telling the
+        operator to back up + remove the directory before retrying
+        (Codex pass 20 P1 fix).
         """
         if not (self.checkout_path / ".git").exists():
             return False
@@ -744,10 +749,19 @@ class PersonalizationManager:
             origin = self._git("remote", "get-url", "origin").strip()
         except _GitError:
             return False
-        match = self._ORIGIN_OWNER_REPO_RE.search(origin)
+        match = self._ORIGIN_GITHUB_RE.match(origin)
         if not match:
             return False
-        return match.group(1).lower() == self.cfg.repo.lower()
+        host = (
+            match.group("host_https")
+            or match.group("host_ssh")
+            or match.group("host_git")
+            or match.group("host_sshurl")
+            or ""
+        )
+        if host.lower() != "github.com":
+            return False
+        return match.group("owner_repo").lower() == self.cfg.repo.lower()
 
     def _ensure_working_branch(self) -> None:
         """Make sure HEAD is on ``working_branch``, creating it from
