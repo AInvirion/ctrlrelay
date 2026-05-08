@@ -317,14 +317,22 @@ class PersonalizationPath(BaseModel):
         # ``source`` is documented as a path inside the personalization
         # repo (joined to ``checkout_path`` at wire time). Reject ``..``
         # segments and absolute paths so an entry can't escape the
-        # checkout, e.g. ``source: ../secret`` (Codex pass 8 caught
-        # this). Also reject ``..`` in target — if a target uses ``..``
-        # we may still wire a symlink, but it makes auditing harder
-        # for no upside.
+        # checkout, e.g. ``source: ../secret`` (Codex pass 8). Also
+        # reject ``${HOME}`` in source: it's a valid placeholder for
+        # targets, but in source it's nonsensical (would resolve to a
+        # subdir literally named after $HOME, which the wire code
+        # would silently mark as source-missing — Codex pass 11).
+        # Reject ``..`` in target too for auditability.
         if self.source.startswith("/"):
             raise ValueError(
                 f"personalization path source {self.source!r} must be "
                 "relative to the personalization checkout, not absolute"
+            )
+        if "${HOME}" in self.source:
+            raise ValueError(
+                f"personalization path source {self.source!r} uses "
+                "${HOME}; sources are paths inside the personalization "
+                "checkout and cannot reference the user's home directory"
             )
         for side, value in (("source", self.source), ("target", self.target)):
             for segment in value.split("/"):

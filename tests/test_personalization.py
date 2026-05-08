@@ -236,6 +236,23 @@ class TestPersonalizationConfig:
         with pytest.raises(ConfigError):
             load_config(path)
 
+    def test_home_in_source_rejected(self, tmp_path: Path) -> None:
+        """${HOME} is a valid target placeholder but nonsensical in
+        source — source is rooted at the personalization checkout,
+        not the user's home dir. Earlier the validator accepted it
+        and wire would silently treat it as a literal subdir whose
+        name was ``${HOME}`` (Codex pass 11).
+        """
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "paths": [
+                {"source": "${HOME}/something", "target": "~/elsewhere"},
+            ],
+        })))
+        with pytest.raises(ConfigError, match="HOME"):
+            load_config(path)
+
     def test_target_dotdot_rejected(self, tmp_path: Path) -> None:
         """``..`` in target is also rejected for auditability."""
         path = tmp_path / "cfg.yaml"

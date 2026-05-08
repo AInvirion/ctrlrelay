@@ -178,31 +178,45 @@ class PersonalizationManager:
         otherwise silently create a parallel ``main_branch`` and push
         it, which is rarely what the user wants. Treat that case as a
         configuration error and surface it loudly with a hint.
+
+        Note: a missing local ``refs/remotes/origin/<main>`` is NOT
+        proof the remote lacks the branch — a ``--single-branch`` or
+        stale clone may not have fetched it. Always consult
+        ``ls-remote`` for the authoritative answer (Codex pass 11
+        caught this).
         """
-        # If origin/<main_branch> already exists, nothing to do.
-        existing_remote = self._git_capturing(
-            "show-ref", "--verify", "--quiet",
-            f"refs/remotes/origin/{self.main_branch}",
-            check=False,
-        )
-        if existing_remote.returncode == 0:
+        # Authoritative check against the remote: does it have
+        # refs/heads/<main_branch>?
+        ls = self._git_capturing("ls-remote", "origin", check=False)
+        if ls.returncode != 0:
+            # Network / auth failure: surface, don't silently bootstrap.
+            raise PersonalizationError(
+                f"`git ls-remote origin` failed: "
+                f"{ls.stderr.strip() or ls.stdout.strip()}"
+            )
+
+        # Parse ``<sha>\trefs/...`` lines.
+        remote_refs: list[str] = []
+        for line in ls.stdout.strip().splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                remote_refs.append(parts[1])
+
+        wanted_ref = f"refs/heads/{self.main_branch}"
+        if wanted_ref in remote_refs:
+            # Remote has main_branch. Make sure our local remote-
+            # tracking ref reflects it (single-branch clones may not
+            # have it without an explicit fetch) so subsequent
+            # operations can use ``origin/<main_branch>``.
+            self._git_capturing(
+                "fetch", "origin",
+                f"+{wanted_ref}:refs/remotes/origin/{self.main_branch}",
+                check=False,
+            )
             return
 
-        # Distinguish truly-empty from "main_branch is wrong". Truly-
-        # empty: ``ls-remote`` returns no refs. Otherwise some other
-        # branch exists upstream and we should not bootstrap.
-        ls = self._git_capturing("ls-remote", "origin", check=False)
-        # ls-remote prints one ref per line (sha\tref). Empty stdout
-        # ⇒ zero refs ⇒ empty repo.
-        has_refs = bool(ls.stdout.strip())
-        if has_refs:
-            # List the branches the remote actually has so the user
-            # can see what to set ``main_branch`` to.
-            actual = "\n".join(
-                "  " + line.split("\t", 1)[1]
-                for line in ls.stdout.strip().splitlines()
-                if "\t" in line
-            ) or "  (none)"
+        if remote_refs:
+            actual = "\n".join("  " + r for r in remote_refs)
             raise PersonalizationError(
                 f"remote {self.cfg.repo} has no branch named "
                 f"'{self.main_branch}', but the repo is not empty. "
@@ -211,6 +225,7 @@ class PersonalizationManager:
                 "remote branch). Existing refs:\n" + actual
             )
 
+        # Truly empty remote — bootstrap.
         self._ensure_local_identity()
         readme = self.checkout_path / "README.md"
         if not readme.exists():
