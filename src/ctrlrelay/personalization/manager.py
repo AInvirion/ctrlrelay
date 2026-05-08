@@ -792,28 +792,42 @@ class PersonalizationManager:
         if not rels:
             return []
 
+        # Only paths that ``git add`` actually matched (path exists
+        # in the working tree or is tracked) survive. The caller
+        # passes the survivors to ``git commit -- <paths>``; commit
+        # would fail with "pathspec did not match" if we left a
+        # never-tracked, never-present path in the list (Codex
+        # review pass 13 caught this — a normal partial-repo state
+        # where one configured source is populated and another is
+        # not blocked the whole push).
+        matched: list[str] = []
         for rel in rels:
             result = self._git_capturing("add", "-A", "--", rel, check=False)
-            if result.returncode != 0:
-                # ``did not match`` is the benign case: path is
-                # neither in the working tree nor in the index.
-                # Anything else is a real error and should propagate.
-                if "did not match" in (result.stderr + result.stdout):
-                    continue
-                raise _GitError(
-                    args=("add", "-A", "--", rel),
-                    returncode=result.returncode,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
-                )
+            if result.returncode == 0:
+                matched.append(rel)
+                continue
+            if "did not match" in (result.stderr + result.stdout):
+                # Benign — path is neither in the working tree nor
+                # in the index. Skip it.
+                continue
+            raise _GitError(
+                args=("add", "-A", "--", rel),
+                returncode=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
+
+        if not matched:
+            return []
+
         # Only return the pathspecs if SOMETHING in the allowlist
         # actually has staged changes. Pre-staged files outside the
         # allowlist won't show up here because we restrict the diff
         # to the configured pathspecs.
         diff = self._git(
-            "diff", "--cached", "--name-only", "--", *rels
+            "diff", "--cached", "--name-only", "--", *matched
         ).strip()
-        return rels if diff else []
+        return matched if diff else []
 
     def _plan_for_entry(self, entry: PersonalizationPath) -> list[SymlinkPlan]:
         if entry.project_scoped:

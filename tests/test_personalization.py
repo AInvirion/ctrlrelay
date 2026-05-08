@@ -1135,6 +1135,64 @@ class TestPushDeletionAndContention:
         assert (verify / "global" / "CLAUDE.md").read_text() == "public\n"
         assert not (verify / "secrets.txt").exists()
 
+    def test_push_succeeds_when_some_configured_sources_are_missing(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        """A push must succeed when SOME configured sources have
+        changes and OTHERS are missing on disk (the documented
+        partial-repo state — e.g. a machine that uses CLAUDE.md but
+        hasn't populated skills/ yet). Earlier the missing source's
+        pathspec leaked into the commit's ``-- <paths>`` and
+        ``git commit`` failed with "pathspec did not match" — Codex
+        pass 13 caught this P1.
+        """
+        checkout = tmp_path / "personalization"
+        cfg = Config.model_validate({
+            "version": "1",
+            "node_id": "machine-partial",
+            "timezone": "UTC",
+            "paths": {
+                "state_db": "/tmp/state.db",
+                "worktrees": "/tmp/worktrees",
+                "bare_repos": "/tmp/bare",
+                "contexts": "/tmp/contexts",
+                "skills": "/tmp/skills",
+            },
+            "transport": {
+                "type": "file_mock",
+                "file_mock": {"inbox": "/tmp/in", "outbox": "/tmp/out"},
+            },
+            "dashboard": {"enabled": False},
+            "personalization": {
+                "repo": "test/dotclaude",
+                "checkout_path": str(checkout),
+                # Two paths configured. We'll only populate the first.
+                "paths": [
+                    {
+                        "source": "global/CLAUDE.md",
+                        "target": str(tmp_path / "fake/CLAUDE.md"),
+                    },
+                    {
+                        "source": "global/skills/",
+                        "target": str(tmp_path / "fake/skills") + "/",
+                    },
+                ],
+            },
+            "repos": [],
+        })
+        mgr = PersonalizationManager(cfg)
+        _patch_remote_url(mgr, str(remote_bare))
+        mgr.init()
+
+        # Populate ONLY the CLAUDE.md source. The skills/ source is
+        # never created on this machine — the documented "partial"
+        # state.
+        (checkout / "global").mkdir()
+        (checkout / "global" / "CLAUDE.md").write_text("partial-only\n")
+
+        result = mgr.push(message="partial")
+        assert result.success, result.summary
+
     def test_init_works_with_non_default_main_branch(
         self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
     ) -> None:
