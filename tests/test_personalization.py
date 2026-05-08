@@ -267,6 +267,47 @@ class TestPersonalizationConfig:
         with pytest.raises(ConfigError):
             load_config(path)
 
+    @pytest.mark.parametrize("bad", [
+        "main:backup",   # colon — refspec separator
+        "foo..bar",      # consecutive dots
+        ".leading-dot",  # leading dot
+        "-leading-dash", # leading dash (also looks like a git option)
+        "has space",     # whitespace
+        "tilde~here",    # tilde — git ref-illegal
+        "caret^here",    # caret — git ref-illegal
+        "with/slash",    # slash inside a single component
+        "",              # empty
+    ])
+    def test_main_branch_rejects_git_unsafe_chars(
+        self, tmp_path: Path, bad: str
+    ) -> None:
+        # Codex pass 7 finding: earlier denylist let things like
+        # ``main:backup`` and ``foo..bar`` through; tighten to an
+        # explicit allow-list matching the documented safe set.
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "main_branch": bad,
+            "paths": [],
+        })))
+        with pytest.raises(ConfigError):
+            load_config(path)
+
+    @pytest.mark.parametrize("bad", [
+        "host:name", "node..2", ".host", "-host", "name with space",
+    ])
+    def test_personalization_node_id_rejects_git_unsafe_chars(
+        self, tmp_path: Path, bad: str
+    ) -> None:
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict({
+            "repo": "owner/repo",
+            "node_id": bad,
+            "paths": [],
+        })))
+        with pytest.raises(ConfigError):
+            load_config(path)
+
 
 # ---------- Layer 3: symlink wiring ------------------------------------------
 

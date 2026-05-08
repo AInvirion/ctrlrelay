@@ -226,6 +226,32 @@ class RepoConfig(BaseModel):
         return v
 
 
+_GIT_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _is_safe_git_ref_component(value: str) -> bool:
+    """Return True iff ``value`` is safe as part of a git branch/ref name.
+
+    Stricter than ``git check-ref-format --branch`` on purpose: the
+    config's documented allow-list is exactly ``letters, digits, '.',
+    '_', '-'`` (the same set we use for repo names) plus the rule that
+    ``..`` and a leading ``-``/``.`` are disallowed. Earlier validators
+    used a denylist for shell metacharacters which silently accepted
+    things git later rejects (Codex review pass 7 caught e.g.
+    ``main_branch: "main:backup"`` and ``node_id: "foo..bar"`` slipping
+    through). Doing this as an explicit allow-list keeps the config
+    error synchronous with load and avoids late git failures during
+    ``init``/``push``.
+    """
+    if not value:
+        return False
+    if value.startswith("-") or value.startswith("."):
+        return False
+    if ".." in value:
+        return False
+    return bool(_GIT_BRANCH_NAME_RE.match(value))
+
+
 _ALLOWED_PATH_PLACEHOLDERS = frozenset({
     "HOME",
     "PROJECT",
@@ -348,11 +374,12 @@ class Personalization(BaseModel):
     @field_validator("main_branch")
     @classmethod
     def validate_main_branch(cls, v: str) -> str:
-        # Refuse anything that's not a plain branch name. The value is
-        # spliced into ``git`` invocations, so option-like inputs (``--`` or
-        # leading dashes) and shell metacharacters must not get through.
-        if not v or v.startswith("-") or any(c in v for c in " \t\n\\\"'$;|&<>"):
-            raise ValueError(f"invalid main_branch {v!r}")
+        if not _is_safe_git_ref_component(v):
+            raise ValueError(
+                f"invalid main_branch {v!r} "
+                "(allowed: letters, digits, '.', '_', '-'; no leading "
+                "'-' or '.', no '..')"
+            )
         return v
 
     @field_validator("node_id")
@@ -360,10 +387,11 @@ class Personalization(BaseModel):
     def validate_node_id(cls, v: str | None) -> str | None:
         if v is None:
             return None
-        if not v or v.startswith("-") or any(c in v for c in " \t\n\\\"'$;|&<>/"):
+        if not _is_safe_git_ref_component(v):
             raise ValueError(
                 f"invalid personalization node_id {v!r} "
-                "(used as part of a git branch name)"
+                "(used as a git branch component; allowed: letters, "
+                "digits, '.', '_', '-'; no leading '-' or '.', no '..')"
             )
         return v
 
@@ -489,16 +517,14 @@ class Config(BaseModel):
         if self.personalization.node_id is not None:
             # Already validated by Personalization.validate_node_id.
             return self
-        node = self.node_id
-        if not node or node.startswith("-") or any(
-            c in node for c in " \t\n\\\"'$;|&<>/"
-        ):
+        if not _is_safe_git_ref_component(self.node_id):
             raise ValueError(
-                f"effective personalization node_id {node!r} (from top-level "
-                "node_id) is not safe as part of a git branch name; either "
-                "set personalization.node_id explicitly to a branch-safe "
-                "value (letters, digits, '.', '_', '-') or change the "
-                "top-level node_id"
+                f"effective personalization node_id {self.node_id!r} (from "
+                "top-level node_id) is not safe as part of a git branch "
+                "name; either set personalization.node_id explicitly to a "
+                "branch-safe value (letters, digits, '.', '_', '-'; no "
+                "leading '-' or '.', no '..') or change the top-level "
+                "node_id"
             )
         return self
 
