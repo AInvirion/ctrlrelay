@@ -170,3 +170,4 @@ To run the poller as a long-lived background service, see [Operations]({{ '/oper
 - [Feedback loop]({{ '/feedback-loop/' | relative_url }}) — what `BLOCKED_NEEDS_INPUT` actually does end-to-end.
 - [CLI reference]({{ '/cli/' | relative_url }}) — every subcommand and flag.
 - [Operations]({{ '/operations/' | relative_url }}) — running ctrlrelay as a service.
+- [Personalization sync]({{ '/personalization/' | relative_url }}) — sync your Claude config, per-project memory, and spec outputs across machines.

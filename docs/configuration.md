@@ -39,6 +39,8 @@ repos:        [ ... ]
 | `transport` | object | **yes** | — | See [transport](#transport). |
 | `dashboard` | object | no | (defaults) | See [dashboard](#dashboard). |
 | `repos` | list | no | `[]` | See [repos](#repos). |
+| `schedules` | object | no | (defaults) | See [schedules](#schedules). |
+| `personalization` | object | no | unset | Cross-machine sync of Claude state. See [personalization](#personalization) and [Personalization sync]({{ '/personalization/' | relative_url }}). |
 
 ## paths
 
@@ -308,6 +310,77 @@ repos and which labels trigger the pipeline; a hostile collaborator with
 triage access was already able to push branches and trigger CI, so allowing
 them to opt an issue into the dev pipeline is a narrower extension, not a new
 vector.
+
+## schedules
+
+In-process cron jobs run by the poller daemon. All expressions are
+standard 5-field (minute hour dom month dow) and evaluate in the
+top-level `timezone`. Malformed expressions fail at config load — they
+won't silently disable the job at runtime.
+
+```yaml
+schedules:
+  secops_cron: "0 6 * * *"          # daily 06:00 sweep across repos
+  personalization_cron: "*/15 * * * *"  # optional auto-pull
+```
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `secops_cron` | string | no | `"0 6 * * *"` | When to run the secops sweep (`ctrlrelay secops run` equivalent) across all configured repos. Set to e.g. `"0 6 * * 1"` for weekly Mondays. |
+| `personalization_cron` | string | no | unset | When to auto-pull the personalization repo on this machine. Only effective when [`personalization`](#personalization) is also set. Skip-on-dirty: never rebases under uncommitted operator edits. Adoption is never performed by auto-pull — that stays an init-time concern. |
+
+## personalization
+
+Optional. Configures cross-machine sync of operator state (Claude
+config, per-project memory, spec/superpower outputs) through a
+separate (typically private) GitHub repo. See [Personalization
+sync]({{ '/personalization/' | relative_url }}) for the full
+walkthrough; this section documents the schema.
+
+```yaml
+personalization:
+  repo: "your-handle/dotclaude"
+  # checkout_path: "~/.ctrlrelay/personalization"   # default
+  # main_branch: "main"                              # default
+  # node_id: "studio-mac"                            # default: top-level node_id
+  paths:
+    - source: "global/CLAUDE.md"
+      target: "~/.claude/CLAUDE.md"
+    - source: "global/skills/"
+      target: "~/.claude/skills/"
+    - source: "claude-memory/${PROJECT}/"
+      target: "~/.claude/projects/${PROJECT_ENCODED}/memory/"
+      project_scoped: true
+    - source: "specs/${PROJECT}/"
+      target: "${PROJECT_PARENT}/specs/${PROJECT}/"
+      project_scoped: true
+```
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `repo` | string | **yes** | — | `<owner>/<repo>` slug for the personalization repo on github.com. |
+| `checkout_path` | string | no | `~/.ctrlrelay/personalization` | Where ctrlrelay clones the repo on this machine. |
+| `main_branch` | string | no | `"main"` | Long-lived integration branch. Per-machine branches rebase onto this. |
+| `node_id` | string | no | top-level `node_id` | Identifies this machine's working branch (`personalization/<node_id>`). Override only if the top-level value isn't safe as a git branch component. |
+| `paths` | list | **yes** | — | One entry per file/dir to sync. See [personalization.paths](#personalizationpaths). |
+
+### personalization.paths
+
+Each entry declares one source-to-target wiring. Trailing slashes
+distinguish files from directories — `source: "global/CLAUDE.md"` is
+a file, `source: "global/skills/"` is a directory; the target must
+agree.
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `source` | string | **yes** | Path inside the personalization repo. Trailing slash means directory. |
+| `target` | string | **yes** | On-disk path the symlink will be created at. Supports `${HOME}` and (when `project_scoped`) `${PROJECT}`, `${PROJECT_ENCODED}`, `${PROJECT_LOCAL}`, `${PROJECT_PARENT}`. |
+| `project_scoped` | bool | no (default `false`) | When `true`, the entry expands once per repo in `repos:`, with the `${PROJECT_*}` placeholders resolved against that repo's `local_path`. |
+
+The `${PROJECT}` slug uses **`<owner>--<repo>`** with a double
+hyphen so `a-b/c` and `a/b-c` produce different slugs. `${PROJECT_ENCODED}`
+matches Claude Code's own path encoding rule (`/Users/foo/Projects/bar`
+→ `-Users-foo-Projects-bar`).
 
 ## Example: telegram-enabled config
 

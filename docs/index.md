@@ -36,6 +36,9 @@ isolated git worktree, opens a PR, and asks you on Telegram when it gets stuck.
 - **[Operations]({{ '/operations/' | relative_url }})** — running the bridge
   and poller under launchd (macOS) or systemd (Linux), tailing logs, reading
   the state DB.
+- **[Personalization sync]({{ '/personalization/' | relative_url }})** —
+  cross-machine sync of Claude config, per-project memory, and spec
+  outputs through a private GitHub repo.
 
 ## Build on it
 

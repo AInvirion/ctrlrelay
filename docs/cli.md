@@ -232,6 +232,85 @@ ctrlrelay poller status [-c PATH]
 
 Reports running / not-running.
 
+## `ctrlrelay personalization`
+
+See [Personalization sync]({{ '/personalization/' | relative_url }})
+for the conceptual walkthrough. All subcommands require a
+`personalization:` block in `orchestrator.yaml` and operate on the
+checkout at `personalization.checkout_path` (default
+`~/.ctrlrelay/personalization`).
+
+### `personalization init`
+
+```bash
+ctrlrelay personalization init [-c PATH] [--no-adopt]
+```
+
+Clones the personalization repo into `checkout_path`, creates the
+per-machine working branch (`personalization/<node_id>`), and lays
+down the symlinks declared in `personalization.paths`.
+
+By default, **adopt-flow** is on: a target that exists as a real file
+or directory while its corresponding source slot in the repo is empty
+is moved into the repo and replaced with a symlink. Your existing
+content is preserved and immediately under sync. Run `personalization
+push` after `init` to send the adopted content to GitHub.
+
+Pass `--no-adopt` to opt out of adoption — pre-existing real targets
+surface as `skipped-real-file-at-target` instead, and you back them up
++ remove them manually before re-running.
+
+If both the repo source and the on-disk target have real content,
+`init` refuses with `skipped-conflict-both-exist` regardless of
+`--no-adopt`. Reconcile manually before re-running.
+
+### `personalization status`
+
+```bash
+ctrlrelay personalization status [-c PATH]
+```
+
+Prints the working branch, repo URL, ahead/behind counts vs. origin,
+and per-symlink state — `correct`, `wrong-target`, `missing`,
+`source-missing`, etc. Read-only; doesn't touch the filesystem.
+
+### `personalization push`
+
+```bash
+ctrlrelay personalization push [-c PATH] -m "MESSAGE"
+```
+
+Stages the entries declared in `paths` (allowlist — random files in
+the checkout are not committed), commits with `MESSAGE`, rebases the
+per-machine branch onto `origin/<main_branch>`, and pushes. Retries
+the fast-forward of `origin/main` up to three times if another
+machine's push lands between fetch and push. Uses
+`--force-with-lease` on the per-machine branch only when the local
+working branch has diverged from the remote (after a rebase) — never
+on `main`.
+
+Conflicts during the rebase abort and list the unmerged files for you
+to resolve.
+
+### `personalization pull`
+
+```bash
+ctrlrelay personalization pull [-c PATH]
+```
+
+Fetches, rebases the per-machine branch onto `origin/<main_branch>`,
+fast-forwards local `main` if it's an ancestor of the remote, and
+re-wires symlinks (the config-as-code shipped in the repo may have
+changed). Uses `adopt=True` like `init` so newly-declared paths can
+adopt local content during a `pull`. Conflicts abort cleanly and list
+the unmerged files.
+
+The daemon-driven auto-pull (under
+[`schedules.personalization_cron`]({{ '/configuration/#schedules' | relative_url }}))
+calls the same code with two extra rails: skip when the working tree
+is dirty, and re-wire with `adopt=False` so a background sync never
+silently moves files.
+
 ## `ctrlrelay status`
 
 ```bash
