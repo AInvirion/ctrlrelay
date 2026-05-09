@@ -41,6 +41,51 @@ ctrlrelay [--version] <command> ...
 Every command that reads config accepts `--config` / `-c` to point at a
 non-default `orchestrator.yaml` (default: `config/orchestrator.yaml`).
 
+## `ctrlrelay setup`
+
+```bash
+ctrlrelay setup [OPTIONS]
+```
+
+First-run onboarding: detect GitHub orgs, enumerate their non-fork
+non-archived repos, write a fresh `~/.config/ctrlrelay/orchestrator.yaml`,
+clone every repo to `~/Projects/<owner.lower()>/<repo>`, and (optionally)
+configure the personalization sync block plus install launchd/systemd unit
+files. Composes the building blocks operators previously had to wire by hand.
+
+The interactive flow asks one question at a time. `--yes` skips prompts and
+accepts every default. Repeat `--owner` to lock the owner list non-interactively.
+
+Key flags:
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--owner OWNER` | (interactive prompt) | Repeatable. When omitted, prompts to pick from accessible owners. |
+| `--repo-root PATH` | `~/Projects` | Where repos land — `~/Projects/<owner.lower()>/<repo>`. |
+| `--config-out PATH` | `~/.config/ctrlrelay/orchestrator.yaml` | Where to write the generated config. |
+| `--timezone TZ` | `UTC` | IANA zone for cron schedules. |
+| `--transport TRANSPORT` | `file_mock` | `telegram` or `file_mock`. |
+| `--telegram-chat-id ID` | none | Required for `--transport=telegram`. |
+| `--personalization-repo OWNER/REPO` | none | Adds a personalization block. |
+| `--no-personalization` | off | Skip the personalization prompt entirely. |
+| `--install-daemons` | (prompted) | Render and write launchd/systemd unit files. Reads `$CTRLRELAY_TELEGRAM_TOKEN` so the rendered plist isn't a placeholder. |
+| `--skip-archived/--include-archived` | skip | gh repo list filter. |
+| `--skip-forks/--include-forks` | skip | gh repo list filter. |
+| `--yes` / `-y` | off | Accept every default; never prompt. |
+| `--force` | off | Overwrite an existing `orchestrator.yaml` (and existing daemon plists when `--install-daemons`). |
+
+Refuses to overwrite an existing config or daemon plist without `--force`.
+Refuses to proceed if `gh auth status` fails — run `gh auth login` first.
+
+After setup completes, the next manual steps are:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ctrlrelay.ctrlrelay-poller.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ctrlrelay.ctrlrelay-bridge.plist
+```
+
+(Or the systemd equivalents on Linux.)
+
 ## `ctrlrelay config`
 
 ### `config validate`

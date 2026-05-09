@@ -40,16 +40,21 @@ class PathsConfig(BaseModel):
     bare_repos: Path
     contexts: Path
     skills: Path
-    # Optional default root for repo clones. Combined with ``owner_aliases``
-    # this lets ``RepoConfig.local_path`` be derived as
-    # ``${repo_root}/${owner_aliases.get(owner, owner)}/${repo_name}``
-    # instead of being hand-written for every repo. When unset, every
-    # repo entry must declare its own ``local_path`` (legacy behaviour).
+    # Optional default root for repo clones. When set,
+    # ``RepoConfig.local_path`` is derived as
+    # ``${repo_root}/${owner.lower()}/${repo_name}`` instead of being
+    # hand-written for every repo. Per-repo ``local_path`` still wins
+    # as an explicit override. When unset, every repo entry must
+    # declare its own ``local_path`` (legacy behaviour).
     repo_root: Path | None = None
-    # Map of GitHub owner -> on-disk folder name. Useful when the local
-    # tree groups repos under a vanity name that differs from the org
-    # slug (e.g. SemClone repos living under ~/Projects/SEMCL.ONE/).
-    # Lookup falls through to the literal owner name if not present.
+    # DEPRECATED (since 0.4.0): GitHub-owner-to-folder mapping. The
+    # path resolver now always uses ``owner.lower()`` as the folder
+    # component, so aliases are no longer consulted. Parsing is
+    # retained so 0.3.x configs don't error on load; a deprecation
+    # warning is emitted when a non-empty mapping is supplied. To
+    # silence: drop the ``owner_aliases`` block from your config and
+    # rename the on-disk folder to match ``owner.lower()`` (or set a
+    # per-repo ``local_path`` override for any that genuinely deviate).
     owner_aliases: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("state_db", "worktrees", "bare_repos", "contexts", "skills",
@@ -588,10 +593,26 @@ class Config(BaseModel):
     @model_validator(mode="after")
     def derive_repo_local_paths(self) -> "Config":
         # Fill in ``RepoConfig.local_path`` for any repo that omitted it,
-        # using ``paths.repo_root`` and the optional ``paths.owner_aliases``
-        # map. This keeps ``orchestrator.yaml`` short on machines whose
-        # local layout follows a convention, while still requiring an
-        # explicit value when no convention is configured.
+        # using ``paths.repo_root``. The folder component is always
+        # ``owner.lower()`` since 0.4.0 — see the ``owner_aliases``
+        # deprecation note on PathsConfig and the migration warning
+        # below. This keeps ``orchestrator.yaml`` short on machines
+        # whose local layout follows the convention, while still
+        # requiring an explicit value when no convention is configured.
+        if self.paths.owner_aliases:
+            import warnings
+
+            warnings.warn(
+                "paths.owner_aliases is deprecated since 0.4.0 and will "
+                "be removed in a future release. The path resolver now "
+                "always uses owner.lower() as the folder component. "
+                "Drop the owner_aliases block from orchestrator.yaml and "
+                "rename your on-disk folders to match owner.lower(), or "
+                "set a per-repo local_path override for any repos that "
+                "genuinely deviate from the convention.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         for repo in self.repos:
             if repo.local_path is not None:
                 continue
@@ -603,8 +624,7 @@ class Config(BaseModel):
                     "to enable convention-based defaults"
                 )
             owner, _, repo_name = repo.name.partition("/")
-            owner_dir = self.paths.owner_aliases.get(owner, owner)
-            repo.local_path = self.paths.repo_root / owner_dir / repo_name
+            repo.local_path = self.paths.repo_root / owner.lower() / repo_name
         return self
 
     @field_validator("timezone")

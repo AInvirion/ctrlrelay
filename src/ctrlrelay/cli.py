@@ -1,5 +1,6 @@
 """CLI entry point for ctrlrelay."""
 
+import os
 from pathlib import Path
 
 import typer
@@ -2203,6 +2204,268 @@ def personalization_pull(
         raise typer.Exit(1)
 
 
+@app.command("setup")
+def setup(
+    owner: list[str] = typer.Option(
+        [],
+        "--owner",
+        help=(
+            "GitHub owner to include (repeat for multiple). When omitted, "
+            "the command prompts to pick from your accessible owners."
+        ),
+    ),
+    repo_root: Path = typer.Option(
+        Path("~/Projects").expanduser(),
+        "--repo-root",
+        help="Folder under which repos will be cloned (one subdir per owner).",
+    ),
+    config_out: Path = typer.Option(
+        Path("~/.config/ctrlrelay/orchestrator.yaml").expanduser(),
+        "--config-out",
+        help="Where to write the generated orchestrator.yaml.",
+    ),
+    timezone: str = typer.Option(
+        "UTC",
+        "--timezone",
+        help="IANA timezone for scheduled jobs (e.g. 'America/Santiago').",
+    ),
+    transport: str = typer.Option(
+        "file_mock",
+        "--transport",
+        help="Transport for operator notifications: 'file_mock' or 'telegram'.",
+    ),
+    telegram_chat_id: int | None = typer.Option(
+        None,
+        "--telegram-chat-id",
+        help="Telegram chat ID. Only used when --transport=telegram.",
+    ),
+    personalization_repo: str | None = typer.Option(
+        None,
+        "--personalization-repo",
+        help=(
+            "owner/repo for cross-machine sync (e.g. 'alice/dotclaude'). "
+            "Adds a personalization block to the config."
+        ),
+    ),
+    no_personalization: bool = typer.Option(
+        False,
+        "--no-personalization",
+        help="Skip the personalization prompt entirely (non-interactive mode).",
+    ),
+    install_daemons: bool = typer.Option(
+        False,
+        "--install-daemons",
+        help=(
+            "Render and write launchd (macOS) / systemd (Linux) unit files. "
+            "Requires --transport=telegram + token in $CTRLRELAY_TELEGRAM_TOKEN "
+            "for the rendered plist to be usable."
+        ),
+    ),
+    skip_archived: bool = typer.Option(
+        True, "--skip-archived/--include-archived"
+    ),
+    skip_forks: bool = typer.Option(True, "--skip-forks/--include-forks"),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Accept all interactive defaults; never prompt.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Overwrite an existing orchestrator.yaml (and existing daemon "
+            "plists when --install-daemons)."
+        ),
+    ),
+) -> None:
+    """First-run setup: detect orgs, enumerate repos, write config, clone, optional daemon install.
+
+    The interactive flow asks one question at a time and accepts every
+    answer with a sensible default. Pass --yes to skip prompts and
+    take all defaults. Provide --owner repeatedly to lock the owner
+    list non-interactively.
+    """
+    from ctrlrelay.setup import (
+        GhAuthError,
+        SetupOptions,
+        assert_gh_auth,
+        detect_owners,
+        run_setup,
+    )
+
+    try:
+        assert_gh_auth()
+    except GhAuthError as e:
+        console.print(f"[red]Setup blocked:[/red] {e}")
+        raise typer.Exit(1)
+
+    # ----- owners --------------------------------------------------------
+    chosen_owners: list[str] = list(owner)
+    if not chosen_owners:
+        try:
+            available = detect_owners()
+        except RuntimeError as e:
+            console.print(f"[red]Setup blocked:[/red] could not list owners: {e}")
+            raise typer.Exit(1)
+        if yes:
+            chosen_owners = available  # take everything
+        else:
+            console.print(
+                "Available owners on this machine's gh login:\n  "
+                + "\n  ".join(f"{i + 1}. {o}" for i, o in enumerate(available))
+            )
+            picked_raw = typer.prompt(
+                "Which to monitor? Enter numbers separated by space "
+                "(or 'all' for everything)",
+                default="all",
+            ).strip()
+            if picked_raw.lower() == "all":
+                chosen_owners = available
+            else:
+                try:
+                    indexes = [int(x) - 1 for x in picked_raw.split()]
+                    chosen_owners = [available[i] for i in indexes]
+                except (ValueError, IndexError):
+                    console.print(f"[red]Invalid selection:[/red] {picked_raw}")
+                    raise typer.Exit(2)
+    if not chosen_owners:
+        console.print("[red]Setup blocked:[/red] no owners chosen")
+        raise typer.Exit(2)
+
+    # ----- personalization ----------------------------------------------
+    chosen_personalization = personalization_repo
+    if (
+        chosen_personalization is None
+        and not no_personalization
+        and not yes
+    ):
+        if typer.confirm(
+            "Configure cross-machine personalization sync (CLAUDE.md, skills, memory)?",
+            default=False,
+        ):
+            chosen_personalization = typer.prompt(
+                "Personalization repo (owner/repo)"
+            ).strip() or None
+
+    # ----- telegram chat_id (required for telegram transport) ------------
+    # ``chat_id: 0`` is a footgun (the bridge would happily try to send
+    # there), so we force the operator to supply a real value before
+    # writing the config — interactively or via --telegram-chat-id.
+    if transport == "telegram":
+        if telegram_chat_id is None:
+            if yes:
+                console.print(
+                    "[red]Setup blocked:[/red] --transport telegram "
+                    "requires --telegram-chat-id (non-interactive mode)."
+                )
+                raise typer.Exit(2)
+            chat_raw = typer.prompt("Telegram chat ID").strip()
+            try:
+                telegram_chat_id = int(chat_raw)
+            except ValueError:
+                console.print(f"[red]Invalid chat ID:[/red] {chat_raw!r}")
+                raise typer.Exit(2)
+        if telegram_chat_id == 0:
+            console.print(
+                "[red]Setup blocked:[/red] telegram chat_id must be non-zero "
+                "for the bridge to deliver messages."
+            )
+            raise typer.Exit(2)
+
+    # ----- daemons -------------------------------------------------------
+    chosen_install_daemons = install_daemons
+    if not chosen_install_daemons and not yes:
+        chosen_install_daemons = typer.confirm(
+            "Render launchd/systemd unit files for the bridge and poller?",
+            default=transport == "telegram",
+        )
+
+    # ----- telegram token (only relevant for plist rendering) ------------
+    # The token is only baked into a rendered plist *if* we're also
+    # installing daemons in this same setup run. Missing token is NOT
+    # a reason to flip the transport: the config only stores
+    # ``bot_token_env``; the literal value can be exported later before
+    # bootstrapping the bridge.
+    token: str | None = None
+    if transport == "telegram" and chosen_install_daemons:
+        token = os.environ.get("CTRLRELAY_TELEGRAM_TOKEN")
+        if token is None and not yes:
+            token = typer.prompt(
+                "Telegram bot token (input hidden, used only to render plists)",
+                hide_input=True,
+            ).strip() or None
+        if token is None:
+            console.print(
+                "[yellow]Warning:[/yellow] no Telegram token in env or prompt. "
+                "Rendered plist will carry the ${CTRLRELAY_TELEGRAM_TOKEN} "
+                "placeholder; export the token before bootstrapping the bridge."
+            )
+
+    options = SetupOptions(
+        owners=chosen_owners,
+        repo_root=repo_root.expanduser(),
+        config_out=config_out.expanduser(),
+        timezone=timezone,
+        transport=transport,
+        telegram_chat_id=telegram_chat_id,
+        telegram_token=token,
+        personalization_repo=chosen_personalization,
+        install_daemons=chosen_install_daemons,
+        skip_archived=skip_archived,
+        skip_forks=skip_forks,
+        force=force,
+    )
+
+    console.print(
+        f"\n[bold]Running setup[/bold]\n"
+        f"  owners: {', '.join(options.owners)}\n"
+        f"  repo_root: {options.repo_root}\n"
+        f"  config_out: {options.config_out}\n"
+        f"  transport: {options.transport}\n"
+        f"  personalization: {options.personalization_repo or '(skipped)'}\n"
+        f"  install_daemons: {options.install_daemons}\n"
+    )
+    try:
+        result = run_setup(options)
+    except FileExistsError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    except (ValueError, RuntimeError) as e:
+        console.print(f"[red]Setup failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(
+        f"\n[green]✓ Wrote {result.config_out} ({result.n_repos} repos across "
+        f"{len(result.owners)} owners)[/green]"
+    )
+    console.print(
+        f"  clone results: [green]{result.cloned} cloned[/green], "
+        f"[dim]{result.skipped} skipped[/dim], "
+        f"[red]{result.failed} failed[/red]"
+    )
+    if result.personalization_summary:
+        console.print(f"  personalization: {result.personalization_summary}")
+    if result.daemon_units:
+        console.print("  daemon unit files:")
+        for p in result.daemon_units:
+            console.print(f"    - {p}")
+        console.print(
+            "\n[bold]Next:[/bold] bootstrap the daemons via:\n"
+            "  launchctl bootstrap gui/$(id -u) <plist>"
+            "    # macOS, one per file above\n"
+            "  systemctl --user daemon-reload && systemctl --user enable --now <unit>"
+            "    # Linux"
+        )
+    # Clone failures must surface as a non-zero exit even when daemon
+    # units were rendered — automation watching exit code shouldn't
+    # mistake a partial setup for success. Codex review pass 3 caught
+    # the prior `elif` that masked this.
+    if result.failed:
+        raise typer.Exit(1)
+
+
 @app.command("version")
 def version() -> None:
     """Print the package version."""
@@ -2293,7 +2556,18 @@ app.add_typer(repos_app, name="repos")
 
 
 def _iter_repos(config_path: str | None, filter_str: str | None):
-    """Yield (name, org, repo, remote) tuples for repos in the orchestrator config."""
+    """Yield (name, org, repo, remote, local_path) tuples for repos in
+    the orchestrator config.
+
+    ``local_path`` is the fully-resolved path the dev pipeline expects,
+    so callers (clone-all, pull-all, repos status) land repos in the
+    same place every other ctrlrelay command operates on. Before 0.4.0
+    these handlers ignored ``local_path`` and computed ``DEST/org/repo``
+    from the raw owner — which broke when ``paths.owner_aliases`` was
+    in play. The resolved value comes from the config validator so
+    legacy aliases, lowercase-owner derivation, and per-repo overrides
+    all collapse into one source of truth here.
+    """
     try:
         config = load_config(resolve_config_path(config_path))
     except ConfigError as e:
@@ -2311,12 +2585,44 @@ def _iter_repos(config_path: str | None, filter_str: str | None):
             continue
         org, repo = r.name.split("/", 1)
         remote = f"git@github.com:{r.name}.git"
-        yield r.name, org, repo, remote
+        # ``local_path`` is always populated by the time we reach here:
+        # either the operator declared it explicitly OR the model
+        # validator filled it in from ``paths.repo_root + owner.lower()``.
+        # If neither path was taken the validator would have raised at
+        # config load, never letting us get this far.
+        local_path = Path(str(r.local_path)).expanduser()
+        yield r.name, org, repo, remote, local_path
+
+
+def _resolve_target(
+    dest: Path | None,
+    org: str,
+    repo: str,
+    config_local_path: Path,
+) -> Path:
+    """Return where a repo should land on disk.
+
+    Without ``dest``, use the config-resolved ``local_path`` so
+    clone-all/pull-all/status agree with the dev pipeline. With
+    ``dest``, override to ``dest/<owner.lower()>/<repo>`` (the new
+    convention since 0.4.0). Pre-0.4.0 the dest-provided form used
+    the raw owner with mixed casing — that was the source of the
+    clone-all/local_path mismatch bug. See #128.
+    """
+    if dest is None:
+        return config_local_path
+    return Path(dest).expanduser().resolve() / org.lower() / repo
 
 
 @repos_app.command("clone-all")
 def repos_clone_all(
-    dest: Path = typer.Argument(..., help="Workspace root (e.g. ~/code/myproject)"),
+    dest: Path | None = typer.Argument(
+        None,
+        help=(
+            "Workspace root override (e.g. ~/code/sandbox). When omitted, "
+            "each repo lands at its resolved local_path from the config."
+        ),
+    ),
     config_path: str | None = typer.Option(
         None,
         "--config",
@@ -2328,14 +2634,14 @@ def repos_clone_all(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show actions without running"),
 ) -> None:
-    """Clone every configured repo into DEST/<org>/<repo>."""
+    """Clone every configured repo to its resolved local_path
+    (or DEST/<owner.lower()>/<repo> when DEST is given)."""
     import subprocess
 
-    root = Path(dest).expanduser().resolve()
     cloned = skipped = failed = 0
 
-    for name, org, repo, remote in _iter_repos(config_path, filter_str):
-        target = root / org / repo
+    for name, org, repo, remote, local_path in _iter_repos(config_path, filter_str):
+        target = _resolve_target(dest, org, repo, local_path)
         if (target / ".git").exists():
             console.print(f"[dim]✓ {name} (already cloned)[/dim]")
             skipped += 1
@@ -2370,7 +2676,13 @@ def repos_clone_all(
 
 @repos_app.command("pull-all")
 def repos_pull_all(
-    dest: Path = typer.Argument(..., help="Workspace root to pull (must already be cloned)"),
+    dest: Path | None = typer.Argument(
+        None,
+        help=(
+            "Workspace root override. When omitted, pulls each repo at "
+            "its resolved local_path from the config."
+        ),
+    ),
     config_path: str | None = typer.Option(
         None,
         "--config",
@@ -2382,14 +2694,14 @@ def repos_pull_all(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show actions without running"),
 ) -> None:
-    """Fast-forward pull every cloned repo under DEST/<org>/<repo>."""
+    """Fast-forward pull every cloned repo at its resolved local_path
+    (or DEST/<owner.lower()>/<repo> when DEST is given)."""
     import subprocess
 
-    root = Path(dest).expanduser().resolve()
     pulled = skipped = dirty = failed = 0
 
-    for name, org, repo, _remote in _iter_repos(config_path, filter_str):
-        target = root / org / repo
+    for name, org, repo, _remote, local_path in _iter_repos(config_path, filter_str):
+        target = _resolve_target(dest, org, repo, local_path)
         if not (target / ".git").exists():
             console.print(f"[dim]– {name} (not cloned)[/dim]")
             skipped += 1
@@ -2447,7 +2759,13 @@ def repos_pull_all(
 
 @repos_app.command("status")
 def repos_status(
-    dest: Path = typer.Argument(..., help="Workspace root to inspect"),
+    dest: Path | None = typer.Argument(
+        None,
+        help=(
+            "Workspace root override. When omitted, inspects each repo "
+            "at its resolved local_path from the config."
+        ),
+    ),
     config_path: str | None = typer.Option(
         None,
         "--config",
@@ -2458,18 +2776,19 @@ def repos_status(
         None, "--filter", "-f", help="Substring filter on repo name"
     ),
 ) -> None:
-    """Show clean/dirty/ahead/behind for every repo under DEST/<org>/<repo>."""
+    """Show clean/dirty/ahead/behind for every repo at its resolved
+    local_path (or DEST/<owner.lower()>/<repo> when DEST is given)."""
     import subprocess
 
-    root = Path(dest).expanduser().resolve()
-    table = Table(title=f"Repo status — {root}")
+    title = "Repo status" if dest is None else f"Repo status — {Path(dest).expanduser().resolve()}"
+    table = Table(title=title)
     table.add_column("Repo", style="cyan")
     table.add_column("Branch", style="blue")
     table.add_column("State")
     table.add_column("Ahead/Behind", justify="right")
 
-    for name, org, repo, _remote in _iter_repos(config_path, filter_str):
-        target = root / org / repo
+    for name, org, repo, _remote, local_path in _iter_repos(config_path, filter_str):
+        target = _resolve_target(dest, org, repo, local_path)
         if not (target / ".git").exists():
             table.add_row(name, "-", "[red]not cloned[/red]", "")
             continue

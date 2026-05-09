@@ -83,11 +83,10 @@ class TestNodeIdDefault:
 class TestRepoLocalPathDerivation:
     """When ``paths.repo_root`` is set, individual repo entries can omit
     ``local_path`` and have it derived as
-    ``${repo_root}/${owner_aliases.get(owner, owner)}/${repo}``. Lets a
-    machine-specific convention live in one place rather than being
-    repeated 70 times. Per-repo override still wins."""
+    ``${repo_root}/${owner.lower()}/${repo}`` (since 0.4.0 / #128).
+    Per-repo override still wins."""
 
-    def test_repo_without_local_path_derives_from_repo_root(
+    def test_repo_without_local_path_derives_from_repo_root_lowercased(
         self, sample_config_dict: dict, tmp_path: Path
     ) -> None:
         sample_config_dict["paths"]["repo_root"] = "/srv/code"
@@ -95,11 +94,18 @@ class TestRepoLocalPathDerivation:
         cfg_path = tmp_path / "orchestrator.yaml"
         cfg_path.write_text(yaml.dump(sample_config_dict))
         config = load_config(cfg_path)
-        assert config.repos[0].local_path == Path("/srv/code/AInvirion/foo")
+        # Lowercase owner — deterministic regardless of GitHub display casing.
+        assert config.repos[0].local_path == Path("/srv/code/ainvirion/foo")
 
-    def test_owner_aliases_remap_folder_name(
+    def test_owner_aliases_emit_deprecation_warning_and_are_ignored(
         self, sample_config_dict: dict, tmp_path: Path
     ) -> None:
+        # 0.3.x configs that still carry ``paths.owner_aliases`` must
+        # load (no schema break) but the alias map is ignored — paths
+        # are derived from ``owner.lower()`` regardless. Operators see
+        # a DeprecationWarning so they know to drop the block.
+        import warnings
+
         sample_config_dict["paths"]["repo_root"] = "/srv/code"
         sample_config_dict["paths"]["owner_aliases"] = {
             "AInvirion": "AINVIRION",
@@ -108,13 +114,23 @@ class TestRepoLocalPathDerivation:
         sample_config_dict["repos"] = [
             {"name": "AInvirion/foo"},
             {"name": "SemClone/bar"},
-            {"name": "personal/baz"},  # no alias -> literal owner
+            {"name": "personal/baz"},
         ]
         cfg_path = tmp_path / "orchestrator.yaml"
         cfg_path.write_text(yaml.dump(sample_config_dict))
-        config = load_config(cfg_path)
-        assert config.repos[0].local_path == Path("/srv/code/AINVIRION/foo")
-        assert config.repos[1].local_path == Path("/srv/code/SEMCL.ONE/bar")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            config = load_config(cfg_path)
+
+        # Warning surfaced.
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert any("owner_aliases" in str(w.message) for w in deprecations), (
+            f"expected a DeprecationWarning mentioning owner_aliases; got {caught}"
+        )
+        # Paths derived from owner.lower(), aliases ignored.
+        assert config.repos[0].local_path == Path("/srv/code/ainvirion/foo")
+        assert config.repos[1].local_path == Path("/srv/code/semclone/bar")
         assert config.repos[2].local_path == Path("/srv/code/personal/baz")
 
     def test_explicit_local_path_overrides_derivation(
@@ -153,7 +169,7 @@ class TestRepoLocalPathDerivation:
         cfg_path.write_text(yaml.dump(sample_config_dict))
         config = load_config(cfg_path)
         home = Path(os.path.expanduser("~"))
-        assert config.repos[0].local_path == home / "Projects" / "AInvirion" / "foo"
+        assert config.repos[0].local_path == home / "Projects" / "ainvirion" / "foo"
 
 
 class TestConfigPaths:

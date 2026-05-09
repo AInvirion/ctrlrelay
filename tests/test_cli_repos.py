@@ -39,7 +39,13 @@ class TestCloneAllDryRun:
         assert "AInvirion/aiproxyguard-cloud" in result.output
         assert "SemClone/binarysniffer" in result.output
 
-    def test_path_is_dest_slash_org_slash_repo(self, repos_config: Path, tmp_path: Path) -> None:
+    def test_path_is_dest_slash_lowered_org_slash_repo(
+        self, repos_config: Path, tmp_path: Path
+    ) -> None:
+        # Since 0.4.0 (#128), DEST overrides land at
+        # dest/<owner.lower()>/<repo>. The lowercase form makes
+        # clone-all match what the dev pipeline expects regardless
+        # of the GitHub org's mixed-case display name.
         dest = tmp_path / "workspace"
         result = runner.invoke(
             app,
@@ -47,8 +53,8 @@ class TestCloneAllDryRun:
         )
         # Rich line-wraps long paths — collapse whitespace before substring check.
         flat = "".join(result.output.split())
-        assert "workspace/AInvirion/aiproxyguard" in flat
-        assert "workspace/SemClone/binarysniffer" in flat
+        assert "workspace/ainvirion/aiproxyguard" in flat
+        assert "workspace/semclone/binarysniffer" in flat
 
     def test_remote_uses_ssh_github_convention(self, repos_config: Path, tmp_path: Path) -> None:
         result = runner.invoke(
@@ -100,7 +106,7 @@ class TestCloneAllExecution:
         clone_cmds = [c for c in calls if c[:2] == ["git", "clone"]]
         assert len(clone_cmds) == 3
 
-        target = (dest / "AInvirion" / "aiproxyguard").resolve()
+        target = (dest / "ainvirion" / "aiproxyguard").resolve()
         expected = [
             "git",
             "clone",
@@ -117,7 +123,7 @@ class TestCloneAllExecution:
     ) -> None:
         dest = tmp_path / "workspace"
         # Pre-create one repo as if already cloned.
-        already = dest / "AInvirion" / "aiproxyguard" / ".git"
+        already = dest / "ainvirion" / "aiproxyguard" / ".git"
         already.mkdir(parents=True)
 
         with patch("subprocess.run") as mock_run:
@@ -156,7 +162,7 @@ class TestPullAll:
     ) -> None:
         """pull-all on a clean tree must call `git -C TARGET pull --ff-only --quiet`."""
         dest = tmp_path / "workspace"
-        target = dest / "AInvirion" / "aiproxyguard"
+        target = dest / "ainvirion" / "aiproxyguard"
         (target / ".git").mkdir(parents=True)
 
         calls: list[list[str]] = []
@@ -188,7 +194,7 @@ class TestPullAll:
     ) -> None:
         """If `git fetch` returns non-zero on a dirty tree, count it as failed (not dirty)."""
         dest = tmp_path / "workspace"
-        target = dest / "AInvirion" / "aiproxyguard"
+        target = dest / "ainvirion" / "aiproxyguard"
         (target / ".git").mkdir(parents=True)
 
         def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]

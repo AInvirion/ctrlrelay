@@ -55,9 +55,6 @@ paths:
   skills:      "~/.claude/skills"
   # Optional convention for repos[].local_path:
   repo_root:   "~/Projects"
-  owner_aliases:
-    AInvirion: AINVIRION       # GitHub owner -> on-disk folder name
-    SemClone: SEMCL.ONE
 ```
 
 | Key | Type | Required | Description |
@@ -67,8 +64,8 @@ paths:
 | `bare_repos` | path | **yes** | Where ctrlrelay clones bare mirrors of each configured repo. |
 | `contexts` | path | **yes** | Per-repo context directory (looked up as `<contexts>/<owner-repo>/CLAUDE.md`). If a `CLAUDE.md` exists, it is symlinked into the worktree at session start. |
 | `skills` | path | **yes** | Claude Code skills directory used by `ctrlrelay skills audit` and `ctrlrelay skills list`. |
-| `repo_root` | path | no | Convention root for repo clones. When set, `repos[].local_path` may be omitted and is derived as `${repo_root}/${owner_aliases.get(owner, owner)}/${repo}`. Without `repo_root`, every repo entry must declare its own `local_path` (legacy behaviour). |
-| `owner_aliases` | object | no | Map of GitHub owner -> on-disk folder name. Lets the convention work when local folders use a vanity name (`SemClone` repos under `~/Projects/SEMCL.ONE/`). Lookup falls through to the literal owner if not present. |
+| `repo_root` | path | no | Convention root for repo clones. When set, `repos[].local_path` may be omitted and is derived as `${repo_root}/${owner.lower()}/${repo}` (since v0.4.0). Without `repo_root`, every repo entry must declare its own `local_path` (legacy behaviour). |
+| `owner_aliases` | object | no | **Deprecated since v0.4.0.** Pre-0.4.0 this remapped the on-disk folder name (e.g. `SemClone` -> `SEMCL.ONE`). The path resolver now always uses `owner.lower()`, so aliases are no longer consulted. Parsing is retained so 0.3.x configs still load; a `DeprecationWarning` is emitted when a non-empty mapping is supplied. To silence: drop the `owner_aliases` block, rename your on-disk folder to match `owner.lower()`, or set a per-repo `local_path` override for any that genuinely deviate. |
 
 ## claude
 
@@ -181,7 +178,7 @@ repos:
 | Key | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | **yes** | — | GitHub `owner/repo` slug. Used for `gh` calls and bare-repo / worktree naming. |
-| `local_path` | path | conditional | derived | Where the repo is checked out on disk for human use. Optional when `paths.repo_root` is set (then derived as `${repo_root}/${owner_aliases.get(owner, owner)}/${repo}`); required otherwise. An explicit value always wins as override. ctrlrelay itself uses bare mirrors under `paths.bare_repos`. |
+| `local_path` | path | conditional | derived | Where the repo is checked out on disk for human use. Optional when `paths.repo_root` is set (then derived as `${repo_root}/${owner.lower()}/${repo}`, since v0.4.0); required otherwise. An explicit value always wins as override. ctrlrelay itself uses bare mirrors under `paths.bare_repos`. |
 | `dev_branch_template` | string | no | `"fix/issue-{n}"` | Branch-name template for dev-pipeline runs. `{n}` is replaced by the issue number. |
 | `automation` | object | no | (defaults) | See [automation](#repos-automation). |
 | `code_review` | object | no | (defaults) | Reserved for code-review policy. Currently unused by the bundled pipelines. |
