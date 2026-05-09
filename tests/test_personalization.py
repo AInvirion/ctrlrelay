@@ -482,9 +482,13 @@ class TestSymlinkWiring:
         assert results[0].action == "replaced-stale-symlink"
         assert target.readlink() == empty_checkout / "global" / "CLAUDE.md"
 
-    def test_refuses_real_file_at_target(
+    def test_refuses_when_both_source_and_target_are_real_content(
         self, tmp_path: Path, empty_checkout: Path
     ) -> None:
+        """Slice 2 distinguishes adoption-eligible (only target has
+        content) from un-resolvable (both sides do). This case is
+        the latter: refuse with ``skipped-conflict-both-exist``.
+        """
         (empty_checkout / "global").mkdir()
         (empty_checkout / "global" / "CLAUDE.md").write_text("from-checkout")
         target = tmp_path / "home" / ".claude" / "CLAUDE.md"
@@ -496,7 +500,7 @@ class TestSymlinkWiring:
             paths=[{"source": "global/CLAUDE.md", "target": str(target)}],
         )
         results = PersonalizationManager(config).wire_symlinks()
-        assert results[0].action == "skipped-real-file-at-target"
+        assert results[0].action == "skipped-conflict-both-exist"
         assert target.is_symlink() is False
         assert target.read_text() == "real file, do not clobber"
 
@@ -539,6 +543,133 @@ class TestSymlinkWiring:
         results = PersonalizationManager(config).wire_symlinks()
         assert results[0].action == "skipped-source-type-mismatch"
         assert not target.exists()
+
+    def test_adopt_moves_real_file_into_checkout_and_wires(
+        self, tmp_path: Path, empty_checkout: Path
+    ) -> None:
+        """Slice 2: when the source is missing in the checkout AND the
+        target is a real file, adopt-flow moves the target into the
+        source location and creates the symlink. Eliminates the
+        manual "move then re-init" dance Slice 1 required.
+        """
+        # Pre-existing real file at the target.
+        target_dir = tmp_path / "home" / ".claude"
+        target_dir.mkdir(parents=True)
+        target = target_dir / "CLAUDE.md"
+        target.write_text("real content from before adopt\n")
+
+        # Source not yet in checkout.
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[{"source": "global/CLAUDE.md", "target": str(target)}],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+
+        assert len(results) == 1
+        assert results[0].action == "adopted"
+        # Target is now a symlink into the checkout.
+        assert target.is_symlink()
+        assert target.readlink() == empty_checkout / "global" / "CLAUDE.md"
+        # Content survived the move (still readable through the symlink).
+        assert target.read_text() == "real content from before adopt\n"
+        # And lives at the source path inside the checkout.
+        assert (empty_checkout / "global" / "CLAUDE.md").read_text() == (
+            "real content from before adopt\n"
+        )
+
+    def test_adopt_moves_directory(
+        self, tmp_path: Path, empty_checkout: Path
+    ) -> None:
+        """Adoption works for directory targets too, not just files."""
+        target_dir = tmp_path / "home" / ".claude"
+        target_dir.mkdir(parents=True)
+        skills = target_dir / "skills"
+        skills.mkdir()
+        (skills / "skill1.md").write_text("a skill\n")
+        (skills / "skill2.md").write_text("another\n")
+
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[{"source": "global/skills/", "target": str(skills) + "/"}],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+        assert results[0].action == "adopted"
+        assert skills.is_symlink()
+        # Both files are now readable through the symlink and live in
+        # the checkout.
+        assert (empty_checkout / "global" / "skills" / "skill1.md").read_text() == "a skill\n"
+        assert (skills / "skill2.md").read_text() == "another\n"
+
+    def test_no_adopt_preserves_slice1_behavior(
+        self, tmp_path: Path, empty_checkout: Path
+    ) -> None:
+        """``adopt=False`` reverts to the conservative Slice 1 path:
+        refuse to touch the real file, instruct backup-and-remove.
+        """
+        target_dir = tmp_path / "home" / ".claude"
+        target_dir.mkdir(parents=True)
+        target = target_dir / "CLAUDE.md"
+        target.write_text("don't touch me\n")
+
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[{"source": "global/CLAUDE.md", "target": str(target)}],
+        )
+        results = PersonalizationManager(config).wire_symlinks(adopt=False)
+        assert results[0].action == "skipped-real-file-at-target"
+        assert not target.is_symlink()
+        assert target.read_text() == "don't touch me\n"
+        # Source NOT created in checkout.
+        assert not (empty_checkout / "global" / "CLAUDE.md").exists()
+
+    def test_adopt_refuses_when_both_source_and_target_have_content(
+        self, tmp_path: Path, empty_checkout: Path
+    ) -> None:
+        """If BOTH the checkout source AND the on-disk target have
+        real content, adopt can't pick a winner — refuse and ask the
+        operator to reconcile manually.
+        """
+        # Source already populated in checkout.
+        (empty_checkout / "global").mkdir()
+        (empty_checkout / "global" / "CLAUDE.md").write_text("from-repo\n")
+
+        # Target also has content, NOT a symlink.
+        target_dir = tmp_path / "home" / ".claude"
+        target_dir.mkdir(parents=True)
+        target = target_dir / "CLAUDE.md"
+        target.write_text("from-disk\n")
+
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[{"source": "global/CLAUDE.md", "target": str(target)}],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+        assert results[0].action == "skipped-conflict-both-exist"
+        # Neither side touched.
+        assert target.read_text() == "from-disk\n"
+        assert (empty_checkout / "global" / "CLAUDE.md").read_text() == "from-repo\n"
+
+    def test_adopt_refuses_when_target_type_doesnt_match_config(
+        self, tmp_path: Path, empty_checkout: Path
+    ) -> None:
+        """Config says directory (trailing slash) but target on disk
+        is a regular file: refuse rather than silently move a file
+        into a slot the config thinks is a directory.
+        """
+        target_dir = tmp_path / "home" / ".claude"
+        target_dir.mkdir(parents=True)
+        # Target is a FILE, but config will say DIRECTORY.
+        target = target_dir / "skills"
+        target.write_text("oops, not a dir\n")
+
+        config = _build_config(
+            checkout_path=empty_checkout,
+            paths=[{"source": "global/skills/", "target": str(target) + "/"}],
+        )
+        results = PersonalizationManager(config).wire_symlinks()
+        assert results[0].action == "skipped-target-type-mismatch"
+        # Target unchanged.
+        assert target.read_text() == "oops, not a dir\n"
 
     def test_skips_missing_source(
         self, tmp_path: Path, empty_checkout: Path
@@ -638,10 +769,25 @@ def remote_bare(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return bare
 
 
-def _config_for(checkout: Path, remote_bare: Path, *, node_id: str) -> Config:
+def _config_for(
+    checkout: Path,
+    remote_bare: Path,
+    *,
+    node_id: str,
+    paths: list[dict] | None = None,
+) -> Config:
     """Build a Config whose personalization repo URL points at the
     local bare repo (so tests don't hit the network).
     """
+    if paths is None:
+        paths = [
+            {
+                "source": "global/CLAUDE.md",
+                "target": str(
+                    checkout.parent / "fake-home/.claude/CLAUDE.md"
+                ),
+            },
+        ]
     cfg = Config.model_validate({
         "version": "1",
         "node_id": node_id,
@@ -661,14 +807,7 @@ def _config_for(checkout: Path, remote_bare: Path, *, node_id: str) -> Config:
         "personalization": {
             "repo": "test/dotclaude",   # passes the regex; URL is overridden below
             "checkout_path": str(checkout),
-            "paths": [
-                {
-                    "source": "global/CLAUDE.md",
-                    "target": str(
-                        checkout.parent / "fake-home/.claude/CLAUDE.md"
-                    ),
-                },
-            ],
+            "paths": paths,
         },
         "repos": [],
     })
@@ -1347,6 +1486,134 @@ class TestPushDeletionAndContention:
         assert head == "personalization/machine-x"
         # ...and reachable from develop's content (the marker file).
         assert (checkout / "develop-marker.md").exists()
+
+
+class TestAutoPull:
+    """Slice 2 daemon-friendly pull variant — skips on dirty working
+    tree so the operator's unsaved edits aren't disturbed by a rebase.
+    """
+
+    def test_auto_pull_runs_when_clean(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        # Set up: A pushes a commit, B inits and is clean.
+        a_checkout = tmp_path / "a" / "personalization"
+        b_checkout = tmp_path / "b" / "personalization"
+        a_mgr = PersonalizationManager(_config_for(a_checkout, remote_bare, node_id="a"))
+        b_mgr = PersonalizationManager(_config_for(b_checkout, remote_bare, node_id="b"))
+        _patch_remote_url(a_mgr, str(remote_bare))
+        _patch_remote_url(b_mgr, str(remote_bare))
+        a_mgr.init()
+        b_mgr.init()
+
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "CLAUDE.md").write_text("from-a\n")
+        a_mgr.push(message="from-a")
+
+        # B's working tree is clean — auto_pull should proceed.
+        result = b_mgr.auto_pull()
+        assert result.success
+        assert "skipped" not in result.summary.lower()
+        assert (b_checkout / "global" / "CLAUDE.md").read_text() == "from-a\n"
+
+    def test_auto_pull_skips_on_dirty_tree(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        a_checkout = tmp_path / "a" / "personalization"
+        a_mgr = PersonalizationManager(_config_for(a_checkout, remote_bare, node_id="a"))
+        _patch_remote_url(a_mgr, str(remote_bare))
+        a_mgr.init()
+
+        # Local edit, uncommitted.
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "CLAUDE.md").write_text("uncommitted edit\n")
+
+        # Auto-pull MUST skip — rebase under operator edits is the
+        # behavior we're explicitly trying to avoid.
+        result = a_mgr.auto_pull()
+        assert result.success
+        assert "skipped" in result.summary.lower()
+        # Edit preserved.
+        assert (
+            a_checkout / "global" / "CLAUDE.md"
+        ).read_text() == "uncommitted edit\n"
+
+    def test_auto_pull_no_checkout_returns_benign(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        """Daemon shouldn't crash because the operator hasn't run
+        init on this machine yet."""
+        checkout = tmp_path / "personalization"  # not created
+        config = _config_for(checkout, remote_bare, node_id="machine-x")
+        mgr = PersonalizationManager(config)
+        result = mgr.auto_pull()
+        assert result.success
+        assert "no checkout" in result.summary.lower()
+
+    def test_auto_pull_does_not_adopt_real_target(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        """Daemon-driven auto-pull MUST NOT silently move operator
+        files. ``pull()`` re-wires symlinks at the end and now defaults
+        to ``adopt=True``; ``auto_pull()`` must thread ``adopt=False``
+        so a background sync never absorbs a real file into the
+        checkout. Codex review pass 1 caught this regression — keep
+        the regression test next to it.
+        """
+        checkout = tmp_path / "personalization"
+        target_dir = tmp_path / "home" / ".claude"
+        target_dir.mkdir(parents=True)
+        target = target_dir / "CLAUDE.md"
+        target.write_text("operator-local content\n")
+
+        config = _config_for(
+            checkout,
+            remote_bare,
+            node_id="machine-x",
+            paths=[{"source": "global/CLAUDE.md", "target": str(target)}],
+        )
+        mgr = PersonalizationManager(config)
+        _patch_remote_url(mgr, str(remote_bare))
+        mgr.init(adopt=False)
+        # No untracked files (init with adopt=False didn't move target).
+        assert mgr._git("status", "--porcelain").strip() == ""
+
+        result = mgr.auto_pull()
+        assert result.success
+        # Target file untouched — still a real file, not a symlink.
+        assert target.is_file()
+        assert not target.is_symlink()
+        assert target.read_text() == "operator-local content\n"
+        # Source NOT created in the checkout by auto_pull.
+        assert not (checkout / "global" / "CLAUDE.md").exists()
+
+
+class TestPersonalizationCronConfig:
+    """Slice 2 added the optional ``schedules.personalization_cron``
+    field. Validate parsing + cron-expression validation.
+    """
+
+    def test_personalization_cron_optional(self, tmp_path: Path) -> None:
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.dump(_base_config_dict()))
+        config = load_config(path)
+        assert config.schedules.personalization_cron is None
+
+    def test_personalization_cron_loaded(self, tmp_path: Path) -> None:
+        path = tmp_path / "cfg.yaml"
+        cfg = _base_config_dict()
+        cfg["schedules"] = {"personalization_cron": "*/15 * * * *"}
+        path.write_text(yaml.dump(cfg))
+        config = load_config(path)
+        assert config.schedules.personalization_cron == "*/15 * * * *"
+
+    def test_personalization_cron_invalid_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "cfg.yaml"
+        cfg = _base_config_dict()
+        cfg["schedules"] = {"personalization_cron": "not a cron expression"}
+        path.write_text(yaml.dump(cfg))
+        with pytest.raises(ConfigError):
+            load_config(path)
 
 
 class TestManagerErrors:

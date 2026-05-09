@@ -37,3 +37,6 @@ repos.manifest
 
 # Lock file — not committed per AInvirion Python-SDK convention.
 uv.lock
+
+# Operator-private notes (runbooks, personal cheatsheets).
+notes/
