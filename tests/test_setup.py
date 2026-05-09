@@ -17,11 +17,28 @@ from ctrlrelay.setup import (
     assert_gh_auth,
     build_orchestrator_yaml,
     detect_owners,
+    detect_personalization_skills,
     list_repos,
     run_setup,
 )
 
 runner = CliRunner()
+
+
+def _write_fake_checkout(checkout: Path, origin_url: str) -> None:
+    """Lay down a checkout that ``git remote get-url origin`` would
+    accept, without needing a real ``git init`` (the test fixtures
+    patch ``subprocess.run`` and would intercept real git ops).
+    """
+    git_dir = checkout / ".git"
+    git_dir.mkdir(parents=True, exist_ok=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+    (git_dir / "config").write_text(
+        "[core]\n"
+        "\trepositoryformatversion = 0\n"
+        f'[remote "origin"]\n'
+        f"\turl = {origin_url}\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +248,28 @@ def fake_gh(monkeypatch: pytest.MonkeyPatch) -> dict:
             target = Path(cmd[-1])
             (target / ".git").mkdir(parents=True, exist_ok=True)
             return subprocess.CompletedProcess(cmd, 0, "", "")
+        # git -C <checkout> remote get-url origin — used by the
+        # personalization-checkout origin verification.
+        if (
+            len(cmd) >= 6
+            and cmd[0] == "git"
+            and cmd[1] == "-C"
+            and cmd[3:6] == ["remote", "get-url", "origin"]
+        ):
+            checkout = Path(cmd[2])
+            cfg = checkout / ".git" / "config"
+            if cfg.is_file():
+                # Pull `url = ...` out of the [remote "origin"] block.
+                in_origin = False
+                for line in cfg.read_text().splitlines():
+                    s = line.strip()
+                    if s.startswith("["):
+                        in_origin = s == '[remote "origin"]'
+                        continue
+                    if in_origin and s.startswith("url"):
+                        url = s.split("=", 1)[1].strip()
+                        return subprocess.CompletedProcess(cmd, 0, url + "\n", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "no origin")
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr("subprocess.run", fake_run)
@@ -358,6 +397,247 @@ class TestRunSetup:
         assert fake_gh["git_clone_calls"] == []
         # Config is still on disk and parses.
         assert opts.config_out.is_file()
+
+
+# ---------------------------------------------------------------------------
+# personalization follow-ups: filter the personalization repo, auto-wire skills
+
+
+class TestDetectPersonalizationSkills:
+    def test_returns_sorted_subdirs_only(self, tmp_path: Path) -> None:
+        skills_dir = tmp_path / "global" / "skills"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "Bravo").mkdir()
+        (skills_dir / "alpha").mkdir()
+        (skills_dir / "charlie").mkdir()
+        # A stray file at the top level — must be ignored.
+        (skills_dir / "README.md").write_text("not a skill\n")
+        # A hidden dir — must be ignored.
+        (skills_dir / ".hidden").mkdir()
+
+        paths = detect_personalization_skills(tmp_path)
+        names = [p.source.removeprefix("global/skills/").removesuffix("/") for p in paths]
+        # Case-insensitive sort: 'alpha', 'Bravo', 'charlie'.
+        assert names == ["alpha", "Bravo", "charlie"]
+
+    def test_returns_empty_when_skills_dir_missing(self, tmp_path: Path) -> None:
+        # Personalization repo without a global/skills/ tree at all.
+        assert detect_personalization_skills(tmp_path) == []
+
+    def test_target_uses_tilde_home_for_portability(self, tmp_path: Path) -> None:
+        skills_dir = tmp_path / "global" / "skills"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "gh-secops").mkdir()
+        paths = detect_personalization_skills(tmp_path)
+        # Target must use ``~/.claude/...`` rather than an absolute home
+        # path so the same config works across machines with different
+        # operator home directories.
+        assert paths[0].target == "~/.claude/skills/gh-secops/"
+
+
+class TestPersonalizationRepoFilteredOutOfRepos:
+    def test_personalization_repo_not_listed_under_owner(
+        self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the personalization repo lives under one of the
+        configured owners (e.g. ``alice/dotclaude`` while ``alice`` is
+        also an enumerated owner), it must not appear in the ``repos:``
+        block — it's the sync target, not a project to monitor."""
+        from ctrlrelay import setup as setup_mod
+        from ctrlrelay.personalization import manager as mgr_mod
+
+        # Don't try to clone the personalization repo for skill scan
+        # or actually run init in this test — we're focused on the
+        # repos: filter.
+        monkeypatch.setattr(
+            setup_mod, "_ensure_personalization_clone", lambda repo, checkout: False
+        )
+        monkeypatch.setattr(
+            mgr_mod.PersonalizationManager, "init", lambda self, **kw: "stub-init"
+        )
+        fake_gh["repos_by_owner"] = {
+            "alice": ["alice/foo", "alice/dotclaude", "alice/bar"],
+            "AInvirion": ["AInvirion/baz"],
+        }
+        opts = SetupOptions(
+            owners=["alice", "AInvirion"],
+            repo_root=tmp_path / "Projects",
+            config_out=tmp_path / "cfg.yaml",
+            personalization_repo="alice/dotclaude",
+            wire_skills=False,  # skip scan in this test
+        )
+        result = run_setup(opts)
+        # 3 repos remain (alice/foo, alice/bar, AInvirion/baz). The
+        # personalization repo is excluded but other alice repos pass.
+        assert result.n_repos == 3
+        text = opts.config_out.read_text()
+        assert "alice/foo" in text
+        assert "alice/bar" in text
+        assert "AInvirion/baz" in text
+        assert 'name: "alice/dotclaude"' not in text
+
+
+    def test_personalization_repo_filter_is_case_insensitive(
+        self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GitHub repo names are case-insensitive (``alice/dotclaude``
+        and ``Alice/DotClaude`` resolve to the same repo). The filter
+        must match regardless of casing — codex review pass 1 caught
+        the case where ``gh repo list`` returns the canonical casing
+        but the operator's --personalization-repo arg differs."""
+        from ctrlrelay import setup as setup_mod
+        from ctrlrelay.personalization import manager as mgr_mod
+
+        monkeypatch.setattr(
+            setup_mod, "_ensure_personalization_clone", lambda repo, checkout: False
+        )
+        monkeypatch.setattr(
+            mgr_mod.PersonalizationManager, "init", lambda self, **kw: "stub-init"
+        )
+        # gh returns the canonical casing; operator typed lowercase.
+        fake_gh["repos_by_owner"] = {
+            "alice": ["alice/foo", "Alice/DotClaude"],
+            "AInvirion": [],
+        }
+        opts = SetupOptions(
+            owners=["alice", "AInvirion"],
+            repo_root=tmp_path / "Projects",
+            config_out=tmp_path / "cfg.yaml",
+            personalization_repo="alice/dotclaude",  # lowercase
+            wire_skills=False,
+        )
+        result = run_setup(opts)
+        # Only alice/foo remains — the canonical-cased dotclaude was filtered.
+        assert result.n_repos == 1
+        text = opts.config_out.read_text()
+        assert "alice/foo" in text
+        assert "DotClaude" not in text
+        assert "dotclaude" not in text.replace(opts.personalization_repo or "", "")
+
+
+class TestSkillAutoWiringInRunSetup:
+    def test_detected_skills_appear_in_personalization_paths(
+        self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: when --wire-skills is on (default) and the
+        personalization checkout has skill subdirs, run_setup adds
+        per-skill paths: entries to the generated YAML."""
+        from ctrlrelay import setup as setup_mod
+        from ctrlrelay.personalization import manager as mgr_mod
+
+        # Stand up a fake personalization checkout with two skills.
+        fake_checkout = tmp_path / "personalization-checkout"
+        skills = fake_checkout / "global" / "skills"
+        skills.mkdir(parents=True)
+        (skills / "gh-secops").mkdir()
+        (skills / "codex-review-loop").mkdir()
+        # Origin must match `personalization_repo` for the existence
+        # check to accept this checkout (codex review pass 2 added the
+        # check; without an origin, scan would be skipped).
+        _write_fake_checkout(fake_checkout, "git@github.com:alice/dotclaude.git")
+
+        # Point setup at the fake checkout instead of ~/.ctrlrelay/...
+        monkeypatch.setattr(
+            setup_mod, "DEFAULT_PERSONALIZATION_CHECKOUT", fake_checkout
+        )
+        # Don't run real PersonalizationManager.init — that would issue
+        # additional git commands the fake_gh fixture doesn't mock.
+        monkeypatch.setattr(
+            mgr_mod.PersonalizationManager, "init", lambda self, **kw: "stub-init"
+        )
+
+        fake_gh["repos_by_owner"] = {"alice": ["alice/foo"], "AInvirion": []}
+        opts = SetupOptions(
+            owners=["alice", "AInvirion"],
+            repo_root=tmp_path / "Projects",
+            config_out=tmp_path / "cfg.yaml",
+            personalization_repo="alice/dotclaude",
+            wire_skills=True,
+        )
+        run_setup(opts)
+        text = opts.config_out.read_text()
+        # CLAUDE.md still there; skills appended in detect order.
+        assert 'source: "global/CLAUDE.md"' in text
+        assert 'source: "global/skills/codex-review-loop/"' in text
+        assert 'source: "global/skills/gh-secops/"' in text
+        assert 'target: "~/.claude/skills/codex-review-loop/"' in text
+
+    def test_existing_checkout_with_different_origin_is_not_scanned(
+        self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If ~/.ctrlrelay/personalization already holds a clone of a
+        DIFFERENT repo than what setup is configuring, the helper must
+        treat it as unusable and skip the skill scan. Otherwise we'd
+        bake the unrelated repo's skill names into the new config and
+        PersonalizationManager.init would later refuse the checkout.
+        Codex review pass 2 caught this."""
+        from ctrlrelay import setup as setup_mod
+        from ctrlrelay.personalization import manager as mgr_mod
+
+        # Stand up a fake checkout whose origin is for "other/unrelated",
+        # but configure setup with personalization-repo "alice/dotclaude".
+        fake_checkout = tmp_path / "stale-checkout"
+        skills = fake_checkout / "global" / "skills"
+        skills.mkdir(parents=True)
+        (skills / "should-not-leak").mkdir()
+        _write_fake_checkout(fake_checkout, "git@github.com:other/unrelated.git")
+
+        monkeypatch.setattr(
+            setup_mod, "DEFAULT_PERSONALIZATION_CHECKOUT", fake_checkout
+        )
+        monkeypatch.setattr(
+            mgr_mod.PersonalizationManager, "init", lambda self, **kw: "stub-init"
+        )
+
+        fake_gh["repos_by_owner"] = {"alice": ["alice/foo"], "AInvirion": []}
+        opts = SetupOptions(
+            owners=["alice", "AInvirion"],
+            repo_root=tmp_path / "Projects",
+            config_out=tmp_path / "cfg.yaml",
+            personalization_repo="alice/dotclaude",
+            wire_skills=True,
+        )
+        run_setup(opts)
+        text = opts.config_out.read_text()
+        # CLAUDE.md is the only paths: entry. The unrelated checkout's
+        # skill name does NOT leak into the generated config.
+        assert 'source: "global/CLAUDE.md"' in text
+        assert "should-not-leak" not in text
+        assert "global/skills/" not in text
+
+    def test_no_wire_skills_emits_only_default_path(
+        self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--no-wire-skills`` must NOT scan or add per-skill
+        entries even if the personalization checkout has skill dirs."""
+        from ctrlrelay import setup as setup_mod
+        from ctrlrelay.personalization import manager as mgr_mod
+
+        fake_checkout = tmp_path / "personalization-checkout"
+        skills = fake_checkout / "global" / "skills"
+        skills.mkdir(parents=True)
+        (skills / "gh-secops").mkdir()
+        (fake_checkout / ".git").mkdir()
+        monkeypatch.setattr(
+            setup_mod, "DEFAULT_PERSONALIZATION_CHECKOUT", fake_checkout
+        )
+        monkeypatch.setattr(
+            mgr_mod.PersonalizationManager, "init", lambda self, **kw: "stub-init"
+        )
+
+        fake_gh["repos_by_owner"] = {"alice": ["alice/foo"], "AInvirion": []}
+        opts = SetupOptions(
+            owners=["alice", "AInvirion"],
+            repo_root=tmp_path / "Projects",
+            config_out=tmp_path / "cfg.yaml",
+            personalization_repo="alice/dotclaude",
+            wire_skills=False,
+        )
+        run_setup(opts)
+        text = opts.config_out.read_text()
+        assert 'source: "global/CLAUDE.md"' in text
+        # No per-skill entries written when wire-skills is off.
+        assert "global/skills/" not in text
 
 
 # ---------------------------------------------------------------------------
