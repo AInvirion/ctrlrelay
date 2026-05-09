@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-08
+
+Minor release. Three additive features: cross-machine **personalization
+sync** of operator state through a private GitHub repo, **portability
+fixes** that let one `orchestrator.yaml` work unmodified across machines,
+and **label-driven issue matching** for the dev pipeline. One install
+fix (`PYTHONUNBUFFERED`) and a docs page covering the new
+personalization flow.
+
+### Added
+
+- **Personalization sync** (#123, #124). New `personalization:` config
+  block + `ctrlrelay personalization init/status/push/pull`
+  subcommands sync the operator's Claude Code state — global config,
+  per-project memory, spec/superpower outputs — across machines
+  through a separate (typically private) GitHub repo. Per-machine
+  branches (`personalization/<node_id>`) rebase onto `main` and FF
+  the integration branch, so two machines pushing concurrently never
+  overwrite each other; `--force-with-lease` is reserved for the
+  per-machine branch, never used on `main`. Source/target paths
+  support `${HOME}`, `${PROJECT}` (slug `<owner>--<repo>`),
+  `${PROJECT_ENCODED}` (matches Claude's path encoding),
+  `${PROJECT_LOCAL}`, and `${PROJECT_PARENT}` placeholders. An
+  allowlist limits commits to declared entries — random files in the
+  checkout aren't staged. **Adopt-flow** is on by default: `init`
+  moves pre-existing real targets (e.g. `~/.claude/CLAUDE.md` that
+  predates the sync setup) into the synced repo and lays a symlink in
+  their place; `--no-adopt` opts out. Both-real-content collisions
+  surface as `skipped-conflict-both-exist` for manual reconciliation.
+  See the new [Personalization sync](docs/personalization.md) page.
+- **Auto-pull on cron** (#124). New optional
+  `schedules.personalization_cron` runs `personalization pull` on the
+  poller daemon, with two safety rails: skip-on-dirty (never rebases
+  under uncommitted operator edits) and `adopt=False` on the re-wire
+  (a background sync never silently moves files; adoption stays
+  init-only). Auto-push is intentionally not scheduled — daemon-side
+  commits surprise people. Dispatched via `asyncio.to_thread` so a
+  slow remote can't stall the poller's event loop (Telegram dispatch,
+  pending-resume sweeper, secops cron).
+- **`paths.repo_root` + `paths.owner_aliases`** (#121). When set,
+  `repos[].local_path` is derived as
+  `${repo_root}/${owner_aliases.get(owner, owner)}/${repo}`. Per-repo
+  `local_path` still wins as an override. Without `repo_root`, the
+  legacy "local_path required per repo" behaviour is preserved.
+  Collapses 69 explicit `local_path` values to 20 in the maintainer's
+  config.
+- **`node_id` defaults to hostname** (#121). Falls back to
+  `socket.gethostname()` when missing, null, or blank. Heartbeats and
+  session logs still get a meaningful per-node label without forcing
+  every operator to edit the file.
+- **`ctrlrelay install launchd|systemd`** (#121). Renders
+  bridge/poller service unit files from in-package templates,
+  substituting `USER`, `HOME`, `CTRLRELAY_BIN`, `WORKDIR`,
+  `LABEL_PREFIX`, `POLLER_INTERVAL`, and (when set)
+  `CTRLRELAY_TELEGRAM_TOKEN`. Writes to the conventional locations
+  (`~/Library/LaunchAgents` on macOS, `~/.config/systemd/user` on
+  Linux) and refuses to clobber existing files unless `--force`.
+  Replaces the docs.operations.md copy-paste flow where every
+  operator hand-edited `/Users/$ME/...` strings — a tax on
+  portability and a common source of broken plists.
+- **Label-driven issue matching** (#115, closes #80). Two new
+  per-repo lists govern which issues the poller hands to the dev
+  pipeline:
+  - `repos[].automation.exclude_labels` (default `["manual",
+    "operator", "instruction"]`) — issues carrying any of these
+    labels are skipped, marked seen, logged as
+    `poll.issue.excluded_by_label`, and never trigger code changes.
+    For operator tasks and pure instruction issues.
+  - `repos[].automation.include_labels` (default `[]`) — when
+    non-empty, issues carrying any of these labels opt **in** to the
+    dev pipeline regardless of who is (or isn't) assigned. For repos
+    that drive the pipeline by triage label rather than assignment.
+  Matching is case-insensitive. Trust model documented in
+  [configuration.md](docs/configuration.md#repos-automation): anyone
+  with triage permission on a repo can apply a label, which matches
+  ctrlrelay's existing trust model.
+
+### Fixed
+
+- **`PYTHONUNBUFFERED=1` in launchd plists and systemd units** (#122).
+  Without it, daemon stdout/stderr buffered up to 4–8 KB before
+  flushing to the log file — so `tail -f` on a poller log looked
+  frozen for minutes during quiet periods, and crash diagnostics were
+  clipped at the last buffer boundary instead of the actual failure
+  point. Templates now set the env var and `ctrlrelay install
+  launchd|systemd` re-emits both unit files on next run.
+
+### Docs
+
+- **[Personalization sync](docs/personalization.md)** (#125). New
+  page (nav order 8) covering setup, the dotclaude repo layout, the
+  init/status/push/pull lifecycle, `--no-adopt`, auto-pull cron,
+  multi-machine bootstrap, and the gotchas (worktrees, edit-through-
+  symlink semantics, allowlist enforcement, conflict handling, strict
+  origin URL match). Pairs with new `schedules` and `personalization`
+  sections in [configuration.md](docs/configuration.md) and a new
+  `ctrlrelay personalization` block in [cli.md](docs/cli.md).
+
 ## [0.2.1] - 2026-04-28
 
 Patch release. Fixes a long-standing UX bug where `ctrlrelay` could
