@@ -743,7 +743,6 @@ class PersonalizationManager:
             plan.source.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(plan.target), str(plan.source))
             source_exists = True
-            target_is_real = False
             adopted = True
         else:
             adopted = False
