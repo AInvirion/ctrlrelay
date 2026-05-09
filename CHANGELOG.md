@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-08
+
+Patch release. Two follow-ups against the v0.4.0 setup flow surfaced
+during the dogfood validation:
+
+### Fixed
+
+- **`setup` no longer lists the personalization repo under
+  `repos:`.** When the operator's personalization repo lives under
+  one of the configured owners (e.g. `alice/dotclaude` while `alice`
+  is also an enumerated owner), it was being added to the dev
+  pipeline's monitored set — the poller would have polled it for
+  issues and worktree-cloned it. The repo is the cross-machine sync
+  target, not a project; setup now drops it from the enumerated list
+  before generating the YAML.
+
+### Added
+
+- **Auto-wire detected skills on `setup`.** When the personalization
+  repo already contains `global/skills/<name>/` directories (e.g.
+  from a prior `personalization push` on another machine), setup now
+  pre-clones the repo, scans for skill subdirectories, and adds one
+  `paths:` entry per skill to the generated `personalization.paths`
+  block. Operators don't have to hand-edit the config to wire each
+  skill back on a new machine. Pass `--no-wire-skills` to opt out.
+  Hidden directories and stray top-level files are ignored — only
+  real skill packages count.
+
 ## [0.4.0] - 2026-05-08
 
 Minor release. One new feature plus one schema simplification:

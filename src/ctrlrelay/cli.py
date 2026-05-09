@@ -2252,6 +2252,15 @@ def setup(
         "--no-personalization",
         help="Skip the personalization prompt entirely (non-interactive mode).",
     ),
+    wire_skills: bool = typer.Option(
+        True,
+        "--wire-skills/--no-wire-skills",
+        help=(
+            "When the personalization repo already contains "
+            "global/skills/<name>/ directories, add a paths: entry per "
+            "skill so they sync to ~/.claude/skills/<name>/. Default: on."
+        ),
+    ),
     install_daemons: bool = typer.Option(
         False,
         "--install-daemons",
@@ -2412,6 +2421,7 @@ def setup(
         telegram_chat_id=telegram_chat_id,
         telegram_token=token,
         personalization_repo=chosen_personalization,
+        wire_skills=wire_skills,
         install_daemons=chosen_install_daemons,
         skip_archived=skip_archived,
         skip_forks=skip_forks,

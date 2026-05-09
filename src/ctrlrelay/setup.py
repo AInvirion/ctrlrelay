@@ -23,11 +23,14 @@ from ctrlrelay.core.config import Config, load_config
 __all__ = [
     "SetupOptions",
     "SetupResult",
+    "PersonalizationPath",
     "GhAuthError",
     "VALID_TRANSPORTS",
     "DEFAULT_CONFIG_OUT",
+    "DEFAULT_PERSONALIZATION_CHECKOUT",
     "detect_owners",
     "list_repos",
+    "detect_personalization_skills",
     "build_orchestrator_yaml",
     "clone_repos",
     "run_setup",
@@ -44,6 +47,11 @@ VALID_TRANSPORTS = ("file_mock", "telegram")
 # operator at a non-default path while also installing daemons would
 # orphan them, so setup refuses that combo (see ``run_setup``).
 DEFAULT_CONFIG_OUT = Path("~/.config/ctrlrelay/orchestrator.yaml").expanduser()
+
+# Mirrors ``Personalization.checkout_path``'s default. Setup pre-clones
+# into this path before generating the YAML so we can scan for skill
+# directories and wire them in the same setup run (see #129 follow-up).
+DEFAULT_PERSONALIZATION_CHECKOUT = Path("~/.ctrlrelay/personalization").expanduser()
 
 
 class GhAuthError(RuntimeError):
@@ -72,9 +80,30 @@ class SetupOptions:
     telegram_chat_id: int | None = None
     telegram_token: str | None = None  # only used when transport == "telegram"
     personalization_repo: str | None = None  # e.g. "alice/dotclaude"
+    # When True (the default) and ``personalization_repo`` is set,
+    # setup pre-clones the personalization repo and scans
+    # ``global/skills/<name>/`` for existing skill directories,
+    # wiring each as its own ``paths:`` entry. Skills already laid
+    # down by the operator on a prior machine then auto-sync to this
+    # one without a hand-edit.
+    wire_skills: bool = True
     install_daemons: bool = False
     force: bool = False
     skip_clone: bool = False  # for tests / dry-run scenarios
+
+
+@dataclass
+class PersonalizationPath:
+    """One source/target pair for the personalization block.
+
+    Setup uses this to assemble the ``personalization.paths`` list:
+    the always-on ``global/CLAUDE.md`` entry plus any auto-detected
+    skills. Kept as a flat dataclass so tests can construct lists
+    without touching the YAML output format.
+    """
+
+    source: str
+    target: str
 
 
 @dataclass
@@ -169,14 +198,117 @@ def list_repos(
 
 
 # ---------------------------------------------------------------------------
+# personalization helpers
+
+
+def _ensure_personalization_clone(
+    repo: str, checkout: Path
+) -> bool:
+    """Make sure ``checkout`` is a clone of ``github.com:<repo>.git``.
+
+    Returns True if the clone is present and matches ``repo`` (existing
+    or freshly created), False if the remote refused (auth error, repo
+    doesn't exist) OR the existing checkout points at a different repo.
+    Errors are swallowed so setup proceeds with the default
+    CLAUDE.md-only personalization paths — a missing or unrelated
+    remote shouldn't abort the whole onboarding flow, but we also must
+    not scan an unrelated working tree's skills and bake them into the
+    new config (codex review pass 2).
+    """
+    if (checkout / ".git").is_dir():
+        return _checkout_matches_repo(checkout, repo)
+    checkout.parent.mkdir(parents=True, exist_ok=True)
+    # Use HTTPS to match ``PersonalizationManager.repo_url`` so the
+    # pre-scan works for operators authenticated to GitHub via gh
+    # tokens / HTTPS without an SSH key on the machine. Codex review
+    # pass 3 caught the SSH/HTTPS mismatch — pre-scan would silently
+    # fail, the manager's own init() would later succeed via HTTPS,
+    # and the auto-wire feature would be bypassed in a common setup.
+    proc = subprocess.run(
+        ["git", "clone", "--quiet", f"https://github.com/{repo}.git", str(checkout)],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def _checkout_matches_repo(checkout: Path, repo: str) -> bool:
+    """Return True iff the existing ``checkout``'s origin remote points
+    at ``github.com:<repo>``.
+
+    Accepts the three URL forms git emits for github.com remotes:
+    ``https://github.com/owner/repo(.git)``,
+    ``git@github.com:owner/repo(.git)``, and
+    ``ssh://git@github.com/owner/repo(.git)``. Comparison is
+    case-insensitive — GitHub repo names are. Any other host or any
+    error reading the remote returns False (treated as "not ours").
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(checkout), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return False
+    url = proc.stdout.strip()
+    expected = repo.lower()
+    # Strip the optional ``.git`` suffix and reduce each accepted URL
+    # form to ``owner/repo`` for the comparison.
+    if url.endswith(".git"):
+        url = url[: -len(".git")]
+    for prefix in (
+        "https://github.com/",
+        "ssh://git@github.com/",
+        "git@github.com:",
+    ):
+        if url.startswith(prefix):
+            return url[len(prefix):].lower() == expected
+    return False
+
+
+def detect_personalization_skills(checkout: Path) -> list[PersonalizationPath]:
+    """Return a sorted list of per-skill ``paths:`` entries derived from
+    ``<checkout>/global/skills/``.
+
+    Each direct subdirectory becomes one entry mapping
+    ``global/skills/<name>/`` -> ``~/.claude/skills/<name>/``. Hidden
+    dirs (``.foo``) and files at the top level are skipped — only
+    actual skill packages count. Returns an empty list when the
+    directory is missing.
+    """
+    skills_dir = checkout / "global" / "skills"
+    if not skills_dir.is_dir():
+        return []
+    paths: list[PersonalizationPath] = []
+    for entry in sorted(skills_dir.iterdir(), key=lambda p: p.name.lower()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        paths.append(
+            PersonalizationPath(
+                source=f"global/skills/{entry.name}/",
+                target=f"~/.claude/skills/{entry.name}/",
+            )
+        )
+    return paths
+
+
+# ---------------------------------------------------------------------------
 # config generation
 
 
 def build_orchestrator_yaml(
-    options: SetupOptions, repos_by_owner: dict[str, list[dict]]
+    options: SetupOptions,
+    repos_by_owner: dict[str, list[dict]],
+    personalization_paths: list[PersonalizationPath] | None = None,
 ) -> str:
     """Render the orchestrator.yaml as a string (no pyyaml — we want full
     control over comments and key order).
+
+    ``personalization_paths`` is the full list of ``paths:`` entries to
+    emit under the personalization block. When ``None`` and a
+    personalization repo is configured, defaults to the always-on
+    ``global/CLAUDE.md`` mapping. Pass an explicit list to add detected
+    skills (see :func:`detect_personalization_skills`).
     """
     lines: list[str] = []
     a = lines.append
@@ -222,11 +354,19 @@ def build_orchestrator_yaml(
     a('  secops_cron: "0 6 * * *"')
     a("")
     if options.personalization_repo:
+        if personalization_paths is None:
+            personalization_paths = [
+                PersonalizationPath(
+                    source="global/CLAUDE.md",
+                    target="~/.claude/CLAUDE.md",
+                )
+            ]
         a("personalization:")
         a(f'  repo: "{options.personalization_repo}"')
         a("  paths:")
-        a('    - source: "global/CLAUDE.md"')
-        a('      target: "~/.claude/CLAUDE.md"')
+        for entry in personalization_paths:
+            a(f'    - source: "{_yaml_escape(entry.source)}"')
+            a(f'      target: "{_yaml_escape(entry.target)}"')
         a("")
     a("# Repos discovered via `gh repo list`. Filters applied:")
     a(
@@ -345,11 +485,51 @@ def run_setup(options: SetupOptions) -> SetupResult:
 
     repos_by_owner: dict[str, list[dict]] = {}
     for owner in options.owners:
-        repos_by_owner[owner] = list_repos(
+        repos = list_repos(
             owner, skip_archived=options.skip_archived, skip_forks=options.skip_forks
         )
+        # Drop the personalization repo if it surfaced under one of the
+        # configured owners. It's the cross-machine sync target, not a
+        # project the dev pipeline should monitor for issues — listing
+        # it under ``repos:`` alongside the per-machine personalization
+        # checkout would have ctrlrelay polling and worktree-cloning
+        # the operator's own dotfiles. Comparison is case-insensitive
+        # because GitHub repo names are case-insensitive: ``alice/foo``
+        # and ``Alice/Foo`` resolve to the same repo, so an operator
+        # passing one casing while ``gh repo list`` returned the other
+        # would otherwise dodge the filter (codex review pass 1).
+        if options.personalization_repo:
+            personalization_norm = options.personalization_repo.lower()
+            repos = [
+                r for r in repos
+                if r["nameWithOwner"].lower() != personalization_norm
+            ]
+        repos_by_owner[owner] = repos
 
-    yaml_text = build_orchestrator_yaml(options, repos_by_owner)
+    # Build the personalization paths list BEFORE writing the YAML so
+    # auto-detected skills end up baked into the file the operator
+    # eventually edits. Pre-clone the personalization repo if needed
+    # (it might already exist from a prior setup run on this machine).
+    personalization_paths: list[PersonalizationPath] | None = None
+    if options.personalization_repo:
+        personalization_paths = [
+            PersonalizationPath(
+                source="global/CLAUDE.md",
+                target="~/.claude/CLAUDE.md",
+            )
+        ]
+        if options.wire_skills:
+            cloned_for_scan = _ensure_personalization_clone(
+                options.personalization_repo, DEFAULT_PERSONALIZATION_CHECKOUT
+            )
+            if cloned_for_scan:
+                personalization_paths.extend(
+                    detect_personalization_skills(DEFAULT_PERSONALIZATION_CHECKOUT)
+                )
+
+    yaml_text = build_orchestrator_yaml(
+        options, repos_by_owner, personalization_paths=personalization_paths
+    )
     options.config_out.parent.mkdir(parents=True, exist_ok=True)
     options.config_out.write_text(yaml_text)
 
