@@ -443,26 +443,43 @@ class SchedulesConfig(BaseModel):
     evaluated in the top-level ``timezone``. Each schedule is validated at
     config load time so an unparseable expression fails fast rather than
     silently disabling the job.
+
+    ``personalization_cron`` is optional: when ``None`` (the default), no
+    auto-pull job is registered. Set it to e.g. ``"*/15 * * * *"`` to
+    have the daemon pull the personalization repo every 15 minutes so
+    machines converge without manual ``ctrlrelay personalization pull``.
+    Skip-on-dirty: auto-pull never rebases under uncommitted operator
+    edits.
     """
 
     secops_cron: str = "0 6 * * *"
+    personalization_cron: str | None = None
 
     @field_validator("secops_cron")
     @classmethod
-    def validate_cron(cls, v: str) -> str:
-        from ctrlrelay.core.scheduler import _build_vixie_trigger
+    def validate_secops_cron(cls, v: str) -> str:
+        return _validate_cron_expression(v, "secops_cron")
 
-        try:
-            # Build through the same helper the scheduler uses so
-            # (a) DOW normalization and (b) Vixie DOM/DOW-OR splitting
-            # are both exercised at load time. Bad expressions surface
-            # synchronously instead of at daemon start.
-            _build_vixie_trigger(v, timezone=None)
-        except Exception as e:
-            raise ValueError(
-                f"invalid cron expression {v!r}: {e}"
-            ) from e
-        return v
+    @field_validator("personalization_cron")
+    @classmethod
+    def validate_personalization_cron(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_cron_expression(v, "personalization_cron")
+
+
+def _validate_cron_expression(v: str, field: str) -> str:
+    from ctrlrelay.core.scheduler import _build_vixie_trigger
+
+    try:
+        # Build through the same helper the scheduler uses so
+        # (a) DOW normalization and (b) Vixie DOM/DOW-OR splitting
+        # are both exercised at load time. Bad expressions surface
+        # synchronously instead of at daemon start.
+        _build_vixie_trigger(v, timezone=None)
+    except Exception as e:
+        raise ValueError(f"invalid cron expression for {field} {v!r}: {e}") from e
+    return v
 
 
 class Config(BaseModel):

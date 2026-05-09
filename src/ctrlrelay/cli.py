@@ -1777,6 +1777,52 @@ def poller_start(
                         pass
 
         async def _main() -> None:
+            async def _run_scheduled_personalization_pull() -> None:
+                """Cron-driven auto-pull of the personalization repo.
+
+                Runs at ``schedules.personalization_cron``. Skips when
+                the working tree is dirty so unsaved operator edits
+                aren't disturbed by the rebase. Conflicts during the
+                rebase abort and are logged; operator must intervene
+                via ``ctrlrelay personalization pull`` to surface the
+                conflict files. Auto-push is intentionally NOT done
+                here — a daemon committing on the operator's behalf
+                without explicit intent is the kind of thing that
+                surprises people; commits stay manual.
+
+                ``auto_pull`` runs synchronous ``git fetch``/``rebase``
+                subprocesses; dispatch to a worker thread so a slow
+                or stuck remote can't stall the poller's event loop
+                (Telegram dispatch, pending-resume sweeper, secops
+                cron). Codex pass 3 caught this.
+                """
+                if config.personalization is None:
+                    return
+                import asyncio
+
+                from ctrlrelay.personalization import PersonalizationManager
+                from ctrlrelay.personalization.manager import (
+                    PersonalizationError,
+                )
+
+                try:
+                    mgr = PersonalizationManager(config)
+                    result = await asyncio.to_thread(mgr.auto_pull)
+                except PersonalizationError as e:
+                    console.print(
+                        f"[yellow]Auto-pull failed: {e}[/yellow]"
+                    )
+                    return
+                if result.success:
+                    console.print(f"[dim]Auto-pull: {result.summary}[/dim]")
+                else:
+                    console.print(
+                        f"[yellow]Auto-pull: {result.summary}[/yellow]"
+                    )
+                    if result.conflict_files:
+                        for f in result.conflict_files:
+                            console.print(f"[yellow]  conflict: {f}[/yellow]")
+
             # Register + start the scheduler FIRST, before any potentially
             # slow startup work. Otherwise a 6am fire that lands during
             # seed_current's per-repo GitHub calls would be lost —
@@ -1797,11 +1843,31 @@ def poller_start(
                 cron_expr="* * * * *",
                 func=_run_pending_resume_sweeper,
             )
+            # Register the personalization auto-pull only when the
+            # operator has both configured the personalization block
+            # AND set a cron expression. Either alone is intentional
+            # (config without cron = manual sync only; cron without
+            # config = invalid in load_config).
+            personalization_cron_summary = ""
+            if (
+                config.personalization is not None
+                and config.schedules.personalization_cron is not None
+            ):
+                scheduler.add_cron_job(
+                    name="personalization_auto_pull",
+                    cron_expr=config.schedules.personalization_cron,
+                    func=_run_scheduled_personalization_pull,
+                )
+                personalization_cron_summary = (
+                    f" | personalization_auto_pull cron="
+                    f"{config.schedules.personalization_cron}"
+                )
             scheduler.start()
             console.print(
                 f"[dim]Scheduler: secops cron={config.schedules.secops_cron} "
                 f"tz={config.timezone} | "
-                f"pending_resume_sweeper=every 1m[/dim]"
+                f"pending_resume_sweeper=every 1m"
+                f"{personalization_cron_summary}[/dim]"
             )
 
             # Now the slow startup: first-run seeding (one gh call per
@@ -2031,6 +2097,16 @@ def personalization_init(
         "-c",
         help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
+    no_adopt: bool = typer.Option(
+        False,
+        "--no-adopt",
+        help=(
+            "Refuse to adopt pre-existing real files at target paths. "
+            "Default: adopt (move target into checkout, then symlink). "
+            "Use --no-adopt for the conservative Slice 1 behavior of "
+            "skipping such targets with a back-up-and-remove instruction."
+        ),
+    ),
 ) -> None:
     """Clone the personalization repo and wire symlinks.
 
@@ -2041,7 +2117,7 @@ def personalization_init(
 
     mgr = _make_personalization_manager(config_path)
     try:
-        summary = mgr.init()
+        summary = mgr.init(adopt=not no_adopt)
     except PersonalizationError as e:
         console.print(f"[red]Init failed:[/red] {e}")
         raise typer.Exit(1)

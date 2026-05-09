@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -123,12 +124,19 @@ class PersonalizationManager:
 
     # ----- top-level commands ------------------------------------------------
 
-    def init(self) -> str:
+    def init(self, *, adopt: bool = True) -> str:
         """Clone the personalization repo into ``checkout_path`` and
         wire symlinks. Refuses to overwrite an existing non-empty
         directory; if the checkout already looks like a clone of the
         right repo, falls through to ``wire_symlinks`` so a re-run is
         idempotent.
+
+        ``adopt=True`` (the default since Slice 2) moves pre-existing
+        real files/dirs at target paths into the personalization
+        checkout and wires the symlink, eliminating the manual
+        adoption dance Slice 1 required. ``adopt=False`` preserves
+        the conservative Slice 1 behavior of skipping such targets
+        with a "back up and remove" instruction.
 
         Returns a human-readable summary.
         """
@@ -156,14 +164,14 @@ class PersonalizationManager:
                 # caught this).
                 self._bootstrap_main_if_empty()
                 self._ensure_working_branch()
-                results = self.wire_symlinks()
+                results = self.wire_symlinks(adopt=adopt)
                 return self._format_init_summary(results, cloned=False)
 
         self.checkout_path.parent.mkdir(parents=True, exist_ok=True)
         self._git_global("clone", self.repo_url, str(self.checkout_path))
         self._bootstrap_main_if_empty()
         self._ensure_working_branch()
-        results = self.wire_symlinks()
+        results = self.wire_symlinks(adopt=adopt)
         return self._format_init_summary(results, cloned=True)
 
     def _bootstrap_main_if_empty(self) -> None:
@@ -331,17 +339,19 @@ class PersonalizationManager:
 
         return "\n".join(lines)
 
-    def wire_symlinks(self) -> list[SymlinkResult]:
+    def wire_symlinks(self, *, adopt: bool = True) -> list[SymlinkResult]:
         """Apply the ``paths`` config to the filesystem. Idempotent.
 
         For each plan: create missing symlinks, replace pointing-
-        elsewhere symlinks, refuse to clobber a real file/dir, skip
-        entries whose source doesn't exist in the checkout yet (so a
-        partially-populated personalization repo is OK).
+        elsewhere symlinks, skip entries whose source doesn't exist
+        in the checkout yet, and (when ``adopt=True``, the default)
+        adopt pre-existing target files/dirs by moving them into the
+        checkout. ``adopt=False`` reverts to Slice 1 behavior:
+        refuse to clobber a real file/dir at the target.
         """
         results: list[SymlinkResult] = []
         for plan in self._plan_symlinks():
-            results.append(self._apply_symlink(plan))
+            results.append(self._apply_symlink(plan, adopt=adopt))
         return results
 
     # Bounded retries for the rebase + branch-push + FF-push cycle on
@@ -513,11 +523,18 @@ class PersonalizationManager:
             ),
         )
 
-    def pull(self) -> PullResult:
+    def pull(self, *, adopt: bool = True) -> PullResult:
         """Fetch and rebase the per-machine branch onto ``origin/<main>``.
         FF-update local main if possible. Re-wire symlinks at the end
         because the config-as-code shipped in the personalization repo
         may have changed.
+
+        ``adopt`` is forwarded to :meth:`wire_symlinks`. The interactive
+        ``ctrlrelay personalization pull`` defaults to ``True`` (matches
+        ``init`` semantics: pre-existing real targets are moved into the
+        synced repo). The daemon-scheduled :meth:`auto_pull` passes
+        ``False`` so a background sync never silently moves operator
+        files.
         """
         self._require_checkout()
         self._ensure_working_branch()
@@ -554,7 +571,7 @@ class PersonalizationManager:
             check=False,
         )
         # Re-wire (config may have changed; harmless if not).
-        self.wire_symlinks()
+        self.wire_symlinks(adopt=adopt)
 
         ff_note = "" if ff.returncode == 0 else (
             f" (local {self.main_branch} not fast-forwarded — diverged "
@@ -567,6 +584,43 @@ class PersonalizationManager:
                 f"origin/{self.main_branch}{ff_note}"
             ),
         )
+
+    def auto_pull(self) -> PullResult:
+        """Pull variant for the daemon scheduler.
+
+        Differs from ``pull`` in two ways:
+
+        1. Refuses to run when the working tree is dirty. The
+           operator may be mid-edit (writes go straight to the
+           personalization repo via the symlinks); rebasing under
+           them would lose the unsaved work, fail the rebase, or
+           both. Skip-on-dirty is the safe default.
+        2. Refuses if no checkout exists yet, returning a benign
+           summary instead of raising — the daemon shouldn't crash
+           because an operator hasn't run ``init`` on this machine.
+
+        Conflicts during rebase still abort (same as ``pull``); the
+        daemon log records the conflict files. The re-wire phase runs
+        with ``adopt=False`` — a background sync must never silently
+        move operator files. Adoption stays an explicit init-time act.
+        """
+        if not (self.checkout_path / ".git").exists():
+            return PullResult(
+                success=True,
+                summary="auto-pull skipped: no checkout (run init first)",
+            )
+        # ``status --porcelain`` outputs nothing for a clean working
+        # tree; non-empty means there are uncommitted changes.
+        porcelain = self._git("status", "--porcelain").strip()
+        if porcelain:
+            return PullResult(
+                success=True,
+                summary=(
+                    "auto-pull skipped: working tree dirty "
+                    f"({len(porcelain.splitlines())} entries)"
+                ),
+            )
+        return self.pull(adopt=False)
 
     # ----- internals: symlink planning + apply -------------------------------
 
@@ -626,18 +680,81 @@ class PersonalizationManager:
                 repo_name=repo.name,
             )
 
-    def _apply_symlink(self, plan: SymlinkPlan) -> SymlinkResult:
-        if not plan.source.exists():
-            # Tolerated: the user may not have populated this entry on
-            # any machine yet. Skip without failing so wire-symlinks is
-            # safe to run on a partial repo.
+    def _apply_symlink(
+        self, plan: SymlinkPlan, *, adopt: bool = True
+    ) -> SymlinkResult:
+        """Apply one symlink wiring decision.
+
+        With ``adopt=True`` (Slice 2 default), a target that is a real
+        file/dir AND a missing source triggers ADOPTION: the target is
+        moved into the checkout at the source location, then the
+        symlink is created. This eliminates the manual "move then
+        re-init" dance Slice 1 required.
+
+        Adoption is intentionally narrow: it only fires when the
+        source is missing. If BOTH source and target exist as real
+        content the manager refuses (``skipped-conflict-both-exist``)
+        — that needs operator judgment to reconcile.
+        """
+        source_exists = plan.source.exists()
+        target_is_real = plan.target.exists() and not plan.target.is_symlink()
+
+        if source_exists and target_is_real:
+            # Both populated — operator must reconcile manually.
+            return SymlinkResult(
+                plan=plan,
+                action="skipped-conflict-both-exist",
+                detail=(
+                    "both the personalization repo's source and the on-disk "
+                    "target have content; reconcile manually (move one into "
+                    "the other or delete one) before re-running init"
+                ),
+            )
+
+        if not source_exists and target_is_real:
+            if not adopt:
+                return SymlinkResult(
+                    plan=plan,
+                    action="skipped-real-file-at-target",
+                    detail=(
+                        "adopt disabled (--no-adopt or wire(adopt=False)); "
+                        "back up and remove the existing path before retrying"
+                    ),
+                )
+            # Type sanity: refuse if target's on-disk shape doesn't
+            # match config's trailing-slash declaration. Better to
+            # surface the mismatch than to move a file into a slot
+            # the config says is a directory.
+            actual_is_dir = plan.target.is_dir()
+            if plan.is_dir != actual_is_dir:
+                expected = "directory" if plan.is_dir else "file"
+                actual = "directory" if actual_is_dir else "file"
+                return SymlinkResult(
+                    plan=plan,
+                    action="skipped-target-type-mismatch",
+                    detail=(
+                        f"config declares {expected} (trailing slash) but "
+                        f"on-disk target {plan.target} is a {actual}; "
+                        "fix the config or the target before retrying"
+                    ),
+                )
+            # Adopt: move target into source location, then continue
+            # the wire path as if source had been there all along.
+            plan.source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(plan.target), str(plan.source))
+            source_exists = True
+            target_is_real = False
+            adopted = True
+        else:
+            adopted = False
+
+        if not source_exists:
+            # Source missing AND no real-file target to adopt. Common
+            # for partial-repo state where another machine hasn't
+            # populated this entry yet. Skip without failing.
             return SymlinkResult(plan=plan, action="skipped-source-missing")
 
-        # Source's actual on-disk type must match what the config says
-        # (trailing slash → dir, no slash → file). A directory entry
-        # accidentally present as a regular file (or vice versa)
-        # would otherwise wire a symlink that breaks downstream
-        # consumers (Codex pass 15). Refuse loudly with a hint.
+        # Source-side type check (existing Slice 1 invariant).
         actual_is_dir = plan.source.is_dir()
         if plan.is_dir != actual_is_dir:
             expected = "directory" if plan.is_dir else "file"
@@ -651,14 +768,12 @@ class PersonalizationManager:
                 ),
             )
 
-        # Ensure parent dir of target exists.
         plan.target.parent.mkdir(parents=True, exist_ok=True)
 
         if plan.target.is_symlink():
             current = plan.target.readlink()
             if current == plan.source or self._same_resolved(current, plan.source):
                 return SymlinkResult(plan=plan, action="already-correct")
-            # Wrong symlink — replace.
             plan.target.unlink()
             plan.target.symlink_to(plan.source)
             return SymlinkResult(
@@ -667,17 +782,11 @@ class PersonalizationManager:
                 detail=f"was -> {current}",
             )
 
-        if plan.target.exists():
-            # Real file or directory at the target. Refuse — the user
-            # must back up and remove. Adopt-flow comes in Slice 2.
-            return SymlinkResult(
-                plan=plan,
-                action="skipped-real-file-at-target",
-                detail="back up and remove the existing path before retrying",
-            )
-
         plan.target.symlink_to(plan.source)
-        return SymlinkResult(plan=plan, action="created")
+        return SymlinkResult(
+            plan=plan,
+            action="adopted" if adopted else "created",
+        )
 
     def _inspect_symlink(self, plan: SymlinkPlan) -> str:
         """Read-only counterpart to ``_apply_symlink`` for ``status``."""

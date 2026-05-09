@@ -51,6 +51,12 @@ dashboard:
 # set above. Change `secops_cron` to e.g. "0 6 * * 1" for weekly (Mondays).
 schedules:
   secops_cron: "0 6 * * *"
+  # Optional. When personalization is configured AND this is set, the
+  # poller daemon runs `ctrlrelay personalization pull` on this cron
+  # so machines converge without manual sync. Skip-on-dirty: never
+  # rebases under uncommitted operator edits. Defaults to None
+  # (manual sync only).
+  # personalization_cron: "*/15 * * * *"
 
 # Optional: cross-machine personalization sync.
 #
