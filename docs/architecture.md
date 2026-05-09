@@ -1,7 +1,7 @@
 ---
 title: Architecture
 layout: default
-nav_order: 8
+nav_order: 9
 description: "Layer diagram, dispatcher / Claude interaction, state-DB shape, and worktree lifecycle for contributors."
 permalink: /architecture/
 ---

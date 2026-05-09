@@ -1,7 +1,7 @@
 ---
 title: Development
 layout: default
-nav_order: 9
+nav_order: 10
 description: "Local development setup, running tests, linting, and contributing."
 permalink: /development/
 ---
