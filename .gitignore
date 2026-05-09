@@ -40,3 +40,14 @@ uv.lock
 
 # Operator-private notes (runbooks, personal cheatsheets).
 notes/
+
+# Rendered service unit files. `ctrlrelay install launchd|systemd`
+# substitutes CTRLRELAY_TELEGRAM_TOKEN into a copy of the in-package
+# template and writes it to the system path (~/Library/LaunchAgents on
+# macOS, ~/.config/systemd/user on Linux). The default install command
+# never lands a rendered file inside the repo, but a future flag — or
+# an operator running it with --target-dir pointed at the working tree —
+# would. Defense-in-depth so a `git add .` after such a slip can't
+# scoop the literal token into a commit.
+*.plist
+*.service

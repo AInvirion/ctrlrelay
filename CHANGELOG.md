@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-08
+
+Minor release. One new feature plus one schema simplification:
+
+- **`ctrlrelay setup`** — first-run onboarding command. Detects every
+  GitHub org you belong to, enumerates non-fork non-archived repos in
+  each, writes a fresh `~/.config/ctrlrelay/orchestrator.yaml`, clones
+  every repo to `~/Projects/<owner.lower()>/<repo>`, optionally
+  configures the personalization sync block, and optionally renders
+  launchd/systemd unit files. Replaces the multi-step manual playbook
+  operators previously had to follow on a new machine. Interactive by
+  default; `--yes` and `--owner` flags make it scriptable.
+- **`paths.owner_aliases` deprecated; lowercase-org-folder convention.**
+  The path resolver now always derives `local_path` as
+  `${repo_root}/${owner.lower()}/${repo}` (closes #128). The previous
+  `owner_aliases` indirection caused `clone-all`/`pull-all`/`status`
+  to disagree with the dev pipeline on where a given repo lived.
+  Parsing of `owner_aliases` is retained so 0.3.x configs still load;
+  a `DeprecationWarning` fires when the block is non-empty.
+
+### Added
+
+- **`ctrlrelay setup`** (closes the onboarding gap reported during the
+  v0.3.0 reinstall flow). Composes existing primitives (gh discovery,
+  config generation, `git clone`, `personalization init`, `install
+  launchd|systemd`) into a single command. Reads
+  `$CTRLRELAY_TELEGRAM_TOKEN` so the rendered plist isn't a
+  placeholder. Refuses to overwrite an existing `orchestrator.yaml`
+  without `--force`.
+- **`repos clone-all` / `pull-all` / `status` accept DEST as
+  optional**. When omitted, each command operates on the
+  config-resolved `local_path` of every repo, so the same path
+  resolution serves the bulk commands and the dev pipeline. Pass DEST
+  to override (lands at `DEST/<owner.lower()>/<repo>`).
+
+### Changed
+
+- **Path resolver: `owner.lower()` is the folder, always.** Closes #128.
+  Affects every command that touches `repo.local_path`. Operators on
+  v0.3.0 with mixed-case folders (e.g. `~/Projects/AInvirion/...`)
+  must either rename the folder, set per-repo `local_path` overrides,
+  or run `ctrlrelay setup --force` to land everything at the new
+  lowercase paths.
+
+### Migration from 0.3.0
+
+- Drop `paths.owner_aliases` from `orchestrator.yaml` (or ignore the
+  deprecation warning until you next regenerate the config).
+- Rename existing on-disk folders to lowercase (e.g.
+  `mv ~/Projects/AInvirion ~/Projects/ainvirion`) — or, easier, run
+  `ctrlrelay setup --force` to clone everything fresh under the new
+  convention.
+
 ## [0.3.0] - 2026-05-08
 
 Minor release. Three additive features: cross-machine **personalization

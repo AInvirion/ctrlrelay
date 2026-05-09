@@ -28,75 +28,52 @@ Optional:
 
 ## Install
 
-Clone the repo and install in editable mode:
+The recommended install is via `pipx`:
 
 ```bash
-git clone https://github.com/AInvirion/ctrlrelay.git
-cd ctrlrelay
-
-# With uv (recommended):
-uv pip install -e .
-
-# Or with pip:
-pip install -e .
-```
-
-This installs the `ctrlrelay` console script. Verify:
-
-```bash
+pipx install ctrlrelay
 ctrlrelay --version
 ```
 
-## Write your first config
+Use `uv tool install ctrlrelay` if you prefer uv. For local development, see
+[Development]({{ '/development/' | relative_url }}).
 
-ctrlrelay reads `config/orchestrator.yaml` by default. Start from the example:
+## First-run setup
+
+Since v0.4.0, `ctrlrelay setup` does the boring parts of onboarding for you:
+detect every GitHub org you belong to, list the non-fork non-archived repos
+in each, write a fresh `orchestrator.yaml` to `~/.config/ctrlrelay/`, and
+clone every repo to `~/Projects/<owner.lower()>/<repo>`. It can also
+configure the personalization sync block and render daemon unit files for
+launchd (macOS) or systemd (Linux).
+
+Interactive (recommended for the first machine you set up):
 
 ```bash
-cp config/orchestrator.yaml.example config/orchestrator.yaml
+ctrlrelay setup
 ```
 
-Open `config/orchestrator.yaml` and edit at least:
+Pick which owners to monitor when prompted. Setup will then enumerate repos,
+write the config, clone everything, and ask whether you want personalization
+sync and background services.
 
-- `timezone` — your local IANA timezone.
-- `repos[].name` — the `owner/repo` slug of a repository you can push to.
-- `repos[].local_path` — where the local clone lives (or will live) on disk.
-  *Or* set `paths.repo_root` to a workspace root and let the path be
-  derived as `${repo_root}/${owner}/${repo}` (recommended for >1 repo).
+Non-interactive (good for second/third machines once you know the answers):
 
-`node_id` is optional — when omitted it defaults to your machine's
-hostname (`socket.gethostname()`). Set it explicitly only if the
-hostname is meaningless (CI runners, containers).
-
-A minimal working config:
-
-```yaml
-version: "1"
-timezone: "America/New_York"
-
-paths:
-  state_db: "~/.ctrlrelay/state.db"
-  worktrees: "~/.ctrlrelay/worktrees"
-  bare_repos: "~/.ctrlrelay/repos"
-  contexts: "~/.ctrlrelay/contexts"
-  skills: "~/.claude/skills"
-
-claude:
-  binary: "claude"
-  default_timeout_seconds: 1800
-  output_format: "json"
-
-transport:
-  type: "file_mock"
-  file_mock:
-    inbox: "~/.ctrlrelay/inbox.txt"
-    outbox: "~/.ctrlrelay/outbox.txt"
-
-repos:
-  - name: "your-org/your-repo"
-    local_path: "~/Projects/your-repo"
+```bash
+ctrlrelay setup --yes \
+  --owner alice \
+  --owner AInvirion \
+  --transport telegram \
+  --telegram-chat-id 12345 \
+  --personalization-repo alice/dotclaude \
+  --install-daemons
 ```
 
-Validate it:
+`--yes` accepts every default and never prompts. The Telegram bot token is
+read from `$CTRLRELAY_TELEGRAM_TOKEN`; export it before running setup if you
+want it baked into the rendered launchd plist.
+
+After setup completes, validate:
 
 ```bash
 ctrlrelay config validate
@@ -105,14 +82,22 @@ ctrlrelay config validate
 You should see something like:
 
 ```
-✓ Config valid: config/orchestrator.yaml
+✓ Config valid: ~/.config/ctrlrelay/orchestrator.yaml
   Node ID: your-hostname.local
-  Timezone: America/New_York
-  Transport: file_mock
-  Repos: 1
+  Timezone: UTC
+  Transport: telegram
+  Repos: 86
 ```
 
-For the full schema (every key, every default), see [Configuration]({{ '/configuration/' | relative_url }}).
+For the full schema (every key, every default), see
+[Configuration]({{ '/configuration/' | relative_url }}). To edit the file
+later, open `~/.config/ctrlrelay/orchestrator.yaml`; ctrlrelay re-reads it on
+every command. Re-running `ctrlrelay setup` refuses to clobber an existing
+config without `--force`.
+
+`node_id` is optional in the generated config — when omitted it defaults to
+your machine's hostname (`socket.gethostname()`). Set it explicitly only if
+the hostname is meaningless (CI runners, containers).
 
 ## Your first dev-pipeline run
 
