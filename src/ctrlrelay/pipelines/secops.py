@@ -166,8 +166,16 @@ class SecopsPipeline:
         signal BLOCKED with a one-line summary like "operator
         dependabot.yml PR #N modifies existing config — needs
         review". Do NOT auto-merge.
+     c. **CI check**: confirm all status checks pass (matches the
+        Dependabot PR rule above). Run:
+        `gh pr checks <NUM> --repo {repo}`
+        Any failing or pending check -> BLOCKED. A PR that adds
+        invalid dependabot YAML can pass author+diff but fail
+        repo validation; without this gate the agent could merge
+        broken config and break Dependabot for the repo.
 
-     If both (a) and (b) pass: merge with squash, delete the branch.
+     If (a), (b), AND (c) all pass: merge with squash, delete the
+     branch. If any one fails: BLOCKED.
    - **Any other PR from `$OPERATOR`** (touches code, tests, configs
      other than dependabot.yml): signal BLOCKED for operator approval.
      Never auto-merge code changes, even from the trusted operator.

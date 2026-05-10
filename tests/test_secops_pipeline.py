@@ -242,6 +242,28 @@ class TestSecopsPromptOperatorConfigPRs:
         # Must NOT use the original buggy filter pattern that codex flagged.
         assert 'author.login != "app/dependabot"' not in prompt
 
+    def test_prompt_requires_passing_ci_for_operator_config_merge(self) -> None:
+        """Codex P2 (review of #132 round 3): the Dependabot auto-merge
+        path requires patch/minor + passing CI. The operator-config
+        carve-out must require passing CI too — otherwise a PR that
+        introduces invalid dependabot YAML could auto-merge and break
+        Dependabot for the repo."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+
+        assert "gh pr checks" in prompt
+        # CI must be in the same gate list as author+diff.
+        assert "CI check" in prompt or "all status checks pass" in prompt.lower()
+
     def test_prompt_requires_diff_validation_for_additive_only(self) -> None:
         """Codex P2 (review of #132 round 2): the prompt says 'additive
         ecosystem entries' in prose but must ACTUALLY require the agent
