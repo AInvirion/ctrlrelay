@@ -242,6 +242,36 @@ class TestSecopsPromptOperatorConfigPRs:
         # Must NOT use the original buggy filter pattern that codex flagged.
         assert 'author.login != "app/dependabot"' not in prompt
 
+    def test_prompt_requires_diff_validation_for_additive_only(self) -> None:
+        """Codex P2 (review of #132 round 2): the prompt says 'additive
+        ecosystem entries' in prose but must ACTUALLY require the agent
+        to inspect the diff and BLOCK non-additive changes (deletions
+        or modifications of existing stanzas). Otherwise a trusted
+        operator could open a PR that removes an entire ecosystem
+        block and the auto-merge would still fire."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+
+        # Must instruct the agent to actually pull the diff.
+        assert "gh pr diff" in prompt
+        # Must explicitly say BLOCK if any deletion/modification line is
+        # present in the diff.
+        assert (
+            "PURELY" in prompt or "purely additive" in prompt.lower()
+        )
+        # Must reference the `-` line marker so the agent has a concrete
+        # signal to look for, not just vague "additive only" prose.
+        assert "begins with `-`" in prompt or "lines beginning with `-`" in prompt.lower()
+
 
 class TestSecopsCleanupLogging:
     """Regression for codex round-4 [P3]: worktree cleanup failures must

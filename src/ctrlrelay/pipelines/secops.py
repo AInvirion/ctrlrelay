@@ -147,14 +147,27 @@ class SecopsPipeline:
    - **Dependabot PRs**: if patch/minor update with passing CI, merge.
      If major or unclear, signal BLOCKED to ask for guidance.
    - **PR authored by `$OPERATOR` touching ONLY `.github/dependabot.yml`**
-     (additive ecosystem entries, no other files changed): auto-merge
-     eligible. These are the "enable Dependabot" prerequisites the
-     operator opened. Merge with squash, delete the branch.
-     **CRITICAL**: this carve-out applies only when `author.login`
-     exactly equals `$OPERATOR`. Do NOT auto-merge a dependabot.yml-only
-     PR from any other login — collaborators, GitHub apps, or external
-     contributors can craft such a PR to slip past review. Those go
-     to BLOCKED with a one-line summary instead.
+     (additive ecosystem entries, no other files changed): MAYBE
+     auto-merge — but only after diff validation. These are the
+     "enable Dependabot" prerequisites the operator opened.
+
+     Required validation BEFORE merging:
+     a. **Author check**: confirm `author.login` exactly equals
+        `$OPERATOR`. Collaborators, GitHub apps, or external
+        contributors can craft a `dependabot.yml`-only PR to slip
+        past review — those go to BLOCKED, not auto-merge.
+     b. **Diff check**: pull the diff and confirm it is PURELY
+        ADDITIVE — no `-` lines (deletions or modifications of
+        existing stanzas), only `+` lines that introduce new
+        `package-ecosystem` blocks. Run:
+        `gh pr diff <NUM> --repo {repo}`
+        If any line in the diff begins with `-` (other than `---`
+        file headers), the PR modifies or removes existing config:
+        signal BLOCKED with a one-line summary like "operator
+        dependabot.yml PR #N modifies existing config — needs
+        review". Do NOT auto-merge.
+
+     If both (a) and (b) pass: merge with squash, delete the branch.
    - **Any other PR from `$OPERATOR`** (touches code, tests, configs
      other than dependabot.yml): signal BLOCKED for operator approval.
      Never auto-merge code changes, even from the trusted operator.
