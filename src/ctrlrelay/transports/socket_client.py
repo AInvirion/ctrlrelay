@@ -55,6 +55,17 @@ class SocketTransport:
                 try:
                     msg = parse_message(line.decode())
                     if msg.request_id and msg.request_id in self._pending:
+                        # The bridge sends two messages back for an ASK:
+                        # an intermediate ACK(status="pending") immediately
+                        # after queuing for Telegram, then an ANSWER (or
+                        # ERROR) once the operator replies. Resolving the
+                        # future on the first ACK collapses the wait
+                        # prematurely — caller sees "Unexpected response:
+                        # BridgeOp.ACK" and throws. Skip those to keep
+                        # waiting. Terminal ACKs (status="sent" from SEND)
+                        # remain the final response and resolve normally.
+                        if msg.op == BridgeOp.ACK and msg.status == "pending":
+                            continue
                         self._pending[msg.request_id].set_result(msg)
                 except ProtocolError:
                     pass
