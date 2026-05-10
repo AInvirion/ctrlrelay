@@ -183,6 +183,43 @@ class TestSecopsPipeline:
         assert "locked" in results[0].error.lower()
 
 
+class TestSecopsPromptOperatorConfigPRs:
+    """The secops prompt must instruct the agent to auto-merge
+    operator-authored PRs that ONLY touch .github/dependabot.yml.
+    Without this, "enable Dependabot ecosystem" PRs the operator
+    opens manually sit forever — the conservative default treats
+    every operator-authored PR as needing approval, but a config-only
+    additive change has effectively the same risk as a Dependabot
+    config bump (zero)."""
+
+    def test_prompt_mentions_operator_config_pr_auto_merge(self) -> None:
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+
+        # Must explicitly tell the agent that operator-authored PRs
+        # touching ONLY dependabot.yml are auto-mergeable.
+        assert ".github/dependabot.yml" in prompt
+        assert "auto-merge" in prompt.lower()
+        # Must distinguish operator-authored from Dependabot-authored
+        # so the agent doesn't blanket-merge any operator PR it sees.
+        assert "operator-authored" in prompt.lower()
+        # Must still preserve the safety: code changes from operator
+        # require BLOCKED.
+        assert (
+            "never auto-merge code changes the operator" in prompt
+            or "operator-authored PR" in prompt and "BLOCKED" in prompt
+        )
+
+
 class TestSecopsCleanupLogging:
     """Regression for codex round-4 [P3]: worktree cleanup failures must
     not be silently swallowed. Log them via the obs stream so operators

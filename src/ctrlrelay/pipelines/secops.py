@@ -131,13 +131,28 @@ class SecopsPipeline:
 
 1. Check Dependabot alerts:
    `gh api repos/{repo}/dependabot/alerts --jq '.[] | select(.state=="open")'`
-2. Check security PRs:
+2. Check Dependabot-authored security PRs:
    `gh pr list --repo {repo} --author "app/dependabot" --json number,title`
-3. For each alert or PR:
-   - Review the severity and impact
-   - If patch/minor update with passing CI, merge the PR
-   - If major or unclear, signal BLOCKED to ask for guidance
-4. Summarize actions taken
+3. Check operator-authored config-only PRs that enable Dependabot itself.
+   These are prerequisites for future Dependabot work — they sit waiting
+   on the operator's own approval and block the security pipeline if
+   left open:
+   `gh pr list --repo {repo} --state open --json number,title,author,files \\
+     --jq '.[] | select(.author.login != "app/dependabot")'`
+   For each, inspect files via: `gh pr view <NUM> --repo {repo} --json files`
+4. For each alert or PR:
+   - **Dependabot PRs**: if patch/minor update with passing CI, merge.
+     If major or unclear, signal BLOCKED to ask for guidance.
+   - **Operator-authored PR touching ONLY `.github/dependabot.yml`**
+     (additive ecosystem entries, no other files changed): treat as
+     auto-merge eligible. These are the "enable Dependabot" prerequisites
+     the operator opened — a conservative review policy would otherwise
+     leave them stranded indefinitely. Merge with squash, delete the branch.
+   - **Any other operator-authored PR** (touches code, tests, configs other
+     than dependabot.yml): signal BLOCKED with a one-line summary so the
+     operator decides — never auto-merge code changes the operator
+     authored.
+5. Summarize actions taken
 
 ## Signaling Completion
 
