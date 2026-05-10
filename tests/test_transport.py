@@ -142,7 +142,6 @@ class TestSocketTransportAckThenAnswer:
     ) -> None:
         import asyncio
         import json
-        import os
         import tempfile
         import uuid
         from pathlib import Path
