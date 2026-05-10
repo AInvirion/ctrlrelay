@@ -205,19 +205,42 @@ class TestSecopsPromptOperatorConfigPRs:
         )
         prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
 
-        # Must explicitly tell the agent that operator-authored PRs
-        # touching ONLY dependabot.yml are auto-mergeable.
+        # Carve-out exists for dependabot.yml-only PRs.
         assert ".github/dependabot.yml" in prompt
         assert "auto-merge" in prompt.lower()
-        # Must distinguish operator-authored from Dependabot-authored
-        # so the agent doesn't blanket-merge any operator PR it sees.
-        assert "operator-authored" in prompt.lower()
-        # Must still preserve the safety: code changes from operator
-        # require BLOCKED.
-        assert (
-            "never auto-merge code changes the operator" in prompt
-            or "operator-authored PR" in prompt and "BLOCKED" in prompt
+        # Code changes always BLOCKED, even from the trusted operator.
+        assert "Never auto-merge code changes" in prompt or "never auto-merge code" in prompt.lower()
+
+    def test_prompt_positively_identifies_operator_not_just_excludes_dependabot(
+        self,
+    ) -> None:
+        """Codex P1 (review of #132): the carve-out must positively
+        identify the trusted operator (`author.login == $OPERATOR`),
+        not just `author.login != "app/dependabot"`. Otherwise a
+        collaborator, external contributor, or another bot could open
+        a `.github/dependabot.yml`-only PR and slip past review."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
         )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+
+        # Must instruct the agent to derive its own identity from `gh api user`
+        # and use that as the trusted-operator allowlist.
+        assert "gh api user" in prompt
+        assert "OPERATOR" in prompt
+        assert '--author "$OPERATOR"' in prompt
+        # Must explicitly call out that other authors (collaborators, apps,
+        # external contributors) are NOT eligible — even for dependabot.yml-only.
+        assert "collaborators" in prompt.lower() or "external contributors" in prompt.lower()
+        # Must NOT use the original buggy filter pattern that codex flagged.
+        assert 'author.login != "app/dependabot"' not in prompt
 
 
 class TestSecopsCleanupLogging:

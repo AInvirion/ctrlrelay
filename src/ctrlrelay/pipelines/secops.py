@@ -133,26 +133,34 @@ class SecopsPipeline:
    `gh api repos/{repo}/dependabot/alerts --jq '.[] | select(.state=="open")'`
 2. Check Dependabot-authored security PRs:
    `gh pr list --repo {repo} --author "app/dependabot" --json number,title`
-3. Check operator-authored config-only PRs that enable Dependabot itself.
-   These are prerequisites for future Dependabot work — they sit waiting
-   on the operator's own approval and block the security pipeline if
-   left open:
-   `gh pr list --repo {repo} --state open --json number,title,author,files \\
-     --jq '.[] | select(.author.login != "app/dependabot")'`
-   For each, inspect files via: `gh pr view <NUM> --repo {repo} --json files`
-4. For each alert or PR:
+3. Determine the trusted operator's GitHub login (the identity the
+   agent itself runs as). The auto-merge carve-out below applies ONLY
+   to PRs authored by this exact login — never to other contributors,
+   apps, or bots even if their PR looks safe:
+   `OPERATOR=$(gh api user --jq '.login')`
+4. Check open PRs authored by the trusted operator that enable
+   Dependabot itself. These are prerequisites for future Dependabot
+   work and block the security pipeline if left open:
+   `gh pr list --repo {repo} --state open --author "$OPERATOR" --json number,title,files`
+   For each, inspect files: `gh pr view <NUM> --repo {repo} --json files`
+5. For each alert or PR:
    - **Dependabot PRs**: if patch/minor update with passing CI, merge.
      If major or unclear, signal BLOCKED to ask for guidance.
-   - **Operator-authored PR touching ONLY `.github/dependabot.yml`**
-     (additive ecosystem entries, no other files changed): treat as
-     auto-merge eligible. These are the "enable Dependabot" prerequisites
-     the operator opened — a conservative review policy would otherwise
-     leave them stranded indefinitely. Merge with squash, delete the branch.
-   - **Any other operator-authored PR** (touches code, tests, configs other
-     than dependabot.yml): signal BLOCKED with a one-line summary so the
-     operator decides — never auto-merge code changes the operator
-     authored.
-5. Summarize actions taken
+   - **PR authored by `$OPERATOR` touching ONLY `.github/dependabot.yml`**
+     (additive ecosystem entries, no other files changed): auto-merge
+     eligible. These are the "enable Dependabot" prerequisites the
+     operator opened. Merge with squash, delete the branch.
+     **CRITICAL**: this carve-out applies only when `author.login`
+     exactly equals `$OPERATOR`. Do NOT auto-merge a dependabot.yml-only
+     PR from any other login — collaborators, GitHub apps, or external
+     contributors can craft such a PR to slip past review. Those go
+     to BLOCKED with a one-line summary instead.
+   - **Any other PR from `$OPERATOR`** (touches code, tests, configs
+     other than dependabot.yml): signal BLOCKED for operator approval.
+     Never auto-merge code changes, even from the trusted operator.
+   - **PRs from anyone else** (collaborators, contributors, other bots):
+     signal BLOCKED. Never on this path.
+6. Summarize actions taken
 
 ## Signaling Completion
 
