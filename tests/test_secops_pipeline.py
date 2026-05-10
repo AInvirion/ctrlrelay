@@ -183,6 +183,122 @@ class TestSecopsPipeline:
         assert "locked" in results[0].error.lower()
 
 
+class TestSecopsPromptOperatorConfigPRs:
+    """The secops prompt must instruct the agent to auto-merge
+    operator-authored PRs that ONLY touch .github/dependabot.yml.
+    Without this, "enable Dependabot ecosystem" PRs the operator
+    opens manually sit forever — the conservative default treats
+    every operator-authored PR as needing approval, but a config-only
+    additive change has effectively the same risk as a Dependabot
+    config bump (zero)."""
+
+    def test_prompt_mentions_operator_config_pr_auto_merge(self) -> None:
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+
+        # Carve-out exists for dependabot.yml-only PRs.
+        assert ".github/dependabot.yml" in prompt
+        assert "auto-merge" in prompt.lower()
+        # Code changes always BLOCKED, even from the trusted operator.
+        lower = prompt.lower()
+        assert (
+            "Never auto-merge code changes" in prompt
+            or "never auto-merge code" in lower
+        )
+
+    def test_prompt_positively_identifies_operator_not_just_excludes_dependabot(
+        self,
+    ) -> None:
+        """Codex P1 (review of #132): the carve-out must positively
+        identify the trusted operator (`author.login == $OPERATOR`),
+        not just `author.login != "app/dependabot"`. Otherwise a
+        collaborator, external contributor, or another bot could open
+        a `.github/dependabot.yml`-only PR and slip past review."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+
+        # Must instruct the agent to derive its own identity from `gh api user`
+        # and use that as the trusted-operator allowlist.
+        assert "gh api user" in prompt
+        assert "OPERATOR" in prompt
+        assert '--author "$OPERATOR"' in prompt
+        # Must explicitly call out that other authors (collaborators, apps,
+        # external contributors) are NOT eligible — even for dependabot.yml-only.
+        assert "collaborators" in prompt.lower() or "external contributors" in prompt.lower()
+        # Must NOT use the original buggy filter pattern that codex flagged.
+        assert 'author.login != "app/dependabot"' not in prompt
+
+    def test_prompt_requires_passing_ci_for_operator_config_merge(self) -> None:
+        """Codex P2 (review of #132 round 3): the Dependabot auto-merge
+        path requires patch/minor + passing CI. The operator-config
+        carve-out must require passing CI too — otherwise a PR that
+        introduces invalid dependabot YAML could auto-merge and break
+        Dependabot for the repo."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+
+        assert "gh pr checks" in prompt
+        # CI must be in the same gate list as author+diff.
+        assert "CI check" in prompt or "all status checks pass" in prompt.lower()
+
+    def test_prompt_requires_diff_validation_for_additive_only(self) -> None:
+        """Codex P2 (review of #132 round 2): the prompt says 'additive
+        ecosystem entries' in prose but must ACTUALLY require the agent
+        to inspect the diff and BLOCK non-additive changes (deletions
+        or modifications of existing stanzas). Otherwise a trusted
+        operator could open a PR that removes an entire ecosystem
+        block and the auto-merge would still fire."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+
+        # Must instruct the agent to actually pull the diff.
+        assert "gh pr diff" in prompt
+        # Must explicitly say BLOCK if any deletion/modification line is
+        # present in the diff.
+        assert (
+            "PURELY" in prompt or "purely additive" in prompt.lower()
+        )
+        # Must reference the `-` line marker so the agent has a concrete
+        # signal to look for, not just vague "additive only" prose.
+        assert "begins with `-`" in prompt or "lines beginning with `-`" in prompt.lower()
+
+
 class TestSecopsCleanupLogging:
     """Regression for codex round-4 [P3]: worktree cleanup failures must
     not be silently swallowed. Log them via the obs stream so operators

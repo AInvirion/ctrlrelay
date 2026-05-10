@@ -131,13 +131,57 @@ class SecopsPipeline:
 
 1. Check Dependabot alerts:
    `gh api repos/{repo}/dependabot/alerts --jq '.[] | select(.state=="open")'`
-2. Check security PRs:
+2. Check Dependabot-authored security PRs:
    `gh pr list --repo {repo} --author "app/dependabot" --json number,title`
-3. For each alert or PR:
-   - Review the severity and impact
-   - If patch/minor update with passing CI, merge the PR
-   - If major or unclear, signal BLOCKED to ask for guidance
-4. Summarize actions taken
+3. Determine the trusted operator's GitHub login (the identity the
+   agent itself runs as). The auto-merge carve-out below applies ONLY
+   to PRs authored by this exact login — never to other contributors,
+   apps, or bots even if their PR looks safe:
+   `OPERATOR=$(gh api user --jq '.login')`
+4. Check open PRs authored by the trusted operator that enable
+   Dependabot itself. These are prerequisites for future Dependabot
+   work and block the security pipeline if left open:
+   `gh pr list --repo {repo} --state open --author "$OPERATOR" --json number,title,files`
+   For each, inspect files: `gh pr view <NUM> --repo {repo} --json files`
+5. For each alert or PR:
+   - **Dependabot PRs**: if patch/minor update with passing CI, merge.
+     If major or unclear, signal BLOCKED to ask for guidance.
+   - **PR authored by `$OPERATOR` touching ONLY `.github/dependabot.yml`**
+     (additive ecosystem entries, no other files changed): MAYBE
+     auto-merge — but only after diff validation. These are the
+     "enable Dependabot" prerequisites the operator opened.
+
+     Required validation BEFORE merging:
+     a. **Author check**: confirm `author.login` exactly equals
+        `$OPERATOR`. Collaborators, GitHub apps, or external
+        contributors can craft a `dependabot.yml`-only PR to slip
+        past review — those go to BLOCKED, not auto-merge.
+     b. **Diff check**: pull the diff and confirm it is PURELY
+        ADDITIVE — no `-` lines (deletions or modifications of
+        existing stanzas), only `+` lines that introduce new
+        `package-ecosystem` blocks. Run:
+        `gh pr diff <NUM> --repo {repo}`
+        If any line in the diff begins with `-` (other than `---`
+        file headers), the PR modifies or removes existing config:
+        signal BLOCKED with a one-line summary like "operator
+        dependabot.yml PR #N modifies existing config — needs
+        review". Do NOT auto-merge.
+     c. **CI check**: confirm all status checks pass (matches the
+        Dependabot PR rule above). Run:
+        `gh pr checks <NUM> --repo {repo}`
+        Any failing or pending check -> BLOCKED. A PR that adds
+        invalid dependabot YAML can pass author+diff but fail
+        repo validation; without this gate the agent could merge
+        broken config and break Dependabot for the repo.
+
+     If (a), (b), AND (c) all pass: merge with squash, delete the
+     branch. If any one fails: BLOCKED.
+   - **Any other PR from `$OPERATOR`** (touches code, tests, configs
+     other than dependabot.yml): signal BLOCKED for operator approval.
+     Never auto-merge code changes, even from the trusted operator.
+   - **PRs from anyone else** (collaborators, contributors, other bots):
+     signal BLOCKED. Never on this path.
+6. Summarize actions taken
 
 ## Signaling Completion
 
