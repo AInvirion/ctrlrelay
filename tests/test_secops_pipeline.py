@@ -209,7 +209,11 @@ class TestSecopsPromptOperatorConfigPRs:
         assert ".github/dependabot.yml" in prompt
         assert "auto-merge" in prompt.lower()
         # Code changes always BLOCKED, even from the trusted operator.
-        assert "Never auto-merge code changes" in prompt or "never auto-merge code" in prompt.lower()
+        lower = prompt.lower()
+        assert (
+            "Never auto-merge code changes" in prompt
+            or "never auto-merge code" in lower
+        )
 
     def test_prompt_positively_identifies_operator_not_just_excludes_dependabot(
         self,
