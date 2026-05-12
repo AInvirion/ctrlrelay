@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-11
+
+Minor release. Three changes on the secops path; together they take the
+secops sweep from "silently drops operator decisions" to "respects per-repo
+policy and reaches the operator on every blocked decision".
+
+### Fixed
+
+- **Secops BLOCKED questions now reach the operator via Telegram.**
+  Three discrete bugs were stacking to drop every blocked secops session
+  silently (#131):
+  1. `run_secops_all` never called `transport.ask()` after a blocked
+     pipeline result. The DB row was marked `status='blocked'` and a
+     `pending_resumes` entry was inserted, but the question went nowhere.
+     Now mirrors the dev/task pipelines: post the question, await an
+     answer, resume — up to `DEFAULT_MAX_BLOCKED_ROUNDS=5` rounds. On
+     transport failure preserves `blocked=True` so the existing
+     persistence-on-blocked branch fires.
+  2. `ctrlrelay run secops` (manual CLI) was passing `transport=None`,
+     so even with the dispatch loop in place, the `is not None` gate
+     short-circuited and questions still went to pending_resumes
+     instead of Telegram. Now builds a `SocketTransport` when the
+     bridge socket is up, mirroring the scheduled-cron path.
+  3. `SocketTransport._receive_loop` resolved the per-request future on
+     the FIRST message matching `request_id`. The bridge sends two
+     messages for an ASK: an intermediate `ACK(status="pending")` then
+     a terminal `ANSWER`. Receiving the ACK fulfilled the future early
+     and `ask()` raised `TransportError("Unexpected response: BridgeOp.ACK")`.
+     Now skips `ACK(status="pending")` and waits for `ANSWER`/`ERROR`.
+
+  Real-world impact: an 86-repo secops sweep with 21 sessions hitting
+  BLOCKED produced zero Telegram messages pre-fix. Post-fix, every
+  blocked session reaches the operator with a structured question.
+
+### Added
+
+- **Auto-merge operator-authored `.github/dependabot.yml`-only PRs.**
+  The secops agent's policy treated all operator-authored PRs as needing
+  explicit approval, even ones that ONLY add an ecosystem entry to
+  `.github/dependabot.yml`. These are the prerequisite PRs the operator
+  files when bulk-enabling Dependabot across repos with branch protection,
+  and they sat indefinitely (#132). The carve-out is narrow and
+  multi-gated:
+  1. **Author check**: `author.login == $OPERATOR` (derived from
+     `gh api user --jq .login`) — collaborators, GitHub apps, or
+     external contributors are NOT eligible even for dependabot.yml-only.
+  2. **Diff check**: `gh pr diff` must be PURELY ADDITIVE — any line
+     beginning with `-` (other than `---` file headers) signals a
+     deletion or modification of existing config -> BLOCKED.
+  3. **CI check**: `gh pr checks` must all pass — a PR adding invalid
+     YAML can pass author+diff and still break Dependabot for the repo
+     if merged without this gate.
+
+  All three must pass before merge. Any one failing -> BLOCKED.
+
+- **Per-repo `automation:` policy now drives the secops agent.**
+  `orchestrator.yaml`'s per-repo `automation` block (defining
+  `dependabot_patch`, `dependabot_minor`, `dependabot_major` as
+  auto/ask/never) was decorative — the secops prompt had hardcoded
+  prose that ignored it (#133). Now `_build_prompt` accepts an
+  `AutomationConfig` and renders per-tier directives like
+  "patch updates: AUTO-MERGE", "minor updates: ASK", "major updates: NEVER"
+  per repo. `run_secops_all` puts `repo_config.automation` in
+  `ctx.extra`; `resume_secops_from_pending` accepts an `automation`
+  kwarg; the pending-resume sweeper in `cli.py` looks up the per-repo
+  policy and threads it on resume.
+
+  Operators can now set a sensitive repo to `dependabot_minor: never`
+  and the agent will actually respect it.
+
 ## [0.4.1] - 2026-05-08
 
 Patch release. Two follow-ups against the v0.4.0 setup flow surfaced
