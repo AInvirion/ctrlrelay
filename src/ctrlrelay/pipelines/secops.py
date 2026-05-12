@@ -60,6 +60,7 @@ class SecopsPipeline:
             ctx.repo,
             session_id=ctx.session_id,
             state_file=ctx.state_file,
+            automation=ctx.extra.get("automation"),
         )
 
         result = await self._spawn(ctx, prompt, resume=False)
@@ -125,9 +126,59 @@ class SecopsPipeline:
         repo: str,
         session_id: str = "",
         state_file: Path | None = None,
+        automation: Any = None,
     ) -> str:
-        """Build the secops prompt."""
+        """Build the secops prompt.
+
+        ``automation`` is an optional ``AutomationConfig`` carrying the
+        per-repo Dependabot policy (auto/ask/never per severity tier).
+        When provided, the prompt explicitly tells the agent which tiers
+        auto-merge vs ask vs never-merge. When ``None``, falls back to
+        the default policy (patch=auto, minor=ask, never-major) so
+        existing callers and the schema defaults stay coherent."""
         state_file_path = str(state_file) if state_file else "/tmp/state.json"
+
+        # Translate per-repo policy into prompt directives. Use defaults
+        # from AutomationConfig if no policy was passed.
+        patch_pol = (
+            automation.dependabot_patch.value
+            if automation is not None and hasattr(automation, "dependabot_patch")
+            else "auto"
+        )
+        minor_pol = (
+            automation.dependabot_minor.value
+            if automation is not None and hasattr(automation, "dependabot_minor")
+            else "ask"
+        )
+        major_pol = (
+            automation.dependabot_major.value
+            if automation is not None and hasattr(automation, "dependabot_major")
+            else "never"
+        )
+
+        def _policy_directive(tier: str, policy: str) -> str:
+            if policy == "auto":
+                return (
+                    f"     - {tier}: AUTO-MERGE with passing CI. Squash + "
+                    "delete branch."
+                )
+            if policy == "ask":
+                return (
+                    f"     - {tier}: ASK — signal BLOCKED with a one-line "
+                    f"summary so the operator decides."
+                )
+            return (
+                f"     - {tier}: NEVER — do not merge. Leave the PR open "
+                "for manual review."
+            )
+
+        dependabot_policy_block = "\n".join(
+            [
+                _policy_directive("patch updates", patch_pol),
+                _policy_directive("minor updates", minor_pol),
+                _policy_directive("major updates", major_pol),
+            ]
+        )
 
         return f"""Execute security operations for repository {repo}.
 
@@ -146,8 +197,11 @@ class SecopsPipeline:
    `gh pr list --repo {repo} --state open --author "$OPERATOR" --json number,title,files`
    For each, inspect files: `gh pr view <NUM> --repo {repo} --json files`
 5. For each alert or PR:
-   - **Dependabot PRs**: if patch/minor update with passing CI, merge.
-     If major or unclear, signal BLOCKED to ask for guidance.
+   - **Dependabot PRs**: classify the update as patch/minor/major and
+     apply the per-repo policy below. If the severity is unclear, signal
+     BLOCKED to ask for guidance.
+
+{dependabot_policy_block}
    - **PR authored by `$OPERATOR` touching ONLY `.github/dependabot.yml`**
      (additive ecosystem entries, no other files changed): MAYBE
      auto-merge — but only after diff validation. These are the
@@ -307,6 +361,7 @@ async def run_secops_all(
                 worktree_path=worktree_path,
                 context_path=context_path,
                 state_file=state_file,
+                extra={"automation": getattr(repo_config, "automation", None)},
             )
 
             state_db.execute(
@@ -544,6 +599,7 @@ async def resume_secops_from_pending(
     state_db: StateDB,
     transport: Transport | None,
     contexts_dir: Path,
+    automation: Any = None,
 ) -> PipelineResult:
     """Resume a BLOCKED secops session using an answer that arrived via
     Telegram after the original session had already torn down.
@@ -589,6 +645,7 @@ async def resume_secops_from_pending(
             worktree_path=worktree_path,
             context_path=context_path,
             state_file=state_file,
+            extra={"automation": automation},
         )
 
         # Flip the session back to running so an observer sees progress,
