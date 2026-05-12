@@ -21,6 +21,8 @@ from ctrlrelay.transports.base import Transport
 
 _logger = get_logger("pipeline.secops")
 
+DEFAULT_MAX_BLOCKED_ROUNDS = 5
+
 
 def _question_for_persist(session_id: str, result: PipelineResult) -> str:
     """Return a non-empty question string for pending_resumes storage.
@@ -258,6 +260,7 @@ async def run_secops_all(
     state_db: StateDB,
     transport: Transport | None,
     contexts_dir: Path,
+    max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
 ) -> list[PipelineResult]:
     """Run secops pipeline on all configured repos."""
     results = []
@@ -315,6 +318,51 @@ async def run_secops_all(
             session_row_inserted = True
 
             result = await pipeline.run(ctx)
+
+            # BLOCKED loop: when the agent ends BLOCKED_NEEDS_INPUT, push
+            # the question to the operator via the configured transport
+            # (Telegram), wait for an answer, and resume. Mirrors the
+            # dev/task pipelines — without this, secops blocked sessions
+            # silently land as "blocked" in the DB without ever reaching
+            # the operator. transport.ask() failure preserves blocked=True
+            # so the persistence-on-blocked branch below still fires and
+            # writes a pending_resumes row that a later out-of-band reply
+            # could resume via the sweeper.
+            rounds = 0
+            while (
+                result.blocked
+                and transport is not None
+                and rounds < max_blocked_rounds
+            ):
+                question = _question_for_persist(session_id, result)
+                try:
+                    answer = await transport.ask(
+                        question,
+                        session_id=session_id,
+                        repo=repo,
+                    )
+                except Exception as e:
+                    log_event(
+                        _logger,
+                        "secops.transport.ask_failed",
+                        session_id=session_id,
+                        repo=repo,
+                        error_type=type(e).__name__,
+                        error=str(e)[:200],
+                    )
+                    result = PipelineResult(
+                        success=False,
+                        blocked=True,
+                        session_id=session_id,
+                        summary=f"Blocked session deferred (transport): {e}",
+                        error=str(e),
+                        question=question,
+                        outputs=result.outputs,
+                    )
+                    break
+                rounds += 1
+                result = await pipeline.resume(ctx, answer)
+
             results.append(result)
 
             status = "done" if result.success else ("blocked" if result.blocked else "failed")

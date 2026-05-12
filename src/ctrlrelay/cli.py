@@ -593,6 +593,29 @@ def run_secops(
     console.print(f"Running secops on {len(repos)} repo(s)...")
 
     async def _run():
+        # Build a transport so secops blocked questions reach Telegram.
+        # Without this, agents that end BLOCKED_NEEDS_INPUT silently land
+        # in the DB+pending_resumes and the operator never sees the
+        # question (mirror of the wiring in the scheduled path).
+        transport = None
+        if (
+            config.transport.type.value == "telegram"
+            and config.transport.telegram
+        ):
+            from ctrlrelay.transports import SocketTransport
+            sock = config.transport.telegram.socket_path.expanduser().resolve()
+            if sock.exists():
+                try:
+                    candidate = SocketTransport(sock)
+                    await candidate.connect()
+                    transport = candidate
+                except Exception as e:
+                    console.print(
+                        f"[yellow]Bridge transport connect failed ({e}) — "
+                        f"running without notifications. Blocked sessions "
+                        f"will land in pending_resumes for later resume.[/yellow]"
+                    )
+
         return await run_secops_all(
             repos=repos,
             dispatcher=dispatcher,
@@ -600,7 +623,7 @@ def run_secops(
             worktree=worktree,
             dashboard=dashboard,
             state_db=db,
-            transport=None,
+            transport=transport,
             contexts_dir=config.paths.contexts,
         )
 

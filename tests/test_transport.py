@@ -127,6 +127,103 @@ class TestSocketTransport:
         assert isinstance(transport, Transport)
 
 
+class TestSocketTransportAckThenAnswer:
+    """Regression for bug #3: bridge sends back ACK(status=pending) for an
+    ASK as soon as the question is queued for Telegram, then later sends
+    ANSWER once the operator replies. The receive loop must skip the
+    intermediate ACK and only resolve the future on ANSWER/ERROR/terminal-ACK,
+    or transport.ask() raises TransportError("Unexpected response: BridgeOp.ACK")
+    and every blocked secops session falls through to pending_resumes
+    instead of reaching the operator on Telegram."""
+
+    @pytest.mark.asyncio
+    async def test_ask_waits_past_intermediate_ack_and_returns_answer(
+        self,
+    ) -> None:
+        import asyncio
+        import json
+        import tempfile
+        import uuid
+        from pathlib import Path
+
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        # Use /tmp directly — macOS sun_path limit is ~104 chars and pytest's
+        # tmp_path lives under /var/folders/... which often blows past it.
+        sock_path = Path(tempfile.gettempdir()) / f"ctrlrelay-{uuid.uuid4().hex[:8]}.sock"
+
+        async def fake_bridge(reader, writer):
+            line = await reader.readline()
+            msg = json.loads(line.decode())
+            assert msg["op"] == "ask"
+            request_id = msg["request_id"]
+            ack = json.dumps({
+                "op": "ack",
+                "request_id": request_id,
+                "status": "pending",
+            }) + "\n"
+            writer.write(ack.encode())
+            await writer.drain()
+            await asyncio.sleep(0.05)
+            answer = json.dumps({
+                "op": "answer",
+                "request_id": request_id,
+                "answer": "operator said yes",
+            }) + "\n"
+            writer.write(answer.encode())
+            await writer.drain()
+
+        server = await asyncio.start_unix_server(fake_bridge, path=str(sock_path))
+        try:
+            transport = SocketTransport(sock_path)
+            await transport.connect()
+            answer = await transport.ask(
+                "Merge PR?", timeout=5, session_id="s1", repo="o/r",
+            )
+            assert answer == "operator said yes"
+            await transport.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_send_terminal_ack_still_resolves(self) -> None:
+        """SEND ACK(status="sent") is the terminal response — must still
+        resolve normally; only ACK(status="pending") is intermediate."""
+        import asyncio
+        import json
+        import tempfile
+        import uuid
+        from pathlib import Path
+
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        sock_path = Path(tempfile.gettempdir()) / f"ctrlrelay-{uuid.uuid4().hex[:8]}.sock"
+
+        async def fake_bridge(reader, writer):
+            line = await reader.readline()
+            msg = json.loads(line.decode())
+            assert msg["op"] == "send"
+            request_id = msg["request_id"]
+            ack = json.dumps({
+                "op": "ack",
+                "request_id": request_id,
+                "status": "sent",
+            }) + "\n"
+            writer.write(ack.encode())
+            await writer.drain()
+
+        server = await asyncio.start_unix_server(fake_bridge, path=str(sock_path))
+        try:
+            transport = SocketTransport(sock_path)
+            await transport.connect()
+            await transport.send("hello")  # Should return without error.
+            await transport.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+
 class TestTransportError:
     def test_error_exists(self) -> None:
         """TransportError should be defined."""

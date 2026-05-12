@@ -299,6 +299,139 @@ class TestSecopsPromptOperatorConfigPRs:
         assert "begins with `-`" in prompt or "lines beginning with `-`" in prompt.lower()
 
 
+class TestSecopsBlockedDispatch:
+    """Regression for the silent-blocked-secops bug: when an agent ends
+    BLOCKED_NEEDS_INPUT, the orchestrator must call transport.ask() to
+    deliver the question to the operator (mirroring dev/task pipelines).
+    Without this, blocked secops sessions land in the DB with status
+    'blocked' but the question never reaches Telegram."""
+
+    @pytest.mark.asyncio
+    async def test_blocked_secops_dispatches_question_via_transport(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        # First spawn returns BLOCKED with a question; the resume call
+        # returns DONE so the session unblocks.
+        blocked_state = MagicMock()
+        blocked_state.status = CheckpointStatus.BLOCKED_NEEDS_INPUT
+        blocked_state.question = "Merge PR #42 (major version bump)?"
+        blocked_state.summary = None
+        blocked_state.outputs = {}
+        blocked_state.error = None
+
+        done_state = MagicMock()
+        done_state.status = CheckpointStatus.DONE
+        done_state.summary = "Merged PR #42"
+        done_state.outputs = {"merged_prs": [42]}
+        done_state.error = None
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.side_effect = [
+            SessionResult(session_id="sess", exit_code=0, state=blocked_state),
+            SessionResult(session_id="sess", exit_code=0, state=done_state),
+        ]
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.get_agent_session_id.return_value = "sess"
+
+        mock_transport = AsyncMock()
+        mock_transport.ask.return_value = "yes, merge it"
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        results = await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=mock_transport,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        assert len(results) == 1
+        assert results[0].success
+        # transport.ask MUST be called with the agent's question — that's
+        # the whole point of the fix.
+        mock_transport.ask.assert_called_once()
+        call_args = mock_transport.ask.call_args
+        assert "Merge PR #42" in call_args.args[0]
+        assert call_args.kwargs.get("session_id", "").startswith("secops-")
+        assert call_args.kwargs.get("repo") == "owner/repo"
+        # Final state should be 'done' since the resume succeeded.
+        statuses = [
+            c.args[1][0] for c in mock_db.execute.call_args_list
+            if c.args and "UPDATE sessions" in c.args[0]
+        ]
+        assert "done" in statuses
+
+    @pytest.mark.asyncio
+    async def test_transport_ask_failure_preserves_blocked_for_pending_resume(
+        self, tmp_path: Path
+    ) -> None:
+        """When transport.ask() raises (bridge down, timeout), the session
+        must stay blocked so the existing pending_resumes persistence
+        branch fires — letting an out-of-band Telegram reply still resume
+        the session via the sweeper."""
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        blocked_state = MagicMock()
+        blocked_state.status = CheckpointStatus.BLOCKED_NEEDS_INPUT
+        blocked_state.question = "Need decision"
+        blocked_state.summary = None
+        blocked_state.outputs = {}
+        blocked_state.error = None
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="sess", exit_code=0, state=blocked_state,
+        )
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+
+        mock_transport = AsyncMock()
+        mock_transport.ask.side_effect = RuntimeError("bridge unavailable")
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        results = await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=mock_transport,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        assert len(results) == 1
+        assert results[0].blocked
+        # Pending resume row should still get inserted so a later reply
+        # can route through the sweeper.
+        mock_db.add_pending_resume.assert_called_once()
+        assert "Need decision" in mock_db.add_pending_resume.call_args.kwargs["question"]
+
+
 class TestSecopsCleanupLogging:
     """Regression for codex round-4 [P3]: worktree cleanup failures must
     not be silently swallowed. Log them via the obs stream so operators
