@@ -432,6 +432,149 @@ class TestSecopsBlockedDispatch:
         assert "Need decision" in mock_db.add_pending_resume.call_args.kwargs["question"]
 
 
+class TestSecopsPromptRespectsAutomationConfig:
+    """The per-repo `automation:` block in orchestrator.yaml defines the
+    Dependabot policy per severity tier (patch/minor/major × auto/ask/never).
+    Before #133, the secops prompt had hardcoded prose ("merge patch/minor")
+    that ignored the config entirely — so a repo configured `dependabot_minor:
+    never` would still get its minors auto-merged. The prompt must reflect
+    the configured policy per repo.
+    """
+
+    def test_default_policy_when_no_automation_passed(self) -> None:
+        """With no automation, the prompt must use the AutomationConfig
+        defaults: patch=auto, minor=ask, never-major."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+
+        assert "patch updates: AUTO-MERGE" in prompt
+        assert "minor updates: ASK" in prompt
+        assert "major updates: NEVER" in prompt
+
+    def test_per_repo_policy_overrides_defaults(self) -> None:
+        """When AutomationConfig is passed in, its values drive the prompt."""
+        from ctrlrelay.core.config import AutomationConfig, AutomationPolicy
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        # Aggressive: auto-merge everything including majors.
+        automation = AutomationConfig(
+            dependabot_patch=AutomationPolicy.AUTO,
+            dependabot_minor=AutomationPolicy.AUTO,
+            dependabot_major=AutomationPolicy.AUTO,
+        )
+        prompt = pipeline._build_prompt(
+            repo="o/r", session_id="s1", automation=automation,
+        )
+
+        assert "patch updates: AUTO-MERGE" in prompt
+        assert "minor updates: AUTO-MERGE" in prompt
+        assert "major updates: AUTO-MERGE" in prompt
+
+    def test_conservative_policy_renders_never_for_all(self) -> None:
+        """Conservative repo: dependabot disabled across all tiers."""
+        from ctrlrelay.core.config import AutomationConfig, AutomationPolicy
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        automation = AutomationConfig(
+            dependabot_patch=AutomationPolicy.NEVER,
+            dependabot_minor=AutomationPolicy.NEVER,
+            dependabot_major=AutomationPolicy.NEVER,
+        )
+        prompt = pipeline._build_prompt(
+            repo="o/r", session_id="s1", automation=automation,
+        )
+
+        assert "patch updates: NEVER" in prompt
+        assert "minor updates: NEVER" in prompt
+        assert "major updates: NEVER" in prompt
+
+    @pytest.mark.asyncio
+    async def test_run_secops_all_threads_automation_into_ctx_extra(
+        self, tmp_path: Path
+    ) -> None:
+        """run_secops_all must read each RepoConfig.automation and put it
+        in ctx.extra so the prompt builder picks it up. Without this, the
+        per-repo schema is decorative."""
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.config import AutomationConfig, AutomationPolicy
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        captured_prompts: list[str] = []
+
+        async def fake_spawn(**kwargs):
+            captured_prompts.append(kwargs["prompt"])
+            state = MagicMock()
+            state.status = CheckpointStatus.DONE
+            state.summary = "Done"
+            state.outputs = {}
+            state.error = None
+            return SessionResult(
+                session_id=kwargs["session_id"], exit_code=0, state=state,
+            )
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.side_effect = fake_spawn
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.release_lock.return_value = True
+
+        # Repo configured with NEVER on patches — a non-default policy.
+        repo = MagicMock()
+        repo.name = "owner/repo"
+        repo.automation = AutomationConfig(
+            dependabot_patch=AutomationPolicy.NEVER,
+            dependabot_minor=AutomationPolicy.NEVER,
+            dependabot_major=AutomationPolicy.NEVER,
+        )
+
+        await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        assert len(captured_prompts) == 1
+        # The spawned prompt must reflect the NEVER policy — not the
+        # auto/ask/never default.
+        assert "patch updates: NEVER" in captured_prompts[0]
+
+
 class TestSecopsCleanupLogging:
     """Regression for codex round-4 [P3]: worktree cleanup failures must
     not be silently swallowed. Log them via the obs stream so operators

@@ -1614,6 +1614,7 @@ def poller_start(
 
                     try:
                         if pipeline_name == "secops":
+                            sweep_repo_cfg = repo_cfg_by_name.get(repo)
                             result = await resume_secops_from_pending(
                                 session_id=session_id,
                                 repo=repo,
@@ -1625,6 +1626,11 @@ def poller_start(
                                 state_db=state_db,
                                 transport=sweeper_transport,
                                 contexts_dir=config.paths.contexts,
+                                automation=(
+                                    sweep_repo_cfg.automation
+                                    if sweep_repo_cfg is not None
+                                    else None
+                                ),
                             )
                         elif pipeline_name == "dev":
                             # Dev resume needs the repo's branch template
