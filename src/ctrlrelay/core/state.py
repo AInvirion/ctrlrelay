@@ -423,28 +423,41 @@ class StateDB:
         self,
         repo: str,
         *,
+        operation: str | None = None,
         since_ts: int | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Recent operator decisions for this repo, newest first.
+
+        ``operation`` namespaces the read so a Dependabot-PR consumer
+        only sees ``dependabot_pr`` rows, not e.g. ``codeql_alert``
+        decisions also tracked in the same repo. Without this filter,
+        a "suppress this CVE" answer for a CodeQL alert would render
+        into the Dependabot prompt as a prior-PR decision and the
+        agent could act on it. Defaults to ``None`` (all operations)
+        to preserve the original behaviour for callers that want a
+        full audit view.
 
         ``since_ts`` (unix seconds) filters to decisions made
         at-or-after that point — used by the secops prompt builder to
         inject a 30-day rolling window into the agent's context so the
         agent can act on prior decisions instead of asking again.
         """
-        if since_ts is None:
-            rows = self._conn.execute(
-                "SELECT * FROM automation_decisions WHERE repo = ? "
-                "ORDER BY decided_at DESC LIMIT ?",
-                (repo, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM automation_decisions WHERE repo = ? "
-                "AND decided_at >= ? ORDER BY decided_at DESC LIMIT ?",
-                (repo, since_ts, limit),
-            ).fetchall()
+        clauses = ["repo = ?"]
+        params: list[Any] = [repo]
+        if operation is not None:
+            clauses.append("operation = ?")
+            params.append(operation)
+        if since_ts is not None:
+            clauses.append("decided_at >= ?")
+            params.append(since_ts)
+        sql = (
+            "SELECT * FROM automation_decisions WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY decided_at DESC LIMIT ?"
+        )
+        params.append(limit)
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
     # PR watches (durable, cross-restart)

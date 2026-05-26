@@ -690,3 +690,34 @@ class TestAutomationDecisions:
         rows = db.list_recent_automation_decisions("o/r")
         assert [r["decision"] for r in rows] == ["second", "first"]
         db.close()
+
+    def test_list_filters_by_operation(self, tmp_path: Path) -> None:
+        """The schema namespaces decisions by `operation` so e.g. a
+        `codeql_alert` suppression doesn't leak into a Dependabot-PR
+        prompt as a prior PR decision. The reader must honour the
+        namespace — otherwise a 'suppress this CVE' answer would
+        render as 'merge this PR'."""
+        db = StateDB(tmp_path / "state.db")
+        db.record_automation_decision(
+            repo="o/r", operation="dependabot_pr",
+            item_id="#10", decision="merge",
+        )
+        db.record_automation_decision(
+            repo="o/r", operation="codeql_alert",
+            item_id="alert-42", decision="suppress until next quarter",
+        )
+        dep_rows = db.list_recent_automation_decisions(
+            "o/r", operation="dependabot_pr",
+        )
+        assert len(dep_rows) == 1
+        assert dep_rows[0]["item_id"] == "#10"
+        cq_rows = db.list_recent_automation_decisions(
+            "o/r", operation="codeql_alert",
+        )
+        assert len(cq_rows) == 1
+        assert cq_rows[0]["item_id"] == "alert-42"
+        # Default (no operation filter) returns the full audit view —
+        # used by ops debugging / future audit UI, not the prompt.
+        all_rows = db.list_recent_automation_decisions("o/r")
+        assert len(all_rows) == 2
+        db.close()

@@ -1280,6 +1280,83 @@ class TestSecopsPriorDecisionsInPrompt:
             )
             is not None
         )
+        # Lookup must be namespaced to dependabot_pr — otherwise a
+        # `codeql_alert` decision in the same repo would render into
+        # this Dependabot prompt as a prior PR decision.
+        assert (
+            mock_db.list_recent_automation_decisions.call_args.kwargs.get(
+                "operation"
+            )
+            == "dependabot_pr"
+        )
+
+    def test_prompt_renders_context_snippet_for_stale_check(self) -> None:
+        """The prompt tells the agent to act on a prior decision only
+        when circumstances haven't materially changed (different
+        version bump, CI flipped). To enforce that, the rendered entry
+        must include the stored context (the original question
+        snippet) so the agent can compare prior bump/CI state with
+        the current PR. Without context, the rule is unenforceable."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prior = [
+            {
+                "decided_at": 1779445200,
+                "item_id": "#60",
+                "decision": "yes merge it",
+                "context": "PR #60 actions/upload-artifact 4->7 (CI green)",
+            },
+        ]
+        prompt = pipeline._build_prompt(
+            repo="o/r", session_id="s1", prior_decisions=prior,
+        )
+        # Question snippet must appear so the agent can detect a
+        # force-pushed PR that swapped the version under #60.
+        assert "actions/upload-artifact 4->7" in prompt
+        # And the rule must explicitly point the agent at the snippet
+        # so it knows to compare, not just decoration.
+        assert "prior-question snippet" in prompt.lower()
+
+    def test_prompt_handles_missing_context_gracefully(self) -> None:
+        """Older rows (written before context was stored) lack the
+        snippet. The render must not produce 'prior question: ' with
+        an empty tail, or worse a literal 'None' — degrade to the
+        item+answer-only form."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prior = [
+            {
+                "decided_at": 1779445200,
+                "item_id": "#60",
+                "decision": "merge",
+                "context": None,
+            },
+        ]
+        prompt = pipeline._build_prompt(
+            repo="o/r", session_id="s1", prior_decisions=prior,
+        )
+        assert "#60" in prompt
+        assert '"merge"' in prompt
+        assert "prior question: " not in prompt
+        assert "None" not in prompt.split("Prior operator decisions")[1].split(
+            "**Use these"
+        )[0]
 
 
 class TestSecopsEdgeCasePromptDirectives:

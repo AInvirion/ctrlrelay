@@ -261,6 +261,14 @@ class SecopsPipeline:
         # normalize "yes"/"approve"/"merge it" to a canonical decision
         # because that classification is exactly what the agent does
         # best, and getting it wrong silently auto-merges PRs.
+        #
+        # We render the stored ``context`` (question snippet captured
+        # at decision time) alongside item_id + answer so the agent
+        # can compare prior bump/CI state with the PR it's looking at
+        # right now. Without context, the "only re-ASK if circumstances
+        # materially changed" rule below is unenforceable — the agent
+        # can't detect a force-pushed PR that swapped the version bump
+        # under the same PR number.
         if prior_decisions:
             lines = ["## Prior operator decisions (last 30 days)", ""]
             for d in prior_decisions:
@@ -275,17 +283,31 @@ class SecopsPipeline:
                 # doesn't bloat the prompt past the model's context.
                 if len(ans) > 160:
                     ans = ans[:157] + "..."
-                lines.append(f'- {date} {item}: operator said "{ans}"')
+                ctx = (d.get("context") or "").strip().replace("\n", " ")
+                # Same cap rationale as answers; the prompt has many
+                # entries and at-scale this is the bigger context risk.
+                if len(ctx) > 240:
+                    ctx = ctx[:237] + "..."
+                if ctx:
+                    lines.append(
+                        f'- {date} {item}: operator said "{ans}" '
+                        f"(prior question: {ctx})"
+                    )
+                else:
+                    lines.append(
+                        f'- {date} {item}: operator said "{ans}"'
+                    )
             lines.append("")
             lines.append(
                 "**Use these to avoid re-asking.** If a Dependabot PR "
                 "matches an item above and circumstances are unchanged "
                 "(same package, version range still applies, CI state "
-                "still the same), act per the prior decision without "
-                "signalling BLOCKED. Only re-ASK if the situation has "
-                "materially changed (different version bump, CI flipped "
-                "red, new conflicts) — and quote what changed in the "
-                "question."
+                "still the same — compare the current PR against the "
+                "prior-question snippet above), act per the prior "
+                "decision without signalling BLOCKED. Only re-ASK if "
+                "the situation has materially changed (different "
+                "version bump, CI flipped red, new conflicts) — and "
+                "quote what changed in the question."
             )
             prior_decisions_block = "\n".join(lines) + "\n\n"
         else:
@@ -510,6 +532,7 @@ async def run_secops_all(
             try:
                 prior_decisions = state_db.list_recent_automation_decisions(
                     repo,
+                    operation="dependabot_pr",
                     since_ts=int(time.time()) - DECISION_RECALL_SECONDS,
                 )
             except Exception as e:

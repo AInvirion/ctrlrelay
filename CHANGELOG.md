@@ -21,13 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      forms, dedupes, and tolerates questions with no PR# (e.g.
      CodeQL-only) by writing nothing.
   2. Before building each sweep's prompt, `run_secops_all` pulls the
-     last 30 days of decisions for that repo and threads them via
+     last 30 days of decisions for that repo (namespaced to
+     `operation="dependabot_pr"` so e.g. CodeQL-suppression decisions
+     don't leak into the Dependabot prompt) and threads them via
      `ctx.extra['prior_decisions']` into `_build_prompt`, which renders
      a `## Prior operator decisions (last 30 days)` block listing each
-     decision verbatim. The block carries instructions to act on prior
-     answers unless circumstances have materially changed (different
-     version bump, CI state flipped). Without this the persistence
-     layer was dead weight.
+     decision verbatim alongside the original question snippet so the
+     agent can detect a force-pushed PR that swapped the version bump
+     under the same PR number. The block carries instructions to act
+     on prior answers unless circumstances have materially changed
+     (different version bump, CI state flipped). Without this the
+     persistence layer was dead weight.
 
 ### Fixed
 
