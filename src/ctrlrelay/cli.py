@@ -1631,6 +1631,7 @@ def poller_start(
                                     if sweep_repo_cfg is not None
                                     else None
                                 ),
+                                question=row.get("question"),
                             )
                         elif pipeline_name == "dev":
                             # Dev resume needs the repo's branch template

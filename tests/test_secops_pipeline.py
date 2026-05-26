@@ -945,3 +945,411 @@ class TestSecopsCancellation:
 
         # Assert: the per-repo lock was released.
         assert mock_db.release_lock.called
+
+
+class TestPRNumberExtraction:
+    """The persistence layer keys decisions by PR#, so the regex that
+    pulls PR numbers out of free-form BLOCKED questions has to handle
+    the variants the agent emits in practice (see real
+    pending_resumes rows in production)."""
+
+    def test_extracts_pr_hash_form(self) -> None:
+        from ctrlrelay.pipelines.secops import _extract_pr_numbers
+
+        q = "Dependabot PR #60 is a MAJOR bump. Approve merge?"
+        assert _extract_pr_numbers(q) == ["60"]
+
+    def test_extracts_bare_hash_form(self) -> None:
+        from ctrlrelay.pipelines.secops import _extract_pr_numbers
+
+        q = "approve which of: #15, #14, #13?"
+        assert _extract_pr_numbers(q) == ["15", "14", "13"]
+
+    def test_extracts_mixed_forms_and_dedupes(self) -> None:
+        from ctrlrelay.pipelines.secops import _extract_pr_numbers
+
+        q = "PR #293 (major); PR #290 (major). Also #293 has alert."
+        assert _extract_pr_numbers(q) == ["293", "290"]
+
+    def test_returns_empty_when_no_pr_mentioned(self) -> None:
+        """Edge-case questions about a repo with no PRs (e.g. CodeQL
+        alert decisions) shouldn't produce phantom rows."""
+        from ctrlrelay.pipelines.secops import _extract_pr_numbers
+
+        q = "Open CodeQL alert on injection sink. Suppress or fix?"
+        assert _extract_pr_numbers(q) == []
+
+
+class TestSecopsDecisionPersistence:
+    """When the operator answers a BLOCKED question, the pipeline must
+    persist that answer against every PR# mentioned in the question so
+    the next sweep skips re-asking. Without this, the daily 6am cron
+    surfaces the same "approve PR #60?" question every day even after
+    the operator has answered."""
+
+    @pytest.mark.asyncio
+    async def test_blocked_loop_records_decisions_per_pr(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        blocked_state = MagicMock()
+        blocked_state.status = CheckpointStatus.BLOCKED_NEEDS_INPUT
+        blocked_state.question = "Approve majors PR #60 and PR #61?"
+        blocked_state.summary = None
+        blocked_state.outputs = {}
+        blocked_state.error = None
+
+        done_state = MagicMock()
+        done_state.status = CheckpointStatus.DONE
+        done_state.summary = "Merged"
+        done_state.outputs = {}
+        done_state.error = None
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.side_effect = [
+            SessionResult(session_id="s", exit_code=0, state=blocked_state),
+            SessionResult(session_id="s", exit_code=0, state=done_state),
+        ]
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.list_recent_automation_decisions.return_value = []
+
+        mock_transport = AsyncMock()
+        mock_transport.ask.return_value = "yes merge both"
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=mock_transport,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        # One row per PR# in the question, both with the verbatim
+        # operator answer.
+        calls = mock_db.record_automation_decision.call_args_list
+        item_ids = sorted(c.kwargs["item_id"] for c in calls)
+        assert item_ids == ["#60", "#61"]
+        for c in calls:
+            assert c.kwargs["decision"] == "yes merge both"
+            assert c.kwargs["repo"] == "owner/repo"
+            assert c.kwargs["operation"] == "dependabot_pr"
+
+    @pytest.mark.asyncio
+    async def test_no_decision_written_when_question_lacks_pr_number(
+        self, tmp_path: Path
+    ) -> None:
+        """A BLOCKED question about a CodeQL alert (no PR#) must not
+        produce a phantom row keyed on an empty item_id."""
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        blocked_state = MagicMock()
+        blocked_state.status = CheckpointStatus.BLOCKED_NEEDS_INPUT
+        blocked_state.question = "Open CodeQL alert: suppress or fix?"
+        blocked_state.summary = None
+        blocked_state.outputs = {}
+        blocked_state.error = None
+
+        done_state = MagicMock()
+        done_state.status = CheckpointStatus.DONE
+        done_state.summary = "Done"
+        done_state.outputs = {}
+        done_state.error = None
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.side_effect = [
+            SessionResult(session_id="s", exit_code=0, state=blocked_state),
+            SessionResult(session_id="s", exit_code=0, state=done_state),
+        ]
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.list_recent_automation_decisions.return_value = []
+
+        mock_transport = AsyncMock()
+        mock_transport.ask.return_value = "suppress for now"
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=mock_transport,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        mock_db.record_automation_decision.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resume_from_pending_records_decisions(
+        self, tmp_path: Path
+    ) -> None:
+        """resume_secops_from_pending runs from the sweeper (out-of-band
+        Telegram reply, original session torn down). It must also
+        capture the operator's answer so the next 6am sweep doesn't
+        re-ask. The question text is carried from the pending_resumes
+        row."""
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import resume_secops_from_pending
+
+        done_state = MagicMock()
+        done_state.status = CheckpointStatus.DONE
+        done_state.summary = "Resumed and merged"
+        done_state.outputs = {}
+        done_state.error = None
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="s", exit_code=0, state=done_state,
+        )
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+
+        await resume_secops_from_pending(
+            session_id="s",
+            repo="owner/repo",
+            answer="merge 60 only",
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+            question="Approve PR #60 and PR #61?",
+        )
+
+        calls = mock_db.record_automation_decision.call_args_list
+        item_ids = sorted(c.kwargs["item_id"] for c in calls)
+        assert item_ids == ["#60", "#61"]
+        for c in calls:
+            assert c.kwargs["decision"] == "merge 60 only"
+
+
+class TestSecopsPriorDecisionsInPrompt:
+    """The prompt must inject the rolling window of prior operator
+    decisions for this repo so the agent can act on them instead of
+    re-asking. Without injection, persistence is dead weight."""
+
+    def test_prompt_includes_prior_decisions_block(self) -> None:
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prior = [
+            {
+                "decided_at": 1779445200,
+                "item_id": "#60",
+                "decision": "yes, merge it",
+            },
+            {
+                "decided_at": 1779358800,
+                "item_id": "#25",
+                "decision": "skip for now",
+            },
+        ]
+        prompt = pipeline._build_prompt(
+            repo="o/r", session_id="s1", prior_decisions=prior,
+        )
+
+        assert "Prior operator decisions" in prompt
+        assert '#60: operator said "yes, merge it"' in prompt
+        assert '#25: operator said "skip for now"' in prompt
+        # Must instruct the agent to act on prior decisions, not just
+        # echo them back as decoration.
+        assert "avoid re-asking" in prompt.lower()
+        assert "materially changed" in prompt.lower()
+
+    def test_prompt_omits_block_when_no_prior_decisions(self) -> None:
+        """When the table is empty (fresh repo, or window expired), the
+        block must be omitted entirely — not rendered as an empty
+        header that would confuse the agent."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+        assert "Prior operator decisions" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_run_secops_all_threads_prior_decisions_into_prompt(
+        self, tmp_path: Path
+    ) -> None:
+        """run_secops_all must query state_db for prior decisions and
+        thread them through ctx.extra so _build_prompt picks them up."""
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        captured_prompts: list[str] = []
+
+        async def fake_spawn(**kwargs):
+            captured_prompts.append(kwargs["prompt"])
+            state = MagicMock()
+            state.status = CheckpointStatus.DONE
+            state.summary = "Done"
+            state.outputs = {}
+            state.error = None
+            return SessionResult(
+                session_id=kwargs["session_id"], exit_code=0, state=state,
+            )
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.side_effect = fake_spawn
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.release_lock.return_value = True
+        mock_db.list_recent_automation_decisions.return_value = [
+            {
+                "decided_at": 1779445200,
+                "item_id": "#42",
+                "decision": "approved last week",
+            }
+        ]
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        assert len(captured_prompts) == 1
+        assert "#42" in captured_prompts[0]
+        assert "approved last week" in captured_prompts[0]
+        # Lookup must use a since_ts (30-day window), not unbounded.
+        mock_db.list_recent_automation_decisions.assert_called_once()
+        assert (
+            mock_db.list_recent_automation_decisions.call_args.kwargs.get(
+                "since_ts"
+            )
+            is not None
+        )
+
+
+class TestSecopsEdgeCasePromptDirectives:
+    """The prompt must cover the two edge cases the agent reliably
+    fumbles in production: (1) repos with no CI configured, where
+    the 'auto-merge with passing CI' gate cannot be evaluated; and
+    (2) CI failing on a check unrelated to the PR's package, where
+    patch PRs would otherwise sit stuck for weeks."""
+
+    def test_prompt_covers_no_ci_configured_case(self) -> None:
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+        # Must call out the missing-workflows signal explicitly so the
+        # agent can detect the case (not guess it).
+        assert ".github/workflows" in prompt
+        assert "No CI configured" in prompt or "no CI" in prompt.lower()
+        # Must instruct one consolidated question, not one per PR.
+        assert "consolidated" in prompt.lower()
+
+    def test_prompt_covers_unrelated_ci_failure_case(self) -> None:
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+        # Must instruct the agent to surface the pre-existing failure,
+        # not silently leave patches stuck.
+        assert "unrelated" in prompt.lower()
+        assert "pre-existing" in prompt.lower() or "stuck" in prompt.lower()
+        # Must reference the diagnostic command the agent runs to extract
+        # the root cause, otherwise it's just vague prose.
+        assert "gh run view" in prompt or "log-failed" in prompt.lower()
+
+    def test_prompt_enforces_scope_discipline(self) -> None:
+        """Production saw the agent invent options like 'batch into a
+        single review PR' that were never in the policy ladder. Prompt
+        must explicitly forbid this."""
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        prompt = pipeline._build_prompt(repo="o/r", session_id="s1")
+        # Must name the freelance options the agent has been observed
+        # offering so the prohibition is concrete, not abstract.
+        assert "batch" in prompt.lower()
+        # Must establish the three-exit ladder so the agent has a clear
+        # mental model of legitimate actions.
+        assert (
+            "three legitimate exits" in prompt.lower()
+            or "three exits" in prompt.lower()
+        )
+

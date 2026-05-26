@@ -592,3 +592,101 @@ class TestPendingResumes:
         assert db.mark_pending_resume_resumed("s1") is True
         assert db.list_pending_resumes_to_execute() == []
         db.close()
+
+
+class TestAutomationDecisions:
+    """automation_decisions persists operator answers across sweeps so
+    the secops agent doesn't re-ask about the same Dependabot PR every
+    day. Decisions are scoped per-repo and the recall window is a
+    rolling 30 days (filter applied at read-time)."""
+
+    def test_record_and_list_decisions(self, tmp_path: Path) -> None:
+        db = StateDB(tmp_path / "state.db")
+        db.record_automation_decision(
+            repo="owner/repo",
+            operation="dependabot_pr",
+            item_id="#60",
+            decision="yes, merge it",
+            context="PR #60 actions/upload-artifact 4->7",
+        )
+        rows = db.list_recent_automation_decisions("owner/repo")
+        assert len(rows) == 1
+        assert rows[0]["repo"] == "owner/repo"
+        assert rows[0]["operation"] == "dependabot_pr"
+        assert rows[0]["item_id"] == "#60"
+        assert rows[0]["decision"] == "yes, merge it"
+        assert rows[0]["decided_by"] == "operator"
+        assert rows[0]["decided_at"] is not None
+        db.close()
+
+    def test_list_is_scoped_per_repo(self, tmp_path: Path) -> None:
+        """A decision recorded for repo A must not leak into repo B's
+        prompt — otherwise an "approve" for repo A's upload-artifact
+        bump would silently authorize the same bump in unrelated repos."""
+        db = StateDB(tmp_path / "state.db")
+        db.record_automation_decision(
+            repo="owner/repo-a", operation="dependabot_pr",
+            item_id="#1", decision="approve",
+        )
+        db.record_automation_decision(
+            repo="owner/repo-b", operation="dependabot_pr",
+            item_id="#1", decision="reject",
+        )
+        assert len(db.list_recent_automation_decisions("owner/repo-a")) == 1
+        assert (
+            db.list_recent_automation_decisions("owner/repo-a")[0][
+                "decision"
+            ]
+            == "approve"
+        )
+        assert len(db.list_recent_automation_decisions("owner/repo-b")) == 1
+        assert (
+            db.list_recent_automation_decisions("owner/repo-b")[0][
+                "decision"
+            ]
+            == "reject"
+        )
+        db.close()
+
+    def test_list_filters_by_since_ts(self, tmp_path: Path) -> None:
+        """30-day recall is implemented via since_ts at the read site,
+        not by deleting old rows. A decision older than the window
+        must be returned by an unbounded query but excluded when
+        since_ts is set just after its timestamp."""
+        import time as _time
+
+        db = StateDB(tmp_path / "state.db")
+        db.record_automation_decision(
+            repo="o/r", operation="dependabot_pr",
+            item_id="#1", decision="old answer",
+        )
+        # Cutoff one second in the future — should exclude the row
+        # written above (decided_at == now).
+        cutoff = int(_time.time()) + 1
+        rows = db.list_recent_automation_decisions("o/r", since_ts=cutoff)
+        assert rows == []
+        # Same query without the cutoff still finds it.
+        rows = db.list_recent_automation_decisions("o/r")
+        assert len(rows) == 1
+        db.close()
+
+    def test_list_orders_newest_first(self, tmp_path: Path) -> None:
+        """The prompt-rendering site relies on newest-first ordering so
+        the most recent decision wins when the operator changed their
+        mind on the same PR."""
+        import time as _time
+
+        db = StateDB(tmp_path / "state.db")
+        db.record_automation_decision(
+            repo="o/r", operation="dependabot_pr",
+            item_id="#1", decision="first",
+        )
+        # Force a tick so decided_at differs even on fast machines.
+        _time.sleep(1)
+        db.record_automation_decision(
+            repo="o/r", operation="dependabot_pr",
+            item_id="#1", decision="second",
+        )
+        rows = db.list_recent_automation_decisions("o/r")
+        assert [r["decision"] for r in rows] == ["second", "first"]
+        db.close()
