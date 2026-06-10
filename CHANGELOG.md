@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Secops sweeps now remember operator decisions across days.** The
+  `automation_decisions` table had a schema but no producer or consumer
+  — every 6am sweep re-asked about the same Dependabot PRs the operator
+  had already answered, drowning Telegram. Wired both halves:
+  1. When the BLOCKED loop in `run_secops_all` (or the out-of-band
+     `resume_secops_from_pending` sweeper) receives an answer, regex
+     extracts every PR# from the question and records one row per PR#
+     keyed on `(repo, "dependabot_pr", "#N")` with the operator's
+     verbatim answer. PR# regex handles both `PR #60` and bare `#60`
+     forms, dedupes, and tolerates questions with no PR# (e.g.
+     CodeQL-only) by writing nothing.
+  2. Before building each sweep's prompt, `run_secops_all` pulls the
+     last 30 days of decisions for that repo (namespaced to
+     `operation="dependabot_pr"` so e.g. CodeQL-suppression decisions
+     don't leak into the Dependabot prompt) and threads them via
+     `ctx.extra['prior_decisions']` into `_build_prompt`, which renders
+     a `## Prior operator decisions (last 30 days)` block listing each
+     decision verbatim alongside the original question snippet so the
+     agent can detect a force-pushed PR that swapped the version bump
+     under the same PR number. The block carries instructions to act
+     on prior answers unless circumstances have materially changed
+     (different version bump, CI state flipped). Without this the
+     persistence layer was dead weight.
+
+### Fixed
+
+- **Secops handles "no CI configured" without inventing options.**
+  Repos with no `.github/workflows/*` previously confused the agent
+  into freelance suggestions ("Want me to batch into a review PR?")
+  because the "auto-merge with passing CI" gate couldn't fire. Prompt
+  now explicitly directs: treat ALL Dependabot PRs as ASK regardless
+  of tier, and signal BLOCKED ONCE with a single consolidated question
+  per repo (not one per PR).
+- **Secops escalates pre-existing CI failures instead of stalling PRs.**
+  When CI is failing on a check unrelated to the PR's package (e.g.
+  `pip-audit` flagging a transitive CVE in `idna` while the PR bumps
+  `boto3`), patch PRs were sitting stuck for weeks because the agent
+  reported the failure and moved on. Prompt now requires the agent to
+  signal BLOCKED with a one-line question naming the underlying issue
+  and a root-cause hint from `gh run view --log-failed`.
+- **Secops scope discipline.** The prompt now enforces "exactly three
+  legitimate exits" per open PR (merge / leave / BLOCKED) and
+  explicitly forbids batching PRs into review PRs, opening tracking
+  issues, or performing manual reviews. Cuts off the freelance
+  options observed in production sweeps.
+
 ## [0.5.0] - 2026-05-11
 
 Minor release. Three changes on the secops path; together they take the

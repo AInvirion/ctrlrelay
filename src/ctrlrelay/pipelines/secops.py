@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -22,6 +23,72 @@ from ctrlrelay.transports.base import Transport
 _logger = get_logger("pipeline.secops")
 
 DEFAULT_MAX_BLOCKED_ROUNDS = 5
+
+# 30-day rolling window of operator decisions injected into each
+# sweep's prompt. Long enough to cover weekly cadences and a vacation;
+# short enough that a stale "approve" from months ago can't auto-merge
+# a PR whose risk profile may have shifted (new transitive deps,
+# changed maintainer, etc.).
+DECISION_RECALL_SECONDS = 30 * 86400
+
+# Captures both "PR #60" and "#60" forms the agent uses interchangeably
+# in BLOCKED questions. The negative-lookahead on `#0` avoids matching
+# CVE-2026-... style identifiers; PR numbers are always >= 1.
+_PR_NUM_RE = re.compile(r"(?:PR\s*)?#(\d+)(?!\d)", re.IGNORECASE)
+
+
+def _extract_pr_numbers(question: str) -> list[str]:
+    """Pull deduplicated PR numbers out of a BLOCKED question so we
+    can record one operator-decision row per PR. Order-preserving so
+    a multi-PR question like 'approve #60, #61, #62?' records the
+    decision against each in the order the agent listed them."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in _PR_NUM_RE.findall(question or ""):
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out
+
+
+def _record_decisions_from_answer(
+    state_db: StateDB,
+    *,
+    repo: str,
+    question: str,
+    answer: str,
+    session_id: str,
+) -> None:
+    """Best-effort persistence of an operator's verbatim Telegram
+    answer against every PR# mentioned in the question. Failure here
+    is logged but does not break the pipeline — the answer has
+    already been acted on by the agent; losing the persistence layer
+    just means the next sweep will re-ask, which is the pre-fix
+    status quo."""
+    pr_numbers = _extract_pr_numbers(question)
+    if not pr_numbers:
+        return
+    for pr_num in pr_numbers:
+        try:
+            state_db.record_automation_decision(
+                repo=repo,
+                operation="dependabot_pr",
+                item_id=f"#{pr_num}",
+                decision=answer,
+                decided_by="operator",
+                context=(question or "")[:500],
+            )
+        except Exception as e:
+            log_event(
+                _logger,
+                "secops.decision.record_failed",
+                session_id=session_id,
+                repo=repo,
+                pr_number=pr_num,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
 
 
 def _question_for_persist(session_id: str, result: PipelineResult) -> str:
@@ -61,6 +128,7 @@ class SecopsPipeline:
             session_id=ctx.session_id,
             state_file=ctx.state_file,
             automation=ctx.extra.get("automation"),
+            prior_decisions=ctx.extra.get("prior_decisions"),
         )
 
         result = await self._spawn(ctx, prompt, resume=False)
@@ -127,6 +195,7 @@ class SecopsPipeline:
         session_id: str = "",
         state_file: Path | None = None,
         automation: Any = None,
+        prior_decisions: list[dict[str, Any]] | None = None,
     ) -> str:
         """Build the secops prompt.
 
@@ -135,7 +204,13 @@ class SecopsPipeline:
         When provided, the prompt explicitly tells the agent which tiers
         auto-merge vs ask vs never-merge. When ``None``, falls back to
         the default policy (patch=auto, minor=ask, never-major) so
-        existing callers and the schema defaults stay coherent."""
+        existing callers and the schema defaults stay coherent.
+
+        ``prior_decisions`` is a list of recent automation_decisions
+        rows for this repo. When present, they're rendered as a
+        "Prior operator decisions" block so the agent can act on a
+        past answer instead of asking again about the same PR.
+        """
         state_file_path = str(state_file) if state_file else "/tmp/state.json"
 
         # Translate per-repo policy into prompt directives. Use defaults
@@ -180,6 +255,64 @@ class SecopsPipeline:
             ]
         )
 
+        # Render the rolling window of prior operator decisions for this
+        # repo. The agent reads the verbatim Telegram answer and decides
+        # whether the prior call still applies — we don't try to
+        # normalize "yes"/"approve"/"merge it" to a canonical decision
+        # because that classification is exactly what the agent does
+        # best, and getting it wrong silently auto-merges PRs.
+        #
+        # We render the stored ``context`` (question snippet captured
+        # at decision time) alongside item_id + answer so the agent
+        # can compare prior bump/CI state with the PR it's looking at
+        # right now. Without context, the "only re-ASK if circumstances
+        # materially changed" rule below is unenforceable — the agent
+        # can't detect a force-pushed PR that swapped the version bump
+        # under the same PR number.
+        if prior_decisions:
+            lines = ["## Prior operator decisions (last 30 days)", ""]
+            for d in prior_decisions:
+                ts = d.get("decided_at") or 0
+                date = (
+                    time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
+                    if ts else "unknown-date"
+                )
+                item = d.get("item_id") or "?"
+                ans = (d.get("decision") or "").strip().replace("\n", " ")
+                # Cap each answer so a pathological Telegram reply
+                # doesn't bloat the prompt past the model's context.
+                if len(ans) > 160:
+                    ans = ans[:157] + "..."
+                ctx = (d.get("context") or "").strip().replace("\n", " ")
+                # Same cap rationale as answers; the prompt has many
+                # entries and at-scale this is the bigger context risk.
+                if len(ctx) > 240:
+                    ctx = ctx[:237] + "..."
+                if ctx:
+                    lines.append(
+                        f'- {date} {item}: operator said "{ans}" '
+                        f"(prior question: {ctx})"
+                    )
+                else:
+                    lines.append(
+                        f'- {date} {item}: operator said "{ans}"'
+                    )
+            lines.append("")
+            lines.append(
+                "**Use these to avoid re-asking.** If a Dependabot PR "
+                "matches an item above and circumstances are unchanged "
+                "(same package, version range still applies, CI state "
+                "still the same — compare the current PR against the "
+                "prior-question snippet above), act per the prior "
+                "decision without signalling BLOCKED. Only re-ASK if "
+                "the situation has materially changed (different "
+                "version bump, CI flipped red, new conflicts) — and "
+                "quote what changed in the question."
+            )
+            prior_decisions_block = "\n".join(lines) + "\n\n"
+        else:
+            prior_decisions_block = ""
+
         return f"""Execute security operations for repository {repo}.
 
 1. Check Dependabot alerts:
@@ -202,6 +335,42 @@ class SecopsPipeline:
      BLOCKED to ask for guidance.
 
 {dependabot_policy_block}
+
+{prior_decisions_block}**Edge cases that override the policy ladder above:**
+
+- **No CI configured** (repo has no `.github/workflows/*.yml`): the
+  "passing CI" gate cannot be evaluated, so an "auto" policy cannot
+  fire safely. Treat ALL open Dependabot PRs as ASK regardless of
+  their tier — signal BLOCKED ONCE for the whole repo with a single
+  consolidated question naming every open PR, e.g.: "Repo has no CI;
+  approve merging: #N (pkg X -> Y, patch), #M (pkg A -> B, minor)?"
+  Do not ask one BLOCKED per PR — operators get one consolidated
+  question per repo per sweep.
+
+- **CI failing on a check UNRELATED to the PR's own package** (e.g.
+  pip-audit fails on a transitive CVE in `idna` while the PR bumps
+  `boto3`): do NOT silently report this and move on — that's how
+  patch PRs end up stuck for weeks. Signal BLOCKED with a one-line
+  question naming the underlying issue: "Patch PRs blocked by
+  pre-existing pip-audit failure on idna CVE-2026-... in lockfile.
+  Fix idna >= 3.15 first, then re-evaluate #117 and #119?" Include
+  the failing check name and a one-line root-cause hint extracted
+  from `gh run view --log-failed`.
+
+**Scope discipline:**
+
+You have exactly three legitimate exits for each open PR:
+  1. Merge it (per policy or per prior decision).
+  2. Leave it open (per policy or per prior decision).
+  3. Signal BLOCKED with a one-line policy question.
+
+Do NOT propose alternative actions outside this ladder. In
+particular, do NOT offer to: batch multiple Dependabot PRs into a
+single review PR, open a tracking issue for the operator, perform a
+manual code review of the bump, or any other freelance option. If
+the right action isn't clear from policy + prior decisions + edge
+cases above, ASK with a one-line question — don't invent.
+
    - **PR authored by `$OPERATOR` touching ONLY `.github/dependabot.yml`**
      (additive ecosystem entries, no other files changed): MAYBE
      auto-merge — but only after diff validation. These are the
@@ -355,13 +524,38 @@ async def run_secops_all(
             state_file = worktree_path / ".ctrlrelay" / "state.json"
             state_file.parent.mkdir(parents=True, exist_ok=True)
 
+            # Pull the 30-day rolling window of prior operator decisions
+            # so the prompt can include them. Best-effort: if the lookup
+            # fails for any reason, fall through with an empty list —
+            # losing this just means the next sweep re-asks, which is the
+            # pre-fix status quo, not a regression.
+            try:
+                prior_decisions = state_db.list_recent_automation_decisions(
+                    repo,
+                    operation="dependabot_pr",
+                    since_ts=int(time.time()) - DECISION_RECALL_SECONDS,
+                )
+            except Exception as e:
+                log_event(
+                    _logger,
+                    "secops.prior_decisions.lookup_failed",
+                    session_id=session_id,
+                    repo=repo,
+                    error_type=type(e).__name__,
+                    error=str(e)[:200],
+                )
+                prior_decisions = []
+
             ctx = PipelineContext(
                 session_id=session_id,
                 repo=repo,
                 worktree_path=worktree_path,
                 context_path=context_path,
                 state_file=state_file,
-                extra={"automation": getattr(repo_config, "automation", None)},
+                extra={
+                    "automation": getattr(repo_config, "automation", None),
+                    "prior_decisions": prior_decisions,
+                },
             )
 
             state_db.execute(
@@ -415,6 +609,13 @@ async def run_secops_all(
                         outputs=result.outputs,
                     )
                     break
+                _record_decisions_from_answer(
+                    state_db,
+                    repo=repo,
+                    question=question,
+                    answer=answer,
+                    session_id=session_id,
+                )
                 rounds += 1
                 result = await pipeline.resume(ctx, answer)
 
@@ -600,6 +801,7 @@ async def resume_secops_from_pending(
     transport: Transport | None,
     contexts_dir: Path,
     automation: Any = None,
+    question: str | None = None,
 ) -> PipelineResult:
     """Resume a BLOCKED secops session using an answer that arrived via
     Telegram after the original session had already torn down.
@@ -609,7 +811,21 @@ async def resume_secops_from_pending(
     row in ``sessions`` (status='blocked') and a ``pending_resumes`` row
     ready for ``mark_pending_resume_resumed``. Caller is responsible for
     flipping the pending_resumes row after this returns.
+
+    ``question`` is the original BLOCKED question (carried in the
+    pending_resumes row). When supplied, the operator answer is
+    persisted against any PR# the question mentioned so the next
+    sweep skips re-asking. Optional for backwards compat with older
+    callers that pre-date the persistence work.
     """
+    if question:
+        _record_decisions_from_answer(
+            state_db,
+            repo=repo,
+            question=question,
+            answer=answer,
+            session_id=session_id,
+        )
     pipeline = SecopsPipeline(
         dispatcher=dispatcher,
         github=github,

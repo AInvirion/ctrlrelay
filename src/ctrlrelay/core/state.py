@@ -386,6 +386,80 @@ class StateDB:
         self._conn.commit()
         return cursor.rowcount > 0
 
+    # Automation decisions (operator answers persisted across sweeps)
+
+    def record_automation_decision(
+        self,
+        *,
+        repo: str,
+        operation: str,
+        item_id: str,
+        decision: str,
+        decided_by: str = "operator",
+        context: str | None = None,
+        policy: str = "",
+    ) -> None:
+        """Record an operator decision so future sweeps can avoid
+        re-asking the same question.
+
+        ``operation`` namespaces the decision domain
+        (e.g. ``"dependabot_pr"`` or ``"codeql_alert"``); ``item_id``
+        is the specific item the decision applies to (e.g. ``"#60"``
+        for PR #60). ``decision`` is the operator's verbatim answer —
+        the agent that reads this back interprets it; we don't try to
+        normalize to yes/no here because Telegram replies are free-form.
+        """
+        self._conn.execute(
+            """INSERT INTO automation_decisions
+               (repo, operation, policy, item_id, decision,
+                decided_by, decided_at, context)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (repo, operation, policy, item_id, decision,
+             decided_by, int(time.time()), context),
+        )
+        self._conn.commit()
+
+    def list_recent_automation_decisions(
+        self,
+        repo: str,
+        *,
+        operation: str | None = None,
+        since_ts: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Recent operator decisions for this repo, newest first.
+
+        ``operation`` namespaces the read so a Dependabot-PR consumer
+        only sees ``dependabot_pr`` rows, not e.g. ``codeql_alert``
+        decisions also tracked in the same repo. Without this filter,
+        a "suppress this CVE" answer for a CodeQL alert would render
+        into the Dependabot prompt as a prior-PR decision and the
+        agent could act on it. Defaults to ``None`` (all operations)
+        to preserve the original behaviour for callers that want a
+        full audit view.
+
+        ``since_ts`` (unix seconds) filters to decisions made
+        at-or-after that point — used by the secops prompt builder to
+        inject a 30-day rolling window into the agent's context so the
+        agent can act on prior decisions instead of asking again.
+        """
+        clauses = ["repo = ?"]
+        params: list[Any] = [repo]
+        if operation is not None:
+            clauses.append("operation = ?")
+            params.append(operation)
+        if since_ts is not None:
+            clauses.append("decided_at >= ?")
+            params.append(since_ts)
+        sql = (
+            "SELECT * FROM automation_decisions WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY decided_at DESC LIMIT ?"
+        )
+        params.append(limit)
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
     # PR watches (durable, cross-restart)
 
     def add_pr_watch(

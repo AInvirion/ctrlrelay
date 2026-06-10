@@ -172,6 +172,8 @@ class TestSocketTransportAckThenAnswer:
             }) + "\n"
             writer.write(answer.encode())
             await writer.drain()
+            writer.close()
+            await writer.wait_closed()
 
         server = await asyncio.start_unix_server(fake_bridge, path=str(sock_path))
         try:
@@ -212,6 +214,8 @@ class TestSocketTransportAckThenAnswer:
             }) + "\n"
             writer.write(ack.encode())
             await writer.drain()
+            writer.close()
+            await writer.wait_closed()
 
         server = await asyncio.start_unix_server(fake_bridge, path=str(sock_path))
         try:
