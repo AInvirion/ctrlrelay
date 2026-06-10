@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-10
+
 ### Added
 
 - **Secops sweeps now remember operator decisions across days.** The
@@ -1191,7 +1193,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.5.0...v0.6.0
 [0.1.3]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.3
 [0.1.1]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.1
 [0.1.0]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.0
