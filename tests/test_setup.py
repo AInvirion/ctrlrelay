@@ -220,12 +220,15 @@ def fake_gh(monkeypatch: pytest.MonkeyPatch) -> dict:
         "auth_ok": True,
         "repos_by_owner": {"alice": [], "AInvirion": []},
         "git_clone_calls": [],
+        "git_protocol": "https",
     }
 
     def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
         if cmd[:3] == ["gh", "auth", "status"]:
             rc = 0 if state["auth_ok"] else 1
             return subprocess.CompletedProcess(cmd, rc, "ok", "")
+        if cmd == ["gh", "config", "get", "git_protocol"]:
+            return subprocess.CompletedProcess(cmd, 0, state["git_protocol"] + "\n", "")
         if cmd[:3] == ["gh", "api", "user"]:
             return subprocess.CompletedProcess(cmd, 0, "alice\n", "")
         if cmd[:3] == ["gh", "api", "user/orgs"]:
@@ -640,6 +643,94 @@ class TestSkillAutoWiringInRunSetup:
         assert "global/skills/" not in text
 
 
+class TestPersonalizationCloneProtocol:
+    """The personalization pre-scan clone must respect gh's configured
+    git_protocol instead of hardcoding HTTPS (#137) — an SSH-only
+    operator otherwise hits "could not read Username" on every setup
+    run even though the other 27 repos clone fine over SSH."""
+
+    def test_uses_https_by_default(self, fake_gh: dict, tmp_path: Path) -> None:
+        from ctrlrelay.setup import _ensure_personalization_clone
+
+        checkout = tmp_path / "checkout"
+        assert _ensure_personalization_clone("alice/dotclaude", checkout)
+        clone_cmd = fake_gh["git_clone_calls"][-1]
+        assert clone_cmd[-2] == "https://github.com/alice/dotclaude.git"
+
+    def test_uses_ssh_when_gh_configured_for_ssh(
+        self, fake_gh: dict, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.setup import _ensure_personalization_clone
+
+        fake_gh["git_protocol"] = "ssh"
+        checkout = tmp_path / "checkout"
+        assert _ensure_personalization_clone("alice/dotclaude", checkout)
+        clone_cmd = fake_gh["git_clone_calls"][-1]
+        assert clone_cmd[-2] == "git@github.com:alice/dotclaude.git"
+
+
+class TestPersonalizationFailureSurfacesLoudly:
+    """A personalization clone/init failure must not be a silently
+    swallowed warning — run_setup flags it (#137) so the CLI can print
+    an unmissable banner and exit non-zero, instead of the prior single
+    buried log line + exit 0."""
+
+    def test_run_setup_flags_personalization_failure(
+        self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ctrlrelay import setup as setup_mod
+        from ctrlrelay.personalization import manager as mgr_mod
+        from ctrlrelay.personalization.manager import PersonalizationError
+
+        monkeypatch.setattr(
+            setup_mod, "_ensure_personalization_clone", lambda repo, checkout: False
+        )
+
+        def fail_init(self, **kw):  # type: ignore[no-untyped-def]
+            raise PersonalizationError(
+                "git clone ... exited 128: could not read Username "
+                "for 'https://github.com': terminal prompts disabled"
+            )
+
+        monkeypatch.setattr(mgr_mod.PersonalizationManager, "init", fail_init)
+
+        fake_gh["repos_by_owner"] = {"alice": ["alice/foo"], "AInvirion": []}
+        opts = SetupOptions(
+            owners=["alice", "AInvirion"],
+            repo_root=tmp_path / "Projects",
+            config_out=tmp_path / "cfg.yaml",
+            personalization_repo="alice/dotclaude",
+            wire_skills=False,
+        )
+        result = run_setup(opts)
+        assert result.personalization_failed is True
+        assert result.personalization_summary is not None
+        assert "failed" in result.personalization_summary
+
+    def test_run_setup_does_not_flag_failure_on_success(
+        self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ctrlrelay import setup as setup_mod
+        from ctrlrelay.personalization import manager as mgr_mod
+
+        monkeypatch.setattr(
+            setup_mod, "_ensure_personalization_clone", lambda repo, checkout: False
+        )
+        monkeypatch.setattr(
+            mgr_mod.PersonalizationManager, "init", lambda self, **kw: "stub-init"
+        )
+        fake_gh["repos_by_owner"] = {"alice": ["alice/foo"], "AInvirion": []}
+        opts = SetupOptions(
+            owners=["alice", "AInvirion"],
+            repo_root=tmp_path / "Projects",
+            config_out=tmp_path / "cfg.yaml",
+            personalization_repo="alice/dotclaude",
+            wire_skills=False,
+        )
+        result = run_setup(opts)
+        assert result.personalization_failed is False
+
+
 # ---------------------------------------------------------------------------
 # CLI surface
 
@@ -746,17 +837,27 @@ class TestSetupCli:
         tmp_config_out = tmp_path / "cfg.yaml"
         monkeypatch.setattr(setup_mod, "DEFAULT_CONFIG_OUT", tmp_config_out)
 
-        # Route plist writes to tmp so we don't touch ~/Library/LaunchAgents.
-        target_dir = tmp_path / "LaunchAgents"
+        # Route plist/unit writes to tmp, and fake $HOME, so this test
+        # never touches ~/Library/LaunchAgents, ~/.config/systemd/user,
+        # or ~/.ctrlrelay/logs on the machine actually running the
+        # suite (which may have a real ctrlrelay install/daemon).
+        monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+        target_dir = tmp_path / "units"
         from ctrlrelay import install as install_mod
 
-        original_render = install_mod.render_launchd
+        original_render_launchd = install_mod.render_launchd
+        original_render_systemd = install_mod.render_systemd
 
-        def render_to_tmp(**kwargs):  # type: ignore[no-untyped-def]
+        def render_launchd_to_tmp(**kwargs):  # type: ignore[no-untyped-def]
             kwargs["target_dir"] = target_dir
-            return original_render(**kwargs)
+            return original_render_launchd(**kwargs)
 
-        monkeypatch.setattr(install_mod, "render_launchd", render_to_tmp)
+        def render_systemd_to_tmp(**kwargs):  # type: ignore[no-untyped-def]
+            kwargs["target_dir"] = target_dir
+            return original_render_systemd(**kwargs)
+
+        monkeypatch.setattr(install_mod, "render_launchd", render_launchd_to_tmp)
+        monkeypatch.setattr(install_mod, "render_systemd", render_systemd_to_tmp)
 
         # Wrap the existing fake_gh subprocess.run so git clone fails.
         original_run = subprocess.run
@@ -809,3 +910,36 @@ class TestSetupCli:
         assert result.exit_code == 0, result.output
         assert (tmp_path / "cfg.yaml").is_file()
         assert (tmp_path / "Projects" / "alice" / "foo" / ".git").is_dir()
+
+    def test_personalization_failure_exits_nonzero_with_action_needed_banner(
+        self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed personalization clone must be impossible to miss:
+        non-zero exit and an ACTION NEEDED banner, not a single buried
+        log line with exit 0 (#137)."""
+        from ctrlrelay.personalization import manager as mgr_mod
+        from ctrlrelay.personalization.manager import PersonalizationError
+
+        def fail_init(self, **kw):  # type: ignore[no-untyped-def]
+            raise PersonalizationError(
+                "git clone ... exited 128: could not read Username "
+                "for 'https://github.com': terminal prompts disabled"
+            )
+
+        monkeypatch.setattr(mgr_mod.PersonalizationManager, "init", fail_init)
+
+        fake_gh["repos_by_owner"] = {"alice": ["alice/foo"], "AInvirion": []}
+        result = runner.invoke(
+            app,
+            [
+                "setup",
+                "--yes",
+                "--repo-root", str(tmp_path / "Projects"),
+                "--config-out", str(tmp_path / "cfg.yaml"),
+                "--personalization-repo", "alice/dotclaude",
+                "--no-wire-skills",
+                "--transport", "file_mock",
+            ],
+        )
+        assert result.exit_code != 0, result.output
+        assert "ACTION NEEDED" in result.output

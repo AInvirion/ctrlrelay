@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ctrlrelay.core.config import Config, load_config
+from ctrlrelay.gh_protocol import detect_git_protocol, github_clone_url
 
 __all__ = [
     "SetupOptions",
@@ -117,6 +118,7 @@ class SetupResult:
     skipped: int
     failed: int
     personalization_summary: str | None = None
+    personalization_failed: bool = False
     daemon_units: list[Path] = field(default_factory=list)
 
 
@@ -218,14 +220,13 @@ def _ensure_personalization_clone(
     if (checkout / ".git").is_dir():
         return _checkout_matches_repo(checkout, repo)
     checkout.parent.mkdir(parents=True, exist_ok=True)
-    # Use HTTPS to match ``PersonalizationManager.repo_url`` so the
-    # pre-scan works for operators authenticated to GitHub via gh
-    # tokens / HTTPS without an SSH key on the machine. Codex review
-    # pass 3 caught the SSH/HTTPS mismatch — pre-scan would silently
-    # fail, the manager's own init() would later succeed via HTTPS,
-    # and the auto-wire feature would be bypassed in a common setup.
+    # Match the protocol ``PersonalizationManager.repo_url`` will use
+    # (gh's configured git_protocol) so the pre-scan doesn't fail for
+    # SSH-only operators while the manager's own later clone succeeds
+    # (or vice versa) — see #137.
+    url = github_clone_url(repo, protocol=detect_git_protocol())
     proc = subprocess.run(
-        ["git", "clone", "--quiet", f"https://github.com/{repo}.git", str(checkout)],
+        ["git", "clone", "--quiet", url, str(checkout)],
         capture_output=True,
         text=True,
     )
@@ -540,6 +541,7 @@ def run_setup(options: SetupOptions) -> SetupResult:
         cloned, skipped, failed = clone_repos(config)
 
     personalization_summary: str | None = None
+    personalization_failed = False
     if options.personalization_repo:
         from ctrlrelay.personalization import PersonalizationManager
         from ctrlrelay.personalization.manager import PersonalizationError
@@ -549,6 +551,7 @@ def run_setup(options: SetupOptions) -> SetupResult:
             personalization_summary = mgr.init(adopt=True)
         except PersonalizationError as e:
             personalization_summary = f"(failed: {e})"
+            personalization_failed = True
 
     daemon_units: list[Path] = []
     if options.install_daemons:
@@ -562,6 +565,7 @@ def run_setup(options: SetupOptions) -> SetupResult:
         skipped=skipped,
         failed=failed,
         personalization_summary=personalization_summary,
+        personalization_failed=personalization_failed,
         daemon_units=daemon_units,
     )
 

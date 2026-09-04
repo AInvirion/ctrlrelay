@@ -178,7 +178,17 @@ def write_units(
     silently overwriting an operator's customised plist would be a foot-gun.
     Returns the list of paths actually written. Raises ``FileExistsError``
     if any target exists and overwrite is False.
+
+    Also ensures ``~/.ctrlrelay/logs/`` exists — both the launchd and
+    systemd templates set StandardOutput/StandardError paths under it,
+    and systemd refuses to start a unit at all (EXIT_STDOUT, code 209)
+    when the directory is missing; combined with ``Restart=always``
+    that's an immediate crash-loop (#137).
+
+    Unit files are chmod'd ``0600`` after writing since they embed
+    ``CTRLRELAY_TELEGRAM_TOKEN`` as plaintext.
     """
+    (Path.home() / ".ctrlrelay" / "logs").mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for unit in units:
         unit.target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,5 +198,6 @@ def write_units(
                 "pass --force to replace it"
             )
         unit.target_path.write_text(unit.content, encoding="utf-8")
+        unit.target_path.chmod(0o600)
         written.append(unit.target_path)
     return written
