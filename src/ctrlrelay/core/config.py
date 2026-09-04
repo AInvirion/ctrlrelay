@@ -183,6 +183,16 @@ class AutomationConfig(BaseModel):
     # Matching is case-insensitive. An issue that is both labeled AND
     # assigned is processed exactly once — not duplicated. See #80.
     include_labels: list[str] = Field(default_factory=list)
+    # Labels that gate the plain-assignment trigger. Default ``[]``
+    # preserves today's behavior (assignment alone is sufficient).
+    # When non-empty, bare assignment is no longer enough on its own:
+    # an issue must be assigned to the operator AND carry at least one
+    # of these labels to be picked up. This only tightens the
+    # assignment path — ``include_labels`` keeps triggering on label
+    # match alone regardless of ``require_labels``, and
+    # ``exclude_labels`` is still checked first. Matching is
+    # case-insensitive. See #139.
+    require_labels: list[str] = Field(default_factory=list)
     # Labels that route an issue to the task pipeline (run a command /
     # investigate / report findings via issue comment) instead of the
     # dev pipeline (branch + PR). Matching is case-insensitive; the

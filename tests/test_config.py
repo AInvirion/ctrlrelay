@@ -544,3 +544,99 @@ class TestAutomationIncludeLabels:
 
         assert config.repos[0].automation.include_labels == ["ctrlrelay:auto"]
         assert config.repos[1].automation.include_labels == []
+
+
+class TestAutomationRequireLabels:
+    """require_labels gates the plain-assignment trigger — an issue must be
+    BOTH assigned and labeled to be picked up. Default [] preserves
+    today's assignment-only behavior. See #139."""
+
+    def test_default_require_labels_is_empty(self) -> None:
+        """Default preserves assignment-only behavior."""
+        auto = AutomationConfig()
+        assert auto.require_labels == []
+
+    def test_require_labels_override_accepts_list(self) -> None:
+        """Explicit list of label strings is accepted verbatim."""
+        auto = AutomationConfig(require_labels=["ctrlrelay:auto"])
+        assert auto.require_labels == ["ctrlrelay:auto"]
+
+    def test_config_without_require_labels_key_defaults_to_empty(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """Legacy configs without require_labels load and get [] — no
+        behavior change for operators who haven't opted in."""
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"dependabot_patch": "auto"},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.repos[0].automation.require_labels == []
+
+    def test_require_labels_from_yaml(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """YAML ``require_labels: [...]`` is plumbed through to the
+        resolved AutomationConfig so the CLI can pass it to the poller."""
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"require_labels": ["ctrlrelay:auto"]},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.repos[0].automation.require_labels == ["ctrlrelay:auto"]
+
+    def test_require_labels_rejects_non_list(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """A scalar value (common mistake: forgetting list brackets) must
+        fail loudly at config load time rather than silently coerce."""
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"require_labels": "ctrlrelay:auto"},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        with pytest.raises(ConfigError, match="require_labels"):
+            load_config(cfg_path)
+
+    def test_mixed_repos_with_and_without_require_labels(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        """Two repos in the same config: A opts in, B doesn't. Each keeps
+        its own list — the config surface is per-repo, not global."""
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo-a",
+                "local_path": "~/Projects/repo-a",
+                "automation": {"require_labels": ["ctrlrelay:auto"]},
+            },
+            {
+                "name": "owner/repo-b",
+                "local_path": "~/Projects/repo-b",
+            },
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.repos[0].automation.require_labels == ["ctrlrelay:auto"]
+        assert config.repos[1].automation.require_labels == []

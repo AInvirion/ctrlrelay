@@ -1831,3 +1831,153 @@ class TestIncludeLabelsFilter:
         assert rec.repo == "owner/repo-a"
         assert rec.issue_number == 11
         assert rec.matched_label == "ctrlrelay:auto"
+
+
+class TestRequireLabelsFilter:
+    """Per-repo require_labels gates the plain-assignment trigger. See
+    #139. Behavior contract:
+
+    - Empty / missing ``require_labels`` preserves today's behavior:
+      assignment alone is sufficient.
+    - A configured list means assignment is no longer enough by
+      itself: the issue must ALSO carry at least one of the
+      configured labels.
+    - Matching is case-insensitive.
+    - An assigned issue missing the required label is left unmarked
+      (not seen) so a later label addition still surfaces it.
+    - ``include_labels`` is unaffected: a label match there still
+      admits the issue regardless of ``require_labels``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_assigned_without_required_label_is_not_accepted(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(1, "Create a Stripe account", assignees=["alice"]),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            require_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+
+        assert results == []
+        # Left unmarked so a later label-add still triggers it.
+        assert 1 not in poller.seen_issues.get("owner/repo-a", set())
+
+    @pytest.mark.asyncio
+    async def test_assigned_with_required_label_is_accepted(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(
+                2, "Fix the bug", assignees=["alice"],
+                labels=[{"name": "ctrlrelay:auto"}],
+            ),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            require_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+
+        assert [r["issue"]["number"] for r in results] == [2]
+        assert 2 in poller.seen_issues["owner/repo-a"]
+
+    @pytest.mark.asyncio
+    async def test_matching_is_case_insensitive(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(
+                3, "Fix the bug", assignees=["alice"],
+                labels=[{"name": "CtrlRelay:Auto"}],
+            ),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            require_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        results = await poller.poll()
+
+        assert [r["issue"]["number"] for r in results] == [3]
+
+    @pytest.mark.asyncio
+    async def test_empty_require_labels_preserves_default_behavior(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """Missing / empty require_labels_by_repo entry: assignment
+        alone still triggers, exactly as before #139."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(4, "Fix the bug", assignees=["alice"]),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+        )
+
+        results = await poller.poll()
+
+        assert [r["issue"]["number"] for r in results] == [4]
+
+    @pytest.mark.asyncio
+    async def test_include_label_match_bypasses_require_labels(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """A repo can have both include_labels and require_labels
+        configured. A label match via include_labels still admits the
+        issue even though it lacks a require_labels label — the two
+        knobs gate different paths (#139)."""
+        mock_github.list_assigned_issues.return_value = []
+        mock_github.list_issues_by_label.return_value = [
+            make_issue(5, "Safe to hand off", labels=[{"name": "ctrlrelay:auto"}]),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            include_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+            require_labels_by_repo={"owner/repo-a": ["some-other-label"]},
+        )
+
+        results = await poller.poll()
+
+        assert [r["issue"]["number"] for r in results] == [5]
+
+    @pytest.mark.asyncio
+    async def test_seed_current_does_not_seed_missing_required_label(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """An assigned issue missing the required label must NOT be
+        seeded as seen — otherwise adding the label later would never
+        surface it, since it's already marked seen."""
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(6, "Create a Stripe account", assignees=["alice"]),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            require_labels_by_repo={"owner/repo-a": ["ctrlrelay:auto"]},
+        )
+
+        await poller.seed_current()
+
+        assert 6 not in poller.seen_issues.get("owner/repo-a", set())

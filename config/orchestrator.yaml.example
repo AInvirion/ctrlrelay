@@ -139,3 +139,10 @@ repos: []
   #     # Matching is case-insensitive. Defaults to ["manual", "operator",
   #     # "instruction"]; override with an empty list to disable.
   #     exclude_labels: ["manual", "operator", "instruction"]
+  #     # Gates the plain-assignment trigger: when set, assignment alone
+  #     # is no longer enough on its own — an issue must ALSO carry at
+  #     # least one of these labels to be picked up. Does not affect
+  #     # include_labels, which still triggers on a label match alone.
+  #     # Matching is case-insensitive. Defaults to [] (assignment alone
+  #     # is sufficient, same as today).
+  #     require_labels: []
