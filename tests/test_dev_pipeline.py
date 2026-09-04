@@ -1697,3 +1697,124 @@ class TestRepoLockHandleReacquireBudget:
             * dev_mod._REACQUIRE_LOCK_SLEEP_SECONDS
         )
         assert cleanup_seconds < fix_seconds / 10
+
+
+class TestIssueCommentsInPrompt:
+    """The body is the issue as filed; the thread is where an operator
+    changes their mind. A prompt built from the body alone sends the
+    agent to build a plan that was already rejected in writing."""
+
+    def test_discussion_reaches_the_prompt(self) -> None:
+        from ctrlrelay.pipelines.dev import DevPipeline, format_issue_comments
+
+        pipeline = DevPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+
+        rendered = format_issue_comments([
+            {
+                "author": {"login": "operator"},
+                "createdAt": "2026-09-04T03:42:45Z",
+                "body": "I disagree. Price up removing the source instead.",
+            },
+        ])
+        prompt = pipeline._build_prompt(
+            repo="owner/repo",
+            issue_number=42,
+            extra={
+                "issue_title": "t",
+                "issue_body": "make the client work",
+                "issue_comments": rendered,
+                "branch_name": "fix/issue-42",
+            },
+            session_id="dev-42",
+            state_file=Path("/tmp/state.json"),
+        )
+
+        assert "Price up removing the source instead." in prompt
+        assert "@operator" in prompt
+        # The agent must be told which one wins, not left to guess.
+        assert "the comment\nwins" in prompt
+
+    def test_claim_comment_is_not_fed_back(self) -> None:
+        """Our own claim marker is orchestrator noise; echoing it back
+        just spends tokens telling the agent it is itself."""
+        from ctrlrelay.pipelines.dev import (
+            AGENT_CLAIM_COMMENT,
+            format_issue_comments,
+        )
+
+        rendered = format_issue_comments([
+            {
+                "author": {"login": "operator"},
+                "createdAt": "2026-09-04T03:42:45Z",
+                "body": AGENT_CLAIM_COMMENT,
+            },
+        ])
+
+        assert rendered == "_No comments._"
+
+    def test_no_comments_renders_placeholder(self) -> None:
+        from ctrlrelay.pipelines.dev import format_issue_comments
+
+        assert format_issue_comments(None) == "_No comments._"
+        assert format_issue_comments([]) == "_No comments._"
+
+    def test_keeps_newest_and_says_what_it_dropped(self) -> None:
+        """A redirect is likelier to be the latest word than the first
+        reply, so the tail survives — and the agent is told the head is
+        missing rather than silently seeing a partial thread."""
+        from ctrlrelay.pipelines.dev import format_issue_comments
+
+        comments = [
+            {
+                "author": {"login": "operator"},
+                "createdAt": f"2026-09-0{i}T00:00:00Z",
+                "body": f"comment {i}",
+            }
+            for i in range(1, 6)
+        ]
+        rendered = format_issue_comments(comments, max_comments=2)
+
+        assert "comment 5" in rendered
+        assert "comment 4" in rendered
+        assert "comment 1" not in rendered
+        assert "3 earlier comment(s) omitted" in rendered
+        # Oldest-first inside the kept window: the thread must read in order.
+        assert rendered.index("comment 4") < rendered.index("comment 5")
+
+    def test_long_comment_is_clipped(self) -> None:
+        """One pasted log dump must not crowd the rest of the thread out
+        of the prompt."""
+        from ctrlrelay.pipelines.dev import format_issue_comments
+
+        rendered = format_issue_comments(
+            [
+                {
+                    "author": {"login": "operator"},
+                    "createdAt": "2026-09-04T00:00:00Z",
+                    "body": "x" * 5000,
+                },
+            ],
+            max_chars=100,
+        )
+
+        assert "truncated" in rendered
+        assert len(rendered) < 500
+
+    def test_missing_author_does_not_crash(self) -> None:
+        """gh has handed back comments with a null author for deleted
+        accounts; a prompt build must not die on one."""
+        from ctrlrelay.pipelines.dev import format_issue_comments
+
+        rendered = format_issue_comments([
+            {"author": None, "createdAt": "", "body": "still matters"},
+        ])
+
+        assert "@unknown" in rendered
+        assert "still matters" in rendered
