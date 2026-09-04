@@ -192,6 +192,81 @@ class TestGitHubCLI:
         }]
 
     @pytest.mark.asyncio
+    async def test_get_pr_checks_maps_every_checkrun_conclusion(self) -> None:
+        """Every terminal CheckRun conclusion GitHub can emit, not just the
+        SUCCESS/FAILURE pair - an unmapped conclusion silently falling into
+        the wrong bucket is what decides whether ctrlrelay merges or waits."""
+        from ctrlrelay.core.github import GitHubCLI
+
+        cases = [
+            ("SUCCESS", "pass"),
+            ("NEUTRAL", "pass"),
+            ("SKIPPED", "skipping"),
+            ("CANCELLED", "cancel"),
+            ("FAILURE", "fail"),
+            ("TIMED_OUT", "fail"),
+            ("ACTION_REQUIRED", "fail"),
+            ("STARTUP_FAILURE", "fail"),
+            ("STALE", "fail"),
+        ]
+        for conclusion, expected_bucket in cases:
+            mock_output = json.dumps({"statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "job",
+                    "status": "COMPLETED",
+                    "conclusion": conclusion,
+                    "detailsUrl": "https://example.com/run",
+                },
+            ]})
+
+            mock_proc = MagicMock()
+            mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
+            mock_proc.returncode = 0
+
+            with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+                gh = GitHubCLI()
+                checks = await gh.get_pr_checks("owner/repo", 42)
+
+            assert checks[0]["bucket"] == expected_bucket, conclusion
+
+    @pytest.mark.asyncio
+    async def test_get_pr_checks_maps_every_status_context_state(self) -> None:
+        """EXPECTED is the one that matters: it means a branch-protection
+        status that hasn't reported yet. Bucketing it as `fail` rather than
+        `pending` would abort a PR that is merely still waiting."""
+        from ctrlrelay.core.github import GitHubCLI
+
+        cases = [
+            ("SUCCESS", "pass"),
+            ("PENDING", "pending"),
+            ("EXPECTED", "pending"),
+            ("ERROR", "fail"),
+            ("FAILURE", "fail"),
+        ]
+        for state, expected_bucket in cases:
+            mock_output = json.dumps({"statusCheckRollup": [
+                {
+                    "__typename": "StatusContext",
+                    "context": "legacy-ci",
+                    "state": state,
+                    "targetUrl": "https://example.com/build",
+                },
+            ]})
+
+            mock_proc = MagicMock()
+            mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
+            mock_proc.returncode = 0
+
+            with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+                gh = GitHubCLI()
+                checks = await gh.get_pr_checks("owner/repo", 42)
+
+            assert checks[0]["name"] == "legacy-ci"
+            assert checks[0]["bucket"] == expected_bucket, state
+            assert checks[0]["link"] == "https://example.com/build"
+
+    @pytest.mark.asyncio
     async def test_get_pr_checks_returns_empty_when_no_checks_reported(self) -> None:
         """A PR with no CI at all (or checks not registered yet) just comes
         back as an empty statusCheckRollup - gh pr view exits 0 either way,
