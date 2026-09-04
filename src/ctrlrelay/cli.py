@@ -2487,6 +2487,14 @@ def setup(
     )
     if result.personalization_summary:
         console.print(f"  personalization: {result.personalization_summary}")
+    if result.personalization_failed:
+        console.print(
+            "\n[bold red]ACTION NEEDED[/bold red] — personalization repo "
+            "sync failed; the rest of setup completed but your "
+            "personalization config/skills were not cloned. Check your "
+            "git auth (`gh auth status`, `gh config get git_protocol`) "
+            "and re-run `ctrlrelay personalization init` once it's fixed."
+        )
     if result.daemon_units:
         console.print("  daemon unit files:")
         for p in result.daemon_units:
@@ -2498,11 +2506,10 @@ def setup(
             "  systemctl --user daemon-reload && systemctl --user enable --now <unit>"
             "    # Linux"
         )
-    # Clone failures must surface as a non-zero exit even when daemon
-    # units were rendered — automation watching exit code shouldn't
-    # mistake a partial setup for success. Codex review pass 3 caught
-    # the prior `elif` that masked this.
-    if result.failed:
+    # Clone and personalization-sync failures must surface as a
+    # non-zero exit even when daemon units were rendered — automation
+    # watching exit code shouldn't mistake a partial setup for success.
+    if result.failed or result.personalization_failed:
         raise typer.Exit(1)
 
 

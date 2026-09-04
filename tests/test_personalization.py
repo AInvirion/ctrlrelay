@@ -1616,6 +1616,33 @@ class TestPersonalizationCronConfig:
             load_config(path)
 
 
+class TestRepoUrlProtocol:
+    """``repo_url`` must follow gh's configured git_protocol (#137)
+    instead of hardcoding HTTPS — see ``ctrlrelay.gh_protocol``."""
+
+    def test_defaults_to_https_url(
+        self, tmp_path: Path, remote_bare: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import ctrlrelay.personalization.manager as mgr_mod
+
+        monkeypatch.setattr(mgr_mod, "detect_git_protocol", lambda **kw: "https")
+        checkout = tmp_path / "personalization"
+        config = _config_for(checkout, remote_bare, node_id="machine-a")
+        mgr = PersonalizationManager(config)
+        assert mgr.repo_url == "https://github.com/test/dotclaude.git"
+
+    def test_uses_ssh_url_when_gh_configured_for_ssh(
+        self, tmp_path: Path, remote_bare: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import ctrlrelay.personalization.manager as mgr_mod
+
+        monkeypatch.setattr(mgr_mod, "detect_git_protocol", lambda **kw: "ssh")
+        checkout = tmp_path / "personalization"
+        config = _config_for(checkout, remote_bare, node_id="machine-a")
+        mgr = PersonalizationManager(config)
+        assert mgr.repo_url == "git@github.com:test/dotclaude.git"
+
+
 class TestManagerErrors:
     def test_init_rejected_when_path_exists_and_not_ours(
         self, tmp_path: Path, remote_bare: Path

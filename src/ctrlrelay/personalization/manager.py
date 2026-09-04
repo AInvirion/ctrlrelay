@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ctrlrelay.core.config import Config, Personalization, PersonalizationPath
+from ctrlrelay.gh_protocol import detect_git_protocol, github_clone_url
 from ctrlrelay.personalization.paths import (
     TemplateContext,
     project_slug,
@@ -120,7 +121,13 @@ class PersonalizationManager:
             raise PersonalizationError("personalization_branch is unset")
         self.working_branch: str = branch
         self.main_branch: str = self.cfg.main_branch
-        self.repo_url: str = f"https://github.com/{self.cfg.repo}.git"
+        # Respect the operator's configured git protocol (gh's
+        # git_protocol setting) rather than assuming HTTPS — an
+        # operator set up for SSH-only GitHub auth would otherwise
+        # hit "could not read Username" on the clone below (#137).
+        self.repo_url: str = github_clone_url(
+            self.cfg.repo, protocol=detect_git_protocol()
+        )
 
     # ----- top-level commands ------------------------------------------------
 

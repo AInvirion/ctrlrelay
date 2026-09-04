@@ -11,6 +11,9 @@ out of docs and hand-edit /Users/$ME/... paths. Coverage focuses on:
   load-bearing one — silently writing a plist with a literal
   ``${TOKEN}`` would brick the bridge at next boot).
 * ``write_units`` refuses to clobber existing files unless ``overwrite``.
+* ``write_units`` creates ``~/.ctrlrelay/logs/`` (missing it crash-loops
+  the generated systemd units, see #137) and chmods unit files 0600
+  (they embed CTRLRELAY_TELEGRAM_TOKEN in plaintext).
 """
 
 from __future__ import annotations
@@ -26,6 +29,20 @@ from ctrlrelay.install import (
     render_systemd,
     write_units,
 )
+
+
+@pytest.fixture(autouse=True)
+def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point ``Path.home()`` at a scratch dir for every test in this
+    module. ``write_units`` now creates ``~/.ctrlrelay/logs/`` as a
+    side effect (#137) — without this, running the suite would create
+    that directory (and touch unit-file permissions) under the real
+    developer/CI home.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
 
 
 @pytest.fixture
@@ -166,6 +183,28 @@ class TestRenderSystemd:
 
 
 class TestWriteUnits:
+    def test_creates_logs_dir(
+        self, workdir: Path, target_dir: Path, fake_home: Path
+    ) -> None:
+        # Both the launchd and systemd templates set
+        # StandardOutput/StandardError under ~/.ctrlrelay/logs/, but
+        # nothing else in setup ever creates it. systemd refuses to
+        # start a unit whose log dir is missing (EXIT_STDOUT, 209),
+        # and with Restart=always that's an immediate crash-loop.
+        units = render_systemd(workdir=workdir, target_dir=target_dir)
+        write_units(units)
+        assert (fake_home / ".ctrlrelay" / "logs").is_dir()
+
+    def test_written_units_are_chmod_600(
+        self, workdir: Path, target_dir: Path
+    ) -> None:
+        # Unit files embed CTRLRELAY_TELEGRAM_TOKEN as plaintext —
+        # refuse to leave them group/world-readable.
+        units = render_systemd(workdir=workdir, target_dir=target_dir)
+        written = write_units(units)
+        for path in written:
+            assert (path.stat().st_mode & 0o777) == 0o600
+
     def test_writes_files_to_disk(
         self, workdir: Path, target_dir: Path
     ) -> None:
