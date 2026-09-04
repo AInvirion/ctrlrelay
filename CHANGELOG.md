@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`require_labels`: an AND-gate between assignment and a label,
+  closing the gap `include_labels` (#80) couldn't cover.** `exclude_labels`
+  is a block-list and `include_labels` is an OR-alternate trigger, but
+  neither could express "only pick this up if it's assigned to me AND
+  carries a specific label." On a repo with a long history of
+  self-assigned issues used as personal reminders, that meant the poller
+  replayed the whole backlog as new work the first time it saw the repo —
+  including issues that weren't code tasks at all. `require_labels`
+  (default `[]`, no behavior change) tightens the plain-assignment path
+  only: when set, an issue needs both the assignment and a matching label.
+  `include_labels` keeps triggering on a label match alone regardless.
+  An assigned issue missing the required label is left unmarked so a
+  later label addition still surfaces it. See #139.
+
 ## [0.6.0] - 2026-06-10
 
 ### Added

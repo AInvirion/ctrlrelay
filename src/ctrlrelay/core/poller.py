@@ -84,6 +84,16 @@ class IssuePoller:
     or ``seen_issues``). A repo with an empty / missing ``include_labels``
     keeps the pre-#80 ``--assignee``-filtered query so we don't
     over-fetch.
+
+    ``require_labels_by_repo`` tightens the plain-assignment trigger
+    (see #139). When a repo has any require-labels configured, bare
+    assignment is no longer sufficient by itself — an issue must be
+    assigned to the operator AND carry at least one of the configured
+    labels to be admitted via the assignment path. ``include_labels``
+    is unaffected: a label_match there still admits the issue
+    regardless of ``require_labels``. An issue that's assigned but
+    missing the required label is left unmarked (not seen) so a later
+    label addition still surfaces it on a subsequent poll.
     """
 
     github: GitHubCLI
@@ -94,6 +104,7 @@ class IssuePoller:
     accept_foreign_assignments: set[str] = field(default_factory=set)
     exclude_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
     include_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
+    require_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
     # Per-repo consecutive-skip counter; populated at runtime by poll() /
     # seed_current(). Not persisted — intentionally resets on daemon
     # restart so an operator fix is exercised before we re-escalate.
@@ -343,6 +354,10 @@ class IssuePoller:
                 label.lower()
                 for label in self.exclude_labels_by_repo.get(repo, [])
             }
+            require_lowered = {
+                label.lower()
+                for label in self.require_labels_by_repo.get(repo, [])
+            }
             for issue in issues:
                 # Per-issue guard so ONE malformed payload (missing 'number',
                 # wrong type, non-dict entry) doesn't poison the remaining
@@ -412,6 +427,18 @@ class IssuePoller:
                         is_assigned = self._issue_is_assigned_to(
                             issue, self.username,
                         )
+                    if (
+                        is_assigned
+                        and require_lowered
+                        and self._matched_require_label(
+                            issue, require_lowered,
+                        ) is None
+                    ):
+                        # Assigned but missing the required label
+                        # (#139): the plain-assignment trigger doesn't
+                        # count on this repo. label_match (below) can
+                        # still admit the issue independently.
+                        is_assigned = False
                     if label_match is None and not is_assigned:
                         # Defensive: a targeted query should never
                         # return an issue that matches neither trigger,
@@ -423,7 +450,13 @@ class IssuePoller:
                 else:
                     # Server-side ``--assignee`` already filtered; by
                     # construction every issue reaching here is
-                    # assignment-triggered.
+                    # assignment-triggered — unless require_labels
+                    # (#139) is configured, in which case the missing
+                    # label leaves the issue unmarked for a later poll.
+                    if require_lowered and self._matched_require_label(
+                        issue, require_lowered,
+                    ) is None:
+                        continue
                     is_assigned = True
 
                 if label_match is not None:
@@ -585,6 +618,27 @@ class IssuePoller:
         return None
 
     @staticmethod
+    def _matched_require_label(
+        issue: dict[str, Any], require_lowered: set[str]
+    ) -> str | None:
+        """Return the first issue label that matches ``require_lowered``.
+
+        Mirrors ``_matched_exclude_label`` / ``_matched_include_label``.
+        Used to gate the plain-assignment trigger when a repo has
+        ``require_labels`` configured. See #139.
+        """
+        if not require_lowered:
+            return None
+        for label in issue.get("labels") or []:
+            if isinstance(label, dict):
+                name = label.get("name", "")
+            else:
+                name = str(label)
+            if name and name.lower() in require_lowered:
+                return name
+        return None
+
+    @staticmethod
     def _issue_is_assigned_to(issue: dict[str, Any], username: str) -> bool:
         """Check whether ``username`` is listed in the issue's assignees.
 
@@ -726,6 +780,10 @@ class IssuePoller:
             self._clear_repo_failure(repo)
             seen_for_repo = self.seen_issues.setdefault(repo, set())
             include_lowered = {label.lower() for label in include_labels}
+            require_lowered = {
+                label.lower()
+                for label in self.require_labels_by_repo.get(repo, [])
+            }
             for issue in issues:
                 try:
                     number = int(issue["number"])
@@ -776,11 +834,25 @@ class IssuePoller:
                         seen_for_repo.add(number)
                         continue
                     if self_assigned:
+                        if require_lowered and self._matched_require_label(
+                            issue, require_lowered,
+                        ) is None:
+                            # Assigned but missing the required label
+                            # (#139): leave unseeded so a later
+                            # label-add still surfaces it on the next
+                            # poll.
+                            continue
                         seen_for_repo.add(number)
                 else:
                     # Pre-#80 behavior: server-side --assignee already
                     # filtered, seed everything so first poll doesn't
-                    # flood.
+                    # flood — unless require_labels (#139) is
+                    # configured, in which case an issue missing the
+                    # required label is left unseeded.
+                    if require_lowered and self._matched_require_label(
+                        issue, require_lowered,
+                    ) is None:
+                        continue
                     seen_for_repo.add(number)
         self._save_state_best_effort()
 

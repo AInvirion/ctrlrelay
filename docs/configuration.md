@@ -200,6 +200,7 @@ and ask the operator), or `never` (skip).
 | `accept_foreign_assignments` | `false` | When `true`, the poller also picks up issues assigned to you by someone else. Default (`false`) runs the dev pipeline only on issues you self-assigned. |
 | `exclude_labels` | `["manual", "operator", "instruction"]` | Issue labels that tell the poller "this isn't for the agent". See [exclude_labels](#reposautomationexclude_labels) below. |
 | `include_labels` | `[]` | Issue labels that opt an issue **into** the dev pipeline regardless of who is (or isn't) assigned. See [include_labels](#reposautomationinclude_labels) below. |
+| `require_labels` | `[]` | Issue labels that gate the plain-assignment trigger: when set, assignment alone is no longer enough — the issue must also carry one of these labels. See [require_labels](#reposautomationrequire_labels) below. |
 
 The current secops and dev pipelines read these settings to bias their prompts
 to Claude — they're not enforced by hard-coded checks.
@@ -307,6 +308,42 @@ repos and which labels trigger the pipeline; a hostile collaborator with
 triage access was already able to push branches and trigger CI, so allowing
 them to opt an issue into the dev pipeline is a narrower extension, not a new
 vector.
+
+### repos[].automation.require_labels
+
+Assignment-only ends up too loose on repos with a long history: issues
+self-assigned as personal reminders or notes, unrelated to automation, get
+replayed into the dev pipeline the first time the poller sees the repo (or
+after any config change that clears `poller_state.json` for it). Some of
+those issues aren't code tasks at all — "create an account with a
+third-party service", "look into pricing" — and shouldn't go anywhere near
+an unsupervised `claude -p ... --dangerously-skip-permissions` run.
+
+`require_labels` closes that gap: when configured, bare assignment is no
+longer sufficient by itself. An issue must be **both** assigned to the
+operator **and** carry at least one of the configured labels to be picked
+up via the assignment path.
+
+```yaml
+repos:
+  - name: "your-org/your-repo"
+    local_path: "~/Projects/your-repo"
+    automation:
+      require_labels: ["ctrlrelay:auto"]
+```
+
+- Default: `[]`. An empty list preserves today's behavior — assignment
+  alone is sufficient, no change for operators who haven't opted in.
+- Matching is **case-insensitive**, same as `exclude_labels` / `include_labels`.
+- This only tightens the **assignment** path. `include_labels` is
+  unaffected — a label match there still admits the issue regardless of
+  `require_labels`, since that path already treats the label as its own
+  trust signal.
+- An issue that's assigned but missing the required label is left
+  **unmarked** (not added to `seen_issues`), so applying the label later
+  still surfaces it on a subsequent poll — nothing is lost, it's just not
+  picked up yet.
+- `exclude_labels` is still checked first, same precedence as always.
 
 ## schedules
 
