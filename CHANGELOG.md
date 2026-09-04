@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-04
+
 ### Added
 
 - **`require_labels`: an AND-gate between assignment and a label,
@@ -22,6 +24,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `include_labels` keeps triggering on a label match alone regardless.
   An assigned issue missing the required label is left unmarked so a
   later label addition still surfaces it. See #139.
+
+### Fixed
+
+- **`ctrlrelay setup --install-daemons` on a fresh SSH-only machine:
+  personalization clone ignored the configured git protocol, and
+  generated daemon units crash-looped.** The personalization repo
+  clone (setup pre-scan and `PersonalizationManager.init`) hardcoded
+  an HTTPS URL regardless of `gh`'s configured `git_protocol`,
+  so SSH-only operators hit `could not read Username` with the
+  failure buried in a single warning line while setup still exited
+  0. `ctrlrelay.gh_protocol` now reads `gh`'s configured protocol and
+  builds the matching clone URL; a personalization failure flips
+  `SetupResult.personalization_failed` so the CLI prints an ACTION
+  NEEDED banner and exits non-zero instead of silently continuing.
+  Separately, generated launchd/systemd units point
+  `StandardOutput`/`StandardError` at `~/.ctrlrelay/logs/`, which
+  setup never created — systemd refuses to start a unit with a
+  missing log dir (`EXIT_STDOUT`, 209), and with `Restart=always`
+  that's an immediate crash-loop. `write_units` now creates the log
+  dir up front and chmods unit files `0600` since they embed
+  `CTRLRELAY_TELEGRAM_TOKEN` in plaintext. See #137.
 
 ## [0.6.0] - 2026-06-10
 
@@ -1209,7 +1232,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.5.0...v0.6.0
 [0.1.3]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.3
 [0.1.1]: https://github.com/AInvirion/ctrlrelay/releases/tag/v0.1.1
