@@ -13,6 +13,65 @@ class GitHubError(Exception):
     """Raised when gh CLI operations fail."""
 
 
+# CheckRun.conclusion values (only present once status == "COMPLETED").
+_CHECK_RUN_PASS = frozenset({"SUCCESS", "NEUTRAL"})
+_CHECK_RUN_SKIP = frozenset({"SKIPPED"})
+_CHECK_RUN_CANCEL = frozenset({"CANCELLED"})
+# StatusContext.state values (the legacy commit-status API, e.g. CLA bots).
+_STATUS_CONTEXT_PASS = frozenset({"SUCCESS"})
+_STATUS_CONTEXT_PENDING = frozenset({"PENDING", "EXPECTED"})
+
+
+def _normalize_check(entry: dict[str, Any]) -> dict[str, Any]:
+    """Map one `statusCheckRollup` entry to the `{name, state, bucket,
+    link}` shape `PRVerifier` expects (see #145).
+
+    `statusCheckRollup` mixes two GraphQL shapes: `CheckRun` (Actions
+    jobs, CodeQL — `status`/`conclusion`) and `StatusContext` (the
+    legacy commit-status API, e.g. CLA bots — `state`). `bucket` is
+    the only field the rest of the app actually branches on; `state`
+    is carried through for parity/debugging.
+    """
+    if entry.get("__typename") == "StatusContext":
+        state = entry.get("state", "")
+        if state in _STATUS_CONTEXT_PASS:
+            bucket = "pass"
+        elif state in _STATUS_CONTEXT_PENDING:
+            bucket = "pending"
+        else:
+            bucket = "fail"
+        return {
+            "name": entry.get("context", ""),
+            "state": state,
+            "bucket": bucket,
+            "link": entry.get("targetUrl", ""),
+        }
+
+    status = entry.get("status", "")
+    conclusion = entry.get("conclusion")
+    if status != "COMPLETED":
+        bucket = "pending"
+        state = status
+    elif conclusion in _CHECK_RUN_PASS:
+        bucket = "pass"
+        state = conclusion
+    elif conclusion in _CHECK_RUN_SKIP:
+        bucket = "skipping"
+        state = conclusion
+    elif conclusion in _CHECK_RUN_CANCEL:
+        bucket = "cancel"
+        state = conclusion
+    else:
+        bucket = "fail"
+        state = conclusion or "FAILURE"
+    return {
+        "name": entry.get("name", ""),
+        "state": state,
+        "bucket": bucket,
+        "link": entry.get("detailsUrl", ""),
+    }
+
+
 def _find_gh() -> str:
     """Find gh binary, checking common paths if not in PATH."""
     gh = shutil.which("gh")
@@ -146,57 +205,30 @@ class GitHubCLI:
     ) -> list[dict[str, Any]]:
         """Get status checks for a PR.
 
-        Bypasses `_run_gh` because we need to inspect stdout, stderr, and the
-        exit code independently. `gh pr checks`:
-          - prints a JSON array on stdout when checks exist (exits non-zero
-            when any are pending or failing — the payload is still valid)
-          - prints "no checks reported on the '<branch>' branch" to stderr
-            and exits non-zero when the PR has no checks at all
-          - emits arbitrary errors to stderr (auth, network, missing PR) on
-            non-zero exit with empty stdout
+        Uses `gh pr view --json statusCheckRollup` rather than `gh pr
+        checks --json ...` — the latter's `--json` flag isn't available
+        on `gh` releases before it was added (confirmed absent on gh
+        2.45.0, the current Ubuntu 24.04 package with no newer version
+        in the distro repos), which made this unconditionally broken on
+        those installs regardless of the PR's actual state (#145).
 
-        We return [] only for the "no checks reported" case. Real failures
-        raise GitHubError so callers can distinguish "no CI configured" from
-        "gh is broken".
+        `gh pr view --json` always exits 0 once the PR itself resolves —
+        the check states live in the JSON, not the exit code — so unlike
+        the old implementation, a non-zero exit here is always a genuine
+        failure (auth, network, missing PR): `_run_gh` already raises
+        `GitHubError` for that case. No checks yet (or ever) on the PR
+        just means an empty `statusCheckRollup` list — the ambiguity
+        between "not registered yet" and "no CI configured" is handled
+        by `PRVerifier`'s empty-streak retry, not here.
         """
-        cmd = [
-            self.gh_binary,
-            "pr", "checks",
-            str(pr_number),
+        stdout = await self._run_gh(
+            "pr", "view", str(pr_number),
             "--repo", repo,
-            "--json", "name,state,bucket,link",
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            "--json", "statusCheckRollup",
         )
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=self.timeout,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            try:
-                await proc.wait()
-            except Exception:
-                pass
-            raise
-        stdout = stdout_bytes.decode().strip()
-        stderr = stderr_bytes.decode().strip()
-
-        # JSON payload on stdout — always trust it, regardless of exit code.
-        if stdout:
-            return json.loads(stdout)
-
-        # No stdout. Distinguish "no CI configured" from genuine failures by
-        # looking for gh's well-known "no checks reported" message.
-        if "no checks reported" in stderr.lower():
-            return []
-
-        # Anything else is an honest-to-goodness failure. Don't pretend the
-        # repo has no CI.
-        raise GitHubError(f"gh pr checks failed: {stderr}")
+        payload = json.loads(stdout)
+        rollup = payload.get("statusCheckRollup") or []
+        return [_normalize_check(entry) for entry in rollup]
 
     def all_checks_passed(self, checks: list[dict[str, Any]]) -> bool:
         """Check if all PR checks passed."""

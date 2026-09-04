@@ -98,14 +98,55 @@ class TestGitHubCLI:
             assert "--squash" in args
 
     @pytest.mark.asyncio
-    async def test_get_pr_checks(self) -> None:
-        """Should get PR check status using the bucket field."""
+    async def test_get_pr_checks_uses_pr_view_not_pr_checks(self) -> None:
+        """`gh pr checks --json` isn't available on gh releases before it
+        shipped (confirmed absent on gh 2.45.0, the current Ubuntu 24.04
+        package - #145) - get_pr_checks must use `gh pr view --json
+        statusCheckRollup` instead, which has been stable since early gh 2.x."""
         from ctrlrelay.core.github import GitHubCLI
 
-        mock_output = json.dumps([
-            {"name": "tests", "state": "SUCCESS", "bucket": "pass"},
-            {"name": "lint", "state": "SUCCESS", "bucket": "pass"},
-        ])
+        mock_output = json.dumps({"statusCheckRollup": []})
+
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
+        mock_proc.returncode = 0
+
+        with patch(
+            "asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)
+        ) as mock_exec:
+            gh = GitHubCLI()
+            await gh.get_pr_checks("owner/repo", 42)
+
+        args = mock_exec.call_args[0]
+        assert "checks" not in args
+        assert ("pr", "view", "42") == args[1:4]
+        assert "--repo" in args and "owner/repo" in args
+        assert "statusCheckRollup" in args
+
+    @pytest.mark.asyncio
+    async def test_get_pr_checks_normalizes_check_run_entries(self) -> None:
+        """CheckRun entries (Actions jobs, CodeQL) use status/conclusion,
+        not state - must be mapped into the {name, state, bucket, link}
+        shape PRVerifier's bucket logic expects."""
+        from ctrlrelay.core.github import GitHubCLI
+
+        mock_output = json.dumps({"statusCheckRollup": [
+            {
+                "__typename": "CheckRun", "name": "pytest",
+                "status": "COMPLETED", "conclusion": "SUCCESS",
+                "detailsUrl": "https://example.com/1",
+            },
+            {
+                "__typename": "CheckRun", "name": "lint",
+                "status": "IN_PROGRESS", "conclusion": None,
+                "detailsUrl": "https://example.com/2",
+            },
+            {
+                "__typename": "CheckRun", "name": "flaky-e2e",
+                "status": "COMPLETED", "conclusion": "FAILURE",
+                "detailsUrl": "https://example.com/3",
+            },
+        ]})
 
         mock_proc = MagicMock()
         mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
@@ -115,45 +156,54 @@ class TestGitHubCLI:
             gh = GitHubCLI()
             checks = await gh.get_pr_checks("owner/repo", 42)
 
-        assert len(checks) == 2
-        assert all(c["bucket"] == "pass" for c in checks)
+        by_name = {c["name"]: c for c in checks}
+        assert by_name["pytest"]["bucket"] == "pass"
+        assert by_name["lint"]["bucket"] == "pending"
+        assert by_name["flaky-e2e"]["bucket"] == "fail"
 
     @pytest.mark.asyncio
-    async def test_get_pr_checks_parses_json_on_nonzero_exit(self) -> None:
-        """`gh pr checks` exits non-zero while checks are pending/failing, but
-        still prints the JSON payload to stdout. get_pr_checks must parse it
-        instead of silently returning []."""
-
+    async def test_get_pr_checks_normalizes_status_context_entries(self) -> None:
+        """StatusContext entries (the legacy commit-status API, e.g. CLA
+        bots) use `state` and `context` instead of CheckRun's fields."""
         from ctrlrelay.core.github import GitHubCLI
 
-        mock_output = json.dumps([
-            {"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"},
-        ])
+        mock_output = json.dumps({"statusCheckRollup": [
+            {
+                "__typename": "StatusContext",
+                "context": "verification/cla-signed",
+                "state": "SUCCESS",
+                "targetUrl": "https://example.com/cla",
+            },
+        ]})
 
         mock_proc = MagicMock()
         mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
-        mock_proc.returncode = 1  # non-zero, checks still pending
+        mock_proc.returncode = 0
 
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
             gh = GitHubCLI()
             checks = await gh.get_pr_checks("owner/repo", 42)
 
-        assert len(checks) == 1
-        assert checks[0]["bucket"] == "pending"
+        assert checks == [{
+            "name": "verification/cla-signed",
+            "state": "SUCCESS",
+            "bucket": "pass",
+            "link": "https://example.com/cla",
+        }]
 
     @pytest.mark.asyncio
     async def test_get_pr_checks_returns_empty_when_no_checks_reported(self) -> None:
-        """gh prints 'no checks reported on the <branch> branch' to stderr
-        and exits non-zero when the PR genuinely has no CI. Treat that as []."""
+        """A PR with no CI at all (or checks not registered yet) just comes
+        back as an empty statusCheckRollup - gh pr view exits 0 either way,
+        no stderr-message sniffing needed."""
 
         from ctrlrelay.core.github import GitHubCLI
 
         mock_proc = MagicMock()
         mock_proc.communicate = AsyncMock(return_value=(
-            b"",
-            b"no checks reported on the 'fix/issue-10' branch\n",
+            json.dumps({"statusCheckRollup": []}).encode(), b"",
         ))
-        mock_proc.returncode = 1
+        mock_proc.returncode = 0
 
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
             gh = GitHubCLI()
@@ -163,9 +213,9 @@ class TestGitHubCLI:
 
     @pytest.mark.asyncio
     async def test_get_pr_checks_raises_on_genuine_failure(self) -> None:
-        """Auth/network/missing-PR failures print errors to stderr and leave
-        stdout empty. Must raise GitHubError rather than silently returning []
-        (which would be indistinguishable from 'no CI configured')."""
+        """Auth/network/missing-PR failures exit non-zero with an error on
+        stderr. Must raise GitHubError (via _run_gh) rather than silently
+        returning [] (which would be indistinguishable from 'no CI configured')."""
 
         from ctrlrelay.core.github import GitHubCLI, GitHubError
 

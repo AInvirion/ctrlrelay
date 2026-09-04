@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ctrlrelay ci wait` was unconditionally broken on `gh` releases without
+  `--json` support on `pr checks`** (confirmed on gh 2.45.0, the current
+  Ubuntu 24.04 package — no newer version exists in the distro repos, so
+  this wasn't an "apt upgrade" problem for anyone on that platform).
+  `GitHubCLI.get_pr_checks` shelled out to `gh pr checks --json ...`; on an
+  affected install every single poll failed with `unknown flag: --json`,
+  which `PRVerifier.wait_for_checks` treats as transient and retries —
+  so every `ci wait` call was guaranteed to eat its full timeout and then
+  fail, regardless of the PR's actual state. Reproduced directly and
+  confirmed as the likely cause behind some "session never signaled DONE"
+  reports. Switched to `gh pr view --json statusCheckRollup`, stable since
+  early gh 2.x and always exit-0 regardless of check state, with a new
+  normalizer mapping its two GraphQL shapes (`CheckRun` and the legacy
+  `StatusContext`) into the `{name, state, bucket, link}` shape
+  `PRVerifier` already expects. See #145.
+
 ## [0.8.0] - 2026-09-04
 
 ### Added
