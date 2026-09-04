@@ -98,15 +98,44 @@ class TestGitHubCLI:
             assert "--squash" in args
 
     @pytest.mark.asyncio
-    async def test_get_pr_checks(self) -> None:
-        """Should get PR check status using the bucket field."""
+    async def test_get_pr_checks_uses_pr_view_not_pr_checks(self) -> None:
+        """`gh pr checks --json` isn't supported by every gh build in the
+        wild (older/distro-packaged gh rejects the flag outright). `gh pr
+        view --json statusCheckRollup` has been supported since gh
+        introduced --json at all, so get_pr_checks must shell out to that
+        instead."""
         from ctrlrelay.core.github import GitHubCLI
 
-        mock_output = json.dumps([
-            {"name": "tests", "state": "SUCCESS", "bucket": "pass"},
-            {"name": "lint", "state": "SUCCESS", "bucket": "pass"},
-        ])
+        mock_output = json.dumps({"statusCheckRollup": []})
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
+        mock_proc.returncode = 0
 
+        with patch(
+            "asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc),
+        ) as mock_exec:
+            gh = GitHubCLI()
+            await gh.get_pr_checks("owner/repo", 42)
+
+        args = mock_exec.call_args.args
+        assert "view" in args
+        assert "checks" not in args
+        assert "--json" in args
+        assert "statusCheckRollup" in args
+
+    @pytest.mark.asyncio
+    async def test_get_pr_checks_maps_completed_checkrun_to_pass(self) -> None:
+        from ctrlrelay.core.github import GitHubCLI
+
+        mock_output = json.dumps({"statusCheckRollup": [
+            {
+                "__typename": "CheckRun",
+                "name": "tests",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/x/y/runs/1",
+            },
+        ]})
         mock_proc = MagicMock()
         mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
         mock_proc.returncode = 0
@@ -115,45 +144,113 @@ class TestGitHubCLI:
             gh = GitHubCLI()
             checks = await gh.get_pr_checks("owner/repo", 42)
 
-        assert len(checks) == 2
-        assert all(c["bucket"] == "pass" for c in checks)
+        assert len(checks) == 1
+        assert checks[0]["name"] == "tests"
+        assert checks[0]["bucket"] == "pass"
+        assert checks[0]["link"] == "https://github.com/x/y/runs/1"
 
     @pytest.mark.asyncio
-    async def test_get_pr_checks_parses_json_on_nonzero_exit(self) -> None:
-        """`gh pr checks` exits non-zero while checks are pending/failing, but
-        still prints the JSON payload to stdout. get_pr_checks must parse it
-        instead of silently returning []."""
-
+    async def test_get_pr_checks_maps_incomplete_checkrun_to_pending(self) -> None:
         from ctrlrelay.core.github import GitHubCLI
 
-        mock_output = json.dumps([
-            {"name": "ci", "state": "IN_PROGRESS", "bucket": "pending"},
-        ])
-
+        mock_output = json.dumps({"statusCheckRollup": [
+            {
+                "__typename": "CheckRun",
+                "name": "ci",
+                "status": "IN_PROGRESS",
+                "conclusion": None,
+                "detailsUrl": "https://github.com/x/y/runs/2",
+            },
+        ]})
         mock_proc = MagicMock()
         mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
-        mock_proc.returncode = 1  # non-zero, checks still pending
+        mock_proc.returncode = 0
 
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
             gh = GitHubCLI()
             checks = await gh.get_pr_checks("owner/repo", 42)
 
-        assert len(checks) == 1
         assert checks[0]["bucket"] == "pending"
 
     @pytest.mark.asyncio
-    async def test_get_pr_checks_returns_empty_when_no_checks_reported(self) -> None:
-        """gh prints 'no checks reported on the <branch> branch' to stderr
-        and exits non-zero when the PR genuinely has no CI. Treat that as []."""
-
+    async def test_get_pr_checks_maps_checkrun_conclusions_to_buckets(self) -> None:
         from ctrlrelay.core.github import GitHubCLI
 
+        cases = [
+            ("FAILURE", "fail"),
+            ("TIMED_OUT", "fail"),
+            ("ACTION_REQUIRED", "fail"),
+            ("STARTUP_FAILURE", "fail"),
+            ("STALE", "fail"),
+            ("CANCELLED", "cancel"),
+            ("NEUTRAL", "skipping"),
+            ("SKIPPED", "skipping"),
+        ]
+        for conclusion, expected_bucket in cases:
+            mock_output = json.dumps({"statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "job",
+                    "status": "COMPLETED",
+                    "conclusion": conclusion,
+                    "detailsUrl": "https://github.com/x/y/runs/3",
+                },
+            ]})
+            mock_proc = MagicMock()
+            mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
+            mock_proc.returncode = 0
+
+            with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+                gh = GitHubCLI()
+                checks = await gh.get_pr_checks("owner/repo", 42)
+
+            assert checks[0]["bucket"] == expected_bucket, conclusion
+
+    @pytest.mark.asyncio
+    async def test_get_pr_checks_maps_status_context_to_bucket(self) -> None:
+        """Legacy commit statuses (as opposed to check runs) come back as
+        StatusContext entries with a `state` field rather than
+        status/conclusion."""
+        from ctrlrelay.core.github import GitHubCLI
+
+        cases = [
+            ("SUCCESS", "pass"),
+            ("PENDING", "pending"),
+            ("ERROR", "fail"),
+            ("FAILURE", "fail"),
+        ]
+        for state, expected_bucket in cases:
+            mock_output = json.dumps({"statusCheckRollup": [
+                {
+                    "__typename": "StatusContext",
+                    "context": "legacy-ci",
+                    "state": state,
+                    "targetUrl": "https://example.com/build/1",
+                },
+            ]})
+            mock_proc = MagicMock()
+            mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
+            mock_proc.returncode = 0
+
+            with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+                gh = GitHubCLI()
+                checks = await gh.get_pr_checks("owner/repo", 42)
+
+            assert checks[0]["name"] == "legacy-ci"
+            assert checks[0]["bucket"] == expected_bucket, state
+            assert checks[0]["link"] == "https://example.com/build/1"
+
+    @pytest.mark.asyncio
+    async def test_get_pr_checks_returns_empty_when_no_checks_reported(self) -> None:
+        """`gh pr view` exits 0 with an empty/null rollup when the PR has no
+        CI configured at all — unlike `gh pr checks`, it doesn't need
+        stderr message-sniffing to tell "no CI" apart from a real error."""
+        from ctrlrelay.core.github import GitHubCLI
+
+        mock_output = json.dumps({"statusCheckRollup": None})
         mock_proc = MagicMock()
-        mock_proc.communicate = AsyncMock(return_value=(
-            b"",
-            b"no checks reported on the 'fix/issue-10' branch\n",
-        ))
-        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(mock_output.encode(), b""))
+        mock_proc.returncode = 0
 
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
             gh = GitHubCLI()

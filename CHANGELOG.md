@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`get_pr_checks` no longer depends on `gh pr checks --json`.** That flag
+  isn't supported by every `gh` build in the wild — an older or
+  distro-packaged `gh` rejects it outright with `unknown flag: --json`,
+  which broke CI verification (`ctrlrelay ci wait`, the dev pipeline's
+  hand-off gate) on every PR. Switched to `gh pr view --json
+  statusCheckRollup`, which has been supported since `gh` introduced
+  `--json` at all, and derive the same pass/fail/pending/skipping/cancel
+  bucket gh itself computes from the raw CheckRun/StatusContext fields.
+
 ## [0.8.0] - 2026-09-04
 
 ### Added

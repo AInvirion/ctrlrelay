@@ -24,6 +24,60 @@ def _find_gh() -> str:
     return "gh"
 
 
+# Terminal CheckRun conclusions that don't indicate a passing or skipped
+# check. Anything completed and not in _PASS_CONCLUSIONS/_SKIP_CONCLUSIONS/
+# _CANCEL_CONCLUSIONS (FAILURE, TIMED_OUT, ACTION_REQUIRED, STARTUP_FAILURE,
+# STALE, ...) maps to "fail".
+_PASS_CONCLUSIONS = frozenset({"SUCCESS"})
+_SKIP_CONCLUSIONS = frozenset({"NEUTRAL", "SKIPPED"})
+_CANCEL_CONCLUSIONS = frozenset({"CANCELLED"})
+
+_STATUS_CONTEXT_BUCKETS = {
+    "SUCCESS": "pass",
+    "PENDING": "pending",
+    "ERROR": "fail",
+    "FAILURE": "fail",
+}
+
+
+def _normalize_check(entry: dict[str, Any]) -> dict[str, Any]:
+    """Reduce one `statusCheckRollup` entry to the {name, state, bucket,
+    link} shape `gh pr checks --json` used to hand us directly.
+
+    The rollup mixes two GraphQL types: `CheckRun` (GitHub Actions and
+    most third-party checks) and `StatusContext` (legacy commit statuses).
+    They use different field names for the same concepts, so each gets
+    its own bucket derivation mirroring gh's own `pr checks` logic.
+    """
+    if entry.get("__typename") == "StatusContext":
+        state = entry.get("state", "")
+        return {
+            "name": entry.get("context", "?"),
+            "state": state,
+            "bucket": _STATUS_CONTEXT_BUCKETS.get(state, "fail"),
+            "link": entry.get("targetUrl"),
+        }
+
+    status = entry.get("status", "")
+    conclusion = entry.get("conclusion")
+    if status != "COMPLETED":
+        bucket = "pending"
+    elif conclusion in _PASS_CONCLUSIONS:
+        bucket = "pass"
+    elif conclusion in _SKIP_CONCLUSIONS:
+        bucket = "skipping"
+    elif conclusion in _CANCEL_CONCLUSIONS:
+        bucket = "cancel"
+    else:
+        bucket = "fail"
+    return {
+        "name": entry.get("name", "?"),
+        "state": conclusion or status,
+        "bucket": bucket,
+        "link": entry.get("detailsUrl"),
+    }
+
+
 @dataclass
 class GitHubCLI:
     """Async wrapper around the gh CLI."""
@@ -146,25 +200,27 @@ class GitHubCLI:
     ) -> list[dict[str, Any]]:
         """Get status checks for a PR.
 
-        Bypasses `_run_gh` because we need to inspect stdout, stderr, and the
-        exit code independently. `gh pr checks`:
-          - prints a JSON array on stdout when checks exist (exits non-zero
-            when any are pending or failing — the payload is still valid)
-          - prints "no checks reported on the '<branch>' branch" to stderr
-            and exits non-zero when the PR has no checks at all
-          - emits arbitrary errors to stderr (auth, network, missing PR) on
-            non-zero exit with empty stdout
+        Shells out to `gh pr view --json statusCheckRollup` rather than
+        `gh pr checks --json` — the latter's `--json` flag isn't supported
+        by every `gh` build in the wild (older/distro-packaged `gh` rejects
+        it outright with "unknown flag: --json"), while `pr view --json`
+        has been supported since `gh` introduced `--json` at all.
 
-        We return [] only for the "no checks reported" case. Real failures
-        raise GitHubError so callers can distinguish "no CI configured" from
-        "gh is broken".
+        Bypasses `_run_gh` because we need to inspect stdout, stderr, and
+        the exit code independently: `gh pr view` exits 0 with an empty or
+        null rollup when the PR has no CI configured, and non-zero with an
+        error on stderr for genuine failures (auth, network, missing PR).
+
+        We compute the same pass/fail/pending/skipping/cancel "bucket"
+        `gh pr checks` itself derives, from the raw CheckRun/StatusContext
+        fields in the rollup.
         """
         cmd = [
             self.gh_binary,
-            "pr", "checks",
+            "pr", "view",
             str(pr_number),
             "--repo", repo,
-            "--json", "name,state,bucket,link",
+            "--json", "statusCheckRollup",
         ]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -185,18 +241,11 @@ class GitHubCLI:
         stdout = stdout_bytes.decode().strip()
         stderr = stderr_bytes.decode().strip()
 
-        # JSON payload on stdout — always trust it, regardless of exit code.
         if stdout:
-            return json.loads(stdout)
+            rollup = json.loads(stdout).get("statusCheckRollup") or []
+            return [_normalize_check(entry) for entry in rollup]
 
-        # No stdout. Distinguish "no CI configured" from genuine failures by
-        # looking for gh's well-known "no checks reported" message.
-        if "no checks reported" in stderr.lower():
-            return []
-
-        # Anything else is an honest-to-goodness failure. Don't pretend the
-        # repo has no CI.
-        raise GitHubError(f"gh pr checks failed: {stderr}")
+        raise GitHubError(f"gh pr view failed: {stderr}")
 
     def all_checks_passed(self, checks: list[dict[str, Any]]) -> bool:
         """Check if all PR checks passed."""
