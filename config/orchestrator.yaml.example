@@ -146,3 +146,9 @@ repos: []
   #     # Matching is case-insensitive. Defaults to [] (assignment alone
   #     # is sufficient, same as today).
   #     require_labels: []
+  #     # Hard cap, in seconds, on the single `ctrlrelay ci wait` call the
+  #     # dev pipeline prompt runs before signaling DONE. Lower this to
+  #     # match how long this repo's CI actually takes — no tokens are
+  #     # generated while blocked in this call, so a slow default here
+  #     # just adds idle wall-clock time. Defaults to 600 (10 minutes).
+  #     ci_wait_timeout_seconds: 600

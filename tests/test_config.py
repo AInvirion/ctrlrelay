@@ -640,3 +640,67 @@ class TestAutomationRequireLabels:
 
         assert config.repos[0].automation.require_labels == ["ctrlrelay:auto"]
         assert config.repos[1].automation.require_labels == []
+
+
+class TestAutomationCiWaitTimeout:
+    """ci_wait_timeout_seconds caps the single `ctrlrelay ci wait` call the
+    dev pipeline prompt tells Claude to run before signaling DONE. Default
+    600 preserves today's behavior."""
+
+    def test_default_ci_wait_timeout_is_600(self) -> None:
+        auto = AutomationConfig()
+        assert auto.ci_wait_timeout_seconds == 600
+
+    def test_ci_wait_timeout_override_accepts_int(self) -> None:
+        auto = AutomationConfig(ci_wait_timeout_seconds=300)
+        assert auto.ci_wait_timeout_seconds == 300
+
+    def test_config_without_ci_wait_timeout_key_defaults_to_600(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"dependabot_patch": "auto"},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.repos[0].automation.ci_wait_timeout_seconds == 600
+
+    def test_ci_wait_timeout_from_yaml(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"ci_wait_timeout_seconds": 300},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.repos[0].automation.ci_wait_timeout_seconds == 300
+
+    def test_ci_wait_timeout_rejects_non_int(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        sample_config_dict["repos"] = [
+            {
+                "name": "owner/repo",
+                "local_path": "~/Projects/repo",
+                "automation": {"ci_wait_timeout_seconds": "fast"},
+            }
+        ]
+        cfg_path = tmp_path / "cfg.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        with pytest.raises(ConfigError, match="ci_wait_timeout_seconds"):
+            load_config(cfg_path)

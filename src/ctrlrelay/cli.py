@@ -748,6 +748,7 @@ def run_dev(
             state_db=db,
             transport=None,
             contexts_dir=config.paths.contexts,
+            ci_wait_timeout_seconds=repo_config.automation.ci_wait_timeout_seconds,
         )
 
     try:
@@ -1273,6 +1274,7 @@ def poller_start(
                         state_db=state_db,
                         transport=connected_transport,
                         contexts_dir=config.paths.contexts,
+                        ci_wait_timeout_seconds=repo_config.automation.ci_wait_timeout_seconds,
                     )
 
                 # Lock-conflict retry hook. The poller marks issues seen

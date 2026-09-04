@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ci_wait_timeout_seconds`: per-repo cap on the dev pipeline's
+  `ctrlrelay ci wait` call.** The dev pipeline prompt tells Claude to run
+  `ctrlrelay ci wait --pr <PR> --repo <repo> --timeout 600` before
+  signaling DONE — a single blocking call, hardcoded to 10 minutes, that
+  generates zero tokens while it polls GitHub. Measured directly on a real
+  session: two `ci wait` calls accounted for 12 of a 26-minute run, versus
+  under 35K output tokens generated the whole time — the wall-clock cost
+  is CI runtime, not model work. `ci_wait_timeout_seconds` (default `600`,
+  unchanged behavior) lets a repo with a faster CI suite cap that single
+  call lower instead of always budgeting the full 10 minutes.
+
 ## [0.7.0] - 2026-09-04
 
 ### Added

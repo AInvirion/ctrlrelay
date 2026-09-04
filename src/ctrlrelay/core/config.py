@@ -201,6 +201,13 @@ class AutomationConfig(BaseModel):
     # precedence so "not for the agent at all" overrides "agent does
     # this but differently".
     task_labels: list[str] = Field(default_factory=lambda: ["task"])
+    # Hard cap, in seconds, on a single `ctrlrelay ci wait` call the dev
+    # pipeline prompt tells Claude to run before signaling DONE. A repo
+    # with slow CI can eat most of a session's wall-clock time sitting
+    # in this one blocking call generating zero tokens; a fast-CI repo
+    # doesn't need anywhere near the 600s default. Lower this per-repo
+    # to match how long that repo's CI actually takes.
+    ci_wait_timeout_seconds: int = 600
 
 
 _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
