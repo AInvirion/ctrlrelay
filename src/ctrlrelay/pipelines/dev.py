@@ -209,7 +209,66 @@ AGENT_CLAIM_COMMENT = (
     f"{AGENT_CLAIM_MARKER}"
 )
 
+# Discussion budget for the prompt. Newest comments are kept because a
+# redirect is far likelier to be the latest word than the first reply,
+# and each body is clipped so one pasted log dump can't crowd out the
+# rest of the thread.
+MAX_PROMPT_COMMENTS = 20
+MAX_PROMPT_COMMENT_CHARS = 2000
+
 _logger = get_logger("pipeline.dev")
+
+
+def format_issue_comments(
+    comments: list[dict[str, Any]] | None,
+    *,
+    max_comments: int = MAX_PROMPT_COMMENTS,
+    max_chars: int = MAX_PROMPT_COMMENT_CHARS,
+) -> str:
+    """Render the issue discussion for the dev prompt.
+
+    The body states the problem as it was first filed. The thread is
+    where an operator narrows, redirects or outright vetoes that plan,
+    and nobody edits the body afterwards. A vulnq issue was filed asking
+    for a client fix and then redirected in a comment to price up
+    dropping the data source instead; the prompt carried only the body,
+    so the agent spent a full session building the plan that had already
+    been rejected in writing.
+
+    Drops our own claim comment — it is our noise, not the operator's.
+    Keeps the newest ``max_comments`` but renders them oldest-first so
+    the thread still reads in order.
+    """
+    if not comments:
+        return "_No comments._"
+
+    kept = [
+        c for c in comments
+        if AGENT_CLAIM_MARKER not in (c.get("body") or "")
+    ]
+    if not kept:
+        return "_No comments._"
+
+    dropped = len(kept) - max_comments
+    if dropped > 0:
+        kept = kept[-max_comments:]
+
+    blocks: list[str] = []
+    if dropped > 0:
+        blocks.append(
+            f"_({dropped} earlier comment(s) omitted; read the issue on "
+            f"GitHub if the thread below references them.)_"
+        )
+
+    for c in kept:
+        author = (c.get("author") or {}).get("login") or "unknown"
+        created = c.get("createdAt") or ""
+        body = (c.get("body") or "").strip() or "_(empty)_"
+        if len(body) > max_chars:
+            body = body[:max_chars] + "\n_[...truncated]_"
+        blocks.append(f"--- @{author} ({created}) ---\n{body}")
+
+    return "\n\n".join(blocks)
 
 
 def _question_for_persist(session_id: str, result: PipelineResult) -> str:
@@ -329,6 +388,7 @@ class DevPipeline:
         """Build the dev pipeline prompt."""
         issue_title = extra.get("issue_title", "")
         issue_body = extra.get("issue_body", "")
+        issue_comments = extra.get("issue_comments") or "_No comments._"
         branch_name = extra.get("branch_name", "")
         ci_wait_timeout_seconds = extra.get("ci_wait_timeout_seconds", 600)
         state_file_path = str(state_file) if state_file else "/tmp/state.json"
@@ -339,6 +399,15 @@ class DevPipeline:
 
 **Issue Body:**
 {issue_body}
+
+**Discussion:**
+{issue_comments}
+
+The body is the issue as first filed; the discussion is newer. Where a
+comment narrows, redirects or rejects what the body asks for, the comment
+wins — nobody goes back and edits the body after changing their mind in
+the thread. If the discussion contradicts the body in a way you cannot
+reconcile, signal BLOCKED and ask rather than picking one.
 
 **Branch:** {branch_name}
 
@@ -716,6 +785,7 @@ async def run_dev_issue(
             extra={
                 "issue_title": issue.get("title", ""),
                 "issue_body": issue.get("body", ""),
+                "issue_comments": format_issue_comments(issue.get("comments")),
                 "branch_name": branch_name,
                 "ci_wait_timeout_seconds": ci_wait_timeout_seconds,
             },
@@ -1145,6 +1215,7 @@ async def resume_dev_from_pending(
             extra={
                 "issue_title": issue.get("title", ""),
                 "issue_body": issue.get("body", ""),
+                "issue_comments": format_issue_comments(issue.get("comments")),
                 "branch_name": branch_name,
             },
         )
