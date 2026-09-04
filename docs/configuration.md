@@ -201,6 +201,7 @@ and ask the operator), or `never` (skip).
 | `exclude_labels` | `["manual", "operator", "instruction"]` | Issue labels that tell the poller "this isn't for the agent". See [exclude_labels](#reposautomationexclude_labels) below. |
 | `include_labels` | `[]` | Issue labels that opt an issue **into** the dev pipeline regardless of who is (or isn't) assigned. See [include_labels](#reposautomationinclude_labels) below. |
 | `require_labels` | `[]` | Issue labels that gate the plain-assignment trigger: when set, assignment alone is no longer enough — the issue must also carry one of these labels. See [require_labels](#reposautomationrequire_labels) below. |
+| `ci_wait_timeout_seconds` | `600` | Hard cap, in seconds, on the single `ctrlrelay ci wait` call the dev pipeline prompt tells Claude to run before signaling DONE. See [ci_wait_timeout_seconds](#reposautomationci_wait_timeout_seconds) below. |
 
 The current secops and dev pipelines read these settings to bias their prompts
 to Claude — they're not enforced by hard-coded checks.
@@ -344,6 +345,31 @@ repos:
   still surfaces it on a subsequent poll — nothing is lost, it's just not
   picked up yet.
 - `exclude_labels` is still checked first, same precedence as always.
+
+### repos[].automation.ci_wait_timeout_seconds
+
+The dev pipeline prompt tells Claude to run `ctrlrelay ci wait --pr <PR>
+--repo <repo> --timeout <N>` before signaling DONE — a single blocking call
+that polls GitHub every 15s until CI finishes, fails, or the timeout hits.
+No tokens get generated while it's blocked; on a repo with a slow CI suite,
+that one call can eat most of a session's wall-clock time.
+
+```yaml
+repos:
+  - name: "your-org/your-repo"
+    local_path: "~/Projects/your-repo"
+    automation:
+      ci_wait_timeout_seconds: 300
+```
+
+- Default: `600` (10 minutes).
+- Lower it to match how long the repo's CI actually takes — a repo with a
+  2-minute CI suite gains nothing from a 10-minute cap.
+- A timeout here isn't a failure: `ctrlrelay ci wait` exits 2 (not 1) when
+  the deadline hits with checks still pending, and the prompt tells Claude
+  to treat that as acceptable and hand off rather than loop.
+- This does not change the overall session timeout (`agent.default_timeout_seconds`,
+  default 1800s) — it only bounds the one `ci wait` call.
 
 ## schedules
 

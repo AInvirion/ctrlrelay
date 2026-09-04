@@ -330,6 +330,7 @@ class DevPipeline:
         issue_title = extra.get("issue_title", "")
         issue_body = extra.get("issue_body", "")
         branch_name = extra.get("branch_name", "")
+        ci_wait_timeout_seconds = extra.get("ci_wait_timeout_seconds", 600)
         state_file_path = str(state_file) if state_file else "/tmp/state.json"
 
         return f"""You are working on issue #{issue_number} in repository {repo}.
@@ -349,7 +350,7 @@ Execute the following workflow:
 4. Push the branch and open a PR that references the issue
 5. Before signaling DONE, verify the PR is mergeable:
    - Wait for CI by running EXACTLY this command (do NOT improvise bash):
-     `ctrlrelay ci wait --pr <PR> --repo {repo} --timeout 600`
+     `ctrlrelay ci wait --pr <PR> --repo {repo} --timeout {ci_wait_timeout_seconds}`
      Exit codes: 0 = all checks passed, 1 = a check failed (investigate,
      fix, push, then re-run the wait), 2 = hard timeout while CI is still
      pending (treat as acceptable — hand off and let the orchestrator
@@ -608,6 +609,7 @@ async def run_dev_issue(
     max_fix_attempts: int = DEFAULT_MAX_FIX_ATTEMPTS,
     max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
     pr_verifier: PRVerifier | None = None,
+    ci_wait_timeout_seconds: int = 600,
 ) -> PipelineResult:
     """Run dev pipeline for a single issue."""
     session_id = f"dev-{repo.replace('/', '-')}-{issue_number}-{uuid.uuid4().hex[:8]}"
@@ -715,6 +717,7 @@ async def run_dev_issue(
                 "issue_title": issue.get("title", ""),
                 "issue_body": issue.get("body", ""),
                 "branch_name": branch_name,
+                "ci_wait_timeout_seconds": ci_wait_timeout_seconds,
             },
         )
 

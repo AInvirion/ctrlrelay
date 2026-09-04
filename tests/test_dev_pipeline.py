@@ -61,6 +61,65 @@ class TestDevPipeline:
             "prompt should explicitly ban `until`/`while` bash CI-wait loops"
         )
 
+    def test_prompt_uses_default_ci_wait_timeout_when_not_configured(self) -> None:
+        """No ci_wait_timeout_seconds in extra: falls back to 600, matching
+        AutomationConfig's default so an unconfigured repo behaves as before."""
+        from ctrlrelay.pipelines.dev import DevPipeline
+
+        pipeline = DevPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+
+        prompt = pipeline._build_prompt(
+            repo="owner/repo",
+            issue_number=42,
+            extra={
+                "issue_title": "t",
+                "issue_body": "b",
+                "branch_name": "fix/issue-42",
+            },
+            session_id="dev-42",
+            state_file=Path("/tmp/state.json"),
+        )
+
+        assert "ctrlrelay ci wait --pr <PR> --repo owner/repo --timeout 600" in prompt
+
+    def test_prompt_uses_configured_ci_wait_timeout(self) -> None:
+        """A repo with a slow (or fast) CI can override the 600s default so
+        the dev pipeline doesn't spend most of a session blocked in one
+        `ctrlrelay ci wait` call."""
+        from ctrlrelay.pipelines.dev import DevPipeline
+
+        pipeline = DevPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+
+        prompt = pipeline._build_prompt(
+            repo="owner/repo",
+            issue_number=42,
+            extra={
+                "issue_title": "t",
+                "issue_body": "b",
+                "branch_name": "fix/issue-42",
+                "ci_wait_timeout_seconds": 300,
+            },
+            session_id="dev-42",
+            state_file=Path("/tmp/state.json"),
+        )
+
+        assert "ctrlrelay ci wait --pr <PR> --repo owner/repo --timeout 300" in prompt
+        assert "--timeout 600" not in prompt
+
     @pytest.mark.asyncio
     async def test_run_dispatches_claude_session(self, tmp_path: Path) -> None:
         """Should dispatch Claude session with issue context."""
