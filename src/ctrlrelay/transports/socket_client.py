@@ -23,8 +23,18 @@ _logger = get_logger("transport.socket")
 class SocketTransport:
     """Transport that connects to bridge via Unix socket."""
 
-    def __init__(self, socket_path: Path) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        ask_timeout_seconds: int = 300,
+    ) -> None:
         self.socket_path = socket_path
+        # Per-instance default for ask(). Callers construct this from
+        # ``transport.telegram.ask_timeout_seconds`` so a single operator
+        # setting governs every pipeline's BLOCKED wait; the 300s fallback
+        # only applies to ad-hoc construction in tests and one-shot CLI
+        # helpers that never ask.
+        self.ask_timeout_seconds = ask_timeout_seconds
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._pending: dict[str, asyncio.Future[BridgeMessage]] = {}
@@ -119,13 +129,15 @@ class SocketTransport:
         self,
         question: str,
         options: list[str] | None = None,
-        timeout: int = 300,
+        timeout: int | None = None,
         *,
         session_id: str | None = None,
         repo: str | None = None,
         issue_number: int | None = None,
     ) -> str:
         """Ask a question and wait for response."""
+        if timeout is None:
+            timeout = self.ask_timeout_seconds
         request_id = f"r-{uuid.uuid4().hex[:8]}"
         msg = BridgeMessage(
             op=BridgeOp.ASK,

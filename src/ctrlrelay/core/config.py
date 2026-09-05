@@ -99,6 +99,16 @@ class TelegramConfig(BaseModel):
     socket_path: Path = Field(
         default_factory=lambda: Path("~/.ctrlrelay/ctrlrelay.sock").expanduser()
     )
+    # How long a pipeline waits on the operator's Telegram reply before it
+    # gives up and persists the session as BLOCKED. The previous hard-coded
+    # 300s made an unattended sweep effectively unanswerable: the 6am secops
+    # cron posted its question, timed out five minutes later, and by the time
+    # the operator read it the ASK socket — and with it the bridge's
+    # in-memory pending question — was already gone, so the reply arrived as
+    # an orphan. 6h keeps an overnight sweep answerable on the live path.
+    # Lower bound of 60s: anything shorter is a misconfiguration that would
+    # reintroduce the same race.
+    ask_timeout_seconds: int = Field(default=21600, ge=60)
 
     @field_validator("socket_path", mode="before")
     @classmethod

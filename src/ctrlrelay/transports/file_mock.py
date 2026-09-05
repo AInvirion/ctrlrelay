@@ -16,9 +16,15 @@ _logger = get_logger("transport.file_mock")
 class FileMockTransport:
     """Transport that reads/writes to files for testing."""
 
-    def __init__(self, inbox: Path, outbox: Path) -> None:
+    def __init__(
+        self,
+        inbox: Path,
+        outbox: Path,
+        ask_timeout_seconds: int = 300,
+    ) -> None:
         self.inbox = inbox
         self.outbox = outbox
+        self.ask_timeout_seconds = ask_timeout_seconds
 
     async def send(
         self,
@@ -37,13 +43,15 @@ class FileMockTransport:
         self,
         question: str,
         options: list[str] | None = None,
-        timeout: int = 300,
+        timeout: int | None = None,
         *,
         session_id: str | None = None,
         repo: str | None = None,
         issue_number: int | None = None,
     ) -> str:
         """Write question to outbox and poll inbox for answer."""
+        if timeout is None:
+            timeout = self.ask_timeout_seconds
         timestamp = datetime.now(timezone.utc).isoformat()
         opts = f" [{'/'.join(options)}]" if options else ""
         with self.outbox.open("a") as f:

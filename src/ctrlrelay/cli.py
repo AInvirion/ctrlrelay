@@ -506,6 +506,8 @@ def bridge_test(
     async def send_test():
         from ctrlrelay.transports import SocketTransport
 
+        # Send-only helper: never calls ask(), so the operator's
+        # ask_timeout_seconds is irrelevant here.
         transport = SocketTransport(socket_path)
         try:
             await transport.connect()
@@ -606,7 +608,12 @@ def run_secops(
             sock = config.transport.telegram.socket_path.expanduser().resolve()
             if sock.exists():
                 try:
-                    candidate = SocketTransport(sock)
+                    candidate = SocketTransport(
+                        sock,
+                        ask_timeout_seconds=(
+                            config.transport.telegram.ask_timeout_seconds
+                        ),
+                    )
                     await candidate.connect()
                     transport = candidate
                 except Exception as e:
@@ -1090,7 +1097,12 @@ def poller_start(
             from ctrlrelay.transports import SocketTransport
             socket_path = config.transport.telegram.socket_path.expanduser().resolve()
             if socket_path.exists():
-                transport = SocketTransport(socket_path)
+                transport = SocketTransport(
+                    socket_path,
+                    ask_timeout_seconds=(
+                        config.transport.telegram.ask_timeout_seconds
+                    ),
+                )
                 console.print(f"[dim]Telegram transport enabled via {socket_path}[/dim]")
             else:
                 console.print(f"[yellow]Telegram socket not found at {socket_path}[/yellow]")
@@ -1198,7 +1210,12 @@ def poller_start(
                     f"Telegram bridge socket missing at {socket_path}; "
                     "retryable — bridge may be restarting"
                 )
-            watch_transport = SocketTransport(socket_path)
+            watch_transport = SocketTransport(
+                socket_path,
+                ask_timeout_seconds=(
+                    config.transport.telegram.ask_timeout_seconds
+                ),
+            )
             await watch_transport.connect()
             return watch_transport
 
@@ -1452,7 +1469,13 @@ def poller_start(
                 sock = config.transport.telegram.socket_path.expanduser().resolve()
                 if sock.exists():
                     try:
-                        candidate = SocketTransport(sock)
+                        candidate = SocketTransport(
+                            sock,
+                            ask_timeout_seconds=(
+                                config.transport.telegram
+                                .ask_timeout_seconds
+                            ),
+                        )
                         await candidate.connect()
                         secops_transport = candidate
                     except Exception as e:
@@ -1593,7 +1616,13 @@ def poller_start(
                 sock = config.transport.telegram.socket_path.expanduser().resolve()
                 if sock.exists():
                     try:
-                        candidate = SocketTransport(sock)
+                        candidate = SocketTransport(
+                            sock,
+                            ask_timeout_seconds=(
+                                config.transport.telegram
+                                .ask_timeout_seconds
+                            ),
+                        )
                         await candidate.connect()
                         sweeper_transport = candidate
                     except Exception:

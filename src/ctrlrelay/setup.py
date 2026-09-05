@@ -342,6 +342,11 @@ def build_orchestrator_yaml(
         a('    bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"')
         a(f"    chat_id: {options.telegram_chat_id or 0}")
         a('    socket_path: "~/.ctrlrelay/ctrlrelay.sock"')
+        a("    # Seconds a pipeline waits on your reply before giving up")
+        a("    # and persisting the session as BLOCKED. Keep this longer")
+        a("    # than the gap between a scheduled sweep and when you")
+        a("    # actually read Telegram, or every reply arrives too late.")
+        a("    ask_timeout_seconds: 21600")
     else:
         a('  type: "file_mock"')
         a("  file_mock:")

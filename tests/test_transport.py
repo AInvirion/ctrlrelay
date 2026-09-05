@@ -1,5 +1,7 @@
 """Tests for transport abstraction."""
 
+from pathlib import Path
+
 import pytest
 
 
@@ -270,3 +272,79 @@ class TestGetTransport:
 
         transport = get_transport(config)
         assert transport.__class__.__name__ == "SocketTransport"
+
+
+class TestAskTimeoutIsConfigurable:
+    """The hard-coded 300s ask timeout made an unattended sweep
+    unanswerable: the 6am secops cron posted its question, gave up five
+    minutes later, and every reply after that arrived as an orphan."""
+
+    def test_socket_transport_defaults_to_configured_timeout(self) -> None:
+        from ctrlrelay.transports import SocketTransport
+
+        t = SocketTransport(Path("/tmp/x.sock"), ask_timeout_seconds=21600)
+
+        assert t.ask_timeout_seconds == 21600
+
+    @pytest.mark.asyncio
+    async def test_ask_uses_instance_timeout_when_caller_passes_none(
+        self, tmp_path,
+    ) -> None:
+        """No pipeline passes an explicit timeout, so the instance value is
+        what actually governs the wait."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.transports import SocketTransport
+
+        t = SocketTransport(tmp_path / "x.sock", ask_timeout_seconds=4242)
+        captured: dict = {}
+
+        async def fake_send_and_wait(msg, timeout):
+            captured["timeout"] = timeout
+            from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
+
+            return BridgeMessage(
+                op=BridgeOp.ANSWER, request_id=msg.request_id, answer="ok",
+            )
+
+        t._send_and_wait = AsyncMock(side_effect=fake_send_and_wait)  # type: ignore[assignment]
+
+        assert await t.ask("q?") == "ok"
+        assert captured["timeout"] == 4242
+
+    @pytest.mark.asyncio
+    async def test_explicit_timeout_still_wins(self, tmp_path) -> None:
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.transports import SocketTransport
+
+        t = SocketTransport(tmp_path / "x.sock", ask_timeout_seconds=4242)
+        captured: dict = {}
+
+        async def fake_send_and_wait(msg, timeout):
+            captured["timeout"] = timeout
+            from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
+
+            return BridgeMessage(
+                op=BridgeOp.ANSWER, request_id=msg.request_id, answer="ok",
+            )
+
+        t._send_and_wait = AsyncMock(side_effect=fake_send_and_wait)  # type: ignore[assignment]
+
+        await t.ask("q?", timeout=7)
+        assert captured["timeout"] == 7
+
+    def test_factory_threads_config_value_into_transport(self) -> None:
+        from ctrlrelay.core.config import (
+            TelegramConfig,
+            TransportConfig,
+            TransportType,
+        )
+        from ctrlrelay.transports import get_transport
+
+        t = get_transport(TransportConfig(
+            type=TransportType.TELEGRAM,
+            telegram=TelegramConfig(chat_id=1, ask_timeout_seconds=3600),
+        ))
+
+        assert t.ask_timeout_seconds == 3600  # type: ignore[union-attr]

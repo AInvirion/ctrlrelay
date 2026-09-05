@@ -37,6 +37,11 @@ transport:
     bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"
     chat_id: 123456789
     socket_path: "~/.ctrlrelay/ctrlrelay.sock"
+    # Seconds a pipeline waits on your reply before giving up and
+    # persisting the session as BLOCKED. Keep this longer than the gap
+    # between a scheduled sweep and when you actually read Telegram, or
+    # every reply arrives after the question has already expired.
+    ask_timeout_seconds: 21600
   file_mock:
     inbox: "~/.ctrlrelay/inbox.txt"
     outbox: "~/.ctrlrelay/outbox.txt"

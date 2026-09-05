@@ -451,3 +451,260 @@ class TestBridgeServer:
             f"bridge logged ERROR records during client-disconnect race: "
             f"{[r.getMessage() for r in errors]}"
         )
+
+
+class TestQuestionHeader:
+    """A secops sweep posts one question per repo back-to-back and the agent
+    text rarely names its own repo. Without a header the operator can't tell
+    twelve near-identical "approve #387?" messages apart, and never sees the
+    session_id the orphan router asks them to quote."""
+
+    def test_header_carries_repo_and_session(self) -> None:
+        from ctrlrelay.bridge.server import format_question
+
+        out = format_question(
+            "Approve merging #387?",
+            repo="AInvirion/aiproxyguard-cloud",
+            session_id="secops-AInvirion-aiproxyguard-cloud-8eb03a2b",
+        )
+
+        assert out.startswith("[AInvirion/aiproxyguard-cloud]")
+        assert "secops-AInvirion-aiproxyguard-cloud-8eb03a2b" in out
+        assert out.endswith("Approve merging #387?")
+
+    def test_header_includes_issue_number_for_dev(self) -> None:
+        from ctrlrelay.bridge.server import format_question
+
+        out = format_question(
+            "Which approach?", repo="owner/r", session_id="dev-x", issue_number=141
+        )
+
+        assert "issue #141" in out
+
+    def test_header_omitted_when_no_correlation_metadata(self) -> None:
+        """Callers that send neither repo nor session (bare ASK) must get
+        their text through untouched — no empty bracket line."""
+        from ctrlrelay.bridge.server import format_question
+
+        assert format_question("bare question?") == "bare question?"
+
+    def test_header_is_plain_text(self) -> None:
+        """TelegramHandler sends without parse_mode, so Markdown in the
+        header would reach the operator as literal punctuation."""
+        from ctrlrelay.bridge.server import format_question
+
+        out = format_question("q?", repo="owner/r", session_id="s-1")
+
+        assert "`" not in out
+        assert "*" not in out
+        assert "_" not in out
+
+
+class TestReplyRoutingIsStrict:
+    """The old FIFO fallback answered the OLDEST live question whenever it
+    couldn't match the reply — so replying to the third question while the
+    first was still open silently answered the first."""
+
+    @pytest.fixture
+    def socket_path(self):
+        d = tempfile.mkdtemp()
+        yield Path(d) / "b.sock"
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_fresh_message_refuses_when_several_questions_live(
+        self, socket_path,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
+
+        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            for rid, q in [("r-1", "first"), ("r-2", "second")]:
+                writer.write(serialize_message(BridgeMessage(
+                    op=BridgeOp.ASK, request_id=rid, question=q,
+                )).encode())
+                await writer.drain()
+                await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
+
+            await server._on_telegram_reply("yes", reply_to_message_id=None)
+
+            # No ANSWER may be delivered to either question.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(reader.readline(), timeout=0.3)
+            assert set(server._pending_questions) == {"r-1", "r-2"}
+
+            server._telegram.send.assert_awaited_once()  # type: ignore[attr-defined]
+            notice = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+            assert "wasn't routed" in notice
+            assert "reply" in notice.lower()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            await server.stop()
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_reply_to_expired_question_does_not_hit_the_live_one(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """Operator replies to a question whose ASK already timed out while a
+        different repo's question is live. FIFO used to hand that answer to
+        the live one — the wrong repo."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-owner-expired-1111",
+            pipeline="secops",
+            repo="owner/expired",
+            question="merge #60?",
+        )
+
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.ask = AsyncMock(return_value=999)  # type: ignore[attr-defined]
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        # The expired question is only remembered in the msg_id -> session map.
+        async with server._pending_lock:
+            server._remember_asked_session(111, "secops-owner-expired-1111")
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.ASK, request_id="r-live", question="live one",
+                repo="owner/live", session_id="secops-owner-live-9999",
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
+
+            await server._on_telegram_reply("hold it", reply_to_message_id=111)
+
+            # The live question must NOT have been answered.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(reader.readline(), timeout=0.3)
+            assert "r-live" in server._pending_questions
+
+            # The expired session got the answer instead.
+            rows = db.list_pending_resumes_to_execute()
+            assert [r["session_id"] for r in rows] == ["secops-owner-expired-1111"]
+            assert rows[0]["answer"] == "hold it"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            db.close()
+            await server.stop()
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_reply_to_picks_the_right_row_among_many_blocked(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """Twelve BLOCKED sessions used to make every late reply 'ambiguous',
+        and the session_id it told the operator to quote had never been sent
+        to them. A reply-to now resolves the session exactly."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        for i in range(3):
+            db.add_pending_resume(
+                session_id=f"secops-owner-r{i}-abc{i}",
+                pipeline="secops",
+                repo=f"owner/r{i}",
+                question=f"approve #{i}?",
+            )
+
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        async with server._pending_lock:
+            server._remember_asked_session(500, "secops-owner-r1-abc1")
+
+        await server._on_telegram_reply("approve it", reply_to_message_id=500)
+
+        rows = db.list_pending_resumes_to_execute()
+        assert [r["session_id"] for r in rows] == ["secops-owner-r1-abc1"]
+        assert rows[0]["answer"] == "approve it"
+
+        notice = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "Answer queued" in notice
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_asked_sessions_map_is_bounded(self, socket_path) -> None:
+        """The map is a routing convenience, not a log — it must not grow
+        without limit in a bridge that runs for weeks."""
+        from ctrlrelay.bridge.server import _ASKED_SESSIONS_MAX, BridgeServer
+
+        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+
+        async with server._pending_lock:
+            for i in range(_ASKED_SESSIONS_MAX + 25):
+                server._remember_asked_session(i, f"s-{i}")
+
+        assert len(server._asked_sessions) == _ASKED_SESSIONS_MAX
+        # Oldest evicted, newest kept.
+        assert 0 not in server._asked_sessions
+        assert (_ASKED_SESSIONS_MAX + 24) in server._asked_sessions
+
+    @pytest.mark.asyncio
+    async def test_ask_posts_question_with_header(self, socket_path) -> None:
+        """End-to-end: the text handed to Telegram carries the header, not
+        just the raw agent question."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
+
+        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.ask = AsyncMock(return_value=777)  # type: ignore[attr-defined]
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.ASK, request_id="r-1", question="approve #387?",
+                repo="owner/r", session_id="secops-owner-r-abc",
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)
+
+            posted = server._telegram.ask.await_args.args[0]  # type: ignore[attr-defined]
+            assert "[owner/r]" in posted
+            assert "secops-owner-r-abc" in posted
+            assert "approve #387?" in posted
+
+            # And the session is recoverable by the msg_id Telegram returned.
+            assert server._asked_sessions[777] == "secops-owner-r-abc"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            await server.stop()
+            task.cancel()

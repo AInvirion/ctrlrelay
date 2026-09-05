@@ -704,3 +704,37 @@ class TestAutomationCiWaitTimeout:
 
         with pytest.raises(ConfigError, match="ci_wait_timeout_seconds"):
             load_config(cfg_path)
+
+
+class TestAskTimeoutConfig:
+    def test_default_survives_an_overnight_sweep(self) -> None:
+        """The 6am secops cron must still be answerable when the operator
+        reads Telegram hours later."""
+        from ctrlrelay.core.config import TelegramConfig
+
+        assert TelegramConfig().ask_timeout_seconds == 21600
+
+    def test_value_is_read_from_yaml(
+        self, sample_config_dict: dict, tmp_path: Path
+    ) -> None:
+        sample_config_dict["transport"] = {
+            "type": "telegram",
+            "telegram": {"chat_id": 1, "ask_timeout_seconds": 900},
+        }
+        cfg_path = tmp_path / "orchestrator.yaml"
+        cfg_path.write_text(yaml.dump(sample_config_dict))
+
+        config = load_config(cfg_path)
+
+        assert config.transport.telegram is not None
+        assert config.transport.telegram.ask_timeout_seconds == 900
+
+    def test_rejects_a_timeout_short_enough_to_reintroduce_the_race(
+        self,
+    ) -> None:
+        import pydantic
+
+        from ctrlrelay.core.config import TelegramConfig
+
+        with pytest.raises(pydantic.ValidationError):
+            TelegramConfig(chat_id=1, ask_timeout_seconds=5)
