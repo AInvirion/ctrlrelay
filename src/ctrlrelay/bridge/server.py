@@ -70,26 +70,33 @@ def format_question(
     return "\n".join(header) + "\n\n" + question
 
 
-# Expire a question slightly before the client does. Erring early costs
-# nothing — the reply falls through to the pending-resume path, which
-# resolves the session and tells the operator — while erring late is the
-# bug this guards: the bridge writes the answer into a request the client
-# has already abandoned, silently.
-_EXPIRY_SAFETY_MARGIN_SECONDS = 5.0
-
-
 def _deadline(received_at: float, timeout: int | None) -> float | None:
     """Monotonic instant after which a posted question is no longer live.
 
-    ``None`` means "no client-side deadline" — the entry then lives until
-    its socket closes, which is the pre-existing behaviour for callers that
-    send an ASK without a timeout. A non-positive timeout means the client
-    gave up immediately, so the question is already expired rather than
-    eternal.
+    Mirrors the client's own ``ask()`` deadline as closely as the two
+    processes allow. The client starts counting when it writes the ASK to
+    the socket and ``received_at`` is taken as we read it, so the two clocks
+    differ only by unix-socket transit — microseconds. Anchoring here rather
+    than after the Telegram post is what matters: that post takes on the
+    order of a second, and a deadline set on its far side would leave the
+    bridge treating a question as live for that whole second after the
+    client had abandoned it.
+
+    Deliberately no safety margin. Skewing early looks free but is not: a
+    reply landing between the bridge's deadline and the client's is routed
+    to a ``pending_resumes`` row the still-running pipeline has not written
+    yet, so the answer is refused and the operator has to send it again. A
+    margin trades a microsecond-wide hazard for a window thousands of times
+    wider.
+
+    ``None`` means the caller set no deadline; the entry then lives until
+    its socket closes, the pre-existing behaviour. A non-positive timeout
+    means the client gave up immediately, so the question is already
+    expired rather than eternal.
     """
     if timeout is None:
         return None
-    return received_at + max(float(timeout) - _EXPIRY_SAFETY_MARGIN_SECONDS, 0.0)
+    return received_at + max(float(timeout), 0.0)
 
 
 class _PendingQuestion:
@@ -294,12 +301,11 @@ class BridgeServer:
             try:
                 assert self._telegram is not None
                 # Start the expiry clock before the Telegram round trip, not
-                # after it. The client's own ask() deadline started earlier
-                # still (it began counting when it wrote to the socket), so
-                # anchoring here keeps the bridge's view of "live" from
-                # outlasting the client's by the post latency — a window in
-                # which a reply-to would match a question nobody is waiting
-                # on any more and the answer would be written into a dead
+                # after it: the client began counting when it wrote the ASK
+                # to the socket. Anchoring on the far side of the post would
+                # leave the bridge treating the question as live for a full
+                # post latency after the client had abandoned it, and a
+                # reply-to in that window writes the answer into a dead
                 # request.
                 received_at = time.monotonic()
                 question = msg.question or ""

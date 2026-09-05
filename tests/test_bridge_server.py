@@ -1020,18 +1020,30 @@ class TestQuestionDeadline:
 
         assert _deadline(1000.0, None) is None
 
-    def test_deadline_lands_before_the_client_gives_up(self) -> None:
-        from ctrlrelay.bridge.server import (
-            _EXPIRY_SAFETY_MARGIN_SECONDS,
-            _deadline,
-        )
+    def test_deadline_tracks_the_client_with_no_margin(self) -> None:
+        """No safety margin either way. Expiring early is not free: a reply
+        in the gap is routed to a pending_resumes row the still-running
+        pipeline has not written yet, so it is refused and the operator has
+        to send it again."""
+        from ctrlrelay.bridge.server import _deadline
 
         received_at, timeout = 1000.0, 900
-        got = _deadline(received_at, timeout)
 
-        assert got is not None
-        assert got < received_at + timeout
-        assert got == received_at + timeout - _EXPIRY_SAFETY_MARGIN_SECONDS
+        assert _deadline(received_at, timeout) == received_at + timeout
+
+    def test_a_reply_just_before_the_deadline_still_reaches_the_pipeline(
+        self,
+    ) -> None:
+        from ctrlrelay.bridge.server import _deadline, _PendingQuestion
+
+        received_at, timeout = 1000.0, 900
+        q = _PendingQuestion(
+            request_id="r", telegram_msg_id=1, writer=None,  # type: ignore[arg-type]
+            expires_at=_deadline(received_at, timeout),
+        )
+
+        assert not q.is_expired(received_at + timeout - 2)
+        assert q.is_expired(received_at + timeout)
 
     def test_non_positive_timeout_is_already_expired_not_eternal(self) -> None:
         """`if msg.timeout` would read 0 as falsy and give the question no
@@ -1047,7 +1059,9 @@ class TestQuestionDeadline:
             )
             assert q.is_expired(1000.0)
 
-    def test_short_timeout_clamps_instead_of_going_negative(self) -> None:
+    def test_short_timeout_is_honoured_not_collapsed(self) -> None:
+        """A small explicit timeout must still get its full window."""
         from ctrlrelay.bridge.server import _deadline
 
-        assert _deadline(1000.0, 1) == 1000.0
+        assert _deadline(1000.0, 1) == 1001.0
+        assert _deadline(1000.0, 5) == 1005.0
