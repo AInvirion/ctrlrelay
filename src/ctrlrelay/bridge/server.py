@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import stat
+import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,17 +73,35 @@ def format_question(
 class _PendingQuestion:
     """Question posted to Telegram, awaiting the operator's reply."""
 
-    __slots__ = ("request_id", "telegram_msg_id", "writer")
+    __slots__ = (
+        "request_id", "telegram_msg_id", "writer", "expires_at",
+        "repo", "session_id",
+    )
 
     def __init__(
         self,
         request_id: str,
         telegram_msg_id: int,
         writer: asyncio.StreamWriter,
+        expires_at: float | None = None,
+        repo: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.telegram_msg_id = telegram_msg_id
         self.writer = writer
+        self.repo = repo
+        self.session_id = session_id
+        # Monotonic deadline mirroring the client's own ask() timeout. The
+        # client stops waiting at this point and discards the request_id,
+        # but it does NOT close the socket — a secops sweep reuses one
+        # transport across every repo. Without this the bridge would keep
+        # treating the question as live and write the answer into a request
+        # nobody is listening for.
+        self.expires_at = expires_at
+
+    def is_expired(self, now: float) -> bool:
+        return self.expires_at is not None and now >= self.expires_at
 
 
 class BridgeServer:
@@ -226,7 +245,18 @@ class BridgeServer:
         if msg.op == BridgeOp.SEND:
             try:
                 assert self._telegram is not None
-                await self._telegram.send(msg.text or "")
+                telegram_msg_id = await self._telegram.send(msg.text or "")
+                # A SEND that names a session is answerable too: the secops
+                # sweep fans out one "blocked on <repo>" message per repo
+                # after the run, and that message is the most recent — and
+                # most prominent — one the operator sees for that repo. If
+                # its id isn't recorded, replying to it lands in the
+                # ambiguous branch even though the session is unmistakable.
+                if msg.session_id:
+                    async with self._pending_lock:
+                        self._remember_asked_session(
+                            telegram_msg_id, msg.session_id
+                        )
                 _log.info("bridge: SEND delivered, request_id=%s", msg.request_id)
                 return BridgeMessage(op=BridgeOp.ACK, request_id=msg.request_id, status="sent")
             except Exception as e:
@@ -271,6 +301,13 @@ class BridgeServer:
                             request_id=msg.request_id,
                             telegram_msg_id=telegram_msg_id,
                             writer=writer,
+                            expires_at=(
+                                time.monotonic() + msg.timeout
+                                if msg.timeout
+                                else None
+                            ),
+                            repo=msg.repo,
+                            session_id=msg.session_id,
                         )
                     if msg.session_id:
                         self._remember_asked_session(
@@ -345,6 +382,7 @@ class BridgeServer:
         ambiguous_notice: str | None = None
 
         async with self._pending_lock:
+            self._drop_expired_questions()
             if reply_to_message_id is not None:
                 for q in self._pending_questions.values():
                     if q.telegram_msg_id == reply_to_message_id:
@@ -487,15 +525,44 @@ class BridgeServer:
                 "`ctrlrelay run secops --repo <owner>/<repo>`."
             )
 
+    def _drop_expired_questions(self) -> None:
+        """Forget questions whose client has already stopped waiting.
+
+        Caller must hold ``_pending_lock``. An expired entry is worse than
+        no entry: it would match a reply-to and swallow the answer, and it
+        inflates the "more than one question is live" count so that a plain
+        answer to the one real question gets refused. Dropping it here sends
+        the reply down the orphan path, which resolves the session's
+        ``pending_resumes`` row via ``_asked_sessions``.
+        """
+        now = time.monotonic()
+        expired = [
+            rid for rid, q in self._pending_questions.items() if q.is_expired(now)
+        ]
+        for rid in expired:
+            self._pending_questions.pop(rid, None)
+        if expired:
+            _log.info(
+                "bridge: dropped %d expired question(s): %s",
+                len(expired), ", ".join(expired),
+            )
+
     def _live_question_listing(self) -> str:
         """Render the outstanding questions for an operator notice.
 
+        Uses the same ``[repo] session:`` shape as the question header, so
+        the operator can match a line here to a message in their chat by
+        eye. Telegram never shows message ids in its UI and ``request_id``
+        means nothing to a human, so neither belongs in operator-facing
+        text.
+
         Caller must hold ``_pending_lock``."""
         rows = "\n".join(
-            f"  - {q.telegram_msg_id}: {q.request_id}"
+            f"  - {q.repo or 'unknown repo'}"
+            + (f" (session: {q.session_id})" if q.session_id else "")
             for q in self._pending_questions.values()
         )
-        return f"Still waiting (telegram msg id: request):\n{rows}"
+        return f"Still waiting:\n{rows}"
 
     async def _send_notice(self, text: str, log: str | None = None) -> None:
         """Best-effort operator notice. A failure here must never take down

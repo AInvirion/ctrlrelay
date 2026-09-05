@@ -10,15 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`transport.telegram.ask_timeout_seconds`: how long a pipeline waits on
-  your Telegram reply.** Defaults to 6h (was a hard-coded 300s in
-  `SocketTransport.ask`, with no call site overriding it and no way to
-  configure it). Five minutes made an unattended sweep effectively
-  unanswerable: the 6am secops cron posted its question, gave up at
-  06:05, and by the time the operator read Telegram the ASK socket — and
-  with it the bridge's in-memory pending question — was gone, so the reply
-  arrived as an orphan. A single morning's run produced 12 consecutive
-  `secops.transport.ask_failed` / `Timeout waiting for response` entries
-  and 12 unanswerable BLOCKED sessions.
+  your Telegram reply.** Was a hard-coded 300s in `SocketTransport.ask`,
+  with no call site overriding it and no way to configure it. Defaults to
+  900s — deliberately short, because a sweep runs its repos sequentially
+  and holds each repo's lock and worktree for the whole wait, and the
+  poller awaits its issue handler inline. This value only buys the
+  in-session fast path; answering later is covered by the pending-resume
+  path below, so raising it to cover an overnight gap would turn a daily
+  sweep into a multi-day one for no benefit.
 
 ### Fixed
 
@@ -44,6 +43,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its `pending_resumes` row exactly instead of reporting "multiple BLOCKED
   sessions are unanswered" and asking for a session_id the operator was
   never given.
+- **An answer given after the pipeline stopped waiting is no longer thrown
+  away.** When `ask()` timed out, the client discarded the request but did
+  not close the socket — a secops sweep reuses one transport across every
+  repo — so the bridge went on treating the question as live. A later
+  reply-to matched that dead entry, and the ANSWER was written into a
+  request nobody was listening for: no log, no notice, nothing. The
+  operator replied exactly as instructed and the answer vanished. The
+  bridge now tracks each question's deadline and drops expired entries
+  before routing, sending the reply down the pending-resume path instead.
+  Expired entries also no longer inflate the "more than one question is
+  waiting" count, which was refusing plain answers to the one real
+  question.
+- **The post-sweep "blocked on `<repo>`" message is answerable.** It is
+  sent as a one-way notice and its Telegram id was never recorded, so
+  replying to the most recent and most prominent message for a repo landed
+  in the ambiguous branch. A `SEND` that names a session is now tracked the
+  same way an `ASK` is.
+- **Operator notices name repos and sessions, not internal ids.** The
+  "still waiting" listing rendered `telegram_msg_id: request_id` — Telegram
+  never shows message ids in its UI and `request_id` means nothing to a
+  human. It now uses the same `[owner/repo] (session: …)` shape as the
+  question header.
 
 ## [0.8.1] - 2026-09-04
 

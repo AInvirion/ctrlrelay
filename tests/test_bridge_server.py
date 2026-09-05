@@ -732,6 +732,7 @@ class TestReplyRoutingIsStrict:
         try:
             writer.write(serialize_message(BridgeMessage(
                 op=BridgeOp.ASK, request_id="r-live", question="live one",
+                repo="owner/live", session_id="secops-owner-live-9999",
             )).encode())
             await writer.drain()
             await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
@@ -742,7 +743,12 @@ class TestReplyRoutingIsStrict:
             notice = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
             assert "no active session is waiting" not in notice
             assert "Still waiting" in notice
-            assert "r-live" in notice
+            # Named the way the operator sees it, not by internal ids.
+            assert "owner/live" in notice
+            assert "secops-owner-live-9999" in notice
+            # Not by internal plumbing the operator can't see or act on.
+            assert "telegram msg id" not in notice
+            assert "900" not in notice  # the telegram_msg_id
             # And the live question was not answered by accident.
             assert "r-live" in server._pending_questions
         finally:
@@ -834,3 +840,172 @@ class TestReplyRoutingIsStrict:
         db.close()
         await server.stop()
         task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_expired_question_falls_through_to_the_persisted_row(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """The pipeline gives up on ask() after `timeout` and writes a
+        pending_resumes row, but it does NOT close the socket — the secops
+        sweep reuses one transport across every repo. The bridge therefore
+        still held the question, matched a later reply-to against it, and
+        wrote the ANSWER into a socket whose client had already discarded
+        the request_id. The answer vanished with no log and no notice: the
+        operator replied exactly as instructed and nothing ever happened."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-owner-r-abc",
+            pipeline="secops",
+            repo="owner/r",
+            question="merge #60?",
+        )
+
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.ask = AsyncMock(return_value=555)  # type: ignore[attr-defined]
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.ASK, request_id="r-1", question="merge #60?",
+                repo="owner/r", session_id="secops-owner-r-abc",
+                timeout=1,
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
+
+            # The pipeline's ask() has now given up; the socket stays open.
+            await asyncio.sleep(1.2)
+
+            await server._on_telegram_reply("merge it", reply_to_message_id=555)
+
+            # Nothing may be written into the dead request.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(reader.readline(), timeout=0.3)
+
+            # The answer landed on the persisted row instead.
+            rows = db.list_pending_resumes_to_execute()
+            assert [r["session_id"] for r in rows] == ["secops-owner-r-abc"]
+            assert rows[0]["answer"] == "merge it"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            db.close()
+            await server.stop()
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_expired_questions_do_not_make_a_live_one_ambiguous(
+        self, socket_path,
+    ) -> None:
+        """Stale entries used to inflate the >1 count, so a plain answer to
+        the single genuinely-live question was refused and the operator was
+        shown a listing of ghosts."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import (
+            BridgeMessage,
+            BridgeOp,
+            parse_message,
+            serialize_message,
+        )
+        from ctrlrelay.bridge.server import BridgeServer
+
+        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.ASK, request_id="r-stale", question="old", timeout=1,
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)
+
+            await asyncio.sleep(1.2)
+
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.ASK, request_id="r-live", question="new", timeout=600,
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)
+
+            # Plain message: only one question is really live, so it routes.
+            await server._on_telegram_reply("yes", reply_to_message_id=None)
+
+            raw = await asyncio.wait_for(reader.readline(), timeout=1)
+            answer = parse_message(raw.decode())
+            assert answer.op == BridgeOp.ANSWER
+            assert answer.request_id == "r-live"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            await server.stop()
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_send_with_session_is_answerable_by_reply(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """The sweep fans out a 'blocked on <repo>' SEND after the run, and
+        that message is the most recent one the operator sees for the repo.
+        Its Telegram id was never recorded, so replying to it landed in the
+        ambiguous branch even though the session was unmistakable."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        for i in range(3):
+            db.add_pending_resume(
+                session_id=f"secops-owner-r{i}-abc{i}",
+                pipeline="secops",
+                repo=f"owner/r{i}",
+                question=f"approve #{i}?",
+            )
+
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.send = AsyncMock(return_value=321)  # type: ignore[attr-defined]
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.SEND, request_id="r-fanout",
+                text="⏸️ Scheduled secops blocked on owner/r2",
+                session_id="secops-owner-r2-abc2", repo="owner/r2",
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
+
+            assert server._asked_sessions[321] == "secops-owner-r2-abc2"
+
+            await server._on_telegram_reply("approve it", reply_to_message_id=321)
+
+            rows = db.list_pending_resumes_to_execute()
+            assert [r["session_id"] for r in rows] == ["secops-owner-r2-abc2"]
+            assert rows[0]["answer"] == "approve it"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            db.close()
+            await server.stop()
+            task.cancel()

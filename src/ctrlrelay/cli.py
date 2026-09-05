@@ -1535,11 +1535,19 @@ def poller_start(
                                 question = (
                                     result.question or "(no question text)"
                                 )
+                                # session_id makes this message
+                                # reply-to-able: the bridge records it, so
+                                # answering the fan-out resolves the same
+                                # pending_resumes row as answering the
+                                # original question would have.
                                 await secops_transport.send(
                                     f"⏸️ Scheduled secops blocked on "
                                     f"{repo_cfg.name}\n"
-                                    f"Session: `{result.session_id}`\n"
-                                    f"\n{question}"
+                                    f"Session: {result.session_id}\n"
+                                    f"\nReply to this message to answer."
+                                    f"\n\n{question}",
+                                    session_id=result.session_id,
+                                    repo=repo_cfg.name,
                                 )
                             elif not result.success:
                                 err = result.error or result.summary

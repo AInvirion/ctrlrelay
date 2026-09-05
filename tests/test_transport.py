@@ -275,16 +275,16 @@ class TestGetTransport:
 
 
 class TestAskTimeoutIsConfigurable:
-    """The hard-coded 300s ask timeout made an unattended sweep
-    unanswerable: the 6am secops cron posted its question, gave up five
-    minutes later, and every reply after that arrived as an orphan."""
+    """The ask timeout was hard-coded at 300s with no call site overriding
+    it and no way to configure it, so an operator could not tune the live
+    wait to how they actually work."""
 
     def test_socket_transport_defaults_to_configured_timeout(self) -> None:
         from ctrlrelay.transports import SocketTransport
 
-        t = SocketTransport(Path("/tmp/x.sock"), ask_timeout_seconds=21600)
+        t = SocketTransport(Path("/tmp/x.sock"), ask_timeout_seconds=900)
 
-        assert t.ask_timeout_seconds == 21600
+        assert t.ask_timeout_seconds == 900
 
     @pytest.mark.asyncio
     async def test_ask_uses_instance_timeout_when_caller_passes_none(

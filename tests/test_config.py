@@ -707,12 +707,13 @@ class TestAutomationCiWaitTimeout:
 
 
 class TestAskTimeoutConfig:
-    def test_default_survives_an_overnight_sweep(self) -> None:
-        """The 6am secops cron must still be answerable when the operator
-        reads Telegram hours later."""
+    def test_default_does_not_hold_a_sequential_sweep_hostage(self) -> None:
+        """A sweep runs its repos one at a time and holds each lock for the
+        whole wait, so this must stay short. Answering later is covered by
+        pending_resumes, not by a long live window."""
         from ctrlrelay.core.config import TelegramConfig
 
-        assert TelegramConfig().ask_timeout_seconds == 21600
+        assert TelegramConfig().ask_timeout_seconds == 900
 
     def test_value_is_read_from_yaml(
         self, sample_config_dict: dict, tmp_path: Path
