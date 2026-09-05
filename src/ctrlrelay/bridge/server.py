@@ -390,6 +390,26 @@ class BridgeServer:
                                 "mean, or paste its session_id anywhere in "
                                 "your message."
                             )
+                        elif self._pending_questions:
+                            # Reply-to pointed at a message we no longer
+                            # track (bridge restarted, or a question far
+                            # enough back to have been evicted) and nothing
+                            # is persisted — but questions ARE live. Saying
+                            # "no active session is waiting" here would be
+                            # flatly wrong and stop the operator from
+                            # retrying, so point them at what is waiting.
+                            listing = "\n".join(
+                                f"  - {q.telegram_msg_id}: {q.request_id}"
+                                for q in self._pending_questions.values()
+                            )
+                            await self._telegram.send(
+                                "⚠️ Your reply wasn't routed — it pointed at "
+                                "a question this bridge no longer tracks, "
+                                "and nothing is persisted for it.\n\n"
+                                f"Still waiting (telegram msg id: request):"
+                                f"\n{listing}\n\n"
+                                "Reply to one of those messages to answer it."
+                            )
                         else:
                             await self._telegram.send(
                                 "⚠️ Your reply wasn't routed — no active "

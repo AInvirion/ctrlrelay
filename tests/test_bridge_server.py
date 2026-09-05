@@ -708,3 +708,45 @@ class TestReplyRoutingIsStrict:
             await writer.wait_closed()
             await server.stop()
             task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_unknown_reply_to_points_at_live_questions_not_dead_end(
+        self, socket_path,
+    ) -> None:
+        """Reply-to names a message the bridge no longer tracks (restart, or
+        evicted) and nothing is persisted — but questions ARE live. Telling
+        the operator "no active session is waiting" would be flatly wrong and
+        would stop them retrying."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
+
+        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.ask = AsyncMock(return_value=900)  # type: ignore[attr-defined]
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.ASK, request_id="r-live", question="live one",
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
+
+            # No state_db, so the orphan router returns "none".
+            await server._on_telegram_reply("yes", reply_to_message_id=4242)
+
+            notice = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+            assert "no active session is waiting" not in notice
+            assert "Still waiting" in notice
+            assert "r-live" in notice
+            # And the live question was not answered by accident.
+            assert "r-live" in server._pending_questions
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            await server.stop()
+            task.cancel()
