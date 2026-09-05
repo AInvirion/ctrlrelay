@@ -37,6 +37,13 @@ transport:
     bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"
     chat_id: 123456789
     socket_path: "~/.ctrlrelay/ctrlrelay.sock"
+    # Seconds a pipeline waits on your reply before giving up and
+    # persisting the session as BLOCKED. This is only the in-session fast
+    # path — a reply that arrives later still attaches to the saved
+    # session and the pending-resume sweeper drives it. Don't raise this
+    # to cover being asleep: a sweep runs its repos one at a time and
+    # holds each repo's lock and worktree for the whole wait.
+    ask_timeout_seconds: 900
   file_mock:
     inbox: "~/.ctrlrelay/inbox.txt"
     outbox: "~/.ctrlrelay/outbox.txt"

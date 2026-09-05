@@ -19,6 +19,7 @@ def get_transport(config: TransportConfig) -> Transport:
         assert config.telegram is not None
         return SocketTransport(
             socket_path=config.telegram.socket_path,
+            ask_timeout_seconds=config.telegram.ask_timeout_seconds,
         )
 
     raise TransportError(f"Unknown transport type: {config.type}")

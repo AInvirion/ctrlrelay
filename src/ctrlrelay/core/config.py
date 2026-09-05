@@ -99,6 +99,25 @@ class TelegramConfig(BaseModel):
     socket_path: Path = Field(
         default_factory=lambda: Path("~/.ctrlrelay/ctrlrelay.sock").expanduser()
     )
+    # How long a pipeline waits on the operator's Telegram reply before it
+    # gives up and persists the session as BLOCKED.
+    #
+    # This is deliberately NOT sized to cover "operator is asleep". A secops
+    # sweep runs its repos sequentially on one transport, so every second
+    # spent waiting here holds that repo's lock and worktree and delays every
+    # later repo — and the poller awaits its issue handler inline, so a
+    # blocked dev question stalls new-issue dispatch across all repos for the
+    # same duration. Sizing this for an overnight gap would let a dozen
+    # unanswered repos turn a daily sweep into a multi-day one.
+    #
+    # A late reply does not need this window: the bridge records which
+    # session each posted question belongs to, so an answer arriving after
+    # the wait has lapsed attaches to the session's pending_resumes row and
+    # the every-minute sweeper drives the resume. This value only buys the
+    # in-session fast path for an operator who happens to be at their desk.
+    #
+    # Lower bound of 60s: shorter is a misconfiguration, not a preference.
+    ask_timeout_seconds: int = Field(default=900, ge=60)
 
     @field_validator("socket_path", mode="before")
     @classmethod

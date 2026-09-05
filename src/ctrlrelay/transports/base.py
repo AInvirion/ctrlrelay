@@ -33,13 +33,19 @@ class Transport(Protocol):
         self,
         question: str,
         options: list[str] | None = None,
-        timeout: int = 300,
+        timeout: int | None = None,
         *,
         session_id: str | None = None,
         repo: str | None = None,
         issue_number: int | None = None,
     ) -> str:
-        """Ask a question and wait for response."""
+        """Ask a question and wait for response.
+
+        ``timeout`` of ``None`` means "use the implementation's configured
+        default" — callers that have no opinion must not pin a literal here,
+        or the operator's ``ask_timeout_seconds`` setting is silently
+        bypassed.
+        """
         ...
 
     async def close(self) -> None:
