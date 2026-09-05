@@ -1009,3 +1009,45 @@ class TestReplyRoutingIsStrict:
             db.close()
             await server.stop()
             task.cancel()
+
+
+class TestQuestionDeadline:
+    """The bridge's view of "still live" must never outlast the client's, or
+    it writes the answer into a request nobody is waiting on."""
+
+    def test_no_timeout_means_no_deadline(self) -> None:
+        from ctrlrelay.bridge.server import _deadline
+
+        assert _deadline(1000.0, None) is None
+
+    def test_deadline_lands_before_the_client_gives_up(self) -> None:
+        from ctrlrelay.bridge.server import (
+            _EXPIRY_SAFETY_MARGIN_SECONDS,
+            _deadline,
+        )
+
+        received_at, timeout = 1000.0, 900
+        got = _deadline(received_at, timeout)
+
+        assert got is not None
+        assert got < received_at + timeout
+        assert got == received_at + timeout - _EXPIRY_SAFETY_MARGIN_SECONDS
+
+    def test_non_positive_timeout_is_already_expired_not_eternal(self) -> None:
+        """`if msg.timeout` would read 0 as falsy and give the question no
+        deadline at all — the opposite of what a 0 timeout means."""
+        from ctrlrelay.bridge.server import _deadline, _PendingQuestion
+
+        for timeout in (0, -1):
+            deadline = _deadline(1000.0, timeout)
+            assert deadline == 1000.0
+            q = _PendingQuestion(
+                request_id="r", telegram_msg_id=1, writer=None,  # type: ignore[arg-type]
+                expires_at=deadline,
+            )
+            assert q.is_expired(1000.0)
+
+    def test_short_timeout_clamps_instead_of_going_negative(self) -> None:
+        from ctrlrelay.bridge.server import _deadline
+
+        assert _deadline(1000.0, 1) == 1000.0

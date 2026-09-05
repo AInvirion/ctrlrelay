@@ -70,6 +70,28 @@ def format_question(
     return "\n".join(header) + "\n\n" + question
 
 
+# Expire a question slightly before the client does. Erring early costs
+# nothing — the reply falls through to the pending-resume path, which
+# resolves the session and tells the operator — while erring late is the
+# bug this guards: the bridge writes the answer into a request the client
+# has already abandoned, silently.
+_EXPIRY_SAFETY_MARGIN_SECONDS = 5.0
+
+
+def _deadline(received_at: float, timeout: int | None) -> float | None:
+    """Monotonic instant after which a posted question is no longer live.
+
+    ``None`` means "no client-side deadline" — the entry then lives until
+    its socket closes, which is the pre-existing behaviour for callers that
+    send an ASK without a timeout. A non-positive timeout means the client
+    gave up immediately, so the question is already expired rather than
+    eternal.
+    """
+    if timeout is None:
+        return None
+    return received_at + max(float(timeout) - _EXPIRY_SAFETY_MARGIN_SECONDS, 0.0)
+
+
 class _PendingQuestion:
     """Question posted to Telegram, awaiting the operator's reply."""
 
@@ -271,6 +293,15 @@ class BridgeServer:
         if msg.op == BridgeOp.ASK:
             try:
                 assert self._telegram is not None
+                # Start the expiry clock before the Telegram round trip, not
+                # after it. The client's own ask() deadline started earlier
+                # still (it began counting when it wrote to the socket), so
+                # anchoring here keeps the bridge's view of "live" from
+                # outlasting the client's by the post latency — a window in
+                # which a reply-to would match a question nobody is waiting
+                # on any more and the answer would be written into a dead
+                # request.
+                received_at = time.monotonic()
                 question = msg.question or ""
                 log_event(
                     _logger,
@@ -301,11 +332,7 @@ class BridgeServer:
                             request_id=msg.request_id,
                             telegram_msg_id=telegram_msg_id,
                             writer=writer,
-                            expires_at=(
-                                time.monotonic() + msg.timeout
-                                if msg.timeout
-                                else None
-                            ),
+                            expires_at=_deadline(received_at, msg.timeout),
                             repo=msg.repo,
                             session_id=msg.session_id,
                         )
