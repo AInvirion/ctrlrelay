@@ -750,3 +750,87 @@ class TestReplyRoutingIsStrict:
             await writer.wait_closed()
             await server.stop()
             task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_pending_lock_is_free_while_notices_are_sent(
+        self, socket_path,
+    ) -> None:
+        """A stalled Telegram send must not serialize reply routing. The
+        notice paths used to await the API with _pending_lock held, so one
+        slow send blocked every other reply and every ASK registration."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
+
+        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
+
+        lock_was_free = asyncio.Event()
+
+        async def stalled_send(_text):
+            # If the lock were still held, this would hang forever.
+            async with server._pending_lock:
+                lock_was_free.set()
+
+        server._telegram.send = AsyncMock(side_effect=stalled_send)  # type: ignore[attr-defined]
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            for rid, q in [("r-1", "first"), ("r-2", "second")]:
+                writer.write(serialize_message(BridgeMessage(
+                    op=BridgeOp.ASK, request_id=rid, question=q,
+                )).encode())
+                await writer.drain()
+                await asyncio.wait_for(reader.readline(), timeout=1)
+
+            # Two live questions + plain message -> ambiguous notice path.
+            await asyncio.wait_for(
+                server._on_telegram_reply("yes", reply_to_message_id=None),
+                timeout=2,
+            )
+            assert lock_was_free.is_set()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            await server.stop()
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_notice_failure_does_not_break_routing(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """A Telegram outage while acknowledging an orphan answer must not
+        lose the answer — it is already committed to pending_resumes."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-owner-r-abc",
+            pipeline="secops",
+            repo="owner/r",
+            question="merge?",
+        )
+
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.send = AsyncMock(  # type: ignore[attr-defined]
+            side_effect=RuntimeError("telegram down")
+        )
+
+        await server._on_telegram_reply("merge it", reply_to_message_id=None)
+
+        rows = db.list_pending_resumes_to_execute()
+        assert rows[0]["answer"] == "merge it"
+
+        db.close()
+        await server.stop()
+        task.cancel()

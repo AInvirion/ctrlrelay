@@ -330,9 +330,21 @@ class BridgeServer:
         The previous FIFO fallback ran for cases 2 and 4 alike: replying to
         the third question while the first was still open delivered the
         answer to the *first* one, silently, and the operator had no way to
-        see it had happened."""
+        see it had happened.
+
+        ``_pending_lock`` guards only the decision. Every Telegram send and
+        every state_db write happens after it is released — holding it across
+        a stalled Telegram call would serialize routing behind the network.
+        Telegram updates are dispatched one at a time by
+        ``TelegramHandler._poll_loop``, so releasing early cannot interleave
+        two replies.
+        """
+        match: _PendingQuestion | None = None
+        hinted_session_id: str | None = None
+        live_listing: str | None = None
+        ambiguous_notice: str | None = None
+
         async with self._pending_lock:
-            match: _PendingQuestion | None = None
             if reply_to_message_id is not None:
                 for q in self._pending_questions.values():
                     if q.telegram_msg_id == reply_to_message_id:
@@ -341,91 +353,42 @@ class BridgeServer:
             elif len(self._pending_questions) == 1:
                 match = next(iter(self._pending_questions.values()))
             elif len(self._pending_questions) > 1:
-                await self._reject_ambiguous_live_reply()
-                return
-            if match is None:
-                _log.info(
-                    "bridge: incoming telegram msg with no pending question; "
-                    "text=%r", text[:80],
+                ambiguous_notice = (
+                    "Your message wasn't routed - "
+                    f"{len(self._pending_questions)} questions are waiting "
+                    "and a plain message doesn't say which one you "
+                    "mean.\n\n"
+                    "Use Telegram's reply on the question you want to "
+                    "answer.\n\n"
+                    f"{self._live_question_listing()}"
                 )
-                # Try to route to a persisted BLOCKED session in state_db
-                # so the operator's reply actually drives a resume. Without
-                # this, the reply disappears the instant the session's ASK
-                # socket closes — which is exactly what happens when a
-                # scheduled secops sweep escalates BLOCKED and exits.
+
+            if match is not None:
+                self._pending_questions.pop(match.request_id, None)
+            elif ambiguous_notice is None:
+                # Snapshot what the orphan branch needs, so the lock can be
+                # released before we touch Telegram or the database.
                 hinted_session_id = (
                     self._asked_sessions.get(reply_to_message_id)
                     if reply_to_message_id is not None
                     else None
                 )
-                outcome = await self._queue_orphan_reply_as_resume_answer(
-                    text, session_id=hinted_session_id
+                live_listing = (
+                    self._live_question_listing()
+                    if self._pending_questions
+                    else None
                 )
-                if self._telegram is not None:
-                    try:
-                        if outcome["status"] == "queued":
-                            row = outcome["row"]
-                            await self._telegram.send(
-                                "✅ Answer queued for BLOCKED session "
-                                f"`{row['session_id']}` "
-                                f"(pipeline={row['pipeline']}, "
-                                f"repo={row['repo']}).\n"
-                                "The pending-resume sweeper will drive it "
-                                "on the next tick — you'll get another "
-                                "message with the result."
-                            )
-                        elif outcome["status"] == "ambiguous":
-                            pending_list = "\n".join(
-                                f"  • `{r['session_id']}` ({r['repo']}): "
-                                f"{(r['question'] or '')[:80]}"
-                                for r in outcome["rows"]
-                            )
-                            await self._telegram.send(
-                                "⚠️ Your reply wasn't routed — multiple "
-                                "BLOCKED sessions are unanswered and the "
-                                "reply didn't point at one of them.\n\n"
-                                "Pending:\n"
-                                f"{pending_list}\n\n"
-                                "Use Telegram's reply on the question you "
-                                "mean, or paste its session_id anywhere in "
-                                "your message."
-                            )
-                        elif self._pending_questions:
-                            # Reply-to pointed at a message we no longer
-                            # track (bridge restarted, or a question far
-                            # enough back to have been evicted) and nothing
-                            # is persisted — but questions ARE live. Saying
-                            # "no active session is waiting" here would be
-                            # flatly wrong and stop the operator from
-                            # retrying, so point them at what is waiting.
-                            listing = "\n".join(
-                                f"  - {q.telegram_msg_id}: {q.request_id}"
-                                for q in self._pending_questions.values()
-                            )
-                            await self._telegram.send(
-                                "⚠️ Your reply wasn't routed — it pointed at "
-                                "a question this bridge no longer tracks, "
-                                "and nothing is persisted for it.\n\n"
-                                f"Still waiting (telegram msg id: request):"
-                                f"\n{listing}\n\n"
-                                "Reply to one of those messages to answer it."
-                            )
-                        else:
-                            await self._telegram.send(
-                                "⚠️ Your reply wasn't routed — no active "
-                                "session is waiting on input and no "
-                                "persisted BLOCKED session is unanswered. "
-                                "To act manually, re-run the pipeline, "
-                                "e.g. `ctrlrelay run secops --repo "
-                                "<owner>/<repo>`."
-                            )
-                    except Exception as e:
-                        _log.warning(
-                            "bridge: failed to notify orphan-reply sender: %s",
-                            e,
-                        )
-                return
-            self._pending_questions.pop(match.request_id, None)
+
+        if ambiguous_notice is not None:
+            await self._send_notice(
+                ambiguous_notice,
+                log="bridge: ambiguous fresh reply, refusing to guess",
+            )
+            return
+
+        if match is None:
+            await self._route_orphan_reply(text, hinted_session_id, live_listing)
+            return
 
         _log.info(
             "bridge: delivering ANSWER request_id=%s len=%d",
@@ -458,32 +421,93 @@ class BridgeServer:
                 match.request_id, e,
             )
 
-    async def _reject_ambiguous_live_reply(self) -> None:
-        """Tell the operator a fresh (non-reply) message can't be routed.
+    async def _route_orphan_reply(
+        self,
+        text: str,
+        hinted_session_id: str | None,
+        live_listing: str | None,
+    ) -> None:
+        """Handle a reply that matched no live question.
 
-        Caller must hold ``_pending_lock``. Several questions are live at
-        once, so any choice we made here would be a guess — and the old FIFO
-        guess was wrong often enough to silently answer the wrong repo."""
-        if self._telegram is None:
-            return
-        listing = "\n".join(
+        Called with ``_pending_lock`` released; ``live_listing`` is the
+        snapshot of what was outstanding at decision time.
+        """
+        _log.info(
+            "bridge: incoming telegram msg with no pending question; "
+            "text=%r", text[:80],
+        )
+        # Try to route to a persisted BLOCKED session in state_db so the
+        # operator's reply actually drives a resume. Without this, the reply
+        # disappears the instant the session's ASK socket closes — which is
+        # exactly what happens when a scheduled secops sweep escalates
+        # BLOCKED and exits.
+        outcome = await self._queue_orphan_reply_as_resume_answer(
+            text, session_id=hinted_session_id
+        )
+        if outcome["status"] == "queued":
+            row = outcome["row"]
+            await self._send_notice(
+                "✅ Answer queued for BLOCKED session "
+                f"`{row['session_id']}` "
+                f"(pipeline={row['pipeline']}, repo={row['repo']}).\n"
+                "The pending-resume sweeper will drive it on the next "
+                "tick — you'll get another message with the result."
+            )
+        elif outcome["status"] == "ambiguous":
+            pending_list = "\n".join(
+                f"  • `{r['session_id']}` ({r['repo']}): "
+                f"{(r['question'] or '')[:80]}"
+                for r in outcome["rows"]
+            )
+            await self._send_notice(
+                "⚠️ Your reply wasn't routed — multiple BLOCKED sessions "
+                "are unanswered and the reply didn't point at one of "
+                "them.\n\n"
+                f"Pending:\n{pending_list}\n\n"
+                "Use Telegram's reply on the question you mean, or paste "
+                "its session_id anywhere in your message."
+            )
+        elif live_listing is not None:
+            # Reply-to pointed at a message this bridge no longer tracks
+            # (restarted, or evicted from _asked_sessions) and nothing is
+            # persisted for it — but questions ARE live. Saying "no active
+            # session is waiting" here would be flatly wrong and would stop
+            # the operator retrying, so point them at what is waiting.
+            await self._send_notice(
+                "⚠️ Your reply wasn't routed — it pointed at a question "
+                "this bridge no longer tracks, and nothing is persisted "
+                f"for it.\n\n{live_listing}\n\n"
+                "Reply to one of those messages to answer it."
+            )
+        else:
+            await self._send_notice(
+                "⚠️ Your reply wasn't routed — no active session is "
+                "waiting on input and no persisted BLOCKED session is "
+                "unanswered. To act manually, re-run the pipeline, e.g. "
+                "`ctrlrelay run secops --repo <owner>/<repo>`."
+            )
+
+    def _live_question_listing(self) -> str:
+        """Render the outstanding questions for an operator notice.
+
+        Caller must hold ``_pending_lock``."""
+        rows = "\n".join(
             f"  - {q.telegram_msg_id}: {q.request_id}"
             for q in self._pending_questions.values()
         )
-        _log.info(
-            "bridge: ambiguous fresh reply, %d questions live",
-            len(self._pending_questions),
-        )
+        return f"Still waiting (telegram msg id: request):\n{rows}"
+
+    async def _send_notice(self, text: str, log: str | None = None) -> None:
+        """Best-effort operator notice. A failure here must never take down
+        reply routing — the answer has already been dealt with."""
+        if log:
+            _log.info("%s", log)
+        if self._telegram is None:
+            return
         try:
-            await self._telegram.send(
-                "Your message wasn't routed - "
-                f"{len(self._pending_questions)} questions are waiting and a "
-                "plain message doesn't say which one you mean.\n\n"
-                "Use Telegram's reply on the question you want to answer.\n\n"
-                f"Waiting (telegram msg id: request):\n{listing}"
-            )
+            await self._telegram.send(text)
         except Exception as e:
-            _log.warning("bridge: failed to send ambiguity notice: %s", e)
+            _log.warning("bridge: failed to notify operator: %s", e)
 
     async def _queue_orphan_reply_as_resume_answer(
         self, text: str, *, session_id: str | None = None
