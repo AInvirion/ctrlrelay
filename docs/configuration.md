@@ -118,6 +118,8 @@ transport:
 | `bot_token_env` | string | `"CTRLRELAY_TELEGRAM_TOKEN"` | Name of the environment variable holding the bot token. ctrlrelay never reads the token directly — only the variable name. |
 | `chat_id` | int | `0` | Telegram chat ID the bridge sends messages to and accepts replies from. |
 | `socket_path` | path | `"~/.ctrlrelay/ctrlrelay.sock"` | Unix socket path the bridge listens on. Pipelines connect to this socket as clients. |
+| `ask_timeout_seconds` | int | `900` | How long a pipeline blocks waiting on your reply in-session. Minimum `60`. A reply arriving later still works: the question is persisted to `pending_resumes` and the every-minute sweeper drives the resume. |
+| `question_ttl_seconds` | int | `172800` (48h) | How long an **unanswered** question stays routable before it is retired. Minimum `3600`. Without a ceiling those rows never die — a question whose PR was merged by hand weeks ago stays a live target for an orphan reply. The hourly `question_expiry_sweeper` also retires a question early once every issue/PR it cites is closed or merged. |
 
 See [Telegram bridge]({{ '/bridge/' | relative_url }}) for the full setup walkthrough.
 

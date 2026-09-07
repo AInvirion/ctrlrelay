@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
+from ctrlrelay.core.question_expiry import extract_referenced_numbers
 from ctrlrelay.core.state import StateDB
 from ctrlrelay.core.worktree import WorktreeManager
 from ctrlrelay.dashboard.client import DashboardClient, EventPayload
@@ -31,25 +31,10 @@ DEFAULT_MAX_BLOCKED_ROUNDS = 5
 # changed maintainer, etc.).
 DECISION_RECALL_SECONDS = 30 * 86400
 
-# Captures both "PR #60" and "#60" forms the agent uses interchangeably
-# in BLOCKED questions. The negative-lookahead on `#0` avoids matching
-# CVE-2026-... style identifiers; PR numbers are always >= 1.
-_PR_NUM_RE = re.compile(r"(?:PR\s*)?#(\d+)(?!\d)", re.IGNORECASE)
-
-
-def _extract_pr_numbers(question: str) -> list[str]:
-    """Pull deduplicated PR numbers out of a BLOCKED question so we
-    can record one operator-decision row per PR. Order-preserving so
-    a multi-PR question like 'approve #60, #61, #62?' records the
-    decision against each in the order the agent listed them."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for n in _PR_NUM_RE.findall(question or ""):
-        if n in seen:
-            continue
-        seen.add(n)
-        out.append(n)
-    return out
+# Shared with the question-expiry sweep, which parses the same "#N"
+# citations out of the same questions to decide whether a question's
+# subject has already been resolved elsewhere. One regex, one meaning.
+_extract_pr_numbers = extract_referenced_numbers
 
 
 def _record_decisions_from_answer(

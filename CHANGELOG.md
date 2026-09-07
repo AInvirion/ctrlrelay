@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`transport.telegram.question_ttl_seconds`: unanswered questions now
+  expire.** A `pending_resumes` row deliberately outlives the in-session
+  wait so a late reply can still drive the resume — but nothing ever
+  retired one, so the table only grew. Measured on one deployment: 46
+  questions posted, 4 ever answered, 16 still live and five repos
+  re-asking the same question on consecutive days. An expired row stops
+  being offered as the routing target for an orphan Telegram reply, and
+  a late answer can no longer revive it. Defaults to 172800 (48h),
+  minimum 3600.
+- **New hourly `question_expiry_sweeper` job.** Retires a question early
+  once every issue and PR it cites is closed or merged — the case where
+  someone merged the PR by hand and the question became meaningless
+  rather than merely unanswered. Fails safe in both directions: a
+  question citing nothing is never expired this way, and any probe error
+  leaves the row alone, because re-asking a dead question is recoverable
+  while dropping a live one is not. The TTL pass runs first and needs no
+  network, so a GitHub outage still lets age-based expiry make progress.
+
 - **`transport.telegram.ask_timeout_seconds`: how long a pipeline waits on
   your Telegram reply.** Was a hard-coded 300s in `SocketTransport.ask`,
   with no call site overriding it and no way to configure it. Defaults to

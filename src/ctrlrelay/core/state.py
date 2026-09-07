@@ -70,7 +70,9 @@ CREATE TABLE IF NOT EXISTS pending_resumes (
     created_at INTEGER NOT NULL,
     answer TEXT,
     answered_at INTEGER,
-    resumed_at INTEGER
+    resumed_at INTEGER,
+    expired_at INTEGER,
+    expired_reason TEXT
 );
 
 -- In-flight PR merge watchers that must survive a poller restart. Without
@@ -155,6 +157,21 @@ class StateDB:
         if pr_watches_cols and "cleanup_phase" not in pr_watches_cols:
             self._conn.execute(
                 "ALTER TABLE pr_watches ADD COLUMN cleanup_phase TEXT"
+            )
+
+        pending_cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(pending_resumes)"
+            ).fetchall()
+        }
+        if pending_cols and "expired_at" not in pending_cols:
+            self._conn.execute(
+                "ALTER TABLE pending_resumes ADD COLUMN expired_at INTEGER"
+            )
+        if pending_cols and "expired_reason" not in pending_cols:
+            self._conn.execute(
+                "ALTER TABLE pending_resumes ADD COLUMN expired_reason TEXT"
             )
 
     def close(self) -> None:
@@ -314,13 +331,14 @@ class StateDB:
         if pipeline is None:
             row = self._conn.execute(
                 "SELECT * FROM pending_resumes "
-                "WHERE answered_at IS NULL "
+                "WHERE answered_at IS NULL AND expired_at IS NULL "
                 "ORDER BY created_at ASC LIMIT 1"
             ).fetchone()
         else:
             row = self._conn.execute(
                 "SELECT * FROM pending_resumes "
-                "WHERE answered_at IS NULL AND pipeline = ? "
+                "WHERE answered_at IS NULL AND expired_at IS NULL "
+                "AND pipeline = ? "
                 "ORDER BY created_at ASC LIMIT 1",
                 (pipeline,),
             ).fetchone()
@@ -333,8 +351,43 @@ class StateDB:
         about repo B onto repo A."""
         rows = self._conn.execute(
             "SELECT * FROM pending_resumes "
-            "WHERE answered_at IS NULL "
+            "WHERE answered_at IS NULL AND expired_at IS NULL "
             "ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def expire_pending_resume(self, session_id: str, reason: str) -> bool:
+        """Retire an unanswered question so it stops being routable.
+
+        A question nobody can act on is worse than no question: the
+        bridge keeps offering it as a target for an orphan reply, and
+        the operator keeps seeing it re-posted. Guarded on
+        ``answered_at IS NULL`` so a reply that landed in the same tick
+        wins the race — expiry must never discard a real answer.
+
+        Returns True iff a row was expired."""
+        cursor = self._conn.execute(
+            """UPDATE pending_resumes
+               SET expired_at = ?, expired_reason = ?
+               WHERE session_id = ? AND answered_at IS NULL
+                 AND expired_at IS NULL""",
+            (int(time.time()), reason, session_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def list_expirable_pending_resumes(
+        self,
+        older_than_ts: int,
+    ) -> list[dict[str, Any]]:
+        """Unanswered, unexpired questions created at or before
+        ``older_than_ts``. The TTL sweep's candidate set."""
+        rows = self._conn.execute(
+            "SELECT * FROM pending_resumes "
+            "WHERE answered_at IS NULL AND expired_at IS NULL "
+            "AND created_at <= ? "
+            "ORDER BY created_at ASC",
+            (older_than_ts,),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -345,7 +398,8 @@ class StateDB:
         cursor = self._conn.execute(
             """UPDATE pending_resumes
                SET answer = ?, answered_at = ?
-               WHERE session_id = ? AND answered_at IS NULL""",
+               WHERE session_id = ? AND answered_at IS NULL
+                 AND expired_at IS NULL""",
             (answer, int(time.time()), session_id),
         )
         self._conn.commit()
