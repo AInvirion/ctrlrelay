@@ -12,9 +12,17 @@ name: Publish to PyPI
 #   Workflow:    publish.yml
 #   Environment: pypi
 #
-# The `pypi` environment adds a manual approval gate — releases pause
-# at the "Publish" step until a repo maintainer approves, so a
-# compromised tag alone can't silently push to PyPI.
+# Publishing is intentionally automatic: tag, publish the GitHub
+# release, and this ships to PyPI with no human step. The `pypi`
+# environment scopes the OIDC trust to this workflow — it is NOT an
+# approval gate and carries no protection rules. Anything that can
+# publish a release here can publish to PyPI.
+#
+# (This comment previously claimed the environment paused for a
+# maintainer. It never did, and someone reading it planned a release
+# around a checkpoint that was not there. If a gate is ever wanted,
+# it is a required reviewer on the `pypi` environment in repo
+# settings — not something this file can assert.)
 
 on:
   release:
