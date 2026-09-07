@@ -1430,3 +1430,108 @@ class TestSecopsEdgeCasePromptDirectives:
             or "three exits" in prompt.lower()
         )
 
+
+
+class TestSecopsFailureIsDiagnosable:
+    """A repo whose sweep died before the sessions INSERT left no trace
+    anywhere: no DB row (the UPDATE is guarded on the insert having
+    happened), no log line (the except block had none), and a Telegram
+    alert that fell back to the generic summary because the exception's
+    `str()` was empty. The operator got a repo name and nothing else."""
+
+    @pytest.mark.asyncio
+    async def test_early_failure_logs_and_names_the_cause(
+        self, tmp_path: Path
+    ) -> None:
+        import asyncio
+
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.release_lock.return_value = True
+
+        # Fail in ensure_bare_repo — i.e. BEFORE the sessions row exists,
+        # with the empty-message exception that caused the mystery alert.
+        mock_worktree = AsyncMock()
+        mock_worktree.ensure_bare_repo.side_effect = asyncio.TimeoutError()
+
+        repo = MagicMock(local_path=tmp_path / "repo")
+        repo.name = "owner/big-repo"
+
+        with patch("ctrlrelay.pipelines.secops.log_event") as mock_log:
+            results = await run_secops_all(
+                repos=[repo],
+                dispatcher=MagicMock(),
+                github=MagicMock(),
+                worktree=mock_worktree,
+                dashboard=None,
+                state_db=mock_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+
+        assert len(results) == 1
+        result = results[0]
+        assert not result.success
+
+        # The notifier picks `result.error or result.summary`. Both must
+        # now name the exception type rather than stringify to "".
+        assert result.error
+        assert "TimeoutError" in result.error
+        assert "TimeoutError" in result.summary
+        assert "owner/big-repo" in result.summary
+
+        # And the failure must reach the log even with no DB row.
+        failure_events = [
+            call for call in mock_log.call_args_list
+            if len(call.args) > 1 and call.args[1] == "secops.repo.failed"
+        ]
+        assert failure_events, "early failure must emit secops.repo.failed"
+        kwargs = failure_events[0].kwargs
+        assert kwargs["repo"] == "owner/big-repo"
+        assert kwargs["error_type"] == "TimeoutError"
+        assert kwargs["session_row_inserted"] is False
+
+    @pytest.mark.asyncio
+    async def test_logging_failure_does_not_abort_the_sweep(
+        self, tmp_path: Path
+    ) -> None:
+        """The failure logger runs in the last-resort handler, and every
+        later repo depends on that handler returning. A raising logger
+        must not take the whole pass down with it."""
+        import asyncio
+
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.release_lock.return_value = True
+
+        mock_worktree = AsyncMock()
+        mock_worktree.ensure_bare_repo.side_effect = asyncio.TimeoutError()
+
+        first = MagicMock(local_path=tmp_path / "a")
+        first.name = "owner/a"
+        second = MagicMock(local_path=tmp_path / "b")
+        second.name = "owner/b"
+
+        with patch(
+            "ctrlrelay.pipelines.secops.log_event",
+            side_effect=RuntimeError("logging backend down"),
+        ):
+            results = await run_secops_all(
+                repos=[first, second],
+                dispatcher=MagicMock(),
+                github=MagicMock(),
+                worktree=mock_worktree,
+                dashboard=None,
+                state_db=mock_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+
+        # Both repos still reported, and each names its real cause.
+        assert len(results) == 2
+        assert all(not r.success for r in results)
+        assert all("TimeoutError" in r.error for r in results)

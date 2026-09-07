@@ -21,6 +21,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A secops repo failure now says what broke.** A sweep that died before
+  the `sessions` INSERT — anything raised by `ensure_bare_repo` or
+  `create_worktree`, both network-bound and both ahead of it — left no
+  trace at all: the DB update is guarded on the insert having happened,
+  and the `except` block had no logging. With an exception whose `str()`
+  is empty the Telegram alert then fell back to its generic summary, so
+  the operator got `Error processing <repo>` and nothing else. The
+  failure is now logged as `secops.repo.failed` regardless of which
+  branch runs, and both `summary` and `error` carry the exception type.
+- **`git` timeouts stringify to something.** `asyncio.wait_for` raises a
+  bare `TimeoutError` whose message is the empty string; it is now
+  re-raised as the same type with the command, timeout, and cwd
+  attached, so it stays useful wherever it surfaces.
+- **Bare clone and fetch get a transfer-sized timeout.** Both inherited
+  the 120s budget meant for local git plumbing, which a multi-gigabyte
+  repo cannot meet on any normal link — a 1.8 GB repo failed its sweep
+  this way every day. Network transfers now use 1800s, matching claude's
+  own `default_timeout_seconds`.
+
 - **Telegram questions now say which repo and session they belong to.** A
   secops sweep posts one consolidated question per repo back-to-back and
   the agent's text rarely names its own repo, so the operator saw a run of

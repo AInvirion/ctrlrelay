@@ -686,18 +686,51 @@ async def run_secops_all(
             raise
 
         except Exception as e:
+            # Never let a repo fail silently. Two independent holes put
+            # the cause beyond reach for the operator:
+            #   1. No log_event here, so nothing reached poller.log.
+            #   2. The DB row is written only when the failure lands
+            #      AFTER the INSERT — anything raised by ensure_bare_repo
+            #      or create_worktree (both network-bound, both before
+            #      it) left no row at all.
+            # With an exception whose str() is empty (a bare
+            # asyncio.TimeoutError) the Telegram alert then fell back to
+            # the generic summary and named only the repo. Log first, so
+            # the cause survives regardless of which branch runs next.
+            detail = str(e) or type(e).__name__
+            # This is the last-resort handler for the whole repo, and
+            # every repo after this one in the sweep depends on it
+            # returning normally. A raising logger here would abort the
+            # remaining repos AND destroy the original exception —
+            # trading one repo's failure for the entire pass. Losing the
+            # log line is the strictly better failure.
+            try:
+                log_event(
+                    _logger,
+                    "secops.repo.failed",
+                    session_id=session_id,
+                    repo=repo,
+                    session_row_inserted=session_row_inserted,
+                    error_type=type(e).__name__,
+                    error=detail[:200],
+                )
+            except Exception:
+                pass
             if session_row_inserted:
                 state_db.execute(
                     "UPDATE sessions SET status = ?, summary = ?, "
                     "ended_at = ? WHERE id = ?",
-                    ("failed", f"Error: {e}", int(time.time()), session_id),
+                    ("failed", f"Error: {detail}", int(time.time()), session_id),
                 )
                 state_db.commit()
             results.append(PipelineResult(
                 success=False,
                 session_id=session_id,
-                summary=f"Error processing {repo}",
-                error=str(e),
+                summary=f"Error processing {repo}: {type(e).__name__}: {detail}",
+                # `str(e)` alone can be empty; the notifier picks
+                # `result.error or result.summary`, so an empty error
+                # silently degraded the alert to the bare summary.
+                error=f"{type(e).__name__}: {detail}",
             ))
 
         finally:
