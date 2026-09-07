@@ -137,19 +137,40 @@ async def expire_stale_questions(
 
     probes_used = 0
     for row in state_db.list_unanswered_pending_resumes():
-        if probes_used >= _MAX_RESOLVED_PROBES_PER_RUN:
-            log_event(
-                _logger,
-                "question.expiry.probe_budget_exhausted",
-                budget=_MAX_RESOLVED_PROBES_PER_RUN,
-                reason="remaining rows deferred to the next run",
-            )
-            break
         numbers = extract_referenced_numbers(row["question"])
         # Rows citing nothing are skipped without spending budget —
         # they can never be resolution-expired anyway.
         if not numbers:
             continue
+
+        # Check the budget against what this row will actually COST,
+        # before spending any of it. Testing `probes_used` alone lets a
+        # single row overshoot without limit: one question citing 300
+        # numbers passes a `0 >= 200` check and then issues all 300
+        # calls, ~75min of a job that fires hourly.
+        if len(numbers) > _MAX_RESOLVED_PROBES_PER_RUN:
+            # Bigger than any run's whole budget, so it can never be
+            # resolution-checked — expiry needs EVERY reference closed.
+            # Skip rather than break: one pathological row must not
+            # starve the rest. The TTL pass still retires it on age.
+            log_event(
+                _logger,
+                "question.expiry.row_exceeds_budget",
+                session_id=row["session_id"],
+                repo=row["repo"],
+                references=len(numbers),
+                budget=_MAX_RESOLVED_PROBES_PER_RUN,
+            )
+            continue
+        if probes_used + len(numbers) > _MAX_RESOLVED_PROBES_PER_RUN:
+            log_event(
+                _logger,
+                "question.expiry.probe_budget_exhausted",
+                budget=_MAX_RESOLVED_PROBES_PER_RUN,
+                probes_used=probes_used,
+                reason="remaining rows deferred to the next run",
+            )
+            break
         probes_used += len(numbers)
         if not await _all_references_resolved(
             github, repo=row["repo"], numbers=numbers

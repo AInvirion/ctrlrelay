@@ -304,3 +304,65 @@ class TestProbeBudget:
 
         assert [r["session_id"] for r in expired] == ["real"]
         assert github.get_issue_or_pr_state.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_single_row_cannot_overshoot_the_cap(
+        self, db: StateDB
+    ) -> None:
+        """Checking `probes_used` alone lets one row blow past the cap:
+        a question citing 300 numbers passes `0 >= 200` and then issues
+        all 300 calls. The budget must be tested against what the row
+        will cost, before any of it is spent."""
+        from ctrlrelay.core import question_expiry
+
+        cap = question_expiry._MAX_RESOLVED_PROBES_PER_RUN
+        many = " ".join(f"#{i}" for i in range(1, cap))  # just under cap
+        _add(db, "wide", f"Approve {many}?", age_seconds=60)
+        _add(db, "also-wide", f"Approve {many}?", age_seconds=60)
+
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=False)
+
+        await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        assert github.get_issue_or_pr_state.await_count <= cap
+
+    @pytest.mark.asyncio
+    async def test_oversized_row_is_skipped_not_blocking(
+        self, db: StateDB
+    ) -> None:
+        """A row citing more numbers than a whole run's budget can never
+        be resolution-checked — expiry needs every reference closed. It
+        must be skipped, not allowed to starve every row behind it."""
+        from ctrlrelay.core import question_expiry
+
+        cap = question_expiry._MAX_RESOLVED_PROBES_PER_RUN
+        huge = " ".join(f"#{i}" for i in range(1, cap + 50))
+        _add(db, "huge", f"Approve {huge}?", age_seconds=60)
+        _add(db, "normal", "Approve #7?", age_seconds=60)
+
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        expired = await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        # The oversized row is left alone; the one behind it still ran.
+        assert [r["session_id"] for r in expired] == ["normal"]
+        assert github.get_issue_or_pr_state.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_oversized_row_still_expires_on_age(
+        self, db: StateDB
+    ) -> None:
+        """Skipping it for resolution must not make it immortal."""
+        from ctrlrelay.core import question_expiry
+
+        cap = question_expiry._MAX_RESOLVED_PROBES_PER_RUN
+        huge = " ".join(f"#{i}" for i in range(1, cap + 50))
+        _add(db, "huge", f"Approve {huge}?", age_seconds=TTL + 60)
+
+        github = AsyncMock()
+        expired = await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        assert [r["session_id"] for r in expired] == ["huge"]
+        assert expired[0]["expired_reason"] == EXPIRY_REASON_TTL
