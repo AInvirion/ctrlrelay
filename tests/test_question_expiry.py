@@ -401,3 +401,38 @@ class TestReplyDuringSweepWins:
         assert [r["session_id"] for r in db.list_pending_resumes_to_execute()] == [
             "racing"
         ]
+
+
+class TestExpiredRowsNeverResume:
+    """`answer_pending_resume` refuses expired rows, but that guard only
+    holds while every process runs the same code. The bridge writes the
+    answer and the poller reads it back — separate daemons, so a deploy
+    that restarts one before the other leaves a window where an old
+    bridge stamps `answered_at` on a row the new poller already expired.
+    Observed live: the bridge ran three-day-old code for an hour after
+    the poller was upgraded."""
+
+    def test_expired_row_answered_out_of_band_is_not_executed(
+        self, db: StateDB
+    ) -> None:
+        _add(db, "s1", "Approve #1?", age_seconds=TTL + 60)
+        assert db.expire_pending_resume("s1", EXPIRY_REASON_TTL)
+
+        # An old bridge, unaware of expiry, writes the answer directly.
+        db.execute(
+            "UPDATE pending_resumes SET answer = ?, answered_at = ? "
+            "WHERE session_id = ?",
+            ("yes, merge it", 1, "s1"),
+        )
+        db.commit()
+
+        assert db.list_pending_resumes_to_execute() == []
+
+    def test_live_answered_rows_still_execute(self, db: StateDB) -> None:
+        """The filter must not swallow ordinary work."""
+        _add(db, "live", "Approve #2?", age_seconds=60)
+        assert db.answer_pending_resume("live", "yes")
+
+        assert [r["session_id"] for r in db.list_pending_resumes_to_execute()] == [
+            "live"
+        ]

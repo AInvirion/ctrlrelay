@@ -408,10 +408,21 @@ class StateDB:
     def list_pending_resumes_to_execute(self) -> list[dict[str, Any]]:
         """Rows that have been answered by the operator but not yet
         resumed. Poller's pending-resume sweeper loads these and drives
-        the pipeline resume. Oldest first so FIFO semantics hold."""
+        the pipeline resume. Oldest first so FIFO semantics hold.
+
+        Expired rows are excluded even though ``answer_pending_resume``
+        already refuses to answer one. That guard only holds while every
+        process runs the same code: the bridge writes the answer and the
+        poller reads it back, they are separate daemons, and a deploy
+        that restarts one before the other leaves a window where an old
+        bridge stamps ``answered_at`` on a row this poller has already
+        expired. Filtering on read closes that window from the side that
+        actually acts on the row.
+        """
         rows = self._conn.execute(
             "SELECT * FROM pending_resumes "
             "WHERE answered_at IS NOT NULL AND resumed_at IS NULL "
+            "AND expired_at IS NULL "
             "ORDER BY answered_at ASC"
         ).fetchall()
         return [dict(row) for row in rows]

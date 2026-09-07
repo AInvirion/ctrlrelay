@@ -44,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An expired question can no longer be resumed by a stale bridge.**
+  `answer_pending_resume` already refuses to answer an expired row, but
+  that guard only holds while every process runs the same code. The
+  bridge writes the answer and the poller reads it back — separate
+  daemons — so a deploy that restarts one before the other leaves a
+  window where an old bridge stamps `answered_at` on a row the new
+  poller has already expired, and the resume fires against state that
+  moved on. Seen live: the bridge ran three-day-old code for an hour
+  after the poller was upgraded. `list_pending_resumes_to_execute` now
+  filters expired rows too, closing the window from the side that acts
+  on them.
+
 - **A secops repo failure now says what broke.** A sweep that died before
   the `sessions` INSERT — anything raised by `ensure_bare_repo` or
   `create_worktree`, both network-bound and both ahead of it — left no
