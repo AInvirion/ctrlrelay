@@ -25,6 +25,17 @@ _PR_PROBE_RETRY_SLEEP_SECONDS = 1.0
 # single pr-list call with --head filter against GitHub.
 _PR_PROBE_TIMEOUT_SECONDS = 10
 
+# Network-bound git transfers (bare clone, fetch) get their own, much
+# larger budget than the 120s that suits local plumbing. A 1.8 GB repo
+# cannot clone or fetch its first time inside two minutes on any normal
+# link, and the failure mode was silent: `asyncio.wait_for` raises a
+# bare `TimeoutError` whose `str()` is empty, so the sweep reported
+# "Error processing <repo>" with no cause attached and wrote neither a
+# session row nor a log line. 1800s matches claude's own
+# `default_timeout_seconds` — a transfer still running past that is
+# genuinely stuck, not merely large.
+_GIT_TRANSFER_TIMEOUT_SECONDS = 1800
+
 
 class WorktreeError(Exception):
     """Raised when worktree operations fail."""
@@ -68,6 +79,7 @@ class WorktreeManager:
         for one call — useful for cheap probes that shouldn't inherit the full
         120s default when network is flaky."""
         cmd = ["git", *args]
+        effective_timeout = timeout if timeout is not None else self.timeout
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=cwd,
@@ -77,7 +89,7 @@ class WorktreeManager:
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
-                timeout=timeout if timeout is not None else self.timeout,
+                timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
             try:
@@ -85,7 +97,17 @@ class WorktreeManager:
                 await proc.wait()
             except Exception:
                 pass
-            raise
+            # Re-raise the SAME type (callers filter on TimeoutError) but
+            # with a message attached. A bare `asyncio.TimeoutError()`
+            # stringifies to "", so every layer above rendered it as
+            # empty: the secops sweep reported "Error processing <repo>"
+            # with no cause, and the operator got a Telegram alert that
+            # named a repo and nothing else.
+            raise asyncio.TimeoutError(
+                f"git {' '.join(args)} timed out after "
+                f"{effective_timeout}s"
+                + (f" (cwd={cwd})" if cwd is not None else "")
+            ) from None
         except asyncio.CancelledError:
             # Scheduler/shutdown cancel: kill the child BEFORE re-raising
             # so the git subprocess isn't left mutating the bare repo /
@@ -768,12 +790,14 @@ class WorktreeManager:
                 "fetch", "--prune", "origin",
                 "refs/heads/*:refs/heads/*",
                 cwd=bare_path,
+                timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
             )
         else:
             await self._run_git(
                 "clone", "--bare",
                 f"https://github.com/{repo}.git",
                 str(bare_path),
+                timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
             )
 
         return bare_path

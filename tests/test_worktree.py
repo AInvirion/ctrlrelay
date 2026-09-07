@@ -1533,3 +1533,69 @@ class TestRunGitCancellation:
 
         mock_proc.kill.assert_called_once()
         mock_proc.wait.assert_awaited()
+
+
+class TestGitTimeoutIsDiagnosable:
+    """A bare `asyncio.TimeoutError()` stringifies to "". That empty
+    string propagated all the way to Telegram, where the secops alert
+    rendered as "Error processing <repo>" with no cause attached."""
+
+    @pytest.mark.asyncio
+    async def test_git_timeout_carries_a_message(self, tmp_path: Path) -> None:
+        import asyncio
+
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        wt = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "bare",
+            timeout=1,
+        )
+
+        async def _always_timeout(*_a: object, **_kw: object) -> None:
+            raise asyncio.TimeoutError()
+
+        with patch(
+            "ctrlrelay.core.worktree.asyncio.wait_for", _always_timeout
+        ):
+            with pytest.raises(asyncio.TimeoutError) as excinfo:
+                await wt._run_git("fetch", "--prune", "origin", timeout=42)
+
+        message = str(excinfo.value)
+        assert message, "timeout must not stringify to an empty string"
+        assert "timed out after 42s" in message
+        assert "fetch --prune origin" in message
+
+    @pytest.mark.asyncio
+    async def test_transfer_timeout_applies_to_clone_and_fetch(
+        self, tmp_path: Path
+    ) -> None:
+        """Network transfers must not inherit the 120s plumbing budget.
+        A 1.8 GB bare clone cannot finish inside it, and the failure was
+        indistinguishable from a hung git."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.core.worktree import (
+            _GIT_TRANSFER_TIMEOUT_SECONDS,
+            WorktreeManager,
+        )
+
+        assert _GIT_TRANSFER_TIMEOUT_SECONDS > 120
+
+        wt = WorktreeManager(
+            worktrees_dir=tmp_path / "wt",
+            bare_repos_dir=tmp_path / "bare",
+        )
+        wt._run_git = AsyncMock(return_value="")  # type: ignore[method-assign]
+
+        # Bare repo absent -> clone path.
+        await wt.ensure_bare_repo("owner/repo")
+        clone_kwargs = wt._run_git.await_args_list[0].kwargs
+        assert clone_kwargs["timeout"] == _GIT_TRANSFER_TIMEOUT_SECONDS
+
+        # Bare repo present -> fetch path.
+        wt._get_bare_repo_path("owner/repo").mkdir(parents=True, exist_ok=True)
+        wt._run_git.reset_mock()
+        await wt.ensure_bare_repo("owner/repo")
+        fetch_kwargs = wt._run_git.await_args_list[0].kwargs
+        assert fetch_kwargs["timeout"] == _GIT_TRANSFER_TIMEOUT_SECONDS
