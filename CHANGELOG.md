@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves the row alone, because re-asking a dead question is recoverable
   while dropping a live one is not. The TTL pass runs first and needs no
   network, so a GitHub outage still lets age-based expiry make progress.
+  Probing is capped at 200 numbers per run so one pass cannot outlive its
+  own hourly interval — unbounded, a 2000-row backlog against a slow
+  GitHub would be 8.3h of serialized `gh api` reads. Rows past the cap
+  are examined on the next run, and the TTL pass retires them on age
+  regardless.
 
 - **`transport.telegram.ask_timeout_seconds`: how long a pipeline waits on
   your Telegram reply.** Was a hard-coded 300s in `SocketTransport.ask`,

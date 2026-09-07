@@ -243,3 +243,64 @@ class TestMigration:
         assert {"expired_at", "expired_reason"} <= cols
         # The pre-existing row survives and stays routable.
         assert len(db.list_unanswered_pending_resumes()) == 1
+
+
+class TestProbeBudget:
+    """One resolved-elsewhere pass must not outlive its own cron
+    interval. Unbounded it is one serialized `gh api` call per cited
+    number: 2000 backlogged rows against a slow GitHub is 8.3h of a job
+    that fires hourly."""
+
+    @pytest.mark.asyncio
+    async def test_probe_count_is_capped_per_run(self, db: StateDB) -> None:
+        from ctrlrelay.core import question_expiry
+
+        cap = question_expiry._MAX_RESOLVED_PROBES_PER_RUN
+        for i in range(cap + 25):
+            _add(db, f"s{i}", f"Approve #{i + 1}?", age_seconds=60)
+
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=False)
+
+        await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        assert github.get_issue_or_pr_state.await_count <= cap
+
+    @pytest.mark.asyncio
+    async def test_deferred_rows_are_still_processed_next_run(
+        self, db: StateDB
+    ) -> None:
+        """Hitting the cap defers work; it must not drop it."""
+        from ctrlrelay.core import question_expiry
+
+        cap = question_expiry._MAX_RESOLVED_PROBES_PER_RUN
+        for i in range(cap + 5):
+            _add(db, f"s{i}", f"Approve #{i + 1}?", age_seconds=60)
+
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        first = await expire_stale_questions(db, github, ttl_seconds=TTL)
+        second = await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        assert len(first) == cap
+        assert len(second) == 5
+        assert db.list_unanswered_pending_resumes() == []
+
+    @pytest.mark.asyncio
+    async def test_rows_citing_nothing_do_not_consume_budget(
+        self, db: StateDB
+    ) -> None:
+        """A repo full of 'Enable Dependabot alerts?' questions must not
+        starve the rows that can actually be resolution-expired."""
+        for i in range(50):
+            _add(db, f"noref{i}", "Enable Dependabot alerts?", age_seconds=60)
+        _add(db, "real", "Approve #7?", age_seconds=60)
+
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        expired = await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        assert [r["session_id"] for r in expired] == ["real"]
+        assert github.get_issue_or_pr_state.await_count == 1

@@ -39,6 +39,16 @@ _PR_NUM_RE = re.compile(r"(?:PR\s*)?#(\d+)(?!\d)", re.IGNORECASE)
 # a single REST read has no business taking longer than this.
 _STATE_PROBE_TIMEOUT_SECONDS = 15
 
+# Ceiling on probes per run, so one pass cannot outlive its own cron
+# interval. Unbounded, the cost is one serialized `gh api` call per
+# cited number: 2000 backlogged rows against a slow GitHub is
+# 2000 x 15s = 8.3h of a job that fires hourly, and the sweep would
+# spend all day overlapping itself. Rows past the cap are simply
+# examined on the next run — expiry is never urgent, and the TTL pass
+# retires them on age regardless of whether they were ever probed.
+# 200 x 15s worst case = 50min, inside the hour with room to spare.
+_MAX_RESOLVED_PROBES_PER_RUN = 200
+
 EXPIRY_REASON_TTL = "ttl"
 EXPIRY_REASON_RESOLVED = "resolved_elsewhere"
 
@@ -125,8 +135,22 @@ async def expire_stale_questions(
     if github is None:
         return expired
 
+    probes_used = 0
     for row in state_db.list_unanswered_pending_resumes():
+        if probes_used >= _MAX_RESOLVED_PROBES_PER_RUN:
+            log_event(
+                _logger,
+                "question.expiry.probe_budget_exhausted",
+                budget=_MAX_RESOLVED_PROBES_PER_RUN,
+                reason="remaining rows deferred to the next run",
+            )
+            break
         numbers = extract_referenced_numbers(row["question"])
+        # Rows citing nothing are skipped without spending budget —
+        # they can never be resolution-expired anyway.
+        if not numbers:
+            continue
+        probes_used += len(numbers)
         if not await _all_references_resolved(
             github, repo=row["repo"], numbers=numbers
         ):
