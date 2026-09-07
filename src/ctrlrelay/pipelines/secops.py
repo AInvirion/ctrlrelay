@@ -356,6 +356,13 @@ manual code review of the bump, or any other freelance option. If
 the right action isn't clear from policy + prior decisions + edge
 cases above, ASK with a one-line question — don't invent.
 
+Every BLOCKED question must contain ONLY items where the operator's
+answer changes what you do next. Never pad a question with items you
+have already decided — no "confirm no action wanted", no "left open
+per policy" tails, no FYI clauses. Those belong in the step-6
+summary. If nothing in the repo needs a decision, do not signal
+BLOCKED at all: finish DONE and say what you left alone.
+
    - **PR authored by `$OPERATOR` touching ONLY `.github/dependabot.yml`**
      (additive ecosystem entries, no other files changed): MAYBE
      auto-merge — but only after diff validation. These are the
@@ -390,8 +397,26 @@ cases above, ASK with a one-line question — don't invent.
      other than dependabot.yml): signal BLOCKED for operator approval.
      Never auto-merge code changes, even from the trusted operator.
    - **PRs from anyone else** (collaborators, contributors, other bots):
-     signal BLOCKED. Never on this path.
-6. Summarize actions taken
+     out of scope — see the PR scope fence below. Do not fetch them, do
+     not evaluate them, do not name them, do not signal BLOCKED on them.
+6. Summarize actions taken. Report only what you acted on or decided
+   under the queries in steps 1-4. Do not report counts or descriptions
+   of PRs outside that scope.
+
+**PR scope fence:**
+
+The ONLY open PRs in scope are the ones returned by the two author-
+filtered queries above: `--author "app/dependabot"` (step 2) and
+`--author "$OPERATOR"` (step 4). That is the complete universe of PRs
+this pipeline may look at.
+
+Never run an unfiltered `gh pr list` (or any other broad PR/issue
+search) to discover PRs beyond those two queries. A third party's open
+PR is not this pipeline's business: it cannot be merged here, it needs
+no decision here, and surfacing it only produces noise. If you catch
+yourself about to write a phrase like "no open PRs at all" or "N open
+PRs total", you have already stepped outside the fence — you can only
+speak to the author-filtered results.
 
 ## Signaling Completion
 

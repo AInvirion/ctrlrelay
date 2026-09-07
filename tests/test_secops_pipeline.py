@@ -1535,3 +1535,100 @@ class TestSecopsFailureIsDiagnosable:
         assert len(results) == 2
         assert all(not r.success for r in results)
         assert all("TimeoutError" in r.error for r in results)
+
+
+class TestNonOperatorPRsAreOutOfScope:
+    """Third-party PRs were never meant to reach this pipeline. The prompt
+    issues exactly two author-filtered queries (app/dependabot, $OPERATOR),
+    but a step-5 bullet for "PRs from anyone else" implied a wider list
+    existed, so the agent ran its own unfiltered `gh pr list` to fill the
+    category — then signalled BLOCKED on PRs it can never merge. Run
+    summaries saying "no open PRs at all" are the fingerprint of that
+    out-of-scope query."""
+
+    @staticmethod
+    def _prompt() -> str:
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        pipeline = SecopsPipeline(
+            dispatcher=MagicMock(),
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+        return pipeline._build_prompt(repo="o/r", session_id="s1")
+
+    def test_prompt_only_lists_prs_via_author_filtered_queries(self) -> None:
+        """Every `gh pr list` in the prompt must carry an --author filter.
+        An unfiltered one is what dragged third-party PRs in."""
+        prompt = self._prompt()
+
+        # Discriminate on backticks, not on a substring of the flags: a
+        # command the agent is told to run is always fenced, while the
+        # prohibition sentence names the bare command with no arguments.
+        # Keying off `--repo` instead would let `gh pr list --state open`
+        # slip past unexamined — the exact query this fence exists to
+        # forbid.
+        import re
+
+        fenced = re.findall(r"`([^`]+)`", prompt)
+        invocations = [
+            cmd.strip() for cmd in fenced
+            if cmd.strip().startswith("gh pr list")
+            and cmd.strip() != "gh pr list"
+        ]
+        assert invocations, "expected at least one PR query in the prompt"
+        for cmd in invocations:
+            assert "--author" in cmd, f"unfiltered PR query: {cmd}"
+
+    def test_guard_would_catch_an_unfiltered_query(self) -> None:
+        """The guard above is only worth having if it fails on the thing
+        it forbids. Feed it a prompt containing the query that started
+        this and confirm the same predicate rejects it."""
+        import re
+
+        bad_prompt = "Run `gh pr list --state open --json number` first."
+        fenced = re.findall(r"`([^`]+)`", bad_prompt)
+        invocations = [
+            cmd.strip() for cmd in fenced
+            if cmd.strip().startswith("gh pr list")
+            and cmd.strip() != "gh pr list"
+        ]
+
+        assert invocations, "the unfiltered query must be examined, not skipped"
+        assert not all("--author" in cmd for cmd in invocations)
+
+    def test_prompt_forbids_broadening_the_pr_search(self) -> None:
+        prompt = self._prompt()
+        lower = prompt.lower()
+
+        assert "never run an unfiltered `gh pr list`" in lower
+        assert "no open prs at all" in lower  # named as the tell-tale phrase
+
+    def test_prompt_puts_third_party_prs_out_of_scope(self) -> None:
+        prompt = self._prompt()
+        lower = prompt.lower()
+
+        assert "collaborators, contributors, other bots" in lower
+        assert "out of scope" in lower
+        assert "do not signal blocked on them" in lower
+
+    def test_prompt_still_blocks_on_operator_code_prs(self) -> None:
+        """The operator's own code PRs stay ASK — there an answer really
+        does change what happens next. Only the out-of-scope branch went."""
+        prompt = self._prompt()
+        lower = prompt.lower()
+
+        assert "signal blocked for operator approval" in lower
+        assert "never auto-merge code changes" in lower
+
+    def test_prompt_forbids_padding_questions_with_decided_items(self) -> None:
+        """Several real questions bundled a genuine Dependabot decision
+        with a non-actionable tail ("...confirm no action wanted")."""
+        prompt = self._prompt()
+        lower = prompt.lower()
+
+        assert "confirm no action wanted" in lower
+        assert "answer changes what you do next" in lower

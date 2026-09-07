@@ -62,7 +62,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repo cannot meet on any normal link — a 1.8 GB repo failed its sweep
   this way every day. Network transfers now use 1800s, matching claude's
   own `default_timeout_seconds`.
-
+- **secops no longer looks at PRs outside its two author-filtered queries.**
+  The prompt only ever tells the agent to run `gh pr list` with
+  `--author "app/dependabot"` and `--author "$OPERATOR"` — but a step-5
+  bullet for "PRs from anyone else" implied a wider list existed, so the
+  agent ran its own unfiltered `gh pr list` to populate the category and
+  then signalled BLOCKED on PRs it can never merge. That fired a Telegram
+  question every sweep, forever, and every one timed out unanswered; run
+  summaries reporting "no open PRs at all" were the fingerprint of the
+  out-of-scope query. A third party's PR is now explicitly out of scope:
+  not fetched, not evaluated, not named in the summary. An explicit scope
+  fence forbids broadening the search. Operator-authored code PRs still
+  ASK, because there the answer genuinely decides what happens next.
+- **BLOCKED questions may no longer be padded with already-decided items.**
+  Real questions were bundling a genuine Dependabot decision with a
+  non-actionable tail ("...confirm no action wanted"), burying the part
+  that needed an answer. Decided items belong in the run summary; a repo
+  with nothing to decide now finishes DONE instead of signalling BLOCKED.
 - **Telegram questions now say which repo and session they belong to.** A
   secops sweep posts one consolidated question per repo back-to-back and
   the agent's text rarely names its own repo, so the operator saw a run of
