@@ -1492,3 +1492,46 @@ class TestSecopsFailureIsDiagnosable:
         assert kwargs["repo"] == "owner/big-repo"
         assert kwargs["error_type"] == "TimeoutError"
         assert kwargs["session_row_inserted"] is False
+
+    @pytest.mark.asyncio
+    async def test_logging_failure_does_not_abort_the_sweep(
+        self, tmp_path: Path
+    ) -> None:
+        """The failure logger runs in the last-resort handler, and every
+        later repo depends on that handler returning. A raising logger
+        must not take the whole pass down with it."""
+        import asyncio
+
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.release_lock.return_value = True
+
+        mock_worktree = AsyncMock()
+        mock_worktree.ensure_bare_repo.side_effect = asyncio.TimeoutError()
+
+        first = MagicMock(local_path=tmp_path / "a")
+        first.name = "owner/a"
+        second = MagicMock(local_path=tmp_path / "b")
+        second.name = "owner/b"
+
+        with patch(
+            "ctrlrelay.pipelines.secops.log_event",
+            side_effect=RuntimeError("logging backend down"),
+        ):
+            results = await run_secops_all(
+                repos=[first, second],
+                dispatcher=MagicMock(),
+                github=MagicMock(),
+                worktree=mock_worktree,
+                dashboard=None,
+                state_db=mock_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+
+        # Both repos still reported, and each names its real cause.
+        assert len(results) == 2
+        assert all(not r.success for r in results)
+        assert all("TimeoutError" in r.error for r in results)

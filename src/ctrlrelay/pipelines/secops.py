@@ -698,15 +698,24 @@ async def run_secops_all(
             # the generic summary and named only the repo. Log first, so
             # the cause survives regardless of which branch runs next.
             detail = str(e) or type(e).__name__
-            log_event(
-                _logger,
-                "secops.repo.failed",
-                session_id=session_id,
-                repo=repo,
-                session_row_inserted=session_row_inserted,
-                error_type=type(e).__name__,
-                error=detail[:200],
-            )
+            # This is the last-resort handler for the whole repo, and
+            # every repo after this one in the sweep depends on it
+            # returning normally. A raising logger here would abort the
+            # remaining repos AND destroy the original exception —
+            # trading one repo's failure for the entire pass. Losing the
+            # log line is the strictly better failure.
+            try:
+                log_event(
+                    _logger,
+                    "secops.repo.failed",
+                    session_id=session_id,
+                    repo=repo,
+                    session_row_inserted=session_row_inserted,
+                    error_type=type(e).__name__,
+                    error=detail[:200],
+                )
+            except Exception:
+                pass
             if session_row_inserted:
                 state_db.execute(
                     "UPDATE sessions SET status = ?, summary = ?, "
