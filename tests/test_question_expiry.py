@@ -366,3 +366,38 @@ class TestProbeBudget:
 
         assert [r["session_id"] for r in expired] == ["huge"]
         assert expired[0]["expired_reason"] == EXPIRY_REASON_TTL
+
+
+class TestReplyDuringSweepWins:
+    """The sweep enumerates rows, then expires them one at a time, so a
+    reply can land in between. The expiry UPDATE is guarded on
+    `answered_at IS NULL`, so the reply wins that race — an operator
+    answer is never traded for an expiry."""
+
+    @pytest.mark.asyncio
+    async def test_reply_between_enumeration_and_expiry_is_kept(
+        self, db: StateDB
+    ) -> None:
+        _add(db, "racing", "Approve #12?", age_seconds=60)
+
+        answered: list[str] = []
+
+        async def _reply_mid_sweep(*_a: object, **_kw: object) -> dict[str, object]:
+            # Fires while the sweep is probing this very row.
+            if not answered:
+                db.answer_pending_resume("racing", "yes, merge it")
+                answered.append("racing")
+            return _state(closed=True)
+
+        github = AsyncMock()
+        github.get_issue_or_pr_state.side_effect = _reply_mid_sweep
+
+        expired = await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        # Every reference read as closed, so the sweep tried to expire —
+        # and the guard refused because the answer had landed.
+        assert answered == ["racing"]
+        assert expired == []
+        assert [r["session_id"] for r in db.list_pending_resumes_to_execute()] == [
+            "racing"
+        ]
