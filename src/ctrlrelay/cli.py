@@ -11,6 +11,7 @@ from ctrlrelay import __version__
 from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.pr_verifier import PRVerifier
+from ctrlrelay.core.question_expiry import expire_stale_questions
 
 app = typer.Typer(
     name="ctrlrelay",
@@ -1591,6 +1592,38 @@ def poller_start(
                     except Exception:
                         pass
 
+        async def _run_question_expiry_sweeper() -> None:
+            """Retire BLOCKED questions the operator can no longer
+            usefully answer: aged past the TTL, or whose cited PRs and
+            issues have all been closed or merged outside ctrlrelay.
+
+            Hourly, not per-minute: expiry is never urgent, and the
+            resolved-elsewhere pass costs one `gh api` read per cited
+            number. TTL runs first and needs no network, so a GitHub
+            outage still lets the age-based sweep make progress.
+            """
+            ttl = getattr(
+                getattr(config.transport, "telegram", None),
+                "question_ttl_seconds",
+                None,
+            )
+            if not ttl:
+                return
+            try:
+                expired = await expire_stale_questions(
+                    state_db, github, ttl_seconds=ttl,
+                )
+            except Exception as e:
+                console.print(
+                    f"[yellow]question_expiry_sweeper: failed ({e})[/yellow]"
+                )
+                return
+            for row in expired:
+                console.print(
+                    f"[dim]question_expiry: retired "
+                    f"{row['session_id']} ({row['expired_reason']})[/dim]"
+                )
+
         async def _run_pending_resume_sweeper() -> None:
             """Drain pending_resumes rows that an operator answered via
             Telegram while the original BLOCKED session had already torn
@@ -1917,6 +1950,16 @@ def poller_start(
                 cron_expr="* * * * *",
                 func=_run_pending_resume_sweeper,
             )
+            # Retire questions nobody can act on any more. Without
+            # this the pending_resumes table only grows: unanswered
+            # rows stay live targets for orphan reply routing and get
+            # re-posted every sweep, including ones whose PR was
+            # merged by hand days earlier.
+            scheduler.add_cron_job(
+                name="question_expiry_sweeper",
+                cron_expr="0 * * * *",
+                func=_run_question_expiry_sweeper,
+            )
             # Register the personalization auto-pull only when the
             # operator has both configured the personalization block
             # AND set a cron expression. Either alone is intentional
@@ -1940,7 +1983,8 @@ def poller_start(
             console.print(
                 f"[dim]Scheduler: secops cron={config.schedules.secops_cron} "
                 f"tz={config.timezone} | "
-                f"pending_resume_sweeper=every 1m"
+                f"pending_resume_sweeper=every 1m | "
+                f"question_expiry_sweeper=hourly"
                 f"{personalization_cron_summary}[/dim]"
             )
 

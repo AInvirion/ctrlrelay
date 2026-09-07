@@ -118,6 +118,16 @@ class TelegramConfig(BaseModel):
     #
     # Lower bound of 60s: shorter is a misconfiguration, not a preference.
     ask_timeout_seconds: int = Field(default=900, ge=60)
+    # How long an UNANSWERED question stays routable before it is
+    # retired. `ask_timeout_seconds` only bounds the in-session wait;
+    # the pending_resumes row outlives it so a later reply can still
+    # drive the resume. Without a ceiling those rows never die: a
+    # question whose PR was merged by hand weeks ago stays a live
+    # target for an orphan Telegram reply, and each sweep re-posts it.
+    # 48h spans a weekend-adjacent gap without letting a stale decision
+    # act on a PR whose state has since moved on. Lower bound of 3600s:
+    # anything shorter races the operator's own working day.
+    question_ttl_seconds: int = Field(default=172800, ge=3600)
 
     @field_validator("socket_path", mode="before")
     @classmethod

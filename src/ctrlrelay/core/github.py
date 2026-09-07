@@ -376,6 +376,32 @@ class GitHubCLI:
         )
         return json.loads(output)
 
+    async def get_issue_or_pr_state(
+        self,
+        repo: str,
+        number: int,
+        *,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Return ``{"number", "state", "is_pr", "merged"}`` for a
+        number that may name either an issue or a PR.
+
+        A BLOCKED question only ever cites ``#N``; nothing in the text
+        says which kind it is. The REST ``issues`` endpoint covers both
+        — GitHub models a PR as an issue — so one call answers it
+        without guessing and retrying. ``state`` is ``"open"`` or
+        ``"closed"``; ``merged`` is only meaningful when ``is_pr``.
+        """
+        output = await self._run_gh(
+            "api", f"repos/{repo}/issues/{number}",
+            "--jq",
+            '{number: .number, state: .state, '
+            'is_pr: (.pull_request != null), '
+            'merged: (.pull_request.merged_at != null)}',
+            timeout=timeout,
+        )
+        return json.loads(output)
+
     async def comment_on_issue(
         self,
         repo: str,
