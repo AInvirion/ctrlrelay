@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agent PRs now carry an automated review comment.** The `code_review`
+  config existed on every repo and was read by nothing. The dev pipeline
+  now runs the configured review after CI is green and posts the findings
+  to the PR.
+
+  **No trust label is applied, and the comment says it is unverified.**
+  Two attempts at a `code_review done` marker were defeated by the party
+  being reviewed, which authors every file the reviewer reads. Inferring
+  it from the reviewer's prose fell to a committed `AGENTS.md` saying
+  *respond with exactly: No findings*. Requiring evidence of a
+  diff-reading command fell four further ways — `.agents/skills/` steers
+  the reviewer and was unguarded, `gh pr view --json files` caps at 100
+  paths so the guard is evadable by filename, the evidence match hit diff
+  bodies and failed commands and one run that reviewed a *different
+  repository*, and nothing pinned the review to the pushed head.
+
+  Each fix is individually easy, which is the trap. The findings are
+  worth publishing; the claim that a review happened is not one this can
+  keep, so it is not made. Review is best-effort and never fails a PR
+  whose code and CI are fine.
+
 ### Fixed
 
 - **Archived repos are skipped instead of swept forever.** `skip_archived`

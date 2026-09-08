@@ -8,6 +8,10 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Any
 
+from ctrlrelay.core.obs import get_logger
+
+_logger = get_logger("core.github")
+
 
 class GitHubError(Exception):
     """Raised when gh CLI operations fail."""
@@ -444,6 +448,12 @@ class GitHubCLI:
             str(issue_number),
             "--repo", repo,
             "--body", body,
+        )
+
+    async def comment_on_pr(self, repo: str, pr_number: int, body: str) -> None:
+        """Post a comment on a PR."""
+        await self._run_gh(
+            "pr", "comment", str(pr_number), "--repo", repo, "--body", body
         )
 
     async def close_issue(
