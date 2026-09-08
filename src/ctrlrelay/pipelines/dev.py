@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from ctrlrelay.core.checkpoint import CheckpointStatus
+from ctrlrelay.core.code_review import (
+    REVIEW_DONE_LABEL,
+    format_review_comment,
+    run_code_review,
+)
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
@@ -548,6 +553,90 @@ def _build_fix_prompt(pr_number: int, verification: VerificationResult) -> str:
     )
 
 
+async def _review_and_mark(
+    *,
+    github: GitHubCLI,
+    repo: str,
+    session_id: str,
+    pr_number: int,
+    worktree_path: Path,
+    base_branch: str,
+    config: Any = None,
+) -> None:
+    """Run the configured review and mark the PR only if it really ran.
+
+    Best-effort by design: a reviewer that is missing, wedged or broken
+    must not fail a PR whose code and CI are fine. The cost of that
+    choice is that an unmarked PR is ambiguous between "reviewer was
+    down" and "review found nothing" — so the marker means exactly one
+    thing, "a review read this diff", and its absence is the prompt to
+    look at the log.
+    """
+    method = getattr(config, "method", "cli")
+    if method == "off":
+        return
+
+    outcome = await run_code_review(
+        repo=repo,
+        worktree_path=worktree_path,
+        base_branch=base_branch,
+        cli_command=getattr(config, "cli_command", "codex review"),
+        timeout_seconds=getattr(config, "timeout_seconds", 900),
+        session_id=session_id,
+    )
+
+    if not outcome.may_mark_reviewed:
+        # Deliberately no label. Marking here would certify the exact
+        # case the marker exists to catch: a run that inspected nothing
+        # but exited 0.
+        log_event(
+            _logger,
+            "dev.code_review.not_marked",
+            session_id=session_id,
+            repo=repo,
+            pr_number=pr_number,
+            status=outcome.status.value,
+            error=outcome.error[:200],
+        )
+        return
+
+    if getattr(config, "comment_on_pr", True):
+        try:
+            await github.comment_on_pr(
+                repo, pr_number, format_review_comment(outcome)
+            )
+        except Exception as e:
+            log_event(
+                _logger,
+                "dev.code_review.comment_failed",
+                session_id=session_id,
+                repo=repo,
+                pr_number=pr_number,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
+
+    try:
+        await github.add_label(repo, pr_number, REVIEW_DONE_LABEL)
+        log_event(
+            _logger,
+            "dev.code_review.marked",
+            session_id=session_id,
+            repo=repo,
+            pr_number=pr_number,
+        )
+    except Exception as e:
+        log_event(
+            _logger,
+            "dev.code_review.label_failed",
+            session_id=session_id,
+            repo=repo,
+            pr_number=pr_number,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+
+
 async def _verify_and_fix_pr(
     *,
     pipeline: DevPipeline,
@@ -681,6 +770,7 @@ async def run_dev_issue(
     max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
     pr_verifier: PRVerifier | None = None,
     ci_wait_timeout_seconds: int = 600,
+    code_review: Any = None,
 ) -> PipelineResult:
     """Run dev pipeline for a single issue."""
     session_id = f"dev-{repo.replace('/', '-')}-{issue_number}-{uuid.uuid4().hex[:8]}"
@@ -878,6 +968,28 @@ async def run_dev_issue(
                 max_attempts=max_fix_attempts,
                 lock_handle=lock,
             )
+
+            # Review the branch before the PR is handed to a human.
+            # After verification, so a PR that is still being fixed is
+            # not reviewed mid-flight; before cleanup, while the
+            # worktree still exists for the reviewer to read.
+            if result.success:
+                try:
+                    review_base = await worktree.get_default_branch(repo)
+                except Exception:
+                    # Best-effort: a review is not worth failing a green
+                    # PR over, and the marker's absence already says one
+                    # did not happen.
+                    review_base = "main"
+                await _review_and_mark(
+                    github=github,
+                    repo=repo,
+                    session_id=session_id,
+                    pr_number=int(result.outputs["pr_number"]),
+                    worktree_path=worktree_path,
+                    base_branch=review_base,
+                    config=code_review,
+                )
 
         # Reacquire the lock for the post-verify cleanup phase (remove
         # worktree / delete branch). Usually SHORT budget (cleanup is

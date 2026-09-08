@@ -184,11 +184,41 @@ class DeployConfig(BaseModel):
 
 
 class CodeReviewConfig(BaseModel):
-    """Code review configuration for a repo."""
+    """Code review run over an agent branch before it is handed over.
 
-    method: str = "mcp_then_cli"
-    mcp_tool: str = "mcp__codex-reviewer__codex_review"
+    The orchestrator runs this, not the agent: a party cannot certify its
+    own work, and a prompt instruction to self-review is unverifiable.
+    """
+
+    # "cli" runs ``cli_command`` directly. "off" disables review for the
+    # repo. The old "mcp_then_cli" is accepted so existing configs keep
+    # loading, but it is no longer the default and no longer leads with
+    # the MCP path — that server is essentially never connected, so
+    # every review fell through to the CLI after paying for the attempt.
+    method: str = "cli"
     cli_command: str = "codex review"
+    # Per-run cap. A wedged reviewer must not be able to hold a dev
+    # session open until the session's own timeout.
+    timeout_seconds: int = Field(default=900, ge=30)
+    # Findings are posted to the PR. Off means the marker still lands but
+    # the detail stays in the log.
+    comment_on_pr: bool = True
+
+    @field_validator("method")
+    @classmethod
+    def normalise_method(cls, v: str) -> str:
+        """Map legacy and off-ish spellings; never refuse to load.
+
+        This field was parsed and ignored for its entire existence, so
+        configs in the wild may carry any value at all. Making one of
+        them fatal would stop the daemon booting over a setting that
+        never did anything — a much worse outcome than running the
+        default review. Unknown values fall back to "cli".
+        """
+        lowered = (v or "").strip().lower()
+        if lowered in ("off", "none", "disabled", "false", "no"):
+            return "off"
+        return "cli"
 
 
 class AutomationConfig(BaseModel):

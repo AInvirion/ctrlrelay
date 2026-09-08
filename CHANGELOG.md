@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agent PRs are reviewed before they reach you, and say so.** The
+  `code_review` config existed on every repo and was read by nothing, so
+  a PR that had been reviewed and one that never was looked identical.
+  The dev pipeline now runs the configured review after CI is green and
+  before handing over, posts the findings, and labels the PR
+  `code_review done`.
+
+  The orchestrator runs it, not the agent: a party cannot certify its own
+  work, and a prompt instruction to self-review can be skipped or
+  misreported.
+
+  The marker names no tool, model or vendor, and neither does the
+  comment — which backend runs is an implementation detail that does not
+  belong in repository history.
+
+  **It means exactly one thing: a review read this diff.** It is withheld
+  when the reviewer could not be run, timed out, produced no verdict, or
+  said it could not inspect the tree. That last case is why an exit-code
+  check is not enough — review CLIs announce "I could not access the
+  repository contents" in prose and still exit 0, so checking the code
+  alone would stamp the label on precisely the runs it exists to catch.
+  Only the reviewer's own verdict is scanned, never the whole transcript:
+  the transcript contains the diff, so scanning all of it matches source
+  code that merely mentions such a phrase — including this feature's own
+  tests, which is how the first version of the check declared a good
+  review unreadable.
+
+  Silence is treated the same way. A `cli_command` that exits 0 with
+  nothing to say has reviewed nothing, and gets no marker.
+
+### Changed
+
+- **`code_review.method` defaults to `"cli"`.** The old `"mcp_then_cli"`
+  led with an MCP server that is essentially never connected, so every
+  review paid for a failed attempt before falling through. It is accepted
+  and mapped to `"cli"`; `"none"`, `"disabled"`, `"false"` and `"no"` map
+  to `"off"`. An unrecognised value falls back to `"cli"` rather than
+  refusing to load — the field was parsed and ignored for its entire
+  existence, so a config in the wild carrying anything must not stop the
+  daemon from booting.
+
 ## [0.10.0] - 2026-09-08
 
 ### Added

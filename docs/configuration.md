@@ -183,7 +183,7 @@ repos:
 | `local_path` | path | conditional | derived | Where the repo is checked out on disk for human use. Optional when `paths.repo_root` is set (then derived as `${repo_root}/${owner.lower()}/${repo}`, since v0.4.0); required otherwise. An explicit value always wins as override. ctrlrelay itself uses bare mirrors under `paths.bare_repos`. |
 | `dev_branch_template` | string | no | `"fix/issue-{n}"` | Branch-name template for dev-pipeline runs. `{n}` is replaced by the issue number. |
 | `automation` | object | no | (defaults) | See [automation](#repos-automation). |
-| `code_review` | object | no | (defaults) | Reserved for code-review policy. Currently unused by the bundled pipelines. |
+| `code_review` | object | no | (defaults) | Review run over an agent branch before its PR is handed over. See [code_review](#code_review). |
 | `deploy` | object | no | `null` | Reserved for deploy policy. Currently surfaced in `ctrlrelay config repos` but otherwise inert. |
 
 ### repos[].automation
@@ -488,3 +488,49 @@ repos:
 Always run `ctrlrelay config validate` after editing the file. It prints the
 resolved transport, repo count, and parsed timezone — and surfaces any pydantic
 validation errors with line context.
+
+## code_review
+
+A review the **orchestrator** runs over an agent's branch after CI is
+green and before the PR is handed to a human. It is deliberately not a
+prompt instruction: a party cannot certify its own work, and an agent
+told to self-review can skip the step or misreport it.
+
+```yaml
+repos:
+  - name: "owner/repo"
+    code_review:
+      method: "cli"
+      cli_command: "codex review"
+      timeout_seconds: 900
+      comment_on_pr: true
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `method` | string | `"cli"` | `"cli"` runs `cli_command`; `"off"` disables review for the repo. `"none"`, `"disabled"`, `"false"` and `"no"` are accepted as `"off"`. The legacy `"mcp_then_cli"` maps to `"cli"` — the MCP path is essentially never connected, so leading with it only paid for a failed attempt. An unrecognised value falls back to `"cli"` rather than failing to load: this field was parsed and ignored for its whole existence, so a config in the wild carrying anything must not stop the daemon booting. |
+| `cli_command` | string | `"codex review"` | Invoked with `--base <default branch>` appended, in the session's worktree. |
+| `timeout_seconds` | int | `900` | Per-run cap, minimum 30. A wedged reviewer must not hold a dev session open to the session's own timeout. |
+| `comment_on_pr` | bool | `true` | Post the findings to the PR. When false the marker still lands and the detail stays in the log. |
+
+### The `code_review done` marker
+
+A PR that was reviewed is labelled **`code_review done`**. The label
+names no tool, model or vendor, and neither does the posted comment —
+which backend runs is an implementation detail and does not belong in
+repository history.
+
+**The marker means exactly one thing: a review read this diff.** It is
+withheld when the reviewer could not be run, timed out, produced no
+verdict, or reported that it could not inspect the tree. That last case
+is the one worth stating plainly: review CLIs announce "I could not
+access the repository contents" in prose and still exit 0, so an
+exit-code check alone would stamp the label on precisely the runs it
+exists to catch.
+
+Only the reviewer's own verdict is examined for that, not the whole
+transcript — the transcript contains the diff, so scanning all of it
+matches source code that merely mentions such a phrase.
+
+The absence of the marker is therefore the signal to look at the log.
+Review is best-effort and never fails a PR whose code and CI are fine.

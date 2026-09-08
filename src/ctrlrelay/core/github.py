@@ -416,6 +416,35 @@ class GitHubCLI:
             "--body", body,
         )
 
+    async def comment_on_pr(
+        self, repo: str, pr_number: int, body: str
+    ) -> None:
+        """Post a comment on a PR (PRs are issues to this endpoint)."""
+        await self._run_gh(
+            "pr", "comment", str(pr_number), "--repo", repo, "--body", body
+        )
+
+    async def add_label(self, repo: str, number: int, label: str) -> None:
+        """Add a label to an issue or PR, creating it if absent.
+
+        `gh` fails the whole call when the label does not exist yet, so
+        the create is attempted first and its "already exists" failure
+        ignored — the only outcome that matters is that the label is
+        applied afterwards.
+        """
+        try:
+            await self._run_gh(
+                "label", "create", label,
+                "--repo", repo,
+                "--description", "A code review ran against this pull request",
+                "--color", "0E8A16",
+            )
+        except GitHubError:
+            pass
+        await self._run_gh(
+            "pr", "edit", str(number), "--repo", repo, "--add-label", label
+        )
+
     async def close_issue(
         self,
         repo: str,
