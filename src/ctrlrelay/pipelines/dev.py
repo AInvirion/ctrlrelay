@@ -364,6 +364,8 @@ class DevPipeline:
             working_dir=ctx.worktree_path,
             state_file=ctx.state_file,
             resume_session_id=resume_uuid,
+            repo=ctx.repo,
+            issue_number=ctx.issue_number,
         )
 
         if result.agent_session_id:

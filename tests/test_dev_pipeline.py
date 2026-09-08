@@ -1818,3 +1818,53 @@ class TestIssueCommentsInPrompt:
 
         assert "@unknown" in rendered
         assert "still matters" in rendered
+
+
+class TestSpawnCorrelationFields:
+    """#156: the dispatcher logs repo/issue on every session event, so the
+    pipelines have to hand it those fields instead of making the reader
+    re-parse the composite session id."""
+
+    @pytest.mark.asyncio
+    async def test_resume_forwards_repo_and_issue_number(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import PipelineContext
+        from ctrlrelay.pipelines.dev import DevPipeline
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="dev-o-r-3-abc",
+            exit_code=0,
+            state=CheckpointState(
+                status=CheckpointStatus.DONE,
+                session_id="dev-o-r-3-abc",
+                summary="done",
+            ),
+        )
+
+        pipeline = DevPipeline(
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=MagicMock(),
+            dashboard=None,
+            state_db=MagicMock(),
+            transport=None,
+        )
+
+        ctx = PipelineContext(
+            session_id="dev-o-r-3-abc",
+            repo="owner/repo",
+            worktree_path=tmp_path,
+            context_path=tmp_path / "CLAUDE.md",
+            state_file=tmp_path / "state.json",
+            issue_number=3,
+        )
+
+        await pipeline.resume(ctx, "proceed")
+
+        call_kwargs = mock_dispatcher.spawn_session.call_args.kwargs
+        assert call_kwargs["repo"] == "owner/repo"
+        assert call_kwargs["issue_number"] == 3

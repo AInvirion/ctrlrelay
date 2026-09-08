@@ -305,6 +305,34 @@ tail -f ~/.ctrlrelay/logs/poller.error.log
 The poller prints one line per detected issue and one line per pipeline outcome.
 The bridge prints connection events and Telegram API errors.
 
+### Tracing one agent session
+
+Log lines are newline-delimited JSON, and the dispatcher — the module that
+spawns and supervises every agent subprocess — tags each of its events with
+the session id, so one grep reconstructs a whole run:
+
+```bash
+grep dev-owner-repo-42- ~/.ctrlrelay/logs/poller.log | jq -c '{ts, level, event}'
+```
+
+The events it emits:
+
+| Event | Level | When |
+|---|---|---|
+| `dispatcher.session.start` | INFO | Subprocess about to launch. Carries `binary`, `timeout`, `resume`, `prompt_hash`, `prompt_len`. |
+| `dispatcher.session.finished` | INFO | Subprocess exited. Carries `exit_code`, `checkpoint_status`, `elapsed_ms`. |
+| `dispatcher.session.subprocess_failed` | ERROR | Non-zero exit, with `stderr_tail`. |
+| `dispatcher.session.timeout` | ERROR | The `timeout` seconds elapsed and the child was killed. |
+| `dispatcher.session.spawn_failed` | ERROR | The binary could not be exec'd at all. |
+| `dispatcher.session.cancelled` | INFO | Daemon shutdown killed the child mid-run. |
+| `dispatcher.checkpoint.missing` | WARNING | The session ended without writing a checkpoint. |
+| `dispatcher.checkpoint.read_failed` | ERROR | A checkpoint file existed but would not parse. |
+| `dispatcher.binary.fallback` | WARNING | `claude` was not on `PATH`; a well-known path was used instead. Expect this when the unit's `PATH` is minimal. |
+| `dispatcher.binary.unresolved` | WARNING | Not on `PATH` and not at any known path — sessions are about to start failing to spawn. |
+
+Prompts and agent output never appear in plaintext: only a short SHA-256
+prefix and a length are logged.
+
 ## Inspecting state
 
 ### `ctrlrelay status`
