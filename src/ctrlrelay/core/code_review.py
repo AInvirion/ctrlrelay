@@ -51,6 +51,14 @@ _UNREADABLE_PATTERNS = (
     "failed to decode models response",
     "usage limit",
     "not supported when using",
+    # "There are no code changes to review" from a reviewer pointed at
+    # the wrong tree. This branch always has a diff — that is why a
+    # review was requested — so the claim can only mean the reviewer
+    # looked somewhere else. Marking it reviewed would be a false pass,
+    # which is worse than an unreadable one: it is confidently wrong.
+    "no code changes to review",
+    "no changes to review",
+    "identical to the specified merge-base",
 )
 
 # Long enough for a real review of a sizeable diff, short enough that a

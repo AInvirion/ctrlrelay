@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Silence is treated the same way. A `cli_command` that exits 0 with
   nothing to say has reviewed nothing, and gets no marker.
 
+  So is a review of the wrong tree. A verdict of "there are no code
+  changes to review" can only mean the reviewer looked somewhere else —
+  the branch under review always has a diff — and a false pass is worse
+  than an unreadable one, because it is confidently wrong.
+
 ### Changed
 
 - **`code_review.method` defaults to `"cli"`.** The old `"mcp_then_cli"`

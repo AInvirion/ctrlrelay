@@ -367,3 +367,51 @@ class TestSilenceIsNotAReview:
             )
 
         assert outcome.may_mark_reviewed is False
+
+
+class TestAReviewOfTheWrongTreeIsNotAPass:
+    """Found by pointing the gate at its own PR. Reviewing code that
+    itself invokes the reviewer caused a nested run in a scratch repo,
+    whose verdict — "there are no code changes to review" — was about an
+    empty temp directory. The gate called that REVIEWED.
+
+    A false pass is worse than an unreadable one: it is confidently
+    wrong, and it is exactly what the marker promises cannot happen. A
+    branch under review always has a diff, so this claim can only mean
+    the reviewer looked somewhere else."""
+
+    @pytest.mark.parametrize(
+        "verdict",
+        [
+            "The working tree is identical to the specified merge-base "
+            "commit, so there are no code changes to review.",
+            "There are no code changes to review.",
+            "No changes to review in this branch.",
+        ],
+    )
+    def test_no_changes_claims_are_rejected(self, verdict: str) -> None:
+        assert looks_unreadable(f"transcript\ncodex\n{verdict}\n")
+
+    @pytest.mark.asyncio
+    async def test_such_a_review_earns_no_marker(self, tmp_path: Path) -> None:
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(
+            return_value=(
+                b"transcript\ncodex\nThe working tree is identical to the "
+                b"specified merge-base commit, so there are no code changes "
+                b"to review.\n",
+                b"",
+            )
+        )
+
+        with patch(
+            "ctrlrelay.core.code_review.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            outcome = await run_code_review(
+                repo="o/r", worktree_path=tmp_path, base_branch="main"
+            )
+
+        assert outcome.status is ReviewStatus.UNREADABLE
+        assert outcome.may_mark_reviewed is False
