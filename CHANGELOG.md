@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The dispatcher now logs.** `core/dispatcher.py` is the module that
+  spawns and supervises every agent session, and it was the only core
+  module with no structured logging at all — so the one place where a
+  session is born, times out or dies was the one place with no trail.
+  It now emits `dispatcher.session.start` / `.finished` / `.timeout` /
+  `.subprocess_failed` / `.spawn_failed` / `.cancelled`, plus
+  `dispatcher.checkpoint.missing` when a session ends without
+  signalling and `dispatcher.checkpoint.read_failed` when the file
+  won't parse. Every failure event carries `error_type`, so a bare
+  `asyncio.TimeoutError` — whose `str()` is empty — is still
+  identifiable in the log. Prompts and agent output are never logged in
+  plaintext: only a `hash_text()` prefix and a length. See
+  [Tracing one agent session](https://ainvirion.github.io/ctrlrelay/operations/#tracing-one-agent-session).
+- **`dispatcher.binary.fallback` / `.unresolved` warn when `claude`
+  isn't on `PATH`.** Under systemd and launchd the unit's `PATH` is
+  minimal, and falling through to a hard-coded path is the usual
+  precursor to every session failing to spawn. It used to happen
+  silently.
+
+### Changed
+
+- `spawn_session` takes optional `repo` and `issue_number` arguments,
+  which the dev, task and secops pipelines now pass. They are
+  observability-only — they let dispatcher events be correlated with
+  pipeline events without re-parsing the composite session id.
+
 ## [0.9.0] - 2026-09-07
 
 ### Added
