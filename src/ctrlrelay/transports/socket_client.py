@@ -16,7 +16,7 @@ from ctrlrelay.bridge.protocol import (
     serialize_message,
 )
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
-from ctrlrelay.transports.base import TransportError
+from ctrlrelay.transports.base import TransportError, TransportTimeoutError
 
 _logger = get_logger("transport.socket")
 
@@ -122,7 +122,7 @@ class SocketTransport:
             await self._send_message(msg)
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError as e:
-            raise TransportError("Timeout waiting for response") from e
+            raise TransportTimeoutError("Timeout waiting for response") from e
         finally:
             self._pending.pop(msg.request_id, None)
             self._on_ack.pop(msg.request_id, None)
@@ -204,11 +204,21 @@ class SocketTransport:
             response = await self._send_and_wait(msg, timeout, on_ack=_mark_posted)
         except Exception as e:
             if not posted:
+                # A timeout is not a failed delivery. The bridge ACKs only
+                # after Telegram has accepted the message, so a post slower
+                # than our wait leaves us timing out first and the bridge
+                # succeeding afterwards — logging "post_failed" there would
+                # contradict the bridge's own "posted", which is the same
+                # false-claim problem this change exists to remove, just
+                # pointing the other way.
+                timed_out = isinstance(e, TransportTimeoutError)
                 log_event(
                     _logger,
-                    "dev.question.post_failed",
+                    "dev.question.post_unknown"
+                    if timed_out
+                    else "dev.question.post_failed",
                     **common,
-                    reason="send_failed",
+                    reason="timeout_no_ack" if timed_out else "send_failed",
                     error=str(e)[:200],
                 )
             raise

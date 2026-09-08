@@ -9,6 +9,17 @@ class TransportError(Exception):
     """Raised when transport operations fail."""
 
 
+class TransportTimeoutError(TransportError):
+    """Raised when a request was sent but no reply arrived in time.
+
+    Distinct from its parent because the outcomes differ: a write that
+    failed is a known non-delivery, whereas a timeout leaves delivery
+    genuinely unknown — the bridge may still post the question after we
+    stop waiting. Subclasses TransportError so existing handlers are
+    unaffected.
+    """
+
+
 @runtime_checkable
 class Transport(Protocol):
     """Protocol for orchestrator-to-human communication.

@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import json
 import logging
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -854,3 +856,62 @@ class TestSensitivePayloadsAreNotLogged:
                 task.cancel()
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class TestTimeoutIsNotClaimedAsFailedDelivery:
+    """The bridge ACKs only after Telegram has accepted the message. A
+    post slower than our wait means we time out first and the bridge
+    succeeds afterwards — so logging `post_failed` there contradicts the
+    bridge's own `posted`. That is the same false claim this change
+    removes, pointing the other way."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_logs_unknown_not_failed(self, tmp_path: Path) -> None:
+        import asyncio
+
+        from ctrlrelay.transports.base import TransportTimeoutError
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        transport = SocketTransport(socket_path=tmp_path / "s.sock")
+        transport._writer = MagicMock()
+        transport._writer.is_closing.return_value = False
+        transport._writer.drain = AsyncMock()
+
+        async def _never_answers(*_a: object, **_kw: object) -> None:
+            raise asyncio.TimeoutError()
+
+        with patch(
+            "ctrlrelay.transports.socket_client.asyncio.wait_for", _never_answers
+        ), patch("ctrlrelay.transports.socket_client.log_event") as log:
+            with pytest.raises(TransportTimeoutError):
+                await transport.ask("approve #1?", session_id="s", repo="o/r")
+
+        events = [c.args[1] for c in log.call_args_list if len(c.args) > 1]
+        assert "dev.question.post_unknown" in events
+        assert "dev.question.post_failed" not in events
+
+    @pytest.mark.asyncio
+    async def test_a_real_write_failure_still_reports_failed(
+        self, tmp_path: Path
+    ) -> None:
+        """A write that failed is a known non-delivery — that one keeps
+        its definite label."""
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        transport = SocketTransport(socket_path=tmp_path / "s.sock")
+        transport._writer = None  # connected is False -> _send_message raises
+
+        with patch("ctrlrelay.transports.socket_client.log_event") as log:
+            with pytest.raises(Exception):
+                await transport.ask("approve #1?", session_id="s", repo="o/r")
+
+        events = [c.args[1] for c in log.call_args_list if len(c.args) > 1]
+        assert "dev.question.post_failed" in events
+        assert "dev.question.post_unknown" not in events
+
+    def test_timeout_is_catchable_as_transport_error(self) -> None:
+        """Existing handlers filter on TransportError and must keep
+        working."""
+        from ctrlrelay.transports.base import TransportError, TransportTimeoutError
+
+        assert issubclass(TransportTimeoutError, TransportError)

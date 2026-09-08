@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A slow post is no longer logged as a failed one.** The bridge ACKs
+  only after Telegram has accepted a question, so a post slower than the
+  transport's wait meant the transport timed out first and logged
+  `dev.question.post_failed` while the bridge logged
+  `dev.question.posted` for the same request — a false claim in the
+  opposite direction to the one being fixed. A timeout now emits
+  `dev.question.post_unknown`, because the outcome genuinely is unknown;
+  a write that actually failed keeps the definite `post_failed`.
+  `TransportTimeoutError` subclasses `TransportError`, so existing
+  handlers are unaffected.
+
 - **`dev.question.posted` no longer claims a delivery that never
   happened.** The transport logged it before writing to the socket and the
   bridge logged it before calling Telegram, so a failed write or a Telegram
