@@ -194,9 +194,11 @@ class CodeReviewConfig(BaseModel):
     # old "mcp_then_cli" is mapped to "cli" — that server is essentially
     # never connected, so leading with it only paid for a failed attempt.
     method: str = "cli"
-    # Read-only on purpose. With host access the orchestrator executes
-    # agent-authored branch code before any human has seen it; a real run
-    # was observed invoking pytest.
+    # Read-only on purpose: the reviewer cannot write to disk or reach
+    # the network. It does NOT stop branch code executing — the reviewer
+    # ran pytest from the tree in a real run, as your user, with read
+    # access to the whole disk. It bounds the damage; it does not
+    # eliminate it.
     cli_command: str = 'codex review -c sandbox_mode="read-only"'
     timeout_seconds: int = Field(default=900, ge=30)
     comment_on_pr: bool = True

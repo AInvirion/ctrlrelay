@@ -11,8 +11,7 @@ from typing import Any
 
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.code_review import (
-    INSTRUCTION_FILE_PATTERNS,
-    REVIEW_DONE_LABEL,
+    extract_verdict,
     format_review_comment,
     run_code_review,
 )
@@ -554,7 +553,7 @@ def _build_fix_prompt(pr_number: int, verification: VerificationResult) -> str:
     )
 
 
-async def _review_and_mark(
+async def _review_and_comment(
     *,
     github: GitHubCLI,
     repo: str,
@@ -564,29 +563,22 @@ async def _review_and_mark(
     base_branch: str,
     config: Any = None,
 ) -> None:
-    """Run the configured review and mark the PR only on proven evidence.
+    """Run the configured review and post what it found.
+
+    No label, and no claim that a review happened — see
+    :mod:`ctrlrelay.core.code_review` for why that claim cannot be made
+    against a branch the reviewed party authored.
 
     Best-effort throughout: a reviewer that is missing, wedged or broken
-    must never fail a PR whose code and CI are already fine. The cost is
-    that an unmarked PR is ambiguous between "reviewer was down" and
-    "review found nothing" — so the marker means exactly one thing, "a
-    reviewer read this diff", and its absence sends you to the log.
+    must never fail a PR whose code and CI are already fine.
     """
     if getattr(config, "method", "cli") == "off":
         return
-
-    try:
-        changed_paths = await github.list_pr_files(repo, pr_number)
-    except Exception:
-        # Unknown file list means the instruction-file guard cannot run,
-        # and a guard that cannot run must not be assumed to have passed.
-        changed_paths = list(INSTRUCTION_FILE_PATTERNS)
 
     outcome = await run_code_review(
         repo=repo,
         worktree_path=worktree_path,
         base_branch=base_branch,
-        changed_paths=changed_paths,
         cli_command=getattr(
             config, "cli_command", 'codex review -c sandbox_mode="read-only"'
         ),
@@ -594,10 +586,10 @@ async def _review_and_mark(
         session_id=session_id,
     )
 
-    if not outcome.may_mark_reviewed:
+    if not outcome.worth_posting:
         log_event(
             _logger,
-            "dev.code_review.not_marked",
+            "dev.code_review.not_posted",
             session_id=session_id,
             repo=repo,
             pr_number=pr_number,
@@ -606,38 +598,34 @@ async def _review_and_mark(
         )
         return
 
-    if getattr(config, "comment_on_pr", True):
-        try:
-            await github.comment_on_pr(
-                repo,
-                pr_number,
-                format_review_comment(outcome, worktree_path=worktree_path),
-            )
-        except Exception as e:
-            log_event(
-                _logger,
-                "dev.code_review.comment_failed",
-                session_id=session_id,
-                repo=repo,
-                pr_number=pr_number,
-                error_type=type(e).__name__,
-                error=str(e)[:200],
-            )
-
-    try:
-        await github.add_label(repo, pr_number, REVIEW_DONE_LABEL)
+    if not getattr(config, "comment_on_pr", True):
         log_event(
             _logger,
-            "dev.code_review.marked",
+            "dev.code_review.completed",
             session_id=session_id,
             repo=repo,
             pr_number=pr_number,
-            evidence_count=len(outcome.evidence),
+            findings=extract_verdict(outcome.output)[:2000],
+        )
+        return
+
+    try:
+        await github.comment_on_pr(
+            repo,
+            pr_number,
+            format_review_comment(outcome, worktree_path=worktree_path),
+        )
+        log_event(
+            _logger,
+            "dev.code_review.commented",
+            session_id=session_id,
+            repo=repo,
+            pr_number=pr_number,
         )
     except Exception as e:
         log_event(
             _logger,
-            "dev.code_review.label_failed",
+            "dev.code_review.comment_failed",
             session_id=session_id,
             repo=repo,
             pr_number=pr_number,
@@ -1001,7 +989,7 @@ async def run_dev_issue(
                     )
                 if review_base is not None:
                     try:
-                        await _review_and_mark(
+                        await _review_and_comment(
                             github=github,
                             repo=repo,
                             session_id=session_id,
