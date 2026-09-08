@@ -896,10 +896,32 @@ async def resume_secops_from_pending(
     # Dependabot API answers 403 — the exact waste #163 removes, through
     # a door the gate does not cover.
     if archived is not None and await archived.is_archived(repo):
+        summary = f"Skipped resume of {repo}: repository is archived on GitHub"
+        # Close the session out. The caller only marks the
+        # pending_resumes row consumed, so returning early without this
+        # leaves the sessions row at status='blocked' with no ended_at —
+        # a resume that was handled but looks forever outstanding, in
+        # every status listing and count.
+        try:
+            state_db.execute(
+                "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
+                "WHERE id = ?",
+                ("done", summary, int(time.time()), session_id),
+            )
+            state_db.commit()
+        except Exception as e:
+            log_event(
+                _logger,
+                "secops.resume.archived_status_update_failed",
+                session_id=session_id,
+                repo=repo,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
         return PipelineResult(
             success=True,
             session_id=session_id,
-            summary=f"Skipped resume of {repo}: repository is archived on GitHub",
+            summary=summary,
         )
 
     if question:

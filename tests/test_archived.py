@@ -254,6 +254,20 @@ class TestResumeIsGatedToo:
         state_db.acquire_lock.assert_not_called()
         worktree.create_worktree.assert_not_awaited()
 
+        # The session must be closed out. The caller only marks the
+        # pending_resumes row consumed, so an early return that skips
+        # this leaves the row at status='blocked' with no ended_at —
+        # handled, but forever outstanding in every status listing.
+        updates = [
+            c for c in state_db.execute.call_args_list
+            if c.args and "UPDATE sessions" in c.args[0]
+        ]
+        assert updates, "archived resume must write a terminal session state"
+        params = updates[0].args[1]
+        assert params[0] == "done"
+        assert "archived" in params[1].lower()
+        assert params[2] is not None  # ended_at
+
     @pytest.mark.asyncio
     async def test_an_active_repo_still_resumes(self, tmp_path: Path) -> None:
         """The gate must not swallow ordinary resumes."""

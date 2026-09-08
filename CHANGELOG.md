@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sits blocked, and the answer arriving later would otherwise take the
   lock, build a worktree and spawn the agent against it.
 
+  **Known limit:** a repo archived in the window between a poll returning
+  its batch and the handlers dispatching it is still processed once.
+  Closing that would cost a lookup per dispatched issue to save a single
+  wasted session in a race measured in seconds — more machinery than the
+  defect. The next cycle catches it.
+
 ## [0.10.0] - 2026-09-08
 
 ### Added
