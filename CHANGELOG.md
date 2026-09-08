@@ -17,8 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opposite direction to the one being fixed. A timeout now emits
   `dev.question.post_unknown`, because the outcome genuinely is unknown;
   a write that actually failed keeps the definite `post_failed`.
-  `TransportTimeoutError` subclasses `TransportError`, so existing
-  handlers are unaffected.
+  Delivery is only ever confirmed by the far side's acknowledgement;
+  everything else divides into "the bytes provably never left" (a
+  definite failure) and "they may have" (unknown). A `drain()` failure
+  is unknown — `write()` had already handed the data over — and on the
+  bridge, a Telegram timeout or bare transport error is unknown too,
+  while `BadRequest`/`Forbidden`/`InvalidToken` are Telegram answering
+  "no". Note `BadRequest` subclasses `NetworkError` in
+  python-telegram-bot, so that check cannot be a plain isinstance; it
+  lives in `is_ambiguous_delivery` next to the library that defines the
+  taxonomy. `TransportTimeoutError` subclasses
+  `TransportUnknownDeliveryError` subclasses `TransportError`, so
+  existing handlers are unaffected.
 
 - **`dev.question.posted` no longer claims a delivery that never
   happened.** The transport logged it before writing to the socket and the

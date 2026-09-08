@@ -915,3 +915,78 @@ class TestTimeoutIsNotClaimedAsFailedDelivery:
         from ctrlrelay.transports.base import TransportError, TransportTimeoutError
 
         assert issubclass(TransportTimeoutError, TransportError)
+
+
+class TestOnlyDefiniteFailuresAreCalledFailures:
+    """Delivery is only ever confirmed by the far side. Everything else
+    splits in two: the bytes provably never left (definite failure), or
+    they may have (unknown). Enumerating ambiguous cases one at a time
+    does not converge — the discriminator is whether anything was
+    written."""
+
+    @pytest.mark.asyncio
+    async def test_drain_failure_is_unknown_not_failed(
+        self, tmp_path: Path
+    ) -> None:
+        """`write()` already handed the bytes to the transport, so the
+        bridge may have received and acted on the ASK."""
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        transport = SocketTransport(socket_path=tmp_path / "s.sock")
+        transport._writer = MagicMock()
+        transport._writer.is_closing.return_value = False
+        transport._writer.drain = AsyncMock(side_effect=ConnectionResetError())
+
+        with patch("ctrlrelay.transports.socket_client.log_event") as log:
+            with pytest.raises(Exception):
+                await transport.ask("approve #1?", session_id="s", repo="o/r")
+
+        events = [c.args[1] for c in log.call_args_list if len(c.args) > 1]
+        assert "dev.question.post_unknown" in events
+        assert "dev.question.post_failed" not in events
+
+    @pytest.mark.asyncio
+    async def test_never_connected_is_a_definite_failure(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        transport = SocketTransport(socket_path=tmp_path / "s.sock")
+        transport._writer = None
+
+        with patch("ctrlrelay.transports.socket_client.log_event") as log:
+            with pytest.raises(Exception):
+                await transport.ask("approve #1?", session_id="s", repo="o/r")
+
+        events = [c.args[1] for c in log.call_args_list if len(c.args) > 1]
+        assert "dev.question.post_failed" in events
+        assert "dev.question.post_unknown" not in events
+
+
+class TestTelegramAmbiguityTaxonomy:
+    """`BadRequest` subclasses `NetworkError` in python-telegram-bot, so
+    a plain isinstance check against NetworkError would sweep definite
+    rejections into the ambiguous bucket."""
+
+    def test_timeouts_and_bare_network_errors_are_ambiguous(self) -> None:
+        from telegram.error import NetworkError, TimedOut
+
+        from ctrlrelay.bridge.telegram_handler import is_ambiguous_delivery
+
+        assert is_ambiguous_delivery(TimedOut())
+        assert is_ambiguous_delivery(NetworkError("connection dropped"))
+
+    def test_telegram_saying_no_is_definite(self) -> None:
+        from telegram.error import BadRequest, Forbidden, InvalidToken
+
+        from ctrlrelay.bridge.telegram_handler import is_ambiguous_delivery
+
+        assert not is_ambiguous_delivery(BadRequest("chat not found"))
+        assert not is_ambiguous_delivery(Forbidden("bot was blocked"))
+        assert not is_ambiguous_delivery(InvalidToken())
+
+    def test_badrequest_really_does_subclass_networkerror(self) -> None:
+        """Guards the reason the helper cannot be a simple isinstance."""
+        from telegram.error import BadRequest, NetworkError
+
+        assert issubclass(BadRequest, NetworkError)

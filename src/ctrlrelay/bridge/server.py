@@ -19,7 +19,10 @@ from ctrlrelay.bridge.protocol import (
     parse_message,
     serialize_message,
 )
-from ctrlrelay.bridge.telegram_handler import TelegramHandler
+from ctrlrelay.bridge.telegram_handler import (
+    TelegramHandler,
+    is_ambiguous_delivery,
+)
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 
 if TYPE_CHECKING:
@@ -365,9 +368,20 @@ class BridgeServer:
                 )
             except Exception as e:
                 _log.warning("bridge: ASK failed, request_id=%s err=%s", msg.request_id, e)
+                # Same rule as the transport: only claim a definite
+                # failure when Telegram actually answered. A timeout or a
+                # bare transport error can be raised after Telegram
+                # accepted the message, in which case the question IS on
+                # the operator's phone and "post_failed" is a lie.
+                #
+                # The taxonomy is not intuitive, so it lives next to the
+                # library that defines it — see is_ambiguous_delivery.
+                unknown = is_ambiguous_delivery(e)
                 log_event(
                     _logger,
-                    "dev.question.post_failed",
+                    "dev.question.post_unknown"
+                    if unknown
+                    else "dev.question.post_failed",
                     **post_fields,
                     reason=type(e).__name__,
                     error=str(e)[:200],

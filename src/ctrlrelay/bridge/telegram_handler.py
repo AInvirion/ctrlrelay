@@ -7,11 +7,30 @@ import logging
 from typing import Awaitable, Callable
 
 from telegram import Bot, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.error import NetworkError, TimedOut
 
 _log = logging.getLogger(__name__)
 
 IncomingMessageHandler = Callable[[str, int | None], Awaitable[None]]
 
+
+
+def is_ambiguous_delivery(exc: BaseException) -> bool:
+    """True when a send may have reached Telegram despite raising.
+
+    Delivery is only confirmed by a response. A timeout or a bare
+    transport error can be raised *after* Telegram accepted the message,
+    so calling those a failed post would put a lie in the log while the
+    question sits on the operator's phone.
+
+    The taxonomy is not intuitive and is worth stating: `BadRequest`
+    subclasses `NetworkError` here, so `isinstance(exc, NetworkError)`
+    would sweep definite rejections into the ambiguous bucket. Only
+    `TimedOut` and a bare `NetworkError` are genuinely unknown —
+    `BadRequest`, `Forbidden`, `InvalidToken` and the rest are Telegram
+    answering "no".
+    """
+    return isinstance(exc, TimedOut) or type(exc) is NetworkError
 
 class TelegramHandler:
     """Handles Telegram Bot API communication — outbound (send/ask) and

@@ -16,7 +16,11 @@ from ctrlrelay.bridge.protocol import (
     serialize_message,
 )
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
-from ctrlrelay.transports.base import TransportError, TransportTimeoutError
+from ctrlrelay.transports.base import (
+    TransportError,
+    TransportTimeoutError,
+    TransportUnknownDeliveryError,
+)
 
 _logger = get_logger("transport.socket")
 
@@ -91,13 +95,27 @@ class SocketTransport:
             pass
 
     async def _send_message(self, msg: BridgeMessage) -> None:
-        """Send message to bridge."""
+        """Send message to bridge.
+
+        Raises ``TransportError`` while nothing has been written — a
+        definite non-delivery — and ``TransportUnknownDeliveryError``
+        once bytes may have reached the far side. `drain()` failing does
+        not mean the bridge never saw the request: `write()` has already
+        handed the data to the transport, so the ASK may well have been
+        received and acted on.
+        """
         if not self.connected:
             raise TransportError("Transport not connected")
         assert self._writer is not None
         data = serialize_message(msg).encode()
-        self._writer.write(data)
-        await self._writer.drain()
+        try:
+            self._writer.write(data)
+        except Exception as e:
+            raise TransportError(f"Write failed: {e}") from e
+        try:
+            await self._writer.drain()
+        except Exception as e:
+            raise TransportUnknownDeliveryError(f"Drain failed: {e}") from e
 
     async def _send_and_wait(
         self,
@@ -211,14 +229,18 @@ class SocketTransport:
                 # contradict the bridge's own "posted", which is the same
                 # false-claim problem this change exists to remove, just
                 # pointing the other way.
-                timed_out = isinstance(e, TransportTimeoutError)
+                # Only claim a definite failure when the request
+                # provably never left. Anything past the write is
+                # unknown: no ACK arrived, but the bridge may have
+                # received and acted on it regardless.
+                unknown = isinstance(e, TransportUnknownDeliveryError)
                 log_event(
                     _logger,
                     "dev.question.post_unknown"
-                    if timed_out
+                    if unknown
                     else "dev.question.post_failed",
                     **common,
-                    reason="timeout_no_ack" if timed_out else "send_failed",
+                    reason=type(e).__name__ if unknown else "send_failed",
                     error=str(e)[:200],
                 )
             raise

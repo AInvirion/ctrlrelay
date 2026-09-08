@@ -9,14 +9,24 @@ class TransportError(Exception):
     """Raised when transport operations fail."""
 
 
-class TransportTimeoutError(TransportError):
-    """Raised when a request was sent but no reply arrived in time.
+class TransportUnknownDeliveryError(TransportError):
+    """Raised when a request may or may not have been delivered.
 
-    Distinct from its parent because the outcomes differ: a write that
-    failed is a known non-delivery, whereas a timeout leaves delivery
-    genuinely unknown — the bridge may still post the question after we
-    stop waiting. Subclasses TransportError so existing handlers are
-    unaffected.
+    Delivery is only ever *confirmed* by the far side's acknowledgement.
+    Everything else divides in two: we know the bytes never left (a
+    definite failure), or we do not (unknown). Enumerating individual
+    ambiguous cases does not converge — the honest discriminator is
+    whether anything was written at all.
+
+    Subclasses TransportError so existing handlers are unaffected.
+    """
+
+
+class TransportTimeoutError(TransportUnknownDeliveryError):
+    """Sent, but no reply arrived in time.
+
+    A specific unknown: the request went out and the far side may still
+    act on it after we stop waiting.
     """
 
 
