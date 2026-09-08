@@ -262,3 +262,32 @@ class TestExecFailuresAreNotReportedAsOffline:
 
         assert "could not be run" in message
         assert "executable" in message
+
+
+class TestPeerVanishedMidWrite:
+    """`write tcp …: write: broken pipe` is a connectivity failure that
+    contains none of the other network markers, so it fell through to
+    API_ERROR — a miss of this classifier's own purpose."""
+
+    def test_broken_pipe_reads_as_a_network_failure(self) -> None:
+        from ctrlrelay.core.network import GhFailureKind, classify_gh_failure
+
+        failure = classify_gh_failure(
+            "write tcp 10.0.0.5:52341->140.82.114.6:443: write: broken pipe",
+            returncode=1,
+        )
+
+        assert failure.kind is GhFailureKind.NETWORK_UNAVAILABLE
+
+    def test_eof_in_an_api_body_is_not_treated_as_an_outage(self) -> None:
+        """The reason bare "EOF" is deliberately not a network pattern:
+        gh passes API response bodies through verbatim, so matching it
+        would misclassify real API errors as outages — the same mistake
+        in the other direction."""
+        from ctrlrelay.core.network import GhFailureKind, classify_gh_failure
+
+        failure = classify_gh_failure(
+            "HTTP 422: Validation failed, unexpected EOF in body", returncode=1
+        )
+
+        assert failure.kind is GhFailureKind.API_ERROR

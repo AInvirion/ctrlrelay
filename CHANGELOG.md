@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator to check their wifi while their `gh` install is broken. Only a
   hung `gh` (timeout) still reads as connectivity — there the child
   launched and then stopped responding.
+- **`broken pipe` now reads as a network failure.** A peer that vanished
+  mid-write carries none of the other network markers, so it fell through
+  to a generic API error — a miss of the classifier's own purpose. Bare
+  `EOF` is deliberately still not matched: `gh` passes API response
+  bodies through verbatim, so matching it would misclassify real API
+  errors as outages, the same mistake in the other direction.
 
 ### Added
 

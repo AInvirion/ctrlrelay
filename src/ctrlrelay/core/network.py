@@ -38,6 +38,11 @@ _NETWORK_PATTERNS = (
     "no route to host",
     "connection refused",
     "connection reset by peer",
+    # A peer that vanished mid-write. Deliberately not matching bare
+    # "EOF" alongside it: gh passes API response bodies through verbatim
+    # and "EOF" is common enough in them to misclassify real API errors
+    # as outages, which is the mistake in the other direction.
+    "broken pipe",
     "i/o timeout",
     "tls handshake",
     "x509:",
