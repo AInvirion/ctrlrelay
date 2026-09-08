@@ -8,6 +8,10 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Any
 
+from ctrlrelay.core.obs import get_logger, log_event
+
+_logger = get_logger("core.github")
+
 
 class GitHubError(Exception):
     """Raised when gh CLI operations fail."""
@@ -444,6 +448,46 @@ class GitHubCLI:
             str(issue_number),
             "--repo", repo,
             "--body", body,
+        )
+
+    async def comment_on_pr(self, repo: str, pr_number: int, body: str) -> None:
+        """Post a comment on a PR."""
+        await self._run_gh(
+            "pr", "comment", str(pr_number), "--repo", repo, "--body", body
+        )
+
+    async def list_pr_files(self, repo: str, pr_number: int) -> list[str]:
+        """Paths changed by a PR."""
+        output = await self._run_gh(
+            "pr", "view", str(pr_number), "--repo", repo,
+            "--json", "files", "--jq", ".files[].path",
+        )
+        return [line.strip() for line in output.splitlines() if line.strip()]
+
+    async def add_label(self, repo: str, number: int, label: str) -> None:
+        """Add a label, creating it first if absent.
+
+        `gh` fails the whole call on an unknown label, so the create is
+        attempted first and its "already exists" failure ignored — the
+        add is the call whose success actually matters.
+        """
+        try:
+            await self._run_gh(
+                "label", "create", label,
+                "--repo", repo,
+                "--description", "A code review read this pull request's diff",
+                "--color", "0E8A16",
+            )
+        except GitHubError as e:
+            log_event(
+                _logger,
+                "github.label_create_skipped",
+                repo=repo,
+                label=label,
+                error=str(e)[:200],
+            )
+        await self._run_gh(
+            "pr", "edit", str(number), "--repo", repo, "--add-label", label
         )
 
     async def close_issue(

@@ -184,11 +184,36 @@ class DeployConfig(BaseModel):
 
 
 class CodeReviewConfig(BaseModel):
-    """Code review configuration for a repo."""
+    """Review run over an agent branch before its PR is handed over.
 
-    method: str = "mcp_then_cli"
-    mcp_tool: str = "mcp__codex-reviewer__codex_review"
-    cli_command: str = "codex review"
+    The orchestrator runs it, not the agent: a party cannot certify its
+    own work.
+    """
+
+    # "cli" runs ``cli_command``; "off" disables review for the repo. The
+    # old "mcp_then_cli" is mapped to "cli" — that server is essentially
+    # never connected, so leading with it only paid for a failed attempt.
+    method: str = "cli"
+    # Read-only on purpose. With host access the orchestrator executes
+    # agent-authored branch code before any human has seen it; a real run
+    # was observed invoking pytest.
+    cli_command: str = 'codex review -c sandbox_mode="read-only"'
+    timeout_seconds: int = Field(default=900, ge=30)
+    comment_on_pr: bool = True
+
+    @field_validator("method")
+    @classmethod
+    def normalise_method(cls, v: str) -> str:
+        """Map legacy and off-ish spellings; never refuse to load.
+
+        This field was parsed and ignored for its entire existence, so
+        configs in the wild may carry any value. Making one fatal would
+        stop the daemon booting over a setting that never did anything.
+        """
+        lowered = (v or "").strip().lower()
+        if lowered in ("off", "none", "disabled", "false", "no"):
+            return "off"
+        return "cli"
 
 
 class AutomationConfig(BaseModel):
