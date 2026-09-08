@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -163,3 +164,120 @@ class TestArchivedRepoTracker:
         github.repo_is_archived = AsyncMock(return_value=False)
         fresh = ArchivedRepoTracker(github=github)
         assert await fresh.is_archived("owner/repo") is False
+
+
+class TestConcurrentProbesAreDeduplicated:
+    """The poller and the secops sweep share one tracker and can reach
+    the same repo at once. Without per-repo serialisation both observe
+    the cache miss before either awaits, so the module's "one probe, one
+    log" contract held only single-threaded."""
+
+    @pytest.mark.asyncio
+    async def test_simultaneous_callers_probe_once(self) -> None:
+        import asyncio
+
+        calls: list[str] = []
+
+        async def slow(repo: str, timeout: int | None = None) -> bool:
+            calls.append(repo)
+            await asyncio.sleep(0.05)
+            return True
+
+        github = AsyncMock()
+        github.repo_is_archived = slow
+        tracker = ArchivedRepoTracker(github=github)
+
+        results = await asyncio.gather(
+            *[tracker.is_archived("o/r") for _ in range(5)]
+        )
+
+        assert all(results)
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_different_repos_are_not_serialised_against_each_other(
+        self,
+    ) -> None:
+        """The lock is per repo — one slow probe must not stall the rest
+        of a 88-repo cycle."""
+        import asyncio
+
+        async def slow(repo: str, timeout: int | None = None) -> bool:
+            await asyncio.sleep(0.05)
+            return False
+
+        github = AsyncMock()
+        github.repo_is_archived = slow
+        tracker = ArchivedRepoTracker(github=github)
+
+        started = asyncio.get_event_loop().time()
+        await asyncio.gather(*[tracker.is_archived(f"o/r{i}") for i in range(10)])
+        elapsed = asyncio.get_event_loop().time() - started
+
+        # Serialised would be ~0.5s; concurrent is ~0.05s.
+        assert elapsed < 0.3
+
+
+class TestResumeIsGatedToo:
+    """The sweep gate covers new runs only. A repo can be archived while
+    a session sits blocked, and the answer arriving afterwards would take
+    the lock, build a worktree and spawn the agent against a repo whose
+    Dependabot API answers 403 — the waste #163 removes, through a door
+    the gate did not cover."""
+
+    @pytest.mark.asyncio
+    async def test_archived_repo_is_not_resumed_into(self, tmp_path: Path) -> None:
+        from ctrlrelay.pipelines.secops import resume_secops_from_pending
+
+        tracker = AsyncMock()
+        tracker.is_archived.return_value = True
+
+        state_db = MagicMock()
+        worktree = AsyncMock()
+
+        result = await resume_secops_from_pending(
+            session_id="secops-o-r-1",
+            repo="o/r",
+            answer="yes",
+            dispatcher=AsyncMock(),
+            github=AsyncMock(),
+            worktree=worktree,
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+            contexts_dir=tmp_path,
+            archived=tracker,
+        )
+
+        assert result.success
+        assert "archived" in result.summary.lower()
+        state_db.acquire_lock.assert_not_called()
+        worktree.create_worktree.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_active_repo_still_resumes(self, tmp_path: Path) -> None:
+        """The gate must not swallow ordinary resumes."""
+        from ctrlrelay.pipelines.secops import resume_secops_from_pending
+
+        tracker = AsyncMock()
+        tracker.is_archived.return_value = False
+
+        state_db = MagicMock()
+        state_db.acquire_lock.return_value = False  # stop right after the gate
+
+        result = await resume_secops_from_pending(
+            session_id="secops-o-r-1",
+            repo="o/r",
+            answer="yes",
+            dispatcher=AsyncMock(),
+            github=AsyncMock(),
+            worktree=AsyncMock(),
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+            contexts_dir=tmp_path,
+            archived=tracker,
+        )
+
+        state_db.acquire_lock.assert_called_once()
+        assert "archived" not in (result.summary or "").lower()

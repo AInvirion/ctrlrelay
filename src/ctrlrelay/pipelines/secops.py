@@ -873,6 +873,7 @@ async def resume_secops_from_pending(
     contexts_dir: Path,
     automation: Any = None,
     question: str | None = None,
+    archived: Any = None,
 ) -> PipelineResult:
     """Resume a BLOCKED secops session using an answer that arrived via
     Telegram after the original session had already torn down.
@@ -889,6 +890,18 @@ async def resume_secops_from_pending(
     sweep skips re-asking. Optional for backwards compat with older
     callers that pre-date the persistence work.
     """
+    # The sweep gate covers new runs only. A repo can be archived while a
+    # session sits blocked, and an answer arriving afterwards would take
+    # the lock, build a worktree and spawn the agent against a repo whose
+    # Dependabot API answers 403 — the exact waste #163 removes, through
+    # a door the gate does not cover.
+    if archived is not None and await archived.is_archived(repo):
+        return PipelineResult(
+            success=True,
+            session_id=session_id,
+            summary=f"Skipped resume of {repo}: repository is archived on GitHub",
+        )
+
     if question:
         _record_decisions_from_answer(
             state_db,

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Archived repos are skipped instead of swept forever.** `skip_archived`
+  only ever existed in the config generator, so a repo archived after its
+  `orchestrator.yaml` entry was written kept being polled and swept — the
+  daily secops run spawned a full agent session to discover the Dependabot
+  API answers 403 for archived repos, then wrote a benign `done`. Quiet
+  enough to accumulate unnoticed; two such repos were found live.
+
+  Detection fails open by design. This check gates every piece of work the
+  daemon does, so a bug here would not skip one repo — it could silently
+  stop the orchestrator while the process looked healthy. Only a definite
+  `isArchived: true` skips: a failed lookup, timeout, auth error or
+  malformed response all mean "unknown", and unknown keeps polling.
+  Nothing derived from an error is cached, so one flaky call cannot
+  disable a repo for the daemon's lifetime.
+
+  Probes are serialised per repo, since the poller and the sweep share a
+  tracker and would otherwise both probe on a simultaneous cache miss.
+  The resume path is gated too — a repo can be archived while a session
+  sits blocked, and the answer arriving later would otherwise take the
+  lock, build a worktree and spawn the agent against it.
+
 ## [0.10.0] - 2026-09-08
 
 ### Added

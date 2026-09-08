@@ -57,6 +57,11 @@ class ArchivedRepoTracker:
     # logs. Cleared on the next successful probe so a NEW outage is still
     # visible. This never affects the answer we return.
     _failed_probes: set[str] = field(default_factory=set, repr=False)
+    # One lock per repo. The poller and the secops sweep share a tracker
+    # and can reach the same repo concurrently; without this both observe
+    # the cache miss before either awaits, so the "one probe, one log"
+    # contract in the docstring above is only true single-threaded.
+    _locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
 
     async def is_archived(self, repo: str) -> bool:
         """Return True only for a confirmed-archived repo.
@@ -69,6 +74,16 @@ class ArchivedRepoTracker:
         if repo in self.archived_repos:
             return True
 
+        lock = self._locks.setdefault(repo, asyncio.Lock())
+        async with lock:
+            # Re-check: a concurrent caller may have confirmed it while we
+            # waited, in which case we must not probe again.
+            if repo in self.archived_repos:
+                return True
+            return await self._probe(repo)
+
+    async def _probe(self, repo: str) -> bool:
+        """One probe, holding this repo's lock."""
         try:
             result: Any = await self.github.repo_is_archived(
                 repo, timeout=ARCHIVED_PROBE_TIMEOUT_SECONDS,

@@ -1744,6 +1744,10 @@ def poller_start(
                                     else None
                                 ),
                                 question=row.get("question"),
+                                # Same tracker as the poller and the
+                                # sweep: a repo archived while a session
+                                # sat blocked must not be resumed into.
+                                archived=poller.archived_tracker,
                             )
                         elif pipeline_name == "dev":
                             # Dev resume needs the repo's branch template
