@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A broken `gh` install no longer reports itself as "network
+  unavailable".** `subprocess.run` raising `OSError` means the child could
+  not be exec'd — a non-executable binary, a bad path, a wrong
+  architecture. Python does no networking here, `gh` does, so an `OSError`
+  raised on our side can never mean offline. Reporting it that way was the
+  exact misdiagnosis this classification exists to prevent: it sends the
+  operator to check their wifi while their `gh` install is broken. Only a
+  hung `gh` (timeout) still reads as connectivity — there the child
+  launched and then stopped responding.
+- **`broken pipe` now reads as a network failure.** A peer that vanished
+  mid-write carries none of the other network markers, so it fell through
+  to a generic API error — a miss of the classifier's own purpose. Bare
+  `EOF` is deliberately still not matched: `gh` passes API response
+  bodies through verbatim, so matching it would misclassify real API
+  errors as outages, the same mistake in the other direction.
+- **A resource limit is no longer blamed on the `gh` install.** `EMFILE`
+  and `ENOMEM` also reach the classifier as `OSError` from a failed spawn,
+  but answering those with "install GitHub CLI" is the same misdirection
+  wearing a different hat. Only exec-family errnos say the install is
+  broken; the rest surface the errno.
+- **Go transport failures are no longer reported as API errors.** `gh`
+  renders a failed round-trip as `Get "https://…": <cause>`, which by
+  construction means no HTTP response arrived — so `EOF`, `http2: client
+  connection lost`, `request canceled` and `remote error: tls: handshake
+  failure` were all landing as "GitHub API call failed". Matching the
+  shape rather than each wording catches the family; a real API error
+  carries `(HTTP nnn)` instead and is unaffected. `read tcp …: connection
+  timed out` (a link dropped mid-request) is matched too.
+- **TLS trust failures are no longer called transient.** An untrusted CA
+  or a skewed clock is a persistent local problem, and "retry later" can
+  never fix it. These now report as `tls_trust` with remediation pointing
+  at the CA bundle and the system clock. A certificate valid for the
+  wrong host stays a network failure — that is the captive-portal case.
+- **`gh` stderr is escaped before Rich renders it.** Stderr containing
+  bracketed text (e.g. `[/docs]`) raised `MarkupError`, replacing the
+  diagnostic with a traceback and skipping the exit — losing the raw
+  detail the line exists to show.
+- **The startup `gh` probe is time-bounded.** Without a timeout a hung
+  `gh` wedged `poller start` indefinitely, and the one exception branch
+  that really does mean connectivity could never fire.
+
 ### Added
 
 - **The dispatcher now logs.** `core/dispatcher.py` is the module that
@@ -34,6 +77,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which the dev, task and secops pipelines now pass. They are
   observability-only — they let dispatcher events be correlated with
   pipeline events without re-parsing the composite session id.
+
+### Fixed
+
+- **Startup no longer blames your GitHub auth when you are offline.**
+  `poller start` probes `gh api user` before it does anything else, and
+  every way that probe can fail — unplugged network, expired token, a
+  500 from the API — exits 1, so the CLI printed
+  `Command '[...]' returned non-zero exit status 1.` for all of them.
+  A new `core/network.py` classifies the failure from gh's own stderr
+  into network / auth / rate-limit / API-error (plus "gh not
+  installed"), and the CLI prints the matching message —
+  `Network unavailable — could not reach api.github.com` in yellow when
+  it is transient, a pointer to `gh auth status` when the credentials are the
+  problem, the HTTP status when the API answered. gh's raw stderr is
+  still printed underneath.
 
 ## [0.9.0] - 2026-09-07
 

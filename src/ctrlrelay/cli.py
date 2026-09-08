@@ -5,6 +5,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from ctrlrelay import __version__
@@ -12,6 +13,10 @@ from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.pr_verifier import PRVerifier
 from ctrlrelay.core.question_expiry import expire_stale_questions
+
+# Startup probe cap. `GitHubCLI` uses 60s for ordinary calls; this one
+# gates daemon startup, so a hung gh must not wedge it indefinitely.
+_GH_PROBE_TIMEOUT_SECONDS = 60
 
 app = typer.Typer(
     name="ctrlrelay",
@@ -1035,10 +1040,33 @@ def poller_start(
                 capture_output=True,
                 text=True,
                 check=True,
+                # Without this a hung gh hangs `poller start` forever, and
+                # the TimeoutExpired branch of the classifier — the one
+                # case that really does mean connectivity — can never fire.
+                timeout=_GH_PROBE_TIMEOUT_SECONDS,
             )
             username = result.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            console.print(f"[red]Failed to get GitHub username:[/red] {e}")
+        except (subprocess.SubprocessError, OSError) as e:
+            # `gh` exits 1 for offline, expired-token and API-error alike,
+            # so classify from its stderr — otherwise operators debug auth
+            # when the laptop is simply offline (#32).
+            from ctrlrelay.core.network import gh_failure_from_exception
+
+            failure = gh_failure_from_exception(e)
+            color = "yellow" if failure.is_transient else "red"
+            console.print(
+                f"[{color}]Could not determine GitHub username:[/{color}] "
+                f"{failure.message}"
+            )
+            if failure.stderr:
+                # gh's stderr is arbitrary text and Rich parses [...] as
+                # markup: a stderr containing something like "[/docs]"
+                # raises MarkupError, which replaces the diagnostic with a
+                # traceback and skips the exit — losing exactly the detail
+                # this line exists to show.
+                console.print(
+                    f"[dim]gh: {rich_escape(failure.stderr)}[/dim]"
+                )
             raise typer.Exit(1)
 
         if not username:

@@ -671,3 +671,139 @@ class TestPollerStartForeground:
             "execution must proceed past the PID-file guard into the poll "
             "setup path"
         )
+
+
+def _squash(text: str) -> str:
+    """Strip ANSI and collapse whitespace, so assertions survive Rich's
+    line wrapping at the runner's terminal width."""
+    return " ".join(_plain(text).split())
+
+
+class TestPollerStartGhProbeErrors:
+    """Regression for #32: the startup `gh api user` probe must say what
+    actually went wrong — offline vs unauthenticated vs API error — instead
+    of dumping `Command '[...]' returned non-zero exit status 1.`"""
+
+    def _run_with_gh_stderr(self, config: Path, stderr: str) -> str:
+        exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api", "user", "--jq", ".login"],
+            stderr=stderr,
+        )
+        with (
+            patch("ctrlrelay.core.github._find_gh", return_value="gh"),
+            patch("subprocess.run", side_effect=exc),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "poller",
+                    "start",
+                    "--foreground",
+                    "--config",
+                    str(config),
+                ],
+            )
+        assert result.exit_code == 1
+        return _squash(result.output)
+
+    def test_offline_reports_network_not_auth(
+        self, telegram_config: Path
+    ) -> None:
+        output = self._run_with_gh_stderr(
+            telegram_config,
+            "error connecting to api.github.com\n"
+            "check your internet connection or https://githubstatus.com",
+        )
+        assert "Network unavailable" in output
+        assert "returned non-zero exit status" not in output
+        assert "gh auth" not in output
+
+    def test_unauthenticated_points_at_gh_auth_status(
+        self, telegram_config: Path
+    ) -> None:
+        output = self._run_with_gh_stderr(
+            telegram_config, "gh: Bad credentials (HTTP 401)"
+        )
+        assert "gh auth status" in output
+        assert "Network unavailable" not in output
+
+    def test_api_error_surfaces_the_status(
+        self, telegram_config: Path
+    ) -> None:
+        output = self._run_with_gh_stderr(
+            telegram_config, "gh: Server Error (HTTP 500)"
+        )
+        assert "500" in output
+        assert "Network unavailable" not in output
+
+    def test_rate_limit_is_named(self, telegram_config: Path) -> None:
+        output = self._run_with_gh_stderr(
+            telegram_config, "gh: API rate limit exceeded (HTTP 403)"
+        )
+        assert "rate limit" in output.lower()
+
+    def test_gh_stderr_is_still_shown(self, telegram_config: Path) -> None:
+        """The classification is a headline, not a replacement — gh's own
+        wording still has to reach the operator."""
+        output = self._run_with_gh_stderr(
+            telegram_config, "gh: Server Error (HTTP 500)"
+        )
+        assert "Server Error" in output
+
+    def test_missing_gh_binary_is_reported(
+        self, telegram_config: Path
+    ) -> None:
+        with (
+            patch("ctrlrelay.core.github._find_gh", return_value="gh"),
+            patch(
+                "subprocess.run",
+                side_effect=FileNotFoundError(2, "No such file or directory"),
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "poller",
+                    "start",
+                    "--foreground",
+                    "--config",
+                    str(telegram_config),
+                ],
+            )
+        assert result.exit_code == 1
+        output = _squash(result.output)
+        assert "gh" in output
+        assert "Traceback" not in output
+
+
+class TestGhStderrIsNotParsedAsMarkup:
+    """`gh` stderr is arbitrary text and Rich parses `[...]` as markup. A
+    stderr containing something like `[/docs]` raised MarkupError, which
+    replaced the diagnostic with a traceback and skipped the exit — losing
+    exactly the raw detail that line exists to show."""
+
+    def test_stderr_with_markup_like_text_still_renders(self) -> None:
+        from rich.console import Console
+
+        from ctrlrelay.cli import rich_escape
+
+        stderr = "gh: Bad credentials (HTTP 401) see [/docs] for details"
+        console = Console(file=__import__("io").StringIO(), no_color=True)
+
+        # The unescaped form is what used to blow up.
+        with pytest.raises(Exception):
+            console.print(f"[dim]gh: {stderr}[/dim]")
+
+        console.print(f"[dim]gh: {rich_escape(stderr)}[/dim]")
+        rendered = console.file.getvalue()
+
+        assert "[/docs]" in rendered
+        assert "Bad credentials" in rendered
+
+    def test_the_probe_is_time_bounded(self) -> None:
+        """Without a timeout a hung gh wedges `poller start` forever, and
+        the classifier's TimeoutExpired branch can never fire."""
+        from ctrlrelay.cli import _GH_PROBE_TIMEOUT_SECONDS
+
+        assert _GH_PROBE_TIMEOUT_SECONDS > 0
