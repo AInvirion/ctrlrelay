@@ -9,6 +9,27 @@ class TransportError(Exception):
     """Raised when transport operations fail."""
 
 
+class TransportUnknownDeliveryError(TransportError):
+    """Raised when a request may or may not have been delivered.
+
+    Delivery is only ever *confirmed* by the far side's acknowledgement.
+    Everything else divides in two: we know the bytes never left (a
+    definite failure), or we do not (unknown). Enumerating individual
+    ambiguous cases does not converge — the honest discriminator is
+    whether anything was written at all.
+
+    Subclasses TransportError so existing handlers are unaffected.
+    """
+
+
+class TransportTimeoutError(TransportUnknownDeliveryError):
+    """Sent, but no reply arrived in time.
+
+    A specific unknown: the request went out and the far side may still
+    act on it after we stop waiting.
+    """
+
+
 @runtime_checkable
 class Transport(Protocol):
     """Protocol for orchestrator-to-human communication.

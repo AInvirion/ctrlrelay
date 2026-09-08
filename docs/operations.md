@@ -333,6 +333,29 @@ The events it emits:
 Prompts and agent output never appear in plaintext: only a short SHA-256
 prefix and a length are logged.
 
+### Blocked-question events
+
+When a session blocks on a question, the transport and the bridge each emit
+their own record:
+
+| Event | When |
+|---|---|
+| `dev.question.posted` | The question reached the operator. The transport emits it on the bridge's ACK; the bridge emits it once the Telegram API has accepted the message, and adds `telegram_msg_id`. |
+| `dev.question.post_failed` | Delivery failed. Carries `reason` (`send_failed`, `bridge_error`, or the exception class on the bridge side) and a truncated `error`. |
+| `dev.answer.received` | The operator's reply came back. |
+
+Neither the question nor the answer is written to the log. Each event carries
+`question_hash` / `question_length` (or `answer_hash` / `answer_length`)
+instead — the hash is stable, so it still joins the poller's record to the
+bridge's record for the same question:
+
+```bash
+grep 44509098fa6eeaf3 ~/.ctrlrelay/logs/*.log | jq -c '{ts, logger, event}'
+```
+
+This matters because these files and the systemd journal have no retention
+policy tuned for human-entered content, and operator replies are free text.
+
 ## Inspecting state
 
 ### `ctrlrelay status`

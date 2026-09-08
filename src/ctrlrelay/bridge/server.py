@@ -19,7 +19,10 @@ from ctrlrelay.bridge.protocol import (
     parse_message,
     serialize_message,
 )
-from ctrlrelay.bridge.telegram_handler import TelegramHandler
+from ctrlrelay.bridge.telegram_handler import (
+    TelegramHandler,
+    is_ambiguous_delivery,
+)
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 
 if TYPE_CHECKING:
@@ -298,6 +301,23 @@ class BridgeServer:
                 )
 
         if msg.op == BridgeOp.ASK:
+            question = msg.question or ""
+            # Hash + length only: these records land in the journal and in
+            # poller.log, so the question text itself would persist there in
+            # plaintext indefinitely. The hash still joins this event to the
+            # client's own dev.question.posted. Built outside the try so the
+            # failure path can always describe what failed.
+            post_fields = {
+                "session_id": msg.session_id,
+                "repo": msg.repo,
+                "issue_number": msg.issue_number,
+                "transport": "telegram",
+                "destination": f"telegram:chat={self.chat_id}",
+                "request_id": msg.request_id,
+                "question_length": len(question),
+                "question_hash": hash_text(question),
+                "options": msg.options,
+            }
             try:
                 assert self._telegram is not None
                 # Start the expiry clock before the Telegram round trip, not
@@ -308,21 +328,6 @@ class BridgeServer:
                 # reply-to in that window writes the answer into a dead
                 # request.
                 received_at = time.monotonic()
-                question = msg.question or ""
-                log_event(
-                    _logger,
-                    "dev.question.posted",
-                    session_id=msg.session_id,
-                    repo=msg.repo,
-                    issue_number=msg.issue_number,
-                    transport="telegram",
-                    destination=f"telegram:chat={self.chat_id}",
-                    request_id=msg.request_id,
-                    question=question,
-                    question_length=len(question),
-                    question_hash=hash_text(question),
-                    options=msg.options,
-                )
                 telegram_msg_id = await self._telegram.ask(
                     format_question(
                         question,
@@ -350,15 +355,50 @@ class BridgeServer:
                     "bridge: ASK posted request_id=%s telegram_msg_id=%s",
                     msg.request_id, telegram_msg_id,
                 )
+                # Emitted here, not before the send: until Telegram has
+                # accepted the message there is nothing posted to claim.
+                log_event(
+                    _logger,
+                    "dev.question.posted",
+                    **post_fields,
+                    telegram_msg_id=telegram_msg_id,
+                )
                 return BridgeMessage(
                     op=BridgeOp.ACK, request_id=msg.request_id, status="pending",
                 )
             except Exception as e:
                 _log.warning("bridge: ASK failed, request_id=%s err=%s", msg.request_id, e)
+                # Same rule as the transport: only claim a definite
+                # failure when Telegram actually answered. A timeout or a
+                # bare transport error can be raised after Telegram
+                # accepted the message, in which case the question IS on
+                # the operator's phone and "post_failed" is a lie.
+                #
+                # The taxonomy is not intuitive, so it lives next to the
+                # library that defines it — see is_ambiguous_delivery.
+                unknown = is_ambiguous_delivery(e)
+                log_event(
+                    _logger,
+                    "dev.question.post_unknown"
+                    if unknown
+                    else "dev.question.post_failed",
+                    **post_fields,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                )
                 return BridgeMessage(
                     op=BridgeOp.ERROR,
                     request_id=msg.request_id,
-                    error="telegram_api_error",
+                    # Carry the classification instead of letting the
+                    # other side re-derive it: the transport cannot see
+                    # the Telegram exception, so a generic ERROR forced
+                    # it to assume the worst and contradict the
+                    # post_unknown just logged here for the same request.
+                    error=(
+                        "telegram_delivery_unknown"
+                        if unknown
+                        else "telegram_api_error"
+                    ),
                     message=str(e),
                 )
 
@@ -473,7 +513,6 @@ class BridgeServer:
             request_id=match.request_id,
             telegram_msg_id=match.telegram_msg_id,
             reply_to_message_id=reply_to_message_id,
-            answer=text,
             answer_length=len(text),
             answer_hash=hash_text(text),
         )

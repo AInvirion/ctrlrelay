@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A slow post is no longer logged as a failed one.** The bridge ACKs
+  only after Telegram has accepted a question, so a post slower than the
+  transport's wait meant the transport timed out first and logged
+  `dev.question.post_failed` while the bridge logged
+  `dev.question.posted` for the same request — a false claim in the
+  opposite direction to the one being fixed. A timeout now emits
+  `dev.question.post_unknown`, because the outcome genuinely is unknown;
+  a write that actually failed keeps the definite `post_failed`.
+  Delivery is only ever confirmed by the far side's acknowledgement;
+  everything else divides into "the bytes provably never left" (a
+  definite failure) and "they may have" (unknown). A `drain()` failure
+  is unknown — `write()` had already handed the data over — and on the
+  bridge, a Telegram timeout or bare transport error is unknown too,
+  while `BadRequest`/`Forbidden`/`InvalidToken` are Telegram answering
+  "no". Note `BadRequest` subclasses `NetworkError` in
+  python-telegram-bot, so that check cannot be a plain isinstance; it
+  lives in `is_ambiguous_delivery` next to the library that defines the
+  taxonomy. `TransportTimeoutError` subclasses
+  `TransportUnknownDeliveryError` subclasses `TransportError`, so
+  existing handlers are unaffected. The bridge's ERROR response carries
+  which of the two it was (`telegram_delivery_unknown` vs
+  `telegram_api_error`) rather than letting the transport re-derive it —
+  the transport cannot see the Telegram exception, so a generic error
+  forced it to assume the worst and contradict the bridge's own record
+  for the same `request_id`.
+
+  **Known limit:** python-telegram-bot raises `TimedOut` for an HTTPX
+  connection-pool timeout too, where the request was never sent. That
+  case is currently reported as unknown rather than as the definite
+  non-delivery it is. Separating it means matching on library internals,
+  which is more fragile than the mislabelling is harmful.
+
+- **`dev.question.posted` no longer claims a delivery that never
+  happened.** The transport logged it before writing to the socket and the
+  bridge logged it before calling Telegram, so a failed write or a Telegram
+  outage still left a record saying the operator had been asked. The
+  transport now emits it on the bridge's ACK — the only signal that says
+  the question actually reached Telegram — and the bridge emits it after
+  the API accepts the message, tagged with `telegram_msg_id`. Both sides
+  emit `dev.question.post_failed` (with `reason` and a truncated `error`)
+  on the failure path instead. A question that is posted and then goes
+  unanswered still logs only `posted`: the delivery succeeded, the operator
+  just did not reply.
+- **Questions and operator answers are no longer written to logs in
+  plaintext.** Every event already carried `question_hash` / `answer_hash`,
+  and then defeated it by logging the raw text in the field next door.
+  These records go to stdout and are captured into `~/.ctrlrelay/logs` and
+  the systemd journal, so free-text operator replies — and questions that
+  now enumerate every open PR in a repo — persisted there indefinitely with
+  no retention policy tuned for that content. The hash and length remain,
+  which is enough to correlate the same question across the poller and
+  bridge logs. A test walks the source and fails on any `log_event()` call
+  that passes a raw payload field.
 - **A broken `gh` install no longer reports itself as "network
   unavailable".** `subprocess.run` raising `OSError` means the child could
   not be exec'd — a non-executable binary, a bad path, a wrong
