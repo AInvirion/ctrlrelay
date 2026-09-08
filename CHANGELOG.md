@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A broken `gh` install no longer reports itself as "network
+  unavailable".** `subprocess.run` raising `OSError` means the child could
+  not be exec'd — a non-executable binary, a bad path, a wrong
+  architecture. Python does no networking here, `gh` does, so an `OSError`
+  raised on our side can never mean offline. Reporting it that way was the
+  exact misdiagnosis this classification exists to prevent: it sends the
+  operator to check their wifi while their `gh` install is broken. Only a
+  hung `gh` (timeout) still reads as connectivity — there the child
+  launched and then stopped responding.
+
 ### Added
 
 - **The dispatcher now logs.** `core/dispatcher.py` is the module that

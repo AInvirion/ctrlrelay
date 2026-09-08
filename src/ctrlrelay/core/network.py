@@ -134,8 +134,8 @@ def _message_for(kind: GhFailureKind, status: int | None) -> str:
         )
     if kind is GhFailureKind.GH_MISSING:
         return (
-            "The `gh` CLI was not found — install GitHub CLI and make sure "
-            "it is on PATH."
+            "The `gh` CLI could not be run — install GitHub CLI, make sure "
+            "it is on PATH, and check the file is executable."
         )
     if status is not None:
         return f"GitHub API returned an error (HTTP {status})."
@@ -176,10 +176,26 @@ def gh_failure_from_exception(exc: BaseException) -> GhFailure:
         )
     if isinstance(exc, subprocess.CalledProcessError):
         return classify_gh_failure(exc.stderr, returncode=exc.returncode)
-    if isinstance(exc, (subprocess.TimeoutExpired, TimeoutError, OSError)):
+    if isinstance(exc, (subprocess.TimeoutExpired, TimeoutError)):
+        # A hung gh is the one exception shape that really does suggest
+        # connectivity: the child launched and then stopped responding.
         return GhFailure(
             kind=GhFailureKind.NETWORK_UNAVAILABLE,
             message=_message_for(GhFailureKind.NETWORK_UNAVAILABLE, None),
+            stderr=str(exc),
+        )
+    if isinstance(exc, OSError):
+        # Everything else OSError-shaped comes from `subprocess.run`
+        # failing to EXEC the child — PermissionError on a non-executable
+        # binary, IsADirectoryError on a bad path, OSError(8) on a wrong
+        # architecture. Python is not doing the networking here, gh is,
+        # so an OSError raised on our side can never mean "offline".
+        # Reporting it as such is the exact misdiagnosis this module
+        # exists to prevent: it sends the operator to check their wifi
+        # while their gh install is broken.
+        return GhFailure(
+            kind=GhFailureKind.GH_MISSING,
+            message=_message_for(GhFailureKind.GH_MISSING, None),
             stderr=str(exc),
         )
     return classify_gh_failure(str(exc))

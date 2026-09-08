@@ -188,13 +188,17 @@ class TestFromException:
         assert failure.kind is GhFailureKind.API_ERROR
         assert failure.returncode == 1
 
-    def test_os_error_is_network_unavailable(self) -> None:
-        """A DNS/socket failure raised by Python itself (not gh) is still
-        an offline signal."""
+    def test_os_error_points_at_the_gh_install_not_the_network(self) -> None:
+        """`subprocess.run` raising OSError means the child could not be
+        EXEC'd. Python does no networking here — gh does — so even an
+        errno that reads like connectivity (ENETUNREACH) reached us
+        because the spawn failed, not because a socket did. Calling it
+        "offline" sends the operator to check their wifi while their gh
+        install is broken."""
         failure = gh_failure_from_exception(
             OSError(101, "Network is unreachable")
         )
-        assert failure.kind is GhFailureKind.NETWORK_UNAVAILABLE
+        assert failure.kind is GhFailureKind.GH_MISSING
 
     def test_timeout_expired_is_network_unavailable(self) -> None:
         exc = subprocess.TimeoutExpired(cmd=["gh", "api", "user"], timeout=30)
@@ -210,3 +214,51 @@ class TestFromException:
         )
         assert failure.kind is GhFailureKind.GH_MISSING
         assert "gh" in failure.message
+
+
+class TestExecFailuresAreNotReportedAsOffline:
+    """`subprocess.run` raising OSError means the child could not be
+    EXEC'd — Python is not doing the networking here, gh is. Classifying
+    those as NETWORK_UNAVAILABLE is the exact misdiagnosis this module
+    exists to prevent: it sends the operator to check their wifi while
+    their gh install is broken."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            PermissionError(13, "Permission denied"),
+            IsADirectoryError(21, "Is a directory"),
+            NotADirectoryError(20, "Not a directory"),
+            OSError(8, "Exec format error"),
+        ],
+        ids=["not-executable", "is-a-directory", "bad-path", "wrong-arch"],
+    )
+    def test_exec_failure_points_at_the_install(self, exc: OSError) -> None:
+        from ctrlrelay.core.network import GhFailureKind, gh_failure_from_exception
+
+        failure = gh_failure_from_exception(exc)
+
+        assert failure.kind is GhFailureKind.GH_MISSING
+        assert "network" not in failure.message.lower()
+        assert "connectivity" not in failure.message.lower()
+
+    def test_a_hung_gh_still_reads_as_a_network_problem(self) -> None:
+        """The one exception shape that really does suggest connectivity:
+        the child launched and then stopped responding."""
+        from ctrlrelay.core.network import GhFailureKind, gh_failure_from_exception
+
+        assert (
+            gh_failure_from_exception(TimeoutError("timed out")).kind
+            is GhFailureKind.NETWORK_UNAVAILABLE
+        )
+
+    def test_missing_binary_message_covers_unusable_not_just_absent(self) -> None:
+        """A gh that exists but cannot run is not 'not found'."""
+        from ctrlrelay.core.network import gh_failure_from_exception
+
+        message = gh_failure_from_exception(
+            PermissionError(13, "Permission denied")
+        ).message
+
+        assert "could not be run" in message
+        assert "executable" in message
