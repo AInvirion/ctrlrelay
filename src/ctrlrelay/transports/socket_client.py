@@ -247,9 +247,16 @@ class SocketTransport:
 
         if response.op == BridgeOp.ERROR:
             if not posted:
+                # The bridge knows whether Telegram answered; we do not.
+                # Re-deriving it here is what produced contradictory
+                # pairs — post_unknown on the bridge, post_failed on the
+                # transport, same request_id.
+                bridge_unknown = response.error == "telegram_delivery_unknown"
                 log_event(
                     _logger,
-                    "dev.question.post_failed",
+                    "dev.question.post_unknown"
+                    if bridge_unknown
+                    else "dev.question.post_failed",
                     **common,
                     reason="bridge_error",
                     error=str(response.message)[:200],

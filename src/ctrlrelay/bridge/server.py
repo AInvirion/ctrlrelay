@@ -389,7 +389,16 @@ class BridgeServer:
                 return BridgeMessage(
                     op=BridgeOp.ERROR,
                     request_id=msg.request_id,
-                    error="telegram_api_error",
+                    # Carry the classification instead of letting the
+                    # other side re-derive it: the transport cannot see
+                    # the Telegram exception, so a generic ERROR forced
+                    # it to assume the worst and contradict the
+                    # post_unknown just logged here for the same request.
+                    error=(
+                        "telegram_delivery_unknown"
+                        if unknown
+                        else "telegram_api_error"
+                    ),
                     message=str(e),
                 )
 

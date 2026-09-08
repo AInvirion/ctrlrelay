@@ -28,7 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lives in `is_ambiguous_delivery` next to the library that defines the
   taxonomy. `TransportTimeoutError` subclasses
   `TransportUnknownDeliveryError` subclasses `TransportError`, so
-  existing handlers are unaffected.
+  existing handlers are unaffected. The bridge's ERROR response carries
+  which of the two it was (`telegram_delivery_unknown` vs
+  `telegram_api_error`) rather than letting the transport re-derive it —
+  the transport cannot see the Telegram exception, so a generic error
+  forced it to assume the worst and contradict the bridge's own record
+  for the same `request_id`.
+
+  **Known limit:** python-telegram-bot raises `TimedOut` for an HTTPX
+  connection-pool timeout too, where the request was never sent. That
+  case is currently reported as unknown rather than as the definite
+  non-delivery it is. Separating it means matching on library internals,
+  which is more fragile than the mislabelling is harmful.
 
 - **`dev.question.posted` no longer claims a delivery that never
   happened.** The transport logged it before writing to the socket and the

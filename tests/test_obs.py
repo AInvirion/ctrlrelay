@@ -990,3 +990,72 @@ class TestTelegramAmbiguityTaxonomy:
         from telegram.error import BadRequest, NetworkError
 
         assert issubclass(BadRequest, NetworkError)
+
+
+class TestBridgeClassificationIsNotReDerived:
+    """The transport cannot see the Telegram exception, so a generic
+    ERROR forced it to assume the worst — producing contradictory pairs
+    for one request_id: post_unknown from the bridge, post_failed from
+    the transport. The classification travels in the response instead."""
+
+    @pytest.mark.asyncio
+    async def test_bridge_saying_unknown_is_believed(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        transport = SocketTransport(socket_path=tmp_path / "s.sock")
+        transport._writer = MagicMock()
+        transport._writer.is_closing.return_value = False
+        transport._writer.drain = AsyncMock()
+
+        async def _bridge_says_unknown(*_a: object, **_kw: object) -> BridgeMessage:
+            return BridgeMessage(
+                op=BridgeOp.ERROR,
+                request_id="r-1",
+                error="telegram_delivery_unknown",
+                message="Timed out",
+            )
+
+        with patch(
+            "ctrlrelay.transports.socket_client.asyncio.wait_for",
+            _bridge_says_unknown,
+        ), patch("ctrlrelay.transports.socket_client.log_event") as log:
+            with pytest.raises(Exception):
+                await transport.ask("approve #1?", session_id="s", repo="o/r")
+
+        events = [c.args[1] for c in log.call_args_list if len(c.args) > 1]
+        assert "dev.question.post_unknown" in events
+        assert "dev.question.post_failed" not in events
+
+    @pytest.mark.asyncio
+    async def test_a_definite_bridge_rejection_stays_failed(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        transport = SocketTransport(socket_path=tmp_path / "s.sock")
+        transport._writer = MagicMock()
+        transport._writer.is_closing.return_value = False
+        transport._writer.drain = AsyncMock()
+
+        async def _bridge_says_rejected(*_a: object, **_kw: object) -> BridgeMessage:
+            return BridgeMessage(
+                op=BridgeOp.ERROR,
+                request_id="r-1",
+                error="telegram_api_error",
+                message="chat not found",
+            )
+
+        with patch(
+            "ctrlrelay.transports.socket_client.asyncio.wait_for",
+            _bridge_says_rejected,
+        ), patch("ctrlrelay.transports.socket_client.log_event") as log:
+            with pytest.raises(Exception):
+                await transport.ask("approve #1?", session_id="s", repo="o/r")
+
+        events = [c.args[1] for c in log.call_args_list if len(c.args) > 1]
+        assert "dev.question.post_failed" in events
+        assert "dev.question.post_unknown" not in events
