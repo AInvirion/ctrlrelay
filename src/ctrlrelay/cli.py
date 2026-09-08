@@ -1037,8 +1037,20 @@ def poller_start(
                 check=True,
             )
             username = result.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            console.print(f"[red]Failed to get GitHub username:[/red] {e}")
+        except (subprocess.SubprocessError, OSError) as e:
+            # `gh` exits 1 for offline, expired-token and API-error alike,
+            # so classify from its stderr — otherwise operators debug auth
+            # when the laptop is simply offline (#32).
+            from ctrlrelay.core.network import gh_failure_from_exception
+
+            failure = gh_failure_from_exception(e)
+            color = "yellow" if failure.is_transient else "red"
+            console.print(
+                f"[{color}]Could not determine GitHub username:[/{color}] "
+                f"{failure.message}"
+            )
+            if failure.stderr:
+                console.print(f"[dim]gh: {failure.stderr}[/dim]")
             raise typer.Exit(1)
 
         if not username:

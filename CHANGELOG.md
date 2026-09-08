@@ -35,6 +35,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observability-only — they let dispatcher events be correlated with
   pipeline events without re-parsing the composite session id.
 
+### Fixed
+
+- **Startup no longer blames your GitHub auth when you are offline.**
+  `poller start` probes `gh api user` before it does anything else, and
+  every way that probe can fail — unplugged network, expired token, a
+  500 from the API — exits 1, so the CLI printed
+  `Command '[...]' returned non-zero exit status 1.` for all of them.
+  A new `core/network.py` classifies the failure from gh's own stderr
+  into network / auth / rate-limit / API-error (plus "gh not
+  installed"), and the CLI prints the matching message —
+  `Network unavailable — could not reach api.github.com` in yellow when
+  it is transient, a pointer to `gh auth status` when the credentials are the
+  problem, the HTTP status when the API answered. gh's raw stderr is
+  still printed underneath.
+
 ## [0.9.0] - 2026-09-07
 
 ### Added

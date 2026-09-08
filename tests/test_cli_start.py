@@ -671,3 +671,107 @@ class TestPollerStartForeground:
             "execution must proceed past the PID-file guard into the poll "
             "setup path"
         )
+
+
+def _squash(text: str) -> str:
+    """Strip ANSI and collapse whitespace, so assertions survive Rich's
+    line wrapping at the runner's terminal width."""
+    return " ".join(_plain(text).split())
+
+
+class TestPollerStartGhProbeErrors:
+    """Regression for #32: the startup `gh api user` probe must say what
+    actually went wrong — offline vs unauthenticated vs API error — instead
+    of dumping `Command '[...]' returned non-zero exit status 1.`"""
+
+    def _run_with_gh_stderr(self, config: Path, stderr: str) -> str:
+        exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api", "user", "--jq", ".login"],
+            stderr=stderr,
+        )
+        with (
+            patch("ctrlrelay.core.github._find_gh", return_value="gh"),
+            patch("subprocess.run", side_effect=exc),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "poller",
+                    "start",
+                    "--foreground",
+                    "--config",
+                    str(config),
+                ],
+            )
+        assert result.exit_code == 1
+        return _squash(result.output)
+
+    def test_offline_reports_network_not_auth(
+        self, telegram_config: Path
+    ) -> None:
+        output = self._run_with_gh_stderr(
+            telegram_config,
+            "error connecting to api.github.com\n"
+            "check your internet connection or https://githubstatus.com",
+        )
+        assert "Network unavailable" in output
+        assert "returned non-zero exit status" not in output
+        assert "gh auth" not in output
+
+    def test_unauthenticated_points_at_gh_auth_status(
+        self, telegram_config: Path
+    ) -> None:
+        output = self._run_with_gh_stderr(
+            telegram_config, "gh: Bad credentials (HTTP 401)"
+        )
+        assert "gh auth status" in output
+        assert "Network unavailable" not in output
+
+    def test_api_error_surfaces_the_status(
+        self, telegram_config: Path
+    ) -> None:
+        output = self._run_with_gh_stderr(
+            telegram_config, "gh: Server Error (HTTP 500)"
+        )
+        assert "500" in output
+        assert "Network unavailable" not in output
+
+    def test_rate_limit_is_named(self, telegram_config: Path) -> None:
+        output = self._run_with_gh_stderr(
+            telegram_config, "gh: API rate limit exceeded (HTTP 403)"
+        )
+        assert "rate limit" in output.lower()
+
+    def test_gh_stderr_is_still_shown(self, telegram_config: Path) -> None:
+        """The classification is a headline, not a replacement — gh's own
+        wording still has to reach the operator."""
+        output = self._run_with_gh_stderr(
+            telegram_config, "gh: Server Error (HTTP 500)"
+        )
+        assert "Server Error" in output
+
+    def test_missing_gh_binary_is_reported(
+        self, telegram_config: Path
+    ) -> None:
+        with (
+            patch("ctrlrelay.core.github._find_gh", return_value="gh"),
+            patch(
+                "subprocess.run",
+                side_effect=FileNotFoundError(2, "No such file or directory"),
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "poller",
+                    "start",
+                    "--foreground",
+                    "--config",
+                    str(telegram_config),
+                ],
+            )
+        assert result.exit_code == 1
+        output = _squash(result.output)
+        assert "gh" in output
+        assert "Traceback" not in output
