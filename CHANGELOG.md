@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-08
+
+### Added
+
+- **The dispatcher now logs.** `core/dispatcher.py` is the module that
+  spawns and supervises every agent session, and it was the only core
+  module with no structured logging at all — so the one place where a
+  session is born, times out or dies was the one place with no trail.
+  It now emits `dispatcher.session.start` / `.finished` / `.timeout` /
+  `.subprocess_failed` / `.spawn_failed` / `.cancelled`, plus
+  `dispatcher.checkpoint.missing` when a session ends without
+  signalling and `dispatcher.checkpoint.read_failed` when the file
+  won't parse. Every failure event carries `error_type`, so a bare
+  `asyncio.TimeoutError` — whose `str()` is empty — is still
+  identifiable in the log. Prompts and agent output are never logged in
+  plaintext: only a `hash_text()` prefix and a length. See
+  [Tracing one agent session](https://ainvirion.github.io/ctrlrelay/operations/#tracing-one-agent-session).
+- **`dispatcher.binary.fallback` / `.unresolved` warn when `claude`
+  isn't on `PATH`.** Under systemd and launchd the unit's `PATH` is
+  minimal, and falling through to a hard-coded path is the usual
+  precursor to every session failing to spawn. It used to happen
+  silently.
+
+### Changed
+
+- `spawn_session` takes optional `repo` and `issue_number` arguments,
+  which the dev, task and secops pipelines now pass. They are
+  observability-only — they let dispatcher events be correlated with
+  pipeline events without re-parsing the composite session id.
+
 ### Fixed
 
 - **A slow post is no longer logged as a failed one.** The bridge ACKs
@@ -102,36 +132,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The startup `gh` probe is time-bounded.** Without a timeout a hung
   `gh` wedged `poller start` indefinitely, and the one exception branch
   that really does mean connectivity could never fire.
-
-### Added
-
-- **The dispatcher now logs.** `core/dispatcher.py` is the module that
-  spawns and supervises every agent session, and it was the only core
-  module with no structured logging at all — so the one place where a
-  session is born, times out or dies was the one place with no trail.
-  It now emits `dispatcher.session.start` / `.finished` / `.timeout` /
-  `.subprocess_failed` / `.spawn_failed` / `.cancelled`, plus
-  `dispatcher.checkpoint.missing` when a session ends without
-  signalling and `dispatcher.checkpoint.read_failed` when the file
-  won't parse. Every failure event carries `error_type`, so a bare
-  `asyncio.TimeoutError` — whose `str()` is empty — is still
-  identifiable in the log. Prompts and agent output are never logged in
-  plaintext: only a `hash_text()` prefix and a length. See
-  [Tracing one agent session](https://ainvirion.github.io/ctrlrelay/operations/#tracing-one-agent-session).
-- **`dispatcher.binary.fallback` / `.unresolved` warn when `claude`
-  isn't on `PATH`.** Under systemd and launchd the unit's `PATH` is
-  minimal, and falling through to a hard-coded path is the usual
-  precursor to every session failing to spawn. It used to happen
-  silently.
-
-### Changed
-
-- `spawn_session` takes optional `repo` and `issue_number` arguments,
-  which the dev, task and secops pipelines now pass. They are
-  observability-only — they let dispatcher events be correlated with
-  pipeline events without re-parsing the composite session id.
-
-### Fixed
 
 - **Startup no longer blames your GitHub auth when you are offline.**
   `poller start` probes `gh api user` before it does anything else, and
@@ -1537,7 +1537,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.7.0...v0.8.0
