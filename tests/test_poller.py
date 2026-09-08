@@ -1981,3 +1981,192 @@ class TestRequireLabelsFilter:
         await poller.seed_current()
 
         assert 6 not in poller.seen_issues.get("owner/repo-a", set())
+
+
+class TestArchivedRepoSkip:
+    """Issue #163: a repo archived after its config entry was generated
+    is swept forever. The poller must detect it, skip it, and say so
+    once — while never skipping a repo whose state it couldn't
+    determine."""
+
+    @pytest.mark.asyncio
+    async def test_poll_skips_archived_repo_and_logs_once(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from ctrlrelay.core.poller import IssuePoller
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[make_issue(1, assignees=["alice"])]
+        )
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("alice", "alice")]
+        )
+
+        async def archived(repo: str, **kwargs):
+            return repo == "owner/archived"
+
+        mock_github.repo_is_archived = AsyncMock(side_effect=archived)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/archived", "owner/live"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay.core.archived"):
+            first = await poller.poll()
+            await poller.poll()
+
+        # Only the live repo was ever queried for issues.
+        polled = [c.args[0] for c in mock_github.list_assigned_issues.call_args_list]
+        assert polled == ["owner/live", "owner/live"]
+        assert [r["repo"] for r in first] == ["owner/live"]
+
+        archived_logs = [
+            r for r in caplog.records if r.getMessage() == "poll.repo.archived"
+        ]
+        assert len(archived_logs) == 1
+        assert archived_logs[0].repo == "owner/archived"
+
+    @pytest.mark.asyncio
+    async def test_poll_continues_when_archived_lookup_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """Fail open: an erroring archived-lookup must never skip a repo.
+        A bug here would silently stop the whole daemon doing work."""
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.core.poller import IssuePoller
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[make_issue(7, assignees=["alice"])]
+        )
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("alice", "alice")]
+        )
+        mock_github.repo_is_archived = AsyncMock(
+            side_effect=GitHubError("gh failed: HTTP 502")
+        )
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        results = await poller.poll()
+
+        assert [r["issue"]["number"] for r in results] == [7]
+        assert poller.archived_tracker.archived_repos == set()
+
+    @pytest.mark.asyncio
+    async def test_seed_current_skips_archived_repo(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.poller import IssuePoller
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[make_issue(3, assignees=["alice"])]
+        )
+        mock_github.repo_is_archived = AsyncMock(return_value=True)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/archived"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        await poller.seed_current()
+
+        mock_github.list_assigned_issues.assert_not_awaited()
+        assert poller.seen_issues == {}
+
+    @pytest.mark.asyncio
+    async def test_seed_current_continues_when_lookup_fails(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.poller import IssuePoller
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[make_issue(3, assignees=["alice"])]
+        )
+        mock_github.repo_is_archived = AsyncMock(side_effect=OSError("boom"))
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+        await poller.seed_current()
+
+        assert poller.seen_issues == {"owner/repo-a": {3}}
+
+    @pytest.mark.asyncio
+    async def test_restart_picks_up_unarchived_repo(
+        self, tmp_path: Path
+    ) -> None:
+        """Cache lifetime is the daemon lifetime: a fresh poller re-probes
+        and resumes an un-archived repo."""
+        from ctrlrelay.core.poller import IssuePoller
+
+        state = tmp_path / "poller_state.json"
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(
+            return_value=[make_issue(9, assignees=["alice"])]
+        )
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[make_assigned_event("alice", "alice")]
+        )
+        mock_github.repo_is_archived = AsyncMock(return_value=True)
+
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state,
+        )
+        assert await poller.poll() == []
+
+        mock_github.repo_is_archived = AsyncMock(return_value=False)
+        restarted = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state,
+        )
+        assert [r["issue"]["number"] for r in await restarted.poll()] == [9]
+
+    @pytest.mark.asyncio
+    async def test_shared_tracker_is_used_when_supplied(
+        self, tmp_path: Path
+    ) -> None:
+        """The daemon hands the same tracker to the poller and the secops
+        sweep so one confirmation covers both."""
+        from ctrlrelay.core.archived import ArchivedRepoTracker
+        from ctrlrelay.core.poller import IssuePoller
+
+        mock_github = MagicMock()
+        mock_github.list_assigned_issues = AsyncMock(return_value=[])
+        mock_github.repo_is_archived = AsyncMock(return_value=True)
+
+        tracker = ArchivedRepoTracker(github=mock_github)
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=tmp_path / "poller_state.json",
+            archived_tracker=tracker,
+        )
+
+        await poller.poll()
+
+        assert poller.archived_tracker is tracker
+        assert tracker.archived_repos == {"owner/repo-a"}

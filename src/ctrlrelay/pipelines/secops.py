@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ctrlrelay.core.archived import ArchivedRepoTracker
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.github import GitHubCLI
@@ -496,8 +497,20 @@ async def run_secops_all(
     transport: Transport | None,
     contexts_dir: Path,
     max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
+    archived: ArchivedRepoTracker | None = None,
 ) -> list[PipelineResult]:
-    """Run secops pipeline on all configured repos."""
+    """Run secops pipeline on all configured repos.
+
+    ``archived`` (#163) skips repos that GitHub confirms are archived —
+    the alerts API answers 403 for them, so the sweep spends a whole
+    agent session discovering it can do nothing. Passing ``None``
+    disables the check entirely. A repo whose state can't be determined
+    is swept as normal; see :mod:`ctrlrelay.core.archived`.
+
+    One result is returned per configured repo, in order, including the
+    skipped ones — the scheduled sweep zips results against the repo
+    list to attribute its notifications.
+    """
     results = []
 
     pipeline = SecopsPipeline(
@@ -512,6 +525,19 @@ async def run_secops_all(
     for repo_config in repos:
         repo = repo_config.name
         session_id = f"secops-{repo.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
+
+        # Archived repos accept no security work: the Dependabot alerts
+        # API returns 403 for them, so a sweep burns a full agent session
+        # to reach a benign "nothing to do" summary. Skip before the lock
+        # and the worktree. The tracker logs `poll.repo.archived` once so
+        # the operator knows to drop the entry from orchestrator.yaml.
+        if archived is not None and await archived.is_archived(repo):
+            results.append(PipelineResult(
+                success=True,
+                session_id=session_id,
+                summary=f"Skipped {repo}: repository is archived on GitHub",
+            ))
+            continue
 
         if not state_db.acquire_lock(repo, session_id):
             results.append(PipelineResult(
