@@ -299,7 +299,7 @@ class TestAskTimeoutIsConfigurable:
         t = SocketTransport(tmp_path / "x.sock", ask_timeout_seconds=4242)
         captured: dict = {}
 
-        async def fake_send_and_wait(msg, timeout):
+        async def fake_send_and_wait(msg, timeout, **kwargs):
             captured["timeout"] = timeout
             from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
 
@@ -321,7 +321,7 @@ class TestAskTimeoutIsConfigurable:
         t = SocketTransport(tmp_path / "x.sock", ask_timeout_seconds=4242)
         captured: dict = {}
 
-        async def fake_send_and_wait(msg, timeout):
+        async def fake_send_and_wait(msg, timeout, **kwargs):
             captured["timeout"] = timeout
             from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
 

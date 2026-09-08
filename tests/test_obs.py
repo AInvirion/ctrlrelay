@@ -313,3 +313,544 @@ class TestSessionResumeLogging:
         assert r.__dict__["repo"] == "o/r"
         assert r.__dict__["issue_number"] == 3
         assert r.__dict__["pipeline"] == "dev"
+
+
+class TestSocketTransportDeliverySemantics:
+    """dev.question.posted must never claim a delivery that did not happen."""
+
+    @staticmethod
+    async def _stub_server(socket_path, responses):
+        """Serve one ASK, replying with each message in ``responses``."""
+        import asyncio
+
+        from ctrlrelay.bridge.protocol import parse_message, serialize_message
+
+        async def handle(reader, writer):
+            try:
+                line = await reader.readline()
+                if not line:
+                    return
+                msg = parse_message(line.decode())
+                for build in responses:
+                    writer.write(serialize_message(build(msg)).encode())
+                    await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        return await asyncio.start_unix_server(handle, path=str(socket_path))
+
+    @pytest.mark.asyncio
+    async def test_send_failure_logs_post_failed_and_not_posted(
+        self, caplog
+    ) -> None:
+        """A socket write that never happens must not log a posted question."""
+        import tempfile
+        from pathlib import Path
+
+        from ctrlrelay.transports.base import TransportError
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        # Never connected: _send_message raises before anything reaches a bridge.
+        transport = SocketTransport(Path(tempfile.mkdtemp()) / "absent.sock")
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            with pytest.raises(TransportError):
+                await transport.ask("Deploy to prod?", timeout=1, session_id="s-1")
+
+        names = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("ctrlrelay")
+        ]
+        assert "dev.question.posted" not in names
+        assert "dev.question.post_failed" in names
+
+        failed = next(
+            r
+            for r in caplog.records
+            if r.getMessage() == "dev.question.post_failed"
+        )
+        assert failed.__dict__["session_id"] == "s-1"
+        assert failed.__dict__["transport"] == "socket"
+        assert failed.__dict__["reason"] == "send_failed"
+        assert "question" not in failed.__dict__
+
+    @pytest.mark.asyncio
+    async def test_bridge_error_logs_post_failed_and_not_posted(
+        self, caplog
+    ) -> None:
+        """A bridge that rejects the ASK must not leave a posted event behind."""
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.transports.base import TransportError
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        server = await self._stub_server(
+            tmp_dir / "t.sock",
+            [
+                lambda m: BridgeMessage(
+                    op=BridgeOp.ERROR,
+                    request_id=m.request_id,
+                    error="telegram_api_error",
+                    message="boom",
+                )
+            ],
+        )
+        try:
+            transport = SocketTransport(tmp_dir / "t.sock")
+            await transport.connect()
+
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                with pytest.raises(TransportError):
+                    await transport.ask("Deploy?", timeout=5, session_id="s-2")
+
+            names = [
+                r.getMessage()
+                for r in caplog.records
+                if r.name.startswith("ctrlrelay")
+            ]
+            assert "dev.question.posted" not in names
+            assert "dev.question.post_failed" in names
+
+            failed = next(
+                r
+                for r in caplog.records
+                if r.getMessage() == "dev.question.post_failed"
+            )
+            assert failed.__dict__["reason"] == "bridge_error"
+
+            await transport.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_timeout_after_ack_keeps_posted_and_adds_no_failure(
+        self, caplog
+    ) -> None:
+        """Once the bridge acknowledges, an unanswered question is still posted."""
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.transports.base import TransportError
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        server = await self._stub_server(
+            tmp_dir / "t.sock",
+            [
+                lambda m: BridgeMessage(
+                    op=BridgeOp.ACK, request_id=m.request_id, status="pending"
+                )
+            ],
+        )
+        try:
+            transport = SocketTransport(tmp_dir / "t.sock")
+            await transport.connect()
+
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                with pytest.raises(TransportError):
+                    await transport.ask("Deploy?", timeout=1, session_id="s-3")
+
+            names = [
+                r.getMessage()
+                for r in caplog.records
+                if r.name.startswith("ctrlrelay")
+            ]
+            assert "dev.question.posted" in names
+            assert "dev.question.post_failed" not in names
+
+            await transport.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_posted_precedes_answer_received(self, caplog) -> None:
+        """The ACK is the confirmation, so posted lands before the answer."""
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        server = await self._stub_server(
+            tmp_dir / "t.sock",
+            [
+                lambda m: BridgeMessage(
+                    op=BridgeOp.ACK, request_id=m.request_id, status="pending"
+                ),
+                lambda m: BridgeMessage(
+                    op=BridgeOp.ANSWER, request_id=m.request_id, answer="yes"
+                ),
+            ],
+        )
+        try:
+            transport = SocketTransport(tmp_dir / "t.sock")
+            await transport.connect()
+
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                assert await transport.ask("Deploy?", timeout=5) == "yes"
+
+            names = [
+                r.getMessage()
+                for r in caplog.records
+                if r.name.startswith("ctrlrelay")
+            ]
+            assert names.index("dev.question.posted") < names.index(
+                "dev.answer.received"
+            )
+
+            await transport.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+class TestBridgeServerDeliverySemantics:
+    @pytest.mark.asyncio
+    async def test_telegram_failure_logs_post_failed_and_not_posted(
+        self, caplog
+    ) -> None:
+        """TelegramHandler.ask blowing up must not log a posted question."""
+        import asyncio
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import AsyncMock, patch
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
+
+        d = tempfile.mkdtemp()
+        socket_path = Path(d) / "b.sock"
+
+        mock_handler = AsyncMock()
+        mock_handler.ask = AsyncMock(side_effect=RuntimeError("telegram down"))
+
+        try:
+            with patch(
+                "ctrlrelay.bridge.server.TelegramHandler", return_value=mock_handler
+            ):
+                server = BridgeServer(
+                    socket_path=socket_path, bot_token="x", chat_id=12345
+                )
+                task = asyncio.create_task(server.start())
+                await asyncio.sleep(0.1)
+
+                reader, writer = await asyncio.open_unix_connection(str(socket_path))
+
+                caplog.clear()
+                with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                    writer.write(
+                        serialize_message(
+                            BridgeMessage(
+                                op=BridgeOp.ASK,
+                                request_id="r-1",
+                                question="Continue?",
+                                session_id="dev-o-r-1-a",
+                                repo="o/r",
+                                issue_number=1,
+                            )
+                        ).encode()
+                    )
+                    await writer.drain()
+                    await asyncio.wait_for(reader.readline(), timeout=1)
+
+                names = [
+                    r.getMessage()
+                    for r in caplog.records
+                    if r.name.startswith("ctrlrelay.bridge")
+                ]
+                assert "dev.question.posted" not in names
+                assert "dev.question.post_failed" in names
+
+                failed = next(
+                    r
+                    for r in caplog.records
+                    if r.getMessage() == "dev.question.post_failed"
+                )
+                assert failed.__dict__["session_id"] == "dev-o-r-1-a"
+                assert failed.__dict__["transport"] == "telegram"
+                assert failed.__dict__["reason"] == "RuntimeError"
+                assert "question" not in failed.__dict__
+
+                writer.close()
+                await writer.wait_closed()
+                await server.stop()
+                task.cancel()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_posted_carries_telegram_msg_id(self, caplog) -> None:
+        """Posted after the send means the Telegram message id is known."""
+        import asyncio
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import AsyncMock, patch
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
+
+        d = tempfile.mkdtemp()
+        socket_path = Path(d) / "b.sock"
+
+        mock_handler = AsyncMock()
+        mock_handler.ask = AsyncMock(return_value=99)
+
+        try:
+            with patch(
+                "ctrlrelay.bridge.server.TelegramHandler", return_value=mock_handler
+            ):
+                server = BridgeServer(
+                    socket_path=socket_path, bot_token="x", chat_id=12345
+                )
+                task = asyncio.create_task(server.start())
+                await asyncio.sleep(0.1)
+
+                reader, writer = await asyncio.open_unix_connection(str(socket_path))
+
+                caplog.clear()
+                with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                    writer.write(
+                        serialize_message(
+                            BridgeMessage(
+                                op=BridgeOp.ASK,
+                                request_id="r-1",
+                                question="Continue?",
+                                session_id="dev-o-r-1-a",
+                            )
+                        ).encode()
+                    )
+                    await writer.drain()
+                    await asyncio.wait_for(reader.readline(), timeout=1)
+
+                posted = next(
+                    r
+                    for r in caplog.records
+                    if r.getMessage() == "dev.question.posted"
+                )
+                assert posted.__dict__["telegram_msg_id"] == 99
+
+                writer.close()
+                await writer.wait_closed()
+                await server.stop()
+                task.cancel()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestSensitivePayloadsAreNotLogged:
+    """Questions and answers are operator content; logs keep hash + length only."""
+
+    # Field names that would carry raw human-entered content into the log
+    # stream. ``*_hash`` / ``*_length`` derivatives are the supported path.
+    FORBIDDEN_FIELDS = frozenset(
+        {"question", "answer", "prompt", "text", "body", "stdout", "stderr"}
+    )
+
+    def test_no_log_event_call_passes_raw_sensitive_fields(self) -> None:
+        """Static guard: no ``log_event(..., question=...)`` anywhere in src."""
+        import ast
+        from pathlib import Path
+
+        import ctrlrelay
+
+        src_root = Path(ctrlrelay.__file__).resolve().parent
+        offenders: list[str] = []
+        for path in sorted(src_root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if getattr(node.func, "id", None) != "log_event":
+                    continue
+                for kw in node.keywords:
+                    if kw.arg in self.FORBIDDEN_FIELDS:
+                        offenders.append(f"{path.name}:{node.lineno} {kw.arg}=")
+        assert not offenders, (
+            "log_event must not carry raw sensitive payloads; "
+            f"use hash_text()/len() instead: {offenders}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_file_mock_logs_hash_not_plaintext(
+        self, tmp_path, caplog
+    ) -> None:
+        from ctrlrelay.core.obs import hash_text
+        from ctrlrelay.transports.file_mock import FileMockTransport
+
+        inbox = tmp_path / "inbox.txt"
+        outbox = tmp_path / "outbox.txt"
+        inbox.write_text("ship it\n")
+        outbox.touch()
+
+        transport = FileMockTransport(inbox=inbox, outbox=outbox)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            assert await transport.ask("Secret plan?", timeout=5) == "ship it"
+
+        posted = next(
+            r for r in caplog.records if r.getMessage() == "dev.question.posted"
+        )
+        assert "question" not in posted.__dict__
+        assert posted.__dict__["question_hash"] == hash_text("Secret plan?")
+        assert posted.__dict__["question_length"] == len("Secret plan?")
+
+        received = next(
+            r for r in caplog.records if r.getMessage() == "dev.answer.received"
+        )
+        assert "answer" not in received.__dict__
+        assert received.__dict__["answer_hash"] == hash_text("ship it")
+        assert received.__dict__["answer_length"] == len("ship it")
+
+    @pytest.mark.asyncio
+    async def test_socket_transport_logs_hash_not_plaintext(self, caplog) -> None:
+        import asyncio
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from ctrlrelay.bridge.protocol import (
+            BridgeMessage,
+            BridgeOp,
+            parse_message,
+            serialize_message,
+        )
+        from ctrlrelay.core.obs import hash_text
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        tmp_dir = Path(tempfile.mkdtemp())
+
+        async def handle(reader, writer):
+            try:
+                line = await reader.readline()
+                if not line:
+                    return
+                msg = parse_message(line.decode())
+                writer.write(
+                    serialize_message(
+                        BridgeMessage(
+                            op=BridgeOp.ANSWER,
+                            request_id=msg.request_id,
+                            answer="go ahead",
+                        )
+                    ).encode()
+                )
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_unix_server(
+            handle, path=str(tmp_dir / "t.sock")
+        )
+        try:
+            transport = SocketTransport(tmp_dir / "t.sock")
+            await transport.connect()
+
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                await transport.ask("Secret plan?", timeout=5)
+
+            posted = next(
+                r for r in caplog.records if r.getMessage() == "dev.question.posted"
+            )
+            assert "question" not in posted.__dict__
+            assert posted.__dict__["question_hash"] == hash_text("Secret plan?")
+
+            received = next(
+                r for r in caplog.records if r.getMessage() == "dev.answer.received"
+            )
+            assert "answer" not in received.__dict__
+            assert received.__dict__["answer_hash"] == hash_text("go ahead")
+
+            await transport.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_bridge_answer_logs_hash_not_plaintext(self, caplog) -> None:
+        """The Telegram reply path logs the answer's hash, never its text."""
+        import asyncio
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import AsyncMock, patch
+
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.obs import hash_text
+
+        d = tempfile.mkdtemp()
+        socket_path = Path(d) / "b.sock"
+
+        mock_handler = AsyncMock()
+        mock_handler.ask = AsyncMock(return_value=99)
+
+        try:
+            with patch(
+                "ctrlrelay.bridge.server.TelegramHandler", return_value=mock_handler
+            ):
+                server = BridgeServer(
+                    socket_path=socket_path, bot_token="x", chat_id=12345
+                )
+                task = asyncio.create_task(server.start())
+                await asyncio.sleep(0.1)
+
+                reader, writer = await asyncio.open_unix_connection(str(socket_path))
+                writer.write(
+                    serialize_message(
+                        BridgeMessage(
+                            op=BridgeOp.ASK,
+                            request_id="r-1",
+                            question="Continue?",
+                            session_id="dev-o-r-1-a",
+                        )
+                    ).encode()
+                )
+                await writer.drain()
+                await asyncio.wait_for(reader.readline(), timeout=1)
+
+                caplog.clear()
+                with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                    await server._on_telegram_reply("my private answer", 99)
+
+                received = next(
+                    r
+                    for r in caplog.records
+                    if r.getMessage() == "dev.answer.received"
+                )
+                assert "answer" not in received.__dict__
+                assert received.__dict__["answer_hash"] == hash_text(
+                    "my private answer"
+                )
+                assert received.__dict__["answer_length"] == len("my private answer")
+
+                writer.close()
+                await writer.wait_closed()
+                await server.stop()
+                task.cancel()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

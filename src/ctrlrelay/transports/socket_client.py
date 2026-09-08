@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from ctrlrelay.bridge.protocol import (
@@ -38,6 +39,7 @@ class SocketTransport:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._pending: dict[str, asyncio.Future[BridgeMessage]] = {}
+        self._on_ack: dict[str, Callable[[], None]] = {}
         self._receive_task: asyncio.Task | None = None
 
     @property
@@ -75,6 +77,12 @@ class SocketTransport:
                         # waiting. Terminal ACKs (status="sent" from SEND)
                         # remain the final response and resolve normally.
                         if msg.op == BridgeOp.ACK and msg.status == "pending":
+                            # This ACK is also the only proof the bridge got
+                            # the question in front of the operator, so it is
+                            # what "posted" is allowed to mean.
+                            callback = self._on_ack.get(msg.request_id)
+                            if callback is not None:
+                                callback()
                             continue
                         self._pending[msg.request_id].set_result(msg)
                 except ProtocolError:
@@ -91,11 +99,24 @@ class SocketTransport:
         self._writer.write(data)
         await self._writer.drain()
 
-    async def _send_and_wait(self, msg: BridgeMessage, timeout: int) -> BridgeMessage:
-        """Send message and wait for response."""
+    async def _send_and_wait(
+        self,
+        msg: BridgeMessage,
+        timeout: int,
+        *,
+        on_ack: Callable[[], None] | None = None,
+    ) -> BridgeMessage:
+        """Send message and wait for response.
+
+        ``on_ack`` fires from the receive loop when the bridge sends its
+        intermediate ACK — the point at which the request is known to have
+        been accepted, as opposed to merely written to the socket.
+        """
         assert msg.request_id is not None
         future: asyncio.Future[BridgeMessage] = asyncio.get_event_loop().create_future()
         self._pending[msg.request_id] = future
+        if on_ack is not None:
+            self._on_ack[msg.request_id] = on_ack
 
         try:
             await self._send_message(msg)
@@ -104,6 +125,7 @@ class SocketTransport:
             raise TransportError("Timeout waiting for response") from e
         finally:
             self._pending.pop(msg.request_id, None)
+            self._on_ack.pop(msg.request_id, None)
 
     async def send(
         self,
@@ -150,27 +172,62 @@ class SocketTransport:
             issue_number=issue_number,
         )
 
-        log_event(
-            _logger,
-            "dev.question.posted",
-            session_id=session_id,
-            repo=repo,
-            issue_number=issue_number,
-            transport="socket",
-            destination=str(self.socket_path),
-            request_id=request_id,
-            question=question,
-            question_length=len(question),
-            question_hash=hash_text(question),
-            options=options,
-        )
+        # The question itself never reaches the log stream: these records go
+        # to stdout and are captured into ~/.ctrlrelay/logs, where operator
+        # content would sit in plaintext with no retention policy. The hash
+        # is enough to correlate one question across poller and bridge.
+        common = {
+            "session_id": session_id,
+            "repo": repo,
+            "issue_number": issue_number,
+            "transport": "socket",
+            "destination": str(self.socket_path),
+            "request_id": request_id,
+            "question_length": len(question),
+            "question_hash": hash_text(question),
+            "options": options,
+        }
+
+        posted = False
+
+        def _mark_posted() -> None:
+            # Fired by the receive loop on the bridge's ACK, which is the
+            # first moment the question is known to have reached Telegram.
+            # Logging before the write would claim a delivery that a failed
+            # socket write or a Telegram outage never made.
+            nonlocal posted
+            posted = True
+            log_event(_logger, "dev.question.posted", **common)
 
         sent_at = time.monotonic()
-        response = await self._send_and_wait(msg, timeout)
+        try:
+            response = await self._send_and_wait(msg, timeout, on_ack=_mark_posted)
+        except Exception as e:
+            if not posted:
+                log_event(
+                    _logger,
+                    "dev.question.post_failed",
+                    **common,
+                    reason="send_failed",
+                    error=str(e)[:200],
+                )
+            raise
 
         if response.op == BridgeOp.ERROR:
+            if not posted:
+                log_event(
+                    _logger,
+                    "dev.question.post_failed",
+                    **common,
+                    reason="bridge_error",
+                    error=str(response.message)[:200],
+                )
             raise TransportError(f"Bridge error: {response.message}")
         if response.op == BridgeOp.ANSWER and response.answer:
+            if not posted:
+                # An answer proves the question was posted even if the ACK
+                # never arrived (older bridge, or the ACK was lost).
+                _mark_posted()
             log_event(
                 _logger,
                 "dev.answer.received",
@@ -179,7 +236,6 @@ class SocketTransport:
                 issue_number=issue_number,
                 transport="socket",
                 request_id=request_id,
-                answer=response.answer,
                 answer_length=len(response.answer),
                 answer_hash=hash_text(response.answer),
                 elapsed_ms=int((time.monotonic() - sent_at) * 1000),

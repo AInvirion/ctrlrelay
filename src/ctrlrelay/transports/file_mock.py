@@ -57,6 +57,9 @@ class FileMockTransport:
         with self.outbox.open("a") as f:
             f.write(f"[{timestamp}] QUESTION: {question}{opts}\n")
 
+        # Logged only after the outbox write, and without the question text:
+        # hash + length are enough to correlate, and keep operator content
+        # out of the log stream.
         log_event(
             _logger,
             "dev.question.posted",
@@ -65,7 +68,6 @@ class FileMockTransport:
             issue_number=issue_number,
             transport="file_mock",
             destination=str(self.outbox),
-            question=question,
             question_length=len(question),
             question_hash=hash_text(question),
             options=options,
@@ -85,7 +87,6 @@ class FileMockTransport:
                     repo=repo,
                     issue_number=issue_number,
                     transport="file_mock",
-                    answer=answer,
                     answer_length=len(answer),
                     answer_hash=hash_text(answer),
                     elapsed_ms=int((time.monotonic() - sent_at) * 1000),
