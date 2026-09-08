@@ -24,6 +24,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EOF` is deliberately still not matched: `gh` passes API response
   bodies through verbatim, so matching it would misclassify real API
   errors as outages, the same mistake in the other direction.
+- **A resource limit is no longer blamed on the `gh` install.** `EMFILE`
+  and `ENOMEM` also reach the classifier as `OSError` from a failed spawn,
+  but answering those with "install GitHub CLI" is the same misdirection
+  wearing a different hat. Only exec-family errnos say the install is
+  broken; the rest surface the errno.
+- **Go transport failures are no longer reported as API errors.** `gh`
+  renders a failed round-trip as `Get "https://…": <cause>`, which by
+  construction means no HTTP response arrived — so `EOF`, `http2: client
+  connection lost`, `request canceled` and `remote error: tls: handshake
+  failure` were all landing as "GitHub API call failed". Matching the
+  shape rather than each wording catches the family; a real API error
+  carries `(HTTP nnn)` instead and is unaffected. `read tcp …: connection
+  timed out` (a link dropped mid-request) is matched too.
+- **TLS trust failures are no longer called transient.** An untrusted CA
+  or a skewed clock is a persistent local problem, and "retry later" can
+  never fix it. These now report as `tls_trust` with remediation pointing
+  at the CA bundle and the system clock. A certificate valid for the
+  wrong host stays a network failure — that is the captive-portal case.
+- **`gh` stderr is escaped before Rich renders it.** Stderr containing
+  bracketed text (e.g. `[/docs]`) raised `MarkupError`, replacing the
+  diagnostic with a traceback and skipping the exit — losing the raw
+  detail the line exists to show.
+- **The startup `gh` probe is time-bounded.** Without a timeout a hung
+  `gh` wedged `poller start` indefinitely, and the one exception branch
+  that really does mean connectivity could never fire.
 
 ### Added
 

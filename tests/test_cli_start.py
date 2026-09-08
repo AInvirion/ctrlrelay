@@ -775,3 +775,35 @@ class TestPollerStartGhProbeErrors:
         output = _squash(result.output)
         assert "gh" in output
         assert "Traceback" not in output
+
+
+class TestGhStderrIsNotParsedAsMarkup:
+    """`gh` stderr is arbitrary text and Rich parses `[...]` as markup. A
+    stderr containing something like `[/docs]` raised MarkupError, which
+    replaced the diagnostic with a traceback and skipped the exit — losing
+    exactly the raw detail that line exists to show."""
+
+    def test_stderr_with_markup_like_text_still_renders(self) -> None:
+        from rich.console import Console
+
+        from ctrlrelay.cli import rich_escape
+
+        stderr = "gh: Bad credentials (HTTP 401) see [/docs] for details"
+        console = Console(file=__import__("io").StringIO(), no_color=True)
+
+        # The unescaped form is what used to blow up.
+        with pytest.raises(Exception):
+            console.print(f"[dim]gh: {stderr}[/dim]")
+
+        console.print(f"[dim]gh: {rich_escape(stderr)}[/dim]")
+        rendered = console.file.getvalue()
+
+        assert "[/docs]" in rendered
+        assert "Bad credentials" in rendered
+
+    def test_the_probe_is_time_bounded(self) -> None:
+        """Without a timeout a hung gh wedges `poller start` forever, and
+        the classifier's TimeoutExpired branch can never fire."""
+        from ctrlrelay.cli import _GH_PROBE_TIMEOUT_SECONDS
+
+        assert _GH_PROBE_TIMEOUT_SECONDS > 0

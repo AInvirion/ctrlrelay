@@ -11,6 +11,7 @@ stderr text rather than the exit code.
 
 from __future__ import annotations
 
+import errno
 import re
 import subprocess
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ class GhFailureKind(str, Enum):
     RATE_LIMITED = "rate_limited"
     API_ERROR = "api_error"
     GH_MISSING = "gh_missing"
+    TLS_TRUST = "tls_trust"
 
 
 # Ordered most-specific-first within each group; matched case-insensitively
@@ -37,6 +39,7 @@ _NETWORK_PATTERNS = (
     "network is unreachable",
     "no route to host",
     "connection refused",
+    "connection timed out",
     "connection reset by peer",
     # A peer that vanished mid-write. Deliberately not matching bare
     # "EOF" alongside it: gh passes API response bodies through verbatim
@@ -55,6 +58,32 @@ _NETWORK_PATTERNS = (
     "check your internet connection",
 )
 
+# errnos `subprocess.run` raises when it cannot EXEC the child — the file
+# is absent, unreadable, a directory, or the wrong architecture. These
+# say "your gh install is broken". Resource-exhaustion errnos (EMFILE,
+# ENOMEM, EAGAIN) also surface as OSError here but mean nothing of the
+# sort, and telling that operator to install GitHub CLI sends them the
+# wrong way.
+_EXEC_FAILURE_ERRNOS = frozenset(
+    e for e in (
+        errno.ENOENT, errno.EACCES, errno.EPERM, errno.ENOEXEC,
+        errno.EISDIR, errno.ENOTDIR, errno.ELOOP,
+        errno.ENAMETOOLONG, errno.ETXTBSY,
+    )
+)
+
+# Persistent local trust problems, not outages: a corporate MITM proxy
+# without its CA installed, or a clock skewed far enough to invalidate a
+# valid certificate. "Retry later" is wrong advice for both. A cert valid
+# for the wrong host IS usually a captive portal, so that stays network.
+_TLS_TRUST_PATTERNS = (
+    "certificate signed by unknown authority",
+    "certificate has expired or is not yet valid",
+    "unable to get local issuer certificate",
+    "self-signed certificate",
+    "self signed certificate",
+)
+
 _RATE_LIMIT_PATTERNS = (
     "rate limit exceeded",
     "secondary rate limit",
@@ -67,7 +96,6 @@ _AUTH_PATTERNS = (
     "requires authentication",
     "gh auth login",
     "not logged in",
-    "no such host is authenticated",
     "authentication failed",
     "http 401",
     "required scopes",
@@ -108,9 +136,36 @@ def _decode(stderr: str | bytes | None) -> str:
     return stderr.strip()
 
 
+# Go renders a failed HTTP round-trip as `*url.Error`:
+#   Get "https://api.github.com/user": <cause>
+# By construction that means NO HTTP response was received, so it can
+# never be an API error — whatever the cause reads like. `gh api` prints
+# a real API error in the other shape entirely, `gh: <msg> (HTTP nnn)`,
+# so the two do not overlap. Keying on the shape catches the whole family
+# (EOF, http2 connection lost, request canceled, remote error: tls: …)
+# instead of chasing each new wording as a string.
+_URL_ERROR_RE = re.compile(r'^(?:get|post|put|patch|delete|head)\s+"https?://', re.I)
+
+
+def _is_transport_failure(text: str) -> bool:
+    """True when the text is Go's url.Error shape — request issued, no
+    response received."""
+    return any(
+        _URL_ERROR_RE.match(line.strip())
+        for line in text.splitlines()
+        if line.strip()
+    )
+
+
 def _kind_for(text: str) -> GhFailureKind:
     lowered = text.lower()
+    # Checked before the network patterns: these strings contain
+    # "x509:", but retrying never fixes a CA bundle or a skewed clock.
+    if any(pattern in lowered for pattern in _TLS_TRUST_PATTERNS):
+        return GhFailureKind.TLS_TRUST
     if any(pattern in lowered for pattern in _NETWORK_PATTERNS):
+        return GhFailureKind.NETWORK_UNAVAILABLE
+    if _is_transport_failure(text):
         return GhFailureKind.NETWORK_UNAVAILABLE
     # Rate-limit bodies mention authentication ("Authenticated requests get
     # a higher rate limit"), so they have to be matched before auth.
@@ -136,6 +191,13 @@ def _message_for(kind: GhFailureKind, status: int | None) -> str:
         return (
             "GitHub credentials rejected — run `gh auth status` "
             "(then `gh auth login`) and retry."
+        )
+    if kind is GhFailureKind.TLS_TRUST:
+        return (
+            "TLS certificate not trusted — the connection to api.github.com "
+            "was intercepted or the certificate could not be verified. "
+            "Install your proxy's CA certificate, or check the system clock. "
+            "Retrying will not help."
         )
     if kind is GhFailureKind.GH_MISSING:
         return (
@@ -190,17 +252,26 @@ def gh_failure_from_exception(exc: BaseException) -> GhFailure:
             stderr=str(exc),
         )
     if isinstance(exc, OSError):
-        # Everything else OSError-shaped comes from `subprocess.run`
-        # failing to EXEC the child — PermissionError on a non-executable
-        # binary, IsADirectoryError on a bad path, OSError(8) on a wrong
-        # architecture. Python is not doing the networking here, gh is,
-        # so an OSError raised on our side can never mean "offline".
-        # Reporting it as such is the exact misdiagnosis this module
-        # exists to prevent: it sends the operator to check their wifi
-        # while their gh install is broken.
+        # An OSError here came from `subprocess.run` failing to launch the
+        # child. Python is not doing the networking — gh is — so it can
+        # never mean "offline"; reporting it that way is the exact
+        # misdiagnosis this module exists to prevent.
+        #
+        # But only the EXEC-shaped errnos mean the install is broken. A
+        # process-table or memory limit (EMFILE, ENOMEM, EAGAIN) also
+        # lands here, and answering that with "install GitHub CLI" is
+        # just the same misdirection wearing a different hat. Fall
+        # through for those: the caller still prints the raw errno text,
+        # which is the actionable part.
+        if exc.errno in _EXEC_FAILURE_ERRNOS:
+            return GhFailure(
+                kind=GhFailureKind.GH_MISSING,
+                message=_message_for(GhFailureKind.GH_MISSING, None),
+                stderr=str(exc),
+            )
         return GhFailure(
-            kind=GhFailureKind.GH_MISSING,
-            message=_message_for(GhFailureKind.GH_MISSING, None),
+            kind=GhFailureKind.API_ERROR,
+            message=f"Could not run `gh`: {exc}",
             stderr=str(exc),
         )
     return classify_gh_failure(str(exc))

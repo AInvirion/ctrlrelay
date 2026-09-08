@@ -26,8 +26,6 @@ NETWORK_STDERR = [
     'Get "https://api.github.com/user": dial tcp 140.82.121.5:443: '
     "connect: no route to host",
     'Post "https://api.github.com/graphql": net/http: TLS handshake timeout',
-    'Get "https://api.github.com/user": x509: certificate signed by '
-    "unknown authority",
     'Get "https://api.github.com/user": context deadline exceeded '
     "(Client.Timeout exceeded while awaiting headers)",
     "read tcp 10.0.0.2:52344->140.82.121.5:443: connection reset by peer",
@@ -198,7 +196,11 @@ class TestFromException:
         failure = gh_failure_from_exception(
             OSError(101, "Network is unreachable")
         )
-        assert failure.kind is GhFailureKind.GH_MISSING
+        # ENETUNREACH is not an exec-family errno, so this is not blamed
+        # on the install either — but the invariant that matters is that
+        # it is never reported as connectivity.
+        assert failure.kind is not GhFailureKind.NETWORK_UNAVAILABLE
+        assert "network unavailable" not in failure.message.lower()
 
     def test_timeout_expired_is_network_unavailable(self) -> None:
         exc = subprocess.TimeoutExpired(cmd=["gh", "api", "user"], timeout=30)
@@ -291,3 +293,113 @@ class TestPeerVanishedMidWrite:
         )
 
         assert failure.kind is GhFailureKind.API_ERROR
+
+    def test_resource_exhaustion_is_not_blamed_on_the_gh_install(self) -> None:
+        """EMFILE/ENOMEM also reach us as OSError from a failed spawn, but
+        answering those with "install GitHub CLI" is the same misdirection
+        wearing a different hat. Surface the errno instead."""
+        from ctrlrelay.core.network import GhFailureKind, gh_failure_from_exception
+
+        for exc in (
+            OSError(24, "Too many open files"),
+            OSError(12, "Cannot allocate memory"),
+        ):
+            failure = gh_failure_from_exception(exc)
+
+            assert failure.kind is not GhFailureKind.GH_MISSING
+            assert "install" not in failure.message.lower()
+            assert str(exc.errno) in failure.message or exc.strerror in failure.message
+
+
+class TestTlsTrustIsNotAnOutage:
+    """A CA-trust failure or a skewed clock is a persistent local problem.
+    Reporting it as "network unavailable — retry" is advice that can never
+    work: the operator retries forever behind a corporate proxy whose CA
+    they simply have not installed."""
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            'Get "https://api.github.com/user": x509: certificate signed by '
+            "unknown authority",
+            'Get "https://api.github.com/user": x509: certificate has expired '
+            "or is not yet valid",
+            "SSL certificate problem: unable to get local issuer certificate",
+        ],
+        ids=["unknown-ca", "expired-or-skewed-clock", "no-local-issuer"],
+    )
+    def test_trust_failures_are_not_transient(self, stderr: str) -> None:
+        from ctrlrelay.core.network import GhFailureKind, classify_gh_failure
+
+        failure = classify_gh_failure(stderr, returncode=1)
+
+        assert failure.kind is GhFailureKind.TLS_TRUST
+        assert failure.is_transient is False
+        assert "retry" not in failure.message.lower().replace(
+            "retrying will not help", ""
+        )
+
+    def test_a_cert_for_the_wrong_host_stays_a_network_problem(self) -> None:
+        """A certificate valid for someone else is the captive-portal
+        signature — that really is connectivity, and it clears itself."""
+        from ctrlrelay.core.network import GhFailureKind, classify_gh_failure
+
+        failure = classify_gh_failure(
+            'Get "https://api.github.com/user": x509: certificate is valid '
+            "for portal.hotel.example, not api.github.com",
+            returncode=1,
+        )
+
+        assert failure.kind is GhFailureKind.NETWORK_UNAVAILABLE
+        assert failure.is_transient is True
+
+
+class TestTransportFailuresNeverReadAsApiErrors:
+    """Go renders a failed round-trip as `Get "url": <cause>`, which by
+    construction means no HTTP response arrived. `gh api` prints a real
+    API error in the other shape entirely, `gh: <msg> (HTTP nnn)`. Keying
+    on the shape catches the whole family instead of chasing each new
+    wording as a string."""
+
+    @pytest.mark.parametrize(
+        "cause",
+        [
+            "EOF",
+            "unexpected EOF",
+            "http2: client connection lost",
+            "net/http: request canceled while waiting for connection",
+            "remote error: tls: handshake failure",
+        ],
+    )
+    def test_url_error_shape_is_a_network_failure(self, cause: str) -> None:
+        from ctrlrelay.core.network import GhFailureKind, classify_gh_failure
+
+        failure = classify_gh_failure(
+            f'Get "https://api.github.com/user": {cause}', returncode=1
+        )
+
+        assert failure.kind is GhFailureKind.NETWORK_UNAVAILABLE
+
+    def test_an_api_error_mentioning_eof_is_still_an_api_error(self) -> None:
+        """The shape is what separates them, not the word: a real API
+        error carries `(HTTP nnn)` and no url.Error prefix."""
+        from ctrlrelay.core.network import GhFailureKind, classify_gh_failure
+
+        failure = classify_gh_failure(
+            "gh: Validation failed, unexpected EOF in body (HTTP 422)",
+            returncode=1,
+        )
+
+        assert failure.kind is GhFailureKind.API_ERROR
+
+    def test_established_socket_timeout_is_a_network_failure(self) -> None:
+        """ETIMEDOUT on an open socket — a link dropped mid-request."""
+        from ctrlrelay.core.network import GhFailureKind, classify_gh_failure
+
+        failure = classify_gh_failure(
+            "read tcp 10.0.0.2:52344->140.82.121.5:443: read: "
+            "connection timed out",
+            returncode=1,
+        )
+
+        assert failure.kind is GhFailureKind.NETWORK_UNAVAILABLE
