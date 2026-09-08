@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ctrlrelay.core.archived import ArchivedRepoTracker
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.github import GitHubCLI
@@ -496,8 +497,20 @@ async def run_secops_all(
     transport: Transport | None,
     contexts_dir: Path,
     max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
+    archived: ArchivedRepoTracker | None = None,
 ) -> list[PipelineResult]:
-    """Run secops pipeline on all configured repos."""
+    """Run secops pipeline on all configured repos.
+
+    ``archived`` (#163) skips repos that GitHub confirms are archived —
+    the alerts API answers 403 for them, so the sweep spends a whole
+    agent session discovering it can do nothing. Passing ``None``
+    disables the check entirely. A repo whose state can't be determined
+    is swept as normal; see :mod:`ctrlrelay.core.archived`.
+
+    One result is returned per configured repo, in order, including the
+    skipped ones — the scheduled sweep zips results against the repo
+    list to attribute its notifications.
+    """
     results = []
 
     pipeline = SecopsPipeline(
@@ -512,6 +525,19 @@ async def run_secops_all(
     for repo_config in repos:
         repo = repo_config.name
         session_id = f"secops-{repo.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
+
+        # Archived repos accept no security work: the Dependabot alerts
+        # API returns 403 for them, so a sweep burns a full agent session
+        # to reach a benign "nothing to do" summary. Skip before the lock
+        # and the worktree. The tracker logs `poll.repo.archived` once so
+        # the operator knows to drop the entry from orchestrator.yaml.
+        if archived is not None and await archived.is_archived(repo):
+            results.append(PipelineResult(
+                success=True,
+                session_id=session_id,
+                summary=f"Skipped {repo}: repository is archived on GitHub",
+            ))
+            continue
 
         if not state_db.acquire_lock(repo, session_id):
             results.append(PipelineResult(
@@ -847,6 +873,7 @@ async def resume_secops_from_pending(
     contexts_dir: Path,
     automation: Any = None,
     question: str | None = None,
+    archived: Any = None,
 ) -> PipelineResult:
     """Resume a BLOCKED secops session using an answer that arrived via
     Telegram after the original session had already torn down.
@@ -863,6 +890,40 @@ async def resume_secops_from_pending(
     sweep skips re-asking. Optional for backwards compat with older
     callers that pre-date the persistence work.
     """
+    # The sweep gate covers new runs only. A repo can be archived while a
+    # session sits blocked, and an answer arriving afterwards would take
+    # the lock, build a worktree and spawn the agent against a repo whose
+    # Dependabot API answers 403 — the exact waste #163 removes, through
+    # a door the gate does not cover.
+    if archived is not None and await archived.is_archived(repo):
+        summary = f"Skipped resume of {repo}: repository is archived on GitHub"
+        # Close the session out. The caller only marks the
+        # pending_resumes row consumed, so returning early without this
+        # leaves the sessions row at status='blocked' with no ended_at —
+        # a resume that was handled but looks forever outstanding, in
+        # every status listing and count.
+        try:
+            state_db.execute(
+                "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
+                "WHERE id = ?",
+                ("done", summary, int(time.time()), session_id),
+            )
+            state_db.commit()
+        except Exception as e:
+            log_event(
+                _logger,
+                "secops.resume.archived_status_update_failed",
+                session_id=session_id,
+                repo=repo,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
+        return PipelineResult(
+            success=True,
+            session_id=session_id,
+            summary=summary,
+        )
+
     if question:
         _record_decisions_from_answer(
             state_db,

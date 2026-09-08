@@ -168,6 +168,36 @@ class GitHubCLI:
         output = await self._run_gh(*args, timeout=timeout)
         return json.loads(output) if output.strip() else []
 
+    async def repo_is_archived(
+        self,
+        repo: str,
+        timeout: int | None = None,
+    ) -> bool:
+        """Return whether ``repo`` is archived on GitHub.
+
+        Deliberately strict: anything that isn't a boolean ``isArchived``
+        field raises :class:`GitHubError` rather than being coerced. The
+        caller (:class:`~ctrlrelay.core.archived.ArchivedRepoTracker`)
+        gates every repo the daemon works on, so "we don't know" must
+        never be able to look like "archived" — an ambiguous answer has
+        to raise so the repo keeps being polled.
+        """
+        output = await self._run_gh(
+            "repo", "view", repo, "--json", "isArchived", timeout=timeout,
+        )
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as e:
+            raise GitHubError(
+                f"gh repo view returned non-JSON for {repo}: {e}"
+            ) from e
+        value = data.get("isArchived") if isinstance(data, dict) else None
+        if not isinstance(value, bool):
+            raise GitHubError(
+                f"gh repo view returned no boolean isArchived for {repo}"
+            )
+        return value
+
     async def list_security_alerts(
         self,
         repo: str,

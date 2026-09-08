@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from ctrlrelay.core.archived import ArchivedRepoTracker
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.obs import get_logger, log_event
 
@@ -94,6 +95,10 @@ class IssuePoller:
     regardless of ``require_labels``. An issue that's assigned but
     missing the required label is left unmarked (not seen) so a later
     label addition still surfaces it on a subsequent poll.
+
+    Repos GitHub confirms are archived are skipped entirely, logged once
+    per daemon lifetime (see #163 and :mod:`ctrlrelay.core.archived`). A
+    repo whose archived state can't be determined is polled as normal.
     """
 
     github: GitHubCLI
@@ -115,9 +120,25 @@ class IssuePoller:
     # Resets on daemon restart so a fresh detection still runs if the repo
     # re-enables issues in the meantime.
     _issues_disabled_repos: set[str] = field(default_factory=set, repr=False)
+    # Archived-repo detection (#163). Shared with the secops sweep when the
+    # daemon passes one in, so a single confirmation covers both paths;
+    # built from ``github`` when absent. Same cache lifetime as
+    # ``_issues_disabled_repos``: confirmed-archived only, in memory, reset
+    # on restart. See ctrlrelay.core.archived for the fail-open rule.
+    archived_tracker: ArchivedRepoTracker | None = None
 
     def __post_init__(self) -> None:
+        if self.archived_tracker is None:
+            self.archived_tracker = ArchivedRepoTracker(github=self.github)
         self._load_state()
+
+    @property
+    def _archived(self) -> ArchivedRepoTracker:
+        """The tracker, guaranteed non-None (``__post_init__`` builds one
+        when the caller doesn't supply it)."""
+        if self.archived_tracker is None:
+            self.archived_tracker = ArchivedRepoTracker(github=self.github)
+        return self.archived_tracker
 
     # ------------------------------------------------------------------
     # State persistence
@@ -247,6 +268,12 @@ class IssuePoller:
             # Repos with GitHub Issues disabled will never return issues; skip
             # before the `gh` call so we don't log the same error every cycle.
             if repo in self._issues_disabled_repos:
+                continue
+            # An archived repo accepts no new work — skip it before the
+            # `gh` call. Only a confirmed archive skips; an unknown
+            # answer falls through and the repo is polled as normal
+            # (see ctrlrelay.core.archived).
+            if await self._archived.is_archived(repo):
                 continue
             # Per-repo include-labels controls the fetch strategy. With
             # no include-labels configured we keep the pre-#80
@@ -702,6 +729,8 @@ class IssuePoller:
         """
         for repo in self.repos:
             if repo in self._issues_disabled_repos:
+                continue
+            if await self._archived.is_archived(repo):
                 continue
             include_labels = self.include_labels_by_repo.get(repo, [])
             try:

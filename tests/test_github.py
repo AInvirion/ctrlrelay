@@ -549,3 +549,61 @@ class TestGitHubCLI:
             commands = [" ".join(a) for a in all_args]
             assert any("comment" in c for c in commands)
             assert any("close" in c for c in commands)
+
+
+class TestRepoIsArchived:
+    """Issue #163: one cheap `gh repo view --json isArchived` call, and a
+    hard rule that anything other than a boolean answer raises so the
+    caller can fail open."""
+
+    @pytest.mark.asyncio
+    async def test_returns_true_for_archived_repo(self) -> None:
+        from ctrlrelay.core.github import GitHubCLI
+
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.return_value = json.dumps({"isArchived": True})
+            gh = GitHubCLI()
+            assert await gh.repo_is_archived("owner/repo") is True
+
+        args = mock_run.call_args.args
+        assert args == ("repo", "view", "owner/repo", "--json", "isArchived")
+
+    @pytest.mark.asyncio
+    async def test_returns_false_for_active_repo(self) -> None:
+        from ctrlrelay.core.github import GitHubCLI
+
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.return_value = json.dumps({"isArchived": False})
+            gh = GitHubCLI()
+            assert await gh.repo_is_archived("owner/repo") is False
+
+    @pytest.mark.asyncio
+    async def test_missing_field_raises(self) -> None:
+        from ctrlrelay.core.github import GitHubCLI, GitHubError
+
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.return_value = json.dumps({"name": "repo"})
+            gh = GitHubCLI()
+            with pytest.raises(GitHubError):
+                await gh.repo_is_archived("owner/repo")
+
+    @pytest.mark.asyncio
+    async def test_non_json_output_raises(self) -> None:
+        from ctrlrelay.core.github import GitHubCLI, GitHubError
+
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.return_value = "not json at all"
+            gh = GitHubCLI()
+            with pytest.raises(GitHubError):
+                await gh.repo_is_archived("owner/repo")
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_forwarded(self) -> None:
+        from ctrlrelay.core.github import GitHubCLI
+
+        with patch("ctrlrelay.core.github.GitHubCLI._run_gh") as mock_run:
+            mock_run.return_value = json.dumps({"isArchived": False})
+            gh = GitHubCLI()
+            await gh.repo_is_archived("owner/repo", timeout=15)
+
+        assert mock_run.call_args.kwargs["timeout"] == 15

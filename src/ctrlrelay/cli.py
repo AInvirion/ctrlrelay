@@ -552,6 +552,7 @@ def run_secops(
     """Run secops pipeline on configured repos."""
     import asyncio
 
+    from ctrlrelay.core.archived import ArchivedRepoTracker
     from ctrlrelay.core.dispatcher import make_agent_dispatcher
     from ctrlrelay.core.github import GitHubCLI
     from ctrlrelay.core.state import StateDB
@@ -638,6 +639,9 @@ def run_secops(
             state_db=db,
             transport=transport,
             contexts_dir=config.paths.contexts,
+            # Fresh tracker per invocation — the manual path is one-shot,
+            # so there's nothing to cache across runs (#163).
+            archived=ArchivedRepoTracker(github=github),
         )
 
     try:
@@ -1538,6 +1542,10 @@ def poller_start(
                     state_db=state_db,
                     transport=secops_transport,
                     contexts_dir=config.paths.contexts,
+                    # Same tracker the poller uses, so one confirmed
+                    # archive is logged once and honored by both the
+                    # 120s issue poll and the daily sweep (#163).
+                    archived=poller.archived_tracker,
                 )
                 ok = sum(1 for r in results if r.success)
                 console.print(
@@ -1736,6 +1744,10 @@ def poller_start(
                                     else None
                                 ),
                                 question=row.get("question"),
+                                # Same tracker as the poller and the
+                                # sweep: a repo archived while a session
+                                # sat blocked must not be resumed into.
+                                archived=poller.archived_tracker,
                             )
                         elif pipeline_name == "dev":
                             # Dev resume needs the repo's branch template

@@ -1632,3 +1632,115 @@ class TestNonOperatorPRsAreOutOfScope:
 
         assert "confirm no action wanted" in lower
         assert "answer changes what you do next" in lower
+
+
+class TestSecopsSkipsArchivedRepos:
+    """Issue #163: a full agent session per day against an archived repo
+    does real work to discover it can do nothing (the Dependabot alerts
+    API answers 403). Skip it before spending the session."""
+
+    def _repo(self, name: str) -> MagicMock:
+        repo = MagicMock()
+        repo.name = name
+        repo.automation = None
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_archived_repo_is_skipped_without_a_session(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.archived import ArchivedRepoTracker
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        github = MagicMock()
+        github.repo_is_archived = AsyncMock(
+            side_effect=lambda repo, **kw: repo == "owner/archived"
+        )
+        dispatcher = AsyncMock()
+        worktree = AsyncMock()
+        worktree.create_worktree.return_value = tmp_path / "worktree"
+        worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+        db = MagicMock()
+        db.acquire_lock.return_value = False  # forces an early, cheap exit
+
+        results = await run_secops_all(
+            repos=[self._repo("owner/archived"), self._repo("owner/live")],
+            dispatcher=dispatcher,
+            github=github,
+            worktree=worktree,
+            dashboard=None,
+            state_db=db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+            archived=ArchivedRepoTracker(github=github),
+        )
+
+        # One result per configured repo, in order — the scheduled sweep
+        # zips results against config.repos to attribute notifications.
+        assert len(results) == 2
+        assert "archived" in results[0].summary
+        # The archived repo never reached the lock / worktree / agent.
+        assert [c.args[0] for c in db.acquire_lock.call_args_list] == [
+            "owner/live"
+        ]
+        worktree.create_worktree.assert_not_awaited()
+        dispatcher.spawn_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repo_still_swept_when_archived_lookup_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """Fail open — an unknown archived state must not cancel the sweep."""
+        from ctrlrelay.core.archived import ArchivedRepoTracker
+        from ctrlrelay.core.github import GitHubError
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        github = MagicMock()
+        github.repo_is_archived = AsyncMock(
+            side_effect=GitHubError("gh failed: HTTP 502")
+        )
+        db = MagicMock()
+        db.acquire_lock.return_value = False
+
+        results = await run_secops_all(
+            repos=[self._repo("owner/live")],
+            dispatcher=AsyncMock(),
+            github=github,
+            worktree=AsyncMock(),
+            dashboard=None,
+            state_db=db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+            archived=ArchivedRepoTracker(github=github),
+        )
+
+        assert len(results) == 1
+        db.acquire_lock.assert_called_once()
+        assert "archived" not in (results[0].summary or "")
+
+    @pytest.mark.asyncio
+    async def test_no_tracker_means_no_extra_gh_calls(
+        self, tmp_path: Path
+    ) -> None:
+        """``archived=None`` keeps the pre-#163 behaviour for callers that
+        don't wire a tracker."""
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        github = MagicMock()
+        github.repo_is_archived = AsyncMock(return_value=True)
+        db = MagicMock()
+        db.acquire_lock.return_value = False
+
+        results = await run_secops_all(
+            repos=[self._repo("owner/live")],
+            dispatcher=AsyncMock(),
+            github=github,
+            worktree=AsyncMock(),
+            dashboard=None,
+            state_db=db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        github.repo_is_archived.assert_not_awaited()
+        assert len(results) == 1

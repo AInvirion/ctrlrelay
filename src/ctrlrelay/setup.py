@@ -375,11 +375,13 @@ def build_orchestrator_yaml(
             a(f'    - source: "{_yaml_escape(entry.source)}"')
             a(f'      target: "{_yaml_escape(entry.target)}"')
         a("")
-    a("# Repos discovered via `gh repo list`. Filters applied:")
+    a("# Repos discovered via `gh repo list`. Filters applied ONCE, here,")
+    a("# when this file was generated — not an ongoing guarantee:")
     a(
         f"# skip_archived={options.skip_archived}, "
         f"skip_forks={options.skip_forks}. Empty repos always skipped."
     )
+    a("# (A repo archived later is detected at poll time and skipped.)")
     total_repos = sum(len(rs) for rs in repos_by_owner.values())
     if total_repos == 0:
         # An empty mapping must serialize as ``repos: []``. A bare
