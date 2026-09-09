@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-09
+
 ### Fixed
 
 - **Answering a secops question inline now gets a confirmation.** Two
@@ -1614,7 +1616,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.8.1...v0.9.0
