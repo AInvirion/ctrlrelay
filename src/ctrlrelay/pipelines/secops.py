@@ -657,6 +657,49 @@ async def run_secops_all(
                 rounds += 1
                 result = await pipeline.resume(ctx, answer)
 
+            # Close the loop on an answer the operator gave inline.
+            # The sweep-wide summary only lands when every repo has
+            # been swept — on a 90-repo sweep that's hours after the
+            # reply, so answering felt like shouting into a void. The
+            # late-answer path (pending_resumes) already reports per
+            # session; this is the same courtesy for the case where
+            # the session was still alive to receive the answer.
+            # Guarded on rounds > 0 so the ~90 repos that never asked
+            # anything stay silent.
+            if rounds > 0 and transport is not None:
+                try:
+                    if result.success:
+                        await transport.send(
+                            f"✅ Answer applied on {repo}\n"
+                            f"Session: `{session_id}`\n"
+                            f"\n{result.summary}"
+                        )
+                    elif result.blocked:
+                        q = result.question or "(no question text)"
+                        await transport.send(
+                            f"⏸️ Re-blocked after your answer on {repo}\n"
+                            f"Session: `{session_id}`\n"
+                            f"\n{q}"
+                        )
+                    else:
+                        err = result.error or result.summary
+                        await transport.send(
+                            f"❌ Failed after your answer on {repo}\n"
+                            f"Session: `{session_id}`\n"
+                            f"\n{err}"
+                        )
+                except Exception as e:
+                    # Best-effort: a dead socket must not lose the
+                    # completed work or abort the rest of the sweep.
+                    log_event(
+                        _logger,
+                        "secops.answer_ack.send_failed",
+                        session_id=session_id,
+                        repo=repo,
+                        error_type=type(e).__name__,
+                        error=str(e)[:200],
+                    )
+
             results.append(result)
 
             status = "done" if result.success else ("blocked" if result.blocked else "failed")

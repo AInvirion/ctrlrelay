@@ -432,6 +432,203 @@ class TestSecopsBlockedDispatch:
         assert "Need decision" in mock_db.add_pending_resume.call_args.kwargs["question"]
 
 
+class TestSecopsInlineAnswerAck:
+    """An answer the operator gives while the session is still alive must
+    get its own result message. The sweep-wide summary only lands once
+    every repo is done — hours later on a large sweep — so without this
+    the operator answers and hears nothing back. The late-answer path
+    (pending_resumes sweeper) already reports per session; this covers
+    the inline case.
+    """
+
+    @staticmethod
+    def _states(final_status, *, summary=None, question=None, error=None):
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+
+        blocked = MagicMock()
+        blocked.status = CheckpointStatus.BLOCKED_NEEDS_INPUT
+        blocked.question = "Merge PR #42 (minor bump)?"
+        blocked.summary = None
+        blocked.outputs = {}
+        blocked.error = None
+
+        final = MagicMock()
+        final.status = final_status
+        final.summary = summary
+        final.question = question
+        final.outputs = {}
+        final.error = error
+        return blocked, final
+
+    @staticmethod
+    async def _run(tmp_path, blocked, final, transport):
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.side_effect = [
+            SessionResult(session_id="sess", exit_code=0, state=blocked),
+            SessionResult(session_id="sess", exit_code=0, state=final),
+        ]
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.get_agent_session_id.return_value = "sess"
+
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        return await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=transport,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_resume_sends_summary_to_operator(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+
+        blocked, final = self._states(
+            CheckpointStatus.DONE, summary="Merged 7 minor Dependabot PRs"
+        )
+        transport = AsyncMock()
+        transport.ask.return_value = "yes, merge"
+
+        results = await self._run(tmp_path, blocked, final, transport)
+
+        assert results[0].success
+        transport.send.assert_called_once()
+        text = transport.send.call_args.args[0]
+        assert "owner/repo" in text
+        assert "Merged 7 minor Dependabot PRs" in text
+        assert text.startswith("✅")
+
+    @pytest.mark.asyncio
+    async def test_reblocked_resume_reports_the_new_question(
+        self, tmp_path: Path
+    ) -> None:
+        """Hitting max_blocked_rounds (or a second BLOCKED the operator
+        never sees) must not go silent either — report the open question
+        so the operator knows the session is still stuck."""
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        blocked, _ = self._states(CheckpointStatus.DONE)
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="sess", exit_code=0, state=blocked,
+        )
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+        mock_db.get_agent_session_id.return_value = "sess"
+
+        transport = AsyncMock()
+        transport.ask.return_value = "yes"
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        results = await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=transport,
+            contexts_dir=tmp_path / "contexts",
+            max_blocked_rounds=2,
+        )
+
+        assert results[0].blocked
+        transport.send.assert_called_once()
+        text = transport.send.call_args.args[0]
+        assert text.startswith("⏸️")
+        assert "Merge PR #42" in text
+
+    @pytest.mark.asyncio
+    async def test_repo_that_never_asked_stays_silent(
+        self, tmp_path: Path
+    ) -> None:
+        """The overwhelming majority of a 90-repo sweep finds nothing to
+        decide. Those must send nothing — otherwise the ack turns into
+        90 notifications a day and the operator stops reading them."""
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        done = MagicMock()
+        done.status = CheckpointStatus.DONE
+        done.summary = "No open Dependabot alerts, nothing to do"
+        done.outputs = {}
+        done.error = None
+
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.return_value = SessionResult(
+            session_id="sess", exit_code=0, state=done,
+        )
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "worktree"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+
+        transport = AsyncMock()
+        repo = MagicMock()
+        repo.name = "owner/repo"
+
+        results = await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=transport,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        assert results[0].success
+        transport.ask.assert_not_called()
+        transport.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_failure_does_not_lose_the_completed_result(
+        self, tmp_path: Path
+    ) -> None:
+        """A dead bridge socket at ack time must not discard work the
+        agent already did, nor abort the rest of the sweep."""
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+
+        blocked, final = self._states(
+            CheckpointStatus.DONE, summary="Merged PR #42"
+        )
+        transport = AsyncMock()
+        transport.ask.return_value = "yes"
+        transport.send.side_effect = RuntimeError("socket closed")
+
+        results = await self._run(tmp_path, blocked, final, transport)
+
+        assert len(results) == 1
+        assert results[0].success
+        assert results[0].summary == "Merged PR #42"
+
+
 class TestSecopsPromptRespectsAutomationConfig:
     """The per-repo `automation:` block in orchestrator.yaml defines the
     Dependabot policy per severity tier (patch/minor/major × auto/ask/never).
