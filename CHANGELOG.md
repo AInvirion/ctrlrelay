@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Answering a secops question inline now gets a confirmation.** Two
+  paths reach a resumed session and only one of them reported. A reply
+  that arrived after the session had torn down landed in
+  `pending_resumes` and the sweeper sent `✅ Resume succeeded on <repo>`;
+  a reply that arrived while the session was still parked in
+  `transport.ask` resumed in-process and sent nothing at all.
+
+  The only completion message on that second path was the sweep-wide
+  `✅ Scheduled secops sweep done: N/M ok`, which fires once every repo
+  has been swept. On the 2026-09-09 sweep that was hours after the reply
+  and named no repo: four answers merged 20 Dependabot PRs across
+  `ai-miner`, `kenos-orchestrator`, `prompt-injection-benchmark` and
+  `aiproxyguard-promptest`, and not one outbound message went back to
+  the operator. Answering looked indistinguishable from being ignored.
+
+  The inline path now reports the same three outcomes the sweeper
+  already did — summary, re-blocked question, or error. Repos that never
+  asked anything stay silent; acking all ~90 daily is how an operator
+  learns to ignore the channel. The send is best-effort, so a dead bridge
+  socket cannot discard completed work or abort the rest of the sweep.
+
 ## [0.11.0] - 2026-09-08
 
 ### Added
