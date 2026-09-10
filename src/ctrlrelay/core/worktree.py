@@ -8,8 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ctrlrelay.core.obs import get_logger, log_event
+
 if TYPE_CHECKING:
     from ctrlrelay.core.github import GitHubCLI
+
+_logger = get_logger("core.worktree")
 
 
 # Open-PR probe (issue #52) retries a handful of times before failing
@@ -35,6 +39,49 @@ _PR_PROBE_TIMEOUT_SECONDS = 10
 # `default_timeout_seconds` — a transfer still running past that is
 # genuinely stuck, not merely large.
 _GIT_TRANSFER_TIMEOUT_SECONDS = 1800
+
+# Branches ctrlrelay never authors, so rewinding one can never destroy
+# local work. Dependabot rebases its branches onto a moved base, which
+# rewrites their tips — under a non-force refspec every such rebase is
+# a non-fast-forward rejection.
+_BOT_BRANCH_REFSPEC = "+refs/heads/dependabot/*:refs/heads/dependabot/*"
+
+
+def _rejections_are_only_non_fast_forward(stderr: str) -> list[str]:
+    """Return the refs a fetch declined to rewind, or ``[]`` if the
+    failure was anything else.
+
+    A non-fast-forward rejection is the non-force refspec doing its job:
+    it refused to discard local commits. Git still exits 1, which the
+    caller must not read as "the fetch failed" — the rest of the fetch
+    (the default branch, prunes, new branches) applied normally.
+
+    Anything git considers a real error — ``fatal:`` on a dead remote,
+    ``error:`` on a bad object, or a rejection for some other reason —
+    returns ``[]`` so the caller raises as before. Failing open here
+    would turn an unreachable remote into a silent no-op and let
+    pipelines run against a stale tree, which is the bug this module's
+    explicit refspec was added to prevent in the first place.
+    """
+    refs: list[str] = []
+    for raw in stderr.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith(("fatal:", "error:")):
+            return []
+        if not line.startswith("!"):
+            continue  # progress line: "From ...", " * [new branch]", " abc..def"
+        if "non-fast-forward" not in low and "non-fast forward" not in low:
+            return []  # rejected for some other reason — not ours to swallow
+        # " ! [rejected]  <src> -> <dst>  (non-fast-forward)"
+        body = line.lstrip("! ")
+        if "]" in body:
+            body = body.split("]", 1)[1]
+        target = body.split("->")[-1].split("(")[0].strip()
+        refs.append(target or body.strip())
+    return refs
 
 
 class WorktreeError(Exception):
@@ -74,10 +121,17 @@ class WorktreeManager:
         *args: str,
         cwd: Path | None = None,
         timeout: int | None = None,
+        tolerate_non_fast_forward: bool = False,
     ) -> str:
         """Run git command and return stdout. `timeout` overrides self.timeout
         for one call — useful for cheap probes that shouldn't inherit the full
-        120s default when network is flaky."""
+        120s default when network is flaky.
+
+        ``tolerate_non_fast_forward`` is for fetches under a non-force
+        refspec: git exits 1 when it declines to rewind a diverged local
+        branch, even though every other ref updated. See
+        :func:`_rejections_are_only_non_fast_forward`.
+        """
         cmd = ["git", *args]
         effective_timeout = timeout if timeout is not None else self.timeout
         proc = await asyncio.create_subprocess_exec(
@@ -124,7 +178,21 @@ class WorktreeManager:
             raise
 
         if proc.returncode != 0:
-            raise WorktreeError(f"git failed: {stderr.decode().strip()}")
+            err = stderr.decode().strip()
+            declined = (
+                _rejections_are_only_non_fast_forward(err)
+                if tolerate_non_fast_forward
+                else []
+            )
+            if not declined:
+                raise WorktreeError(f"git failed: {err}")
+            log_event(
+                _logger,
+                "worktree.fetch.non_fast_forward",
+                cwd=str(cwd) if cwd is not None else None,
+                refs=declined,
+                ref_count=len(declined),
+            )
 
         return stdout.decode()
 
@@ -766,12 +834,11 @@ class WorktreeManager:
         test counts from a commit that was two weeks old.
 
         Refspec: ``refs/heads/*:refs/heads/*`` (no leading ``+``).
-        Fast-forward-only on purpose — codex caught this on the
-        first pass: a force update would clobber the dev pipeline's
-        ``create_worktree_with_new_branch`` reuse path, which keeps
-        local-ahead-of-origin commits when a prior session pushed
-        partial work. Non-force semantics give us the right
-        behavior in all three cases:
+        Fast-forward-only on purpose: a force update would clobber
+        the dev pipeline's ``create_worktree_with_new_branch`` reuse
+        path, which keeps local-ahead-of-origin commits when a prior
+        session pushed partial work. Non-force semantics give us the
+        right behavior in all three cases:
 
         - Local branch BEHIND origin (default-branch case, the bug
           we're fixing): fast-forward applies, local catches up.
@@ -782,15 +849,32 @@ class WorktreeManager:
 
         ``--prune`` drops refs that no longer exist on origin so
         deleted branches don't linger forever.
+
+        Two things keep that non-force refspec from failing the
+        caller, both learned from a secops sweep that died on
+        ``AInvirion/zzsites`` with ``main`` already updated:
+
+        - ``dependabot/*`` is fetched with a force refspec first.
+          Dependabot rebases its branches, which rewrites their tips,
+          so under a plain refspec every rebase is a rejection. These
+          branches are bot-authored and never carry local work, so
+          rewinding one destroys nothing. Twelve bare repos were
+          holding such a ref when this was found.
+        - Any rejection that survives is tolerated rather than raised.
+          Git exits 1 on a declined rewind even when every other ref
+          applied, and that exit code was aborting the whole session
+          for a branch it had correctly protected.
         """
         bare_path = self._get_bare_repo_path(repo)
 
         if bare_path.exists():
             await self._run_git(
                 "fetch", "--prune", "origin",
+                _BOT_BRANCH_REFSPEC,
                 "refs/heads/*:refs/heads/*",
                 cwd=bare_path,
                 timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+                tolerate_non_fast_forward=True,
             )
         else:
             await self._run_git(

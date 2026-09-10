@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rebased Dependabot branch no longer fails the whole sweep.** The
+  bare-repo fetch uses a non-force refspec so it cannot discard a prior
+  session's unpushed commits. Dependabot rebases its branches onto a
+  moved base, which rewrites their tips — so every rebase became a
+  `non-fast-forward` rejection, and `git fetch` exits 1 on a declined
+  rewind even when every other ref applied. `ensure_bare_repo` read that
+  exit code as failure and aborted the session.
+
+  Observed on `AInvirion/zzsites`, whose sweep died reporting
+  `WorktreeError: git failed: ... ! [rejected] ... (non-fast-forward)`
+  in the same fetch that had just advanced `main`. Twelve bare repos
+  were holding a `dependabot/*` ref at the time, each one primed to fail
+  the moment Dependabot rebased it.
+
+  `dependabot/*` is now fetched with a force refspec first — those
+  branches are bot-authored and never carry local work, so rewinding one
+  destroys nothing. Any rejection that survives is logged as
+  `worktree.fetch.non_fast_forward` and tolerated rather than raised,
+  because a declined rewind is the refspec doing its job. Real failures
+  still raise: a `fatal:`/`error:` line, a rejection for any other
+  reason, or an unexplained non-zero exit. Failing open there would turn
+  an unreachable remote into a silent no-op and run pipelines against a
+  stale tree.
+
 ## [0.11.1] - 2026-09-09
 
 ### Fixed
