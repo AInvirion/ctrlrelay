@@ -1599,3 +1599,182 @@ class TestGitTimeoutIsDiagnosable:
         await wt.ensure_bare_repo("owner/repo")
         fetch_kwargs = wt._run_git.await_args_list[0].kwargs
         assert fetch_kwargs["timeout"] == _GIT_TRANSFER_TIMEOUT_SECONDS
+
+
+class TestFetchSurvivesRewrittenBranches:
+    """A secops sweep died on `AInvirion/zzsites` with the message
+    `WorktreeError: git failed: ... ! [rejected] ... (non-fast-forward)`
+    — while the same fetch had already advanced `main`. Dependabot
+    rebases its branches, which rewrites their tips, so under the
+    non-force refspec every rebase is a rejection and `git fetch`
+    exits 1. Twelve bare repos held such a ref when this was found.
+    """
+
+    @staticmethod
+    def _git(*args: str, cwd: Path) -> str:
+        import subprocess
+
+        env = {
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+            "PATH": __import__("os").environ.get("PATH", ""),
+            "HOME": str(cwd),
+        }
+        return subprocess.run(
+            ["git", *args], cwd=cwd, env=env,
+            capture_output=True, text=True, check=True,
+        ).stdout
+
+    @classmethod
+    def _build_repos(cls, tmp_path: Path) -> tuple[Path, Path]:
+        """origin with a rewritten dependabot branch and a rewritten
+        `fix/` branch; a bare clone holding its own commit on each."""
+        import subprocess
+
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        cls._git("init", "-q", "-b", "main", ".", cwd=origin)
+        (origin / "f").write_text("base\n")
+        cls._git("add", ".", cwd=origin)
+        cls._git("commit", "-qm", "base", cwd=origin)
+        cls._git("branch", "dependabot/uv/pkg-1.0", cwd=origin)
+        cls._git("branch", "fix/issue-1", cwd=origin)
+
+        bare = tmp_path / "bare.git"
+        subprocess.run(
+            ["git", "clone", "-q", "--bare", str(origin), str(bare)],
+            check=True, capture_output=True,
+        )
+
+        # Rewrite both branches on origin so neither is a descendant of
+        # what the bare clone now holds.
+        for br, text in (
+            ("dependabot/uv/pkg-1.0", "rebased"), ("fix/issue-1", "forced"),
+        ):
+            cls._git("checkout", "-q", br, cwd=origin)
+            (origin / "f").write_text(text + "\n")
+            cls._git("commit", "-qam", "v1", cwd=origin)
+            cls._git("commit", "-q", "--amend", "-m", br, cwd=origin)
+
+        # Give the bare repo a local-only commit on each branch.
+        main_tree = cls._git(
+            "rev-parse", "refs/heads/main^{tree}", cwd=bare
+        ).strip()
+        for br in ("dependabot/uv/pkg-1.0", "fix/issue-1"):
+            sha = cls._git(
+                "commit-tree", main_tree, "-p", "refs/heads/main",
+                "-m", f"local work on {br}", cwd=bare,
+            ).strip()
+            cls._git("update-ref", f"refs/heads/{br}", sha, cwd=bare)
+        return origin, bare
+
+    @staticmethod
+    def _sha(bare: Path, ref: str) -> str:
+        import subprocess
+
+        return subprocess.run(
+            ["git", "rev-parse", ref], cwd=bare,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    @pytest.mark.asyncio
+    async def test_rebased_dependabot_branch_no_longer_fails_the_sweep(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        origin, bare = self._build_repos(tmp_path)
+        before_fix = self._sha(bare, "refs/heads/fix/issue-1")
+
+        wt = WorktreeManager(
+            worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos",
+        )
+        target = wt._get_bare_repo_path("owner/repo")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        bare.rename(target)
+        self._git("remote", "set-url", "origin", str(origin), cwd=target)
+
+        # Must not raise — this is the reported failure.
+        await wt.ensure_bare_repo("owner/repo")
+
+        # Bot branch caught up to the rebase...
+        assert self._sha(target, "refs/heads/dependabot/uv/pkg-1.0") == \
+            self._sha(origin, "refs/heads/dependabot/uv/pkg-1.0")
+        # ...and the local commit on fix/ was NOT discarded. This is the
+        # protection the non-force refspec exists for; a blanket "+"
+        # would silently destroy a prior session's unpushed work.
+        assert self._sha(target, "refs/heads/fix/issue-1") == before_fix
+
+    @pytest.mark.asyncio
+    async def test_real_errors_still_raise(self, tmp_path: Path) -> None:
+        """Failing open would turn an unreachable remote into a silent
+        no-op and run pipelines against a stale tree."""
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+
+        wt = WorktreeManager(
+            worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos",
+        )
+        bare = wt._get_bare_repo_path("owner/repo")
+        bare.parent.mkdir(parents=True, exist_ok=True)
+        self._git("init", "-q", "--bare", str(bare), cwd=tmp_path)
+        self._git(
+            "remote", "add", "origin",
+            str(tmp_path / "does-not-exist"), cwd=bare,
+        )
+
+        with pytest.raises(WorktreeError):
+            await wt.ensure_bare_repo("owner/repo")
+
+
+class TestNonFastForwardClassifier:
+    """`_rejections_are_only_non_fast_forward` decides whether a
+    non-zero `git fetch` is the refspec doing its job or a real
+    failure. Getting it wrong in the permissive direction hides
+    outages; in the strict direction it re-breaks the sweep."""
+
+    def test_extracts_the_declined_refs(self) -> None:
+        from ctrlrelay.core.worktree import (
+            _rejections_are_only_non_fast_forward,
+        )
+
+        stderr = (
+            "From github.com:AInvirion/zzsites\n"
+            " - [deleted]         (none)     -> dependabot/uv/authlib-1.6.12\n"
+            " ! [rejected]        dependabot/uv/playwright-1.62.0 -> "
+            "dependabot/uv/playwright-1.62.0  (non-fast-forward)\n"
+            " * [new branch]      feat/import-navigation -> feat/import-navigation\n"
+            "   c6cfa84..f0a7911  main                   -> main\n"
+        )
+        assert _rejections_are_only_non_fast_forward(stderr) == [
+            "dependabot/uv/playwright-1.62.0"
+        ]
+
+    def test_fatal_is_not_tolerated(self) -> None:
+        from ctrlrelay.core.worktree import (
+            _rejections_are_only_non_fast_forward,
+        )
+
+        stderr = (
+            " ! [rejected]  a -> a  (non-fast-forward)\n"
+            "fatal: could not read from remote repository\n"
+        )
+        assert _rejections_are_only_non_fast_forward(stderr) == []
+
+    def test_other_rejection_reasons_are_not_tolerated(self) -> None:
+        from ctrlrelay.core.worktree import (
+            _rejections_are_only_non_fast_forward,
+        )
+
+        stderr = " ! [rejected]  v1 -> v1  (would clobber existing tag)\n"
+        assert _rejections_are_only_non_fast_forward(stderr) == []
+
+    def test_no_rejection_at_all_is_not_tolerated(self) -> None:
+        """Exit 1 with no rejection line is an unexplained failure."""
+        from ctrlrelay.core.worktree import (
+            _rejections_are_only_non_fast_forward,
+        )
+
+        assert _rejections_are_only_non_fast_forward("") == []
+        assert _rejections_are_only_non_fast_forward(
+            "From github.com:o/r\n   abc..def  main -> main\n"
+        ) == []
