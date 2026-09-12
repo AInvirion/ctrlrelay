@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-09-12
+
 ### Fixed
 
 - **A force-pushed default branch fails the fetch again.** v0.11.2
@@ -1656,7 +1658,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.3...HEAD
+[0.11.3]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.10.0...v0.11.0
