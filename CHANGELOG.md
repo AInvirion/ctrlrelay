@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A force-pushed default branch fails the fetch again.** v0.11.2
+  tolerated every non-fast-forward rejection so a rebased Dependabot
+  branch would stop aborting sweeps. That also covered the default
+  branch, which sessions are cut from: after a force-push to `main` on
+  GitHub, the bare repo would keep its old `main` and every session
+  would run on a tree origin no longer has, with only a log line to show
+  for it. A rejection of the default branch now raises
+  `default branch diverged from origin`; other branches are still
+  tolerated. Closes #120.
+
 ## [0.11.2] - 2026-09-10
 
 ### Fixed

@@ -79,12 +79,14 @@ class TestWorktreeManager:
             mock_git.return_value = ""
             await manager.ensure_bare_repo("owner/repo")
 
-        assert mock_git.await_count == 1
+        # symbolic-ref (default-branch lookup), then the fetch.
+        assert mock_git.await_count == 2
+        assert mock_git.await_args_list[0].args[0] == "symbolic-ref"
         args = mock_git.await_args.args
         # Must be a fetch, not --all, with the explicit refspec.
         assert args[0] == "fetch"
         assert "origin" in args
-        # Non-force refspec on purpose: codex P1 — a force fetch
+        # Non-force refspec on purpose: a force fetch
         # would destroy unpushed local commits in the dev pipeline's
         # branch-reuse flow. Fast-forward-only fixes the stale-
         # default-branch case while leaving divergent dev branches
@@ -1597,7 +1599,10 @@ class TestGitTimeoutIsDiagnosable:
         wt._get_bare_repo_path("owner/repo").mkdir(parents=True, exist_ok=True)
         wt._run_git.reset_mock()
         await wt.ensure_bare_repo("owner/repo")
-        fetch_kwargs = wt._run_git.await_args_list[0].kwargs
+        fetch_kwargs = next(
+            c.kwargs for c in wt._run_git.await_args_list
+            if c.args and c.args[0] == "fetch"
+        )
         assert fetch_kwargs["timeout"] == _GIT_TRANSFER_TIMEOUT_SECONDS
 
 
@@ -1723,6 +1728,47 @@ class TestFetchSurvivesRewrittenBranches:
         )
 
         with pytest.raises(WorktreeError):
+            await wt.ensure_bare_repo("owner/repo")
+
+
+    @pytest.mark.asyncio
+    async def test_force_pushed_default_branch_still_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """Sessions are cut from the default branch. If origin rewrote it,
+        tolerating the rejection would run every session on a tree origin
+        no longer has — quietly, instead of loudly."""
+        import subprocess
+
+        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+
+        origin, bare = self._build_repos(tmp_path)
+
+        # Rewrite main on origin, and give the bare clone its own commit
+        # on main so the two have diverged.
+        self._git("checkout", "-q", "main", cwd=origin)
+        (origin / "f").write_text("rewritten\n")
+        self._git("commit", "-qam", "x", cwd=origin)
+        self._git("commit", "-q", "--amend", "-m", "force-pushed main",
+                  cwd=origin)
+        tree = self._git("rev-parse", "refs/heads/main^{tree}",
+                         cwd=bare).strip()
+        sha = self._git("commit-tree", tree, "-p", "refs/heads/main",
+                        "-m", "local main", cwd=bare).strip()
+        self._git("update-ref", "refs/heads/main", sha, cwd=bare)
+
+        wt = WorktreeManager(
+            worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos",
+        )
+        target = wt._get_bare_repo_path("owner/repo")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        bare.rename(target)
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", str(origin)],
+            cwd=target, check=True,
+        )
+
+        with pytest.raises(WorktreeError, match="default branch diverged"):
             await wt.ensure_bare_repo("owner/repo")
 
 

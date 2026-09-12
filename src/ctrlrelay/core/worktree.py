@@ -122,6 +122,7 @@ class WorktreeManager:
         cwd: Path | None = None,
         timeout: int | None = None,
         tolerate_non_fast_forward: bool = False,
+        protected_refs: frozenset[str] = frozenset(),
     ) -> str:
         """Run git command and return stdout. `timeout` overrides self.timeout
         for one call — useful for cheap probes that shouldn't inherit the full
@@ -131,6 +132,11 @@ class WorktreeManager:
         refspec: git exits 1 when it declines to rewind a diverged local
         branch, even though every other ref updated. See
         :func:`_rejections_are_only_non_fast_forward`.
+
+        ``protected_refs`` names branches whose rejection is never
+        tolerated. A declined rewind of the default branch means local
+        and origin have diverged there, and every worktree cut from it
+        would run against a tree origin no longer has.
         """
         cmd = ["git", *args]
         effective_timeout = timeout if timeout is not None else self.timeout
@@ -186,6 +192,13 @@ class WorktreeManager:
             )
             if not declined:
                 raise WorktreeError(f"git failed: {err}")
+            stuck = sorted(set(declined) & protected_refs)
+            if stuck:
+                raise WorktreeError(
+                    f"git failed: default branch diverged from origin "
+                    f"({', '.join(stuck)}); refusing to use a stale tree: "
+                    f"{err}"
+                )
             log_event(
                 _logger,
                 "worktree.fetch.non_fast_forward",
@@ -864,10 +877,22 @@ class WorktreeManager:
           Git exits 1 on a declined rewind even when every other ref
           applied, and that exit code was aborting the whole session
           for a branch it had correctly protected.
+
+        The default branch is the exception: a rejection there still
+        raises. Sessions are cut from it, so tolerating that one would
+        swap a loud failure for work done quietly on a stale tree —
+        e.g. after a force-push to ``main`` on GitHub.
         """
         bare_path = self._get_bare_repo_path(repo)
 
         if bare_path.exists():
+            try:
+                default_branch = await self.get_default_branch(repo)
+            except WorktreeError:
+                # A bare repo with no symbolic HEAD cannot name a default
+                # branch to protect. create_worktree fails on the same
+                # lookup, so the stale-tree risk never reaches a session.
+                default_branch = ""
             await self._run_git(
                 "fetch", "--prune", "origin",
                 _BOT_BRANCH_REFSPEC,
@@ -875,6 +900,10 @@ class WorktreeManager:
                 cwd=bare_path,
                 timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
                 tolerate_non_fast_forward=True,
+                protected_refs=(
+                    frozenset({default_branch}) if default_branch
+                    else frozenset()
+                ),
             )
         else:
             await self._run_git(
