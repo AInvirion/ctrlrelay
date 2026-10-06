@@ -137,30 +137,79 @@ def test_ci_runs_the_whole_suite():
     If an exclusion is ever genuinely needed, prefer deleting or fixing
     the test. Do not leave the third state - a test that exists, is not
     run, and is believed to be covering something.
+
+    **Reads the parsed `run:` values, not lines of the file.** A review
+    round found three faults in the line-grep version, and parsing fixes
+    all of them: a step `name:` mentioning a flag was reported as an
+    offender (a false positive invites relaxing the guard, and a relaxed
+    guard stops guarding); `--ignore tests/x` with a space slipped past a
+    pattern that required `--ignore=`; and the guard reported clean when
+    it had inspected no pytest command at all.
     """
     import re
 
-    workflows = sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+    import yaml
 
-    # Negative control: an empty glob would report clean for the same
-    # reason a passing run does.
+    wf_dir = REPO_ROOT / ".github" / "workflows"
+    workflows = sorted(
+        [*wf_dir.glob("*.yml"), *wf_dir.glob("*.yaml")]
+    )
     assert len(workflows) >= 3, f"only found {len(workflows)} workflows"
 
-    # Flags that remove tests from a run. `--maxfail` is not one of them
-    # (it stops early on failure, it does not hide a passing test), and
-    # `-m` selects by marker, which the suite does not use for exclusion.
-    excluders = re.compile(r"--deselect|--ignore(?:-glob)?=|\s-k\s")
+    # Every `run:` script in every step, with where it came from.
+    runs: list[tuple[str, str]] = []
+    for wf in workflows:
+        doc = yaml.safe_load(wf.read_text()) or {}
+        for job_name, job in (doc.get("jobs") or {}).items():
+            for step in (job or {}).get("steps") or []:
+                script = (step or {}).get("run")
+                if isinstance(script, str):
+                    runs.append((f"{wf.name}:{job_name}", script))
+
+    invocations = [
+        (where, script)
+        for where, script in runs
+        if re.search(r"(?<![\w-])pytest(?![\w-])", script)
+    ]
+
+    # Invariant D, as a POSITIVE assertion. `offenders == []` alone passes
+    # when no pytest command exists at all - a workflow replaced with
+    # `run: true` would have reported clean.
+    assert invocations, (
+        "no workflow step runs pytest. Either CI stopped running the "
+        "suite, or this guard can no longer see it - both are faults, "
+        f"and neither is a clean result. Scanned: {[w for w, _ in runs]}"
+    )
+
+    # Flags that remove tests from a run, accepting `=` or a space.
+    # `--maxfail` is not one: it stops early on failure, it does not hide
+    # a passing test. `-m` selects by marker, which this suite does not
+    # use for exclusion.
+    excluders = re.compile(
+        r"--deselect(?:[=\s]|$)"
+        r"|--ignore(?:-glob)?(?:[=\s]|$)"
+        r"|(?<!\w)-k(?:[=\s]|$)"
+    )
 
     offenders: list[str] = []
-    for wf in workflows:
-        for lineno, line in enumerate(wf.read_text().splitlines(), start=1):
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                continue
-            if "pytest" not in line and "--deselect" not in line:
+    for where, script in invocations:
+        for lineno, line in enumerate(script.splitlines(), start=1):
+            if line.lstrip().startswith("#"):
                 continue
             if excluders.search(line):
-                offenders.append(f"{wf.name}:{lineno}: {stripped}")
+                offenders.append(f"{where} run line {lineno}: {line.strip()}")
+
+        # Narrowing the target paths excludes tests without any flag at
+        # all, which is the bypass a flag list cannot see.
+        targets = [
+            tok
+            for tok in script.split()
+            if tok.startswith("tests") and not tok.startswith("-")
+        ]
+        if targets and not any(t.rstrip("/") == "tests" for t in targets):
+            offenders.append(
+                f"{where}: runs only {targets}, not the whole tests/ tree"
+            )
 
     assert offenders == [], (
         "a workflow excludes tests from the run. Delete the test, fix it, "
