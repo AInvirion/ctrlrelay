@@ -1343,10 +1343,16 @@ class TestStaleReplyToDoesNotMisroute:
         for code in range(128):
             ch = chr(code)
             separates = ch not in alphabet
-            assert names_session(f"{sid}{ch}x", sid) is separates, (
+            # Each candidate is followed by a space, so the dot's
+            # conditional rule resolves to "separates" here. The dot's
+            # other direction — a dot followed by an id character, which
+            # does NOT separate because a repo name can contain one — is
+            # asserted in test_a_dot_is_both_a_sentence_end_and_part_of_an_id.
+            # Using "x" here instead would make this sweep contradict it.
+            assert names_session(f"{sid}{ch} y", sid) is separates, (
                 f"U+{code:04X} {ch!r} after the id"
             )
-            assert names_session(f"x{ch}{sid} y", sid) is separates, (
+            assert names_session(f"y{ch}{sid} z", sid) is separates, (
                 f"U+{code:04X} {ch!r} before the id"
             )
 
