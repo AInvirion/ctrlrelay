@@ -1340,6 +1340,14 @@ class TestStaleReplyToDoesNotMisroute:
         # text is not, and an ASCII-only class ended the id at the accent.
         assert not names_session(f"{sid}\u00e9 approved", sid)
         assert not names_session(f"\u00e9{sid} approved", sid)
+        # A combining mark renders as part of the neighbouring glyph but is
+        # not a \w character, so the lookaround alone saw a boundary where
+        # a reader sees none.
+        assert not names_session(f"{sid}\u0301 approved", sid)
+        assert not names_session(f"x\u0301{sid} approved", sid)
+        # ...and a real occurrence later in the same message still routes,
+        # rather than the first near-miss suppressing the whole message.
+        assert names_session(f"{sid}\u0301 no wait, {sid} yes", sid)
         assert not names_session("nothing here", sid)
         assert not names_session("anything", "")
 

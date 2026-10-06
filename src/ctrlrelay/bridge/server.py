@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import time
+import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,13 +61,35 @@ def names_session(text: str, session_id: str) -> bool:
     operator input, so ``...-bbb\u00e9`` would have ended the id at the
     accent and matched ``...-bbb``. The ids being ASCII says nothing about
     what surrounds them.
+
+    A combining mark needs the separate check below. ``\w`` does not match
+    one, so ``...-bbb`` followed by U+0301 satisfies the lookahead while
+    rendering as a different final glyph — the regex sees a boundary where
+    a reader sees none. ``re`` cannot match by Unicode category, and
+    enumerating the combining ranges is a guess about a table that grows,
+    so adjacency is checked directly. That makes the guard closed rather
+    than merely unlikely to be wrong, which is the property this function
+    needs: it decides which pipeline gets resumed.
+
+    Every occurrence is examined, not just the first. A near-miss early in
+    a message must not suppress a real mention later in it.
     """
     if not session_id:
         return False
-    return re.search(
-        r"(?<![\w-])" + re.escape(session_id) + r"(?![\w-])",
-        text,
-    ) is not None
+
+    def _is_mark(ch: str) -> bool:
+        # Empty means start- or end-of-string, which is a real boundary.
+        # unicodedata.combining() raises on "" rather than returning 0.
+        return bool(ch) and unicodedata.combining(ch) != 0
+
+    pattern = r"(?<![\w-])" + re.escape(session_id) + r"(?![\w-])"
+    for match in re.finditer(pattern, text):
+        after = text[match.end():match.end() + 1]
+        before = text[match.start() - 1: match.start()] if match.start() else ""
+        if _is_mark(after) or _is_mark(before):
+            continue
+        return True
+    return False
 
 
 def format_question(
