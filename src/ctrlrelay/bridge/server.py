@@ -106,17 +106,41 @@ def names_session(text: str, session_id: str) -> bool:
             # Exhaustive and permanently so: anything outside the id's own
             # alphabet separates. Covers the backtick, quotes, brackets and
             # the C0 controls without naming any of them.
-            return not (ch.isalnum() and ch.isascii())
+            return not ch.isalnum()
         if ch.isspace():
             return True
         return unicodedata.category(ch).startswith("P")
+
+    def _boundary_after(idx: int) -> bool:
+        """Whether the id ends at ``idx`` — the dot case handled properly.
+
+        ``.`` is the one character that is both a sentence terminator and a
+        legal part of a session id, because ids are minted from a GitHub
+        ``owner/repo`` and repo names may contain dots:
+        ``secops-owner-docs.github.com-abc12345``.
+
+        Treating ``.`` as a plain boundary made ``secops-owner-docs`` a
+        whole token inside that id — a false positive, and the only one
+        left that needed no exotic character at all. Treating it as an id
+        character instead would break ``approve secops-owner-r-abc123.``,
+        which is how a person actually writes a sentence.
+
+        So a run of dots separates only when what follows it separates
+        too. ``sid.`` and ``sid. Thanks`` end the id; ``sid.bar-abc`` does
+        not.
+        """
+        j = idx
+        while j < len(text) and text[j] == ".":
+            j += 1
+        if j == idx:
+            return _is_boundary(text[idx: idx + 1])
+        return _is_boundary(text[j: j + 1])
 
     span = len(session_id)
     idx = text.find(session_id)
     while idx != -1:
         before = text[idx - 1: idx] if idx else ""
-        after = text[idx + span: idx + span + 1]
-        if _is_boundary(before) and _is_boundary(after):
+        if _is_boundary(before) and _boundary_after(idx + span):
             return True
         # +1, not +span: a rejected candidate must not hide an overlapping
         # one starting inside it.

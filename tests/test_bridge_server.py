@@ -1350,6 +1350,36 @@ class TestStaleReplyToDoesNotMisroute:
                 f"U+{code:04X} {ch!r} before the id"
             )
 
+    def test_a_dot_is_both_a_sentence_end_and_part_of_an_id(self) -> None:
+        """The last false positive, and it needed no exotic character.
+
+        Session ids are minted as ``{pipeline}-{owner}-{repo}-{suffix}``
+        from a GitHub ``owner/repo``, and repo names may contain dots. So
+        ``secops-owner-docs.github.com-abc12345`` is a real id shape, and
+        treating ``.`` as a plain boundary made ``secops-owner-docs`` a
+        whole token inside it — exactly the wrong-session routing this
+        change exists to stop, reachable with ASCII only.
+
+        Treating ``.`` as an id character instead would break
+        ``approve secops-owner-r-abc123.``, which is how a person writes a
+        sentence. Both directions are asserted here because a fix for
+        either one alone looks correct in isolation.
+        """
+        from ctrlrelay.bridge.server import names_session
+
+        short = "secops-owner-docs"
+        long = "secops-owner-docs.github.com-abc12345"
+        assert not names_session(f"approve {long}", short)
+        assert names_session(f"approve {long}", long)
+
+        sid = "secops-owner-r-abc123"
+        assert names_session(f"approve {sid}.", sid)
+        assert names_session(f"{sid}. thanks", sid)
+        assert names_session(f"{sid}...", sid)
+        assert names_session(f"({sid}).", sid)
+        assert not names_session(f"{sid}.bar-x ok", sid)
+        assert not names_session(f"{sid}.9 ok", sid)
+
     def test_an_unrecognised_character_fails_toward_refusing(self) -> None:
         """Outside ASCII, anything we do not recognise as a separator is
         treated as part of the identifier.
