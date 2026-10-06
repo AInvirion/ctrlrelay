@@ -80,6 +80,21 @@ class SetupOptions:
     transport: str = "file_mock"  # or "telegram"
     telegram_chat_id: int | None = None
     telegram_token: str | None = None  # only used when transport == "telegram"
+    # Only used when transport == "mattermost".
+    #
+    # `url` and `channel_id` are emitted into the config; the CLI refuses
+    # --transport=mattermost without both, because they fail at different
+    # moments and only one is loud. An empty `url` is rejected by the
+    # schema at load. An empty `channel_id` is deliberately ACCEPTED by
+    # the schema and caught later by the bridge factory, so a config with
+    # one loads and starts and only then reports it.
+    #
+    # `mattermost_token` is NOT emitted - the config stores the variable
+    # NAME, never the secret. It exists only to bake a value into
+    # rendered daemon units, exactly as `telegram_token` does.
+    mattermost_url: str | None = None
+    mattermost_channel_id: str | None = None
+    mattermost_token: str | None = None
     personalization_repo: str | None = None  # e.g. "alice/dotclaude"
     # When True (the default) and ``personalization_repo`` is set,
     # setup pre-clones the personalization repo and scans
@@ -348,6 +363,26 @@ def build_orchestrator_yaml(
         a("    # session. Don't raise this to cover being asleep: a sweep")
         a("    # runs repos one at a time and holds each lock while it waits.")
         a("    ask_timeout_seconds: 900")
+    elif options.transport == "mattermost":
+        a('  type: "mattermost"')
+        a("  mattermost:")
+        a(f'    url: "{_yaml_escape(options.mattermost_url or "")}"')
+        a('    bot_token_env: "CTRLRELAY_MATTERMOST_TOKEN"')
+        a("    # The 26-character channel ID, not the channel name: a name")
+        a("    # is only unique within a team and can be renamed under you.")
+        a("    # Channel menu -> View Info, or")
+        a("    # GET /api/v4/teams/name/{team}/channels/name/{channel}.")
+        a("    # The bot must be a MEMBER of this channel - a non-member")
+        a("    # bot cannot post to it and does not receive its reply")
+        a("    # events either, so answers would silently never arrive.")
+        a(f'    channel_id: "{_yaml_escape(options.mattermost_channel_id or "")}"')
+        a('    socket_path: "~/.ctrlrelay/ctrlrelay.sock"')
+        a("    # Seconds a pipeline waits on your reply before giving up")
+        a("    # and persisting the session as BLOCKED. Only the in-session")
+        a("    # fast path - a later reply still resolves via the saved")
+        a("    # session. Don't raise this to cover being asleep: a sweep")
+        a("    # runs repos one at a time and holds each lock while it waits.")
+        a("    ask_timeout_seconds: 900")
     else:
         a('  type: "file_mock"')
         a("  file_mock:")
@@ -594,8 +629,11 @@ def _install_daemons(options: SetupOptions) -> list[Path]:
     # end so a parent shell that was already exporting a different
     # value isn't disturbed.
     prior_token = os.environ.get("CTRLRELAY_TELEGRAM_TOKEN")
+    prior_mm_token = os.environ.get("CTRLRELAY_MATTERMOST_TOKEN")
     if options.transport == "telegram" and options.telegram_token:
         os.environ["CTRLRELAY_TELEGRAM_TOKEN"] = options.telegram_token
+    if options.transport == "mattermost" and options.mattermost_token:
+        os.environ["CTRLRELAY_MATTERMOST_TOKEN"] = options.mattermost_token
 
     # Use the operator's home as the daemon working directory. Stable,
     # always exists, doesn't tie service lifetime to a particular project
@@ -611,9 +649,17 @@ def _install_daemons(options: SetupOptions) -> list[Path]:
             units = render_systemd(workdir=workdir)
         written = write_units(units, overwrite=options.force)
     finally:
-        if prior_token is None:
-            os.environ.pop("CTRLRELAY_TELEGRAM_TOKEN", None)
-        else:
-            os.environ["CTRLRELAY_TELEGRAM_TOKEN"] = prior_token
+        # Restore BOTH, for the reason the telegram one was restored: a
+        # parent shell already exporting a different value must not be
+        # disturbed. Setting one and restoring only the other leaks a
+        # token into the caller's environment.
+        for var, prior in (
+            ("CTRLRELAY_TELEGRAM_TOKEN", prior_token),
+            ("CTRLRELAY_MATTERMOST_TOKEN", prior_mm_token),
+        ):
+            if prior is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = prior
 
     return written

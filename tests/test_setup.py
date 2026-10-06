@@ -943,3 +943,242 @@ class TestSetupCli:
         )
         assert result.exit_code != 0, result.output
         assert "ACTION NEEDED" in result.output
+
+
+class TestSetupWritesTheTransportYouAskedFor:
+    """`--transport mattermost` was accepted and then ignored.
+
+    `VALID_TRANSPORTS` listed mattermost, so validation passed, but
+    `build_orchestrator_yaml` had only a telegram branch and an else.
+    The operator asked for Mattermost and silently got `file_mock` - a
+    config that loads, starts, and asks nobody anything.
+    """
+
+    def test_each_valid_transport_writes_its_own_block(self) -> None:
+        import yaml
+
+        from ctrlrelay.setup import (
+            VALID_TRANSPORTS,
+            SetupOptions,
+            build_orchestrator_yaml,
+        )
+
+        # Driven off VALID_TRANSPORTS rather than a list written here, so
+        # a transport added to that tuple without a branch in the
+        # generator fails this test on the day it is added.
+        assert len(VALID_TRANSPORTS) >= 3, VALID_TRANSPORTS
+
+        for name in VALID_TRANSPORTS:
+            options = SetupOptions(
+                transport=name,
+                mattermost_url="https://chat.example.test",
+                mattermost_channel_id="c" * 26,
+                telegram_chat_id=123,
+            )
+            doc = yaml.safe_load(
+                build_orchestrator_yaml(options, {})
+            )
+            assert doc["transport"]["type"] == name, (
+                f"setup --transport {name} wrote "
+                f"{doc['transport']['type']!r} instead"
+            )
+            assert name in doc["transport"], (
+                f"setup --transport {name} wrote no {name} block"
+            )
+
+    def test_the_generated_mattermost_config_actually_loads(
+        self, tmp_path
+    ) -> None:
+        """A block that validates, not just a block that exists."""
+        import yaml
+
+        from ctrlrelay.core.config import load_config
+        from ctrlrelay.setup import SetupOptions, build_orchestrator_yaml
+
+        options = SetupOptions(
+            transport="mattermost",
+            mattermost_url="https://chat.example.test",
+            mattermost_channel_id="c" * 26,
+            repo_root=tmp_path / "repos",
+        )
+        doc = yaml.safe_load(build_orchestrator_yaml(options, {}))
+        doc["repos"] = []
+        for key in ("state_db", "worktrees", "bare_repos", "contexts", "skills"):
+            doc.setdefault("paths", {})[key] = str(tmp_path / key)
+
+        path = tmp_path / "orchestrator.yaml"
+        path.write_text(yaml.dump(doc))
+
+        config = load_config(path)
+        assert config.transport.type.value == "mattermost"
+        assert config.transport.mattermost is not None
+        assert config.transport.mattermost.url == "https://chat.example.test"
+
+    @staticmethod
+    def _past_the_gh_gate():
+        """Stub the `gh auth status` gate these tests are not about.
+
+        `setup` asserts gh auth BEFORE it validates transport options, so
+        without this the four CLI tests below exercise the auth gate and
+        never reach the code they name. They passed locally only because
+        this machine happens to have gh logged in, and failed on the
+        runner, which does not - the test's subject was an environment
+        privilege rather than the behaviour in its name.
+        """
+        from unittest.mock import patch
+
+        return patch("ctrlrelay.setup.assert_gh_auth", return_value=None)
+
+    def test_the_cli_refuses_mattermost_without_url_and_channel(self) -> None:
+        """The CLI half, which the generator test cannot reach.
+
+        `build_orchestrator_yaml` is called directly by the tests above,
+        so they pass whether or not `ctrlrelay setup` threads the new
+        options into SetupOptions. This drives the command.
+
+        Both values are refused up front rather than emitted blank,
+        because they fail at different moments and only one is loud: an
+        empty url is rejected by the schema at load, while an empty
+        channel_id is deliberately accepted there and surfaces only when
+        the bridge starts.
+        """
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        with self._past_the_gh_gate():
+            result = CliRunner().invoke(
+                app,
+                [
+                    "setup",
+                    "--transport",
+                    "mattermost",
+                    "--owner",
+                    "someone",
+                    "--yes",
+                ],
+            )
+
+        assert result.exit_code == 2, result.output
+        assert "--mattermost-url" in result.output
+        assert "--mattermost-channel-id" in result.output
+
+    def test_the_cli_threads_mattermost_values_into_the_options(self) -> None:
+        """A flag that is accepted and then dropped is this PR's own bug."""
+        from unittest.mock import patch
+
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        seen = {}
+
+        def capture(options, *a, **kw):
+            seen["transport"] = options.transport
+            seen["url"] = options.mattermost_url
+            seen["channel"] = options.mattermost_channel_id
+            raise RuntimeError("short-circuit")
+
+        with self._past_the_gh_gate(), patch(
+            "ctrlrelay.setup.run_setup", side_effect=capture
+        ):
+            CliRunner().invoke(
+                app,
+                [
+                    "setup",
+                    "--transport",
+                    "mattermost",
+                    "--owner",
+                    "someone",
+                    "--mattermost-url",
+                    "https://chat.example.test",
+                    "--mattermost-channel-id",
+                    "c" * 26,
+                    "--yes",
+                ],
+            )
+
+        assert seen.get("transport") == "mattermost"
+        assert seen.get("url") == "https://chat.example.test"
+        assert seen.get("channel") == "c" * 26
+
+    def test_the_cli_refuses_a_channel_id_that_is_not_an_id(self) -> None:
+        """Caught at setup, not at the next config load.
+
+        The 26-character rule lives in `MattermostConfig` and this check
+        constructs that model rather than copying the rule, so the two
+        cannot drift. The test asserts the operator is stopped, not the
+        wording.
+        """
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        with self._past_the_gh_gate():
+            result = CliRunner().invoke(
+                app,
+                [
+                    "setup",
+                    "--transport",
+                    "mattermost",
+                    "--owner",
+                    "someone",
+                    "--mattermost-url",
+                    "https://chat.example.test",
+                    "--mattermost-channel-id",
+                    "my-channel-name",
+                    "--yes",
+                ],
+            )
+
+        assert result.exit_code == 2, result.output
+        assert "26-character" in result.output
+
+    def test_an_exported_but_empty_token_warns_instead_of_passing_silently(
+        self,
+    ) -> None:
+        """Drives the command, because the first version of this test did not.
+
+        It asserted `(os.environ.get(var) or None) is None`, which is an
+        expression evaluated in the test. Removing the `or None` from
+        cli.py left it green - the assertion would have passed if the
+        code under test did nothing at all.
+
+        `os.environ.get` returns "" for an exported-but-empty variable,
+        and `if token is None` treated that as a usable token: no prompt,
+        no warning, and a rendered unit carrying a placeholder nobody
+        mentioned.
+        """
+        import os
+        from unittest.mock import patch
+
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        def short_circuit(options, *a, **kw):
+            raise RuntimeError("short-circuit")
+
+        with (
+            patch.dict(os.environ, {"CTRLRELAY_MATTERMOST_TOKEN": ""}),
+            patch("ctrlrelay.setup.run_setup", side_effect=short_circuit),
+            self._past_the_gh_gate(),
+        ):
+            result = CliRunner().invoke(
+                app,
+                [
+                    "setup",
+                    "--transport",
+                    "mattermost",
+                    "--owner",
+                    "someone",
+                    "--mattermost-url",
+                    "https://chat.example.test",
+                    "--mattermost-channel-id",
+                    "c" * 26,
+                    "--install-daemons",
+                    "--yes",
+                ],
+            )
+
+        assert "no Mattermost token" in result.output, result.output

@@ -31,8 +31,22 @@ agent:
   default_timeout_seconds: 1800
   output_format: "json"
 
+# EXACTLY ONE transport is active, and it is the one named by `type`.
+# The other blocks below are inert: they may stay in the file, but nothing
+# reads them. Running Telegram and Mattermost at the same time is NOT
+# supported - that is tracked as issue #176.
+#
+# Choose:
+#   type: "telegram"    production, 1:1 chat with a bot
+#   type: "mattermost"  production, a channel on your own server
+#   type: "file_mock"   no chat at all; questions are written to files.
+#                       Blocked sessions still persist and can be resumed
+#                       later, but nobody is asked anything.
+#
+# Leaving a stale block for the transport you are NOT using is harmless,
+# but delete it if you want the file to say what is true.
 transport:
-  type: "file_mock"  # Use "telegram" for production
+  type: "file_mock"  # "telegram" or "mattermost" for production
   telegram:
     bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"
     chat_id: 123456789
@@ -44,6 +58,24 @@ transport:
     # to cover being asleep: a sweep runs its repos one at a time and
     # holds each repo's lock and worktree for the whole wait.
     ask_timeout_seconds: 900
+  mattermost:
+    url: "https://chat.example.com"
+    bot_token_env: "CTRLRELAY_MATTERMOST_TOKEN"
+    # The 26-character channel ID, not the channel name: a name is only
+    # unique within a team and can be renamed under you. Channel menu ->
+    # View Info, or GET /api/v4/teams/name/{team}/channels/name/{channel}.
+    #
+    # The bot must be a MEMBER of this channel. A bot without `post:all`
+    # cannot post where it is not a member - and, the part that is easy to
+    # miss, it does not receive that channel's reply events either, so
+    # answers would silently never arrive.
+    channel_id: "abcdefghijklmnopqrstuvwxyz"
+    socket_path: "~/.ctrlrelay/ctrlrelay.sock"
+    ask_timeout_seconds: 900
+    # How long an UNANSWERED question stays routable before it is retired.
+    # Read from whichever transport is active, so a Mattermost deployment
+    # takes this value and not the telegram block's.
+    question_ttl_seconds: 172800
   file_mock:
     inbox: "~/.ctrlrelay/inbox.txt"
     outbox: "~/.ctrlrelay/outbox.txt"

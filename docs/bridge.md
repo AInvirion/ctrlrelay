@@ -19,6 +19,13 @@ It speaks **Telegram** or **Mattermost**. Pipelines never know which: they
 talk to the socket, and the chat app is the bridge's business. Switching is a
 one-line config change and no pipeline code moves.
 
+**One at a time.** `transport.type` names the transport that is active, and the
+other block is inert — it may stay in the file, but nothing reads it, including
+its `question_ttl_seconds`. There is no fallback: a question goes to the one
+you named or nowhere. Running both at once is
+[issue #176](https://github.com/AInvirion/ctrlrelay/issues/176) and is not
+built.
+
 | | Telegram | Mattermost |
 |---|---|---|
 | Needs | a bot from BotFather, your chat id | a self-hosted server, a bot account, a channel id |

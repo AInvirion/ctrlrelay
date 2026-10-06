@@ -2497,12 +2497,32 @@ def setup(
     transport: str = typer.Option(
         "file_mock",
         "--transport",
-        help="Transport for operator notifications: 'file_mock' or 'telegram'.",
+        help=(
+            "Transport for operator notifications: 'file_mock', 'telegram' "
+            "or 'mattermost'. Exactly one is active; there is no fallback "
+            "between them."
+        ),
     ),
     telegram_chat_id: int | None = typer.Option(
         None,
         "--telegram-chat-id",
         help="Telegram chat ID. Only used when --transport=telegram.",
+    ),
+    mattermost_url: str | None = typer.Option(
+        None,
+        "--mattermost-url",
+        help=(
+            "Mattermost server URL, e.g. https://chat.example.com. Only "
+            "used when --transport=mattermost."
+        ),
+    ),
+    mattermost_channel_id: str | None = typer.Option(
+        None,
+        "--mattermost-channel-id",
+        help=(
+            "The channel's 26-character ID, not its name. Only used when "
+            "--transport=mattermost."
+        ),
     ),
     personalization_repo: str | None = typer.Option(
         None,
@@ -2648,6 +2668,53 @@ def setup(
             )
             raise typer.Exit(2)
 
+    # Same shape as the telegram chat_id check above, and for the same
+    # reason: a Mattermost config with no URL is refused by the schema at
+    # load, and one with no channel id loads but cannot post anywhere -
+    # the bridge then fails at start. Refusing here turns both into one
+    # message at the moment the operator can still fix it, rather than a
+    # config that looks written and does not work.
+    if transport == "mattermost":
+        # Bound once, and used for both the presence check and the shape
+        # check below. Stripping inside the comprehension left mypy unable
+        # to narrow `str | None` at the call that follows.
+        mm_url = (mattermost_url or "").strip()
+        mm_channel = (mattermost_channel_id or "").strip()
+        missing = [
+            name
+            for name, value in (
+                ("--mattermost-url", mm_url),
+                ("--mattermost-channel-id", mm_channel),
+            )
+            if not value
+        ]
+        if missing:
+            console.print(
+                "[red]Setup blocked:[/red] --transport=mattermost needs "
+                f"{' and '.join(missing)}. The channel id is the "
+                "26-character id from the channel's View Info, not its name."
+            )
+            raise typer.Exit(2)
+
+        # Shape-check by CONSTRUCTING the model rather than re-implementing
+        # its rule here. The 26-character check lives in MattermostConfig
+        # and a copy of it in this file would be a second rule to keep in
+        # sync - which is how the rule drifts. This only moves WHEN the
+        # operator is told: without it the same error arrives at config
+        # load, after setup has written files.
+        from pydantic import ValidationError
+
+        from ctrlrelay.core.config import MattermostConfig
+
+        try:
+            MattermostConfig(url=mm_url, channel_id=mm_channel)
+        except ValidationError as e:
+            console.print(
+                f"[red]Setup blocked:[/red] mattermost settings are not "
+                f"usable:\n{e}"
+            )
+            raise typer.Exit(2) from e
+
     # ----- daemons -------------------------------------------------------
     chosen_install_daemons = install_daemons
     if not chosen_install_daemons and not yes:
@@ -2664,7 +2731,12 @@ def setup(
     # bootstrapping the bridge.
     token: str | None = None
     if transport == "telegram" and chosen_install_daemons:
-        token = os.environ.get("CTRLRELAY_TELEGRAM_TOKEN")
+        # `or None`: an exported-but-empty variable is not a token. With
+        # `is None` alone, CTRLRELAY_TELEGRAM_TOKEN="" skipped both the
+        # prompt and the warning, and the operator was never told the
+        # rendered unit carries a placeholder. Pre-existing on this path;
+        # fixed here because the mattermost path below was copied from it.
+        token = os.environ.get("CTRLRELAY_TELEGRAM_TOKEN") or None
         if token is None and not yes:
             token = typer.prompt(
                 "Telegram bot token (input hidden, used only to render plists)",
@@ -2677,6 +2749,23 @@ def setup(
                 "placeholder; export the token before bootstrapping the bridge."
             )
 
+    mm_token: str | None = None
+    if transport == "mattermost" and chosen_install_daemons:
+        mm_token = os.environ.get("CTRLRELAY_MATTERMOST_TOKEN") or None
+        if mm_token is None and not yes:
+            mm_token = typer.prompt(
+                "Mattermost bot token (input hidden, used only to render "
+                "unit files)",
+                hide_input=True,
+            ).strip() or None
+        if mm_token is None:
+            console.print(
+                "[yellow]Warning:[/yellow] no Mattermost token in env or "
+                "prompt. Rendered units will carry the "
+                "${CTRLRELAY_MATTERMOST_TOKEN} placeholder; export the token "
+                "before bootstrapping the bridge."
+            )
+
     options = SetupOptions(
         owners=chosen_owners,
         repo_root=repo_root.expanduser(),
@@ -2685,6 +2774,9 @@ def setup(
         transport=transport,
         telegram_chat_id=telegram_chat_id,
         telegram_token=token,
+        mattermost_url=mattermost_url,
+        mattermost_channel_id=mattermost_channel_id,
+        mattermost_token=mm_token,
         personalization_repo=chosen_personalization,
         wire_skills=wire_skills,
         install_daemons=chosen_install_daemons,
