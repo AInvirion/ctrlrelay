@@ -277,13 +277,21 @@ class TestBridgeStartDaemonSecrets:
             "reading `ps`. Pass the env-var name and inherit the process env "
             "instead."
         )
-        assert "--bot-token-env" in cmd, (
-            "daemon should tell the child which env var holds the token"
+        assert "--config" in cmd, (
+            "daemon should tell the child which config to read; the child "
+            "resolves the token env var from it. This replaced "
+            "--bot-token-env/--chat-id: a flag per transport means every new "
+            "chat app has to be added here and in the child, and the two "
+            "have to agree."
         )
+        for leaked in ("--bot-token-env", "--chat-id"):
+            assert leaked not in cmd, (
+                f"{leaked} is gone; the child reads config instead"
+            )
 
 
 class TestBridgeStartDaemonFailFast:
-    """Regression for codex [P2]: if the spawned child exits immediately
+    """Regression: if the spawned child exits immediately
     (bad env, crash-on-import, missing dep), the parent must report failure
     rather than printing 'Bridge started (PID N)' and dropping the user."""
 
@@ -410,7 +418,7 @@ class TestPollerStartDefault:
 
 
 class TestPollerStartDaemonFailFast:
-    """Regression for codex [P2]: if the spawned child exits immediately
+    """Regression: if the spawned child exits immediately
     (missing gh, bad config, etc), the parent must NOT claim success."""
 
     def test_reports_failure_when_child_exits_nonzero(

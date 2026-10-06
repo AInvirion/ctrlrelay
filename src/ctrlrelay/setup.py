@@ -40,7 +40,7 @@ __all__ = [
 
 # Mirrors the keys accepted by ``TransportConfig.type`` in the schema.
 # Keep these in sync if a new transport adapter ships.
-VALID_TRANSPORTS = ("file_mock", "telegram")
+VALID_TRANSPORTS = ("file_mock", "telegram", "mattermost")
 
 # Default destination for ``--config-out``. The daemon plists shipped
 # in ``src/ctrlrelay/templates/launchd|systemd/`` rely on the config

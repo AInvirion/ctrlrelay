@@ -1,19 +1,38 @@
 ---
-title: Telegram bridge
+title: Chat bridge
 layout: default
 nav_order: 4
-description: "Set up the Telegram bridge that delivers BLOCKED questions to a human and routes their answers back to a paused Claude session."
+description: "Set up the chat bridge — Telegram or Mattermost — that delivers BLOCKED questions to a human and routes their answers back to a paused Claude session."
 permalink: /bridge/
 ---
 
-# Telegram bridge
+# Chat bridge
 
 The bridge is a small daemon that:
 
-1. Listens on a Unix socket at `transport.telegram.socket_path`.
-2. Forwards messages from ctrlrelay to a Telegram chat over the Bot API.
-3. Long-polls Telegram for replies in that chat and delivers them back to the
-   socket client that asked.
+1. Listens on a Unix socket at the configured transport's `socket_path`.
+2. Forwards messages from ctrlrelay to a chat channel.
+3. Streams replies back from that channel and delivers them to the socket
+   client that asked.
+
+It speaks **Telegram** or **Mattermost**. Pipelines never know which: they
+talk to the socket, and the chat app is the bridge's business. Switching is a
+one-line config change and no pipeline code moves.
+
+| | Telegram | Mattermost |
+|---|---|---|
+| Needs | a bot from BotFather, your chat id | a self-hosted server, a bot account, a channel id |
+| Outbound | Bot API `sendMessage` | `POST /api/v4/posts` |
+| Inbound | `getUpdates` long-poll | WebSocket `posted` events |
+| "answer this one" | the reply gesture | reply **in the question's thread** |
+| Tappable choices | reply keyboard | rendered as a numbered list you type |
+
+**The one operator-facing difference worth knowing.** When several questions
+are outstanding, the bridge can only route your answer if it knows which
+question you mean. On Telegram that is Telegram's reply; on Mattermost it is
+**replying inside the question's thread**. A loose message in the channel is
+only routable when exactly one question is waiting — otherwise the bridge
+refuses and tells you what is outstanding, rather than guessing.
 
 Pipelines use it as the human-in-the-loop channel: when Claude writes a
 `BLOCKED_NEEDS_INPUT` checkpoint, the dev pipeline calls `transport.ask(question)`,
@@ -108,6 +127,91 @@ Stop it:
 ctrlrelay bridge stop
 ```
 
+## Mattermost instead of Telegram
+
+Steps 1–2 above are Telegram-specific. For Mattermost, do this instead and
+then rejoin at step 4.
+
+### M1 — Enable bot accounts
+
+**System Console → Integrations → Bot Accounts → Enable Bot Account Creation
+= true.**
+
+On a self-hosted install this is off by default. Note that editing
+`config.json` on the server may not be enough — if the instance has no config
+watcher the value will not take effect until `systemctl restart mattermost`,
+and the live value is what matters. Read it back before believing it:
+
+```bash
+curl -s "https://<your-server>/api/v4/config/client?format=old" \
+  | jq .EnableBotAccountCreation
+```
+
+`EnableUserAccessTokens` is **not** required. That setting governs *user*
+personal access tokens; bot account tokens are managed separately. Leaving it
+off avoids letting every user mint long-lived full-access tokens.
+
+### M2 — Create the bot and its token
+
+1. **Integrations → Bot Accounts → Add Bot Account.**
+2. Username `ctrlrelay`, role **Member**. Leave `post:all` and `post:channels`
+   **off** — the bot will be added to one channel, and a token with no reach
+   beyond it is a smaller problem if it leaks.
+3. **Create New Token** and copy it immediately. Mattermost shows it once.
+
+### M3 — A channel, and put the bot in it
+
+Create a channel for orchestrator questions, then invite the bot:
+
+```
+/invite @ctrlrelay
+```
+
+**This is not optional, and the reason is easy to miss.** A bot without
+`post:all` cannot post where it is not a member — and it does not receive the
+reply events for such a channel either. Forget this and questions fail to post
+*and* answers would never arrive. `ctrlrelay bridge start` checks membership
+before it binds its socket and refuses to start until the bot is invited.
+
+The bot must also be on the team. If `/invite` complains, add it via the
+team's **Invite People** first.
+
+### M4 — Find the channel id
+
+The id, not the name: a name is only unique within a team and can be renamed
+under you, while the id is stable. From the channel's **View Info**, or:
+
+```bash
+curl -s -H "Authorization: Bearer $CTRLRELAY_MATTERMOST_TOKEN" \
+  "https://<your-server>/api/v4/teams/name/<team>/channels/name/<channel>" \
+  | jq -r .id
+```
+
+### M5 — Configure
+
+```bash
+export CTRLRELAY_MATTERMOST_TOKEN="your-bot-token"
+```
+
+```yaml
+transport:
+  type: "mattermost"
+  mattermost:
+    url: "https://chat.example.com"   # scheme required
+    bot_token_env: "CTRLRELAY_MATTERMOST_TOKEN"
+    channel_id: "emzhur1hwpyc38ehkfm5ppym8y"
+    socket_path: "~/.ctrlrelay/ctrlrelay.sock"
+    ask_timeout_seconds: 900
+```
+
+Then `ctrlrelay config validate`, and continue from step 4 above —
+`ctrlrelay bridge start` is the same command for either transport.
+
+**Editions.** Everything here works on free self-hosted Mattermost. The REST
+API, the WebSocket, bot accounts and bot tokens are core features, not
+licensed ones; the paid tiers cover SSO/SAML/LDAP, compliance export and high
+availability, none of which the bridge touches.
+
 ## 5 — Send a test message
 
 Once the bridge is running and reachable on its socket, send a one-off message
@@ -186,16 +290,22 @@ no running process", remove the orphan socket file (`rm
 ## Sequence: BLOCKED question round-trip
 
 ```
-   pipeline                bridge                Telegram          user
+   pipeline                bridge               chat app          user
       │                      │                      │               │
       │── ask("Which?") ────>│                      │               │
-      │                      │── sendMessage ──────>│               │
+      │                      │─ post question ─────>│               │
       │                      │                      │── push ──────>│
       │                      │                      │               │
       │                      │                      │<── reply ─────│
-      │                      │<── getUpdates ───────│               │
+      │                      │<─ reply + post id ───│               │
       │<── answer("the b") ──│                      │               │
 ```
+
+The bridge remembers the id of every question it posts, so the reply's
+"this is what I am answering" — Telegram's `reply_to_message_id`, Mattermost's
+thread `root_id` — names the session exactly. That is also how an answer
+arriving *after* the pipeline stopped waiting still drives a resume, via the
+`pending_resumes` table.
 
 The pipeline's `transport.ask()` call blocks (with the configured timeout) until
 the bridge returns the answer. The pipeline then resumes the Claude session via

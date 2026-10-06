@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.conftest import FakeChatHandler
+
 
 class TestObsModule:
     def test_get_logger_returns_namespaced_logger(self) -> None:
@@ -191,7 +193,7 @@ class TestBridgeServerLogging:
         import shutil
         import tempfile
         from pathlib import Path
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
@@ -200,62 +202,63 @@ class TestBridgeServerLogging:
         d = tempfile.mkdtemp()
         socket_path = Path(d) / "b.sock"
 
-        mock_handler = AsyncMock()
-        mock_handler.ask = AsyncMock(return_value=99)
+        mock_handler = FakeChatHandler(name="telegram")
+        mock_handler.ask = AsyncMock(return_value="99")
 
         try:
-            with patch(
-                "ctrlrelay.bridge.server.TelegramHandler", return_value=mock_handler
-            ):
-                server = BridgeServer(
-                    socket_path=socket_path, bot_token="x", chat_id=12345
-                )
-                task = asyncio.create_task(server.start())
-                await asyncio.sleep(0.1)
+            server = BridgeServer(
+                socket_path=socket_path, handler=mock_handler
+            )
+            task = asyncio.create_task(server.start())
+            await asyncio.sleep(0.1)
 
-                reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
 
-                caplog.clear()
-                with caplog.at_level(logging.INFO, logger="ctrlrelay"):
-                    ask = serialize_message(
-                        BridgeMessage(
-                            op=BridgeOp.ASK,
-                            request_id="r-1",
-                            question="Continue?",
-                            session_id="dev-o-r-1-a",
-                            repo="o/r",
-                            issue_number=1,
-                        )
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                ask = serialize_message(
+                    BridgeMessage(
+                        op=BridgeOp.ASK,
+                        request_id="r-1",
+                        question="Continue?",
+                        session_id="dev-o-r-1-a",
+                        repo="o/r",
+                        issue_number=1,
                     )
-                    writer.write(ask.encode())
-                    await writer.drain()
-                    # Wait for ACK
-                    await asyncio.wait_for(reader.readline(), timeout=1)
-
-                events = [
-                    r
-                    for r in caplog.records
-                    if r.name.startswith("ctrlrelay.bridge")
-                ]
-                posted = [
-                    r for r in events if r.getMessage() == "dev.question.posted"
-                ]
-                assert posted, (
-                    f"expected dev.question.posted, got: "
-                    f"{[r.getMessage() for r in events]}"
                 )
+                writer.write(ask.encode())
+                await writer.drain()
+                # Wait for ACK
+                await asyncio.wait_for(reader.readline(), timeout=1)
 
-                record = posted[0]
-                assert record.__dict__["session_id"] == "dev-o-r-1-a"
-                assert record.__dict__["repo"] == "o/r"
-                assert record.__dict__["issue_number"] == 1
-                assert record.__dict__["transport"] == "telegram"
-                assert record.__dict__["destination"] == "telegram:chat=12345"
+            events = [
+                r
+                for r in caplog.records
+                if r.name.startswith("ctrlrelay.bridge")
+            ]
+            posted = [
+                r for r in events if r.getMessage() == "dev.question.posted"
+            ]
+            assert posted, (
+                f"expected dev.question.posted, got: "
+                f"{[r.getMessage() for r in events]}"
+            )
 
-                writer.close()
-                await writer.wait_closed()
-                await server.stop()
-                task.cancel()
+            record = posted[0]
+            assert record.__dict__["session_id"] == "dev-o-r-1-a"
+            assert record.__dict__["repo"] == "o/r"
+            assert record.__dict__["issue_number"] == 1
+            assert record.__dict__["transport"] == "telegram"
+            # The handler's own destination is what reaches the log. The
+            # real Telegram string is asserted directly in
+            # test_telegram_handler, so this stays a test of the bridge
+            # forwarding it rather than a test of the fake's constructor.
+            assert record.__dict__["destination"] == mock_handler.destination
+
+            writer.close()
+            await writer.wait_closed()
+            await server.stop()
+            task.cancel()
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -399,7 +402,7 @@ class TestSocketTransportDeliverySemantics:
                 lambda m: BridgeMessage(
                     op=BridgeOp.ERROR,
                     request_id=m.request_id,
-                    error="telegram_api_error",
+                    error="chat_api_error",
                     message="boom",
                 )
             ],
@@ -530,12 +533,12 @@ class TestBridgeServerDeliverySemantics:
     async def test_telegram_failure_logs_post_failed_and_not_posted(
         self, caplog
     ) -> None:
-        """TelegramHandler.ask blowing up must not log a posted question."""
+        """A handler's ask blowing up must not log a posted question."""
         import asyncio
         import shutil
         import tempfile
         from pathlib import Path
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
@@ -543,71 +546,68 @@ class TestBridgeServerDeliverySemantics:
         d = tempfile.mkdtemp()
         socket_path = Path(d) / "b.sock"
 
-        mock_handler = AsyncMock()
+        mock_handler = FakeChatHandler(name="telegram")
         mock_handler.ask = AsyncMock(side_effect=RuntimeError("telegram down"))
 
         try:
-            with patch(
-                "ctrlrelay.bridge.server.TelegramHandler", return_value=mock_handler
-            ):
-                server = BridgeServer(
-                    socket_path=socket_path, bot_token="x", chat_id=12345
+            server = BridgeServer(
+                socket_path=socket_path, handler=mock_handler
+            )
+            task = asyncio.create_task(server.start())
+            await asyncio.sleep(0.1)
+
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                writer.write(
+                    serialize_message(
+                        BridgeMessage(
+                            op=BridgeOp.ASK,
+                            request_id="r-1",
+                            question="Continue?",
+                            session_id="dev-o-r-1-a",
+                            repo="o/r",
+                            issue_number=1,
+                        )
+                    ).encode()
                 )
-                task = asyncio.create_task(server.start())
-                await asyncio.sleep(0.1)
+                await writer.drain()
+                await asyncio.wait_for(reader.readline(), timeout=1)
 
-                reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            names = [
+                r.getMessage()
+                for r in caplog.records
+                if r.name.startswith("ctrlrelay.bridge")
+            ]
+            assert "dev.question.posted" not in names
+            assert "dev.question.post_failed" in names
 
-                caplog.clear()
-                with caplog.at_level(logging.INFO, logger="ctrlrelay"):
-                    writer.write(
-                        serialize_message(
-                            BridgeMessage(
-                                op=BridgeOp.ASK,
-                                request_id="r-1",
-                                question="Continue?",
-                                session_id="dev-o-r-1-a",
-                                repo="o/r",
-                                issue_number=1,
-                            )
-                        ).encode()
-                    )
-                    await writer.drain()
-                    await asyncio.wait_for(reader.readline(), timeout=1)
+            failed = next(
+                r
+                for r in caplog.records
+                if r.getMessage() == "dev.question.post_failed"
+            )
+            assert failed.__dict__["session_id"] == "dev-o-r-1-a"
+            assert failed.__dict__["transport"] == "telegram"
+            assert failed.__dict__["reason"] == "RuntimeError"
+            assert "question" not in failed.__dict__
 
-                names = [
-                    r.getMessage()
-                    for r in caplog.records
-                    if r.name.startswith("ctrlrelay.bridge")
-                ]
-                assert "dev.question.posted" not in names
-                assert "dev.question.post_failed" in names
-
-                failed = next(
-                    r
-                    for r in caplog.records
-                    if r.getMessage() == "dev.question.post_failed"
-                )
-                assert failed.__dict__["session_id"] == "dev-o-r-1-a"
-                assert failed.__dict__["transport"] == "telegram"
-                assert failed.__dict__["reason"] == "RuntimeError"
-                assert "question" not in failed.__dict__
-
-                writer.close()
-                await writer.wait_closed()
-                await server.stop()
-                task.cancel()
+            writer.close()
+            await writer.wait_closed()
+            await server.stop()
+            task.cancel()
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
     @pytest.mark.asyncio
-    async def test_posted_carries_telegram_msg_id(self, caplog) -> None:
+    async def test_posted_carries_post_id(self, caplog) -> None:
         """Posted after the send means the Telegram message id is known."""
         import asyncio
         import shutil
         import tempfile
         from pathlib import Path
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
@@ -615,47 +615,44 @@ class TestBridgeServerDeliverySemantics:
         d = tempfile.mkdtemp()
         socket_path = Path(d) / "b.sock"
 
-        mock_handler = AsyncMock()
-        mock_handler.ask = AsyncMock(return_value=99)
+        mock_handler = FakeChatHandler(name="telegram")
+        mock_handler.ask = AsyncMock(return_value="99")
 
         try:
-            with patch(
-                "ctrlrelay.bridge.server.TelegramHandler", return_value=mock_handler
-            ):
-                server = BridgeServer(
-                    socket_path=socket_path, bot_token="x", chat_id=12345
+            server = BridgeServer(
+                socket_path=socket_path, handler=mock_handler
+            )
+            task = asyncio.create_task(server.start())
+            await asyncio.sleep(0.1)
+
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                writer.write(
+                    serialize_message(
+                        BridgeMessage(
+                            op=BridgeOp.ASK,
+                            request_id="r-1",
+                            question="Continue?",
+                            session_id="dev-o-r-1-a",
+                        )
+                    ).encode()
                 )
-                task = asyncio.create_task(server.start())
-                await asyncio.sleep(0.1)
+                await writer.drain()
+                await asyncio.wait_for(reader.readline(), timeout=1)
 
-                reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            posted = next(
+                r
+                for r in caplog.records
+                if r.getMessage() == "dev.question.posted"
+            )
+            assert posted.__dict__["post_id"] == "99"
 
-                caplog.clear()
-                with caplog.at_level(logging.INFO, logger="ctrlrelay"):
-                    writer.write(
-                        serialize_message(
-                            BridgeMessage(
-                                op=BridgeOp.ASK,
-                                request_id="r-1",
-                                question="Continue?",
-                                session_id="dev-o-r-1-a",
-                            )
-                        ).encode()
-                    )
-                    await writer.drain()
-                    await asyncio.wait_for(reader.readline(), timeout=1)
-
-                posted = next(
-                    r
-                    for r in caplog.records
-                    if r.getMessage() == "dev.question.posted"
-                )
-                assert posted.__dict__["telegram_msg_id"] == 99
-
-                writer.close()
-                await writer.wait_closed()
-                await server.stop()
-                task.cancel()
+            writer.close()
+            await writer.wait_closed()
+            await server.stop()
+            task.cancel()
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -799,7 +796,7 @@ class TestSensitivePayloadsAreNotLogged:
         import shutil
         import tempfile
         from pathlib import Path
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
@@ -808,52 +805,49 @@ class TestSensitivePayloadsAreNotLogged:
         d = tempfile.mkdtemp()
         socket_path = Path(d) / "b.sock"
 
-        mock_handler = AsyncMock()
-        mock_handler.ask = AsyncMock(return_value=99)
+        mock_handler = FakeChatHandler(name="telegram")
+        mock_handler.ask = AsyncMock(return_value="99")
 
         try:
-            with patch(
-                "ctrlrelay.bridge.server.TelegramHandler", return_value=mock_handler
-            ):
-                server = BridgeServer(
-                    socket_path=socket_path, bot_token="x", chat_id=12345
-                )
-                task = asyncio.create_task(server.start())
-                await asyncio.sleep(0.1)
+            server = BridgeServer(
+                socket_path=socket_path, handler=mock_handler
+            )
+            task = asyncio.create_task(server.start())
+            await asyncio.sleep(0.1)
 
-                reader, writer = await asyncio.open_unix_connection(str(socket_path))
-                writer.write(
-                    serialize_message(
-                        BridgeMessage(
-                            op=BridgeOp.ASK,
-                            request_id="r-1",
-                            question="Continue?",
-                            session_id="dev-o-r-1-a",
-                        )
-                    ).encode()
-                )
-                await writer.drain()
-                await asyncio.wait_for(reader.readline(), timeout=1)
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            writer.write(
+                serialize_message(
+                    BridgeMessage(
+                        op=BridgeOp.ASK,
+                        request_id="r-1",
+                        question="Continue?",
+                        session_id="dev-o-r-1-a",
+                    )
+                ).encode()
+            )
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)
 
-                caplog.clear()
-                with caplog.at_level(logging.INFO, logger="ctrlrelay"):
-                    await server._on_telegram_reply("my private answer", 99)
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                await server._on_reply("my private answer", "99")
 
-                received = next(
-                    r
-                    for r in caplog.records
-                    if r.getMessage() == "dev.answer.received"
-                )
-                assert "answer" not in received.__dict__
-                assert received.__dict__["answer_hash"] == hash_text(
-                    "my private answer"
-                )
-                assert received.__dict__["answer_length"] == len("my private answer")
+            received = next(
+                r
+                for r in caplog.records
+                if r.getMessage() == "dev.answer.received"
+            )
+            assert "answer" not in received.__dict__
+            assert received.__dict__["answer_hash"] == hash_text(
+                "my private answer"
+            )
+            assert received.__dict__["answer_length"] == len("my private answer")
 
-                writer.close()
-                await writer.wait_closed()
-                await server.stop()
-                task.cancel()
+            writer.close()
+            await writer.wait_closed()
+            await server.stop()
+            task.cancel()
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -1014,7 +1008,7 @@ class TestBridgeClassificationIsNotReDerived:
             return BridgeMessage(
                 op=BridgeOp.ERROR,
                 request_id="r-1",
-                error="telegram_delivery_unknown",
+                error="delivery_unknown",
                 message="Timed out",
             )
 
@@ -1045,7 +1039,7 @@ class TestBridgeClassificationIsNotReDerived:
             return BridgeMessage(
                 op=BridgeOp.ERROR,
                 request_id="r-1",
-                error="telegram_api_error",
+                error="chat_api_error",
                 message="chat not found",
             )
 

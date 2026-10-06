@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable
 
 from telegram import Bot, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.error import NetworkError, TimedOut
 
-_log = logging.getLogger(__name__)
+from ctrlrelay.bridge.handler import IncomingMessageHandler
 
-IncomingMessageHandler = Callable[[str, int | None], Awaitable[None]]
+_log = logging.getLogger(__name__)
 
 
 
@@ -42,19 +41,36 @@ class TelegramHandler:
         self._poll_task: asyncio.Task | None = None
         self._offset: int = 0
 
-    async def send(self, text: str) -> int:
-        """Send a message to the configured chat."""
+    def is_ambiguous_delivery(self, exc: BaseException) -> bool:
+        """Per the ChatHandler contract. Delegates to the module-level
+        function, which stays public because the taxonomy is a fact about
+        python-telegram-bot rather than about this instance."""
+        return is_ambiguous_delivery(exc)
+
+    @property
+    def transport_name(self) -> str:
+        return "telegram"
+
+    @property
+    def destination(self) -> str:
+        return f"telegram:chat={self.chat_id}"
+
+    async def send(self, text: str) -> str:
+        """Send a message to the configured chat. Returns its post id."""
         message = await self.bot.send_message(
             chat_id=self.chat_id,
             text=text,
         )
-        return message.message_id
+        # Stringified at the edge: Telegram's ids are ints and Mattermost's
+        # are 26-char strings, and the bridge keys one map on both. See
+        # ChatHandler for why that map must not hold two kinds of key.
+        return str(message.message_id)
 
     async def ask(
         self,
         question: str,
         options: list[str] | None = None,
-    ) -> int:
+    ) -> str:
         """Send a question with optional reply keyboard."""
         reply_markup = None
         if options:
@@ -70,14 +86,15 @@ class TelegramHandler:
             text=question,
             reply_markup=reply_markup or ReplyKeyboardRemove(),
         )
-        return message.message_id
+        return str(message.message_id)
 
     async def start_polling(self, handler: IncomingMessageHandler) -> None:
         """Start long-polling Telegram for incoming messages from the
         configured chat. For each message, invokes
-        ``handler(text, reply_to_message_id)`` where reply_to_message_id is
-        the id of the question the user replied to (or None for a fresh
-        message). Idempotent — a second call replaces the running loop."""
+        ``handler(text, reply_to_post_id)`` where reply_to_post_id is the
+        id of the question the user replied to as a string (or None for a
+        fresh message). Idempotent — a second call while the loop is
+        running is a no-op; it does not replace the loop."""
         if self._poll_task is not None and not self._poll_task.done():
             return
         self._poll_task = asyncio.create_task(self._poll_loop(handler))
@@ -121,7 +138,7 @@ class TelegramHandler:
                 if not text:
                     continue
                 reply_id = (
-                    msg.reply_to_message.message_id
+                    str(msg.reply_to_message.message_id)
                     if msg.reply_to_message is not None
                     else None
                 )

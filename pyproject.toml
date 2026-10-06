@@ -32,6 +32,13 @@ dependencies = [
     "rich>=13.0.0",
     "python-telegram-bot>=21.0",
     "apscheduler>=3.10.0",
+    # Mattermost transport: REST out, WebSocket in. Both are permissive
+    # licences (httpx BSD-3-Clause, websockets BSD-3-Clause) and actively
+    # maintained. A Mattermost-specific client library was considered and
+    # skipped: the surface used here is four endpoints and one event type,
+    # which is less code than keeping a wrapper current.
+    "httpx>=0.27.0",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]

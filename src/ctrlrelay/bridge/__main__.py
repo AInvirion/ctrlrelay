@@ -1,43 +1,71 @@
-"""Bridge process entry point for daemon mode."""
+"""Bridge process entry point for daemon mode.
+
+Takes a config path rather than per-transport flags. The alternative —
+growing a flag per chat app — means every new transport touches this file,
+the CLI that spawns it, and the two of them have to agree. Reading the same
+config the CLI read removes that agreement from the design.
+
+The token is never an argument. It is read from the environment variable
+the config names, which the parent process passes through, because argv is
+world-readable via ``ps`` and ``/proc/*/cmdline``.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import signal
 import sys
 from pathlib import Path
 
-from ctrlrelay.bridge.server import BridgeServer
+from ctrlrelay.bridge import BridgeServer, HandlerConfigError, make_handler
+from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ctrlrelay Telegram bridge")
-    parser.add_argument("--socket-path", required=True, help="Unix socket path")
+    parser = argparse.ArgumentParser(description="ctrlrelay chat bridge")
     parser.add_argument(
-        "--bot-token-env",
-        default="CTRLRELAY_TELEGRAM_TOKEN",
-        help="Environment variable holding the Telegram bot token",
+        "--config",
+        default=None,
+        help="Path to orchestrator.yaml (default: auto-discover).",
     )
-    parser.add_argument("--chat-id", type=int, required=True, help="Telegram chat ID")
+    parser.add_argument(
+        "--socket-path",
+        default=None,
+        help="Unix socket path. Defaults to the configured transport's.",
+    )
     parser.add_argument(
         "--state-db",
         default=None,
         help=(
             "Path to the orchestrator state.db. When provided, orphan "
-            "Telegram replies route to persisted BLOCKED sessions in "
-            "pending_resumes. Required for the resume-via-Telegram flow."
+            "replies route to persisted BLOCKED sessions in "
+            "pending_resumes. Required for the resume-via-chat flow."
         ),
     )
     args = parser.parse_args()
 
-    bot_token = os.environ.get(args.bot_token_env)
-    if not bot_token:
-        print(
-            f"error: bot token env var '{args.bot_token_env}' is unset",
-            file=sys.stderr,
-        )
+    try:
+        config = load_config(resolve_config_path(args.config))
+    except ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        handler = make_handler(config.transport)
+    except HandlerConfigError as e:
+        # Exit 2, not 1: this is a configuration fault the operator must
+        # fix, not a transient failure worth a supervisor restart loop.
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    socket_path = (
+        Path(args.socket_path).expanduser()
+        if args.socket_path
+        else config.transport.socket_path
+    )
+    if socket_path is None:
+        print("error: no socket path in config or arguments", file=sys.stderr)
         sys.exit(2)
 
     state_db = None
@@ -45,11 +73,9 @@ def main() -> None:
         from ctrlrelay.core.state import StateDB
         state_db = StateDB(Path(args.state_db))
 
-    socket_path = Path(args.socket_path)
     server = BridgeServer(
-        socket_path=socket_path,
-        bot_token=bot_token,
-        chat_id=args.chat_id,
+        socket_path=Path(socket_path),
+        handler=handler,
         state_db=state_db,
     )
 
@@ -57,8 +83,8 @@ def main() -> None:
     asyncio.set_event_loop(loop)
 
     async def _run_server() -> None:
-        # Wrap start() in a finally that awaits stop() so the loop can't
-        # close before _telegram.close() and the socket unlink complete.
+        # Wrap start() in a finally that awaits stop() so the loop cannot
+        # close before the handler is closed and the socket unlinked.
         try:
             await server.start()
         finally:
@@ -76,6 +102,11 @@ def main() -> None:
         loop.run_until_complete(main_task)
     except asyncio.CancelledError:
         pass
+    except HandlerConfigError as e:
+        # The server's startup preflight: same class of fault as a bad
+        # token above, reported the same way and with the same exit code.
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
     finally:
         loop.close()
         if state_db is not None:
