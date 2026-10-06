@@ -291,7 +291,7 @@ class TestBridgeServer:
         task.cancel()
 
     @pytest.mark.asyncio
-    async def test_orphan_reply_refuses_to_guess_when_multiple_blocked(
+    async def test_orphan_reply_stays_silent_when_multiple_blocked(
         self, socket_path, tmp_path,
     ) -> None:
         """When two repos are BLOCKED at once and the reply text doesn't
@@ -334,12 +334,13 @@ class TestBridgeServer:
         assert len(unanswered) == 2
         assert all(r["answer"] is None for r in unanswered)
 
-        # And the operator is told which session_ids are pending.
-        sent_text = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
-        assert "multiple BLOCKED sessions" in sent_text.lower() or \
-               "multiple" in sent_text
-        assert "secops-owner-repoA-111" in sent_text
-        assert "secops-owner-repoB-222" in sent_text
+        # And NOTHING is posted (#193). A message pointing at no question
+        # is somebody talking in the channel, not a failed answer. This
+        # used to post every pending session as one block - measured on
+        # the live channel at 4042 characters, fired by `ok` and by a
+        # message addressed to @here, which made the channel unusable for
+        # conversation.
+        server.handler.send.assert_not_awaited()  # type: ignore[attr-defined]
 
         db.close()
         await server.stop()
@@ -518,7 +519,7 @@ class TestReplyRoutingIsStrict:
         shutil.rmtree(d, ignore_errors=True)
 
     @pytest.mark.asyncio
-    async def test_fresh_message_refuses_when_several_questions_live(
+    async def test_fresh_message_is_ignored_when_several_questions_live(
         self, socket_path,
     ) -> None:
         from unittest.mock import AsyncMock
@@ -548,10 +549,12 @@ class TestReplyRoutingIsStrict:
                 await asyncio.wait_for(reader.readline(), timeout=0.3)
             assert set(server._pending_questions) == {"r-1", "r-2"}
 
-            server.handler.send.assert_awaited_once()  # type: ignore[attr-defined]
-            notice = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
-            assert "wasn't routed" in notice
-            assert "reply" in notice.lower()
+            # Silent (#193). The tradeoff is stated rather than hidden:
+            # an answer typed without the reply gesture now gets no
+            # response at all, and the operator learns of it by the
+            # session not resuming. The alternative was a notice on every
+            # message typed in a channel the bridge shares with people.
+            server.handler.send.assert_not_awaited()  # type: ignore[attr-defined]
         finally:
             writer.close()
             await writer.wait_closed()
@@ -798,11 +801,20 @@ class TestReplyRoutingIsStrict:
                 await writer.drain()
                 await asyncio.wait_for(reader.readline(), timeout=1)
 
-            # Two live questions + plain message -> ambiguous notice path.
+            # A reply-to naming a post this bridge does not track, with
+            # questions still live -> the "pointed at a question I no
+            # longer track" notice. That path still posts.
+            #
+            # It used to drive the plain-message-with-several-live path,
+            # which #193 made silent on purpose. A lock test that observes
+            # the lock THROUGH a notice stops observing anything the day
+            # that notice is removed, and would have gone green while
+            # testing nothing had the assertion been `send` not awaited.
             await asyncio.wait_for(
-                server._on_reply("yes", reply_to_post_id=None),
+                server._on_reply("yes", reply_to_post_id="not-a-tracked-post"),
                 timeout=2,
             )
+            server.handler.send.assert_awaited()  # type: ignore[attr-defined]
             assert lock_was_free.is_set()
         finally:
             writer.close()
@@ -1767,3 +1779,148 @@ class TestStartRunsTheHandlerPreflight:
                 await task
             except asyncio.CancelledError:
                 pass
+
+
+class TestTheBridgeSharesItsChannelWithPeople:
+    """#193: a message pointing at no question is conversation, not an answer.
+
+    Measured on the live Mattermost channel on 2026-10-06: a `⚠️ Your reply
+    wasn't routed` notice of **4042 characters over 29 lines**, listing
+    every pending session, fired by `ok` and by a message addressed to
+    `@here`. The operator could not talk to their team in the channel the
+    bridge posts into.
+
+    It also had a hard ceiling. At ~202 characters per row and a server
+    `MaxPostSize` of 16383 - read from that server, not assumed - roughly
+    81 blocked sessions make the notice exceed the limit and post
+    **nothing**: the message whose job is to say a reply was dropped,
+    dropped. This deployment sweeps 87 repos.
+    """
+
+    @pytest.fixture
+    def socket_path(self):
+        # Same as the other classes: tmp_path can exceed AF_UNIX's
+        # 104-char limit, so use a short directory.
+        d = tempfile.mkdtemp()
+        yield Path(d) / "b.sock"
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_chat_in_the_channel_produces_no_post(
+        self, socket_path, tmp_path,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        for i in range(6):
+            db.add_pending_resume(
+                session_id=f"secops-owner-repo{i}-{i}{i}{i}",
+                pipeline="secops",
+                repo=f"owner/repo{i}",
+                question=f"question {i}?",
+            )
+
+        server = BridgeServer(
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
+
+        await server._on_reply(
+            "@here por cierto, agregue a CTRLRelay aca", reply_to_post_id=None
+        )
+
+        server.handler.send.assert_not_awaited()  # type: ignore[attr-defined]
+
+        # And nothing was routed to anybody by accident.
+        assert all(
+            r["answer"] is None for r in db.list_unanswered_pending_resumes()
+        )
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_naming_a_session_still_routes(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """The half that must not regress.
+
+        Going quiet is only safe if the deliberate path still works. If
+        this ever fails, the fix above has made the bridge unanswerable
+        rather than merely quiet.
+        """
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        for i in range(6):
+            db.add_pending_resume(
+                session_id=f"secops-owner-repo{i}-{i}{i}{i}",
+                pipeline="secops",
+                repo=f"owner/repo{i}",
+                question=f"question {i}?",
+            )
+
+        server = BridgeServer(
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
+
+        await server._on_reply(
+            "secops-owner-repo3-333 approved", reply_to_post_id=None
+        )
+
+        row = db.get_pending_resume("secops-owner-repo3-333")
+        assert row["answer"] == "secops-owner-repo3-333 approved"
+        assert row["answered_at"] is not None
+
+        # and only that one
+        others = [
+            r for r in db.list_unanswered_pending_resumes()
+            if r["session_id"] != "secops-owner-repo3-333"
+        ]
+        assert len(others) == 5
+        assert all(r["answer"] is None for r in others)
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    def test_the_pending_list_is_capped_and_says_how_many_it_withheld(
+        self,
+    ) -> None:
+        """Truncating without the count is the same loss one level down."""
+        from ctrlrelay.bridge.server import _PENDING_SHOWN, _format_pending
+
+        rows = [
+            {"session_id": f"s-{i}", "repo": f"owner/r{i}", "question": "q" * 200}
+            for i in range(40)
+        ]
+        out = _format_pending(rows)
+
+        assert out.count("  • ") == _PENDING_SHOWN
+        assert f"… and {40 - _PENDING_SHOWN} more." in out
+
+        # The ceiling this exists for: comfortably under MaxPostSize even
+        # at a count that used to overflow it.
+        assert len(out) < 2000, len(out)
+
+    def test_a_short_list_says_nothing_about_withholding(self) -> None:
+        """The paired case, so the cap is not asserted by a constant."""
+        from ctrlrelay.bridge.server import _format_pending
+
+        rows = [{"session_id": "s-1", "repo": "owner/r1", "question": "q?"}]
+        out = _format_pending(rows)
+
+        assert "  • " in out
+        assert "more." not in out

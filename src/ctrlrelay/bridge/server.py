@@ -37,6 +37,35 @@ _log = logging.getLogger(__name__)
 _ASKED_SESSIONS_MAX = 500
 
 
+_PENDING_SHOWN = 5
+
+
+def _format_pending(rows: list[dict]) -> str:
+    """A sample of outstanding questions, never the whole catalogue.
+
+    Capped because this list is unbounded by nature - one row per blocked
+    session, and a config error can block every repo in a sweep. Measured
+    on the live channel at 20 pending: 4042 characters, about 202 per
+    row. This deployment sweeps 87 repos, and the server's MaxPostSize is
+    16383, so at roughly 81 blocked sessions the message exceeded the
+    limit and posted NOTHING - the notice whose job is to say a reply was
+    dropped, dropped.
+
+    The count of what is withheld is part of the message, not a detail:
+    truncating to "here are five" and not saying five of how many is the
+    same information loss one level down.
+    """
+    shown = rows[:_PENDING_SHOWN]
+    lines = [
+        f"  • `{r['session_id']}` ({r['repo']}): {(r['question'] or '')[:80]}"
+        for r in shown
+    ]
+    rest = len(rows) - len(shown)
+    if rest > 0:
+        lines.append(f"  … and {rest} more.")
+    return "Pending:\n" + "\n".join(lines)
+
+
 def names_session(text: str, session_id: str) -> bool:
     """True when ``text`` names ``session_id`` as a whole token.
 
@@ -617,7 +646,7 @@ class BridgeServer:
         match: _PendingQuestion | None = None
         hinted_session_id: str | None = None
         live_listing: str | None = None
-        ambiguous_notice: str | None = None
+        unaddressed_pending: int | None = None
 
         async with self._pending_lock:
             self._drop_expired_questions()
@@ -629,20 +658,16 @@ class BridgeServer:
             elif len(self._pending_questions) == 1:
                 match = next(iter(self._pending_questions.values()))
             elif len(self._pending_questions) > 1:
-                ambiguous_notice = (
-                    "Your message wasn't routed - "
-                    f"{len(self._pending_questions)} questions are waiting "
-                    "and a plain message doesn't say which one you "
-                    "mean.\n\n"
-                    "Reply to the question you want to answer "
-                    "(Telegram: reply; Mattermost: reply in its thread)."
-                    "\n\n"
-                    f"{self._live_question_listing()}"
-                )
+                # A plain message pointing at nothing, with several
+                # questions live. This used to post the whole list; the
+                # bridge shares its channel with people, so that made
+                # every sentence typed in it produce a wall. Counted,
+                # not inferred.
+                unaddressed_pending = len(self._pending_questions)
 
             if match is not None:
                 self._pending_questions.pop(match.request_id, None)
-            elif ambiguous_notice is None:
+            elif unaddressed_pending is None:
                 # Snapshot what the orphan branch needs, so the lock can be
                 # released before we touch the chat app or the database.
                 hinted_session_id = (
@@ -656,10 +681,20 @@ class BridgeServer:
                     else None
                 )
 
-        if ambiguous_notice is not None:
-            await self._send_notice(
-                ambiguous_notice,
-                log="bridge: ambiguous fresh reply, refusing to guess",
+        if unaddressed_pending is not None:
+            # Silent on purpose. See `_format_pending` for the measurement
+            # and the tradeoff: a plain message while several questions
+            # are open is ignored, so an answer typed without the reply
+            # gesture gets no response. The alternative was a notice on
+            # every message in a shared channel, which is what the
+            # operator reported.
+            log_event(
+                _logger,
+                "bridge.reply.unaddressed",
+                pending=unaddressed_pending,
+                live=True,
+                text_length=len(text),
+                text_hash=hash_text(text),
             )
             return
 
@@ -764,19 +799,27 @@ class BridgeServer:
                     f"({outcome['reason']})"
                 ),
             )
-        elif outcome["status"] == "ambiguous":
-            pending_list = "\n".join(
-                f"  • `{r['session_id']}` ({r['repo']}): "
-                f"{(r['question'] or '')[:80]}"
-                for r in outcome["rows"]
+        elif outcome["status"] == "unaddressed":
+            # Somebody is talking in the channel. Say nothing: the bridge
+            # does not own this channel and a message that points at no
+            # question is not a failed answer. Logged so a genuinely
+            # missed answer is still diagnosable.
+            log_event(
+                _logger,
+                "bridge.reply.unaddressed",
+                pending=len(outcome["rows"]),
+                text_length=len(text),
+                text_hash=hash_text(text),
             )
+        elif outcome["status"] == "ambiguous":
+            # Reached only when the operator DID point at something - they
+            # named more than one session id in one message. That is a
+            # failed answer and is worth a reply.
             await self._send_notice(
-                "⚠️ Your reply wasn't routed — multiple BLOCKED sessions "
-                "are unanswered and the reply didn't point at one of "
-                "them.\n\n"
-                f"Pending:\n{pending_list}\n\n"
-                "Reply to the question you mean, or paste "
-                "its session_id anywhere in your message."
+                "⚠️ Your reply wasn't routed — it names more than one "
+                "session.\n\n"
+                f"{_format_pending(outcome['rows'])}\n\n"
+                "Send one message per session."
             )
         elif live_listing is not None:
             # Reply-to pointed at a message this bridge no longer tracks
@@ -830,11 +873,16 @@ class BridgeServer:
         text.
 
         Caller must hold ``_pending_lock``."""
+        qs = list(self._pending_questions.values())
+        shown = qs[:_PENDING_SHOWN]
         rows = "\n".join(
             f"  - {q.repo or 'unknown repo'}"
             + (f" (session: {q.session_id})" if q.session_id else "")
-            for q in self._pending_questions.values()
+            for q in shown
         )
+        rest = len(qs) - len(shown)
+        if rest > 0:
+            rows += f"\n  … and {rest} more."
         return f"Still waiting:\n{rows}"
 
     async def _send_notice(self, text: str, log: str | None = None) -> None:
@@ -938,8 +986,16 @@ class BridgeServer:
         elif len(rows) == 1:
             target = rows[0]
         else:
-            # Multiple unanswered, no session_id hint — can't route safely.
-            return {"status": "ambiguous", "rows": rows}
+            # Multiple unanswered, and the message pointed at nothing: no
+            # reply-to, no session id. That is not a failed answer, it is
+            # somebody talking in the channel.
+            #
+            # This used to return "ambiguous", which posted every pending
+            # session as one block. Measured on the live channel: 4042
+            # characters, 29 lines, fired by `ok` and by a message
+            # addressed to @here. The operator could not hold a
+            # conversation in the channel the bot lives in.
+            return {"status": "unaddressed", "rows": rows}
 
         return await self._attach_orphan_answer(target, text)
 
