@@ -26,17 +26,47 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-PIPELINES = ("secops", "dev", "task")
+
+def _discover_pipelines() -> dict[str, type]:
+    """Every pipeline class that renders a checkpoint contract.
+
+    Discovered by walking the package rather than listed here. A
+    hardcoded tuple is an enumeration somebody has to remember to
+    extend, and the docstrings below claim a pipeline added later is
+    covered "the day it is added" - which a list makes false. A review
+    round pointed that out and it was right.
+    """
+    import importlib
+    import inspect
+    import pkgutil
+
+    import ctrlrelay.pipelines as pkg
+
+    found: dict[str, type] = {}
+    for info in pkgutil.iter_modules(pkg.__path__):
+        module = importlib.import_module(f"ctrlrelay.pipelines.{info.name}")
+        for _name, obj in inspect.getmembers(module, inspect.isclass):
+            if obj.__module__ != module.__name__:
+                continue
+            if hasattr(obj, "_checkpoint_contract") and hasattr(obj, "resume"):
+                found[info.name] = obj
+    return found
+
+
+_DISCOVERED = _discover_pipelines()
+
+# Negative control: if discovery broke, parametrising over an empty dict
+# would collect zero tests and report a clean run.
+assert set(_DISCOVERED) >= {"secops", "dev", "task"}, (
+    f"pipeline discovery found {sorted(_DISCOVERED)}; it must find at "
+    "least the three that exist, or these tests are measuring nothing"
+)
+
+PIPELINES = tuple(sorted(_DISCOVERED))
 
 
 def _pipeline(mod: str):
-    cls = {
-        "secops": "SecopsPipeline",
-        "dev": "DevPipeline",
-        "task": "TaskPipeline",
-    }[mod]
-    module = __import__(f"ctrlrelay.pipelines.{mod}", fromlist=[cls])
-    return getattr(module, cls)(
+    return _DISCOVERED[mod](
         dispatcher=AsyncMock(),
         github=MagicMock(),
         worktree=MagicMock(),
@@ -167,9 +197,16 @@ def test_every_checkpoint_snippet_creates_its_own_directory(mod: str) -> None:
     """Each snippet must be self-sufficient (#189).
 
     `task.py` had the `mkdir -p` on DONE only. That cost nothing, because
-    the orchestrator pre-creates the directory at `task.py:343` and
-    `:605` - so this was latent, not a live defect, and it is asserted
-    here as a consistency property rather than a bug repro.
+    the orchestrator pre-creates the directory - `run` and
+    `resume_task_from_pending` both call
+    `state_file.parent.mkdir(parents=True, exist_ok=True)` - so this was
+    latent, not a live defect, and it is asserted here as a consistency
+    property rather than a bug repro.
+
+    (Named by method, not by line: the first version of this docstring
+    cited `task.py:343` and `:605`, and the two lines this very change
+    inserts shifted them. A line number in prose rots and nothing fails
+    when it does - the same fault corrected in #173.)
 
     The reason it is worth pinning: the `mkdir` is what makes a snippet
     independent of who created the directory. Without it, a snippet
@@ -190,16 +227,29 @@ def test_every_checkpoint_snippet_creates_its_own_directory(mod: str) -> None:
         "/wt/.ctrlrelay/state.json", "sid-1"
     )
 
-    writes = contract.count("printf ")
-    mkdirs = contract.count('mkdir -p "$(dirname ')
+    # Per shell block, so ORDER is checked and not just totals. Counting
+    # alone passes for a snippet that writes the file and then creates
+    # the directory, which is the same defect with the lines swapped.
+    blocks = [
+        b.split("```")[0]
+        for b in contract.split("```bash")[1:]
+    ]
 
-    # Negative control: a contract that rendered no snippets at all would
-    # otherwise satisfy 0 == 0.
-    assert writes == 3, (
-        f"{mod}: expected DONE, BLOCKED and FAILED snippets, found {writes}"
+    # Negative control: an empty contract would otherwise satisfy every
+    # comparison below by having nothing to compare.
+    assert len(blocks) == 3, (
+        f"{mod}: expected DONE, BLOCKED and FAILED shell blocks, "
+        f"found {len(blocks)}"
     )
-    assert mkdirs == writes, (
-        f"{mod}: {writes} checkpoint snippets but only {mkdirs} create the "
-        "directory first; the ones without it depend on somebody else "
-        "having made it"
-    )
+
+    for i, block in enumerate(blocks):
+        assert "printf " in block, f"{mod}: block {i} writes nothing"
+        mk = block.find('mkdir -p "$(dirname ')
+        pf = block.find("printf ")
+        assert mk != -1, (
+            f"{mod}: block {i} writes the checkpoint without creating its "
+            "directory, so it depends on somebody else having made it"
+        )
+        assert mk < pf, (
+            f"{mod}: block {i} creates the directory AFTER writing to it"
+        )
