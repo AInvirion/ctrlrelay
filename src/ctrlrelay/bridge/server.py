@@ -67,11 +67,27 @@ def names_session(text: str, session_id: str) -> bool:
     What counts as "still inside the identifier", therefore:
 
     - a word character or ``-``, which is the id's own alphabet;
-    - any character in Unicode category ``M`` — Mn, Mc and Me — which
-      covers combining accents, enclosing marks and the variation
-      selectors;
-    - ZERO WIDTH JOINER, named explicitly because it is the one common
-      grapheme extender that is category ``Cf`` rather than ``M``.
+    - any character in Unicode category ``M`` — Mn, Mc and Me — covering
+      combining accents, enclosing marks and the variation selectors;
+    - any character in category ``C`` **except** ``Cc`` — so the invisible
+      format characters (``Cf``: ZWJ, ZWNJ, soft hyphen, bidi controls)
+      plus surrogates, private-use and unassigned code points. ``Cc`` is
+      excluded because a newline and a tab genuinely do end an identifier.
+
+    These are **category tests, not lists**, and that is the whole point.
+    Three review rounds each found one more invisible character the
+    previous fix had missed — U+FE0F, then ZWJ, then ZWNJ — because each
+    fix named characters instead of closing the class they belong to. An
+    enumeration of invisible characters is a guess about a table that
+    grows, and the symptom of getting it wrong is an answer routed to the
+    wrong pipeline.
+
+    Including surrogates, private-use and unassigned code points is
+    deliberate rather than incidental: nobody can say how they render, and
+    the two outcomes here are not symmetric. Treating one as *inside* the
+    identifier refuses to route and tells the operator so; treating it as a
+    boundary routes an answer somewhere on a guess about an unprintable
+    character. Refusing is the recoverable direction.
     """
     if not session_id:
         return False
@@ -82,9 +98,13 @@ def names_session(text: str, session_id: str) -> bool:
             return False
         if ch == "-" or ch.isalnum() or ch == "_":
             return True
-        if unicodedata.category(ch).startswith("M"):
-            return True
-        return ch == "\u200d"
+        # M* = combining marks and variation selectors.
+        # Cf = invisible format characters (ZWJ, ZWNJ, soft hyphen, bidi
+        # controls). Closed by category so this does not need revisiting
+        # the next time Unicode adds one.
+        return unicodedata.category(ch)[:1] in ("M", "C") and (
+            unicodedata.category(ch) != "Cc"
+        )
 
     span = len(session_id)
     idx = text.find(session_id)

@@ -1352,10 +1352,14 @@ class TestStaleReplyToDoesNotMisroute:
         # attempt used unicodedata.combining(), which reports that class
         # and so read every one of these as a boundary.
         for extender in (
-            "\ufe0f",   # VARIATION SELECTOR-16
-            "\u20e3",   # COMBINING ENCLOSING KEYCAP
-            "\u034f",   # COMBINING GRAPHEME JOINER
-            "\u200d",   # ZERO WIDTH JOINER (category Cf, not M)
+            "\ufe0f",   # VARIATION SELECTOR-16          (Mn)
+            "\u20e3",   # COMBINING ENCLOSING KEYCAP     (Me)
+            "\u034f",   # COMBINING GRAPHEME JOINER      (Mn)
+            "\u200d",   # ZERO WIDTH JOINER              (Cf)
+            "\u200c",   # ZERO WIDTH NON-JOINER          (Cf)
+            "\u00ad",   # SOFT HYPHEN                    (Cf)
+            "\u200f",   # RIGHT-TO-LEFT MARK             (Cf)
+            "\ufeff",   # ZERO WIDTH NO-BREAK SPACE/BOM  (Cf)
         ):
             assert not names_session(f"{sid}{extender} approved", sid), extender
             assert not names_session(f"x{extender}{sid} approved", sid), extender
@@ -1371,6 +1375,15 @@ class TestStaleReplyToDoesNotMisroute:
         # reasoning is not load-bearing. This is the case that needs it: a
         # rejected candidate followed by a genuinely separate one.
         assert names_session("\u0301abab abab", "abab") is True
+        # Control characters DO end an identifier — excluded from the C
+        # sweep for exactly this reason.
+        assert names_session(f"{sid}\n approved", sid)
+        assert names_session(f"{sid}\tapproved", sid)
+        assert names_session(f"line one\n{sid}", sid)
+        # Ordinary punctuation and quoting still read as boundaries.
+        for wrapped in (f"({sid})", f'"{sid}"', f"{sid}.", f"{sid}, merge",
+                        f"[{sid}]", f"<{sid}>", f"{sid}!"):
+            assert names_session(wrapped, sid), wrapped
         assert not names_session("nothing here", sid)
         assert not names_session("anything", "")
 
