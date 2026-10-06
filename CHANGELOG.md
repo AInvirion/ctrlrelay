@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-06
+
+### Fixed
+
+- Every checkpoint snippet creates its own directory (#190)
+- Restate the checkpoint contract when resuming (#188)
+- Run the whole suite, and make the next exclusion defendable (#186)
+
+### Changed
+
+- Both-transports-at-once is not planned, not pending (#187)
+
 ## [0.12.0] - 2026-10-06
 
 ### Added
@@ -1671,7 +1683,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.3...v0.12.0
 [0.11.3]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.1...v0.11.2
