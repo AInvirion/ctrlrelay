@@ -153,7 +153,7 @@ class TestBridgeServer:
         self, socket_path,
     ) -> None:
         """If the operator replies to a specific question, bridge matches by
-        telegram_msg_id rather than falling back to FIFO order."""
+        post_id rather than falling back to FIFO order."""
         from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.protocol import (
@@ -754,7 +754,7 @@ class TestReplyRoutingIsStrict:
             assert "secops-owner-live-9999" in notice
             # Not by internal plumbing the operator can't see or act on.
             assert "telegram msg id" not in notice
-            assert "900" not in notice  # the telegram_msg_id
+            assert "900" not in notice  # the post_id
             # And the live question was not answered by accident.
             assert "r-live" in server._pending_questions
         finally:
