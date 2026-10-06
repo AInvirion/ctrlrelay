@@ -2691,6 +2691,28 @@ def setup(
             )
             raise typer.Exit(2)
 
+        # Shape-check by CONSTRUCTING the model rather than re-implementing
+        # its rule here. The 26-character check lives in MattermostConfig
+        # and a copy of it in this file would be a second rule to keep in
+        # sync - which is how the rule drifts. This only moves WHEN the
+        # operator is told: without it the same error arrives at config
+        # load, after setup has written files.
+        from pydantic import ValidationError
+
+        from ctrlrelay.core.config import MattermostConfig
+
+        try:
+            MattermostConfig(
+                url=mattermost_url.strip(),
+                channel_id=mattermost_channel_id.strip(),
+            )
+        except ValidationError as e:
+            console.print(
+                f"[red]Setup blocked:[/red] mattermost settings are not "
+                f"usable:\n{e}"
+            )
+            raise typer.Exit(2) from e
+
     # ----- daemons -------------------------------------------------------
     chosen_install_daemons = install_daemons
     if not chosen_install_daemons and not yes:
@@ -2707,7 +2729,12 @@ def setup(
     # bootstrapping the bridge.
     token: str | None = None
     if transport == "telegram" and chosen_install_daemons:
-        token = os.environ.get("CTRLRELAY_TELEGRAM_TOKEN")
+        # `or None`: an exported-but-empty variable is not a token. With
+        # `is None` alone, CTRLRELAY_TELEGRAM_TOKEN="" skipped both the
+        # prompt and the warning, and the operator was never told the
+        # rendered unit carries a placeholder. Pre-existing on this path;
+        # fixed here because the mattermost path below was copied from it.
+        token = os.environ.get("CTRLRELAY_TELEGRAM_TOKEN") or None
         if token is None and not yes:
             token = typer.prompt(
                 "Telegram bot token (input hidden, used only to render plists)",
@@ -2722,7 +2749,7 @@ def setup(
 
     mm_token: str | None = None
     if transport == "mattermost" and chosen_install_daemons:
-        mm_token = os.environ.get("CTRLRELAY_MATTERMOST_TOKEN")
+        mm_token = os.environ.get("CTRLRELAY_MATTERMOST_TOKEN") or None
         if mm_token is None and not yes:
             mm_token = typer.prompt(
                 "Mattermost bot token (input hidden, used only to render "

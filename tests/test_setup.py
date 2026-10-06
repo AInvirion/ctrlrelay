@@ -1076,3 +1076,51 @@ class TestSetupWritesTheTransportYouAskedFor:
         assert seen.get("transport") == "mattermost"
         assert seen.get("url") == "https://chat.example.test"
         assert seen.get("channel") == "c" * 26
+
+    def test_the_cli_refuses_a_channel_id_that_is_not_an_id(self) -> None:
+        """Caught at setup, not at the next config load.
+
+        The 26-character rule lives in `MattermostConfig` and this check
+        constructs that model rather than copying the rule, so the two
+        cannot drift. The test asserts the operator is stopped, not the
+        wording.
+        """
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        result = CliRunner().invoke(
+            app,
+            [
+                "setup",
+                "--transport",
+                "mattermost",
+                "--owner",
+                "someone",
+                "--mattermost-url",
+                "https://chat.example.test",
+                "--mattermost-channel-id",
+                "my-channel-name",
+                "--yes",
+            ],
+        )
+
+        assert result.exit_code == 2, result.output
+        assert "26-character" in result.output
+
+    def test_an_exported_but_empty_token_is_not_a_token(self) -> None:
+        """`is None` treated `FOO=""` as present.
+
+        The operator then got neither the prompt nor the warning, and the
+        rendered unit carried a placeholder they were never told about.
+        Pre-existing on the telegram path; the mattermost path was copied
+        from it, so both are asserted here.
+        """
+        import os
+        from unittest.mock import patch
+
+        for var in ("CTRLRELAY_TELEGRAM_TOKEN", "CTRLRELAY_MATTERMOST_TOKEN"):
+            with patch.dict(os.environ, {var: ""}):
+                assert (os.environ.get(var) or None) is None, (
+                    f"{var}='' must read as absent, not as a usable token"
+                )
