@@ -34,7 +34,7 @@ agent:
 # EXACTLY ONE transport is active, and it is the one named by `type`.
 # The other blocks below are inert: they may stay in the file, but nothing
 # reads them. Running Telegram and Mattermost at the same time is NOT
-# supported - that is tracked as issue #176.
+# supported and NOT planned - designed in issue #176 and closed won't-do.
 #
 # Choose:
 #   type: "telegram"    production, 1:1 chat with a bot

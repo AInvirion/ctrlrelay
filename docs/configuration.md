@@ -104,10 +104,11 @@ block in the file is inert — it may stay there, but nothing reads it.
 | A channel on your own server | `"mattermost"` | A server URL, a bot token, and the channel's 26-character ID. |
 | No chat at all | `"file_mock"` | Nothing. Questions go to a file; **nobody is asked anything.** |
 
-**Running Telegram and Mattermost at the same time is not supported.** Setting
-`type` to one does not fall back to the other, and a question is delivered to
-one place or not at all. That is tracked as
-[issue #176](https://github.com/AInvirion/ctrlrelay/issues/176).
+**Running Telegram and Mattermost at the same time is not supported, and is
+not planned.** Setting `type` to one does not fall back to the other, and a
+question is delivered to one place or not at all. It was designed in
+[#176](https://github.com/AInvirion/ctrlrelay/issues/176) and closed won't-do;
+the design is still in that issue if anyone wants it.
 
 Switching is a two-line change — set `type`, add that transport's block — plus
 a restart of **both** daemons, which share `state.db`.

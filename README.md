@@ -56,9 +56,9 @@ are on the roadmap (see [Roadmap](#roadmap)).
   relays it to you and resumes the session once you reply. Choose
   **Telegram** (a DM from a bot) or **Mattermost** (a channel on your own
   server) with one `transport.type` setting. Exactly one is active at a
-  time; running both at once is not supported yet
-  ([#176](https://github.com/AInvirion/ctrlrelay/issues/176)). See
-  [configuration][docs-config].
+  time; running both at once is not supported and not planned
+  ([#176](https://github.com/AInvirion/ctrlrelay/issues/176), closed
+  won't-do). See [configuration][docs-config].
 - **PR watcher.** Tracks the opened PR to merge and closes the loop
   with a notification on whichever chat transport is configured.
 - **In-process scheduler** (APScheduler). Runs periodic jobs inside
