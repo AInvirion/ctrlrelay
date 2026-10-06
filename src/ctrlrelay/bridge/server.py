@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import stat
 import time
 import unicodedata
@@ -42,7 +41,7 @@ _ASKED_SESSIONS_MAX = 500
 
 
 def names_session(text: str, session_id: str) -> bool:
-    r"""True when ``text`` names ``session_id`` as a whole token.
+    """True when ``text`` names ``session_id`` as a whole token.
 
     A plain ``session_id in text`` is a substring test, and a substring
     test is not an identifier match: a reply naming
@@ -50,45 +49,53 @@ def names_session(text: str, session_id: str) -> bool:
     the shorter id would claim an answer written for the longer one. Our
     session ids end in a fixed-width hash, which makes that collision
     unlikely between two real ids rather than impossible — and "unlikely"
-    is not the property this function needs to have, because what it
-    decides is which pipeline gets resumed.
+    is not the property this function needs, because what it decides is
+    which pipeline gets resumed.
 
-    Hyphen counts as part of an id rather than as a boundary, so a longer
-    id is never read as containing a shorter one.
+    Written as an explicit scan rather than a regex, for two reasons a
+    regex got wrong in review:
 
-    The boundary class is ``[\w-]``, which is Unicode-aware. An ASCII-only
-    class looked equivalent — our ids are ASCII — but the *text* is
-    operator input, so ``...-bbb\u00e9`` would have ended the id at the
-    accent and matched ``...-bbb``. The ids being ASCII says nothing about
-    what surrounds them.
+    - ``re.finditer`` is **non-overlapping**, so a candidate rejected for
+      its neighbours hides any overlapping candidate behind it. Scanning
+      every offset cannot.
+    - ``re`` cannot test a Unicode category, and the first attempt used
+      ``unicodedata.combining()``, which reports the *canonical combining
+      class* — not whether a character extends the preceding grapheme.
+      U+FE0F, U+20E3, U+034F and U+200D are all class 0, so they passed as
+      boundaries while rendering as part of the neighbouring glyph.
 
-    A combining mark needs the separate check below. ``\w`` does not match
-    one, so ``...-bbb`` followed by U+0301 satisfies the lookahead while
-    rendering as a different final glyph — the regex sees a boundary where
-    a reader sees none. ``re`` cannot match by Unicode category, and
-    enumerating the combining ranges is a guess about a table that grows,
-    so adjacency is checked directly. That makes the guard closed rather
-    than merely unlikely to be wrong, which is the property this function
-    needs: it decides which pipeline gets resumed.
+    What counts as "still inside the identifier", therefore:
 
-    Every occurrence is examined, not just the first. A near-miss early in
-    a message must not suppress a real mention later in it.
+    - a word character or ``-``, which is the id's own alphabet;
+    - any character in Unicode category ``M`` — Mn, Mc and Me — which
+      covers combining accents, enclosing marks and the variation
+      selectors;
+    - ZERO WIDTH JOINER, named explicitly because it is the one common
+      grapheme extender that is category ``Cf`` rather than ``M``.
     """
     if not session_id:
         return False
 
-    def _is_mark(ch: str) -> bool:
-        # Empty means start- or end-of-string, which is a real boundary.
-        # unicodedata.combining() raises on "" rather than returning 0.
-        return bool(ch) and unicodedata.combining(ch) != 0
+    def _inside_identifier(ch: str) -> bool:
+        # "" is start- or end-of-string, which is a genuine boundary.
+        if not ch:
+            return False
+        if ch == "-" or ch.isalnum() or ch == "_":
+            return True
+        if unicodedata.category(ch).startswith("M"):
+            return True
+        return ch == "\u200d"
 
-    pattern = r"(?<![\w-])" + re.escape(session_id) + r"(?![\w-])"
-    for match in re.finditer(pattern, text):
-        after = text[match.end():match.end() + 1]
-        before = text[match.start() - 1: match.start()] if match.start() else ""
-        if _is_mark(after) or _is_mark(before):
-            continue
-        return True
+    span = len(session_id)
+    idx = text.find(session_id)
+    while idx != -1:
+        before = text[idx - 1: idx] if idx else ""
+        after = text[idx + span: idx + span + 1]
+        if not _inside_identifier(before) and not _inside_identifier(after):
+            return True
+        # +1, not +span: a rejected candidate must not hide an overlapping
+        # one starting inside it.
+        idx = text.find(session_id, idx + 1)
     return False
 
 

@@ -1348,6 +1348,29 @@ class TestStaleReplyToDoesNotMisroute:
         # ...and a real occurrence later in the same message still routes,
         # rather than the first near-miss suppressing the whole message.
         assert names_session(f"{sid}\u0301 no wait, {sid} yes", sid)
+        # Grapheme extenders with canonical combining class 0. The first
+        # attempt used unicodedata.combining(), which reports that class
+        # and so read every one of these as a boundary.
+        for extender in (
+            "\ufe0f",   # VARIATION SELECTOR-16
+            "\u20e3",   # COMBINING ENCLOSING KEYCAP
+            "\u034f",   # COMBINING GRAPHEME JOINER
+            "\u200d",   # ZERO WIDTH JOINER (category Cf, not M)
+        ):
+            assert not names_session(f"{sid}{extender} approved", sid), extender
+            assert not names_session(f"x{extender}{sid} approved", sid), extender
+        # Self-overlapping id. Review raised non-overlapping iteration as
+        # a false-negative risk; measured, it cannot be one for THIS
+        # predicate — an overlapping occurrence is by definition preceded
+        # by a character of the first occurrence, which is an identifier
+        # character, so it is rejected on its own merits regardless of
+        # whether it was ever examined. Both of these are correctly False.
+        assert names_session("\u0301abab", "abab") is False
+        assert names_session("\u0301ababab", "abab") is False
+        # The scan is still every-offset rather than every-match, so that
+        # reasoning is not load-bearing. This is the case that needs it: a
+        # rejected candidate followed by a genuinely separate one.
+        assert names_session("\u0301abab abab", "abab") is True
         assert not names_session("nothing here", sid)
         assert not names_session("anything", "")
 
