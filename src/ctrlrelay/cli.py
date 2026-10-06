@@ -2675,13 +2675,18 @@ def setup(
     # message at the moment the operator can still fix it, rather than a
     # config that looks written and does not work.
     if transport == "mattermost":
+        # Bound once, and used for both the presence check and the shape
+        # check below. Stripping inside the comprehension left mypy unable
+        # to narrow `str | None` at the call that follows.
+        mm_url = (mattermost_url or "").strip()
+        mm_channel = (mattermost_channel_id or "").strip()
         missing = [
             name
             for name, value in (
-                ("--mattermost-url", mattermost_url),
-                ("--mattermost-channel-id", mattermost_channel_id),
+                ("--mattermost-url", mm_url),
+                ("--mattermost-channel-id", mm_channel),
             )
-            if not (value or "").strip()
+            if not value
         ]
         if missing:
             console.print(
@@ -2702,10 +2707,7 @@ def setup(
         from ctrlrelay.core.config import MattermostConfig
 
         try:
-            MattermostConfig(
-                url=mattermost_url.strip(),
-                channel_id=mattermost_channel_id.strip(),
-            )
+            MattermostConfig(url=mm_url, channel_id=mm_channel)
         except ValidationError as e:
             console.print(
                 f"[red]Setup blocked:[/red] mattermost settings are not "
