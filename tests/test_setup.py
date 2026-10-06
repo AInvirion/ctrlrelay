@@ -943,3 +943,73 @@ class TestSetupCli:
         )
         assert result.exit_code != 0, result.output
         assert "ACTION NEEDED" in result.output
+
+
+class TestSetupWritesTheTransportYouAskedFor:
+    """`--transport mattermost` was accepted and then ignored.
+
+    `VALID_TRANSPORTS` listed mattermost, so validation passed, but
+    `build_orchestrator_yaml` had only a telegram branch and an else.
+    The operator asked for Mattermost and silently got `file_mock` - a
+    config that loads, starts, and asks nobody anything.
+    """
+
+    def test_each_valid_transport_writes_its_own_block(self) -> None:
+        import yaml
+
+        from ctrlrelay.setup import (
+            VALID_TRANSPORTS,
+            SetupOptions,
+            build_orchestrator_yaml,
+        )
+
+        # Driven off VALID_TRANSPORTS rather than a list written here, so
+        # a transport added to that tuple without a branch in the
+        # generator fails this test on the day it is added.
+        assert len(VALID_TRANSPORTS) >= 3, VALID_TRANSPORTS
+
+        for name in VALID_TRANSPORTS:
+            options = SetupOptions(
+                transport=name,
+                mattermost_url="https://chat.example.test",
+                mattermost_channel_id="c" * 26,
+                telegram_chat_id=123,
+            )
+            doc = yaml.safe_load(
+                build_orchestrator_yaml(options, {})
+            )
+            assert doc["transport"]["type"] == name, (
+                f"setup --transport {name} wrote "
+                f"{doc['transport']['type']!r} instead"
+            )
+            assert name in doc["transport"], (
+                f"setup --transport {name} wrote no {name} block"
+            )
+
+    def test_the_generated_mattermost_config_actually_loads(
+        self, tmp_path
+    ) -> None:
+        """A block that validates, not just a block that exists."""
+        import yaml
+
+        from ctrlrelay.core.config import load_config
+        from ctrlrelay.setup import SetupOptions, build_orchestrator_yaml
+
+        options = SetupOptions(
+            transport="mattermost",
+            mattermost_url="https://chat.example.test",
+            mattermost_channel_id="c" * 26,
+            repo_root=tmp_path / "repos",
+        )
+        doc = yaml.safe_load(build_orchestrator_yaml(options, {}))
+        doc["repos"] = []
+        for key in ("state_db", "worktrees", "bare_repos", "contexts", "skills"):
+            doc.setdefault("paths", {})[key] = str(tmp_path / key)
+
+        path = tmp_path / "orchestrator.yaml"
+        path.write_text(yaml.dump(doc))
+
+        config = load_config(path)
+        assert config.transport.type.value == "mattermost"
+        assert config.transport.mattermost is not None
+        assert config.transport.mattermost.url == "https://chat.example.test"
