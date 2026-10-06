@@ -1108,19 +1108,50 @@ class TestSetupWritesTheTransportYouAskedFor:
         assert result.exit_code == 2, result.output
         assert "26-character" in result.output
 
-    def test_an_exported_but_empty_token_is_not_a_token(self) -> None:
-        """`is None` treated `FOO=""` as present.
+    def test_an_exported_but_empty_token_warns_instead_of_passing_silently(
+        self,
+    ) -> None:
+        """Drives the command, because the first version of this test did not.
 
-        The operator then got neither the prompt nor the warning, and the
-        rendered unit carried a placeholder they were never told about.
-        Pre-existing on the telegram path; the mattermost path was copied
-        from it, so both are asserted here.
+        It asserted `(os.environ.get(var) or None) is None`, which is an
+        expression evaluated in the test. Removing the `or None` from
+        cli.py left it green - the assertion would have passed if the
+        code under test did nothing at all.
+
+        `os.environ.get` returns "" for an exported-but-empty variable,
+        and `if token is None` treated that as a usable token: no prompt,
+        no warning, and a rendered unit carrying a placeholder nobody
+        mentioned.
         """
         import os
         from unittest.mock import patch
 
-        for var in ("CTRLRELAY_TELEGRAM_TOKEN", "CTRLRELAY_MATTERMOST_TOKEN"):
-            with patch.dict(os.environ, {var: ""}):
-                assert (os.environ.get(var) or None) is None, (
-                    f"{var}='' must read as absent, not as a usable token"
-                )
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        def short_circuit(options, *a, **kw):
+            raise RuntimeError("short-circuit")
+
+        with (
+            patch.dict(os.environ, {"CTRLRELAY_MATTERMOST_TOKEN": ""}),
+            patch("ctrlrelay.setup.run_setup", side_effect=short_circuit),
+        ):
+            result = CliRunner().invoke(
+                app,
+                [
+                    "setup",
+                    "--transport",
+                    "mattermost",
+                    "--owner",
+                    "someone",
+                    "--mattermost-url",
+                    "https://chat.example.test",
+                    "--mattermost-channel-id",
+                    "c" * 26,
+                    "--install-daemons",
+                    "--yes",
+                ],
+            )
+
+        assert "no Mattermost token" in result.output, result.output
