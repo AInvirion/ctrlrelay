@@ -1544,26 +1544,44 @@ def poller_start(
             from ctrlrelay.pipelines.base import failure_text
 
             secops_transport = None
-            if config.transport.type.value == "telegram" and config.transport.telegram:
+            settings = _bridge_socket_settings(config)
+            if settings is None:
+                # `None` is "no chat transport is configured at all",
+                # which is a different fact from a missing socket - the
+                # helper's own contract. Said out loud because silence
+                # here is exactly how #181 hid: every BLOCKED session
+                # still persists a pending_resumes row, so the run looks
+                # healthy from the database while the operator is never
+                # asked anything.
+                console.print(
+                    "[yellow]Scheduled secops: no chat transport configured "
+                    "- blocked sessions will persist for later resume and "
+                    "the operator will NOT be asked.[/yellow]"
+                )
+            else:
                 from ctrlrelay.transports import SocketTransport
-                sock = config.transport.telegram.socket_path.expanduser().resolve()
-                if sock.exists():
+                sock, ask_timeout = settings
+                if not sock.exists():
+                    console.print(
+                        f"[yellow]Scheduled secops: bridge socket missing at "
+                        f"{sock} - blocked sessions will persist for later "
+                        f"resume and the operator will NOT be asked."
+                        f"[/yellow]"
+                    )
+                else:
                     try:
                         candidate = SocketTransport(
                             sock,
-                            ask_timeout_seconds=(
-                                config.transport.telegram
-                                .ask_timeout_seconds
-                            ),
+                            ask_timeout_seconds=ask_timeout,
                         )
                         await candidate.connect()
                         secops_transport = candidate
                     except Exception as e:
                         console.print(
                             f"[yellow]Scheduled secops: transport connect "
-                            f"failed ({e}) — running without notifications[/yellow]"
+                            f"failed ({e}) - running without notifications"
+                            f"[/yellow]"
                         )
-
             # Tell the operator the sweep started so a long run isn't
             # silent. Without this, a 10-min sweep that ends with a
             # blocked-on-input result looks like "out of nowhere" pings.
@@ -1736,23 +1754,43 @@ def poller_start(
             from ctrlrelay.pipelines.task import resume_task_from_pending
 
             sweeper_transport = None
-            if config.transport.type.value == "telegram" and config.transport.telegram:
+            settings = _bridge_socket_settings(config)
+            if settings is None:
+                # See the scheduled-secops path above. This one matters
+                # twice over: without a transport the sweeper resumes a
+                # session, cannot confirm the answer was applied, and
+                # cannot deliver the NEW question if that session
+                # re-blocks - so the row is replaced and nobody is told
+                # (#181).
+                console.print(
+                    "[yellow]Resume sweeper: no chat transport configured "
+                    "- resumes will run but no confirmation or re-blocked "
+                    "question will reach the operator.[/yellow]"
+                )
+            else:
                 from ctrlrelay.transports import SocketTransport
-                sock = config.transport.telegram.socket_path.expanduser().resolve()
-                if sock.exists():
+                sock, ask_timeout = settings
+                if not sock.exists():
+                    console.print(
+                        f"[yellow]Resume sweeper: bridge socket missing at "
+                        f"{sock} - resumes will run but no confirmation or "
+                        f"re-blocked question will reach the operator."
+                        f"[/yellow]"
+                    )
+                else:
                     try:
                         candidate = SocketTransport(
                             sock,
-                            ask_timeout_seconds=(
-                                config.transport.telegram
-                                .ask_timeout_seconds
-                            ),
+                            ask_timeout_seconds=ask_timeout,
                         )
                         await candidate.connect()
                         sweeper_transport = candidate
-                    except Exception:
-                        sweeper_transport = None
-
+                    except Exception as e:
+                        console.print(
+                            f"[yellow]Resume sweeper: transport connect "
+                            f"failed ({e}) - resumes will run without "
+                            f"notifications.[/yellow]"
+                        )
             repo_cfg_by_name = {r.name: r for r in config.repos}
 
             try:
