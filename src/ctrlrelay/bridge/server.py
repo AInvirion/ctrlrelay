@@ -41,7 +41,7 @@ _ASKED_SESSIONS_MAX = 500
 
 
 def names_session(text: str, session_id: str) -> bool:
-    """True when ``text`` names ``session_id`` as a whole token.
+    r"""True when ``text`` names ``session_id`` as a whole token.
 
     A plain ``session_id in text`` is a substring test, and a substring
     test is not an identifier match: a reply naming
@@ -52,13 +52,19 @@ def names_session(text: str, session_id: str) -> bool:
     is not the property this function needs to have, because what it
     decides is which pipeline gets resumed.
 
-    Hyphen and underscore count as part of an id, not as boundaries, so a
-    longer id is never read as containing a shorter one.
+    Hyphen counts as part of an id rather than as a boundary, so a longer
+    id is never read as containing a shorter one.
+
+    The boundary class is ``[\w-]``, which is Unicode-aware. An ASCII-only
+    class looked equivalent — our ids are ASCII — but the *text* is
+    operator input, so ``...-bbb\u00e9`` would have ended the id at the
+    accent and matched ``...-bbb``. The ids being ASCII says nothing about
+    what surrounds them.
     """
     if not session_id:
         return False
     return re.search(
-        r"(?<![0-9A-Za-z_-])" + re.escape(session_id) + r"(?![0-9A-Za-z_-])",
+        r"(?<![\w-])" + re.escape(session_id) + r"(?![\w-])",
         text,
     ) is not None
 

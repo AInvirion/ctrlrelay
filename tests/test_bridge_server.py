@@ -1283,6 +1283,44 @@ class TestStaleReplyToDoesNotMisroute:
         await server.stop()
         task.cancel()
 
+    @pytest.mark.asyncio
+    async def test_a_prefix_is_not_matched_on_the_stale_reply_path_either(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """The same prefix guard, on the branch this change actually added.
+
+        The sibling test above sends `reply_to_message_id=None`, which
+        reaches the pre-existing `matched_by_id` call site. It therefore
+        says nothing about the `named` call site inside the stale-hint
+        branch — a regression to substring matching there would pass every
+        other test here. This drives the stale-reply path explicitly: A is
+        answered and mapped to the replied-to message, B and C are live,
+        and the text names a longer id that merely has B's as a prefix.
+        """
+        server, db, task = await self._server_with_blocked(
+            socket_path, tmp_path, extra=True,
+        )
+
+        assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
+
+        await server._on_telegram_reply(
+            "secops-owner-b-bbb2 approved", reply_to_message_id=999,
+        )
+
+        b = db.get_pending_resume("secops-owner-b-bbb")
+        assert b["answer"] is None, "a prefix match claimed another id's answer"
+        assert b["answered_at"] is None
+        c = db.get_pending_resume("secops-owner-c-ccc")
+        assert c["answer"] is None
+        # Only A's deliberate answer is queued; no reply was routed.
+        assert [r["session_id"] for r in db.list_pending_resumes_to_execute()] == [
+            "secops-owner-a-aaa"
+        ]
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
     def test_names_session_requires_a_whole_token(self) -> None:
         """Direct coverage of the matcher, including both boundaries."""
         from ctrlrelay.bridge.server import names_session
@@ -1298,6 +1336,10 @@ class TestStaleReplyToDoesNotMisroute:
         assert not names_session(f"{sid}-x approved", sid)
         assert not names_session(f"{sid}_x approved", sid)
         assert not names_session(f"x{sid} approved", sid)
+        # Boundaries must be Unicode-aware: the ids are ASCII, the operator's
+        # text is not, and an ASCII-only class ended the id at the accent.
+        assert not names_session(f"{sid}\u00e9 approved", sid)
+        assert not names_session(f"\u00e9{sid} approved", sid)
         assert not names_session("nothing here", sid)
         assert not names_session("anything", "")
 
