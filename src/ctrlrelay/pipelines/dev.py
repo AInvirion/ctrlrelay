@@ -483,7 +483,13 @@ printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
                 success=False,
                 session_id=result.session_id,
                 summary="No checkpoint state returned",
-                error=result.stderr or "Unknown error",
+                # No manufactured fallback. An empty stderr means there
+                # is nothing to add, and `failure_text` then reports the
+                # summary above plus the exit code — which is the whole
+                # diagnosis, because exiting 0 without writing state is
+                # a different fault from crashing (#174).
+                error=result.stderr.strip() or None,
+                exit_code=result.exit_code,
             )
 
         if result.state.status == CheckpointStatus.DONE:
