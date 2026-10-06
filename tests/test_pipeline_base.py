@@ -1,6 +1,11 @@
 """Tests for pipeline base protocol."""
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from ctrlrelay.core.checkpoint import CheckpointStatus
 
 
 class TestPipelineProtocol:
@@ -263,4 +268,118 @@ class TestFailureText:
         assert failure_text(result) == (
             "Task failed - uv sync could not reach the index "
             "(agent exit code 2)"
+        )
+
+
+class TestEveryAlertGoesThroughFailureText:
+    """Holds the call sites, which the formatter's own tests do not.
+
+    Measured on 082de46: reverting the two `cli.py` alert sites to
+    `result.error or result.summary` passed the **entire** 1019-test
+    suite. The formatter was pinned and the thing that made the fix a fix
+    — that every alert resolves the two fields the same way — was not.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failure_after_an_answer_names_the_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """Drives the operator path at pipelines/secops.py:685.
+
+        The agent answers, resumes, exits 0 and writes no checkpoint —
+        the incident's own shape, one round later. The alert must carry
+        the reason and the exit code, not `Unknown error`.
+        """
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        blocked = MagicMock()
+        blocked.status = CheckpointStatus.BLOCKED_NEEDS_INPUT
+        blocked.question = "Merge #1?"
+        blocked.outputs = {}
+        blocked.error = None
+
+        # `resume` goes through `_spawn(..., resume=True)`, so both the
+        # first run and the resume arrive as `spawn_session` calls — a
+        # `resume_session` mock is never consulted and would have left
+        # this test looping to max_blocked_rounds instead of failing.
+        mock_dispatcher = AsyncMock()
+        mock_dispatcher.spawn_session.side_effect = [
+            SessionResult(session_id="sess-1", exit_code=0, state=blocked),
+            # The resume exits 0 and writes nothing: state is None.
+            SessionResult(
+                session_id="sess-1", exit_code=0, state=None, stderr=""
+            ),
+        ]
+
+        mock_worktree = AsyncMock()
+        mock_worktree.create_worktree.return_value = tmp_path / "wt"
+        mock_worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+
+        mock_db = MagicMock()
+        mock_db.acquire_lock.return_value = True
+
+        sent: list[str] = []
+        transport = AsyncMock()
+        transport.ask.return_value = "yes, merge it"
+        transport.send.side_effect = lambda text, **kw: sent.append(text)
+
+        repo = MagicMock(local_path=tmp_path / "repo1")
+        repo.name = "owner/repo1"
+
+        await run_secops_all(
+            repos=[repo],
+            dispatcher=mock_dispatcher,
+            github=MagicMock(),
+            worktree=mock_worktree,
+            dashboard=None,
+            state_db=mock_db,
+            transport=transport,
+            contexts_dir=tmp_path / "contexts",
+        )
+
+        failures = [t for t in sent if "Failed after your answer" in t]
+        assert len(failures) == 1, sent
+        assert "No checkpoint state returned" in failures[0]
+        assert "(agent exit code 0)" in failures[0]
+
+    def test_no_module_reconstructs_the_error_or_summary_precedence(self) -> None:
+        """A structural guard over the whole package, so a fifth site
+        cannot reintroduce the bug the other four carried.
+
+        Read with `ast`, not a regex or a source slice: a substring
+        search over this file would be satisfied by the expression
+        appearing in a comment or a docstring — including the ones in
+        this change explaining the fault — and could be disabled by
+        writing prose nearby.
+        """
+        import ast
+
+        offenders: list[str] = []
+        root = Path(__file__).resolve().parent.parent / "src" / "ctrlrelay"
+        files = sorted(root.rglob("*.py"))
+
+        # Negative control: if the walk finds nothing to read, it would
+        # report a clean result for the same reason a passing one does.
+        assert len(files) > 20, f"only walked {len(files)} files"
+
+        for path in files:
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.BoolOp) or not isinstance(
+                    node.op, ast.Or
+                ):
+                    continue
+                attrs = [
+                    v.attr for v in node.values if isinstance(v, ast.Attribute)
+                ]
+                if "error" in attrs and "summary" in attrs:
+                    offenders.append(
+                        f"{path.relative_to(root)}:{node.lineno}"
+                    )
+
+        assert offenders == [], (
+            "these resolve `error`/`summary` by hand instead of calling "
+            f"failure_text(), which is how #174 was reachable four ways: "
+            f"{offenders}"
         )
