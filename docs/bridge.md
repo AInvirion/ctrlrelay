@@ -22,9 +22,11 @@ one-line config change and no pipeline code moves.
 **One at a time.** `transport.type` names the transport that is active, and the
 other block is inert — it may stay in the file, but nothing reads it, including
 its `question_ttl_seconds`. There is no fallback: a question goes to the one
-you named or nowhere. Running both at once is
-[issue #176](https://github.com/AInvirion/ctrlrelay/issues/176) and is not
-built.
+you named or nowhere. Running both at once is **not supported and not
+planned** — it was designed in
+[#176](https://github.com/AInvirion/ctrlrelay/issues/176) and closed
+won't-do. Reopen that issue rather than re-deriving the design if you need
+it.
 
 | | Telegram | Mattermost |
 |---|---|---|
