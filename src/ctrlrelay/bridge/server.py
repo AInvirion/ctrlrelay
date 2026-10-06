@@ -526,13 +526,39 @@ class BridgeServer:
                     # the one case it exists for. Which chat app failed is
                     # diagnostic and lives in the log; what the caller
                     # needs is whether delivery is unknown.
-                    error=(
-                        "delivery_unknown" if unknown else "chat_api_error"
-                    ),
+                    error=self._error_code(unknown),
                     message=str(e),
                 )
 
         return None
+
+    def _error_code(self, unknown: bool) -> str:
+        """The ERROR frame's ``error`` field for a failed post.
+
+        Not derived from the transport name, which is what the ticket
+        asked for and would have been wrong: ``SocketTransport`` compares
+        this string **exactly**, so a ``mattermost_delivery_unknown``
+        would not raise — it would simply stop matching, and the transport
+        would downgrade "delivery unknown" to "definitely failed". That is
+        the one classification this field exists to carry.
+
+        The legacy ``telegram_delivery_unknown`` is still emitted **for
+        Telegram only**, and that asymmetry is deliberate. The bridge and
+        the poller are separate daemons that can differ across a deploy,
+        and a pre-0.12 poller only understands the old spelling. Such a
+        poller can only be configured for Telegram — Mattermost did not
+        exist for it — so Telegram keeps the old string and Mattermost
+        gets the neutral one, and no upgrade order can lose the
+        classification.
+
+        Remove the Telegram special case once no pre-0.12 poller is in
+        service; the only cost of keeping it is this paragraph.
+        """
+        if not unknown:
+            return "chat_api_error"
+        if self.handler.transport_name == "telegram":
+            return "telegram_delivery_unknown"
+        return "delivery_unknown"
 
     def _remember_asked_session(
         self, post_id: str, session_id: str

@@ -34,14 +34,36 @@ def token_env_var(transport: TransportConfig) -> str:
     return str(env)
 
 
+async def verify_handler(handler: ChatHandler) -> None:
+    """Prove the handler can actually reach its channel, if it can say.
+
+    ``make_handler`` only checks what is readable from config, which is a
+    weaker claim than it looks: a syntactically perfect token and a
+    well-formed channel id that names nothing both pass it. A handler that
+    offers a ``preflight`` gets called here so the check is a real one.
+
+    Raises ``HandlerConfigError`` so the caller has one exception type to
+    catch for "this configuration will not work".
+    """
+    preflight = getattr(handler, "preflight", None)
+    if preflight is None:
+        return
+    try:
+        await preflight()
+    except Exception as e:
+        raise HandlerConfigError(
+            f"{handler.transport_name} preflight failed: {e}"
+        ) from e
+
+
 def make_handler(transport: TransportConfig) -> ChatHandler:
     """Construct the handler for ``transport``.
 
     Raises ``HandlerConfigError`` with something an operator can act on.
-    Deliberately eager about the token and the destination: the bridge is a
-    daemon, so anything not checked at startup is discovered when a session
-    blocks — which is hours later, on the one path whose job is to be
-    there when something has gone wrong.
+    Eager about everything readable from config — but note what that does
+    NOT prove: a well-formed token that the server will refuse, and a
+    well-formed channel id that names nothing, both pass here. Call
+    ``verify_handler`` for the part that needs the server.
     """
     if transport.type == TransportType.TELEGRAM:
         cfg = transport.telegram
@@ -70,7 +92,7 @@ def make_handler(transport: TransportConfig) -> ChatHandler:
             raise HandlerConfigError(
                 f"env var '{cfg.bot_token_env}' is unset"
             )
-        if not cfg.channel_id:
+        if not cfg.channel_id.strip():
             raise HandlerConfigError(
                 "transport.mattermost.channel_id is unset — a post with no "
                 "channel is rejected, so no question would ever arrive"
@@ -80,7 +102,7 @@ def make_handler(transport: TransportConfig) -> ChatHandler:
         return MattermostHandler(
             url=cfg.url,
             bot_token=token,
-            channel_id=cfg.channel_id,
+            channel_id=cfg.channel_id.strip(),
         )
 
     raise HandlerConfigError(

@@ -155,6 +155,11 @@ class MattermostConfig(BaseModel):
     url: str
     bot_token_env: str = "CTRLRELAY_MATTERMOST_TOKEN"
     channel_id: str = ""
+    # Preflight the token and channel membership at startup. On by default:
+    # the alternative is a bridge that binds its socket, reports success,
+    # and lets the first blocked session discover a 403 hours later. Can be
+    # turned off for an air-gapped start where the server is not up yet.
+    preflight: bool = True
     socket_path: Path = Field(
         default_factory=lambda: Path("~/.ctrlrelay/ctrlrelay.sock").expanduser()
     )
@@ -170,6 +175,28 @@ class MattermostConfig(BaseModel):
     def expand_socket_path(cls, v: Any) -> Any:
         if isinstance(v, str):
             return Path(v).expanduser()
+        return v
+
+    @field_validator("channel_id")
+    @classmethod
+    def channel_id_must_be_an_id(cls, v: str) -> str:
+        """Reject blank and malformed ids.
+
+        `" "` used to pass every check in the chain, because whitespace is
+        truthy — so the config validated, the factory accepted it, the
+        bridge started, and nothing was ever posted anywhere. A shape check
+        cannot prove the channel exists (only the preflight can) but it
+        catches the blank, the pasted URL and the channel *name*, which are
+        the three things an operator actually types here.
+        """
+        v = v.strip()
+        if not v:
+            return v  # unset is caught by the factory, with a usable message
+        if not v.isalnum() or len(v) != 26:
+            raise ValueError(
+                "mattermost channel_id must be the 26-character id, not a "
+                f"name or URL (got {v!r})"
+            )
         return v
 
     @field_validator("url")

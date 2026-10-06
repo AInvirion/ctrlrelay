@@ -113,7 +113,7 @@ class TestBridgeServer:
         await asyncio.sleep(0.1)
 
         # Swap in a mock Telegram handler so ASK doesn't hit the real API.
-        server.handler.ask = AsyncMock(return_value=999)  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value="999")  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -169,7 +169,7 @@ class TestBridgeServer:
         await asyncio.sleep(0.1)
 
         # Two ASKs -> two different Telegram msg_ids.
-        ask_mock = AsyncMock(side_effect=[111, 222])
+        ask_mock = AsyncMock(side_effect=["111", "222"])
         server.handler.ask = ask_mock  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
@@ -182,7 +182,7 @@ class TestBridgeServer:
                 await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
 
             # Reply specifically to the SECOND question (msg_id=222).
-            await server._on_reply("answering second", reply_to_post_id=222)
+            await server._on_reply("answering second", reply_to_post_id="222")
 
             raw = await asyncio.wait_for(reader.readline(), timeout=1)
             answer = parse_message(raw.decode())
@@ -213,7 +213,7 @@ class TestBridgeServer:
         server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server.handler.ask = AsyncMock(return_value=42)  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value="42")  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         writer.write(serialize_message(BridgeMessage(
@@ -529,7 +529,7 @@ class TestReplyRoutingIsStrict:
         server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server.handler.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(side_effect=["111", "222"])  # type: ignore[attr-defined]
         server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
@@ -584,12 +584,12 @@ class TestReplyRoutingIsStrict:
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server.handler.ask = AsyncMock(return_value=999)  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value="999")  # type: ignore[attr-defined]
         server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         # The expired question is only remembered in the msg_id -> session map.
         async with server._pending_lock:
-            server._remember_asked_session(111, "secops-owner-expired-1111")
+            server._remember_asked_session("111", "secops-owner-expired-1111")
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -600,7 +600,7 @@ class TestReplyRoutingIsStrict:
             await writer.drain()
             await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
 
-            await server._on_reply("hold it", reply_to_post_id=111)
+            await server._on_reply("hold it", reply_to_post_id="111")
 
             # The live question must NOT have been answered.
             with pytest.raises(asyncio.TimeoutError):
@@ -647,9 +647,9 @@ class TestReplyRoutingIsStrict:
         server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         async with server._pending_lock:
-            server._remember_asked_session(500, "secops-owner-r1-abc1")
+            server._remember_asked_session("500", "secops-owner-r1-abc1")
 
-        await server._on_reply("approve it", reply_to_post_id=500)
+        await server._on_reply("approve it", reply_to_post_id="500")
 
         rows = db.list_pending_resumes_to_execute()
         assert [r["session_id"] for r in rows] == ["secops-owner-r1-abc1"]
@@ -691,7 +691,7 @@ class TestReplyRoutingIsStrict:
         server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server.handler.ask = AsyncMock(return_value=777)  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value="777")  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -708,7 +708,7 @@ class TestReplyRoutingIsStrict:
             assert "approve #387?" in posted
 
             # And the session is recoverable by the msg_id Telegram returned.
-            assert server._asked_sessions[777] == "secops-owner-r-abc"
+            assert server._asked_sessions["777"] == "secops-owner-r-abc"
         finally:
             writer.close()
             await writer.wait_closed()
@@ -731,7 +731,7 @@ class TestReplyRoutingIsStrict:
         server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server.handler.ask = AsyncMock(return_value=900)  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value="900")  # type: ignore[attr-defined]
         server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
@@ -744,7 +744,7 @@ class TestReplyRoutingIsStrict:
             await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
 
             # No state_db, so the orphan router returns "none".
-            await server._on_reply("yes", reply_to_post_id=4242)
+            await server._on_reply("yes", reply_to_post_id="4242")
 
             notice = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
             assert "no active session is waiting" not in notice
@@ -778,7 +778,7 @@ class TestReplyRoutingIsStrict:
         server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server.handler.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(side_effect=["111", "222"])  # type: ignore[attr-defined]
 
         lock_was_free = asyncio.Event()
 
@@ -877,7 +877,7 @@ class TestReplyRoutingIsStrict:
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server.handler.ask = AsyncMock(return_value=555)  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value="555")  # type: ignore[attr-defined]
         server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
@@ -893,7 +893,7 @@ class TestReplyRoutingIsStrict:
             # The pipeline's ask() has now given up; the socket stays open.
             await asyncio.sleep(1.2)
 
-            await server._on_reply("merge it", reply_to_post_id=555)
+            await server._on_reply("merge it", reply_to_post_id="555")
 
             # Nothing may be written into the dead request.
             with pytest.raises(asyncio.TimeoutError):
@@ -930,7 +930,7 @@ class TestReplyRoutingIsStrict:
         server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server.handler.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(side_effect=["111", "222"])  # type: ignore[attr-defined]
         server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
@@ -990,7 +990,7 @@ class TestReplyRoutingIsStrict:
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server.handler.send = AsyncMock(return_value=321)  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock(return_value="321")  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -1002,9 +1002,9 @@ class TestReplyRoutingIsStrict:
             await writer.drain()
             await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
 
-            assert server._asked_sessions[321] == "secops-owner-r2-abc2"
+            assert server._asked_sessions["321"] == "secops-owner-r2-abc2"
 
-            await server._on_reply("approve it", reply_to_post_id=321)
+            await server._on_reply("approve it", reply_to_post_id="321")
 
             rows = db.list_pending_resumes_to_execute()
             assert [r["session_id"] for r in rows] == ["secops-owner-r2-abc2"]
@@ -1119,11 +1119,11 @@ class TestStaleReplyToDoesNotMisroute:
             question="merge the torch bump?",
         )
         server = BridgeServer(
-            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
         if extra:
             db.add_pending_resume(
                 session_id="secops-owner-c-ccc",
@@ -1132,7 +1132,7 @@ class TestStaleReplyToDoesNotMisroute:
                 question="merge the mypy bump?",
             )
         # The operator is replying to the message we posted for session A.
-        server._asked_sessions[999] = "secops-owner-a-aaa"
+        server._asked_sessions["999"] = "secops-owner-a-aaa"
         return server, db, task
 
     @pytest.mark.asyncio
@@ -1145,7 +1145,7 @@ class TestStaleReplyToDoesNotMisroute:
         # answer arriving twice from two chat clients.
         assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
 
-        await server._on_telegram_reply("approved", reply_to_message_id=999)
+        await server._on_reply("approved", reply_to_post_id="999")
 
         b = db.get_pending_resume("secops-owner-b-bbb")
         assert b["answer"] is None, "B was given an answer meant for A"
@@ -1156,7 +1156,7 @@ class TestStaleReplyToDoesNotMisroute:
         queued = db.list_pending_resumes_to_execute()
         assert [r["session_id"] for r in queued] == ["secops-owner-a-aaa"]
 
-        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "already been answered" in sent
         assert "secops-owner-a-aaa" in sent
 
@@ -1178,14 +1178,14 @@ class TestStaleReplyToDoesNotMisroute:
 
         assert db.expire_pending_resume("secops-owner-a-aaa", "ttl") is True
 
-        await server._on_telegram_reply("approved", reply_to_message_id=999)
+        await server._on_reply("approved", reply_to_post_id="999")
 
         b = db.get_pending_resume("secops-owner-b-bbb")
         assert b["answer"] is None, "B was given an answer meant for expired A"
         assert b["answered_at"] is None
         assert db.list_pending_resumes_to_execute() == []
 
-        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "expired" in sent
 
         db.close()
@@ -1216,8 +1216,8 @@ class TestStaleReplyToDoesNotMisroute:
 
         assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
 
-        await server._on_telegram_reply(
-            "secops-owner-b-bbb yes merge it", reply_to_message_id=999,
+        await server._on_reply(
+            "secops-owner-b-bbb yes merge it", reply_to_post_id="999",
         )
 
         b = db.get_pending_resume("secops-owner-b-bbb")
@@ -1229,7 +1229,7 @@ class TestStaleReplyToDoesNotMisroute:
         assert c["answer"] is None
         assert c["answered_at"] is None
 
-        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "Answer queued" in sent
 
         db.close()
@@ -1267,16 +1267,16 @@ class TestStaleReplyToDoesNotMisroute:
             question="merge the mypy bump?",
         )
         server = BridgeServer(
-            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         # Names a session that is not in the table at all, but whose id
         # has the live `...-bbb` as a prefix.
-        await server._on_telegram_reply(
-            "secops-owner-b-bbb2 approved", reply_to_message_id=None,
+        await server._on_reply(
+            "secops-owner-b-bbb2 approved", reply_to_post_id=None,
         )
 
         b = db.get_pending_resume("secops-owner-b-bbb")
@@ -1294,7 +1294,7 @@ class TestStaleReplyToDoesNotMisroute:
     ) -> None:
         """The same prefix guard, on the branch this change actually added.
 
-        The sibling test above sends `reply_to_message_id=None`, which
+        The sibling test above sends `reply_to_post_id=None`, which
         reaches the pre-existing `matched_by_id` call site. It therefore
         says nothing about the `named` call site inside the stale-hint
         branch — a regression to substring matching there would pass every
@@ -1308,8 +1308,8 @@ class TestStaleReplyToDoesNotMisroute:
 
         assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
 
-        await server._on_telegram_reply(
-            "secops-owner-b-bbb2 approved", reply_to_message_id=999,
+        await server._on_reply(
+            "secops-owner-b-bbb2 approved", reply_to_post_id="999",
         )
 
         b = db.get_pending_resume("secops-owner-b-bbb")
@@ -1555,9 +1555,9 @@ class TestStaleReplyToDoesNotMisroute:
 
         db.get_pending_resume = boom  # type: ignore[method-assign]
 
-        await server._on_telegram_reply("approved", reply_to_message_id=999)
+        await server._on_reply("approved", reply_to_post_id="999")
 
-        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "could not be checked" in sent
         assert "no question waiting" not in sent
         # Routed nothing, which is the part that matters. A's own row is
@@ -1596,9 +1596,9 @@ class TestStaleReplyToDoesNotMisroute:
             r for r in real_list() if r["session_id"] != "secops-owner-a-aaa"
         ]
 
-        await server._on_telegram_reply("approved", reply_to_message_id=999)
+        await server._on_reply("approved", reply_to_post_id="999")
 
-        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "NEWER question" in sent
         assert "no question waiting" not in sent
 
@@ -1609,3 +1609,66 @@ class TestStaleReplyToDoesNotMisroute:
         db.close()
         await server.stop()
         task.cancel()
+class TestErrorCodeSurvivesADeploySkew:
+    """`SocketTransport` compares the ERROR frame's `error` exactly, and a
+    miss does not raise — it silently downgrades "delivery unknown" to
+    "definitely failed", which is the one thing the field exists to carry.
+
+    These exist because this method was called before it was written: the
+    expression was replaced with `self._error_code(...)`, the method was
+    never added, and 980 tests passed over an AttributeError on the ASK
+    failure path. Nothing covered the line.
+    """
+
+    @pytest.fixture
+    def socket_path(self):
+        d = tempfile.mkdtemp()
+        yield Path(d) / "b.sock"
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _server(self, socket_path, name: str):
+        from ctrlrelay.bridge.server import BridgeServer
+
+        return BridgeServer(
+            socket_path=socket_path,
+            handler=FakeChatHandler(name=name),
+        )
+
+    def test_telegram_keeps_the_legacy_spelling(self, socket_path) -> None:
+        """A pre-0.12 poller only understands this one, and such a poller
+        can only be configured for Telegram."""
+        assert self._server(socket_path, "telegram")._error_code(True) == (
+            "telegram_delivery_unknown"
+        )
+
+    def test_other_transports_use_the_neutral_spelling(self, socket_path) -> None:
+        assert self._server(socket_path, "mattermost")._error_code(True) == (
+            "delivery_unknown"
+        )
+
+    def test_a_definite_failure_is_transport_independent(self, socket_path) -> None:
+        for name in ("telegram", "mattermost"):
+            assert self._server(socket_path, name)._error_code(False) == (
+                "chat_api_error"
+            )
+
+    def test_the_transport_accepts_every_code_the_bridge_can_emit(
+        self, socket_path
+    ) -> None:
+        """The two halves must agree, and nothing else checks that they do.
+
+        Reads the literal set out of SocketTransport rather than restating
+        it, so adding a spelling on one side without the other fails here.
+        """
+        import inspect
+
+        from ctrlrelay.transports import socket_client
+
+        source = inspect.getsource(socket_client.SocketTransport)
+        for name in ("telegram", "mattermost"):
+            emitted = self._server(socket_path, name)._error_code(True)
+            assert f'"{emitted}"' in source, (
+                f"bridge emits {emitted!r} for {name}, which SocketTransport "
+                "does not match — delivery-unknown would silently become "
+                "definitely-failed"
+            )

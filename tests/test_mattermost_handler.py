@@ -132,12 +132,35 @@ class TestAmbiguousDelivery:
         assert not h.is_ambiguous_delivery(httpx.ConnectError("refused"))
         assert not h.is_ambiguous_delivery(httpx.ConnectTimeout("no route"))
 
-    def test_an_http_error_is_a_definite_failure(self, h) -> None:
+    def _status(self, code: int) -> httpx.HTTPStatusError:
         request = httpx.Request("POST", "https://chat.example.com/api/v4/posts")
-        exc = httpx.HTTPStatusError(
-            "500", request=request, response=httpx.Response(500, request=request)
+        return httpx.HTTPStatusError(
+            str(code), request=request,
+            response=httpx.Response(code, request=request),
         )
-        assert not h.is_ambiguous_delivery(exc)
+
+    def test_a_4xx_is_a_definite_failure(self, h) -> None:
+        """The server understood the request and refused it."""
+        assert not h.is_ambiguous_delivery(self._status(403))
+        assert not h.is_ambiguous_delivery(self._status(404))
+
+    def test_a_5xx_is_unknown_not_a_failure(self, h) -> None:
+        """The case that reads wrong and is not.
+
+        A reverse proxy can forward the post, let Mattermost commit it,
+        then lose the upstream response and return 502 or 504. The post
+        exists; only our view of it failed. Calling that definite is how a
+        question already on the operator's screen is reported as never
+        sent.
+        """
+        assert h.is_ambiguous_delivery(self._status(500))
+        assert h.is_ambiguous_delivery(self._status(502))
+        assert h.is_ambiguous_delivery(self._status(504))
+
+    def test_a_pool_timeout_is_a_definite_failure(self, h) -> None:
+        """The surprising TransportError: it fires while waiting for a free
+        connection, so nothing was ever sent."""
+        assert not h.is_ambiguous_delivery(httpx.PoolTimeout("no slot"))
 
     def test_an_unrelated_exception_is_not_ambiguous(self, h) -> None:
         assert not h.is_ambiguous_delivery(ValueError("nothing to do with it"))
@@ -291,21 +314,143 @@ class TestWebSocketSetup:
         )
         assert h._ws_url == "ws://localhost:8065/api/v4/websocket"
 
+
+
+async def _as_coro(value, note=None):
+    if note is not None:
+        note.append(value)
+    return value
+
+
+class TestStartPollingWaitsForTheSocket:
+    """The window this closes loses replies permanently.
+
+    Mattermost has no update cursor. Telegram's `getUpdates` carries an
+    offset, so a reply that arrives before we poll is still there when we
+    do; a Mattermost `posted` event delivered while nothing is subscribed
+    is gone. The bridge posts a question the moment a pipeline asks, so
+    `start_polling` returning before the socket is authenticated opens a
+    window where the operator's answer vanishes and looks, from every
+    side, like they never replied.
+
+    The review that found this was reading the code, not running it — all
+    of this class exists because nothing was covering `_listen_loop`.
+    """
+
     @pytest.mark.asyncio
-    async def test_start_polling_is_idempotent(self) -> None:
-        h = _handler(_ok)
+    async def test_it_returns_once_the_server_acknowledges(self) -> None:
+        h = _handler(_ok, connect_timeout=2.0)
+        ws = _FakeSocket([{"status": "OK", "seq_reply": 1}])
+        h._connect = lambda: _as_coro(ws)  # type: ignore[method-assign]
 
         async def noop(text: str, reply_to: str | None) -> None:
             return None
 
-        # Never actually connects: the loop's first act is a connect that
-        # fails against a host that does not resolve, and it backs off
-        # rather than raising. What is asserted is that a second call does
-        # not start a second task.
         await h.start_polling(noop)
-        first = h._poll_task
-        await h.start_polling(noop)
-        assert h._poll_task is first
+        assert h._poll_task is not None
+        # The challenge really was sent, and it names seq 1 so the reply
+        # can be recognised.
+        assert ws.sent[0]["action"] == "authentication_challenge"
+        assert ws.sent[0]["seq"] == 1
         await h.stop_polling()
+        await h.close()
+
+    @pytest.mark.asyncio
+    async def test_it_raises_rather_than_returning_unauthenticated(self) -> None:
+        """A socket that upgrades and then never answers the challenge.
+
+        Returning here would be the original bug: the bridge binds, posts a
+        question, and the reply lands on nothing.
+        """
+        h = _handler(_ok, connect_timeout=0.3)
+        ws = _FakeSocket([])  # upgrades, then silence
+        h._connect = lambda: _as_coro(ws)  # type: ignore[method-assign]
+
+        async def noop(text: str, reply_to: str | None) -> None:
+            return None
+
+        with pytest.raises(TimeoutError):
+            await h.start_polling(noop)
         assert h._poll_task is None
         await h.close()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_token_surfaces_as_an_auth_error(self) -> None:
+        from ctrlrelay.bridge.mattermost_handler import MattermostAuthError
+
+        h = _handler(_ok)
+        ws = _FakeSocket([{
+            "status": "FAIL", "seq_reply": 1,
+            "error": {"message": "token expired"},
+        }])
+
+        async def collect(text: str, reply_to: str | None) -> None:
+            return None
+
+        with pytest.raises(MattermostAuthError, match="token expired"):
+            await h._consume(ws, collect, asyncio.Event())
+        await h.close()
+
+    @pytest.mark.asyncio
+    async def test_a_posted_event_interleaved_with_the_ack_is_not_lost(
+        self,
+    ) -> None:
+        """The auth reply is handled inline rather than read first.
+
+        A separate "read the ack" step would discard whatever arrived
+        alongside it — and what arrives alongside it is an answer.
+        """
+        h = _handler(_ok)
+        got: list[tuple] = []
+
+        async def collect(text: str, reply_to: str | None) -> None:
+            got.append((text, reply_to))
+
+        ws = _FakeSocket([
+            _posted(message="early answer"),
+            {"status": "OK", "seq_reply": 1},
+            _posted(message="later answer"),
+        ])
+        ready = asyncio.Event()
+        task = asyncio.create_task(h._consume(ws, collect, ready))
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if not ws._frames:
+                break
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert [t for t, _ in got] == ["early answer", "later answer"]
+        assert ready.is_set()
+        await h.close()
+
+    @pytest.mark.asyncio
+    async def test_the_bot_id_is_resolved_before_the_socket_opens(self) -> None:
+        """A /users/me failure inside the read loop would discard events
+        already queued on that socket, so it happens first and a failure
+        there stops start_polling instead."""
+        calls: list[str] = []
+
+        def responder(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            if request.url.path.endswith("/users/me"):
+                return httpx.Response(401, json={"message": "bad token"})
+            return _ok(request)
+
+        h = _handler(responder, connect_timeout=0.3)
+        connected = []
+        h._connect = lambda: _as_coro(_FakeSocket([]), note=connected)  # type: ignore[method-assign]
+
+        async def noop(text: str, reply_to: str | None) -> None:
+            return None
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await h.start_polling(noop)
+        assert any(p.endswith("/users/me") for p in calls)
+        assert connected == [], "socket was opened before the bot id resolved"
+        await h.close()
+
+
