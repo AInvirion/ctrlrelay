@@ -221,7 +221,7 @@ def skills_list(
 
 
 # Bridge subcommand group
-bridge_app = typer.Typer(help="Telegram bridge commands.")
+bridge_app = typer.Typer(help="Chat bridge commands (Telegram or Mattermost).")
 app.add_typer(bridge_app, name="bridge")
 
 
@@ -229,11 +229,37 @@ def _get_socket_path(config_path: str | None) -> Path:
     """Get socket path from config."""
     try:
         config = load_config(resolve_config_path(config_path))
-        if config.transport.telegram:
-            return config.transport.telegram.socket_path.expanduser().resolve()
+        configured = config.transport.socket_path
+        if configured:
+            return configured.expanduser().resolve()
     except ConfigError:
         pass
     return Path("~/.ctrlrelay/ctrlrelay.sock").expanduser().resolve()
+
+
+def _bridge_socket_settings(config) -> tuple[Path, int] | None:
+    """(socket path, ask timeout) for whichever chat transport is set.
+
+    ``None`` means no chat transport is configured at all, which is a
+    legitimate "there is no channel" answer. It does NOT mean the socket is
+    missing — callers must keep treating those two differently.
+
+    This exists because three call sites each gated on
+    ``type.value == "telegram"``. With Mattermost configured, every one of
+    them would have quietly built no transport and the operator would have
+    stopped receiving questions with nothing in the log saying why: a
+    default that opts the caller out without telling it.
+    """
+    chat = {
+        "telegram": config.transport.telegram,
+        "mattermost": config.transport.mattermost,
+    }.get(config.transport.type.value)
+    if chat is None:
+        return None
+    return (
+        chat.socket_path.expanduser().resolve(),
+        chat.ask_timeout_seconds,
+    )
 
 
 def _get_bridge_pid_file(socket_path: Path) -> Path:
@@ -256,7 +282,7 @@ def bridge_start(
         help="Run in the foreground (for launchd/systemd/debugging). Default is to daemonize.",
     ),
 ) -> None:
-    """Start the Telegram bridge.
+    """Start the chat bridge.
 
     Daemonizes by default so the terminal returns to you. Pass --foreground
     under a process supervisor (launchd Type=simple, systemd Type=simple) or
@@ -272,17 +298,26 @@ def bridge_start(
         console.print(f"[red]Error loading config:[/red] {e}")
         raise typer.Exit(1)
 
-    if config.transport.type.value != "telegram":
-        console.print("[yellow]Transport is not set to 'telegram' in config.[/yellow]")
-        console.print("Set transport.type: telegram to use the bridge.")
+    chat_types = ("telegram", "mattermost")
+    if config.transport.type.value not in chat_types:
+        console.print(
+            f"[yellow]Transport is '{config.transport.type.value}', which "
+            "does not use a bridge.[/yellow]"
+        )
+        console.print(
+            "Set transport.type to 'telegram' or 'mattermost' to use the "
+            "bridge."
+        )
         raise typer.Exit(1)
 
-    telegram_config = config.transport.telegram
-    if not telegram_config:
-        console.print("[red]Telegram config not found.[/red]")
+    chat_config = getattr(config.transport, config.transport.type.value)
+    if not chat_config:
+        console.print(
+            f"[red]{config.transport.type.value} config not found.[/red]"
+        )
         raise typer.Exit(1)
 
-    socket_path = telegram_config.socket_path.expanduser().resolve()
+    socket_path = chat_config.socket_path.expanduser().resolve()
     pid_file = _get_bridge_pid_file(socket_path)
 
     if pid_file.exists():
@@ -294,10 +329,15 @@ def bridge_start(
         except (ProcessLookupError, ValueError):
             pid_file.unlink(missing_ok=True)
 
-    bot_token = os.environ.get(telegram_config.bot_token_env)
-    if not bot_token:
-        env_var = telegram_config.bot_token_env
-        console.print(f"[red]Bot token not found.[/red] Set {env_var} environment variable.")
+    # Build the handler here rather than inside the server: a bad token or
+    # a missing channel should fail `bridge start` in the operator's
+    # terminal, not four hours later when a session first blocks.
+    from ctrlrelay.bridge import HandlerConfigError, make_handler
+
+    try:
+        handler = make_handler(config.transport)
+    except HandlerConfigError as e:
+        console.print(f"[red]Cannot start bridge:[/red] {e}")
         raise typer.Exit(1)
 
     pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -322,7 +362,7 @@ def bridge_start(
         console.print(f"Starting bridge on {socket_path}")
         console.print("Press Ctrl+C to stop")
 
-        # Open the state DB so the bridge can route orphan Telegram replies
+        # Open the state DB so the bridge can route orphan chat replies
         # to persisted BLOCKED sessions in pending_resumes. Both daemons
         # share ~/.ctrlrelay/state.db — SQLite's WAL mode handles concurrent
         # readers/writers for the low contention we see here.
@@ -331,8 +371,7 @@ def bridge_start(
 
         server = BridgeServer(
             socket_path=socket_path,
-            bot_token=bot_token,
-            chat_id=telegram_config.chat_id,
+            handler=handler,
             state_db=state_db,
         )
 
@@ -342,7 +381,7 @@ def bridge_start(
 
             async def _run_server() -> None:
                 # Wrap start() in a finally that awaits stop() so the loop
-                # can't close before _telegram.close() and the socket unlink
+                # can't close before handler.close() and the socket unlink
                 # have actually completed. Scheduling stop() as a bare task
                 # in the signal handler would not guarantee that ordering.
                 try:
@@ -378,10 +417,8 @@ def bridge_start(
             "ctrlrelay.bridge",
             "--socket-path",
             str(socket_path),
-            "--bot-token-env",
-            telegram_config.bot_token_env,
-            "--chat-id",
-            str(telegram_config.chat_id),
+            "--config",
+            str(resolve_config_path(config_path)),
             "--state-db",
             str(config.paths.state_db),
         ]
@@ -423,7 +460,7 @@ def bridge_stop(
         help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
-    """Stop the Telegram bridge."""
+    """Stop the chat bridge."""
     import os
     import signal
 
@@ -602,24 +639,20 @@ def run_secops(
     console.print(f"Running secops on {len(repos)} repo(s)...")
 
     async def _run():
-        # Build a transport so secops blocked questions reach Telegram.
-        # Without this, agents that end BLOCKED_NEEDS_INPUT silently land
-        # in the DB+pending_resumes and the operator never sees the
+        # Build a transport so secops blocked questions reach the chat
+        # app. Without this, agents that end BLOCKED_NEEDS_INPUT silently
+        # land in the DB+pending_resumes and the operator never sees the
         # question (mirror of the wiring in the scheduled path).
         transport = None
-        if (
-            config.transport.type.value == "telegram"
-            and config.transport.telegram
-        ):
+        settings = _bridge_socket_settings(config)
+        if settings is not None:
             from ctrlrelay.transports import SocketTransport
-            sock = config.transport.telegram.socket_path.expanduser().resolve()
+            sock, ask_timeout = settings
             if sock.exists():
                 try:
                     candidate = SocketTransport(
                         sock,
-                        ask_timeout_seconds=(
-                            config.transport.telegram.ask_timeout_seconds
-                        ),
+                        ask_timeout_seconds=ask_timeout,
                     )
                     await candidate.connect()
                     transport = candidate
@@ -1127,19 +1160,23 @@ def poller_start(
 
         # Set up transport for notifications
         transport = None
-        if config.transport.type.value == "telegram" and config.transport.telegram:
+        settings = _bridge_socket_settings(config)
+        if settings is not None:
             from ctrlrelay.transports import SocketTransport
-            socket_path = config.transport.telegram.socket_path.expanduser().resolve()
+            socket_path, ask_timeout = settings
+            name = config.transport.type.value
             if socket_path.exists():
                 transport = SocketTransport(
                     socket_path,
-                    ask_timeout_seconds=(
-                        config.transport.telegram.ask_timeout_seconds
-                    ),
+                    ask_timeout_seconds=ask_timeout,
                 )
-                console.print(f"[dim]Telegram transport enabled via {socket_path}[/dim]")
+                console.print(
+                    f"[dim]{name} transport enabled via {socket_path}[/dim]"
+                )
             else:
-                console.print(f"[yellow]Telegram socket not found at {socket_path}[/yellow]")
+                console.print(
+                    f"[yellow]{name} socket not found at {socket_path}[/yellow]"
+                )
                 console.print(
                     "[yellow]Run 'ctrlrelay bridge start' to enable notifications[/yellow]"
                 )
@@ -1227,7 +1264,7 @@ def poller_start(
             independent of the transport used in handle_issue (which is
             closed on exit).
 
-            Return None ONLY when Telegram notifications aren't
+            Return None ONLY when chat notifications aren't
             configured at all — that's a legitimate "no channel" signal
             and the retry loop treats it as clean success. A configured-
             but-currently-missing socket is a transient outage (bridge
@@ -1235,20 +1272,19 @@ def poller_start(
             retry path; the next attempt will reach the socket once the
             bridge is back.
             """
-            if config.transport.type.value != "telegram" or not config.transport.telegram:
+            settings = _bridge_socket_settings(config)
+            if settings is None:
                 return None
             from ctrlrelay.transports import SocketTransport
-            socket_path = config.transport.telegram.socket_path.expanduser().resolve()
+            socket_path, ask_timeout = settings
             if not socket_path.exists():
                 raise FileNotFoundError(
-                    f"Telegram bridge socket missing at {socket_path}; "
+                    f"bridge socket missing at {socket_path}; "
                     "retryable — bridge may be restarting"
                 )
             watch_transport = SocketTransport(
                 socket_path,
-                ask_timeout_seconds=(
-                    config.transport.telegram.ask_timeout_seconds
-                ),
+                ask_timeout_seconds=ask_timeout,
             )
             await watch_transport.connect()
             return watch_transport

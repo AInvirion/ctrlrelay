@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import FakeChatHandler
+
 
 class TestBridgeServer:
     @pytest.fixture
@@ -24,7 +26,7 @@ class TestBridgeServer:
         """Server should create socket file."""
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
@@ -38,7 +40,7 @@ class TestBridgeServer:
         """Socket should have 0600 permissions."""
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
@@ -59,7 +61,7 @@ class TestBridgeServer:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
@@ -82,7 +84,7 @@ class TestBridgeServer:
         """Server should remove socket file on stop."""
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
         assert socket_path.exists()
@@ -106,12 +108,12 @@ class TestBridgeServer:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
         # Swap in a mock Telegram handler so ASK doesn't hit the real API.
-        server._telegram.ask = AsyncMock(return_value=999)  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value=999)  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -131,7 +133,7 @@ class TestBridgeServer:
             assert ack.request_id == "r-xyz"
 
             # Simulate the operator replying via Telegram.
-            await server._on_telegram_reply("pin", reply_to_message_id=None)
+            await server._on_reply("pin", reply_to_post_id=None)
 
             # Bridge pushes ANSWER back over the same socket.
             answer_raw = await asyncio.wait_for(reader.readline(), timeout=1)
@@ -162,13 +164,13 @@ class TestBridgeServer:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
         # Two ASKs -> two different Telegram msg_ids.
         ask_mock = AsyncMock(side_effect=[111, 222])
-        server._telegram.ask = ask_mock  # type: ignore[attr-defined]
+        server.handler.ask = ask_mock  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -180,7 +182,7 @@ class TestBridgeServer:
                 await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
 
             # Reply specifically to the SECOND question (msg_id=222).
-            await server._on_telegram_reply("answering second", reply_to_message_id=222)
+            await server._on_reply("answering second", reply_to_post_id=222)
 
             raw = await asyncio.wait_for(reader.readline(), timeout=1)
             answer = parse_message(raw.decode())
@@ -208,10 +210,10 @@ class TestBridgeServer:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.ask = AsyncMock(return_value=42)  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value=42)  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         writer.write(serialize_message(BridgeMessage(
@@ -228,11 +230,11 @@ class TestBridgeServer:
         # no stale question left behind) AND the operator must be told the
         # reply didn't land — otherwise the message disappears silently and
         # the user waits forever for a BLOCKED session to resume.
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
-        await server._on_telegram_reply("hello", reply_to_message_id=None)
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
+        await server._on_reply("hello", reply_to_post_id=None)
         assert server._pending_questions == {}
-        server._telegram.send.assert_awaited_once()  # type: ignore[attr-defined]
-        sent_text = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        server.handler.send.assert_awaited_once()  # type: ignore[attr-defined]
+        sent_text = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "wasn't routed" in sent_text
         assert "ctrlrelay run secops" in sent_text
 
@@ -259,15 +261,16 @@ class TestBridgeServer:
         )
 
         server = BridgeServer(
-            socket_path=socket_path, bot_token="test", chat_id=123,
+            socket_path=socket_path,
+            handler=FakeChatHandler(),
             state_db=db,
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
-        await server._on_telegram_reply(
-            "merge #286, close the others", reply_to_message_id=None
+        await server._on_reply(
+            "merge #286, close the others", reply_to_post_id=None
         )
 
         # Answer was persisted against the BLOCKED session...
@@ -277,8 +280,8 @@ class TestBridgeServer:
         assert rows[0]["answer"] == "merge #286, close the others"
 
         # ...and the operator got told, not silently dropped.
-        server._telegram.send.assert_awaited_once()  # type: ignore[attr-defined]
-        sent_text = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        server.handler.send.assert_awaited_once()  # type: ignore[attr-defined]
+        sent_text = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "Answer queued" in sent_text
         assert "secops-owner-r-abc" in sent_text
         assert "owner/r" in sent_text
@@ -312,15 +315,16 @@ class TestBridgeServer:
         )
 
         server = BridgeServer(
-            socket_path=socket_path, bot_token="test", chat_id=123,
+            socket_path=socket_path,
+            handler=FakeChatHandler(),
             state_db=db,
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
-        await server._on_telegram_reply(
-            "merge it", reply_to_message_id=None
+        await server._on_reply(
+            "merge it", reply_to_post_id=None
         )
 
         # Neither row was answered — reply is held back until the
@@ -331,7 +335,7 @@ class TestBridgeServer:
         assert all(r["answer"] is None for r in unanswered)
 
         # And the operator is told which session_ids are pending.
-        sent_text = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        sent_text = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "multiple BLOCKED sessions" in sent_text.lower() or \
                "multiple" in sent_text
         assert "secops-owner-repoA-111" in sent_text
@@ -367,17 +371,18 @@ class TestBridgeServer:
         )
 
         server = BridgeServer(
-            socket_path=socket_path, bot_token="test", chat_id=123,
+            socket_path=socket_path,
+            handler=FakeChatHandler(),
             state_db=db,
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         # Reply names session B explicitly.
-        await server._on_telegram_reply(
+        await server._on_reply(
             "For secops-owner-repoB-222: close the PR",
-            reply_to_message_id=None,
+            reply_to_post_id=None,
         )
 
         # Only B was answered; A stays pending.
@@ -414,7 +419,7 @@ class TestBridgeServer:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
@@ -423,7 +428,7 @@ class TestBridgeServer:
         async def slow_ask(*args, **kwargs):
             await asyncio.sleep(0.1)
             return 42
-        server._telegram.ask = AsyncMock(side_effect=slow_ask)  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(side_effect=slow_ask)  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         writer.write(serialize_message(BridgeMessage(
@@ -521,11 +526,11 @@ class TestReplyRoutingIsStrict:
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -536,15 +541,15 @@ class TestReplyRoutingIsStrict:
                 await writer.drain()
                 await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
 
-            await server._on_telegram_reply("yes", reply_to_message_id=None)
+            await server._on_reply("yes", reply_to_post_id=None)
 
             # No ANSWER may be delivered to either question.
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(reader.readline(), timeout=0.3)
             assert set(server._pending_questions) == {"r-1", "r-2"}
 
-            server._telegram.send.assert_awaited_once()  # type: ignore[attr-defined]
-            notice = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+            server.handler.send.assert_awaited_once()  # type: ignore[attr-defined]
+            notice = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
             assert "wasn't routed" in notice
             assert "reply" in notice.lower()
         finally:
@@ -575,12 +580,12 @@ class TestReplyRoutingIsStrict:
         )
 
         server = BridgeServer(
-            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.ask = AsyncMock(return_value=999)  # type: ignore[attr-defined]
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value=999)  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         # The expired question is only remembered in the msg_id -> session map.
         async with server._pending_lock:
@@ -595,7 +600,7 @@ class TestReplyRoutingIsStrict:
             await writer.drain()
             await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
 
-            await server._on_telegram_reply("hold it", reply_to_message_id=111)
+            await server._on_reply("hold it", reply_to_post_id=111)
 
             # The live question must NOT have been answered.
             with pytest.raises(asyncio.TimeoutError):
@@ -635,22 +640,22 @@ class TestReplyRoutingIsStrict:
             )
 
         server = BridgeServer(
-            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         async with server._pending_lock:
             server._remember_asked_session(500, "secops-owner-r1-abc1")
 
-        await server._on_telegram_reply("approve it", reply_to_message_id=500)
+        await server._on_reply("approve it", reply_to_post_id=500)
 
         rows = db.list_pending_resumes_to_execute()
         assert [r["session_id"] for r in rows] == ["secops-owner-r1-abc1"]
         assert rows[0]["answer"] == "approve it"
 
-        notice = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        notice = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "Answer queued" in notice
 
         db.close()
@@ -663,7 +668,7 @@ class TestReplyRoutingIsStrict:
         without limit in a bridge that runs for weeks."""
         from ctrlrelay.bridge.server import _ASKED_SESSIONS_MAX, BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
 
         async with server._pending_lock:
             for i in range(_ASKED_SESSIONS_MAX + 25):
@@ -683,10 +688,10 @@ class TestReplyRoutingIsStrict:
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.ask = AsyncMock(return_value=777)  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value=777)  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -697,7 +702,7 @@ class TestReplyRoutingIsStrict:
             await writer.drain()
             await asyncio.wait_for(reader.readline(), timeout=1)
 
-            posted = server._telegram.ask.await_args.args[0]  # type: ignore[attr-defined]
+            posted = server.handler.ask.await_args.args[0]  # type: ignore[attr-defined]
             assert "[owner/r]" in posted
             assert "secops-owner-r-abc" in posted
             assert "approve #387?" in posted
@@ -723,11 +728,11 @@ class TestReplyRoutingIsStrict:
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.ask = AsyncMock(return_value=900)  # type: ignore[attr-defined]
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value=900)  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -739,9 +744,9 @@ class TestReplyRoutingIsStrict:
             await asyncio.wait_for(reader.readline(), timeout=1)  # ACK
 
             # No state_db, so the orphan router returns "none".
-            await server._on_telegram_reply("yes", reply_to_message_id=4242)
+            await server._on_reply("yes", reply_to_post_id=4242)
 
-            notice = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+            notice = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
             assert "no active session is waiting" not in notice
             assert "Still waiting" in notice
             # Named the way the operator sees it, not by internal ids.
@@ -770,10 +775,10 @@ class TestReplyRoutingIsStrict:
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
 
         lock_was_free = asyncio.Event()
 
@@ -782,7 +787,7 @@ class TestReplyRoutingIsStrict:
             async with server._pending_lock:
                 lock_was_free.set()
 
-        server._telegram.send = AsyncMock(side_effect=stalled_send)  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock(side_effect=stalled_send)  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -795,7 +800,7 @@ class TestReplyRoutingIsStrict:
 
             # Two live questions + plain message -> ambiguous notice path.
             await asyncio.wait_for(
-                server._on_telegram_reply("yes", reply_to_message_id=None),
+                server._on_reply("yes", reply_to_post_id=None),
                 timeout=2,
             )
             assert lock_was_free.is_set()
@@ -825,15 +830,15 @@ class TestReplyRoutingIsStrict:
         )
 
         server = BridgeServer(
-            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.send = AsyncMock(  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock(  # type: ignore[attr-defined]
             side_effect=RuntimeError("telegram down")
         )
 
-        await server._on_telegram_reply("merge it", reply_to_message_id=None)
+        await server._on_reply("merge it", reply_to_post_id=None)
 
         rows = db.list_pending_resumes_to_execute()
         assert rows[0]["answer"] == "merge it"
@@ -868,12 +873,12 @@ class TestReplyRoutingIsStrict:
         )
 
         server = BridgeServer(
-            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.ask = AsyncMock(return_value=555)  # type: ignore[attr-defined]
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(return_value=555)  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -888,7 +893,7 @@ class TestReplyRoutingIsStrict:
             # The pipeline's ask() has now given up; the socket stays open.
             await asyncio.sleep(1.2)
 
-            await server._on_telegram_reply("merge it", reply_to_message_id=555)
+            await server._on_reply("merge it", reply_to_post_id=555)
 
             # Nothing may be written into the dead request.
             with pytest.raises(asyncio.TimeoutError):
@@ -922,11 +927,11 @@ class TestReplyRoutingIsStrict:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, bot_token="test", chat_id=123)
+        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
-        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        server.handler.ask = AsyncMock(side_effect=[111, 222])  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -945,7 +950,7 @@ class TestReplyRoutingIsStrict:
             await asyncio.wait_for(reader.readline(), timeout=1)
 
             # Plain message: only one question is really live, so it routes.
-            await server._on_telegram_reply("yes", reply_to_message_id=None)
+            await server._on_reply("yes", reply_to_post_id=None)
 
             raw = await asyncio.wait_for(reader.readline(), timeout=1)
             answer = parse_message(raw.decode())
@@ -981,11 +986,11 @@ class TestReplyRoutingIsStrict:
             )
 
         server = BridgeServer(
-            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
-        server._telegram.send = AsyncMock(return_value=321)  # type: ignore[attr-defined]
+        server.handler.send = AsyncMock(return_value=321)  # type: ignore[attr-defined]
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -999,7 +1004,7 @@ class TestReplyRoutingIsStrict:
 
             assert server._asked_sessions[321] == "secops-owner-r2-abc2"
 
-            await server._on_telegram_reply("approve it", reply_to_message_id=321)
+            await server._on_reply("approve it", reply_to_post_id=321)
 
             rows = db.list_pending_resumes_to_execute()
             assert [r["session_id"] for r in rows] == ["secops-owner-r2-abc2"]
@@ -1039,7 +1044,7 @@ class TestQuestionDeadline:
 
         received_at, timeout = 1000.0, 900
         q = _PendingQuestion(
-            request_id="r", telegram_msg_id=1, writer=None,  # type: ignore[arg-type]
+            request_id="r", post_id="1", writer=None,  # type: ignore[arg-type]
             expires_at=_deadline(received_at, timeout),
         )
 
@@ -1055,7 +1060,7 @@ class TestQuestionDeadline:
             deadline = _deadline(1000.0, timeout)
             assert deadline == 1000.0
             q = _PendingQuestion(
-                request_id="r", telegram_msg_id=1, writer=None,  # type: ignore[arg-type]
+                request_id="r", post_id="1", writer=None,  # type: ignore[arg-type]
                 expires_at=deadline,
             )
             assert q.is_expired(1000.0)

@@ -23,6 +23,7 @@ class ConfigError(Exception):
 
 class TransportType(str, Enum):
     TELEGRAM = "telegram"
+    MATTERMOST = "mattermost"
     FILE_MOCK = "file_mock"
 
 
@@ -137,6 +138,57 @@ class TelegramConfig(BaseModel):
         return v
 
 
+class MattermostConfig(BaseModel):
+    """Mattermost transport configuration.
+
+    ``channel_id`` is the 26-character id, not the channel name: a name is
+    only unique within a team and can be renamed under us, while the id is
+    stable. Find it from the channel's View Info, or
+    ``GET /api/v4/teams/name/{team}/channels/name/{channel}``.
+
+    The bot must be a **member of that channel**. A bot without
+    ``post:all`` cannot post where it is not a member, and — the part that
+    is easy to miss — it does not receive the reply events for such a
+    channel either, so answers would silently never arrive.
+    """
+
+    url: str
+    bot_token_env: str = "CTRLRELAY_MATTERMOST_TOKEN"
+    channel_id: str = ""
+    socket_path: Path = Field(
+        default_factory=lambda: Path("~/.ctrlrelay/ctrlrelay.sock").expanduser()
+    )
+    # Same meaning and the same reasoning as TelegramConfig's: this bounds
+    # only the in-session wait, and a later reply still resolves through
+    # pending_resumes. See that class for why it is not sized for "the
+    # operator is asleep".
+    ask_timeout_seconds: int = Field(default=900, ge=60)
+    question_ttl_seconds: int = Field(default=172800, ge=3600)
+
+    @field_validator("socket_path", mode="before")
+    @classmethod
+    def expand_socket_path(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return Path(v).expanduser()
+        return v
+
+    @field_validator("url")
+    @classmethod
+    def require_scheme(cls, v: str) -> str:
+        """A bare host silently becomes a relative URL and every post 404s.
+
+        Rejected here rather than at the first post, because the bridge
+        starts fine and the failure arrives only when a session blocks —
+        hours later, on the path that exists to be reliable.
+        """
+        if not v.startswith(("http://", "https://")):
+            raise ValueError(
+                "mattermost url must start with http:// or https:// "
+                f"(got {v!r})"
+            )
+        return v.rstrip("/")
+
+
 class FileMockConfig(BaseModel):
     """File mock transport configuration for testing."""
 
@@ -152,19 +204,41 @@ class FileMockConfig(BaseModel):
 
 
 class TransportConfig(BaseModel):
-    """Transport configuration (Telegram or file mock)."""
+    """Transport configuration (Telegram, Mattermost or file mock)."""
 
     type: TransportType = TransportType.FILE_MOCK
     telegram: TelegramConfig | None = None
+    mattermost: MattermostConfig | None = None
     file_mock: FileMockConfig | None = None
 
     @model_validator(mode="after")
     def validate_transport_config(self) -> "TransportConfig":
-        if self.type == TransportType.TELEGRAM and self.telegram is None:
-            raise ValueError("telegram config required when type is 'telegram'")
-        if self.type == TransportType.FILE_MOCK and self.file_mock is None:
-            raise ValueError("file_mock config required when type is 'file_mock'")
+        # Keyed off the enum rather than written out per type, so adding a
+        # transport cannot leave a branch behind. A missing entry here is a
+        # KeyError at config load, which is loud; an `if` chain that forgot
+        # one silently accepts a config with no settings at all.
+        required = {
+            TransportType.TELEGRAM: "telegram",
+            TransportType.MATTERMOST: "mattermost",
+            TransportType.FILE_MOCK: "file_mock",
+        }
+        field = required[self.type]
+        if getattr(self, field) is None:
+            raise ValueError(
+                f"{field} config required when type is '{self.type.value}'"
+            )
         return self
+
+    @property
+    def socket_path(self) -> Path | None:
+        """The bridge socket, whichever chat transport is configured.
+
+        It lives inside each chat block for backwards compatibility — it is
+        really a property of the bridge, not of Telegram — so every caller
+        that wants it would otherwise re-do this branch. #176 promotes it.
+        """
+        block = getattr(self, self.type.value, None)
+        return getattr(block, "socket_path", None)
 
 
 class DashboardConfig(BaseModel):

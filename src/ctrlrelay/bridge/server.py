@@ -1,4 +1,4 @@
-"""Bridge server for Telegram communication."""
+"""Bridge server: Unix socket on one side, a chat app on the other."""
 
 from __future__ import annotations
 
@@ -20,20 +20,17 @@ from ctrlrelay.bridge.protocol import (
     parse_message,
     serialize_message,
 )
-from ctrlrelay.bridge.telegram_handler import (
-    TelegramHandler,
-    is_ambiguous_delivery,
-)
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 
 if TYPE_CHECKING:
+    from ctrlrelay.bridge.handler import ChatHandler
     from ctrlrelay.core.state import StateDB
 
 _logger = get_logger("bridge.server")
 _log = logging.getLogger(__name__)
 
 
-# Upper bound on the telegram_msg_id -> session_id map. A reply landing
+# Upper bound on the post_id -> session_id map. A reply landing
 # further back than this many questions is vanishingly rare, and the map is
 # a routing convenience, not a source of truth — losing an entry degrades to
 # the session_id-substring path, never to a wrong resume.
@@ -182,8 +179,9 @@ def format_question(
     disambiguate between several BLOCKED sessions if the operator can quote
     one, and until now it was never sent to them.
 
-    Plain text on purpose — TelegramHandler sends without ``parse_mode``, so
-    any Markdown here would reach the operator as literal backticks.
+    Plain text on purpose — no handler sets a markup mode, so any Markdown
+    here would reach a Telegram operator as literal backticks. Mattermost
+    renders it, which is a difference the question text must not depend on.
     """
     header: list[str] = []
     if repo:
@@ -206,7 +204,7 @@ def _deadline(received_at: float, timeout: int | None) -> float | None:
     processes allow. The client starts counting when it writes the ASK to
     the socket and ``received_at`` is taken as we read it, so the two clocks
     differ only by unix-socket transit — microseconds. Anchoring here rather
-    than after the Telegram post is what matters: that post takes on the
+    than after the chat post is what matters: that post takes on the
     order of a second, and a deadline set on its far side would leave the
     bridge treating a question as live for that whole second after the
     client had abandoned it.
@@ -229,24 +227,24 @@ def _deadline(received_at: float, timeout: int | None) -> float | None:
 
 
 class _PendingQuestion:
-    """Question posted to Telegram, awaiting the operator's reply."""
+    """Question posted to the chat app, awaiting the operator's reply."""
 
     __slots__ = (
-        "request_id", "telegram_msg_id", "writer", "expires_at",
+        "request_id", "post_id", "writer", "expires_at",
         "repo", "session_id",
     )
 
     def __init__(
         self,
         request_id: str,
-        telegram_msg_id: int,
+        post_id: str,
         writer: asyncio.StreamWriter,
         expires_at: float | None = None,
         repo: str | None = None,
         session_id: str | None = None,
     ) -> None:
         self.request_id = request_id
-        self.telegram_msg_id = telegram_msg_id
+        self.post_id = post_id
         self.writer = writer
         self.repo = repo
         self.session_id = session_id
@@ -263,50 +261,51 @@ class _PendingQuestion:
 
 
 class BridgeServer:
-    """Unix socket server that bridges to Telegram — bidirectional.
+    """Unix socket server that bridges to a chat app — bidirectional.
 
-    Outbound: clients send SEND/ASK over the socket and we hit Telegram.
-    Inbound: we long-poll Telegram for messages; when a reply arrives it's
-    matched to the oldest outstanding ASK (or by reply_to_message_id if
-    available) and we push an ANSWER frame over that client's socket."""
+    Outbound: clients send SEND/ASK over the socket and we post via the
+    handler. Inbound: the handler streams the operator's messages to us;
+    a reply is matched to the question it points at (by post id) or, when
+    it points at nothing and only one question is live, to that one. The
+    answer goes back as an ANSWER frame on that client's socket.
+
+    It holds a ``ChatHandler`` and nothing chat-specific of its own. Which
+    app is in use shows up only as ``handler.transport_name`` in the log."""
 
     def __init__(
         self,
         socket_path: Path,
-        bot_token: str,
-        chat_id: int,
+        handler: "ChatHandler",
         state_db: "StateDB | None" = None,
     ) -> None:
         self.socket_path = socket_path
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        # Optional: when provided, orphan Telegram replies (no live
+        # The server holds a handler and knows nothing about tokens, chat
+        # ids or URLs. Which chat app this is resolves at construction, in
+        # one place, from config — see ctrlrelay.bridge.make_handler.
+        self.handler = handler
+        # Optional: when provided, orphan replies (no live
         # _pending_question to match) are routed to the oldest unanswered
         # BLOCKED session in state_db's pending_resumes table. The poller's
         # pending-resume sweeper then picks up the answer and drives the
         # actual pipeline resume. Without state_db, orphan replies still
-        # get a "didn't land" Telegram notice but nothing gets queued.
+        # get a "didn't land" notice but nothing gets queued.
         self.state_db = state_db
         self._server: asyncio.Server | None = None
         self._running = False
-        self._telegram: TelegramHandler | None = None
+
         # Insertion-ordered so FIFO dispatch is deterministic.
         self._pending_questions: OrderedDict[str, _PendingQuestion] = OrderedDict()
         self._pending_lock = asyncio.Lock()
-        # telegram_msg_id -> session_id for every ASK we've posted, kept
+        # post_id -> session_id for every ASK we've posted, kept
         # after the question itself is gone. The pipeline process is what
         # dies on an ASK timeout; this bridge outlives it, so a reply-to on
         # a long-expired question can still name its session exactly instead
         # of falling back to "which of these 12 did you mean?".
-        self._asked_sessions: OrderedDict[int, str] = OrderedDict()
+        self._asked_sessions: OrderedDict[str, str] = OrderedDict()
 
     async def start(self) -> None:
         """Start the bridge server."""
-        self._telegram = TelegramHandler(
-            bot_token=self.bot_token,
-            chat_id=self.chat_id,
-        )
-        await self._telegram.start_polling(self._on_telegram_reply)
+        await self.handler.start_polling(self._on_reply)
 
         if self.socket_path.exists():
             self.socket_path.unlink()
@@ -331,8 +330,7 @@ class BridgeServer:
             self._server.close()
             await self._server.wait_closed()
 
-        if self._telegram:
-            await self._telegram.close()
+        await self.handler.close()
 
         if self.socket_path.exists():
             self.socket_path.unlink()
@@ -402,8 +400,7 @@ class BridgeServer:
 
         if msg.op == BridgeOp.SEND:
             try:
-                assert self._telegram is not None
-                telegram_msg_id = await self._telegram.send(msg.text or "")
+                post_id = await self.handler.send(msg.text or "")
                 # A SEND that names a session is answerable too: the secops
                 # sweep fans out one "blocked on <repo>" message per repo
                 # after the run, and that message is the most recent — and
@@ -413,7 +410,7 @@ class BridgeServer:
                 if msg.session_id:
                     async with self._pending_lock:
                         self._remember_asked_session(
-                            telegram_msg_id, msg.session_id
+                            post_id, msg.session_id
                         )
                 _log.info("bridge: SEND delivered, request_id=%s", msg.request_id)
                 return BridgeMessage(op=BridgeOp.ACK, request_id=msg.request_id, status="sent")
@@ -422,7 +419,7 @@ class BridgeServer:
                 return BridgeMessage(
                     op=BridgeOp.ERROR,
                     request_id=msg.request_id,
-                    error="telegram_api_error",
+                    error="chat_api_error",
                     message=str(e),
                 )
 
@@ -437,16 +434,15 @@ class BridgeServer:
                 "session_id": msg.session_id,
                 "repo": msg.repo,
                 "issue_number": msg.issue_number,
-                "transport": "telegram",
-                "destination": f"telegram:chat={self.chat_id}",
+                "transport": self.handler.transport_name,
+                "destination": self.handler.destination,
                 "request_id": msg.request_id,
                 "question_length": len(question),
                 "question_hash": hash_text(question),
                 "options": msg.options,
             }
             try:
-                assert self._telegram is not None
-                # Start the expiry clock before the Telegram round trip, not
+                # Start the expiry clock before the chat round trip, not
                 # after it: the client began counting when it wrote the ASK
                 # to the socket. Anchoring on the far side of the post would
                 # leave the bridge treating the question as live for a full
@@ -454,7 +450,7 @@ class BridgeServer:
                 # reply-to in that window writes the answer into a dead
                 # request.
                 received_at = time.monotonic()
-                telegram_msg_id = await self._telegram.ask(
+                post_id = await self.handler.ask(
                     format_question(
                         question,
                         repo=msg.repo,
@@ -467,7 +463,7 @@ class BridgeServer:
                     if msg.request_id:
                         self._pending_questions[msg.request_id] = _PendingQuestion(
                             request_id=msg.request_id,
-                            telegram_msg_id=telegram_msg_id,
+                            post_id=post_id,
                             writer=writer,
                             expires_at=_deadline(received_at, msg.timeout),
                             repo=msg.repo,
@@ -475,19 +471,19 @@ class BridgeServer:
                         )
                     if msg.session_id:
                         self._remember_asked_session(
-                            telegram_msg_id, msg.session_id
+                            post_id, msg.session_id
                         )
                 _log.info(
-                    "bridge: ASK posted request_id=%s telegram_msg_id=%s",
-                    msg.request_id, telegram_msg_id,
+                    "bridge: ASK posted request_id=%s post_id=%s",
+                    msg.request_id, post_id,
                 )
-                # Emitted here, not before the send: until Telegram has
-                # accepted the message there is nothing posted to claim.
+                # Emitted here, not before the send: until the chat server
+                # has accepted the message there is nothing posted to claim.
                 log_event(
                     _logger,
                     "dev.question.posted",
                     **post_fields,
-                    telegram_msg_id=telegram_msg_id,
+                    post_id=post_id,
                 )
                 return BridgeMessage(
                     op=BridgeOp.ACK, request_id=msg.request_id, status="pending",
@@ -495,14 +491,15 @@ class BridgeServer:
             except Exception as e:
                 _log.warning("bridge: ASK failed, request_id=%s err=%s", msg.request_id, e)
                 # Same rule as the transport: only claim a definite
-                # failure when Telegram actually answered. A timeout or a
-                # bare transport error can be raised after Telegram
+                # failure when the chat server actually answered. A
+                # timeout or a bare transport error can be raised after it
                 # accepted the message, in which case the question IS on
                 # the operator's phone and "post_failed" is a lie.
                 #
-                # The taxonomy is not intuitive, so it lives next to the
-                # library that defines it — see is_ambiguous_delivery.
-                unknown = is_ambiguous_delivery(e)
+                # The taxonomy is not intuitive and belongs to whichever
+                # library raised, so each handler owns it — see
+                # ChatHandler.is_ambiguous_delivery.
+                unknown = self.handler.is_ambiguous_delivery(e)
                 log_event(
                     _logger,
                     "dev.question.post_unknown"
@@ -517,13 +514,20 @@ class BridgeServer:
                     request_id=msg.request_id,
                     # Carry the classification instead of letting the
                     # other side re-derive it: the transport cannot see
-                    # the Telegram exception, so a generic ERROR forced
-                    # it to assume the worst and contradict the
+                    # the chat library's exception, so a generic ERROR
+                    # forced it to assume the worst and contradict the
                     # post_unknown just logged here for the same request.
+                    #
+                    # Deliberately NOT per-transport. SocketTransport
+                    # compares this string exactly, so a
+                    # `mattermost_delivery_unknown` would simply stop
+                    # matching and the transport would silently fall back
+                    # to assuming the worst — the classification lost in
+                    # the one case it exists for. Which chat app failed is
+                    # diagnostic and lives in the log; what the caller
+                    # needs is whether delivery is unknown.
                     error=(
-                        "telegram_delivery_unknown"
-                        if unknown
-                        else "telegram_api_error"
+                        "delivery_unknown" if unknown else "chat_api_error"
                     ),
                     message=str(e),
                 )
@@ -531,26 +535,26 @@ class BridgeServer:
         return None
 
     def _remember_asked_session(
-        self, telegram_msg_id: int, session_id: str
+        self, post_id: str, session_id: str
     ) -> None:
         """Record which session a posted question belongs to.
 
         Caller must hold ``_pending_lock``."""
-        self._asked_sessions[telegram_msg_id] = session_id
-        self._asked_sessions.move_to_end(telegram_msg_id)
+        self._asked_sessions[post_id] = session_id
+        self._asked_sessions.move_to_end(post_id)
         while len(self._asked_sessions) > _ASKED_SESSIONS_MAX:
             self._asked_sessions.popitem(last=False)
 
-    async def _on_telegram_reply(
+    async def _on_reply(
         self,
         text: str,
-        reply_to_message_id: int | None,
+        reply_to_post_id: str | None,
     ) -> None:
-        """Route an incoming Telegram message to the matching pending question.
+        """Route an incoming chat message to the matching pending question.
 
         Routing rules, in order:
 
-        1. ``reply_to_message_id`` names a live pending question — deliver
+        1. ``reply_to_post_id`` names a live pending question — deliver
            there. This is the only path that can be right when more than one
            question is outstanding, so it takes priority.
         2. The operator replied to *something*, but that question is no
@@ -561,19 +565,20 @@ class BridgeServer:
         3. A fresh message (no reply-to) with exactly one question
            outstanding — deliver there; there is nothing to confuse it with.
         4. A fresh message with several outstanding — refuse, and tell the
-           operator to use Telegram's reply.
+           operator to reply to the question they mean. On Telegram that is
+           the reply gesture; on Mattermost it is replying in the thread.
 
         The previous FIFO fallback ran for cases 2 and 4 alike: replying to
         the third question while the first was still open delivered the
         answer to the *first* one, silently, and the operator had no way to
         see it had happened.
 
-        ``_pending_lock`` guards only the decision. Every Telegram send and
+        ``_pending_lock`` guards only the decision. Every chat send and
         every state_db write happens after it is released — holding it across
-        a stalled Telegram call would serialize routing behind the network.
-        Telegram updates are dispatched one at a time by
-        ``TelegramHandler._poll_loop``, so releasing early cannot interleave
-        two replies.
+        a stalled chat call would serialize routing behind the network.
+        Inbound messages are dispatched one at a time by
+        a handler's single inbound loop, so releasing early cannot
+        interleave two replies.
         """
         match: _PendingQuestion | None = None
         hinted_session_id: str | None = None
@@ -582,9 +587,9 @@ class BridgeServer:
 
         async with self._pending_lock:
             self._drop_expired_questions()
-            if reply_to_message_id is not None:
+            if reply_to_post_id is not None:
                 for q in self._pending_questions.values():
-                    if q.telegram_msg_id == reply_to_message_id:
+                    if q.post_id == reply_to_post_id:
                         match = q
                         break
             elif len(self._pending_questions) == 1:
@@ -595,8 +600,9 @@ class BridgeServer:
                     f"{len(self._pending_questions)} questions are waiting "
                     "and a plain message doesn't say which one you "
                     "mean.\n\n"
-                    "Use Telegram's reply on the question you want to "
-                    "answer.\n\n"
+                    "Reply to the question you want to answer "
+                    "(Telegram: reply; Mattermost: reply in its thread)."
+                    "\n\n"
                     f"{self._live_question_listing()}"
                 )
 
@@ -604,10 +610,10 @@ class BridgeServer:
                 self._pending_questions.pop(match.request_id, None)
             elif ambiguous_notice is None:
                 # Snapshot what the orphan branch needs, so the lock can be
-                # released before we touch Telegram or the database.
+                # released before we touch the chat app or the database.
                 hinted_session_id = (
-                    self._asked_sessions.get(reply_to_message_id)
-                    if reply_to_message_id is not None
+                    self._asked_sessions.get(reply_to_post_id)
+                    if reply_to_post_id is not None
                     else None
                 )
                 live_listing = (
@@ -634,11 +640,11 @@ class BridgeServer:
         log_event(
             _logger,
             "dev.answer.received",
-            transport="telegram",
-            source=f"telegram:chat={self.chat_id}",
+            transport=self.handler.transport_name,
+            source=self.handler.destination,
             request_id=match.request_id,
-            telegram_msg_id=match.telegram_msg_id,
-            reply_to_message_id=reply_to_message_id,
+            post_id=match.post_id,
+            reply_to_post_id=reply_to_post_id,
             answer_length=len(text),
             answer_hash=hash_text(text),
         )
@@ -669,7 +675,7 @@ class BridgeServer:
         snapshot of what was outstanding at decision time.
         """
         _log.info(
-            "bridge: incoming telegram msg with no pending question; "
+            "bridge: incoming chat msg with no pending question; "
             "text=%r", text[:80],
         )
         # Try to route to a persisted BLOCKED session in state_db so the
@@ -735,7 +741,7 @@ class BridgeServer:
                 "are unanswered and the reply didn't point at one of "
                 "them.\n\n"
                 f"Pending:\n{pending_list}\n\n"
-                "Use Telegram's reply on the question you mean, or paste "
+                "Reply to the question you mean, or paste "
                 "its session_id anywhere in your message."
             )
         elif live_listing is not None:
@@ -785,7 +791,7 @@ class BridgeServer:
 
         Uses the same ``[repo] session:`` shape as the question header, so
         the operator can match a line here to a message in their chat by
-        eye. Telegram never shows message ids in its UI and ``request_id``
+        eye. Neither chat app shows a post id in its UI, and ``request_id``
         means nothing to a human, so neither belongs in operator-facing
         text.
 
@@ -802,17 +808,15 @@ class BridgeServer:
         reply routing — the answer has already been dealt with."""
         if log:
             _log.info("%s", log)
-        if self._telegram is None:
-            return
         try:
-            await self._telegram.send(text)
+            await self.handler.send(text)
         except Exception as e:
             _log.warning("bridge: failed to notify operator: %s", e)
 
     async def _queue_orphan_reply_as_resume_answer(
         self, text: str, *, session_id: str | None = None
     ) -> dict:
-        """Try to route an orphan Telegram reply to a persisted BLOCKED
+        """Try to route an orphan reply to a persisted BLOCKED
         session so the pending-resume sweeper can pick it up and drive a
         pipeline resume.
 
@@ -830,7 +834,7 @@ class BridgeServer:
 
         Disambiguation rules, in order:
 
-        1. ``session_id`` (resolved from the Telegram reply-to) names an
+        1. ``session_id`` (resolved from the reply-to post id) names an
            unanswered row — route there. This is exact: it comes from the
            message the operator actually replied to.
         2. ``session_id`` was given and does NOT name an unanswered row.

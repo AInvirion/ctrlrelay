@@ -251,7 +251,17 @@ class SocketTransport:
                 # Re-deriving it here is what produced contradictory
                 # pairs — post_unknown on the bridge, post_failed on the
                 # transport, same request_id.
-                bridge_unknown = response.error == "telegram_delivery_unknown"
+                # "telegram_delivery_unknown" is the pre-0.12 spelling.
+                # The bridge and the poller are separate daemons and can be
+                # at different versions across a deploy, and this comparison
+                # failing does not raise — it silently downgrades "delivery
+                # unknown" to "definitely failed", which is the one
+                # classification this branch exists to preserve. Accepting
+                # both costs one tuple.
+                bridge_unknown = response.error in (
+                    "delivery_unknown",
+                    "telegram_delivery_unknown",
+                )
                 log_event(
                     _logger,
                     "dev.question.post_unknown"

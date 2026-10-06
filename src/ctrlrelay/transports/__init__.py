@@ -15,11 +15,18 @@ def get_transport(config: TransportConfig) -> Transport:
             outbox=config.file_mock.outbox,
         )
 
-    if config.type == TransportType.TELEGRAM:
-        assert config.telegram is not None
+    # Every chat transport reaches the bridge the same way — a Unix socket
+    # and a timeout. The chat app is the bridge's concern, not the
+    # pipeline's, which is why there is one branch here and not one per
+    # app.
+    chat = {
+        TransportType.TELEGRAM: config.telegram,
+        TransportType.MATTERMOST: config.mattermost,
+    }.get(config.type)
+    if chat is not None:
         return SocketTransport(
-            socket_path=config.telegram.socket_path,
-            ask_timeout_seconds=config.telegram.ask_timeout_seconds,
+            socket_path=chat.socket_path,
+            ask_timeout_seconds=chat.ask_timeout_seconds,
         )
 
     raise TransportError(f"Unknown transport type: {config.type}")
