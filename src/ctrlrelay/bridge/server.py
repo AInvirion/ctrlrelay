@@ -136,11 +136,28 @@ def names_session(text: str, session_id: str) -> bool:
             return _is_boundary(text[idx: idx + 1])
         return _is_boundary(text[j: j + 1])
 
+    def _boundary_before(idx: int) -> bool:
+        """Mirror of ``_boundary_after`` on the leading side.
+
+        Added because the invariant test found the asymmetry that eight
+        review rounds did not: the dot rule was applied only after the
+        match, so ``.`` before it was still a plain boundary and the id's
+        own alphabet was treated inconsistently depending on which side of
+        the match a character sat.
+        """
+        if idx == 0:
+            return True
+        j = idx
+        while j > 0 and text[j - 1] == ".":
+            j -= 1
+        if j == idx:
+            return _is_boundary(text[idx - 1: idx])
+        return _is_boundary(text[j - 1: j]) if j else True
+
     span = len(session_id)
     idx = text.find(session_id)
     while idx != -1:
-        before = text[idx - 1: idx] if idx else ""
-        if _is_boundary(before) and _boundary_after(idx + span):
+        if _boundary_before(idx) and _boundary_after(idx + span):
             return True
         # +1, not +span: a rejected candidate must not hide an overlapping
         # one starting inside it.

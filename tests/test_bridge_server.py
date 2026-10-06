@@ -1352,8 +1352,40 @@ class TestStaleReplyToDoesNotMisroute:
             assert names_session(f"{sid}{ch} y", sid) is separates, (
                 f"U+{code:04X} {ch!r} after the id"
             )
-            assert names_session(f"y{ch}{sid} z", sid) is separates, (
+            # Space before the candidate for the same reason it is after:
+            # the dot rule resolves on what surrounds the dot run, and the
+            # dot's other direction is asserted in the dot test.
+            assert names_session(f"y {ch}{sid} z", sid) is separates, (
                 f"U+{code:04X} {ch!r} before the id"
+            )
+
+    def test_no_id_character_is_treated_as_a_boundary(self) -> None:
+        """The invariant, asserted over the alphabet rather than examples.
+
+        A wrong-session route needs a character that is both legal inside a
+        session id and classified as a boundary. Ids are minted as
+        ``{pipeline}-{owner}-{repo}-{suffix}`` from a GitHub ``owner/repo``
+        with ``/`` replaced by ``-``, so the alphabet is
+        ``[A-Za-z0-9._-]``. If every one of those is treated as part of the
+        identifier, the set of characters that can misroute is empty by
+        construction — and everything seven review rounds found was outside
+        the alphabet, so it could only ever have cost a retry.
+
+        This is the test that should have existed instead of rounds three
+        through seven.
+        """
+        import string
+
+        from ctrlrelay.bridge.server import names_session
+
+        sid = "secops-owner-r-abc123"
+        for ch in string.ascii_letters + string.digits + "._-":
+            assert not names_session(f"{sid}{ch}bar-x ok", sid), (
+                f"{ch!r} is legal inside a session id but was read as a "
+                "boundary — that is a wrong-session route"
+            )
+            assert not names_session(f"ok x-bar{ch}{sid} y", sid), (
+                f"{ch!r} read as a boundary before the id"
             )
 
     def test_a_dot_is_both_a_sentence_end_and_part_of_an_id(self) -> None:
