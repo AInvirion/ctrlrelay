@@ -739,3 +739,168 @@ class TestAskTimeoutConfig:
 
         with pytest.raises(pydantic.ValidationError):
             TelegramConfig(chat_id=1, ask_timeout_seconds=5)
+
+
+class TestMattermostTransportConfig:
+    """Config is the only thing standing between an operator and a bridge
+    that starts cleanly, posts nowhere, and says nothing about it."""
+
+    def test_a_url_without_a_scheme_is_rejected(self) -> None:
+        """A bare host becomes a relative URL and every post 404s.
+
+        Rejected at load rather than at the first post, because the bridge
+        would otherwise start fine and fail only when a session blocks —
+        hours later, on the path whose whole job is to be there when
+        something has gone wrong.
+        """
+        from pydantic import ValidationError
+
+        from ctrlrelay.core.config import MattermostConfig
+
+        with pytest.raises(ValidationError, match="http"):
+            MattermostConfig(url="chat.example.com", channel_id="c" * 26)
+
+    def test_a_trailing_slash_is_normalised(self) -> None:
+        """Otherwise every request path doubles its separator."""
+        from ctrlrelay.core.config import MattermostConfig
+
+        assert MattermostConfig(url="https://chat.example.com/").url == (
+            "https://chat.example.com"
+        )
+
+    def test_type_mattermost_requires_its_block(self) -> None:
+        from pydantic import ValidationError
+
+        from ctrlrelay.core.config import TransportConfig
+
+        with pytest.raises(ValidationError, match="mattermost config required"):
+            TransportConfig(type="mattermost")
+
+    @pytest.mark.parametrize(
+        "transport_type", ["telegram", "mattermost", "file_mock"]
+    )
+    def test_every_transport_type_demands_its_own_block(
+        self, transport_type: str
+    ) -> None:
+        """Parametrised over the enum on purpose.
+
+        The validator used to be an if-chain, where adding a transport and
+        forgetting its branch silently accepts a config with no settings at
+        all — the bridge then starts and posts nowhere. This fails the day
+        someone adds a type without wiring it.
+        """
+        from pydantic import ValidationError
+
+        from ctrlrelay.core.config import TransportConfig, TransportType
+
+        assert transport_type in {t.value for t in TransportType}
+        with pytest.raises(ValidationError, match="config required"):
+            TransportConfig(type=transport_type)
+
+    def test_socket_path_resolves_for_whichever_transport_is_set(self) -> None:
+        """Three call sites needed this and each re-derived it from the
+        telegram block, so a Mattermost config silently yielded no socket
+        and no notifications."""
+        from ctrlrelay.core.config import (
+            MattermostConfig,
+            TelegramConfig,
+            TransportConfig,
+        )
+
+        mm = TransportConfig(
+            type="mattermost",
+            mattermost=MattermostConfig(
+                url="https://chat.example.com",
+                channel_id="c" * 26,
+                socket_path="~/.ctrlrelay/mm.sock",
+            ),
+        )
+        assert mm.socket_path is not None
+        assert mm.socket_path.name == "mm.sock"
+
+        tg = TransportConfig(
+            type="telegram",
+            telegram=TelegramConfig(chat_id=1, socket_path="~/.ctrlrelay/tg.sock"),
+        )
+        assert tg.socket_path is not None
+        assert tg.socket_path.name == "tg.sock"
+
+
+class TestHandlerFactory:
+    """The factory is where a misconfiguration becomes a loud startup
+    failure instead of a silent no-channel bridge."""
+
+    def test_a_missing_token_names_the_env_var(self, monkeypatch) -> None:
+        from ctrlrelay.bridge import HandlerConfigError, make_handler
+        from ctrlrelay.core.config import MattermostConfig, TransportConfig
+
+        monkeypatch.delenv("CTRLRELAY_MATTERMOST_TOKEN", raising=False)
+        cfg = TransportConfig(
+            type="mattermost",
+            mattermost=MattermostConfig(
+                url="https://chat.example.com", channel_id="c" * 26
+            ),
+        )
+        with pytest.raises(HandlerConfigError, match="CTRLRELAY_MATTERMOST_TOKEN"):
+            make_handler(cfg)
+
+    def test_an_unset_channel_is_refused_at_startup(self, monkeypatch) -> None:
+        """A post with no channel is rejected, so no question would ever
+        arrive — and the bridge would look healthy the whole time."""
+        from ctrlrelay.bridge import HandlerConfigError, make_handler
+        from ctrlrelay.core.config import MattermostConfig, TransportConfig
+
+        monkeypatch.setenv("CTRLRELAY_MATTERMOST_TOKEN", "tok")
+        cfg = TransportConfig(
+            type="mattermost",
+            mattermost=MattermostConfig(url="https://chat.example.com"),
+        )
+        with pytest.raises(HandlerConfigError, match="channel_id"):
+            make_handler(cfg)
+
+    def test_an_unset_chat_id_is_refused_at_startup(self, monkeypatch) -> None:
+        """chat_id defaults to 0, which is a valid int and an invalid chat."""
+        from ctrlrelay.bridge import HandlerConfigError, make_handler
+        from ctrlrelay.core.config import TelegramConfig, TransportConfig
+
+        monkeypatch.setenv("CTRLRELAY_TELEGRAM_TOKEN", "tok")
+        cfg = TransportConfig(type="telegram", telegram=TelegramConfig())
+        with pytest.raises(HandlerConfigError, match="chat_id"):
+            make_handler(cfg)
+
+    def test_it_builds_the_handler_the_config_names(self, monkeypatch) -> None:
+        from ctrlrelay.bridge import make_handler
+        from ctrlrelay.core.config import (
+            MattermostConfig,
+            TelegramConfig,
+            TransportConfig,
+        )
+
+        monkeypatch.setenv("CTRLRELAY_MATTERMOST_TOKEN", "tok")
+        monkeypatch.setenv("CTRLRELAY_TELEGRAM_TOKEN", "1:tok")
+
+        mm = make_handler(TransportConfig(
+            type="mattermost",
+            mattermost=MattermostConfig(
+                url="https://chat.example.com", channel_id="c" * 26
+            ),
+        ))
+        assert mm.transport_name == "mattermost"
+
+        tg = make_handler(TransportConfig(
+            type="telegram", telegram=TelegramConfig(chat_id=42),
+        ))
+        assert tg.transport_name == "telegram"
+
+    def test_file_mock_has_no_handler_and_says_why(self) -> None:
+        """file_mock does not use a bridge at all. The error has to say so,
+        or an operator reads it as "mock is broken" and goes looking."""
+        from ctrlrelay.bridge import HandlerConfigError, make_handler
+        from ctrlrelay.core.config import FileMockConfig, TransportConfig
+
+        cfg = TransportConfig(
+            type="file_mock",
+            file_mock=FileMockConfig(inbox="/tmp/in", outbox="/tmp/out"),
+        )
+        with pytest.raises(HandlerConfigError, match="does not use a bridge"):
+            make_handler(cfg)
