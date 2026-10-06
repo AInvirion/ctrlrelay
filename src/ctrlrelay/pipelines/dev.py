@@ -483,7 +483,22 @@ printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
                 success=False,
                 session_id=result.session_id,
                 summary="No checkpoint state returned",
-                error=result.stderr or "Unknown error",
+                # No manufactured fallback. An empty stderr means there
+                # is nothing to add, and `failure_text` then reports the
+                # summary above plus the exit code — which is the whole
+                # diagnosis, because exiting 0 without writing state is
+                # a different fault from crashing (#174).
+                # `or ""` before `.strip()`: the expression this
+                # replaced tolerated a None stderr, and dropping that
+                # tolerance would raise AttributeError *before* the
+                # failure alert is sent - turning a reportable failure
+                # into a silent crash, which is this ticket's own fault
+                # class. Not reachable from the current dispatcher
+                # (`stderr.decode()` always returns str), but
+                # SessionResult is produced by anything implementing
+                # AgentAdapter.
+                error=(result.stderr or "").strip() or None,
+                exit_code=result.exit_code,
             )
 
         if result.state.status == CheckpointStatus.DONE:

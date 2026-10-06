@@ -1338,6 +1338,7 @@ def poller_start(
 
             try:
                 if is_task:
+                    from ctrlrelay.pipelines.base import failure_text
                     from ctrlrelay.pipelines.task import run_task_issue
                     console.print(
                         f"[dim]#{issue_number} routed to task "
@@ -1507,7 +1508,7 @@ def poller_start(
                         else:
                             await transport.send(
                                 f"❌ Failed on #{issue_number}: "
-                                f"{result.error or result.summary}"
+                                f"{failure_text(result)}"
                             )
                     except Exception as e:
                         console.print(
@@ -1539,6 +1540,8 @@ def poller_start(
             console.print(
                 f"[dim]Scheduled secops: starting across {n_repos} repo(s)[/dim]"
             )
+
+            from ctrlrelay.pipelines.base import failure_text
 
             secops_transport = None
             if config.transport.type.value == "telegram" and config.transport.telegram:
@@ -1631,7 +1634,7 @@ def poller_start(
                                     repo=repo_cfg.name,
                                 )
                             elif not result.success:
-                                err = result.error or result.summary
+                                err = failure_text(result)
                                 await secops_transport.send(
                                     f"❌ Scheduled secops failed on "
                                     f"{repo_cfg.name}\n"
@@ -1727,6 +1730,7 @@ def poller_start(
             if not pending:
                 return
 
+            from ctrlrelay.pipelines.base import failure_text
             from ctrlrelay.pipelines.dev import resume_dev_from_pending
             from ctrlrelay.pipelines.secops import resume_secops_from_pending
             from ctrlrelay.pipelines.task import resume_task_from_pending
@@ -1952,7 +1956,7 @@ def poller_start(
                                     f"\n{q}"
                                 )
                             else:
-                                err = result.error or result.summary
+                                err = failure_text(result)
                                 await sweeper_transport.send(
                                     f"❌ Resume failed on {repo}\n"
                                     f"Session: `{session_id}`\n"

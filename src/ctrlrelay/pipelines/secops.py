@@ -18,7 +18,11 @@ from ctrlrelay.core.question_expiry import extract_referenced_numbers
 from ctrlrelay.core.state import StateDB
 from ctrlrelay.core.worktree import WorktreeManager
 from ctrlrelay.dashboard.client import DashboardClient, EventPayload
-from ctrlrelay.pipelines.base import PipelineContext, PipelineResult
+from ctrlrelay.pipelines.base import (
+    PipelineContext,
+    PipelineResult,
+    failure_text,
+)
 from ctrlrelay.transports.base import Transport
 
 _logger = get_logger("pipeline.secops")
@@ -459,7 +463,22 @@ printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
                 success=False,
                 session_id=result.session_id,
                 summary="No checkpoint state returned",
-                error=result.stderr or "Unknown error",
+                # No manufactured fallback. An empty stderr means there
+                # is nothing to add, and `failure_text` then reports the
+                # summary above plus the exit code — which is the whole
+                # diagnosis, because exiting 0 without writing state is
+                # a different fault from crashing (#174).
+                # `or ""` before `.strip()`: the expression this
+                # replaced tolerated a None stderr, and dropping that
+                # tolerance would raise AttributeError *before* the
+                # failure alert is sent - turning a reportable failure
+                # into a silent crash, which is this ticket's own fault
+                # class. Not reachable from the current dispatcher
+                # (`stderr.decode()` always returns str), but
+                # SessionResult is produced by anything implementing
+                # AgentAdapter.
+                error=(result.stderr or "").strip() or None,
+                exit_code=result.exit_code,
             )
 
         if result.state.status == CheckpointStatus.DONE:
@@ -682,7 +701,7 @@ async def run_secops_all(
                             f"\n{q}"
                         )
                     else:
-                        err = result.error or result.summary
+                        err = failure_text(result)
                         await transport.send(
                             f"❌ Failed after your answer on {repo}\n"
                             f"Session: `{session_id}`\n"
@@ -809,8 +828,9 @@ async def run_secops_all(
                 session_id=session_id,
                 summary=f"Error processing {repo}: {type(e).__name__}: {detail}",
                 # `str(e)` alone can be empty; the notifier picks
-                # `result.error or result.summary`, so an empty error
-                # silently degraded the alert to the bare summary.
+                # `failure_text` keeps both fields now, so an empty
+                # error no longer decides the alert either way - but both
+                # are still filled so the exception type survives alone.
                 error=f"{type(e).__name__}: {detail}",
             ))
 

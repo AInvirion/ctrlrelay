@@ -31,6 +31,70 @@ class PipelineResult:
     question: str | None = None
     error: str | None = None
     outputs: dict[str, Any] = field(default_factory=dict)
+    # Appended rather than inserted before `outputs`: a new field in
+    # the middle of a dataclass silently re-maps every positional
+    # construction. No call site passes these positionally today
+    # (checked across src/ and tests/ with ast), so this ordering is
+    # hazard removal rather than a bug fix — but the hazard costs
+    # nothing to delete.
+    # The agent process's exit code, when the result came from a session
+    # that actually ran. `None` means "not applicable or not known" —
+    # never 0, because exiting 0 and writing no checkpoint is the exact
+    # case this field exists to make visible (#174).
+    exit_code: int | None = None
+
+
+def failure_text(result: PipelineResult) -> str:
+    """The operator-facing reason a run failed.
+
+    Every failure alert goes through this. That is the point: the fault
+    in #174 was reachable from four separate ``result.error or
+    result.summary`` expressions, so fixing the one named in the report
+    would have left the same useless alert reachable three other ways.
+
+    ``error`` used to win over ``summary`` whenever it was truthy - and
+    the manufactured fallback guaranteed it always was, which is what
+    made the precedence bite. (An earlier draft of this docstring said
+    "unconditionally", which is false: ``error or summary`` yields
+    ``summary`` for an empty or absent ``error``. Overstating it would
+    have given the next reader a true reason to dismiss the rest.) A
+    pipeline
+    whose agent exited 0 with empty stderr set
+    ``summary="No checkpoint state returned"`` and then
+    ``error="Unknown error"`` one line below it, so the alert said
+    `Unknown error` while the real reason sat in the field that lost.
+    Both are kept now.
+
+    And when nothing was recorded, this does not manufacture a string
+    that reads like a reason. It says what was expected and did not
+    arrive, which is a different fact from a crash — the distinction the
+    operator needs first and the one `Unknown error` destroyed.
+    """
+    parts: list[str] = []
+    for candidate in (result.summary, result.error):
+        if not candidate:
+            continue
+        text = candidate.strip()
+        # `error` frequently restates `summary` verbatim; printing it
+        # twice reads like two separate faults.
+        if text and text not in parts:
+            parts.append(text)
+
+    # Always stated when known, because "exited 0" is what separates
+    # "the agent crashed" from "the agent finished and wrote nothing",
+    # and those have different causes and different fixes.
+    exit_note = (
+        f" (agent exit code {result.exit_code})"
+        if result.exit_code is not None
+        else ""
+    )
+
+    if not parts:
+        return (
+            "failed with no reason recorded: expected a checkpoint state "
+            "or a stderr message, got neither" + exit_note
+        )
+    return " - ".join(parts) + exit_note
 
 
 @runtime_checkable

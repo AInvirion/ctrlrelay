@@ -237,7 +237,15 @@ printf '{{"version":"1","status":"FAILED",'\\
                 success=False,
                 session_id=result.session_id,
                 summary="Task failed",
-                error=state.error or "unknown failure",
+                # The `or "unknown failure"` that used to be here was
+                # unreachable, not merely useless: CheckpointState's
+                # validator refuses FAILED without a truthy `error`
+                # (`not self.error` catches "" as well as None), so this
+                # field is guaranteed non-empty here. Deleted rather than
+                # replaced — a fallback for a case that cannot happen
+                # reads as coverage to the next person (#174).
+                error=state.error,
+                exit_code=result.exit_code,
             )
         return PipelineResult(
             success=False,
