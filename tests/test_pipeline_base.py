@@ -290,7 +290,12 @@ class TestEveryAlertGoesThroughFailureText:
     async def test_a_failure_after_an_answer_names_the_reason(
         self, tmp_path: Path
     ) -> None:
-        """Drives the operator path at pipelines/secops.py:685.
+        """Drives the operator path in `run_secops_all`.
+
+        Names the function, not a line: the first version of this
+        docstring cited `secops.py:685`, which had already drifted to
+        704 within this same branch. A line number in prose is a claim
+        that rots silently, and nothing fails when it does.
 
         The agent answers, resumes, exits 0 and writes no checkpoint —
         the incident's own shape, one round later. The alert must carry
