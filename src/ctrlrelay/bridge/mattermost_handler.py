@@ -286,11 +286,15 @@ class MattermostHandler:
         reset cannot live after the call. It is driven by the callback,
         which is the only thing that knows the ack arrived.
 
-        A refused token on the **first** connection is fatal: nothing has
-        ever worked, so there is nothing to keep alive, and the operator is
-        at the terminal that started the bridge. After that it is retried
-        with backoff — a token being rotated under a running bridge should
-        not take the bridge down with it.
+        A refused token is fatal **before any connection has ever
+        authenticated**, which is the boundary the code actually tests
+        (``ready.is_set()``) — not "on the first connection". Those differ:
+        if connection one drops before acknowledging and connection two is
+        refused, the refusal is still fatal, because nothing has worked yet
+        and the operator is still at the terminal that started the bridge.
+        Once something has authenticated, a refusal is retried with
+        backoff — a token being rotated under a running bridge should not
+        take the bridge down with it.
         """
         backoff = self._reconnect_delay
         while True:
@@ -312,9 +316,19 @@ class MattermostHandler:
                     }))
                     await self._consume(ws, handler, _on_authenticated)
                 finally:
+                    # Closing must never delay or replace the reason we got
+                    # here. A server that refuses the token and then ignores
+                    # the close handshake would otherwise hold us until
+                    # start_polling's own timeout and surface a TimeoutError
+                    # instead of "token expired"; a close() that raises would
+                    # replace the refusal outright and send us round the
+                    # retry loop. Bounded, and its own failure swallowed.
                     close = getattr(ws, "close", None)
                     if close is not None:
-                        await close()
+                        try:
+                            await asyncio.wait_for(close(), timeout=2.0)
+                        except (asyncio.TimeoutError, Exception):
+                            _log.debug("mattermost websocket close failed")
             except asyncio.CancelledError:
                 raise
             except MattermostAuthError as e:

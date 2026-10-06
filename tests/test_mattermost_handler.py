@@ -332,6 +332,24 @@ async def _as_coro(value, note=None):
     return value
 
 
+class _HostileCloseSocket(_FakeSocket):
+    """A socket whose close() misbehaves, which the plain fake cannot.
+
+    `_FakeSocket` has no `close()` at all, so every test using it skipped
+    the close path entirely — which is why review found this and the tests
+    did not.
+    """
+
+    def __init__(self, frames, *, mode: str = "hang") -> None:
+        super().__init__(frames)
+        self.mode = mode
+
+    async def close(self) -> None:
+        if self.mode == "hang":
+            await asyncio.sleep(3600)
+        raise OSError("connection reset during close")
+
+
 class TestStartPollingWaitsForTheSocket:
     """The window this closes loses replies permanently.
 
@@ -743,3 +761,48 @@ class TestPreflight:
         assert h._poll_task is None, "polling must not start on a failed preflight"
         assert not socket_path.exists(), "the socket must not bind either"
         await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_is_not_masked_by_a_hanging_close(self) -> None:
+        """The refusal must reach the caller, not the close timeout.
+
+        A server that refuses the token and then ignores the close
+        handshake would otherwise hold the `finally` until start_polling's
+        own timeout expired, and the operator would be told
+        "not authenticated within 30s" while "token expired" sat in the
+        log. The close is bounded for exactly this.
+        """
+        from ctrlrelay.bridge.mattermost_handler import MattermostAuthError
+
+        h = _handler(_ok, connect_timeout=10.0)
+        ws = _HostileCloseSocket([{
+            "status": "FAIL", "seq_reply": 1,
+            "error": {"message": "token expired"},
+        }], mode="hang")
+        h._connect = lambda: _as_coro(ws)  # type: ignore[method-assign]
+
+        async def noop(text: str, reply_to: str | None) -> None:
+            return None
+
+        with pytest.raises(MattermostAuthError, match="token expired"):
+            await asyncio.wait_for(h.start_polling(noop), timeout=6)
+        await h.close()
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_is_not_replaced_by_a_raising_close(self) -> None:
+        """A close() that raises must not become the reported reason."""
+        from ctrlrelay.bridge.mattermost_handler import MattermostAuthError
+
+        h = _handler(_ok, connect_timeout=5.0)
+        ws = _HostileCloseSocket([{
+            "status": "FAIL", "seq_reply": 1,
+            "error": {"message": "token expired"},
+        }], mode="raise")
+        h._connect = lambda: _as_coro(ws)  # type: ignore[method-assign]
+
+        async def noop(text: str, reply_to: str | None) -> None:
+            return None
+
+        with pytest.raises(MattermostAuthError, match="token expired"):
+            await asyncio.wait_for(h.start_polling(noop), timeout=6)
+        await h.close()
