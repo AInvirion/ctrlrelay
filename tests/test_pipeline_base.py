@@ -383,3 +383,79 @@ class TestEveryAlertGoesThroughFailureText:
             f"failure_text(), which is how #174 was reachable four ways: "
             f"{offenders}"
         )
+
+
+class TestResultConstructionHazards:
+    """Two findings from the review round on this change."""
+
+    def test_an_absent_stderr_does_not_crash_before_the_alert(self) -> None:
+        """A None stderr must not raise where the old `or` tolerated it.
+
+        Reproduced as AttributeError on fd04b54. Not reachable from the
+        current dispatcher — `stderr.decode()` always returns a str — but
+        `SessionResult` is produced by anything implementing
+        AgentAdapter, and the crash would land *before* the failure alert
+        is sent. That converts a reportable failure into a silent one,
+        which is the fault class this change exists to remove.
+        """
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import failure_text
+        from ctrlrelay.pipelines.dev import DevPipeline
+        from ctrlrelay.pipelines.secops import SecopsPipeline
+
+        for cls in (SecopsPipeline, DevPipeline):
+            pipeline = cls(
+                dispatcher=MagicMock(),
+                github=MagicMock(),
+                worktree=MagicMock(),
+                dashboard=MagicMock(),
+                state_db=MagicMock(),
+                transport=MagicMock(),
+            )
+            result = pipeline._session_to_result(
+                SessionResult(
+                    session_id="sess",
+                    exit_code=0,
+                    state=None,
+                    stderr=None,  # type: ignore[arg-type]
+                )
+            )
+            assert result.error is None
+            assert failure_text(result) == (
+                "No checkpoint state returned (agent exit code 0)"
+            )
+
+    def test_no_call_site_builds_a_pipeline_result_positionally(self) -> None:
+        """Holds the field ordering, rather than only correcting it.
+
+        `exit_code` was first inserted before `outputs`. Nothing passes
+        these positionally, so nothing broke — which is exactly why the
+        next added field would be inserted in the middle too. This fails
+        if any call site starts relying on position, at which point the
+        ordering stops being free to change.
+        """
+        import ast
+
+        offenders: list[str] = []
+        root = Path(__file__).resolve().parent.parent
+        files = sorted((root / "src").rglob("*.py")) + sorted(
+            (root / "tests").rglob("*.py")
+        )
+        assert len(files) > 40, f"only walked {len(files)} files"
+
+        for path in files:
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and getattr(node.func, "id", None) == "PipelineResult"
+                    and node.args
+                ):
+                    offenders.append(
+                        f"{path.relative_to(root)}:{node.lineno}"
+                    )
+
+        assert offenders == [], (
+            "these pass PipelineResult fields positionally, so adding or "
+            f"reordering a field silently re-maps them: {offenders}"
+        )

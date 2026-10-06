@@ -30,12 +30,18 @@ class PipelineResult:
     blocked: bool = False
     question: str | None = None
     error: str | None = None
+    outputs: dict[str, Any] = field(default_factory=dict)
+    # Appended rather than inserted before `outputs`: a new field in
+    # the middle of a dataclass silently re-maps every positional
+    # construction. No call site passes these positionally today
+    # (checked across src/ and tests/ with ast), so this ordering is
+    # hazard removal rather than a bug fix — but the hazard costs
+    # nothing to delete.
     # The agent process's exit code, when the result came from a session
     # that actually ran. `None` means "not applicable or not known" —
     # never 0, because exiting 0 and writing no checkpoint is the exact
     # case this field exists to make visible (#174).
     exit_code: int | None = None
-    outputs: dict[str, Any] = field(default_factory=dict)
 
 
 def failure_text(result: PipelineResult) -> str:
