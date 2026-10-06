@@ -1652,23 +1652,118 @@ class TestErrorCodeSurvivesADeploySkew:
                 "chat_api_error"
             )
 
-    def test_the_transport_accepts_every_code_the_bridge_can_emit(
-        self, socket_path
+    @pytest.mark.asyncio
+    async def test_the_transport_accepts_every_code_the_bridge_can_emit(
+        self, socket_path, tmp_path
     ) -> None:
         """The two halves must agree, and nothing else checks that they do.
 
-        Reads the literal set out of SocketTransport rather than restating
-        it, so adding a spelling on one side without the other fails here.
+        Two observed values: the code the bridge emits for a transport,
+        and what SocketTransport logs when that code comes back in an
+        ERROR frame. An earlier version grepped SocketTransport's source
+        for the quoted literal — which the comment above the tuple in that
+        file also contains, so dropping the legacy spelling from the tuple
+        left this green. Only driving the transport can tell.
         """
-        import inspect
+        from unittest.mock import AsyncMock, MagicMock, patch
 
-        from ctrlrelay.transports import socket_client
+        from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp
+        from ctrlrelay.transports.socket_client import SocketTransport
 
-        source = inspect.getsource(socket_client.SocketTransport)
         for name in ("telegram", "mattermost"):
             emitted = self._server(socket_path, name)._error_code(True)
-            assert f'"{emitted}"' in source, (
+
+            transport = SocketTransport(socket_path=tmp_path / "s.sock")
+            transport._writer = MagicMock()
+            transport._writer.is_closing.return_value = False
+            transport._writer.drain = AsyncMock()
+
+            async def _bridge_says(
+                *_a: object, _code: str = emitted, **_kw: object
+            ) -> BridgeMessage:
+                return BridgeMessage(
+                    op=BridgeOp.ERROR, request_id="r-1",
+                    error=_code, message="Timed out",
+                )
+
+            with patch(
+                "ctrlrelay.transports.socket_client.asyncio.wait_for",
+                _bridge_says,
+            ), patch(
+                "ctrlrelay.transports.socket_client.log_event"
+            ) as log:
+                with pytest.raises(Exception):
+                    await transport.ask("approve #1?", session_id="s", repo="o/r")
+
+            events = [c.args[1] for c in log.call_args_list if len(c.args) > 1]
+            assert "dev.question.post_unknown" in events, (
                 f"bridge emits {emitted!r} for {name}, which SocketTransport "
-                "does not match — delivery-unknown would silently become "
-                "definitely-failed"
+                f"does not match — it logged {events}: delivery-unknown "
+                "silently became definitely-failed"
             )
+
+
+class TestStartRunsTheHandlerPreflight:
+    """`verify_handler` was defined in the factory and called from nowhere,
+    so a handler's preflight was prose. The server is the one place both
+    entry points pass through, and it must run the check before it opens
+    the inbound stream or binds the socket — a bound socket is what the
+    poller reads as "the bridge is up"."""
+
+    @pytest.fixture
+    def socket_path(self):
+        d = tempfile.mkdtemp()
+        yield Path(d) / "b.sock"
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_a_failing_preflight_stops_start_before_polling_or_binding(
+        self, socket_path
+    ) -> None:
+        from ctrlrelay.bridge import BridgeServer, HandlerConfigError
+
+        class Unverifiable(FakeChatHandler):
+            async def preflight(self) -> None:
+                raise RuntimeError("bot is not a member of the channel")
+
+        handler = Unverifiable()
+        server = BridgeServer(socket_path=socket_path, handler=handler)
+        # Bounded: without the preflight, start() reaches serve_forever
+        # and this test would hang rather than fail.
+        with pytest.raises(HandlerConfigError, match="not a member"):
+            await asyncio.wait_for(server.start(), timeout=2)
+        assert handler.polling_handler is None, "polling started anyway"
+        assert not socket_path.exists(), "socket bound anyway"
+        await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_passing_preflight_is_run_and_then_the_bridge_starts(
+        self, socket_path
+    ) -> None:
+        """The mirror: the check is reached on the happy path, not only
+        when it fails."""
+        from ctrlrelay.bridge import BridgeServer
+
+        class Verifiable(FakeChatHandler):
+            def __init__(self) -> None:
+                super().__init__()
+                self.preflights = 0
+
+            async def preflight(self) -> None:
+                self.preflights += 1
+
+        handler = Verifiable()
+        server = BridgeServer(socket_path=socket_path, handler=handler)
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        try:
+            assert handler.preflights == 1
+            assert handler.polling_handler is not None
+            assert socket_path.exists()
+        finally:
+            await server.stop()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass

@@ -170,7 +170,8 @@ Create a channel for orchestrator questions, then invite the bot:
 **This is not optional, and the reason is easy to miss.** A bot without
 `post:all` cannot post where it is not a member — and it does not receive the
 reply events for such a channel either. Forget this and questions fail to post
-*and* answers would never arrive.
+*and* answers would never arrive. `ctrlrelay bridge start` checks membership
+before it binds its socket and refuses to start until the bot is invited.
 
 The bot must also be on the team. If `/invite` complains, add it via the
 team's **Invite People** first.

@@ -401,6 +401,12 @@ def bridge_start(
                 loop.run_until_complete(main_task)
             except asyncio.CancelledError:
                 pass
+            except HandlerConfigError as e:
+                # The server's startup preflight (channel membership and
+                # the like) — the same kind of fault as a bad token, so
+                # the same message shape instead of a traceback.
+                console.print(f"[red]Cannot start bridge:[/red] {e}")
+                raise typer.Exit(1)
         finally:
             loop.close()
             try:

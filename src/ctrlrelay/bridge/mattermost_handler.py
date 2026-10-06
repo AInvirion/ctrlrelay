@@ -35,7 +35,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 import websockets
@@ -112,11 +112,15 @@ class MattermostHandler:
         *,
         request_timeout: float = 20.0,
         connect_timeout: float = _CONNECT_TIMEOUT,
+        reconnect_delay: float = 1.0,
     ) -> None:
         self.base_url = url.rstrip("/")
         self.channel_id = channel_id
         self._token = bot_token
         self._connect_timeout = connect_timeout
+        # First retry interval after the socket drops; doubles up to 30s
+        # until a connection authenticates, then starts over from here.
+        self._reconnect_delay = reconnect_delay
         self._client = httpx.AsyncClient(
             base_url=f"{self.base_url}/api/v4",
             headers={"Authorization": f"Bearer {bot_token}"},
@@ -148,11 +152,13 @@ class MattermostHandler:
     async def preflight(self) -> None:
         """Prove the token works and the bot can see its channel.
 
-        Called by the factory at startup. Without it the bridge binds its
-        socket, reports success, and the first blocked session discovers a
+        ``BridgeServer.start`` runs this (via ``verify_handler``) before it
+        opens the event socket or binds its own. Without it the bridge
+        binds, reports success, and the first blocked session discovers a
         403 hours later — and a bot that is not a channel member receives
         no reply events either, so answers would never arrive even if
-        posting somehow worked.
+        posting somehow worked. ``start_polling`` alone does not catch
+        this: it proves the token, not the channel.
         """
         await self._me()
         r = await self._client.get(f"/channels/{self.channel_id}")
@@ -211,16 +217,23 @@ class MattermostHandler:
         ready = asyncio.Event()
         self._poll_task = asyncio.create_task(self._listen_loop(handler, ready))
         waiter = asyncio.create_task(ready.wait())
-        done, _pending = await asyncio.wait(
-            {waiter, self._poll_task},
-            timeout=self._connect_timeout,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        try:
+            done, _pending = await asyncio.wait(
+                {waiter, self._poll_task},
+                timeout=self._connect_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            # Also on the way out through a cancellation (Ctrl+C during
+            # the connect wait): an orphaned waiter is reported as
+            # "Task was destroyed but it is pending" at loop close, which
+            # reads like a bug in the shutdown that was in fact clean.
+            waiter.cancel()
         if waiter in done:
             return
-        waiter.cancel()
-        # The loop task finishing first means it gave up; surface its
-        # exception rather than a generic timeout.
+        # The loop task finishing first means it gave up — on the first
+        # connection a refused token is fatal, see _listen_loop — so
+        # surface its exception rather than a generic timeout.
         if self._poll_task in done:
             exc = self._poll_task.exception()
             await self.stop_polling()
@@ -259,15 +272,36 @@ class MattermostHandler:
     ) -> None:
         """Hold the socket open, reconnecting with backoff.
 
-        Backoff resets only once a connection has **authenticated**, not
-        when the HTTP upgrade succeeds. A server that accepts the upgrade
-        and then refuses the token would otherwise reset the delay on every
-        attempt, so the retry interval would sit at one second forever
-        instead of backing off — a hot loop against a server that is
-        telling us no.
+        Backoff resets only once **this** connection has authenticated,
+        not when the HTTP upgrade succeeds and not because some earlier
+        connection did. A server that accepts the upgrade and then refuses
+        the token would otherwise reset the delay on every attempt, so the
+        retry interval would sit at one second forever instead of backing
+        off — a hot loop against a server that is telling us no. And a
+        connection that authenticated and then held for a day is a healthy
+        one: its drop must be retried promptly, not at whatever delay the
+        last run of failures left behind.
+
+        ``_consume`` never returns — the socket ends by raising — so the
+        reset cannot live after the call. It is driven by the callback,
+        which is the only thing that knows the ack arrived.
+
+        A refused token on the **first** connection is fatal: nothing has
+        ever worked, so there is nothing to keep alive, and the operator is
+        at the terminal that started the bridge. After that it is retried
+        with backoff — a token being rotated under a running bridge should
+        not take the bridge down with it.
         """
-        backoff = 1.0
+        backoff = self._reconnect_delay
         while True:
+            authenticated = False
+
+            def _on_authenticated() -> None:
+                nonlocal authenticated
+                authenticated = True
+                ready.set()
+
+            failure = "closed"
             try:
                 ws = await self._connect()
                 try:
@@ -276,38 +310,35 @@ class MattermostHandler:
                         "action": "authentication_challenge",
                         "data": {"token": self._token},
                     }))
-                    await self._consume(ws, handler, ready, lambda: None)
+                    await self._consume(ws, handler, _on_authenticated)
                 finally:
                     close = getattr(ws, "close", None)
                     if close is not None:
                         await close()
-                backoff = 1.0 if ready.is_set() else min(backoff * 2, 30.0)
             except asyncio.CancelledError:
                 raise
             except MattermostAuthError as e:
-                # A refused token will keep being refused. Keep retrying —
-                # an operator may be rotating it — but back off, and say so
-                # at warning level every time rather than once.
-                _log.warning(
-                    "mattermost websocket authentication refused (%s), "
-                    "retrying in %.0fs", e, backoff,
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                if not ready.is_set():
+                    raise
+                failure = f"authentication refused ({e})"
             except Exception as e:
-                _log.warning(
-                    "mattermost websocket failed (%s), reconnecting in %.0fs",
-                    e, backoff,
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                failure = f"failed ({e})"
+            if authenticated:
+                backoff = self._reconnect_delay
+            # Warning level every time rather than once: a bridge that is
+            # silently failing to reconnect is the same as one that is up.
+            _log.warning(
+                "mattermost websocket %s, reconnecting in %.0fs",
+                failure, backoff,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
     async def _consume(
         self,
         ws: Any,
         handler: IncomingMessageHandler,
-        ready: asyncio.Event | None = None,
-        _unused: Any = None,
+        on_authenticated: Callable[[], None] | None = None,
     ) -> None:
         """Read frames until the socket ends.
 
@@ -327,8 +358,8 @@ class MattermostHandler:
             if event.get("seq_reply") == 1:
                 status = event.get("status")
                 if status == "OK":
-                    if ready is not None:
-                        ready.set()
+                    if on_authenticated is not None:
+                        on_authenticated()
                     continue
                 if status == "FAIL":
                     raise MattermostAuthError(

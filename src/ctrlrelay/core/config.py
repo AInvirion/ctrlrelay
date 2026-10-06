@@ -155,11 +155,6 @@ class MattermostConfig(BaseModel):
     url: str
     bot_token_env: str = "CTRLRELAY_MATTERMOST_TOKEN"
     channel_id: str = ""
-    # Preflight the token and channel membership at startup. On by default:
-    # the alternative is a bridge that binds its socket, reports success,
-    # and lets the first blocked session discover a 403 hours later. Can be
-    # turned off for an air-gapped start where the server is not up yet.
-    preflight: bool = True
     socket_path: Path = Field(
         default_factory=lambda: Path("~/.ctrlrelay/ctrlrelay.sock").expanduser()
     )

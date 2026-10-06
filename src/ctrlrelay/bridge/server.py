@@ -305,6 +305,14 @@ class BridgeServer:
 
     async def start(self) -> None:
         """Start the bridge server."""
+        # Before polling and before binding: a handler that can prove its
+        # channel does so here, so a bot that is not a member of the
+        # channel fails `bridge start` instead of the first ASK hours
+        # later. Raises HandlerConfigError, which both entry points
+        # report as a configuration fault.
+        from ctrlrelay.bridge.factory import verify_handler
+
+        await verify_handler(self.handler)
         await self.handler.start_polling(self._on_reply)
 
         if self.socket_path.exists():

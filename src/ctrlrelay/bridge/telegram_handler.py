@@ -93,8 +93,8 @@ class TelegramHandler:
         configured chat. For each message, invokes
         ``handler(text, reply_to_post_id)`` where reply_to_post_id is the
         id of the question the user replied to as a string (or None for a
-        fresh message). Idempotent — a second call replaces the running
-        loop."""
+        fresh message). Idempotent — a second call while the loop is
+        running is a no-op; it does not replace the loop."""
         if self._poll_task is not None and not self._poll_task.done():
             return
         self._poll_task = asyncio.create_task(self._poll_loop(handler))

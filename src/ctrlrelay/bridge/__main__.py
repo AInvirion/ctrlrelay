@@ -102,6 +102,11 @@ def main() -> None:
         loop.run_until_complete(main_task)
     except asyncio.CancelledError:
         pass
+    except HandlerConfigError as e:
+        # The server's startup preflight: same class of fault as a bad
+        # token above, reported the same way and with the same exit code.
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
     finally:
         loop.close()
         if state_db is not None:

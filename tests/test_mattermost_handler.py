@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import httpx
 import pytest
@@ -167,10 +168,17 @@ class TestAmbiguousDelivery:
 
 
 class _FakeSocket:
-    """Yields canned frames then blocks, like a real idle socket."""
+    """Yields canned frames then blocks, like a real idle socket.
 
-    def __init__(self, frames: list[dict]) -> None:
+    With ``then_raise`` it ends the way a real socket ends instead — by
+    raising out of ``recv`` — which is what drives the reconnect loop.
+    """
+
+    def __init__(
+        self, frames: list[dict], then_raise: BaseException | None = None
+    ) -> None:
         self._frames = list(frames)
+        self._then_raise = then_raise
         self.sent: list[dict] = []
 
     async def send(self, raw: str) -> None:
@@ -179,6 +187,8 @@ class _FakeSocket:
     async def recv(self) -> str:
         if self._frames:
             return json.dumps(self._frames.pop(0))
+        if self._then_raise is not None:
+            raise self._then_raise
         await asyncio.sleep(3600)
         raise AssertionError("unreachable")
 
@@ -388,8 +398,67 @@ class TestStartPollingWaitsForTheSocket:
             return None
 
         with pytest.raises(MattermostAuthError, match="token expired"):
-            await h._consume(ws, collect, asyncio.Event())
+            await h._consume(ws, collect)
         await h.close()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_token_fails_start_polling_at_once(self) -> None:
+        """The operator-facing half of the test above.
+
+        `_consume` raising is not the same as `bridge start` failing: the
+        listen loop used to catch the refusal and retry with backoff, so
+        `start_polling` sat out its whole connect timeout and then raised
+        a generic "not authenticated within 30s" while the real reason —
+        "token expired" — had gone to the log at warning level. On the
+        first connection nothing has ever worked, so there is nothing to
+        keep alive by retrying; the refusal is the answer.
+
+        connect_timeout is deliberately long: if the loop retries instead
+        of raising, this fails with TimeoutError, not by taking a while.
+        """
+        from ctrlrelay.bridge.mattermost_handler import MattermostAuthError
+
+        h = _handler(_ok, connect_timeout=5.0)
+        ws = _FakeSocket([{
+            "status": "FAIL", "seq_reply": 1,
+            "error": {"message": "token expired"},
+        }])
+        h._connect = lambda: _as_coro(ws)  # type: ignore[method-assign]
+
+        async def noop(text: str, reply_to: str | None) -> None:
+            return None
+
+        with pytest.raises(MattermostAuthError, match="token expired"):
+            await h.start_polling(noop)
+        assert h._poll_task is None
+        await h.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_connect_wait_leaves_no_orphaned_task(
+        self,
+    ) -> None:
+        """Ctrl+C during the connect wait. The internal `ready.wait()`
+        task must be cancelled on that path too, or the loop reports
+        "Task was destroyed but it is pending" at close — on a shutdown
+        that was in fact clean."""
+        h = _handler(_ok, connect_timeout=5.0)
+        h._connect = lambda: _as_coro(_FakeSocket([]))  # type: ignore[method-assign]
+
+        async def noop(text: str, reply_to: str | None) -> None:
+            return None
+
+        starting = asyncio.create_task(h.start_polling(noop))
+        await asyncio.sleep(0.05)
+        starting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await starting
+        await h.close()
+        orphans = [
+            t for t in asyncio.all_tasks()
+            if t is not asyncio.current_task()
+            and t.get_coro().__qualname__ == "Event.wait"
+        ]
+        assert orphans == []
 
     @pytest.mark.asyncio
     async def test_a_posted_event_interleaved_with_the_ack_is_not_lost(
@@ -412,7 +481,7 @@ class TestStartPollingWaitsForTheSocket:
             _posted(message="later answer"),
         ])
         ready = asyncio.Event()
-        task = asyncio.create_task(h._consume(ws, collect, ready))
+        task = asyncio.create_task(h._consume(ws, collect, ready.set))
         for _ in range(50):
             await asyncio.sleep(0.01)
             if not ws._frames:
@@ -454,3 +523,223 @@ class TestStartPollingWaitsForTheSocket:
         await h.close()
 
 
+
+
+async def _noop(text: str, reply_to: str | None) -> None:
+    return None
+
+
+class TestReconnectBackoff:
+    """The listen loop's retry interval, read from its own warning records.
+
+    `reconnect_delay` is the first interval and doubles to a 30s cap. The
+    records carry the delay as a formatting argument, so the assertions
+    are about the number the loop will sleep for rather than about how
+    long the test took — timing would be flaky and would not distinguish
+    "reset" from "small".
+    """
+
+    @staticmethod
+    def _delays(caplog) -> list[float]:
+        return [
+            r.args[-1]
+            for r in caplog.records
+            if r.name == "ctrlrelay.bridge.mattermost_handler"
+            and "reconnecting in" in r.getMessage()
+        ]
+
+    @staticmethod
+    async def _until(cond, *, tries: int = 300) -> None:
+        for _ in range(tries):
+            if cond():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("condition not met in time")
+
+    @pytest.mark.asyncio
+    async def test_backoff_restarts_after_an_authenticated_connection_drops(
+        self, caplog
+    ) -> None:
+        """A connection that authenticated and then dropped was healthy.
+
+        The reset used to sit after the `_consume` call — which never
+        returns, because a socket ends by raising — so it was dead code and
+        every drop doubled the delay: a bridge that lost its socket five
+        times in a week was then waiting the full 30s on every later drop,
+        and each of those seconds is a window in which a `posted` event is
+        lost for good.
+        """
+        h = _handler(_ok, connect_timeout=2.0, reconnect_delay=0.01)
+        connects: list[_FakeSocket] = []
+
+        async def connect() -> _FakeSocket:
+            ws = _FakeSocket(
+                [{"status": "OK", "seq_reply": 1}],
+                then_raise=ConnectionError("server restarted"),
+            )
+            connects.append(ws)
+            return ws
+
+        h._connect = connect  # type: ignore[method-assign]
+        with caplog.at_level(logging.WARNING, logger="ctrlrelay"):
+            await h.start_polling(_noop)
+            await self._until(lambda: len(connects) >= 4)
+        await h.close()
+
+        delays = self._delays(caplog)
+        assert len(delays) >= 3
+        assert delays == [0.01] * len(delays), delays
+
+    @pytest.mark.asyncio
+    async def test_backoff_grows_while_connections_never_authenticate(
+        self, caplog
+    ) -> None:
+        """The mirror: the reset must not fire for a connection that only
+        upgraded. A server accepting the upgrade and dropping us before
+        the ack would otherwise be retried at the floor forever."""
+        h = _handler(_ok, connect_timeout=2.0, reconnect_delay=0.01)
+        sockets = [
+            _FakeSocket(
+                [{"status": "OK", "seq_reply": 1}],
+                then_raise=ConnectionError("dropped"),
+            ),
+        ]
+        connects: list[_FakeSocket] = []
+
+        async def connect() -> _FakeSocket:
+            ws = sockets.pop(0) if sockets else _FakeSocket(
+                [], then_raise=ConnectionError("dropped before ack")
+            )
+            connects.append(ws)
+            return ws
+
+        h._connect = connect  # type: ignore[method-assign]
+        with caplog.at_level(logging.WARNING, logger="ctrlrelay"):
+            await h.start_polling(_noop)
+            await self._until(lambda: len(connects) >= 4)
+        await h.close()
+
+        delays = self._delays(caplog)
+        # First drop followed an authenticated connection: floor. The next
+        # two did not: doubling.
+        assert delays[:3] == [0.01, 0.02, 0.04], delays
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_after_startup_is_retried_not_fatal(
+        self, caplog
+    ) -> None:
+        """A token rotated under a running bridge. The first connection
+        refusing is fatal (see start_polling); a later one is not, because
+        taking the bridge down loses every question in flight and the
+        operator is not at a terminal to see why."""
+        h = _handler(_ok, connect_timeout=2.0, reconnect_delay=0.01)
+        sockets = [
+            _FakeSocket(
+                [{"status": "OK", "seq_reply": 1}],
+                then_raise=ConnectionError("dropped"),
+            ),
+            _FakeSocket([{
+                "status": "FAIL", "seq_reply": 1,
+                "error": {"message": "token revoked"},
+            }]),
+            _FakeSocket([{"status": "OK", "seq_reply": 1}]),
+        ]
+        connects: list[_FakeSocket] = []
+
+        async def connect() -> _FakeSocket:
+            ws = sockets.pop(0) if sockets else _FakeSocket([])
+            connects.append(ws)
+            return ws
+
+        h._connect = connect  # type: ignore[method-assign]
+        with caplog.at_level(logging.WARNING, logger="ctrlrelay"):
+            await h.start_polling(_noop)
+            await self._until(lambda: len(connects) >= 3)
+            await asyncio.sleep(0.05)
+        assert h._poll_task is not None and not h._poll_task.done()
+        await h.close()
+        assert any(
+            "token revoked" in r.getMessage() for r in caplog.records
+        ), "the refusal must be in the log, not swallowed"
+
+
+class TestPreflight:
+    """What `start_polling` cannot prove: that the channel exists and the
+    bot is in it. A bot outside the channel gets a 403 on its first post
+    and — the part that matters — no reply events, so a question that
+    somehow posted would never be answered."""
+
+    @staticmethod
+    def _server(member: bool, channel_exists: bool = True):
+        calls: list[str] = []
+
+        def responder(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            calls.append(path)
+            if path.endswith(f"/channels/{CHANNEL}/members/{BOT_ID}"):
+                if member:
+                    return httpx.Response(200, json={"user_id": BOT_ID})
+                return httpx.Response(404, json={"message": "no such member"})
+            if path.endswith(f"/channels/{CHANNEL}"):
+                if channel_exists:
+                    return httpx.Response(200, json={"id": CHANNEL})
+                return httpx.Response(404, json={"message": "no such channel"})
+            return _ok(request)
+
+        return responder, calls
+
+    @pytest.mark.asyncio
+    async def test_a_bot_outside_the_channel_is_refused_with_the_fix(
+        self,
+    ) -> None:
+        from ctrlrelay.bridge.mattermost_handler import MattermostAuthError
+
+        responder, _calls = self._server(member=False)
+        h = _handler(responder)
+        with pytest.raises(MattermostAuthError, match="/invite"):
+            await h.preflight()
+        await h.close()
+
+    @pytest.mark.asyncio
+    async def test_a_missing_channel_is_refused(self) -> None:
+        responder, _calls = self._server(member=False, channel_exists=False)
+        h = _handler(responder)
+        with pytest.raises(httpx.HTTPStatusError):
+            await h.preflight()
+        await h.close()
+
+    @pytest.mark.asyncio
+    async def test_a_member_bot_passes_and_asks_the_three_questions(
+        self,
+    ) -> None:
+        responder, calls = self._server(member=True)
+        h = _handler(responder)
+        await h.preflight()
+        await h.close()
+        assert any(p.endswith("/users/me") for p in calls)
+        assert any(p.endswith(f"/channels/{CHANNEL}") for p in calls)
+        assert any(p.endswith(f"/members/{BOT_ID}") for p in calls)
+
+    @pytest.mark.asyncio
+    async def test_the_bridge_server_runs_it_before_binding(
+        self, tmp_path
+    ) -> None:
+        """The method existed and nothing called it: `verify_handler` was
+        defined in the factory and reached from nowhere, and the config
+        carried a `preflight: true` that nothing read. A bot outside its
+        channel started cleanly and failed on the first ASK, hours later —
+        the exact outcome the docstring said the check prevented."""
+        from ctrlrelay.bridge import BridgeServer, HandlerConfigError
+
+        responder, _calls = self._server(member=False)
+        h = _handler(responder, connect_timeout=0.5)
+        # Keep it off the network if the preflight is skipped: the socket
+        # then upgrades and never acks, and start_polling times out.
+        h._connect = lambda: _as_coro(_FakeSocket([]))  # type: ignore[method-assign]
+        socket_path = tmp_path / "b.sock"
+        server = BridgeServer(socket_path=socket_path, handler=h)
+        with pytest.raises(HandlerConfigError, match="not a member"):
+            await asyncio.wait_for(server.start(), timeout=2)
+        assert h._poll_task is None, "polling must not start on a failed preflight"
+        assert not socket_path.exists(), "the socket must not bind either"
+        await server.stop()
