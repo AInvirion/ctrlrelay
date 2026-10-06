@@ -160,3 +160,46 @@ def test_the_contract_is_one_source_shared_with_the_initial_prompt(
         assert "pr_url" in contract, "dev's DONE carries the PR outputs"
     else:
         assert "pr_url" not in contract
+
+
+@pytest.mark.parametrize("mod", PIPELINES)
+def test_every_checkpoint_snippet_creates_its_own_directory(mod: str) -> None:
+    """Each snippet must be self-sufficient (#189).
+
+    `task.py` had the `mkdir -p` on DONE only. That cost nothing, because
+    the orchestrator pre-creates the directory at `task.py:343` and
+    `:605` - so this was latent, not a live defect, and it is asserted
+    here as a consistency property rather than a bug repro.
+
+    The reason it is worth pinning: the `mkdir` is what makes a snippet
+    independent of who created the directory. Without it, a snippet
+    relies on a pre-creation two call sites away with nothing connecting
+    them, and if that ever moves, **BLOCKED and FAILED stop being
+    writable while DONE keeps working** - the failure appears only on the
+    paths that report trouble, and looks exactly like the agent crashing.
+
+    Counted rather than read, and counted on the RENDERED contract rather
+    than the source, so a fourth pipeline is held the day it is added.
+
+    Deliberately not asserted: that the agent writes BLOCKED
+    successfully. That passes today with the fault present, because the
+    directory already exists - it would measure the pre-creation and not
+    this.
+    """
+    contract = _pipeline(mod)._checkpoint_contract(
+        "/wt/.ctrlrelay/state.json", "sid-1"
+    )
+
+    writes = contract.count("printf ")
+    mkdirs = contract.count('mkdir -p "$(dirname ')
+
+    # Negative control: a contract that rendered no snippets at all would
+    # otherwise satisfy 0 == 0.
+    assert writes == 3, (
+        f"{mod}: expected DONE, BLOCKED and FAILED snippets, found {writes}"
+    )
+    assert mkdirs == writes, (
+        f"{mod}: {writes} checkpoint snippets but only {mkdirs} create the "
+        "directory first; the ones without it depend on somebody else "
+        "having made it"
+    )
