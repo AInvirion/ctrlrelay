@@ -81,9 +81,17 @@ async def test_the_resume_prompt_carries_the_checkpoint_contract(
 
     assert pipeline.dispatcher.spawn_session.await_count == 1
     sent = pipeline.dispatcher.spawn_session.await_args
-    prompt = " ".join(str(a) for a in sent.args) + " ".join(
-        f"{k}={v}" for k, v in sent.kwargs.items()
+
+    # The PROMPT only. An earlier version of this test joined every
+    # argument into one blob, and `working_dir` happens to contain the
+    # state file path - so the "names the state file" assertion passed
+    # against the reverted code, for a reason that had nothing to do
+    # with the prompt.
+    assert "prompt" in sent.kwargs, (
+        f"prompt is not a keyword argument here: {sent.kwargs.keys()}"
     )
+    prompt = sent.kwargs["prompt"]
+    assert isinstance(prompt, str)
 
     assert "Approved" in prompt, "the answer must still reach the agent"
     assert "Continue from where you left off" in prompt
