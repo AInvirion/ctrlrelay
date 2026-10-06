@@ -1087,8 +1087,13 @@ class TestStaleReplyToDoesNotMisroute:
         yield Path(d) / "b.sock"
         shutil.rmtree(d, ignore_errors=True)
 
-    async def _server_with_two_blocked(self, socket_path, tmp_path):
-        """Session A (pointed at by the reply-to) plus one other, B."""
+    async def _server_with_blocked(self, socket_path, tmp_path, *, extra=False):
+        """Session A (pointed at by the reply-to) plus B, optionally plus C.
+
+        ``extra`` adds C so that B is NOT the only row left once A is out
+        of the running. Without it, a test asserting "the typed id routed"
+        is indistinguishable from the single-row guess picking B anyway.
+        """
         from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.server import BridgeServer
@@ -1113,6 +1118,13 @@ class TestStaleReplyToDoesNotMisroute:
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
         server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        if extra:
+            db.add_pending_resume(
+                session_id="secops-owner-c-ccc",
+                pipeline="secops",
+                repo="owner/c",
+                question="merge the mypy bump?",
+            )
         # The operator is replying to the message we posted for session A.
         server._asked_sessions[999] = "secops-owner-a-aaa"
         return server, db, task
@@ -1121,7 +1133,7 @@ class TestStaleReplyToDoesNotMisroute:
     async def test_reply_to_already_answered_session_leaves_the_other_alone(
         self, socket_path, tmp_path,
     ) -> None:
-        server, db, task = await self._server_with_two_blocked(socket_path, tmp_path)
+        server, db, task = await self._server_with_blocked(socket_path, tmp_path)
 
         # A has been answered already — by an earlier reply, or by the same
         # answer arriving twice from two chat clients.
@@ -1156,7 +1168,7 @@ class TestStaleReplyToDoesNotMisroute:
         listing, so a reply to a question retired by `question_ttl_seconds`
         hit the identical guess.
         """
-        server, db, task = await self._server_with_two_blocked(socket_path, tmp_path)
+        server, db, task = await self._server_with_blocked(socket_path, tmp_path)
 
         assert db.expire_pending_resume("secops-owner-a-aaa", "ttl") is True
 
@@ -1184,8 +1196,17 @@ class TestStaleReplyToDoesNotMisroute:
         a session_id is not. So when the reply-to is stale but the operator
         named another session explicitly, that answer still lands — the fix
         must not turn a deliberate answer into a refusal.
+
+        THREE sessions on purpose. With only A and B, answering A leaves B
+        as the single unanswered row, so the old `len(rows) == 1` guess
+        would also have landed on B and this test would pass without the
+        typed id mattering at all. C makes the typed id the only thing that
+        can select B: guessing is no longer available, and the alternative
+        outcome is a refusal.
         """
-        server, db, task = await self._server_with_two_blocked(socket_path, tmp_path)
+        server, db, task = await self._server_with_blocked(
+            socket_path, tmp_path, extra=True,
+        )
 
         assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
 
@@ -1197,9 +1218,84 @@ class TestStaleReplyToDoesNotMisroute:
         assert b["answer"] == "secops-owner-b-bbb yes merge it"
         assert b["answered_at"] is not None
 
+        # C was never a candidate and must be untouched.
+        c = db.get_pending_resume("secops-owner-c-ccc")
+        assert c["answer"] is None
+        assert c["answered_at"] is None
+
         sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "Answer queued" in sent
 
         db.close()
         await server.stop()
         task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_longer_session_id_is_not_read_as_naming_a_shorter_one(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """Naming one session must not route a different one by prefix.
+
+        `session_id in text` is a substring test, not an identifier match.
+        A reply naming `...-bbb2` also contains `...-bbb`, so the shorter
+        row would claim an answer written for the longer one — the very
+        wrong-session routing this change exists to stop, reintroduced
+        through the branch that is supposed to honour an explicit id.
+        """
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-owner-b-bbb",
+            pipeline="secops",
+            repo="owner/b",
+            question="merge the torch bump?",
+        )
+        db.add_pending_resume(
+            session_id="secops-owner-c-ccc",
+            pipeline="secops",
+            repo="owner/c",
+            question="merge the mypy bump?",
+        )
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        # Names a session that is not in the table at all, but whose id
+        # has the live `...-bbb` as a prefix.
+        await server._on_telegram_reply(
+            "secops-owner-b-bbb2 approved", reply_to_message_id=None,
+        )
+
+        b = db.get_pending_resume("secops-owner-b-bbb")
+        assert b["answer"] is None, "a prefix match claimed another id's answer"
+        assert b["answered_at"] is None
+        assert db.list_pending_resumes_to_execute() == []
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    def test_names_session_requires_a_whole_token(self) -> None:
+        """Direct coverage of the matcher, including both boundaries."""
+        from ctrlrelay.bridge.server import names_session
+
+        sid = "secops-owner-b-bbb"
+        assert names_session(f"{sid} approved", sid)
+        assert names_session(f"approved {sid}", sid)
+        assert names_session(f"re {sid}, merge it", sid)
+        assert names_session(f"`{sid}`", sid)
+        assert names_session(sid, sid)
+        # Longer ids must not match the shorter one, in either direction.
+        assert not names_session(f"{sid}2 approved", sid)
+        assert not names_session(f"{sid}-x approved", sid)
+        assert not names_session(f"{sid}_x approved", sid)
+        assert not names_session(f"x{sid} approved", sid)
+        assert not names_session("nothing here", sid)
+        assert not names_session("anything", "")

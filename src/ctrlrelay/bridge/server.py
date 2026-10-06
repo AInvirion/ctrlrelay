@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import stat
 import time
 from collections import OrderedDict
@@ -37,6 +38,29 @@ _log = logging.getLogger(__name__)
 # a routing convenience, not a source of truth — losing an entry degrades to
 # the session_id-substring path, never to a wrong resume.
 _ASKED_SESSIONS_MAX = 500
+
+
+def names_session(text: str, session_id: str) -> bool:
+    """True when ``text`` names ``session_id`` as a whole token.
+
+    A plain ``session_id in text`` is a substring test, and a substring
+    test is not an identifier match: a reply naming
+    ``secops-owner-r-abc123`` also contains ``secops-owner-r-abc12``, so
+    the shorter id would claim an answer written for the longer one. Our
+    session ids end in a fixed-width hash, which makes that collision
+    unlikely between two real ids rather than impossible — and "unlikely"
+    is not the property this function needs to have, because what it
+    decides is which pipeline gets resumed.
+
+    Hyphen and underscore count as part of an id, not as boundaries, so a
+    longer id is never read as containing a shorter one.
+    """
+    if not session_id:
+        return False
+    return re.search(
+        r"(?<![0-9A-Za-z_-])" + re.escape(session_id) + r"(?![0-9A-Za-z_-])",
+        text,
+    ) is not None
 
 
 def format_question(
@@ -577,6 +601,14 @@ class BridgeServer:
                 "unknown": (
                     f"session `{sid}` has no question waiting for an answer."
                 ),
+                "superseded": (
+                    f"session `{sid}` has since asked a NEWER question, so "
+                    "this reply was not applied to the old one."
+                ),
+                "unchecked": (
+                    f"session `{sid}` could not be checked — the state "
+                    "database did not answer, so nothing was applied."
+                ),
             }[outcome["reason"]]
             await self._send_notice(
                 f"⚠️ Your reply wasn't routed — {detail}\n\n"
@@ -689,9 +721,9 @@ class BridgeServer:
           guess. The sender is told which session_ids exist so they can
           retry with one included.
         - ``"stale_hint"`` with ``session_id`` and ``reason`` (one of
-          ``"answered"``, ``"expired"``, ``"unknown"``) — the operator
-          pointed at a specific question that cannot take an answer.
-          Nothing is routed; see below.
+          ``"answered"``, ``"expired"``, ``"superseded"``, ``"unknown"``,
+          ``"unchecked"``) — the operator pointed at a specific question
+          that cannot take an answer. Nothing is routed; see below.
         - ``"none"`` — no state_db, no unanswered rows, or DB error.
 
         Disambiguation rules, in order:
@@ -749,14 +781,14 @@ class BridgeServer:
             # A typed id outranks a reply-to gesture: replying to the wrong
             # message in a busy chat is an easy slip, typing a session_id
             # is not.
-            named = [r for r in rows if r["session_id"] in text]
+            named = [r for r in rows if names_session(text, r["session_id"])]
             if len(named) == 1:
                 return await self._attach_orphan_answer(named[0], text)
             if len(named) > 1:
                 return {"status": "ambiguous", "rows": named}
             return self._describe_stale_hint(session_id)
 
-        matched_by_id = [r for r in rows if r["session_id"] in text]
+        matched_by_id = [r for r in rows if names_session(text, r["session_id"])]
         if len(matched_by_id) == 1:
             target = matched_by_id[0]
         elif len(matched_by_id) > 1:
@@ -776,18 +808,24 @@ class BridgeServer:
 
         The operator pointed at a real question of ours — ``session_id``
         came out of ``_asked_sessions``, so we posted it. It is simply not
-        routable any more, and the operator deserves to know which of the
-        three reasons applies rather than a generic refusal that reads like
-        the bridge lost their answer.
+        routable any more, and the operator deserves to know which reason
+        applies rather than a generic refusal that reads like the bridge
+        lost their answer.
 
-        Never raises: this runs on the reply path, and a DB error here must
-        degrade to "unknown" rather than take down routing.
+        Never raises: this runs on the reply path, and a failed lookup must
+        degrade to a reason rather than take down routing. It degrades to
+        ``"unchecked"``, not to ``"unknown"`` — "I could not look" and
+        "there is nothing there" are different claims, and collapsing them
+        would put a confident sentence in front of the operator on the
+        strength of a database error.
         """
         row = None
+        looked = self.state_db is not None
         if self.state_db is not None:
             try:
                 row = self.state_db.get_pending_resume(session_id)
             except Exception as e:
+                looked = False
                 log_event(
                     _logger,
                     "bridge.pending_resume.get_failed",
@@ -795,17 +833,26 @@ class BridgeServer:
                     reason=type(e).__name__,
                     error=str(e)[:200],
                 )
-        if row is None:
+        if not looked:
+            reason = "unchecked"
+        elif row is None:
             reason = "unknown"
         elif row["answered_at"] is not None:
+            # Deliberate precedence: the taxonomy is not mutually
+            # exclusive, and a row carrying both timestamps reports as
+            # answered. An answer that was recorded is the more useful
+            # thing to tell the operator than the expiry that followed it.
             reason = "answered"
         elif row["expired_at"] is not None:
             reason = "expired"
         else:
             # Unanswered and unexpired, yet absent from the listing that
-            # produced `rows`. Only a concurrent write explains it, so say
-            # unknown rather than invent a story.
-            reason = "unknown"
+            # produced `rows`. A concurrent write re-opened this session
+            # between the two reads, so the row in front of us is not the
+            # one the operator's reply was about. Refusing is right; saying
+            # "no question is waiting" would be flatly false, because one
+            # is — a newer one.
+            reason = "superseded"
         log_event(
             _logger,
             "bridge.answer.refused_stale_hint",
