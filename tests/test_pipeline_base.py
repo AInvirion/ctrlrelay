@@ -77,12 +77,18 @@ class TestFailureText:
         )
 
     def test_the_2026_09_16_alert_names_the_reason_and_the_exit_code(self) -> None:
-        """Drives the whole operator path, not just the formatter.
+        """The incident's own inputs, through the pipeline's conversion.
 
-        Agent exits 0, writes no checkpoint, stderr empty — exactly the
-        incident. Asserted as the complete sentence rather than as
-        `"Unknown error" not in text`, because an absence assertion here
-        would also pass for an empty alert.
+        Agent exits 0, writes no checkpoint, stderr empty. Asserted as
+        the complete sentence rather than as `"Unknown error" not in
+        text`, because an absence assertion here would also pass for an
+        empty alert.
+
+        Scope, stated precisely: this drives `_session_to_result` into
+        `failure_text`, which is where the incident's text was decided.
+        It does NOT drive any alert sender, so reverting a caller would
+        leave it green. The call sites are held by
+        `TestEveryAlertGoesThroughFailureText`, and only by that class.
         """
         from ctrlrelay.core.dispatcher import SessionResult
         from ctrlrelay.pipelines.base import failure_text
@@ -425,6 +431,30 @@ class TestResultConstructionHazards:
                 "No checkpoint state returned (agent exit code 0)"
             )
 
+            # `error is None` above would also pass for an
+            # implementation that merely forwarded the field, so pin the
+            # two cases that separate "stripped and emptied" from
+            # "passed straight through": whitespace-only must collapse
+            # to None, and real text must survive with padding removed.
+            blank = pipeline._session_to_result(
+                SessionResult(
+                    session_id="sess",
+                    exit_code=0,
+                    state=None,
+                    stderr="   \n",
+                )
+            )
+            assert blank.error is None
+            padded = pipeline._session_to_result(
+                SessionResult(
+                    session_id="sess",
+                    exit_code=0,
+                    state=None,
+                    stderr="  boom  ",
+                )
+            )
+            assert padded.error == "boom"
+
     def test_no_call_site_builds_a_pipeline_result_positionally(self) -> None:
         """Holds the field ordering, rather than only correcting it.
 
@@ -459,3 +489,35 @@ class TestResultConstructionHazards:
             "these pass PipelineResult fields positionally, so adding or "
             f"reordering a field silently re-maps them: {offenders}"
         )
+
+
+    def test_a_mutated_checkpoint_still_yields_an_informative_alert(self) -> None:
+        """The one reachable way `state.error` goes falsy at that line.
+
+        A review round claimed the task conversion was untested for an
+        absent error. As stated that is wrong: the validator makes the
+        input unconstructable, which is why the fallback there was dead
+        code. But `CheckpointState` sets neither `frozen` nor
+        `validate_assignment`, so assignment after construction bypasses
+        the validator, and that path IS reachable. Measured: it yields
+        `Task failed (agent exit code 3)` - no crash, exit code still
+        named. Pinned so that stays true.
+        """
+        from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.base import failure_text
+        from ctrlrelay.pipelines.task import TaskPipeline
+
+        state = CheckpointState(
+            version="1",
+            status=CheckpointStatus.FAILED,
+            session_id="task-owner-repo-1-abc",
+            error="real reason",
+        )
+        state.error = None
+
+        result = TaskPipeline.__new__(TaskPipeline)._session_to_result(
+            SessionResult(session_id="x", exit_code=3, state=state)
+        )
+
+        assert failure_text(result) == "Task failed (agent exit code 3)"

@@ -52,7 +52,13 @@ def failure_text(result: PipelineResult) -> str:
     result.summary`` expressions, so fixing the one named in the report
     would have left the same useless alert reachable three other ways.
 
-    ``error`` used to win over ``summary`` unconditionally. A pipeline
+    ``error`` used to win over ``summary`` whenever it was truthy - and
+    the manufactured fallback guaranteed it always was, which is what
+    made the precedence bite. (An earlier draft of this docstring said
+    "unconditionally", which is false: ``error or summary`` yields
+    ``summary`` for an empty or absent ``error``. Overstating it would
+    have given the next reader a true reason to dismiss the rest.) A
+    pipeline
     whose agent exited 0 with empty stderr set
     ``summary="No checkpoint state returned"`` and then
     ``error="Unknown error"`` one line below it, so the alert said
