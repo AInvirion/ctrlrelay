@@ -151,9 +151,29 @@ class TestBridgeSocketSettings:
         )
         assert _bridge_socket_settings(config) is None
 
+        # Paired in the same test so it cannot pass for a helper that
+        # returns None unconditionally - which `is None` alone would.
+        chat = _config(
+            tmp_path,
+            {
+                "type": "mattermost",
+                "mattermost": {
+                    "url": "https://chat.example.test",
+                    "socket_path": str(tmp_path / "mm.sock"),
+                    "bot_token_env": "MM",
+                    "channel_id": "c" * 26,
+                },
+            },
+        )
+        assert _bridge_socket_settings(chat) is not None
+
 
 class TestOnlyTheHelperNamesATransport:
     """Holds the shape, so an eighth call site cannot reintroduce it.
+
+    The transport names are read from `TransportConfig`'s own fields
+    rather than listed, so a transport added later is covered the day it
+    is added rather than the day somebody remembers this test.
 
     This is the guard that would have caught #181. `_bridge_socket_settings`
     was added precisely to end this fault and its own docstring names the
@@ -168,6 +188,20 @@ class TestOnlyTheHelperNamesATransport:
 
         source = Path(cli_mod.__file__).read_text()
         tree = ast.parse(source)
+
+        # Derived from the model, never listed here. A hardcoded
+        # ("telegram", "mattermost") is an enumeration wearing a guard's
+        # clothes: adding a `slack` block would leave this green while
+        # a new call site reached for it directly, which is #181 again
+        # with a different name.
+        from ctrlrelay.core.config import TransportConfig
+
+        transport_blocks = {
+            name for name in TransportConfig.model_fields if name != "type"
+        }
+        assert {"telegram", "mattermost"} <= transport_blocks, (
+            f"model fields moved; guard is reading {transport_blocks}"
+        )
 
         allowed = "_bridge_socket_settings"
         offenders: list[str] = []
@@ -187,7 +221,7 @@ class TestOnlyTheHelperNamesATransport:
             # config.transport.<name>
             if not isinstance(node, ast.Attribute):
                 continue
-            if node.attr not in ("telegram", "mattermost"):
+            if node.attr not in transport_blocks:
                 continue
             base = node.value
             if not (
