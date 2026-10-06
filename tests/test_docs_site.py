@@ -145,6 +145,21 @@ def test_ci_runs_the_whole_suite():
     guard stops guarding); `--ignore tests/x` with a space slipped past a
     pattern that required `--ignore=`; and the guard reported clean when
     it had inspected no pytest command at all.
+
+    **What this does NOT stop, stated so the paragraph above is not the
+    false sentence.** It reads text, so an author actively evading it
+    wins: `--ig"nore"` reaches pytest as `--ignore` and no pattern here
+    sees it. That is not worth chasing - every fix is defeated by the
+    next quoting trick, and anyone editing the workflow to dodge this
+    guard can edit this file just as easily. The fault in #179 was
+    **inherited, not evasive**: a reason that was true once, left in
+    place, nodded past by every later reader. That is what this catches.
+
+    One known false positive: a run script that *prints* an example
+    containing an exclusion flag - `echo "e.g. pytest --ignore tests/x"` -
+    is reported. Deliberately not fixed, because telling the quoted from
+    the executed needs a shell parser, which is more machinery than the
+    defect. Do not write that line; if you must, name it here.
     """
     import re
 
@@ -166,10 +181,21 @@ def test_ci_runs_the_whole_suite():
                 if isinstance(script, str):
                     runs.append((f"{wf.name}:{job_name}", script))
 
+    def _code_lines(script: str) -> list[str]:
+        """The lines of a run script that are not comments."""
+        return [
+            line
+            for line in script.splitlines()
+            if not line.lstrip().startswith("#")
+        ]
+
     invocations = [
         (where, script)
         for where, script in runs
-        if re.search(r"(?<![\w-])pytest(?![\w-])", script)
+        if any(
+            re.search(r"(?<![\w-])pytest(?![\w-])", line)
+            for line in _code_lines(script)
+        )
     ]
 
     # Invariant D, as a POSITIVE assertion. `offenders == []` alone passes
