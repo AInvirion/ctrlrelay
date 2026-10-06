@@ -3,6 +3,7 @@
 import asyncio
 import os
 import shutil
+import sqlite3
 import stat
 import tempfile
 from pathlib import Path
@@ -1299,3 +1300,81 @@ class TestStaleReplyToDoesNotMisroute:
         assert not names_session(f"x{sid} approved", sid)
         assert not names_session("nothing here", sid)
         assert not names_session("anything", "")
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_that_fails_says_so_rather_than_claiming_nothing_waits(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """"I could not look" must not be reported as "nothing is there".
+
+        A mutation sweep caught this one: collapsing this reason back into
+        `unknown` passed every other test in this class, which means the
+        distinction had no test behind it at all. The operator-facing cost
+        is a confident false sentence — "no question is waiting" — issued
+        on the strength of a database error.
+        """
+        server, db, task = await self._server_with_blocked(socket_path, tmp_path)
+
+        assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
+
+        real_get = db.get_pending_resume
+
+        def boom(_session_id):
+            raise sqlite3.OperationalError("database is locked")
+
+        db.get_pending_resume = boom  # type: ignore[method-assign]
+
+        await server._on_telegram_reply("approved", reply_to_message_id=999)
+
+        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "could not be checked" in sent
+        assert "no question waiting" not in sent
+        # Routed nothing, which is the part that matters. A's own row is
+        # queued by this test's setup — that is the deliberate answer, not
+        # a misroute — so the assertion is about B.
+        b = real_get("secops-owner-b-bbb")
+        assert b["answer"] is None
+        assert b["answered_at"] is None
+        assert [r["session_id"] for r in db.list_pending_resumes_to_execute()] == [
+            "secops-owner-a-aaa"
+        ]
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_reopened_session_is_called_superseded_not_unknown(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """A row re-opened between the two reads has a NEWER question.
+
+        The listing is read first, then the hinted row. A session that
+        re-blocks in that window is absent from the listing but live in the
+        table. Refusing is right — this reply was about the old question —
+        but telling the operator no question is waiting would be false,
+        because one is.
+        """
+        server, db, task = await self._server_with_blocked(socket_path, tmp_path)
+
+        # A is live and unanswered in the table, but the listing the router
+        # works from does not contain it: exactly the state a concurrent
+        # re-block produces between the two reads.
+        real_list = db.list_unanswered_pending_resumes
+        db.list_unanswered_pending_resumes = lambda: [  # type: ignore[method-assign]
+            r for r in real_list() if r["session_id"] != "secops-owner-a-aaa"
+        ]
+
+        await server._on_telegram_reply("approved", reply_to_message_id=999)
+
+        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "NEWER question" in sent
+        assert "no question waiting" not in sent
+
+        # Neither A's newer question nor B was answered by the old reply.
+        assert db.get_pending_resume("secops-owner-a-aaa")["answer"] is None
+        assert db.get_pending_resume("secops-owner-b-bbb")["answer"] is None
+
+        db.close()
+        await server.stop()
+        task.cancel()
