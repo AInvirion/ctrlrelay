@@ -236,6 +236,7 @@ printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\\
 
 **BLOCKED** (need operator input):
 ```bash
+mkdir -p "$(dirname '{state_file_path}')"
 printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\\
 '"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > '{state_file_path}'
@@ -243,6 +244,7 @@ printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\\
 
 **FAILED** (genuine failure, no way forward):
 ```bash
+mkdir -p "$(dirname '{state_file_path}')"
 printf '{{"version":"1","status":"FAILED",'\\
 '"session_id":"{session_id}","timestamp":"%s","error":"%s"}}' \\
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > '{state_file_path}'
