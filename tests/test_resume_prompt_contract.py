@@ -1,7 +1,10 @@
 """The resume prompt must restate the checkpoint contract (#173).
 
 The initial prompt spends ~30 lines establishing how an agent signals
-how it stopped. The resume prompt was 58 characters:
+how it stopped. The resume prompt was **50 characters of template** plus
+the operator's answer - 58 in the incident below, because "Approved" is
+eight of them. (#173 quotes 58 as the length; that is true of that one
+answer, not in general.)
 
     User answered: {answer}
 
@@ -106,21 +109,33 @@ async def test_the_resume_prompt_carries_the_checkpoint_contract(
 
 
 @pytest.mark.parametrize("mod", PIPELINES)
-def test_the_contract_in_the_resume_prompt_is_the_pipelines_own(
+def test_the_contract_is_one_source_shared_with_the_initial_prompt(
     mod: str, tmp_path: Path
 ) -> None:
-    """Each pipeline has a DIFFERENT contract, in substance.
+    """One source per pipeline, and each pipeline's own.
 
     `dev`'s DONE block carries `pr_url` and `pr_number`, and the three
     name different conditions for DONE. A single shared block would have
-    quietly changed what two of them promise, so this pins that the
-    resume prompt reuses the SAME text the initial prompt uses - byte
-    for byte - rather than a copy that can drift.
+    quietly changed what two of them promise.
+
+    Scope, stated because the first name overclaimed: this does NOT
+    drive `resume`, and reverting `resume` to the old one-liner leaves it
+    green. It pins that the initial prompt renders the SAME text the
+    helper returns, so the two cannot drift. The resume wiring is held
+    by `test_the_resume_prompt_carries_the_checkpoint_contract` above,
+    and only by that one.
     """
     pipeline = _pipeline(mod)
     contract = pipeline._checkpoint_contract(
         "/wt/.ctrlrelay/state.json", "sid-1"
     )
+
+    # `contract in initial` is satisfied by the empty string, so the
+    # containment assertion below proves nothing on its own. Pin that
+    # there is a contract first.
+    assert len(contract.splitlines()) >= 20, contract
+    assert "/wt/.ctrlrelay/state.json" in contract
+    assert "BLOCKED_NEEDS_INPUT" in contract
 
     if mod == "secops":
         initial = pipeline._build_prompt(
