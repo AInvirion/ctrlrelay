@@ -80,9 +80,18 @@ class SetupOptions:
     transport: str = "file_mock"  # or "telegram"
     telegram_chat_id: int | None = None
     telegram_token: str | None = None  # only used when transport == "telegram"
-    # Only used when transport == "mattermost". Left blank in the emitted
-    # config when unset, which fails config validation loudly rather than
-    # producing a file that loads and talks to nothing.
+    # Only used when transport == "mattermost".
+    #
+    # `url` and `channel_id` are emitted into the config; the CLI refuses
+    # --transport=mattermost without both, because they fail at different
+    # moments and only one is loud. An empty `url` is rejected by the
+    # schema at load. An empty `channel_id` is deliberately ACCEPTED by
+    # the schema and caught later by the bridge factory, so a config with
+    # one loads and starts and only then reports it.
+    #
+    # `mattermost_token` is NOT emitted - the config stores the variable
+    # NAME, never the secret. It exists only to bake a value into
+    # rendered daemon units, exactly as `telegram_token` does.
     mattermost_url: str | None = None
     mattermost_channel_id: str | None = None
     mattermost_token: str | None = None

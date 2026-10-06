@@ -1013,3 +1013,66 @@ class TestSetupWritesTheTransportYouAskedFor:
         assert config.transport.type.value == "mattermost"
         assert config.transport.mattermost is not None
         assert config.transport.mattermost.url == "https://chat.example.test"
+
+    def test_the_cli_refuses_mattermost_without_url_and_channel(self) -> None:
+        """The CLI half, which the generator test cannot reach.
+
+        `build_orchestrator_yaml` is called directly by the tests above,
+        so they pass whether or not `ctrlrelay setup` threads the new
+        options into SetupOptions. This drives the command.
+
+        Both values are refused up front rather than emitted blank,
+        because they fail at different moments and only one is loud: an
+        empty url is rejected by the schema at load, while an empty
+        channel_id is deliberately accepted there and surfaces only when
+        the bridge starts.
+        """
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        result = CliRunner().invoke(
+            app,
+            ["setup", "--transport", "mattermost", "--owner", "someone", "--yes"],
+        )
+
+        assert result.exit_code == 2, result.output
+        assert "--mattermost-url" in result.output
+        assert "--mattermost-channel-id" in result.output
+
+    def test_the_cli_threads_mattermost_values_into_the_options(self) -> None:
+        """A flag that is accepted and then dropped is this PR's own bug."""
+        from unittest.mock import patch
+
+        from typer.testing import CliRunner
+
+        from ctrlrelay.cli import app
+
+        seen = {}
+
+        def capture(options, *a, **kw):
+            seen["transport"] = options.transport
+            seen["url"] = options.mattermost_url
+            seen["channel"] = options.mattermost_channel_id
+            raise RuntimeError("short-circuit")
+
+        with patch("ctrlrelay.setup.run_setup", side_effect=capture):
+            CliRunner().invoke(
+                app,
+                [
+                    "setup",
+                    "--transport",
+                    "mattermost",
+                    "--owner",
+                    "someone",
+                    "--mattermost-url",
+                    "https://chat.example.test",
+                    "--mattermost-channel-id",
+                    "c" * 26,
+                    "--yes",
+                ],
+            )
+
+        assert seen.get("transport") == "mattermost"
+        assert seen.get("url") == "https://chat.example.test"
+        assert seen.get("channel") == "c" * 26
