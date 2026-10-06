@@ -91,25 +91,51 @@ intentional — the orchestrator runs unattended.
 ## transport
 
 The transport carries `BLOCKED_NEEDS_INPUT` questions out of ctrlrelay to a
-human and routes the answer back. Pick one of two types.
+human and routes the answer back.
+
+### Choosing one
+
+**Exactly one transport is active: the one named by `type`.** Every other
+block in the file is inert — it may stay there, but nothing reads it.
+
+| You want | Set `type` to | You need |
+|---|---|---|
+| A 1:1 chat with a bot | `"telegram"` | A bot token and your chat ID. |
+| A channel on your own server | `"mattermost"` | A server URL, a bot token, and the channel's 26-character ID. |
+| No chat at all | `"file_mock"` | Nothing. Questions go to a file; **nobody is asked anything.** |
+
+**Running Telegram and Mattermost at the same time is not supported.** Setting
+`type` to one does not fall back to the other, and a question is delivered to
+one place or not at all. That is tracked as
+[issue #176](https://github.com/AInvirion/ctrlrelay/issues/176).
+
+Switching is a two-line change — set `type`, add that transport's block — plus
+a restart of **both** daemons, which share `state.db`.
+
+Every per-transport setting below is read from the **active** transport. A
+Mattermost deployment takes `question_ttl_seconds` from the `mattermost` block,
+not from a leftover `telegram` one.
 
 ```yaml
 transport:
-  type: "telegram"   # or "file_mock"
-  telegram:
-    bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"
-    chat_id: 123456789
+  type: "mattermost"   # or "telegram", or "file_mock"
+  mattermost:
+    url: "https://chat.example.com"
+    bot_token_env: "CTRLRELAY_MATTERMOST_TOKEN"
+    channel_id: "abcdefghijklmnopqrstuvwxyz"
     socket_path: "~/.ctrlrelay/ctrlrelay.sock"
-  file_mock:
-    inbox:  "~/.ctrlrelay/inbox.txt"
-    outbox: "~/.ctrlrelay/outbox.txt"
 ```
 
 | Key | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `type` | enum | no | `"file_mock"` | One of `"telegram"`, `"file_mock"`. |
+| `type` | enum | no | `"file_mock"` | One of `"telegram"`, `"mattermost"`, `"file_mock"`. |
 | `telegram` | object | required when `type=telegram` | — | Telegram bridge settings — see below. |
+| `mattermost` | object | required when `type=mattermost` | — | Mattermost bridge settings — see below. |
 | `file_mock` | object | required when `type=file_mock` | — | Local-file fake transport, used for tests/dev. |
+
+The block for the selected type is **required**: a config naming a type whose
+block is absent is refused at load, loudly, rather than starting with no way to
+reach anybody.
 
 ### transport.telegram
 
@@ -122,6 +148,27 @@ transport:
 | `question_ttl_seconds` | int | `172800` (48h) | How long an **unanswered** question stays routable before it is retired. Minimum `3600`. Without a ceiling those rows never die — a question whose PR was merged by hand weeks ago stays a live target for an orphan reply. The hourly `question_expiry_sweeper` also retires a question early once every issue/PR it cites is closed or merged. |
 
 See [Telegram bridge]({{ '/bridge/' | relative_url }}) for the full setup walkthrough.
+
+### transport.mattermost
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `url` | string | — | Base URL of your Mattermost server, e.g. `https://chat.example.com`. Required. |
+| `bot_token_env` | string | `"CTRLRELAY_MATTERMOST_TOKEN"` | Name of the environment variable holding the bot token. ctrlrelay never reads the token directly — only the variable name. |
+| `channel_id` | string | `""` | The channel's **26-character ID**, not its name: a name is only unique within a team and can be renamed under you. Find it in the channel menu under *View Info*, or via `GET /api/v4/teams/name/{team}/channels/name/{channel}`. |
+| `socket_path` | path | `"~/.ctrlrelay/ctrlrelay.sock"` | Unix socket path the bridge listens on. Pipelines connect to this socket as clients. |
+| `ask_timeout_seconds` | int | `900` | Same meaning as the Telegram key above: it bounds only the in-session wait, and a later reply still resolves through `pending_resumes`. |
+| `question_ttl_seconds` | int | `172800` (48h) | Same meaning as the Telegram key above. |
+
+**The bot must be a member of that channel.** A bot without `post:all` cannot
+post where it is not a member — and, the part that is easy to miss, it does not
+receive that channel's reply events either, so answers would silently never
+arrive.
+
+Outbound is `POST /api/v4/posts`; inbound is a WebSocket on
+`/api/v4/websocket` filtered to the one channel. A threaded reply's `root_id`
+equals the question's post ID, which is how an answer is matched to its
+question — the same role `reply_to_message_id` plays on Telegram.
 
 ### transport.file_mock
 

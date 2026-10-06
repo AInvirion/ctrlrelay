@@ -9,7 +9,8 @@
 
 > Local-first orchestrator for headless coding agents across your GitHub
 > repos. Watches for assigned issues, runs a dev pipeline in an isolated
-> git worktree, opens a PR, and asks you on Telegram when it gets stuck.
+> git worktree, opens a PR, and asks you on Telegram or Mattermost when it
+> gets stuck.
 
 ## Table of Contents
 
@@ -39,7 +40,7 @@ Your agent credentials, your GitHub credentials, your repos, your
 machine.
 
 Today `ctrlrelay` ships with a Claude Code (`claude -p`) backend. The
-orchestrator layer — worktrees, state DB, scheduler, Telegram bridge —
+orchestrator layer — worktrees, state DB, scheduler, chat bridge —
 is agent-agnostic, and plug-in backends for other headless coding agents
 are on the roadmap (see [Roadmap](#roadmap)).
 
@@ -51,11 +52,15 @@ are on the roadmap (see [Roadmap](#roadmap)).
   and opens a PR. Label triggers let a teammate without rights on your
   account flag an issue as safe for the bot to pick up —
   see [`include_labels`][docs-config].
-- **Telegram bridge.** When a session hits a blocking question, the
-  bridge relays it to you as a DM and resumes the session once you
-  reply.
+- **Chat bridge.** When a session hits a blocking question, the bridge
+  relays it to you and resumes the session once you reply. Choose
+  **Telegram** (a DM from a bot) or **Mattermost** (a channel on your own
+  server) with one `transport.type` setting. Exactly one is active at a
+  time; running both at once is not supported yet
+  ([#176](https://github.com/AInvirion/ctrlrelay/issues/176)). See
+  [configuration][docs-config].
 - **PR watcher.** Tracks the opened PR to merge and closes the loop
-  with a Telegram notification.
+  with a notification on whichever chat transport is configured.
 - **In-process scheduler** (APScheduler). Runs periodic jobs inside
   the poller daemon. Ships with a `secops` job that reviews Dependabot
   alerts and PRs daily at 6am; cron expressions follow standard Vixie
@@ -114,8 +119,10 @@ a launchd/systemd-supervised daemon.
   independent reviewer for the agent's output; you can disable it by
   setting `code_review.method: "none"` in your config if you prefer to
   skip the review step.
-- *(Optional)* a Telegram bot token if you want the bridge — see
-  [Telegram bridge docs][docs-bridge].
+- *(Optional)* if you want the bridge, credentials for one chat
+  transport: a **Telegram** bot token, or a **Mattermost** server URL,
+  bot token and channel ID — see [bridge docs][docs-bridge] and
+  [configuration][docs-config].
 
 ### Installation
 
