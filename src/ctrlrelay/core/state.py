@@ -356,6 +356,22 @@ class StateDB:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_pending_resume(self, session_id: str) -> dict[str, Any] | None:
+        """One pending-resume row by session_id, whatever state it is in.
+
+        Deliberately unfiltered, unlike every other reader here. The bridge
+        needs to tell "that question was already answered" from "that
+        question expired" from "no such question", and all three look
+        identical through ``list_unanswered_pending_resumes`` — they are
+        simply absent. Being absent is what used to make the bridge fall
+        back to guessing.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM pending_resumes WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     def expire_pending_resume(self, session_id: str, reason: str) -> bool:
         """Retire an unanswered question so it stops being routable.
 

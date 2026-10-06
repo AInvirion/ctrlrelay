@@ -1065,3 +1065,141 @@ class TestQuestionDeadline:
 
         assert _deadline(1000.0, 1) == 1001.0
         assert _deadline(1000.0, 5) == 1005.0
+
+
+class TestStaleReplyToDoesNotMisroute:
+    """A reply-to that resolves to a session which cannot take an answer
+    must route nothing — never fall back to "there is only one row left,
+    it must be that one".
+
+    The bug these cover: `list_unanswered_pending_resumes` filters on
+    `answered_at IS NULL`, so an already-answered session is simply absent
+    from `rows`. The hinted lookup came back empty, control fell through to
+    `elif len(rows) == 1`, and the operator's answer to session A was
+    attached to session B. Nothing double-resumed, because
+    `answer_pending_resume` is guarded — B just received an answer to a
+    question it never asked, silently, and the sweeper acted on it.
+    """
+
+    @pytest.fixture
+    def socket_path(self):
+        d = tempfile.mkdtemp()
+        yield Path(d) / "b.sock"
+        shutil.rmtree(d, ignore_errors=True)
+
+    async def _server_with_two_blocked(self, socket_path, tmp_path):
+        """Session A (pointed at by the reply-to) plus one other, B."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-owner-a-aaa",
+            pipeline="secops",
+            repo="owner/a",
+            question="merge the alembic bump?",
+        )
+        db.add_pending_resume(
+            session_id="secops-owner-b-bbb",
+            pipeline="secops",
+            repo="owner/b",
+            question="merge the torch bump?",
+        )
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        # The operator is replying to the message we posted for session A.
+        server._asked_sessions[999] = "secops-owner-a-aaa"
+        return server, db, task
+
+    @pytest.mark.asyncio
+    async def test_reply_to_already_answered_session_leaves_the_other_alone(
+        self, socket_path, tmp_path,
+    ) -> None:
+        server, db, task = await self._server_with_two_blocked(socket_path, tmp_path)
+
+        # A has been answered already — by an earlier reply, or by the same
+        # answer arriving twice from two chat clients.
+        assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
+
+        await server._on_telegram_reply("approved", reply_to_message_id=999)
+
+        b = db.get_pending_resume("secops-owner-b-bbb")
+        assert b["answer"] is None, "B was given an answer meant for A"
+        assert b["answered_at"] is None
+        assert b["resumed_at"] is None
+
+        # Only A's own answer is queued for the sweeper, not a second row.
+        queued = db.list_pending_resumes_to_execute()
+        assert [r["session_id"] for r in queued] == ["secops-owner-a-aaa"]
+
+        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "already been answered" in sent
+        assert "secops-owner-a-aaa" in sent
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_reply_to_expired_session_leaves_the_other_alone(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """Same fall-through, reached via expiry instead of an answer.
+
+        `expire_pending_resume` also removes a row from the unanswered
+        listing, so a reply to a question retired by `question_ttl_seconds`
+        hit the identical guess.
+        """
+        server, db, task = await self._server_with_two_blocked(socket_path, tmp_path)
+
+        assert db.expire_pending_resume("secops-owner-a-aaa", "ttl") is True
+
+        await server._on_telegram_reply("approved", reply_to_message_id=999)
+
+        b = db.get_pending_resume("secops-owner-b-bbb")
+        assert b["answer"] is None, "B was given an answer meant for expired A"
+        assert b["answered_at"] is None
+        assert db.list_pending_resumes_to_execute() == []
+
+        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "expired" in sent
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_typed_session_id_still_routes_when_the_hint_is_stale(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """The guard must refuse a GUESS, not an intention.
+
+        Replying to the wrong message in a busy chat is an easy slip; typing
+        a session_id is not. So when the reply-to is stale but the operator
+        named another session explicitly, that answer still lands — the fix
+        must not turn a deliberate answer into a refusal.
+        """
+        server, db, task = await self._server_with_two_blocked(socket_path, tmp_path)
+
+        assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
+
+        await server._on_telegram_reply(
+            "secops-owner-b-bbb yes merge it", reply_to_message_id=999,
+        )
+
+        b = db.get_pending_resume("secops-owner-b-bbb")
+        assert b["answer"] == "secops-owner-b-bbb yes merge it"
+        assert b["answered_at"] is not None
+
+        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "Answer queued" in sent
+
+        db.close()
+        await server.stop()
+        task.cancel()

@@ -563,6 +563,33 @@ class BridgeServer:
                 "The pending-resume sweeper will drive it on the next "
                 "tick — you'll get another message with the result."
             )
+        elif outcome["status"] == "stale_hint":
+            sid = outcome["session_id"]
+            detail = {
+                "answered": (
+                    f"session `{sid}` has already been answered, so this "
+                    "reply was not applied."
+                ),
+                "expired": (
+                    f"session `{sid}` expired before this reply arrived, so "
+                    "it was not applied."
+                ),
+                "unknown": (
+                    f"session `{sid}` has no question waiting for an answer."
+                ),
+            }[outcome["reason"]]
+            await self._send_notice(
+                f"⚠️ Your reply wasn't routed — {detail}\n\n"
+                "Nothing else was changed. Earlier this would have been "
+                "applied to a different blocked session; it no longer is.\n\n"
+                "To answer a different one, reply to its own message, or "
+                "paste its session_id in your reply."
+                + (f"\n\n{live_listing}" if live_listing else ""),
+                log=(
+                    "bridge: refusing reply to a non-routable session "
+                    f"({outcome['reason']})"
+                ),
+            )
         elif outcome["status"] == "ambiguous":
             pending_list = "\n".join(
                 f"  • `{r['session_id']}` ({r['repo']}): "
@@ -661,6 +688,10 @@ class BridgeServer:
           sessions exist and the reply didn't name one, so we refuse to
           guess. The sender is told which session_ids exist so they can
           retry with one included.
+        - ``"stale_hint"`` with ``session_id`` and ``reason`` (one of
+          ``"answered"``, ``"expired"``, ``"unknown"``) — the operator
+          pointed at a specific question that cannot take an answer.
+          Nothing is routed; see below.
         - ``"none"`` — no state_db, no unanswered rows, or DB error.
 
         Disambiguation rules, in order:
@@ -668,10 +699,26 @@ class BridgeServer:
         1. ``session_id`` (resolved from the Telegram reply-to) names an
            unanswered row — route there. This is exact: it comes from the
            message the operator actually replied to.
-        2. The reply text contains exactly one unanswered session_id as a
-           substring — route there.
-        3. Exactly one unanswered row exists — route there.
-        4. Anything else — ambiguous, and we refuse to guess.
+        2. ``session_id`` was given and does NOT name an unanswered row.
+           The operator pointed at something specific, so the only other
+           pointer we accept is an equally explicit one: a session_id
+           written in the reply text. Failing that we stop at
+           ``"stale_hint"`` and route nothing.
+        3. No ``session_id`` at all: the reply text contains exactly one
+           unanswered session_id as a substring — route there.
+        4. No ``session_id`` at all and exactly one unanswered row exists —
+           route there.
+        5. Anything else — ambiguous, and we refuse to guess.
+
+        Rule 2 is the whole reason this function is shaped this way. It used
+        to fall straight through to rules 3-5, so a reply to an
+        already-answered question landed on rule 4 and attached that answer
+        to **the one unrelated blocked session** — the operator answered A
+        and the sweeper resumed B with it, silently. An explicit pointer
+        that fails to resolve is information, not an absence of it; turning
+        "I cannot find what you named" into "I will pick something else"
+        is the fault, not the heuristic itself, which is still right when
+        the operator pointed at nothing.
         """
         if self.state_db is None:
             return {"status": "none"}
@@ -696,6 +743,19 @@ class BridgeServer:
             if hinted:
                 return await self._attach_orphan_answer(hinted[0], text)
 
+            # The pointer did not resolve. Accept only another EXPLICIT
+            # pointer — a session_id the operator typed — and never the
+            # single-row guess below, which is what used to misroute here.
+            # A typed id outranks a reply-to gesture: replying to the wrong
+            # message in a busy chat is an easy slip, typing a session_id
+            # is not.
+            named = [r for r in rows if r["session_id"] in text]
+            if len(named) == 1:
+                return await self._attach_orphan_answer(named[0], text)
+            if len(named) > 1:
+                return {"status": "ambiguous", "rows": named}
+            return self._describe_stale_hint(session_id)
+
         matched_by_id = [r for r in rows if r["session_id"] in text]
         if len(matched_by_id) == 1:
             target = matched_by_id[0]
@@ -710,6 +770,49 @@ class BridgeServer:
             return {"status": "ambiguous", "rows": rows}
 
         return await self._attach_orphan_answer(target, text)
+
+    def _describe_stale_hint(self, session_id: str) -> dict:
+        """Say WHY a resolved reply-to cannot take an answer.
+
+        The operator pointed at a real question of ours — ``session_id``
+        came out of ``_asked_sessions``, so we posted it. It is simply not
+        routable any more, and the operator deserves to know which of the
+        three reasons applies rather than a generic refusal that reads like
+        the bridge lost their answer.
+
+        Never raises: this runs on the reply path, and a DB error here must
+        degrade to "unknown" rather than take down routing.
+        """
+        row = None
+        if self.state_db is not None:
+            try:
+                row = self.state_db.get_pending_resume(session_id)
+            except Exception as e:
+                log_event(
+                    _logger,
+                    "bridge.pending_resume.get_failed",
+                    session_id=session_id,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                )
+        if row is None:
+            reason = "unknown"
+        elif row["answered_at"] is not None:
+            reason = "answered"
+        elif row["expired_at"] is not None:
+            reason = "expired"
+        else:
+            # Unanswered and unexpired, yet absent from the listing that
+            # produced `rows`. Only a concurrent write explains it, so say
+            # unknown rather than invent a story.
+            reason = "unknown"
+        log_event(
+            _logger,
+            "bridge.answer.refused_stale_hint",
+            session_id=session_id,
+            reason=reason,
+        )
+        return {"status": "stale_hint", "session_id": session_id, "reason": reason}
 
     async def _attach_orphan_answer(self, target: dict, text: str) -> dict:
         """Write an orphan answer onto one pending_resumes row."""
