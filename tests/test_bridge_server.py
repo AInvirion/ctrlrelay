@@ -1417,6 +1417,10 @@ class TestStaleReplyToDoesNotMisroute:
         assert names_session(f"({sid}).", sid)
         assert not names_session(f"{sid}.bar-x ok", sid)
         assert not names_session(f"{sid}.9 ok", sid)
+        # Known limit, in the safe direction: a full stop with no space
+        # after it reads as an id character, so this refuses and tells the
+        # operator rather than routing. One retry, not a misroute.
+        assert not names_session(f"approve {sid}.Please continue", sid)
 
     def test_an_unrecognised_character_fails_toward_refusing(self) -> None:
         """Outside ASCII, anything we do not recognise as a separator is
