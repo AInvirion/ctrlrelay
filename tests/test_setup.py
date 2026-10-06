@@ -1014,6 +1014,21 @@ class TestSetupWritesTheTransportYouAskedFor:
         assert config.transport.mattermost is not None
         assert config.transport.mattermost.url == "https://chat.example.test"
 
+    @staticmethod
+    def _past_the_gh_gate():
+        """Stub the `gh auth status` gate these tests are not about.
+
+        `setup` asserts gh auth BEFORE it validates transport options, so
+        without this the four CLI tests below exercise the auth gate and
+        never reach the code they name. They passed locally only because
+        this machine happens to have gh logged in, and failed on the
+        runner, which does not - the test's subject was an environment
+        privilege rather than the behaviour in its name.
+        """
+        from unittest.mock import patch
+
+        return patch("ctrlrelay.setup.assert_gh_auth", return_value=None)
+
     def test_the_cli_refuses_mattermost_without_url_and_channel(self) -> None:
         """The CLI half, which the generator test cannot reach.
 
@@ -1031,10 +1046,18 @@ class TestSetupWritesTheTransportYouAskedFor:
 
         from ctrlrelay.cli import app
 
-        result = CliRunner().invoke(
-            app,
-            ["setup", "--transport", "mattermost", "--owner", "someone", "--yes"],
-        )
+        with self._past_the_gh_gate():
+            result = CliRunner().invoke(
+                app,
+                [
+                    "setup",
+                    "--transport",
+                    "mattermost",
+                    "--owner",
+                    "someone",
+                    "--yes",
+                ],
+            )
 
         assert result.exit_code == 2, result.output
         assert "--mattermost-url" in result.output
@@ -1056,7 +1079,9 @@ class TestSetupWritesTheTransportYouAskedFor:
             seen["channel"] = options.mattermost_channel_id
             raise RuntimeError("short-circuit")
 
-        with patch("ctrlrelay.setup.run_setup", side_effect=capture):
+        with self._past_the_gh_gate(), patch(
+            "ctrlrelay.setup.run_setup", side_effect=capture
+        ):
             CliRunner().invoke(
                 app,
                 [
@@ -1089,21 +1114,22 @@ class TestSetupWritesTheTransportYouAskedFor:
 
         from ctrlrelay.cli import app
 
-        result = CliRunner().invoke(
-            app,
-            [
-                "setup",
-                "--transport",
-                "mattermost",
-                "--owner",
-                "someone",
-                "--mattermost-url",
-                "https://chat.example.test",
-                "--mattermost-channel-id",
-                "my-channel-name",
-                "--yes",
-            ],
-        )
+        with self._past_the_gh_gate():
+            result = CliRunner().invoke(
+                app,
+                [
+                    "setup",
+                    "--transport",
+                    "mattermost",
+                    "--owner",
+                    "someone",
+                    "--mattermost-url",
+                    "https://chat.example.test",
+                    "--mattermost-channel-id",
+                    "my-channel-name",
+                    "--yes",
+                ],
+            )
 
         assert result.exit_code == 2, result.output
         assert "26-character" in result.output
@@ -1136,6 +1162,7 @@ class TestSetupWritesTheTransportYouAskedFor:
         with (
             patch.dict(os.environ, {"CTRLRELAY_MATTERMOST_TOKEN": ""}),
             patch("ctrlrelay.setup.run_setup", side_effect=short_circuit),
+            self._past_the_gh_gate(),
         ):
             result = CliRunner().invoke(
                 app,
