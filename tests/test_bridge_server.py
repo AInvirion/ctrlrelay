@@ -3,6 +3,7 @@
 import asyncio
 import os
 import shutil
+import sqlite3
 import stat
 import tempfile
 from pathlib import Path
@@ -1065,3 +1066,541 @@ class TestQuestionDeadline:
 
         assert _deadline(1000.0, 1) == 1001.0
         assert _deadline(1000.0, 5) == 1005.0
+
+
+class TestStaleReplyToDoesNotMisroute:
+    """A reply-to that resolves to a session which cannot take an answer
+    must route nothing — never fall back to "there is only one row left,
+    it must be that one".
+
+    The bug these cover: `list_unanswered_pending_resumes` filters on
+    `answered_at IS NULL`, so an already-answered session is simply absent
+    from `rows`. The hinted lookup came back empty, control fell through to
+    `elif len(rows) == 1`, and the operator's answer to session A was
+    attached to session B. Nothing double-resumed, because
+    `answer_pending_resume` is guarded — B just received an answer to a
+    question it never asked, silently, and the sweeper acted on it.
+    """
+
+    @pytest.fixture
+    def socket_path(self):
+        d = tempfile.mkdtemp()
+        yield Path(d) / "b.sock"
+        shutil.rmtree(d, ignore_errors=True)
+
+    async def _server_with_blocked(self, socket_path, tmp_path, *, extra=False):
+        """Session A (pointed at by the reply-to) plus B, optionally plus C.
+
+        ``extra`` adds C so that B is NOT the only row left once A is out
+        of the running. Without it, a test asserting "the typed id routed"
+        is indistinguishable from the single-row guess picking B anyway.
+        """
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-owner-a-aaa",
+            pipeline="secops",
+            repo="owner/a",
+            question="merge the alembic bump?",
+        )
+        db.add_pending_resume(
+            session_id="secops-owner-b-bbb",
+            pipeline="secops",
+            repo="owner/b",
+            question="merge the torch bump?",
+        )
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+        if extra:
+            db.add_pending_resume(
+                session_id="secops-owner-c-ccc",
+                pipeline="secops",
+                repo="owner/c",
+                question="merge the mypy bump?",
+            )
+        # The operator is replying to the message we posted for session A.
+        server._asked_sessions[999] = "secops-owner-a-aaa"
+        return server, db, task
+
+    @pytest.mark.asyncio
+    async def test_reply_to_already_answered_session_leaves_the_other_alone(
+        self, socket_path, tmp_path,
+    ) -> None:
+        server, db, task = await self._server_with_blocked(socket_path, tmp_path)
+
+        # A has been answered already — by an earlier reply, or by the same
+        # answer arriving twice from two chat clients.
+        assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
+
+        await server._on_telegram_reply("approved", reply_to_message_id=999)
+
+        b = db.get_pending_resume("secops-owner-b-bbb")
+        assert b["answer"] is None, "B was given an answer meant for A"
+        assert b["answered_at"] is None
+        assert b["resumed_at"] is None
+
+        # Only A's own answer is queued for the sweeper, not a second row.
+        queued = db.list_pending_resumes_to_execute()
+        assert [r["session_id"] for r in queued] == ["secops-owner-a-aaa"]
+
+        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "already been answered" in sent
+        assert "secops-owner-a-aaa" in sent
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_reply_to_expired_session_leaves_the_other_alone(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """Same fall-through, reached via expiry instead of an answer.
+
+        `expire_pending_resume` also removes a row from the unanswered
+        listing, so a reply to a question retired by `question_ttl_seconds`
+        hit the identical guess.
+        """
+        server, db, task = await self._server_with_blocked(socket_path, tmp_path)
+
+        assert db.expire_pending_resume("secops-owner-a-aaa", "ttl") is True
+
+        await server._on_telegram_reply("approved", reply_to_message_id=999)
+
+        b = db.get_pending_resume("secops-owner-b-bbb")
+        assert b["answer"] is None, "B was given an answer meant for expired A"
+        assert b["answered_at"] is None
+        assert db.list_pending_resumes_to_execute() == []
+
+        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "expired" in sent
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_typed_session_id_still_routes_when_the_hint_is_stale(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """The guard must refuse a GUESS, not an intention.
+
+        Replying to the wrong message in a busy chat is an easy slip; typing
+        a session_id is not. So when the reply-to is stale but the operator
+        named another session explicitly, that answer still lands — the fix
+        must not turn a deliberate answer into a refusal.
+
+        THREE sessions on purpose. With only A and B, answering A leaves B
+        as the single unanswered row, so the old `len(rows) == 1` guess
+        would also have landed on B and this test would pass without the
+        typed id mattering at all. C makes the typed id the only thing that
+        can select B: guessing is no longer available, and the alternative
+        outcome is a refusal.
+        """
+        server, db, task = await self._server_with_blocked(
+            socket_path, tmp_path, extra=True,
+        )
+
+        assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
+
+        await server._on_telegram_reply(
+            "secops-owner-b-bbb yes merge it", reply_to_message_id=999,
+        )
+
+        b = db.get_pending_resume("secops-owner-b-bbb")
+        assert b["answer"] == "secops-owner-b-bbb yes merge it"
+        assert b["answered_at"] is not None
+
+        # C was never a candidate and must be untouched.
+        c = db.get_pending_resume("secops-owner-c-ccc")
+        assert c["answer"] is None
+        assert c["answered_at"] is None
+
+        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "Answer queued" in sent
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_longer_session_id_is_not_read_as_naming_a_shorter_one(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """Naming one session must not route a different one by prefix.
+
+        `session_id in text` is a substring test, not an identifier match.
+        A reply naming `...-bbb2` also contains `...-bbb`, so the shorter
+        row would claim an answer written for the longer one — the very
+        wrong-session routing this change exists to stop, reintroduced
+        through the branch that is supposed to honour an explicit id.
+        """
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        db.add_pending_resume(
+            session_id="secops-owner-b-bbb",
+            pipeline="secops",
+            repo="owner/b",
+            question="merge the torch bump?",
+        )
+        db.add_pending_resume(
+            session_id="secops-owner-c-ccc",
+            pipeline="secops",
+            repo="owner/c",
+            question="merge the mypy bump?",
+        )
+        server = BridgeServer(
+            socket_path=socket_path, bot_token="test", chat_id=123, state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server._telegram.send = AsyncMock()  # type: ignore[attr-defined]
+
+        # Names a session that is not in the table at all, but whose id
+        # has the live `...-bbb` as a prefix.
+        await server._on_telegram_reply(
+            "secops-owner-b-bbb2 approved", reply_to_message_id=None,
+        )
+
+        b = db.get_pending_resume("secops-owner-b-bbb")
+        assert b["answer"] is None, "a prefix match claimed another id's answer"
+        assert b["answered_at"] is None
+        assert db.list_pending_resumes_to_execute() == []
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_prefix_is_not_matched_on_the_stale_reply_path_either(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """The same prefix guard, on the branch this change actually added.
+
+        The sibling test above sends `reply_to_message_id=None`, which
+        reaches the pre-existing `matched_by_id` call site. It therefore
+        says nothing about the `named` call site inside the stale-hint
+        branch — a regression to substring matching there would pass every
+        other test here. This drives the stale-reply path explicitly: A is
+        answered and mapped to the replied-to message, B and C are live,
+        and the text names a longer id that merely has B's as a prefix.
+        """
+        server, db, task = await self._server_with_blocked(
+            socket_path, tmp_path, extra=True,
+        )
+
+        assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
+
+        await server._on_telegram_reply(
+            "secops-owner-b-bbb2 approved", reply_to_message_id=999,
+        )
+
+        b = db.get_pending_resume("secops-owner-b-bbb")
+        assert b["answer"] is None, "a prefix match claimed another id's answer"
+        assert b["answered_at"] is None
+        c = db.get_pending_resume("secops-owner-c-ccc")
+        assert c["answer"] is None
+        # Only A's deliberate answer is queued; no reply was routed.
+        assert [r["session_id"] for r in db.list_pending_resumes_to_execute()] == [
+            "secops-owner-a-aaa"
+        ]
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    def test_every_ascii_character_is_classified_correctly(self) -> None:
+        """Exhaustive over ASCII, because ASCII is a closed set.
+
+        Four review rounds went by adding one more invisible character to a
+        list. This asserts the whole half of the problem that can be
+        asserted whole: all 128 code points, boundary iff outside the id's
+        own alphabet. It cannot be made stale by Unicode growing.
+
+        The backtick is the case that made this necessary — the bridge's
+        own notices wrap session ids in backticks, and an earlier rule
+        based on Unicode punctuation classified it as part of the
+        identifier, so a quoted id stopped routing.
+        """
+        import string
+
+        from ctrlrelay.bridge.server import names_session
+
+        sid = "secops-owner-b-bbb"
+        alphabet = string.ascii_letters + string.digits + "-_"
+        for code in range(128):
+            ch = chr(code)
+            separates = ch not in alphabet
+            # Each candidate is followed by a space, so the dot's
+            # conditional rule resolves to "separates" here. The dot's
+            # other direction — a dot followed by an id character, which
+            # does NOT separate because a repo name can contain one — is
+            # asserted in test_a_dot_is_both_a_sentence_end_and_part_of_an_id.
+            # Using "x" here instead would make this sweep contradict it.
+            assert names_session(f"{sid}{ch} y", sid) is separates, (
+                f"U+{code:04X} {ch!r} after the id"
+            )
+            # Space before the candidate for the same reason it is after:
+            # the dot rule resolves on what surrounds the dot run, and the
+            # dot's other direction is asserted in the dot test.
+            assert names_session(f"y {ch}{sid} z", sid) is separates, (
+                f"U+{code:04X} {ch!r} before the id"
+            )
+
+    def test_no_id_character_is_treated_as_a_boundary(self) -> None:
+        """The invariant, asserted over the alphabet rather than examples.
+
+        A wrong-session route needs a character that is both legal inside a
+        session id and classified as a boundary. Ids are minted as
+        ``{pipeline}-{owner}-{repo}-{suffix}`` from a GitHub ``owner/repo``
+        with ``/`` replaced by ``-``, so the alphabet is
+        ``[A-Za-z0-9._-]``. If every one of those is treated as part of the
+        identifier, the set of characters that can misroute is empty by
+        construction — and everything seven review rounds found was outside
+        the alphabet, so it could only ever have cost a retry.
+
+        This is the test that should have existed instead of rounds three
+        through seven.
+        """
+        import string
+
+        from ctrlrelay.bridge.server import names_session
+
+        sid = "secops-owner-r-abc123"
+        for ch in string.ascii_letters + string.digits + "._-":
+            assert not names_session(f"{sid}{ch}bar-x ok", sid), (
+                f"{ch!r} is legal inside a session id but was read as a "
+                "boundary — that is a wrong-session route"
+            )
+            assert not names_session(f"ok x-bar{ch}{sid} y", sid), (
+                f"{ch!r} read as a boundary before the id"
+            )
+
+    def test_a_dot_is_both_a_sentence_end_and_part_of_an_id(self) -> None:
+        """The last false positive, and it needed no exotic character.
+
+        Session ids are minted as ``{pipeline}-{owner}-{repo}-{suffix}``
+        from a GitHub ``owner/repo``, and repo names may contain dots. So
+        ``secops-owner-docs.github.com-abc12345`` is a real id shape, and
+        treating ``.`` as a plain boundary made ``secops-owner-docs`` a
+        whole token inside it — exactly the wrong-session routing this
+        change exists to stop, reachable with ASCII only.
+
+        Treating ``.`` as an id character instead would break
+        ``approve secops-owner-r-abc123.``, which is how a person writes a
+        sentence. Both directions are asserted here because a fix for
+        either one alone looks correct in isolation.
+        """
+        from ctrlrelay.bridge.server import names_session
+
+        short = "secops-owner-docs"
+        long = "secops-owner-docs.github.com-abc12345"
+        assert not names_session(f"approve {long}", short)
+        assert names_session(f"approve {long}", long)
+
+        sid = "secops-owner-r-abc123"
+        assert names_session(f"approve {sid}.", sid)
+        assert names_session(f"{sid}. thanks", sid)
+        assert names_session(f"{sid}...", sid)
+        assert names_session(f"({sid}).", sid)
+        assert not names_session(f"{sid}.bar-x ok", sid)
+        assert not names_session(f"{sid}.9 ok", sid)
+        # Known limit, in the safe direction: a full stop with no space
+        # after it reads as an id character, so this refuses and tells the
+        # operator rather than routing. One retry, not a misroute.
+        assert not names_session(f"approve {sid}.Please continue", sid)
+
+    def test_an_unrecognised_character_fails_toward_refusing(self) -> None:
+        """Outside ASCII, anything we do not recognise as a separator is
+        treated as part of the identifier.
+
+        The direction is the point. Refusing to route tells the operator so
+        and costs them a retry; matching on a guess about a character
+        nobody can see puts an answer on a session that never asked, and
+        the sweeper acts on it. These are the characters four rounds of
+        review produced one at a time — they are covered by the policy
+        rather than by being listed.
+        """
+        from ctrlrelay.bridge.server import names_session
+
+        sid = "secops-owner-b-bbb"
+        for label, ch in (
+            ("ZERO WIDTH JOINER", "\u200d"),
+            ("ZERO WIDTH NON-JOINER", "\u200c"),
+            ("VARIATION SELECTOR-16", "\ufe0f"),
+            ("COMBINING ENCLOSING KEYCAP", "\u20e3"),
+            ("COMBINING ACUTE", "\u0301"),
+            ("COMBINING GRAPHEME JOINER", "\u034f"),
+            ("SOFT HYPHEN", "\u00ad"),
+            ("BYTE ORDER MARK", "\ufeff"),
+            ("BRAILLE PATTERN BLANK", "\u2800"),
+            ("EMOJI MODIFIER FITZPATRICK-1-2", "\U0001f3fb"),
+        ):
+            assert not names_session(f"{sid}{ch} x", sid), f"{label} after"
+            assert not names_session(f"x{ch}{sid} y", sid), f"{label} before"
+
+    def test_recognised_non_ascii_separators_still_route(self) -> None:
+        """The conservative half must not swallow real separators."""
+        from ctrlrelay.bridge.server import names_session
+
+        sid = "secops-owner-b-bbb"
+        assert names_session(f"{sid}\u00a0ok", sid)       # NO-BREAK SPACE
+        assert names_session(f"\u3001{sid}\u3002", sid)   # CJK comma, stop
+        assert names_session(f"\u300c{sid}\u300d", sid)   # CJK quotes
+        assert names_session(f"\u2014{sid}\u2014", sid)   # em dashes
+
+    def test_names_session_requires_a_whole_token(self) -> None:
+        """Direct coverage of the matcher, including both boundaries."""
+        from ctrlrelay.bridge.server import names_session
+
+        sid = "secops-owner-b-bbb"
+        assert names_session(f"{sid} approved", sid)
+        assert names_session(f"approved {sid}", sid)
+        assert names_session(f"re {sid}, merge it", sid)
+        assert names_session(f"`{sid}`", sid)
+        assert names_session(sid, sid)
+        # Longer ids must not match the shorter one, in either direction.
+        assert not names_session(f"{sid}2 approved", sid)
+        assert not names_session(f"{sid}-x approved", sid)
+        assert not names_session(f"{sid}_x approved", sid)
+        assert not names_session(f"x{sid} approved", sid)
+        # Boundaries must be Unicode-aware: the ids are ASCII, the operator's
+        # text is not, and an ASCII-only class ended the id at the accent.
+        assert not names_session(f"{sid}\u00e9 approved", sid)
+        assert not names_session(f"\u00e9{sid} approved", sid)
+        # A combining mark renders as part of the neighbouring glyph but is
+        # not a \w character, so the lookaround alone saw a boundary where
+        # a reader sees none.
+        assert not names_session(f"{sid}\u0301 approved", sid)
+        assert not names_session(f"x\u0301{sid} approved", sid)
+        # ...and a real occurrence later in the same message still routes,
+        # rather than the first near-miss suppressing the whole message.
+        assert names_session(f"{sid}\u0301 no wait, {sid} yes", sid)
+        # Grapheme extenders with canonical combining class 0. The first
+        # attempt used unicodedata.combining(), which reports that class
+        # and so read every one of these as a boundary.
+        for extender in (
+            "\ufe0f",   # VARIATION SELECTOR-16          (Mn)
+            "\u20e3",   # COMBINING ENCLOSING KEYCAP     (Me)
+            "\u034f",   # COMBINING GRAPHEME JOINER      (Mn)
+            "\u200d",   # ZERO WIDTH JOINER              (Cf)
+            "\u200c",   # ZERO WIDTH NON-JOINER          (Cf)
+            "\u00ad",   # SOFT HYPHEN                    (Cf)
+            "\u200f",   # RIGHT-TO-LEFT MARK             (Cf)
+            "\ufeff",   # ZERO WIDTH NO-BREAK SPACE/BOM  (Cf)
+        ):
+            assert not names_session(f"{sid}{extender} approved", sid), extender
+            assert not names_session(f"x{extender}{sid} approved", sid), extender
+        # Self-overlapping id. Review raised non-overlapping iteration as
+        # a false-negative risk; measured, it cannot be one for THIS
+        # predicate — an overlapping occurrence is by definition preceded
+        # by a character of the first occurrence, which is an identifier
+        # character, so it is rejected on its own merits regardless of
+        # whether it was ever examined. Both of these are correctly False.
+        assert names_session("\u0301abab", "abab") is False
+        assert names_session("\u0301ababab", "abab") is False
+        # The scan is still every-offset rather than every-match, so that
+        # reasoning is not load-bearing. This is the case that needs it: a
+        # rejected candidate followed by a genuinely separate one.
+        assert names_session("\u0301abab abab", "abab") is True
+        # Control characters DO end an identifier — excluded from the C
+        # sweep for exactly this reason.
+        assert names_session(f"{sid}\n approved", sid)
+        assert names_session(f"{sid}\tapproved", sid)
+        assert names_session(f"line one\n{sid}", sid)
+        # Ordinary punctuation and quoting still read as boundaries.
+        for wrapped in (f"({sid})", f'"{sid}"', f"{sid}.", f"{sid}, merge",
+                        f"[{sid}]", f"<{sid}>", f"{sid}!"):
+            assert names_session(wrapped, sid), wrapped
+        assert not names_session("nothing here", sid)
+        assert not names_session("anything", "")
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_that_fails_says_so_rather_than_claiming_nothing_waits(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """"I could not look" must not be reported as "nothing is there".
+
+        A mutation sweep caught this one: collapsing this reason back into
+        `unknown` passed every other test in this class, which means the
+        distinction had no test behind it at all. The operator-facing cost
+        is a confident false sentence — "no question is waiting" — issued
+        on the strength of a database error.
+        """
+        server, db, task = await self._server_with_blocked(socket_path, tmp_path)
+
+        assert db.answer_pending_resume("secops-owner-a-aaa", "approved") is True
+
+        real_get = db.get_pending_resume
+
+        def boom(_session_id):
+            raise sqlite3.OperationalError("database is locked")
+
+        db.get_pending_resume = boom  # type: ignore[method-assign]
+
+        await server._on_telegram_reply("approved", reply_to_message_id=999)
+
+        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "could not be checked" in sent
+        assert "no question waiting" not in sent
+        # Routed nothing, which is the part that matters. A's own row is
+        # queued by this test's setup — that is the deliberate answer, not
+        # a misroute — so the assertion is about B.
+        b = real_get("secops-owner-b-bbb")
+        assert b["answer"] is None
+        assert b["answered_at"] is None
+        assert [r["session_id"] for r in db.list_pending_resumes_to_execute()] == [
+            "secops-owner-a-aaa"
+        ]
+
+        db.close()
+        await server.stop()
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_reopened_session_is_called_superseded_not_unknown(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """A row re-opened between the two reads has a NEWER question.
+
+        The listing is read first, then the hinted row. A session that
+        re-blocks in that window is absent from the listing but live in the
+        table. Refusing is right — this reply was about the old question —
+        but telling the operator no question is waiting would be false,
+        because one is.
+        """
+        server, db, task = await self._server_with_blocked(socket_path, tmp_path)
+
+        # A is live and unanswered in the table, but the listing the router
+        # works from does not contain it: exactly the state a concurrent
+        # re-block produces between the two reads.
+        real_list = db.list_unanswered_pending_resumes
+        db.list_unanswered_pending_resumes = lambda: [  # type: ignore[method-assign]
+            r for r in real_list() if r["session_id"] != "secops-owner-a-aaa"
+        ]
+
+        await server._on_telegram_reply("approved", reply_to_message_id=999)
+
+        sent = server._telegram.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "NEWER question" in sent
+        assert "no question waiting" not in sent
+
+        # Neither A's newer question nor B was answered by the old reply.
+        assert db.get_pending_resume("secops-owner-a-aaa")["answer"] is None
+        assert db.get_pending_resume("secops-owner-b-bbb")["answer"] is None
+
+        db.close()
+        await server.stop()
+        task.cancel()

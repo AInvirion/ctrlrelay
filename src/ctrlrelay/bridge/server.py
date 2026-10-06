@@ -7,6 +7,7 @@ import logging
 import os
 import stat
 import time
+import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,131 @@ _log = logging.getLogger(__name__)
 # a routing convenience, not a source of truth — losing an entry degrades to
 # the session_id-substring path, never to a wrong resume.
 _ASKED_SESSIONS_MAX = 500
+
+
+def names_session(text: str, session_id: str) -> bool:
+    """True when ``text`` names ``session_id`` as a whole token.
+
+    A plain ``session_id in text`` is a substring test, and a substring
+    test is not an identifier match: a reply naming
+    ``secops-owner-r-abc123`` also contains ``secops-owner-r-abc12``, so
+    the shorter id would claim an answer written for the longer one. That
+    decides which pipeline gets resumed, so "unlikely to collide" is not a
+    strong enough property.
+
+    The rule has two halves, because ASCII and the rest of Unicode are
+    different kinds of problem:
+
+    - **ASCII is a closed set of 128 characters and always will be**, so it
+      is enumerated exhaustively: a boundary is anything that is not
+      ``[A-Za-z0-9_-]``, the identifier's own alphabet. That includes the
+      backtick — which matters, because this bridge's own operator notices
+      wrap session ids in backticks, so an id is routinely surrounded by
+      them.
+    - **Outside ASCII, a boundary is only what we affirmatively recognise
+      as a separator**: whitespace, or Unicode punctuation. Everything
+      else counts as still inside the identifier.
+
+    That direction is the whole design, and it took four review rounds to
+    get right. The first attempts asked "is this character a boundary?"
+    and tried to exclude the ones that are not: an ASCII class, then
+    ``unicodedata.combining()``, then category ``M``, then category ``C``.
+    Each round produced one more character the previous fix had missed —
+    U+FE0F, then ZWJ, then ZWNJ, then NUL and the braille blank and the
+    emoji skin-tone modifiers. **Every one of those fixes was an
+    enumeration wearing a category's clothes**, and the list of invisible
+    or glyph-modifying characters is not something to keep up with.
+
+    Asking the opposite question for the non-ASCII half closes it, because
+    the two errors are not symmetric:
+
+    - treating an unrecognised character as *inside* the identifier means
+      we do not match, so the bridge refuses to route and **tells the
+      operator so**. They reply again. Recoverable.
+    - treating it as a *boundary* means we match on a guess about a
+      character nobody can see, and an answer lands on a session that
+      never asked the question. Silent, and acted on by the sweeper.
+
+    So anything unrecognised fails toward refusing. A new Unicode
+    character cannot open a hole here; at worst it costs one retry.
+
+    One finding was declined on the way: that NUL and the other C0
+    controls are a hole because they are invisible. They are boundaries
+    here and should be. The ZWJ case was real because a joiner can bind
+    into a different rendered sequence; no control character can be part of
+    a session id, so an operator who typed one after an id still meant the
+    id, and matching is the correct answer rather than a guess.
+    """
+    if not session_id:
+        return False
+
+    def _is_boundary(ch: str) -> bool:
+        # "" is start- or end-of-string, which is a genuine boundary.
+        if not ch:
+            return True
+        if ch in "-_":
+            return False
+        if ch.isascii():
+            # Exhaustive and permanently so: anything outside the id's own
+            # alphabet separates. Covers the backtick, quotes, brackets and
+            # the C0 controls without naming any of them.
+            return not ch.isalnum()
+        if ch.isspace():
+            return True
+        return unicodedata.category(ch).startswith("P")
+
+    def _boundary_after(idx: int) -> bool:
+        """Whether the id ends at ``idx`` — the dot case handled properly.
+
+        ``.`` is the one character that is both a sentence terminator and a
+        legal part of a session id, because ids are minted from a GitHub
+        ``owner/repo`` and repo names may contain dots:
+        ``secops-owner-docs.github.com-abc12345``.
+
+        Treating ``.`` as a plain boundary made ``secops-owner-docs`` a
+        whole token inside that id — a false positive, and the only one
+        left that needed no exotic character at all. Treating it as an id
+        character instead would break ``approve secops-owner-r-abc123.``,
+        which is how a person actually writes a sentence.
+
+        So a run of dots separates only when what follows it separates
+        too. ``sid.`` and ``sid. Thanks`` end the id; ``sid.bar-abc`` does
+        not.
+        """
+        j = idx
+        while j < len(text) and text[j] == ".":
+            j += 1
+        if j == idx:
+            return _is_boundary(text[idx: idx + 1])
+        return _is_boundary(text[j: j + 1])
+
+    def _boundary_before(idx: int) -> bool:
+        """Mirror of ``_boundary_after`` on the leading side.
+
+        Added because the invariant test found the asymmetry that eight
+        review rounds did not: the dot rule was applied only after the
+        match, so ``.`` before it was still a plain boundary and the id's
+        own alphabet was treated inconsistently depending on which side of
+        the match a character sat.
+        """
+        if idx == 0:
+            return True
+        j = idx
+        while j > 0 and text[j - 1] == ".":
+            j -= 1
+        if j == idx:
+            return _is_boundary(text[idx - 1: idx])
+        return _is_boundary(text[j - 1: j]) if j else True
+
+    span = len(session_id)
+    idx = text.find(session_id)
+    while idx != -1:
+        if _boundary_before(idx) and _boundary_after(idx + span):
+            return True
+        # +1, not +span: a rejected candidate must not hide an overlapping
+        # one starting inside it.
+        idx = text.find(session_id, idx + 1)
+    return False
 
 
 def format_question(
@@ -563,6 +689,41 @@ class BridgeServer:
                 "The pending-resume sweeper will drive it on the next "
                 "tick — you'll get another message with the result."
             )
+        elif outcome["status"] == "stale_hint":
+            sid = outcome["session_id"]
+            detail = {
+                "answered": (
+                    f"session `{sid}` has already been answered, so this "
+                    "reply was not applied."
+                ),
+                "expired": (
+                    f"session `{sid}` expired before this reply arrived, so "
+                    "it was not applied."
+                ),
+                "unknown": (
+                    f"session `{sid}` has no question waiting for an answer."
+                ),
+                "superseded": (
+                    f"session `{sid}` has since asked a NEWER question, so "
+                    "this reply was not applied to the old one."
+                ),
+                "unchecked": (
+                    f"session `{sid}` could not be checked — the state "
+                    "database did not answer, so nothing was applied."
+                ),
+            }[outcome["reason"]]
+            await self._send_notice(
+                f"⚠️ Your reply wasn't routed — {detail}\n\n"
+                "Nothing else was changed. Earlier this would have been "
+                "applied to a different blocked session; it no longer is.\n\n"
+                "To answer a different one, reply to its own message, or "
+                "paste its session_id in your reply."
+                + (f"\n\n{live_listing}" if live_listing else ""),
+                log=(
+                    "bridge: refusing reply to a non-routable session "
+                    f"({outcome['reason']})"
+                ),
+            )
         elif outcome["status"] == "ambiguous":
             pending_list = "\n".join(
                 f"  • `{r['session_id']}` ({r['repo']}): "
@@ -661,6 +822,10 @@ class BridgeServer:
           sessions exist and the reply didn't name one, so we refuse to
           guess. The sender is told which session_ids exist so they can
           retry with one included.
+        - ``"stale_hint"`` with ``session_id`` and ``reason`` (one of
+          ``"answered"``, ``"expired"``, ``"superseded"``, ``"unknown"``,
+          ``"unchecked"``) — the operator pointed at a specific question
+          that cannot take an answer. Nothing is routed; see below.
         - ``"none"`` — no state_db, no unanswered rows, or DB error.
 
         Disambiguation rules, in order:
@@ -668,10 +833,26 @@ class BridgeServer:
         1. ``session_id`` (resolved from the Telegram reply-to) names an
            unanswered row — route there. This is exact: it comes from the
            message the operator actually replied to.
-        2. The reply text contains exactly one unanswered session_id as a
-           substring — route there.
-        3. Exactly one unanswered row exists — route there.
-        4. Anything else — ambiguous, and we refuse to guess.
+        2. ``session_id`` was given and does NOT name an unanswered row.
+           The operator pointed at something specific, so the only other
+           pointer we accept is an equally explicit one: a session_id
+           written in the reply text. Failing that we stop at
+           ``"stale_hint"`` and route nothing.
+        3. No ``session_id`` at all: the reply text contains exactly one
+           unanswered session_id as a substring — route there.
+        4. No ``session_id`` at all and exactly one unanswered row exists —
+           route there.
+        5. Anything else — ambiguous, and we refuse to guess.
+
+        Rule 2 is the whole reason this function is shaped this way. It used
+        to fall straight through to rules 3-5, so a reply to an
+        already-answered question landed on rule 4 and attached that answer
+        to **the one unrelated blocked session** — the operator answered A
+        and the sweeper resumed B with it, silently. An explicit pointer
+        that fails to resolve is information, not an absence of it; turning
+        "I cannot find what you named" into "I will pick something else"
+        is the fault, not the heuristic itself, which is still right when
+        the operator pointed at nothing.
         """
         if self.state_db is None:
             return {"status": "none"}
@@ -696,7 +877,20 @@ class BridgeServer:
             if hinted:
                 return await self._attach_orphan_answer(hinted[0], text)
 
-        matched_by_id = [r for r in rows if r["session_id"] in text]
+            # The pointer did not resolve. Accept only another EXPLICIT
+            # pointer — a session_id the operator typed — and never the
+            # single-row guess below, which is what used to misroute here.
+            # A typed id outranks a reply-to gesture: replying to the wrong
+            # message in a busy chat is an easy slip, typing a session_id
+            # is not.
+            named = [r for r in rows if names_session(text, r["session_id"])]
+            if len(named) == 1:
+                return await self._attach_orphan_answer(named[0], text)
+            if len(named) > 1:
+                return {"status": "ambiguous", "rows": named}
+            return self._describe_stale_hint(session_id)
+
+        matched_by_id = [r for r in rows if names_session(text, r["session_id"])]
         if len(matched_by_id) == 1:
             target = matched_by_id[0]
         elif len(matched_by_id) > 1:
@@ -710,6 +904,64 @@ class BridgeServer:
             return {"status": "ambiguous", "rows": rows}
 
         return await self._attach_orphan_answer(target, text)
+
+    def _describe_stale_hint(self, session_id: str) -> dict:
+        """Say WHY a resolved reply-to cannot take an answer.
+
+        The operator pointed at a real question of ours — ``session_id``
+        came out of ``_asked_sessions``, so we posted it. It is simply not
+        routable any more, and the operator deserves to know which reason
+        applies rather than a generic refusal that reads like the bridge
+        lost their answer.
+
+        Never raises: this runs on the reply path, and a failed lookup must
+        degrade to a reason rather than take down routing. It degrades to
+        ``"unchecked"``, not to ``"unknown"`` — "I could not look" and
+        "there is nothing there" are different claims, and collapsing them
+        would put a confident sentence in front of the operator on the
+        strength of a database error.
+        """
+        row = None
+        looked = self.state_db is not None
+        if self.state_db is not None:
+            try:
+                row = self.state_db.get_pending_resume(session_id)
+            except Exception as e:
+                looked = False
+                log_event(
+                    _logger,
+                    "bridge.pending_resume.get_failed",
+                    session_id=session_id,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                )
+        if not looked:
+            reason = "unchecked"
+        elif row is None:
+            reason = "unknown"
+        elif row["answered_at"] is not None:
+            # Deliberate precedence: the taxonomy is not mutually
+            # exclusive, and a row carrying both timestamps reports as
+            # answered. An answer that was recorded is the more useful
+            # thing to tell the operator than the expiry that followed it.
+            reason = "answered"
+        elif row["expired_at"] is not None:
+            reason = "expired"
+        else:
+            # Unanswered and unexpired, yet absent from the listing that
+            # produced `rows`. A concurrent write re-opened this session
+            # between the two reads, so the row in front of us is not the
+            # one the operator's reply was about. Refusing is right; saying
+            # "no question is waiting" would be flatly false, because one
+            # is — a newer one.
+            reason = "superseded"
+        log_event(
+            _logger,
+            "bridge.answer.refused_stale_hint",
+            session_id=session_id,
+            reason=reason,
+        )
+        return {"status": "stale_hint", "session_id": session_id, "reason": reason}
 
     async def _attach_orphan_answer(self, target: dict, text: str) -> dict:
         """Write an orphan answer onto one pending_resumes row."""
