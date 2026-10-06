@@ -203,34 +203,46 @@ class TestOnlyTheHelperNamesATransport:
             f"model fields moved; guard is reading {transport_blocks}"
         )
 
-        allowed = "_bridge_socket_settings"
+        allowed = ("_bridge_socket_settings", "_active_chat_config")
         offenders: list[str] = []
         seen = 0
 
         # Map every line of the allowed function so membership is a line
         # lookup rather than a name match on the enclosing scope.
         allowed_lines: set[int] = set()
+        found: set[str] = set()
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == allowed:
-                allowed_lines = set(
+            if isinstance(node, ast.FunctionDef) and node.name in allowed:
+                found.add(node.name)
+                allowed_lines |= set(
                     range(node.lineno, (node.end_lineno or node.lineno) + 1)
                 )
-        assert allowed_lines, f"{allowed} not found in cli.py"
+        assert found == set(allowed), f"missing from cli.py: {set(allowed) - found}"
 
         for node in ast.walk(tree):
-            # config.transport.<name>
-            if not isinstance(node, ast.Attribute):
-                continue
-            if node.attr not in transport_blocks:
-                continue
-            base = node.value
-            if not (
-                isinstance(base, ast.Attribute) and base.attr == "transport"
+            # Deliberately NOT restricted to `config.transport.<name>`.
+            # Requiring that base let two bypasses through: an aliased
+            # local (`t = config.transport; t.telegram`) and a
+            # `getattr(..., "telegram")`. Broadening it immediately found
+            # a third live instance of #181 in the question-expiry
+            # sweeper that neither review round had seen, so the narrower
+            # rule was not merely weaker - it was already failing.
+            name = None
+            if isinstance(node, ast.Attribute) and node.attr in transport_blocks:
+                name = node.attr
+            elif (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "getattr"
+                and len(node.args) > 1
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in transport_blocks
             ):
+                name = node.args[1].value
+            if name is None:
                 continue
             seen += 1
             if node.lineno not in allowed_lines:
-                offenders.append(f"cli.py:{node.lineno} -> .{node.attr}")
+                offenders.append(f"cli.py:{node.lineno} -> {name}")
 
         # Negative control: if the walk matched nothing, an empty
         # offender list would be reported for the same reason a passing
@@ -238,7 +250,78 @@ class TestOnlyTheHelperNamesATransport:
         assert seen >= 2, f"walk found only {seen} transport references"
 
         assert offenders == [], (
-            "only _bridge_socket_settings may name a specific transport's "
-            "config block; these re-derive it and will skip whichever "
-            f"transport they do not name (#181): {offenders}"
+            f"only {' and '.join(allowed)} may name a specific "
+            "transport's config block; these re-derive it and will skip "
+            f"whichever transport they do not name (#181): {offenders}"
         )
+
+
+class TestPerTransportSettingsFollowTheActiveTransport:
+    """#181's third instance, found by broadening the guard above.
+
+    The question-expiry sweeper read `question_ttl_seconds` off
+    `config.transport.telegram` whatever transport was running. On this
+    deployment it returned a real number only because a vestigial
+    telegram block was still sitting in the config file; deleting that
+    block would have made `ttl` None, taken the `if not ttl: return`
+    path, and stopped questions expiring with nothing logged.
+    """
+
+    def test_the_ttl_comes_from_the_running_transport(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.cli import _active_chat_config
+
+        config = _config(
+            tmp_path,
+            {
+                "type": "mattermost",
+                "telegram": {
+                    "socket_path": str(tmp_path / "tg.sock"),
+                    "bot_token_env": "TG",
+                    "chat_id": 1,
+                    "question_ttl_seconds": 3600,
+                },
+                "mattermost": {
+                    "url": "https://chat.example.test",
+                    "socket_path": str(tmp_path / "mm.sock"),
+                    "bot_token_env": "MM",
+                    "channel_id": "c" * 26,
+                    "question_ttl_seconds": 7200,
+                },
+            },
+        )
+
+        chat = _active_chat_config(config)
+        assert chat is not None
+        assert chat.question_ttl_seconds == 7200, (
+            "the TTL must come from the transport that is running; 3600 "
+            "here means it was read from the telegram block"
+        )
+
+    def test_a_deployment_with_no_telegram_block_still_has_a_ttl(
+        self, tmp_path: Path
+    ) -> None:
+        """The case that would have gone silent.
+
+        A Mattermost deployment with the vestigial telegram block
+        removed - which is the tidy-up anyone would eventually do.
+        """
+        from ctrlrelay.cli import _active_chat_config
+
+        config = _config(
+            tmp_path,
+            {
+                "type": "mattermost",
+                "mattermost": {
+                    "url": "https://chat.example.test",
+                    "socket_path": str(tmp_path / "mm.sock"),
+                    "bot_token_env": "MM",
+                    "channel_id": "c" * 26,
+                },
+            },
+        )
+
+        chat = _active_chat_config(config)
+        assert chat is not None
+        assert chat.question_ttl_seconds > 0

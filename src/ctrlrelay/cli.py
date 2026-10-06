@@ -237,6 +237,22 @@ def _get_socket_path(config_path: str | None) -> Path:
     return Path("~/.ctrlrelay/ctrlrelay.sock").expanduser().resolve()
 
 
+def _active_chat_config(config):
+    """The config block for whichever chat transport is selected.
+
+    ``None`` means no chat transport is configured at all.
+
+    Every per-transport setting is read through this. Reading one
+    directly off ``config.transport.telegram`` is #181: it answers for
+    the transport you named rather than the one that is running, and the
+    wrong answer is silent.
+    """
+    return {
+        "telegram": config.transport.telegram,
+        "mattermost": config.transport.mattermost,
+    }.get(config.transport.type.value)
+
+
 def _bridge_socket_settings(config) -> tuple[Path, int] | None:
     """(socket path, ask timeout) for whichever chat transport is set.
 
@@ -250,10 +266,7 @@ def _bridge_socket_settings(config) -> tuple[Path, int] | None:
     stopped receiving questions with nothing in the log saying why: a
     default that opts the caller out without telling it.
     """
-    chat = {
-        "telegram": config.transport.telegram,
-        "mattermost": config.transport.mattermost,
-    }.get(config.transport.type.value)
+    chat = _active_chat_config(config)
     if chat is None:
         return None
     return (
@@ -1703,12 +1716,21 @@ def poller_start(
             number. TTL runs first and needs no network, so a GitHub
             outage still lets the age-based sweep make progress.
             """
-            ttl = getattr(
-                getattr(config.transport, "telegram", None),
-                "question_ttl_seconds",
-                None,
-            )
+            # Read from the ACTIVE chat transport, not from telegram.
+            # This was `getattr(config.transport, "telegram", ...)`, so on
+            # a Mattermost deployment it answered from a block that is
+            # not the one running - and when that vestigial block is
+            # eventually deleted from the config it answers None, `not
+            # ttl` returns early, and questions stop expiring with
+            # nothing logged. Same fault as #181, third instance.
+            chat = _active_chat_config(config)
+            ttl = getattr(chat, "question_ttl_seconds", None)
             if not ttl:
+                console.print(
+                    "[yellow]question_expiry_sweeper: no chat transport "
+                    "configured - stale questions will NOT be retired."
+                    "[/yellow]"
+                )
                 return
             try:
                 expired = await expire_stale_questions(
