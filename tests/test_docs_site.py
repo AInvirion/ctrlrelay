@@ -110,3 +110,60 @@ def test_no_stray_bare_markdown_outside_structure():
 def test_front_matter_parses(path: Path):
     front, _ = _split_front_matter(path.read_text())
     assert isinstance(front, dict)
+
+
+def test_ci_runs_the_whole_suite():
+    """No workflow may exclude tests from the run (#179).
+
+    `test.yml` carried `--deselect
+    tests/test_docs_site.py::test_nav_order_unique_per_sibling_group` under
+    the comment "tracked separately and unchanged by this PR". The test
+    passed the whole time - verified by making two pages collide on
+    `nav_order`, which it catches and names both files for - so CI had
+    been skipping a working guard for months and under-counting itself.
+
+    The transferable part is the justification, not the flag. "Unchanged
+    by this PR" is a pull-request-scoped reason frozen into a file that
+    runs for every change. It was true the day it was written and stays
+    plausible forever, because it is true of almost every pull request -
+    so every reader nods and moves on. **Such a reason cannot expire on
+    its own.**
+
+    This makes the next exclusion something that has to be defended
+    rather than inherited: adding one fails here, and the person adding
+    it has to come and say why in this file, where a reviewer will see
+    it next to this paragraph.
+
+    If an exclusion is ever genuinely needed, prefer deleting or fixing
+    the test. Do not leave the third state - a test that exists, is not
+    run, and is believed to be covering something.
+    """
+    import re
+
+    workflows = sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+
+    # Negative control: an empty glob would report clean for the same
+    # reason a passing run does.
+    assert len(workflows) >= 3, f"only found {len(workflows)} workflows"
+
+    # Flags that remove tests from a run. `--maxfail` is not one of them
+    # (it stops early on failure, it does not hide a passing test), and
+    # `-m` selects by marker, which the suite does not use for exclusion.
+    excluders = re.compile(r"--deselect|--ignore(?:-glob)?=|\s-k\s")
+
+    offenders: list[str] = []
+    for wf in workflows:
+        for lineno, line in enumerate(wf.read_text().splitlines(), start=1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if "pytest" not in line and "--deselect" not in line:
+                continue
+            if excluders.search(line):
+                offenders.append(f"{wf.name}:{lineno}: {stripped}")
+
+    assert offenders == [], (
+        "a workflow excludes tests from the run. Delete the test, fix it, "
+        "or change this guard and say why here - do not leave a test that "
+        f"exists, is not run, and is assumed to pass (#179): {offenders}"
+    )

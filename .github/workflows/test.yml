@@ -37,9 +37,4 @@ jobs:
         run: uv run ruff check src/ tests/
 
       - name: Pytest
-        # Deselect the pre-existing unrelated docs-site test that asserts
-        # nav_order uniqueness across docs/ — tracked separately and
-        # unchanged by this PR.
-        run: |
-          uv run pytest tests/ -v \
-            --deselect tests/test_docs_site.py::test_nav_order_unique_per_sibling_group
+        run: uv run pytest tests/ -v
