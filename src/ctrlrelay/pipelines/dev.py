@@ -318,7 +318,20 @@ class DevPipeline:
 
     async def resume(self, ctx: PipelineContext, answer: str) -> PipelineResult:
         """Resume blocked dev session with user answer."""
-        prompt = f"User answered: {answer}\n\nContinue from where you left off."
+        # The checkpoint contract is restated here, not just in the
+        # initial prompt (#173). A resumed agent that is told "continue"
+        # and nothing else can do its work, exit 0, write no state, and
+        # be indistinguishable from one that crashed - which is what
+        # happened on 2026-09-16, after three of four pull requests had
+        # already been merged.
+        contract = self._checkpoint_contract(
+            str(ctx.state_file), ctx.session_id
+        )
+        prompt = (
+            f"User answered: {answer}\n\n"
+            "Continue from where you left off.\n\n"
+            f"{contract}"
+        )
 
         # Resume uses Claude's own session UUID (captured on the first spawn
         # and persisted to state_db). Passing our composite id here makes
@@ -444,7 +457,34 @@ Do NOT merge the PR - wait for human review.
 The orchestrator re-verifies CI and mergeability after you hand off; if it
 finds the PR broken it will resume this session asking you to fix it.
 
-## Signaling Completion
+{self._checkpoint_contract(state_file_path, session_id)}"""
+
+    def _checkpoint_contract(
+        self, state_file_path: str, session_id: str
+    ) -> str:
+        """How the agent signals how it stopped.
+
+        Extracted so the RESUME prompt can carry it too (#173). The
+        initial prompt spent ~30 lines establishing this; the resume
+        prompt was 58 characters and said only "continue", so a resumed
+        agent could do its work, exit 0, write no state, and be
+        indistinguishable from one that crashed.
+
+        Measured case, 2026-09-16:
+        secops-AInvirion-Product-Telemetry-bbb99925 resumed after an
+        "Approved", ran 27.4s, exited 0 and wrote no checkpoint - having
+        in fact merged three of four pull requests. The operator was told
+        the resume failed, which was wrong in both directions: most of
+        the work had landed, and the one thing outstanding was never
+        named.
+
+        Per-pipeline rather than shared, because the three contracts
+        differ in substance and not only wording: the dev DONE block
+        carries pr_url and pr_number outputs, and each names different
+        conditions for DONE. One shared block would have quietly changed
+        what two of them promise.
+        """
+        return f"""## Signaling Completion
 
 **CRITICAL**: Before exiting, you MUST write a checkpoint file to signal completion.
 
