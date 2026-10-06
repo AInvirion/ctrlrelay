@@ -1321,6 +1321,74 @@ class TestStaleReplyToDoesNotMisroute:
         await server.stop()
         task.cancel()
 
+    def test_every_ascii_character_is_classified_correctly(self) -> None:
+        """Exhaustive over ASCII, because ASCII is a closed set.
+
+        Four review rounds went by adding one more invisible character to a
+        list. This asserts the whole half of the problem that can be
+        asserted whole: all 128 code points, boundary iff outside the id's
+        own alphabet. It cannot be made stale by Unicode growing.
+
+        The backtick is the case that made this necessary — the bridge's
+        own notices wrap session ids in backticks, and an earlier rule
+        based on Unicode punctuation classified it as part of the
+        identifier, so a quoted id stopped routing.
+        """
+        import string
+
+        from ctrlrelay.bridge.server import names_session
+
+        sid = "secops-owner-b-bbb"
+        alphabet = string.ascii_letters + string.digits + "-_"
+        for code in range(128):
+            ch = chr(code)
+            separates = ch not in alphabet
+            assert names_session(f"{sid}{ch}x", sid) is separates, (
+                f"U+{code:04X} {ch!r} after the id"
+            )
+            assert names_session(f"x{ch}{sid} y", sid) is separates, (
+                f"U+{code:04X} {ch!r} before the id"
+            )
+
+    def test_an_unrecognised_character_fails_toward_refusing(self) -> None:
+        """Outside ASCII, anything we do not recognise as a separator is
+        treated as part of the identifier.
+
+        The direction is the point. Refusing to route tells the operator so
+        and costs them a retry; matching on a guess about a character
+        nobody can see puts an answer on a session that never asked, and
+        the sweeper acts on it. These are the characters four rounds of
+        review produced one at a time — they are covered by the policy
+        rather than by being listed.
+        """
+        from ctrlrelay.bridge.server import names_session
+
+        sid = "secops-owner-b-bbb"
+        for label, ch in (
+            ("ZERO WIDTH JOINER", "\u200d"),
+            ("ZERO WIDTH NON-JOINER", "\u200c"),
+            ("VARIATION SELECTOR-16", "\ufe0f"),
+            ("COMBINING ENCLOSING KEYCAP", "\u20e3"),
+            ("COMBINING ACUTE", "\u0301"),
+            ("COMBINING GRAPHEME JOINER", "\u034f"),
+            ("SOFT HYPHEN", "\u00ad"),
+            ("BYTE ORDER MARK", "\ufeff"),
+            ("BRAILLE PATTERN BLANK", "\u2800"),
+            ("EMOJI MODIFIER FITZPATRICK-1-2", "\U0001f3fb"),
+        ):
+            assert not names_session(f"{sid}{ch} x", sid), f"{label} after"
+            assert not names_session(f"x{ch}{sid} y", sid), f"{label} before"
+
+    def test_recognised_non_ascii_separators_still_route(self) -> None:
+        """The conservative half must not swallow real separators."""
+        from ctrlrelay.bridge.server import names_session
+
+        sid = "secops-owner-b-bbb"
+        assert names_session(f"{sid}\u00a0ok", sid)       # NO-BREAK SPACE
+        assert names_session(f"\u3001{sid}\u3002", sid)   # CJK comma, stop
+        assert names_session(f"\u300c{sid}\u300d", sid)   # CJK quotes
+        assert names_session(f"\u2014{sid}\u2014", sid)   # em dashes
+
     def test_names_session_requires_a_whole_token(self) -> None:
         """Direct coverage of the matcher, including both boundaries."""
         from ctrlrelay.bridge.server import names_session

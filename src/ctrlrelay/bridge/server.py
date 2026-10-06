@@ -46,72 +46,77 @@ def names_session(text: str, session_id: str) -> bool:
     A plain ``session_id in text`` is a substring test, and a substring
     test is not an identifier match: a reply naming
     ``secops-owner-r-abc123`` also contains ``secops-owner-r-abc12``, so
-    the shorter id would claim an answer written for the longer one. Our
-    session ids end in a fixed-width hash, which makes that collision
-    unlikely between two real ids rather than impossible — and "unlikely"
-    is not the property this function needs, because what it decides is
-    which pipeline gets resumed.
+    the shorter id would claim an answer written for the longer one. That
+    decides which pipeline gets resumed, so "unlikely to collide" is not a
+    strong enough property.
 
-    Written as an explicit scan rather than a regex, for two reasons a
-    regex got wrong in review:
+    The rule has two halves, because ASCII and the rest of Unicode are
+    different kinds of problem:
 
-    - ``re.finditer`` is **non-overlapping**, so a candidate rejected for
-      its neighbours hides any overlapping candidate behind it. Scanning
-      every offset cannot.
-    - ``re`` cannot test a Unicode category, and the first attempt used
-      ``unicodedata.combining()``, which reports the *canonical combining
-      class* — not whether a character extends the preceding grapheme.
-      U+FE0F, U+20E3, U+034F and U+200D are all class 0, so they passed as
-      boundaries while rendering as part of the neighbouring glyph.
+    - **ASCII is a closed set of 128 characters and always will be**, so it
+      is enumerated exhaustively: a boundary is anything that is not
+      ``[A-Za-z0-9_-]``, the identifier's own alphabet. That includes the
+      backtick — which matters, because this bridge's own operator notices
+      wrap session ids in backticks, so an id is routinely surrounded by
+      them.
+    - **Outside ASCII, a boundary is only what we affirmatively recognise
+      as a separator**: whitespace, or Unicode punctuation. Everything
+      else counts as still inside the identifier.
 
-    What counts as "still inside the identifier", therefore:
+    That direction is the whole design, and it took four review rounds to
+    get right. The first attempts asked "is this character a boundary?"
+    and tried to exclude the ones that are not: an ASCII class, then
+    ``unicodedata.combining()``, then category ``M``, then category ``C``.
+    Each round produced one more character the previous fix had missed —
+    U+FE0F, then ZWJ, then ZWNJ, then NUL and the braille blank and the
+    emoji skin-tone modifiers. **Every one of those fixes was an
+    enumeration wearing a category's clothes**, and the list of invisible
+    or glyph-modifying characters is not something to keep up with.
 
-    - a word character or ``-``, which is the id's own alphabet;
-    - any character in Unicode category ``M`` — Mn, Mc and Me — covering
-      combining accents, enclosing marks and the variation selectors;
-    - any character in category ``C`` **except** ``Cc`` — so the invisible
-      format characters (``Cf``: ZWJ, ZWNJ, soft hyphen, bidi controls)
-      plus surrogates, private-use and unassigned code points. ``Cc`` is
-      excluded because a newline and a tab genuinely do end an identifier.
+    Asking the opposite question for the non-ASCII half closes it, because
+    the two errors are not symmetric:
 
-    These are **category tests, not lists**, and that is the whole point.
-    Three review rounds each found one more invisible character the
-    previous fix had missed — U+FE0F, then ZWJ, then ZWNJ — because each
-    fix named characters instead of closing the class they belong to. An
-    enumeration of invisible characters is a guess about a table that
-    grows, and the symptom of getting it wrong is an answer routed to the
-    wrong pipeline.
+    - treating an unrecognised character as *inside* the identifier means
+      we do not match, so the bridge refuses to route and **tells the
+      operator so**. They reply again. Recoverable.
+    - treating it as a *boundary* means we match on a guess about a
+      character nobody can see, and an answer lands on a session that
+      never asked the question. Silent, and acted on by the sweeper.
 
-    Including surrogates, private-use and unassigned code points is
-    deliberate rather than incidental: nobody can say how they render, and
-    the two outcomes here are not symmetric. Treating one as *inside* the
-    identifier refuses to route and tells the operator so; treating it as a
-    boundary routes an answer somewhere on a guess about an unprintable
-    character. Refusing is the recoverable direction.
+    So anything unrecognised fails toward refusing. A new Unicode
+    character cannot open a hole here; at worst it costs one retry.
+
+    One finding was declined on the way: that NUL and the other C0
+    controls are a hole because they are invisible. They are boundaries
+    here and should be. The ZWJ case was real because a joiner can bind
+    into a different rendered sequence; no control character can be part of
+    a session id, so an operator who typed one after an id still meant the
+    id, and matching is the correct answer rather than a guess.
     """
     if not session_id:
         return False
 
-    def _inside_identifier(ch: str) -> bool:
+    def _is_boundary(ch: str) -> bool:
         # "" is start- or end-of-string, which is a genuine boundary.
         if not ch:
-            return False
-        if ch == "-" or ch.isalnum() or ch == "_":
             return True
-        # M* = combining marks and variation selectors.
-        # Cf = invisible format characters (ZWJ, ZWNJ, soft hyphen, bidi
-        # controls). Closed by category so this does not need revisiting
-        # the next time Unicode adds one.
-        return unicodedata.category(ch)[:1] in ("M", "C") and (
-            unicodedata.category(ch) != "Cc"
-        )
+        if ch in "-_":
+            return False
+        if ch.isascii():
+            # Exhaustive and permanently so: anything outside the id's own
+            # alphabet separates. Covers the backtick, quotes, brackets and
+            # the C0 controls without naming any of them.
+            return not (ch.isalnum() and ch.isascii())
+        if ch.isspace():
+            return True
+        return unicodedata.category(ch).startswith("P")
 
     span = len(session_id)
     idx = text.find(session_id)
     while idx != -1:
         before = text[idx - 1: idx] if idx else ""
         after = text[idx + span: idx + span + 1]
-        if not _inside_identifier(before) and not _inside_identifier(after):
+        if _is_boundary(before) and _is_boundary(after):
             return True
         # +1, not +span: a rejected candidate must not hide an overlapping
         # one starting inside it.
