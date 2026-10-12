@@ -443,6 +443,151 @@ def _notify_close_finished(task: asyncio.Task) -> None:
     )
 
 
+def unresolved_review_programs(config) -> dict[str, list[str]]:
+    """Reviewer programs that cannot be found, to the repos that want them.
+
+    Asked once at startup rather than once per pull request. The fault
+    in #197 was visible only as a `code_review.spawn_failed` line on the
+    first issue of the day, hours after the daemon came up and with
+    nothing at boot to say the reviewer was unreachable — and the pull
+    request it affected carried zero reviews, which on the forge reads
+    as a review that has not run yet rather than one that cannot.
+
+    Repos with review switched off are skipped: a reviewer nobody asked
+    for being absent is not a fault. A RELATIVE program with a path
+    separator is skipped too, because only the child's working
+    directory can answer for it — an absolute one is answered. An empty
+    dict means every reviewer this check can answer for resolved, which
+    is a different fact from no repo configuring one.
+    """
+    import shlex
+
+    from ctrlrelay.core.binaries import expand_named_file, probe_binary
+
+    wanted: dict[str, list[str]] = {}
+    for repo in getattr(config, "repos", []) or []:
+        review = getattr(repo, "code_review", None)
+        if review is None or getattr(review, "method", "cli") == "off":
+            continue
+        command = getattr(review, "cli_command", "") or ""
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            # A malformed command — an unbalanced quote, or a dangling
+            # backslash, which `shlex` also refuses. Either way it is a
+            # different fault from a missing program, and
+            # `run_code_review` already reports it per run with the
+            # repo named. Do not re-report it as something to install.
+            continue
+        if not argv:
+            # A review-enabled repo whose command is blank fails every
+            # review deterministically, so it is a startup problem and
+            # not something to discover on the first issue of the day.
+            # Named distinctly because the fix is different: there is
+            # nothing to install.
+            wanted.setdefault("", []).append(repo.name)
+            continue
+
+        # `~` expanded first, so a `~/.local/bin/...` command is
+        # answered here instead of falling into the relative branch and
+        # being reported nowhere at all.
+        program = expand_named_file(argv[0])
+        # A RELATIVE program with a separator is resolved by `exec`
+        # against the CHILD's working directory, which is the repo's
+        # worktree. Probing it from the daemon's own directory answers
+        # a different question, and would report a script that is
+        # present as missing — or stay quiet because a same-named file
+        # sits next to the daemon. Not answerable here, so not
+        # answered. An ABSOLUTE path is answerable, and is answered.
+        if not os.path.isabs(program) and (
+            os.sep in program or (os.altsep and os.altsep in program)
+        ):
+            continue
+        wanted.setdefault(program, []).append(repo.name)
+
+    # The blank-command key needs no special case: `probe_binary("")`
+    # finds nothing on PATH and `os.path.join(dir, "")` is a directory,
+    # so it answers None and the entry is kept. An earlier version
+    # short-circuited it, and a mutation showed the short-circuit
+    # changed no outcome — a guard that cannot fire reads as coverage
+    # to the next person.
+    return {
+        program: repos
+        for program, repos in wanted.items()
+        if probe_binary(program) is None
+    }
+
+
+def describe_unresolved_reviewer(
+    program: str, repos: list[str]
+) -> tuple[str, str]:
+    """``(log detail, console line)`` for one unfindable reviewer.
+
+    One function so the two cannot disagree. They did: for a blank
+    ``cli_command`` the event said "there is nothing to install" while
+    the console told the operator to install it.
+
+    Phrased as of now, never as a prediction. Resolution is re-done on
+    every spawn, so installing the tool later makes the next review
+    work — "reviews will fail" is a claim this probe cannot keep. For
+    the same reason the count is of repos that ASKED for the tool, not
+    of failures to come.
+
+    The program name comes from config and is interpolated into Rich
+    markup, so it is escaped. Measured, because the obvious case is not
+    the dangerous one: Rich tolerates an unclosed ``[bold]``, a stray
+    ``[`` and an unterminated ``[red``. ``[/]`` is what raises
+    ``MarkupError`` — an implicit close with nothing open — and a
+    program name carrying it would turn a missing reviewer into a
+    daemon that will not start.
+    """
+    shown = ", ".join(sorted(repos)[:3])
+    more = "" if len(repos) <= 3 else f" and {len(repos) - 3} more"
+    safe_repos = rich_escape(f"{shown}{more}")
+
+    if program == "":
+        detail = (
+            "a review-enabled repo has a blank cli_command, so its "
+            "reviews cannot spawn and there is nothing to install"
+        )
+        line = (
+            f"Review tool: blank cli_command for {safe_repos} — reviews "
+            "there cannot spawn. Set cli_command, or set "
+            "code_review.method to 'off' for those repos."
+        )
+        return detail, line
+
+    if os.path.isabs(program):
+        # Only that one path was examined — deliberately, since the
+        # operator named a file. Telling them it was not found "on PATH
+        # or in the usual user install directories" would be false, and
+        # "install it" is usually the wrong fix: the path has a typo.
+        detail = (
+            f"{program!r} is not an executable file as of startup; it "
+            "was the exact path configured, and nowhere else was "
+            "searched, so reviews needing it cannot spawn"
+        )
+        line = (
+            f"Review tool {rich_escape(repr(program))} is not an "
+            f"executable file — reviews for {safe_repos} cannot spawn. "
+            "Check the path in cli_command, or set "
+            "code_review.method to 'off' for those repos."
+        )
+        return detail, line
+
+    detail = (
+        f"{program!r} was not found on PATH or in the usual user "
+        "install directories as of startup; reviews needing it cannot "
+        "spawn until it is installed"
+    )
+    line = (
+        f"Review tool {rich_escape(repr(program))} not found as of "
+        f"startup — reviews for {safe_repos} cannot spawn until it is "
+        "installed. Or set code_review.method to 'off' for those repos."
+    )
+    return detail, line
+
+
 async def connect_notify_transport(config) -> Transport | None:
     """A connected transport for lane notifications, or ``None``.
 
@@ -1553,6 +1698,23 @@ def poller_start(
                     "Each notification re-checks, so this resolves itself "
                     "once the bridge is up.[/yellow]"
                 )
+
+        # Say once, at boot, which reviewers cannot be found. #197: the
+        # only symptom was a `code_review.spawn_failed` line on the
+        # first issue of the day, and the pull request it affected
+        # carried zero reviews — indistinguishable on the forge from a
+        # review that simply has not run yet.
+        missing_reviewers = unresolved_review_programs(config)
+        for program, repos in sorted(missing_reviewers.items()):
+            detail, line = describe_unresolved_reviewer(program, repos)
+            log_event(
+                _logger,
+                "code_review.binary.unresolved_at_startup",
+                program=program,
+                repos_configured=len(repos),
+                detail=detail,
+            )
+            console.print(f"[yellow]{line}[/yellow]")
 
         # Track in-flight PR-watch background tasks so they outlive
         # handle_issue and aren't garbage-collected. Cleared via

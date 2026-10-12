@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from ctrlrelay.core.binaries import resolve_binary
 from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 
@@ -38,26 +39,17 @@ def _find_claude() -> str:
     PATH is minimal, so ``shutil.which`` missing is the usual precursor to
     every session failing to spawn, and it is worth seeing in the log
     before the failures start.
+
+    The search itself lives in :func:`ctrlrelay.core.binaries.resolve_binary`
+    now. It was duplicated here and nowhere else, and the review tool —
+    which has the same problem for the same reason — had no copy at all
+    (#197). Event names are unchanged, so existing log readers and the
+    `dispatcher.binary.fallback` line already in the poller log still
+    mean what they meant.
     """
-    claude = shutil.which("claude")
-    if claude:
-        return claude
-    for path in [
-        os.path.expanduser("~/.local/bin/claude"),
-        "/usr/local/bin/claude",
-        "/opt/homebrew/bin/claude",
-    ]:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            _logger.warning(
-                "dispatcher.binary.fallback",
-                extra={"binary": path, "reason": "not_on_path"},
-            )
-            return path
-    _logger.warning(
-        "dispatcher.binary.unresolved",
-        extra={"binary": "claude", "reason": "not_on_path"},
+    return resolve_binary(
+        "claude", logger=_logger, event_prefix="dispatcher.binary"
     )
-    return "claude"
 
 
 @dataclass

@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from ctrlrelay.core.binaries import resolve_binary
 from ctrlrelay.core.obs import get_logger, log_event
 
 _logger = get_logger("core.code_review")
@@ -189,13 +190,37 @@ async def run_code_review(
 ) -> CodeReviewOutcome:
     """Review the branch against ``base_branch``."""
     try:
-        argv = [*shlex.split(cli_command), "--base", base_branch]
+        words = shlex.split(cli_command)
     except ValueError as e:
         # Inside the try on purpose: an unbalanced quote in config must
         # not escape into the caller and fail a PR that is already green.
         return CodeReviewOutcome(
             status=ReviewStatus.FAILED, error=f"invalid cli_command: {e}"
         )
+
+    # Before the flags are appended, not after. Checking the assembled
+    # argv is useless — it is never empty — and the first version of
+    # this guard did exactly that, so a blank `cli_command` resolved
+    # and then tried to exec `--base`.
+    if not words:
+        return CodeReviewOutcome(
+            status=ReviewStatus.FAILED,
+            error="cli_command is empty; nothing to run",
+        )
+
+    argv = [*words, "--base", base_branch]
+
+    # Resolve the program before exec. A systemd user unit gets a minimal
+    # PATH and does not read ~/.bashrc, so a reviewer installed under
+    # ~/.local/bin is invisible to the daemon and visible in the
+    # operator's terminal — #197, where every review on alkaturbo died
+    # with FileNotFoundError on the configured reviewer's name while
+    # `command -v` on that name answered a path. A name that cannot be
+    # resolved is passed through unchanged, so the failure stays the one
+    # that names the tool.
+    argv[0] = resolve_binary(
+        argv[0], logger=_logger, event_prefix="code_review.binary"
+    )
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -214,6 +239,7 @@ async def run_code_review(
             "code_review.spawn_failed",
             session_id=session_id,
             repo=repo,
+            program=argv[0],
             error_type=type(e).__name__,
             error=str(e)[:200],
         )

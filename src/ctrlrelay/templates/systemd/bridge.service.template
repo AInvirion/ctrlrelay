@@ -10,6 +10,23 @@ Environment=CTRLRELAY_TELEGRAM_TOKEN=${CTRLRELAY_TELEGRAM_TOKEN}
 # buffer instead of flushing line-by-line, making `tail -f` and
 # `journalctl -f` lag noticeably.
 Environment=PYTHONUNBUFFERED=1
+# A systemd user unit gets a minimal PATH and does not read ~/.bashrc,
+# so anything under ~/.local/bin is invisible to the daemon while
+# working in the operator's terminal. That is #197: every code_review
+# spawn failed with FileNotFoundError on the configured reviewer's
+# name, which was installed under ~/.local/bin. ctrlrelay's own
+# fallback search covers a unit that predates this line; a fresh
+# install should not need it.
+#
+# A SUPERSET of what the user manager was handing us, measured from a
+# live poller's /proc/<pid>/environ — including /snap/bin and the
+# games directories — so rendering this unit cannot narrow the PATH of
+# a machine that already works. Setting PATH here does override the
+# user manager's value, so if you extend it through
+# ~/.config/environment.d or `systemctl --user import-environment`,
+# delete this line and let that win; the fallback search still covers
+# the two binaries ctrlrelay spawns.
+Environment=PATH=${HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
 ExecStart=${CTRLRELAY_BIN} bridge start --foreground
 Restart=always
 RestartSec=5
