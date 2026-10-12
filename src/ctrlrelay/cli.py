@@ -518,6 +518,40 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
     }
 
 
+async def announce_dev_success(
+    transport, *, repo: str, result
+) -> list[str]:
+    """Send the dev lane's success messages and return what was sent.
+
+    A function rather than inline statements so the SEQUENCE is
+    testable, not only the strings. Three rounds of review kept finding
+    the same thing about the `ast` guards that stood in for this: they
+    can show a call exists and cannot show it runs. `if False: await
+    transport.send(warning)` satisfied every structural check while
+    restoring the original silence. A fake transport settles it.
+
+    The warning goes FIRST. Both sends sit inside one ``except`` in the
+    caller, so whichever is second is what a mid-sequence transport
+    failure loses — and of the two, the routine line is the
+    convenience while the warning is the reason somebody opens the
+    pull request.
+
+    Returns the messages in the order they were sent, which is what
+    the caller's tests assert on.
+    """
+    sent: list[str] = []
+    warning = unreviewed_pr_warning(repo, result)
+    if warning is not None:
+        await transport.send(warning)
+        sent.append(warning)
+
+    pr_url = (getattr(result, "outputs", None) or {}).get("pr_url", "")
+    routine = f"✅ PR ready: {pr_url}"
+    await transport.send(routine)
+    sent.append(routine)
+    return sent
+
+
 def unreviewed_pr_warning(repo: str, result) -> str | None:
     """The line to post when a pull request has no review, or ``None``.
 
@@ -2081,22 +2115,13 @@ def poller_start(
                                     f"({repo}): {result.summary}"
                                 )
                             else:
-                                pr_url = result.outputs.get("pr_url", "")
-                                # Its own message, and FIRST. Both
-                                # sends share one `except`, so whichever
-                                # goes second is the one a mid-sequence
-                                # transport failure loses — and of the
-                                # two, the warning is the one #196 is
-                                # about. The routine line is a
-                                # convenience; this one is the reason
-                                # somebody opens the pull request.
-                                warning = unreviewed_pr_warning(
-                                    repo, result
-                                )
-                                if warning is not None:
-                                    await connected_transport.send(warning)
-                                await connected_transport.send(
-                                    f"✅ PR ready: {pr_url}"
+                                # The order and the two-message shape
+                                # live in `announce_dev_success`, where
+                                # a fake transport can watch them.
+                                await announce_dev_success(
+                                    connected_transport,
+                                    repo=repo,
+                                    result=result,
                                 )
                         elif result.blocked:
                             await connected_transport.send(

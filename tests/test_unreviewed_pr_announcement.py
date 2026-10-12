@@ -127,25 +127,87 @@ class TestWhenItWarns:
         assert "o/r" in warning
         assert "#None" not in warning
 
-    @pytest.mark.parametrize(
-        "status",
-        ["failed", "no_evidence", "errored", "base_unknown", "comment_failed"],
-    )
-    def test_every_way_the_review_can_fail_is_announced(
-        self, status: str
-    ) -> None:
-        """Walked, not listed one at a time.
+    def test_every_status_the_product_can_emit_is_classified(self) -> None:
+        """Read out of the producing code, not listed by hand.
 
-        Each of these is a distinct way the reviewer never got as far
-        as posting, and each produced a pull request that reads as
-        finished. A new one added later and forgotten is the shape of
-        this ticket.
+        An earlier version of this carried a hand-written list and a
+        docstring claiming it was walked, which was the opposite of
+        true: a new reviewer outcome added later would not have been in
+        it. The statuses are now taken from the `ReviewReport(...)`
+        constructions in `dev.py`, so adding one and forgetting it here
+        is impossible — and every one of them that is not a deliberate
+        setting has to produce a warning.
         """
-        warning = unreviewed_pr_warning(
-            "o/r",
-            _result(pr_number=1, review_posted=False, review_status=status),
+        import ast
+        from pathlib import Path as _Path
+
+        import ctrlrelay.pipelines.dev as dev_module
+        from ctrlrelay.core.code_review import ReviewStatus
+
+        tree = ast.parse(_Path(dev_module.__file__).read_text())
+        emitted = set()
+        forwards_outcome = False
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "ReviewReport"
+            ):
+                continue
+            for kw in node.keywords:
+                if kw.arg != "status":
+                    continue
+                if isinstance(kw.value, ast.Constant):
+                    emitted.add(kw.value.value)
+                elif (
+                    # `status=outcome.status.value` — this branch
+                    # forwards whatever the reviewer produced, so the
+                    # enum is the authority for those.
+                    isinstance(kw.value, ast.Attribute)
+                    and kw.value.attr == "value"
+                ):
+                    forwards_outcome = True
+                else:
+                    raise AssertionError(
+                        "a ReviewReport status is computed in a way "
+                        "this test cannot read, so it can no longer "
+                        "enumerate the statuses: "
+                        + ast.dump(kw.value)[:160]
+                    )
+
+        assert forwards_outcome, (
+            "nothing forwards the reviewer's own status any more; the "
+            "enum below may no longer be a producer"
         )
-        assert warning is not None, status
+        # Both producers: the literals here, and the enum they forward.
+        emitted |= {member.value for member in ReviewStatus}
+        assert len(emitted) >= 6, emitted
+        deliberate = {"reviewed", "skipped", "not_commented"}
+        failures = emitted - deliberate
+        assert failures, emitted
+        for status in sorted(failures):
+            warning = unreviewed_pr_warning(
+                "o/r",
+                _result(
+                    pr_number=1, review_posted=False, review_status=status
+                ),
+            )
+            assert warning is not None, status
+        # And the three deliberate ones stay quiet, so this cannot
+        # pass for a classifier that warns about everything.
+        for status in sorted(deliberate & emitted):
+            posted = status == "reviewed"
+            assert (
+                unreviewed_pr_warning(
+                    "o/r",
+                    _result(
+                        pr_number=1,
+                        review_posted=posted,
+                        review_status=status,
+                    ),
+                )
+                is None
+            ), status
 
 
 class TestWhenItStaysQuiet:
@@ -440,23 +502,26 @@ class TestEveryExitReports:
             f"{type(last).__name__} at line {last.lineno}"
         )
         if isinstance(last, ast.Try):
-            # The real shape today: a try whose body and handler both
-            # return. Every branch of it has to.
-            for block_name in ("body", "handlers", "orelse"):
-                for block in (
-                    getattr(last, block_name, []) or []
-                ):
-                    stmts = (
-                        block.body
-                        if isinstance(block, ast.ExceptHandler)
-                        else [block]
-                    )
-                    assert any(
-                        isinstance(st, (ast.Return, ast.Raise))
-                        for st in stmts
-                    ) or block_name == "body", (
-                        f"the final try's {block_name} can fall through"
-                    )
+            # The real shape today: a try whose body and every handler
+            # return. An earlier version exempted the body with
+            # `or block_name == "body"`, so deleting the successful
+            # `return ReviewReport(...)` passed — found by review.
+            assert any(
+                isinstance(st, (ast.Return, ast.Raise))
+                for st in last.body
+            ), "the final try's body can fall through, returning None"
+            for handler in last.handlers:
+                assert any(
+                    isinstance(st, (ast.Return, ast.Raise))
+                    for st in handler.body
+                ), (
+                    f"the handler at line {handler.lineno} can fall "
+                    "through, returning None"
+                )
+            assert not last.orelse or any(
+                isinstance(st, (ast.Return, ast.Raise))
+                for st in last.orelse
+            ), "the final try's else can fall through"
 
 
 class TestTheOutcomeReachesTheCaller:
@@ -532,28 +597,151 @@ class TestTheOutcomeReachesTheCaller:
         )
 
 
+class _FakeTransport:
+    """Records what it was asked to send, in order."""
+
+    def __init__(self, fail_on: int | None = None) -> None:
+        self.sent: list[str] = []
+        self._fail_on = fail_on
+
+    async def send(self, message: str, **_kw) -> None:
+        if self._fail_on is not None and len(self.sent) == self._fail_on:
+            raise OSError("bridge went away")
+        self.sent.append(message)
+
+
 class TestTheWarningIsActuallySent:
-    """Structural, and it is the claim the ticket is about.
+    """Driven, not read.
 
-    Found by mutation: deleting the send from `handle_issue` left every
-    other case in this file green — I had tested the function I wrote
-    and not the thing an operator sees, which is how the original fault
-    shipped in the first place.
-
-    `handle_issue` is a closure inside `poller_start`, which opens a
-    state database and polls 87 repositories, so it is read rather than
-    driven.
+    Three review rounds kept finding the same limit in the `ast`
+    guards that used to stand here: they can show a call exists and
+    cannot show it runs. `if False: await transport.send(warning)`
+    satisfied the transport, await, ordering and own-message checks
+    while restoring the original silence. So the sequence moved into
+    `announce_dev_success`, which a fake transport can watch.
     """
 
-    @staticmethod
-    def _handle_issue():
+    @pytest.mark.asyncio
+    async def test_both_messages_go_out_when_there_is_no_review(
+        self,
+    ) -> None:
+        from ctrlrelay.cli import announce_dev_success
+
+        transport = _FakeTransport()
+        await announce_dev_success(
+            transport,
+            repo="AInvirion/zzsites",
+            result=_result(
+                pr_number=842,
+                pr_url="https://example/842",
+                review_posted=False,
+                review_status="failed",
+                review_detail="FileNotFoundError",
+            ),
+        )
+        assert len(transport.sent) == 2, transport.sent
+        # Separate messages. A warning concatenated onto a success
+        # line is read as part of the success line.
+        assert "NO REVIEW ON THIS PR" in transport.sent[0]
+        assert transport.sent[1] == "✅ PR ready: https://example/842"
+        assert "NO REVIEW" not in transport.sent[1]
+
+    @pytest.mark.asyncio
+    async def test_the_warning_is_sent_first(self) -> None:
+        """Both sends share one `except` in the caller, so the second
+        is what a mid-sequence transport failure loses — and of the two
+        the warning is the one this ticket is about."""
+        from ctrlrelay.cli import announce_dev_success
+
+        # A transport that dies on its SECOND send.
+        transport = _FakeTransport(fail_on=1)
+        with pytest.raises(OSError):
+            await announce_dev_success(
+                transport,
+                repo="o/r",
+                result=_result(
+                    pr_number=1,
+                    pr_url="u",
+                    review_posted=False,
+                    review_status="failed",
+                ),
+            )
+        # The warning survived; the routine line is what was lost.
+        assert len(transport.sent) == 1, transport.sent
+        assert "NO REVIEW ON THIS PR" in transport.sent[0]
+
+    @pytest.mark.asyncio
+    async def test_a_reviewed_pr_gets_only_the_routine_line(self) -> None:
+        """The other direction, so the above cannot pass for something
+        that always sends two."""
+        from ctrlrelay.cli import announce_dev_success
+
+        transport = _FakeTransport()
+        await announce_dev_success(
+            transport,
+            repo="o/r",
+            result=_result(
+                pr_number=1,
+                pr_url="u",
+                review_posted=True,
+                review_status="reviewed",
+            ),
+        )
+        assert transport.sent == ["✅ PR ready: u"]
+
+    @pytest.mark.asyncio
+    async def test_the_routine_line_survives_a_missing_pr_url(self) -> None:
+        """`outputs` comes from an agent and need not be complete."""
+        from ctrlrelay.cli import announce_dev_success
+
+        transport = _FakeTransport()
+        await announce_dev_success(
+            transport,
+            repo="o/r",
+            result=_result(review_posted=True, review_status="reviewed"),
+        )
+        assert transport.sent == ["✅ PR ready: "]
+
+    @pytest.mark.asyncio
+    async def test_what_it_returns_is_what_it_sent(self) -> None:
+        """The return value is what the caller's tests read, so it has
+        to be the truth rather than a second construction of it."""
+        from ctrlrelay.cli import announce_dev_success
+
+        transport = _FakeTransport()
+        returned = await announce_dev_success(
+            transport,
+            repo="o/r",
+            result=_result(
+                pr_number=1,
+                pr_url="u",
+                review_posted=False,
+                review_status="failed",
+            ),
+        )
+        assert returned == transport.sent
+
+    def test_handle_issue_delegates_to_it(self) -> None:
+        """The one claim left to structure, and it is a weak one.
+
+        Everything about the order and the two messages is asserted
+        above against a real transport. All this adds is that the dev
+        branch of `handle_issue` routes through that function rather
+        than growing its own copy — `handle_issue` is a closure inside
+        `poller_start`, which opens a state database and polls 87
+        repositories.
+
+        It cannot show the call is reachable. Nothing structural can,
+        which is why the behaviour moved out rather than the guard
+        getting a fourth patch.
+        """
         import ast
         from pathlib import Path as _Path
 
         import ctrlrelay.cli as cli_module
 
         tree = ast.parse(_Path(cli_module.__file__).read_text())
-        node = next(
+        handle_issue = next(
             (
                 n
                 for n in ast.walk(tree)
@@ -562,196 +750,29 @@ class TestTheWarningIsActuallySent:
             ),
             None,
         )
-        assert node is not None, "handle_issue is gone from cli.py"
-        return node
-
-    def test_handle_issue_builds_the_warning_and_sends_it(self) -> None:
-        import ast
-
-        handle_issue = self._handle_issue()
-
-        builds = [
+        assert handle_issue is not None, "handle_issue is gone from cli.py"
+        calls = [
             n
             for n in ast.walk(handle_issue)
             if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Name)
-            and n.func.id == "unreviewed_pr_warning"
+            and n.func.id == "announce_dev_success"
         ]
-        assert len(builds) == 1, (
-            "exactly one place should ask whether the pull request was "
-            f"reviewed; found {len(builds)}"
+        assert len(calls) == 1, (
+            f"expected exactly one announce_dev_success call, got "
+            f"{len(calls)}"
         )
-
-        # The value has to be assigned to a name, and that name has to
-        # reach a `.send(...)`. Building it and dropping it is the
-        # defect with extra steps.
-        assigned = {
-            t.id
-            for n in ast.walk(handle_issue)
-            if isinstance(n, ast.Assign)
-            for t in n.targets
-            if isinstance(t, ast.Name)
-            and any(
-                isinstance(c, ast.Call)
-                and isinstance(c.func, ast.Name)
-                and c.func.id == "unreviewed_pr_warning"
-                for c in ast.walk(n.value)
-            )
-        }
-        assert len(assigned) == 1, assigned
-        name = assigned.pop()
-
-        # The transport's name is taken from the ROUTINE line
-        # specifically — the one whose text contains "PR ready" — not
-        # from every awaited send in the function. Deriving it from all
-        # of them includes the warning's own send, so the check would
-        # be satisfied by its own input: `if False: bogus.send(warning)`
-        # would add `bogus` to the set and then match against it.
-        # Found by mutation.
-        def _send_text(call: ast.Call) -> str:
-            parts = []
-            for arg in call.args:
-                for node in ast.walk(arg):
-                    if isinstance(node, ast.Constant) and isinstance(
-                        node.value, str
-                    ):
-                        parts.append(node.value)
-            return " ".join(parts)
-
-        routine_targets = {
-            a.value.func.value.id
-            for a in ast.walk(handle_issue)
-            if isinstance(a, ast.Await)
-            and isinstance(a.value, ast.Call)
-            and isinstance(a.value.func, ast.Attribute)
-            and a.value.func.attr == "send"
-            and isinstance(a.value.func.value, ast.Name)
-            and "PR ready" in _send_text(a.value)
-        }
-        assert routine_targets, (
-            "no awaited send carries the routine 'PR ready' line, so "
-            "there is nothing to check the warning's send against"
-        )
-
-        sent = [
-            a
-            for a in ast.walk(handle_issue)
-            if isinstance(a, ast.Await)
-            and isinstance(a.value, ast.Call)
-            and isinstance(a.value.func, ast.Attribute)
-            and a.value.func.attr == "send"
-            and isinstance(a.value.func.value, ast.Name)
-            and a.value.func.value.id in routine_targets
-            and any(
-                isinstance(x, ast.Name) and x.id == name
-                for x in a.value.args
-            )
-        ]
-        assert sent, (
-            f"{name!r} is built and never awaited on a send — the "
-            "warning exists and nobody is told, which is #196 with "
-            "extra steps"
-        )
-
-    def test_the_warning_is_sent_before_the_routine_line(self) -> None:
-        """Both sends share one `except`, so order decides what is lost.
-
-        A transport that dies between them loses whichever went
-        second. Of the two, the warning is the one this ticket is
-        about: the routine line is a convenience, and the warning is
-        the reason somebody opens the pull request at all.
-
-        Found by mutation: putting the warning back second left every
-        other case in this file green.
-        """
-        import ast
-
-        handle_issue = self._handle_issue()
-
-        def _text(call: ast.Call) -> str:
-            out = []
-            for arg in call.args:
-                for n in ast.walk(arg):
-                    if isinstance(n, ast.Constant) and isinstance(
-                        n.value, str
-                    ):
-                        out.append(n.value)
-            return " ".join(out)
-
-        routine_line = None
-        warning_line = None
-        for a in ast.walk(handle_issue):
-            if not (
-                isinstance(a, ast.Await)
-                and isinstance(a.value, ast.Call)
-                and isinstance(a.value.func, ast.Attribute)
-                and a.value.func.attr == "send"
-            ):
-                continue
-            if "PR ready" in _text(a.value):
-                routine_line = a.lineno
-            if any(
-                isinstance(x, ast.Name) and x.id == "warning"
-                for x in a.value.args
-            ):
-                warning_line = a.lineno
-
-        assert routine_line is not None, "the routine line is gone"
-        assert warning_line is not None, "the warning is never sent"
-        assert warning_line < routine_line, (
-            f"the warning is sent at line {warning_line}, after the "
-            f"routine line at {routine_line} — a transport that dies "
-            "between them loses the warning"
-        )
-
-    def test_the_routine_success_line_is_still_there(self) -> None:
-        """It was never missing, and replacing it was not this ticket.
-
-        The claim at the top of #196 — that nothing announces a pull
-        request the dev lane opens — came from searching the live
-        config for `notify`/`announce` keys instead of reading the send
-        path. This pins the line that was already there, so a later
-        change cannot quietly fold the two messages into one and lose
-        the separation the warning depends on.
-        """
-        import ast
-
-        handle_issue = self._handle_issue()
-        literals = [
+        # And it does not also hand-roll the routine line, which is how
+        # the two messages would drift apart again.
+        literals = " ".join(
             n.value
             for n in ast.walk(handle_issue)
             if isinstance(n, ast.Constant) and isinstance(n.value, str)
-        ]
-        joined = " ".join(literals)
-        assert "PR ready" in joined, joined[:400]
-
-    def test_the_warning_goes_out_as_its_own_message(self) -> None:
-        """Not appended to the routine line.
-
-        A warning concatenated onto a success message is read as part
-        of the success message. Two sends, so the second cannot be
-        skimmed past with the first.
-        """
-        import ast
-
-        handle_issue = self._handle_issue()
-        for node in ast.walk(handle_issue):
-            if not (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "send"
-            ):
-                continue
-            for arg in node.args:
-                mentions = {
-                    n.id
-                    for n in ast.walk(arg)
-                    if isinstance(n, ast.Name)
-                }
-                if "warning" in mentions:
-                    # The warning's own send must carry the warning and
-                    # nothing else interpolated with it.
-                    assert isinstance(arg, ast.Name), ast.dump(arg)[:200]
+        )
+        assert "PR ready" not in literals, (
+            "handle_issue builds a 'PR ready' line of its own; the "
+            "announcement lives in announce_dev_success"
+        )
 
 
 class TestTheSafeDefault:
@@ -821,33 +842,57 @@ class TestTheSafeDefault:
 
         default_found = False
         for block in _blocks_containing(merge):
-            defaults = [
-                i
-                for i, st in enumerate(block)
-                if isinstance(st, ast.Assign)
-                and any(
-                    isinstance(t, ast.Name) and t.id == "review_report"
-                    for t in st.targets
+            def _is_default(st) -> bool:
+                """`x = DEFAULT` or `x: T = DEFAULT` — both are fine."""
+                if isinstance(st, ast.Assign):
+                    names = [
+                        t.id for t in st.targets if isinstance(t, ast.Name)
+                    ]
+                elif isinstance(st, ast.AnnAssign) and isinstance(
+                    st.target, ast.Name
+                ):
+                    names = [st.target.id]
+                else:
+                    return False
+                return (
+                    "review_report" in names
+                    and isinstance(st.value, ast.Name)
+                    and st.value.id == "REVIEW_NOT_REPORTED"
                 )
-                and isinstance(st.value, ast.Name)
-                and st.value.id == "REVIEW_NOT_REPORTED"
+
+            defaults = [
+                i for i, st in enumerate(block) if _is_default(st)
             ]
             if not defaults:
                 continue
-            overrides = [
-                i
-                for i, st in enumerate(block)
-                if i > defaults[0]
-                and isinstance(st, ast.Assign)
-                and any(
+            # Assignment, annotated assignment or `del`: all three
+            # change what an unset path sees, and an earlier version
+            # looked only for `Assign` — so `del review_report` passed
+            # and would raise UnboundLocalError.
+            overrides = []
+            for i, st in enumerate(block):
+                if i <= defaults[0]:
+                    continue
+                if isinstance(st, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id == "review_report"
                     for t in st.targets
-                )
-            ]
+                ):
+                    overrides.append(i)
+                elif (
+                    isinstance(st, ast.AnnAssign)
+                    and isinstance(st.target, ast.Name)
+                    and st.target.id == "review_report"
+                ):
+                    overrides.append(i)
+                elif isinstance(st, ast.Delete) and any(
+                    isinstance(t, ast.Name) and t.id == "review_report"
+                    for t in st.targets
+                ):
+                    overrides.append(i)
             assert not overrides, (
-                "review_report is reassigned unconditionally after its "
-                f"default at block positions {overrides}, so the "
-                "default is not what an unset path gets"
+                "review_report is reassigned or deleted unconditionally "
+                f"after its default at block positions {overrides}, so "
+                "the default is not what an unset path gets"
             )
             default_found = True
             break
