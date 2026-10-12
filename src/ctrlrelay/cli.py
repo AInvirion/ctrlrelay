@@ -11,8 +11,12 @@ from rich.table import Table
 from ctrlrelay import __version__
 from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 from ctrlrelay.core.github import GitHubCLI, GitHubError
+from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier
 from ctrlrelay.core.question_expiry import expire_stale_questions
+from ctrlrelay.transports.base import Transport
+
+_logger = get_logger("cli")
 
 # Startup probe cap. `GitHubCLI` uses 60s for ordinary calls; this one
 # gates daemon startup, so a hung gh must not wedge it indefinitely.
@@ -273,6 +277,81 @@ def _bridge_socket_settings(config) -> tuple[Path, int] | None:
         chat.socket_path.expanduser().resolve(),
         chat.ask_timeout_seconds,
     )
+
+
+async def connect_notify_transport(config) -> Transport | None:
+    """A connected transport for lane notifications, or ``None``.
+
+    Resolved on every call on purpose. The poller used to build this
+    once at startup behind a single ``socket_path.exists()`` and keep
+    the answer for the life of the process, so losing a boot race to
+    the bridge by a few seconds silenced every issue-lane announcement
+    until somebody restarted the daemon — #198. On alkaturbo the
+    poller's check logged ``mattermost socket not found`` at
+    2026-10-11T20:47:59-0700 and the bridge process started at
+    20:48:02, and the dev lane then said nothing for 24 hours.
+
+    Unit ordering is not the alternative: the unit already declares
+    ``After=ctrlrelay-bridge.service``, and the bridge is
+    ``Type=simple``, so systemd calls it started when the process forks
+    rather than when the socket exists. Any design that trusts one
+    ``exists()`` at startup is racing something it cannot order.
+
+    ``None`` means there is no channel RIGHT NOW, which is a different
+    fact from "nothing needed sending" — so every ``None`` returned
+    here logs an event naming what the operator loses. The original
+    fault's only symptom was an absent message, which is
+    indistinguishable from an uneventful day, and that is why it ran
+    for a day unnoticed rather than being spotted in the log.
+
+    Never raises. A notification must not fail a pipeline run, so a
+    connect error is logged and swallowed; the log line is what keeps
+    the swallow from being invisible.
+    """
+    settings = _bridge_socket_settings(config)
+    if settings is None:
+        log_event(
+            _logger,
+            "notify.transport.unconfigured",
+            detail=(
+                "no chat transport configured; this notification is not sent"
+            ),
+        )
+        return None
+
+    socket_path, ask_timeout = settings
+    if not socket_path.exists():
+        log_event(
+            _logger,
+            "notify.transport.socket_missing",
+            socket_path=str(socket_path),
+            detail="bridge socket absent; this notification is not sent",
+        )
+        return None
+
+    from ctrlrelay.transports import SocketTransport
+
+    candidate = SocketTransport(socket_path, ask_timeout_seconds=ask_timeout)
+    try:
+        await candidate.connect()
+    except Exception as e:
+        log_event(
+            _logger,
+            "notify.transport.connect_failed",
+            socket_path=str(socket_path),
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+            detail="bridge did not accept the connection; "
+            "this notification is not sent",
+        )
+        return None
+
+    log_event(
+        _logger,
+        "notify.transport.connected",
+        socket_path=str(socket_path),
+    )
+    return candidate
 
 
 def _get_bridge_pid_file(socket_path: Path) -> Path:
@@ -1177,27 +1256,37 @@ def poller_start(
             bare_repos_dir=config.paths.bare_repos,
         )
 
-        # Set up transport for notifications
-        transport = None
+        # Report the notification channel at startup; do not DECIDE it
+        # here. `connect_notify_transport` resolves it per use, and
+        # these lines are a banner, not a gate — the previous version
+        # built the transport once here and a missing socket at that
+        # instant silenced the lane for the whole process (#198).
+        #
+        # The merge watcher, the scheduled secops sweep and the
+        # pending-resume sweeper already resolve theirs at use, and they
+        # kept working through the 24 hours this one was mute. That is
+        # the negative control: the transport, the credentials and
+        # Mattermost were all fine.
         settings = _bridge_socket_settings(config)
-        if settings is not None:
-            from ctrlrelay.transports import SocketTransport
-            socket_path, ask_timeout = settings
+        if settings is None:
+            console.print(
+                "[yellow]No chat transport configured — the dev lane will "
+                "not announce issues, pull requests or failures.[/yellow]"
+            )
+        else:
             name = config.transport.type.value
+            socket_path, _ = settings
             if socket_path.exists():
-                transport = SocketTransport(
-                    socket_path,
-                    ask_timeout_seconds=ask_timeout,
-                )
                 console.print(
-                    f"[dim]{name} transport enabled via {socket_path}[/dim]"
+                    f"[dim]{name} transport via {socket_path}[/dim]"
                 )
             else:
+                # Not fatal and no longer sticky: the bridge may still be
+                # starting, and the next notification re-checks.
                 console.print(
-                    f"[yellow]{name} socket not found at {socket_path}[/yellow]"
-                )
-                console.print(
-                    "[yellow]Run 'ctrlrelay bridge start' to enable notifications[/yellow]"
+                    f"[yellow]{name} socket not present yet at "
+                    f"{socket_path} — notifications will connect when the "
+                    "bridge creates it.[/yellow]"
                 )
 
         # Track in-flight PR-watch background tasks so they outlive
@@ -1315,13 +1404,15 @@ def poller_start(
                 f"[green]New issue detected:[/green] #{issue_number} in {repo} — {title}"
             )
 
-            # Connect transport for notifications
-            connected_transport = None
-            if transport:
+            # Connect a transport for notifications. Resolved now, not
+            # at daemon startup, so a bridge that came up after this
+            # process did is still reachable (#198).
+            connected_transport = await connect_notify_transport(config)
+            if connected_transport is not None:
                 try:
-                    await transport.connect()
-                    connected_transport = transport
-                    await transport.send(f"🔔 New issue #{issue_number} in {repo}: {title}")
+                    await connected_transport.send(
+                        f"🔔 New issue #{issue_number} in {repo}: {title}"
+                    )
                 except Exception as e:
                     console.print(f"[yellow]Transport error: {e}[/yellow]")
 
@@ -1329,8 +1420,8 @@ def poller_start(
             repo_configs = [r for r in config.repos if r.name == repo]
             if not repo_configs:
                 console.print(f"[yellow]No config found for repo {repo}, skipping.[/yellow]")
-                if connected_transport:
-                    await transport.close()
+                if connected_transport is not None:
+                    await connected_transport.close()
                 return
 
             repo_config = repo_configs[0]
@@ -1404,9 +1495,9 @@ def poller_start(
                         "(secops running?) — un-marked for retry next "
                         "poll.[/yellow]"
                     )
-                    if connected_transport:
+                    if connected_transport is not None:
                         try:
-                            await transport.send(
+                            await connected_transport.send(
                                 f"⏳ #{issue_number} in {repo} "
                                 "deferred (repo busy); will retry."
                             )
@@ -1501,25 +1592,25 @@ def poller_start(
                 # Send result notification — best-effort. A failed send
                 # must NOT prevent the merge watcher (spawned above)
                 # from running, so swallow transport errors here.
-                if connected_transport:
+                if connected_transport is not None:
                     try:
                         if result.success:
                             if is_task:
-                                await transport.send(
+                                await connected_transport.send(
                                     f"✅ Task done on #{issue_number} "
                                     f"({repo}): {result.summary}"
                                 )
                             else:
                                 pr_url = result.outputs.get("pr_url", "")
-                                await transport.send(
+                                await connected_transport.send(
                                     f"✅ PR ready: {pr_url}"
                                 )
                         elif result.blocked:
-                            await transport.send(
+                            await connected_transport.send(
                                 f"⏸️ Blocked on #{issue_number}: {result.question}"
                             )
                         else:
-                            await transport.send(
+                            await connected_transport.send(
                                 f"❌ Failed on #{issue_number}: "
                                 f"{failure_text(result)}"
                             )
@@ -1528,8 +1619,8 @@ def poller_start(
                             f"[yellow]Transport error sending result: {e}[/yellow]"
                         )
             finally:
-                if connected_transport:
-                    await transport.close()
+                if connected_transport is not None:
+                    await connected_transport.close()
 
         console.print(f"[green]Starting poller[/green] for {len(repo_names)} repo(s) as {username}")
         console.print(f"  Interval: {interval}s | Press Ctrl+C to stop")
