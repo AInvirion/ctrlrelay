@@ -423,9 +423,12 @@ class TestItNeverCostsTheRun:
         sock.write_text("placeholder so the existence check passes")
         config = _config(tmp_path, _mattermost(sock))
 
+        built: list[_WedgedTransport] = []
+
         class _WedgedTransport:
             def __init__(self, *_a, **_kw) -> None:
                 self.closed = False
+                built.append(self)
 
             async def connect(self) -> None:
                 await asyncio.Event().wait()  # never returns
@@ -442,12 +445,19 @@ class TestItNeverCostsTheRun:
             result = await asyncio.wait_for(
                 connect_notify_transport(config), timeout=5
             )
-        assert result is None
+        assert result is None, (
+            "a connect nobody waited for is not a working channel"
+        )
         events = _event_names(caplog)
+        assert "notify.transport.abandoned" in events
         assert "notify.transport.connect_failed" in events
-        # The abandoned half-open transport is closed rather than left
-        # for the garbage collector.
         assert "notify.transport.connected" not in events
+        # The half-open transport is closed, not left for the garbage
+        # collector. Asserted on the object, because the previous
+        # version of this test asserted only that "connected" was
+        # absent — which stays true with the close deleted.
+        assert built, "the resolver never got as far as building one"
+        assert built[0].closed, "the abandoned transport was left open"
 
     @pytest.mark.asyncio
     async def test_a_close_that_raises_does_not_escape(self, caplog) -> None:
@@ -485,21 +495,99 @@ class TestItNeverCostsTheRun:
         assert "notify.transport.close_failed" in _event_names(caplog)
 
     @pytest.mark.asyncio
-    async def test_closing_nothing_is_fine(self) -> None:
-        """`handle_issue`'s finally runs whether or not a channel exists."""
+    async def test_closing_nothing_is_a_no_op(self) -> None:
+        """Closing `None` does nothing and says nothing.
+
+        This is what lets `handle_issue`'s `finally` be unconditional:
+        it runs on the path where no channel was ever opened too, and
+        the old code's `if connected_transport is not None` around each
+        close is what left one of them behind. It does not exercise
+        `handle_issue` — `TestTheTransportIsClosedOnEveryPath` is the
+        guard that reads that function.
+        """
         from ctrlrelay.cli import _close_notify_transport
 
         await _close_notify_transport(None)
+
+
+class TestCancellationIsPassedOnAndCleanedUp:
+    """Shutdown must not swallow a cancellation or leak the half-open socket.
+
+    `asyncio.CancelledError` is a `BaseException`, so the resolver's
+    `except Exception` does not see it — and the candidate was created
+    inside a statement that never completed, so `handle_issue`'s
+    try/finally has not started and nothing else holds a reference.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_connect_closes_and_re_raises(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        import ctrlrelay.cli as cli_module
+        import ctrlrelay.transports as transports
+        from ctrlrelay.cli import connect_notify_transport
+
+        sock = tmp_path / "mm.sock"
+        sock.write_text("placeholder so the existence check passes")
+        config = _config(tmp_path, _mattermost(sock))
+
+        started = asyncio.Event()
+        built: list[object] = []
+
+        class _SlowTransport:
+            def __init__(self, *_a, **_kw) -> None:
+                self.closed = False
+                built.append(self)
+
+            async def connect(self) -> None:
+                started.set()
+                await asyncio.Event().wait()
+
+            async def close(self) -> None:
+                self.closed = True
+
+        monkeypatch.setattr(transports, "SocketTransport", _SlowTransport)
+        monkeypatch.setattr(cli_module, "_NOTIFY_CONNECT_TIMEOUT_SECONDS", 30)
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            task = asyncio.ensure_future(connect_notify_transport(config))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # The close is scheduled, not awaited, so give the loop a
+            # turn to run it.
+            for _ in range(50):
+                if built and built[0].closed:
+                    break
+                await asyncio.sleep(0.01)
+
+        assert built, "the resolver never built a transport"
+        assert built[0].closed, "a cancelled connect left the socket open"
+        assert "notify.transport.cancelled" in _event_names(caplog)
 
 
 class TestEveryLossPathSaysNotSent:
     """Read from the source, because a test cannot reach every branch.
 
     One loss path needs a directory this process cannot stat, and CI
-    runs as root, where there is no such directory. So the claim "every
-    way of losing a notification is logged, and says a notification was
+    runs as root, where there is no such directory. Another needs the
+    enclosing task to be cancelled mid-connect. So the claim "every way
+    of losing a notification is logged, and says a notification was
     lost" is pinned structurally: a branch added later is covered
     whether or not anybody writes a case for it.
+
+    Paired per path, not counted globally. An earlier version of this
+    guard compared the number of loss events to the number of
+    ``return None`` statements, which is satisfied by two logs on one
+    path plus a silent path, and broken by a correct path that exits
+    with ``raise`` instead of a return.
+
+    Known limit, stated rather than implied: this reads literal
+    ``log_event`` calls in this one function. A loss routed through a
+    helper, or an event name built at runtime, is invisible to it — the
+    guard fails loudly on a computed name rather than passing quietly,
+    which is the direction that sends somebody to look.
     """
 
     @staticmethod
@@ -515,18 +603,10 @@ class TestEveryLossPathSaysNotSent:
                 return node
         raise AssertionError("connect_notify_transport is gone from cli.py")
 
-    def test_each_none_return_is_matched_by_a_logged_loss(self) -> None:
-        resolver = self._resolver()
-
-        none_returns = [
-            n
-            for n in ast.walk(resolver)
-            if isinstance(n, ast.Return)
-            and isinstance(n.value, ast.Constant)
-            and n.value.value is None
-        ]
-        loss_events = []
-        for node in ast.walk(resolver):
+    @staticmethod
+    def _loss_event(stmt) -> tuple[str, ast.Call] | None:
+        """``(event_name, call)`` if this statement logs a lost notification."""
+        for node in ast.walk(stmt):
             if not (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
@@ -534,33 +614,85 @@ class TestEveryLossPathSaysNotSent:
             ):
                 continue
             name = node.args[1] if len(node.args) > 1 else None
-            if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
+            if not (
+                isinstance(name, ast.Constant) and isinstance(name.value, str)
+            ):
                 raise AssertionError(
                     "an event name in connect_notify_transport is computed "
-                    "rather than literal; this guard can no longer read it"
+                    "rather than literal; this guard can no longer read it, "
+                    "so go and check the loss paths by hand"
                 )
             if name.value != "notify.transport.connected":
-                loss_events.append((name.value, node))
+                return name.value, node
+        return None
 
-        assert none_returns, "the resolver has stopped being able to say 'no'"
-        assert len(loss_events) == len(none_returns), (
-            f"{len(none_returns)} paths return None but "
-            f"{len(loss_events)} log a loss: "
-            f"{[n for n, _ in loss_events]}"
+    @staticmethod
+    def _is_loss_exit(stmt) -> bool:
+        """A statement that leaves the function without a channel.
+
+        ``return None`` is the ordinary case; a bare ``raise`` is the
+        cancellation path, which must also say what went unsent.
+        """
+        if isinstance(stmt, ast.Return):
+            return isinstance(stmt.value, ast.Constant) and (
+                stmt.value.value is None
+            )
+        return isinstance(stmt, ast.Raise) and stmt.exc is None
+
+    def test_each_loss_path_logs_before_it_exits(self) -> None:
+        resolver = self._resolver()
+
+        exits = 0
+        unlogged = []
+        silent_detail = []
+
+        # Every statement list in the function: a body, an else, a
+        # handler. A loss exit must be preceded IN ITS OWN LIST by the
+        # event that explains it, so a log on a sibling branch cannot
+        # vouch for this one.
+        for node in ast.walk(resolver):
+            for field in ("body", "orelse", "finalbody"):
+                block = getattr(node, field, None)
+                if not isinstance(block, list):
+                    continue
+                self._check_block(block, exits_counter := [], unlogged,
+                                  silent_detail)
+                exits += len(exits_counter)
+            for handler in getattr(node, "handlers", []):
+                self._check_block(handler.body, exits_counter := [],
+                                  unlogged, silent_detail)
+                exits += len(exits_counter)
+
+        assert exits, "the resolver has stopped being able to say 'no'"
+        assert not unlogged, (
+            "these exits leave without logging anything, so a reader "
+            f"cannot tell them from an uneventful day: lines {unlogged}"
+        )
+        assert not silent_detail, (
+            "these loss events do not say a notification was not sent: "
+            f"{silent_detail}"
         )
 
-        missing = []
-        for event_name, call in loss_events:
+    @classmethod
+    def _check_block(cls, block, exits, unlogged, silent_detail) -> None:
+        logged: list[tuple[str, ast.Call]] = []
+        for stmt in block:
+            found = cls._loss_event(stmt)
+            if found is not None:
+                logged.append(found)
+            if not cls._is_loss_exit(stmt):
+                continue
+            exits.append(stmt.lineno)
+            if not logged:
+                unlogged.append(stmt.lineno)
+                continue
+            event_name, call = logged[-1]
             detail = next(
                 (kw.value for kw in call.keywords if kw.arg == "detail"), None
             )
             text = _literal_text(detail)
             if text is None or "not sent" not in text:
-                missing.append((event_name, text))
-        assert not missing, (
-            "these loss events do not say a notification was not sent, so a "
-            f"reader cannot tell them from an uneventful day: {missing}"
-        )
+                silent_detail.append((event_name, text))
 
 
 class TestTheTransportIsClosedOnEveryPath:
@@ -588,21 +720,22 @@ class TestTheTransportIsClosedOnEveryPath:
         assert handle_issue is not None, "handle_issue is gone from cli.py"
 
         body = handle_issue.body
-        connect_at = [
-            i
+        # Calls, not statements. An earlier version indexed statements,
+        # so two connects inside one statement read as "exactly one".
+        connect_calls = [
+            (i, n)
             for i, stmt in enumerate(body)
-            if any(
-                isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Name)
-                and n.func.id == "connect_notify_transport"
-                for n in ast.walk(stmt)
-            )
+            for n in ast.walk(stmt)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "connect_notify_transport"
         ]
-        assert len(connect_at) == 1, (
-            "exactly one transport per issue; "
-            f"found {len(connect_at)} connect sites"
+        assert len(connect_calls) == 1, (
+            "exactly one transport per issue; found "
+            f"{len(connect_calls)} connect calls at lines "
+            f"{[n.lineno for _, n in connect_calls]}"
         )
-        i = connect_at[0]
+        i = connect_calls[0][0]
         assert i + 1 < len(body), "nothing follows the connect at all"
         following = body[i + 1]
         assert isinstance(following, ast.Try), (
@@ -611,14 +744,37 @@ class TestTheTransportIsClosedOnEveryPath:
             "leak the connection"
         )
         assert following.finalbody, "the try has no finally to close it"
-        closed = any(
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "_close_notify_transport"
+        # A DIRECT statement of the finally, not nested in an `if`:
+        # a conditional close is how the old code left one path open.
+        closed = [
+            stmt
             for stmt in following.finalbody
-            for n in ast.walk(stmt)
+            if isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Await)
+            and isinstance(stmt.value.value, ast.Call)
+            and isinstance(stmt.value.value.func, ast.Name)
+            and stmt.value.value.func.id == "_close_notify_transport"
+        ]
+        assert len(closed) == 1, (
+            "the finally must close the transport unconditionally, as one "
+            "of its own statements; _close_notify_transport handles None "
+            "so no `if` is needed"
         )
-        assert closed, "the finally does not close the transport"
+        passed = closed[0].value.value.args
+        assert len(passed) == 1 and isinstance(passed[0], ast.Name), (
+            "the finally closes something other than a plain local name"
+        )
+        assigned = {
+            t.id
+            for stmt in body[: i + 1]
+            if isinstance(stmt, ast.Assign)
+            for t in stmt.targets
+            if isinstance(t, ast.Name)
+        }
+        assert passed[0].id in assigned, (
+            f"the finally closes {passed[0].id!r}, which is not what the "
+            "connect was assigned to"
+        )
         # And it is the ONLY close, so no path can close it twice or
         # close it early and go on using it.
         closes = [
