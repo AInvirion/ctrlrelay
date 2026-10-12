@@ -190,13 +190,24 @@ class TestEveryFailureSaysSo:
         A reader at 2am gets the event name and whatever fields came
         with it. "notify.transport.socket_missing" alone does not say
         that a message was dropped on the floor.
+
+        One case per way of losing a notification, and the list is why:
+        an earlier version of this test had only the stale-socket and
+        unconfigured cases, so removing the sentence from
+        socket_missing — the event the outage itself produced — left it
+        green. A test named "every" has to visit every branch, or it is
+        a test about the branches its author happened to think of.
         """
         from ctrlrelay.cli import connect_notify_transport
 
-        sock = tmp_path / "stale.sock"
-        sock.write_text("not a socket")
+        stale = tmp_path / "stale.sock"
+        stale.write_text("not a socket")
         cases = [
-            _config(tmp_path, _mattermost(sock)),
+            # The outage's own branch: nothing at the path at all.
+            _config(tmp_path, _mattermost(tmp_path / "never-created.sock")),
+            # Present but not connectable.
+            _config(tmp_path, _mattermost(stale)),
+            # No chat transport configured at all.
             _config(
                 tmp_path,
                 {
@@ -208,6 +219,7 @@ class TestEveryFailureSaysSo:
                 },
             ),
         ]
+        seen: set[str] = set()
         for config in cases:
             caplog.clear()
             with caplog.at_level(logging.INFO, logger="ctrlrelay"):
@@ -223,6 +235,16 @@ class TestEveryFailureSaysSo:
             ), [
                 (r.getMessage(), getattr(r, "detail", None)) for r in lost
             ]
+            seen.update(r.getMessage() for r in lost)
+
+        # The cases above must actually have reached three different
+        # branches. Without this the loop could visit one branch three
+        # times and still read as exhaustive.
+        assert seen == {
+            "notify.transport.socket_missing",
+            "notify.transport.connect_failed",
+            "notify.transport.unconfigured",
+        }, sorted(seen)
 
 
 class TestTheIssueLaneResolvesAtUse:
