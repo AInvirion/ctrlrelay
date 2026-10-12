@@ -133,6 +133,14 @@ class TestProbe:
 
         Found by mutation: deleting the guard left every other case in
         this file green.
+
+        This is the probe's own defensive rule. Both callers reject a
+        relative separator-containing name before they get here, so
+        deleting this guard alone cannot make the daemon run the decoy
+        — the operator-visible claims are
+        `test_a_relative_operator_path_is_not_claimed_about` and
+        `test_a_relative_program_is_not_answered_for`. Kept because the
+        probe is public and the next caller will not know the rule.
         """
         from ctrlrelay.core import binaries
 
@@ -688,3 +696,76 @@ class TestTheUnitsCarryTheUserBinDir:
             plist = plistlib.loads(unit.content.encode())
             value = plist["EnvironmentVariables"]["PATH"]
             assert value.split(":")[0] == expected, (unit.service, value)
+
+
+class TestWhatTheOperatorIsTold:
+    """The log event and the console line, which had disagreed.
+
+    For a blank `cli_command` the event said there was nothing to
+    install while the console said to install it. One function builds
+    both now, so they cannot drift apart without a test noticing.
+    """
+
+    def test_a_blank_command_does_not_tell_anybody_to_install_something(
+        self,
+    ) -> None:
+        from ctrlrelay.cli import describe_unresolved_reviewer
+
+        detail, line = describe_unresolved_reviewer("", ["o/a"])
+        assert "nothing to install" in detail
+        assert "install" not in line.lower(), line
+        assert "cli_command" in line
+
+    def test_a_missing_tool_says_install_it_in_both(self) -> None:
+        from ctrlrelay.cli import describe_unresolved_reviewer
+
+        detail, line = describe_unresolved_reviewer("ghostly", ["o/a"])
+        assert "installed" in detail
+        assert "installed" in line
+        assert "ghostly" in detail and "ghostly" in line
+
+    def test_neither_predicts_the_future(self) -> None:
+        """Resolution is re-done per spawn, so "will fail" is unkeepable.
+
+        An earlier version said "every review on these repos will fail
+        to spawn", which stops being true the moment somebody installs
+        the tool — and the daemon needs no restart for that.
+        """
+        from ctrlrelay.cli import describe_unresolved_reviewer
+
+        for program in ("", "ghostly"):
+            detail, line = describe_unresolved_reviewer(program, ["o/a"])
+            for text in (detail, line):
+                assert "will fail" not in text, text
+                assert "will not run" not in text, text
+
+    def test_a_program_name_cannot_break_the_console(self) -> None:
+        """The name comes from config and is interpolated into markup.
+
+        `[bold]reviewer` opens a tag that is never closed, and
+        `console.print` raises `MarkupError` — turning a missing
+        reviewer into a daemon that will not start, which is the one
+        outcome worse than the bug being fixed.
+        """
+        from rich.console import Console
+
+        from ctrlrelay.cli import describe_unresolved_reviewer
+
+        console = Console(file=open(os.devnull, "w"), force_terminal=False)
+        try:
+            for program in ("[bold]reviewer", "[/]", "rev[iewer", "[red"):
+                _detail, line = describe_unresolved_reviewer(
+                    program, ["o/a"]
+                )
+                # Raises MarkupError if the name was not escaped.
+                console.print(f"[yellow]{line}[/yellow]")
+        finally:
+            console.file.close()
+
+    def test_the_repo_list_is_capped_and_says_how_many_it_hid(self) -> None:
+        from ctrlrelay.cli import describe_unresolved_reviewer
+
+        _detail, line = describe_unresolved_reviewer(
+            "ghostly", [f"o/r{i}" for i in range(7)]
+        )
+        assert "and 4 more" in line, line

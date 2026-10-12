@@ -454,10 +454,11 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
     as a review that has not run yet rather than one that cannot.
 
     Repos with review switched off are skipped: a reviewer nobody asked
-    for being absent is not a fault. A program named with a path
-    separator is skipped too — see below. An empty dict means every
-    reviewer this check can answer for resolved, which is a different
-    fact from no repo configuring one.
+    for being absent is not a fault. A RELATIVE program with a path
+    separator is skipped too, because only the child's working
+    directory can answer for it — an absolute one is answered. An empty
+    dict means every reviewer this check can answer for resolved, which
+    is a different fact from no repo configuring one.
     """
     import shlex
 
@@ -512,6 +513,56 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
         for program, repos in wanted.items()
         if probe_binary(program) is None
     }
+
+
+def describe_unresolved_reviewer(
+    program: str, repos: list[str]
+) -> tuple[str, str]:
+    """``(log detail, console line)`` for one unfindable reviewer.
+
+    One function so the two cannot disagree. They did: for a blank
+    ``cli_command`` the event said "there is nothing to install" while
+    the console told the operator to install it.
+
+    Phrased as of now, never as a prediction. Resolution is re-done on
+    every spawn, so installing the tool later makes the next review
+    work — "reviews will fail" is a claim this probe cannot keep. For
+    the same reason the count is of repos that ASKED for the tool, not
+    of failures to come.
+
+    The program name comes from config and is interpolated into Rich
+    markup, so it is escaped: a name like ``[bold]reviewer`` opens a tag
+    that is never closed and `console.print` raises `MarkupError`,
+    which would turn a missing reviewer into a daemon that will not
+    start.
+    """
+    shown = ", ".join(sorted(repos)[:3])
+    more = "" if len(repos) <= 3 else f" and {len(repos) - 3} more"
+    safe_repos = rich_escape(f"{shown}{more}")
+
+    if program == "":
+        detail = (
+            "a review-enabled repo has a blank cli_command, so its "
+            "reviews cannot run and there is nothing to install"
+        )
+        line = (
+            f"Review tool: blank cli_command for {safe_repos} — reviews "
+            "there cannot spawn. Set cli_command, or set "
+            "code_review.method to 'off' for those repos."
+        )
+        return detail, line
+
+    detail = (
+        f"{program!r} was not found on PATH or in the usual user "
+        "install directories as of startup; reviews needing it cannot "
+        "spawn until it is installed"
+    )
+    line = (
+        f"Review tool {rich_escape(repr(program))} not found as of "
+        f"startup — reviews for {safe_repos} cannot spawn until it is "
+        "installed. Or set code_review.method to 'off' for those repos."
+    )
+    return detail, line
 
 
 async def connect_notify_transport(config) -> Transport | None:
@@ -1632,22 +1683,7 @@ def poller_start(
         # review that simply has not run yet.
         missing_reviewers = unresolved_review_programs(config)
         for program, repos in sorted(missing_reviewers.items()):
-            blank = program == ""
-            # Phrased as of now, not as a prediction. Installing the
-            # tool later makes the next review work — the resolution is
-            # re-done per spawn — so "will fail" would be a claim this
-            # probe cannot keep, and repo_count is the number of repos
-            # that asked for it, not a count of future failures.
-            detail = (
-                "a review-enabled repo has a blank cli_command, so its "
-                "reviews cannot run and there is nothing to install"
-                if blank
-                else (
-                    f"{program!r} was not found on PATH or in the usual "
-                    "user install directories as of startup; reviews "
-                    "needing it cannot spawn until it is installed"
-                )
-            )
+            detail, line = describe_unresolved_reviewer(program, repos)
             log_event(
                 _logger,
                 "code_review.binary.unresolved_at_startup",
@@ -1655,18 +1691,7 @@ def poller_start(
                 repos_configured=len(repos),
                 detail=detail,
             )
-            shown = ", ".join(sorted(repos)[:3])
-            more = "" if len(repos) <= 3 else f" and {len(repos) - 3} more"
-            what = (
-                "has a blank cli_command"
-                if blank
-                else f"{program!r} not found"
-            )
-            console.print(
-                f"[yellow]Review tool {what} for {shown}{more} — reviews "
-                "there cannot spawn. Install it, fix cli_command, or set "
-                "code_review.method to 'off' for those repos.[/yellow]"
-            )
+            console.print(f"[yellow]{line}[/yellow]")
 
         # Track in-flight PR-watch background tasks so they outlive
         # handle_issue and aren't garbage-collected. Cleared via
