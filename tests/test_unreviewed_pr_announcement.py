@@ -85,6 +85,39 @@ class TestWhenItWarns:
         assert warning is not None
         assert REVIEW_NOT_REPORTED.detail in warning
 
+    @pytest.mark.parametrize("value", ["false", "0", "", 0, 1, "true", None])
+    def test_only_a_real_true_counts_as_reviewed(self, value) -> None:
+        """These outputs are merged with an agent's own checkpoint.
+
+        So the value can be whatever the agent wrote, and
+        `bool("false")` is True — which would silence the warning,
+        the exact direction this ticket exists to prevent. Anything
+        that is not the boolean `True` has to read as not posted.
+
+        Found by mutation: swapping `is True` back to `bool(...)` left
+        every other case in this file green.
+        """
+        warning = unreviewed_pr_warning(
+            "o/r",
+            _result(
+                pr_number=1, review_posted=value, review_status="failed"
+            ),
+        )
+        assert warning is not None, value
+
+    def test_a_real_true_does_silence_it(self) -> None:
+        """The other direction, so the above cannot pass for a
+        function that always warns."""
+        assert (
+            unreviewed_pr_warning(
+                "o/r",
+                _result(
+                    pr_number=1, review_posted=True, review_status="reviewed"
+                ),
+            )
+            is None
+        )
+
     def test_an_absent_pr_number_still_produces_a_usable_line(self) -> None:
         """The outputs come from an agent and need not be complete."""
         warning = unreviewed_pr_warning(
@@ -568,19 +601,37 @@ class TestTheWarningIsActuallySent:
         assert len(assigned) == 1, assigned
         name = assigned.pop()
 
-        # Awaited, and on the same object the routine line is sent on.
-        # `if False: bogus.send(warning)` satisfies a looser check.
+        # The transport's name is taken from the ROUTINE line
+        # specifically — the one whose text contains "PR ready" — not
+        # from every awaited send in the function. Deriving it from all
+        # of them includes the warning's own send, so the check would
+        # be satisfied by its own input: `if False: bogus.send(warning)`
+        # would add `bogus` to the set and then match against it.
+        # Found by mutation.
+        def _send_text(call: ast.Call) -> str:
+            parts = []
+            for arg in call.args:
+                for node in ast.walk(arg):
+                    if isinstance(node, ast.Constant) and isinstance(
+                        node.value, str
+                    ):
+                        parts.append(node.value)
+            return " ".join(parts)
+
         routine_targets = {
-            n.func.value.id
-            for n in ast.walk(handle_issue)
-            if isinstance(n, ast.Await)
-            and isinstance(n.value, ast.Call)
-            and isinstance(n.value.func, ast.Attribute)
-            and n.value.func.attr == "send"
-            and isinstance(n.value.func.value, ast.Name)
-            for n in [n.value]
+            a.value.func.value.id
+            for a in ast.walk(handle_issue)
+            if isinstance(a, ast.Await)
+            and isinstance(a.value, ast.Call)
+            and isinstance(a.value.func, ast.Attribute)
+            and a.value.func.attr == "send"
+            and isinstance(a.value.func.value, ast.Name)
+            and "PR ready" in _send_text(a.value)
         }
-        assert routine_targets, "nothing in handle_issue awaits a send"
+        assert routine_targets, (
+            "no awaited send carries the routine 'PR ready' line, so "
+            "there is nothing to check the warning's send against"
+        )
 
         sent = [
             a
@@ -600,6 +651,57 @@ class TestTheWarningIsActuallySent:
             f"{name!r} is built and never awaited on a send — the "
             "warning exists and nobody is told, which is #196 with "
             "extra steps"
+        )
+
+    def test_the_warning_is_sent_before_the_routine_line(self) -> None:
+        """Both sends share one `except`, so order decides what is lost.
+
+        A transport that dies between them loses whichever went
+        second. Of the two, the warning is the one this ticket is
+        about: the routine line is a convenience, and the warning is
+        the reason somebody opens the pull request at all.
+
+        Found by mutation: putting the warning back second left every
+        other case in this file green.
+        """
+        import ast
+
+        handle_issue = self._handle_issue()
+
+        def _text(call: ast.Call) -> str:
+            out = []
+            for arg in call.args:
+                for n in ast.walk(arg):
+                    if isinstance(n, ast.Constant) and isinstance(
+                        n.value, str
+                    ):
+                        out.append(n.value)
+            return " ".join(out)
+
+        routine_line = None
+        warning_line = None
+        for a in ast.walk(handle_issue):
+            if not (
+                isinstance(a, ast.Await)
+                and isinstance(a.value, ast.Call)
+                and isinstance(a.value.func, ast.Attribute)
+                and a.value.func.attr == "send"
+            ):
+                continue
+            if "PR ready" in _text(a.value):
+                routine_line = a.lineno
+            if any(
+                isinstance(x, ast.Name) and x.id == "warning"
+                for x in a.value.args
+            ):
+                warning_line = a.lineno
+
+        assert routine_line is not None, "the routine line is gone"
+        assert warning_line is not None, "the warning is never sent"
+        assert warning_line < routine_line, (
+            f"the warning is sent at line {warning_line}, after the "
+            f"routine line at {routine_line} — a transport that dies "
+            "between them loses the warning"
         )
 
     def test_the_routine_success_line_is_still_there(self) -> None:
@@ -676,10 +778,84 @@ class TestTheSafeDefault:
             if isinstance(n, ast.AsyncFunctionDef)
             and n.name == "run_dev_issue"
         )
-        # Sorted by line, because `ast.walk` is breadth-first and NOT
-        # source order — measured: three assignments at lines 4, 5, 6
-        # come back as [5, 6, 4]. An earlier version of this test took
-        # `[0]` off the walk and was reading an arbitrary assignment.
+        # Dominance, not "first by line". An unreachable
+        # `if False: review_report = REVIEW_NOT_REPORTED` above a wrong
+        # live default satisfies a first-by-line check — found by
+        # mutation. So: find the block that merges the review keys,
+        # walk its ancestors, and require the default to be a DIRECT
+        # statement of one of them, before the merge, with no
+        # unconditional reassignment after it in that same block.
+        parent: dict[int, ast.AST] = {}
+        for node in ast.walk(func):
+            for child in ast.iter_child_nodes(node):
+                parent[id(child)] = node
+
+        merge = next(
+            (
+                n
+                for n in ast.walk(func)
+                if isinstance(n, ast.Assign)
+                and any(
+                    isinstance(t, ast.Subscript)
+                    and isinstance(t.slice, ast.Constant)
+                    and t.slice.value == "review_posted"
+                    for t in n.targets
+                )
+            ),
+            None,
+        )
+        assert merge is not None, "nothing merges review_posted any more"
+
+        def _blocks_containing(stmt):
+            """Every statement list an ancestor of ``stmt`` owns."""
+            seen = []
+            node = stmt
+            while id(node) in parent:
+                owner = parent[id(node)]
+                for field in ("body", "orelse", "finalbody"):
+                    block = getattr(owner, field, None)
+                    if isinstance(block, list) and node in block:
+                        seen.append(block)
+                node = owner
+            return seen
+
+        default_found = False
+        for block in _blocks_containing(merge):
+            defaults = [
+                i
+                for i, st in enumerate(block)
+                if isinstance(st, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "review_report"
+                    for t in st.targets
+                )
+                and isinstance(st.value, ast.Name)
+                and st.value.id == "REVIEW_NOT_REPORTED"
+            ]
+            if not defaults:
+                continue
+            overrides = [
+                i
+                for i, st in enumerate(block)
+                if i > defaults[0]
+                and isinstance(st, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "review_report"
+                    for t in st.targets
+                )
+            ]
+            assert not overrides, (
+                "review_report is reassigned unconditionally after its "
+                f"default at block positions {overrides}, so the "
+                "default is not what an unset path gets"
+            )
+            default_found = True
+            break
+        assert default_found, (
+            "no block containing the merge sets review_report to "
+            "REVIEW_NOT_REPORTED as one of its own statements"
+        )
+
         assigns = sorted(
             (
                 n
@@ -692,13 +868,6 @@ class TestTheSafeDefault:
             ),
             key=lambda n: (n.lineno, n.col_offset),
         )
-        assert assigns, "review_report is never assigned in run_dev_issue"
-        first = assigns[0].value
-        assert isinstance(first, ast.Name), ast.dump(first)[:200]
-        assert first.id == "REVIEW_NOT_REPORTED", first.id
-
-        # And it comes before every USE of the name, so it really is
-        # the default rather than an unreachable line somewhere above.
         uses = [
             n.lineno
             for n in ast.walk(func)
