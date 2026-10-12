@@ -441,3 +441,175 @@ class TestTheOutcomeReachesTheCaller:
             "review_status",
             "review_detail",
         }, keys
+
+
+class TestTheWarningIsActuallySent:
+    """Structural, and it is the claim the ticket is about.
+
+    Found by mutation: deleting the send from `handle_issue` left every
+    other case in this file green — I had tested the function I wrote
+    and not the thing an operator sees, which is how the original fault
+    shipped in the first place.
+
+    `handle_issue` is a closure inside `poller_start`, which opens a
+    state database and polls 87 repositories, so it is read rather than
+    driven.
+    """
+
+    @staticmethod
+    def _handle_issue():
+        import ast
+        from pathlib import Path as _Path
+
+        import ctrlrelay.cli as cli_module
+
+        tree = ast.parse(_Path(cli_module.__file__).read_text())
+        node = next(
+            (
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name == "handle_issue"
+            ),
+            None,
+        )
+        assert node is not None, "handle_issue is gone from cli.py"
+        return node
+
+    def test_handle_issue_builds_the_warning_and_sends_it(self) -> None:
+        import ast
+
+        handle_issue = self._handle_issue()
+
+        builds = [
+            n
+            for n in ast.walk(handle_issue)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "unreviewed_pr_warning"
+        ]
+        assert len(builds) == 1, (
+            "exactly one place should ask whether the pull request was "
+            f"reviewed; found {len(builds)}"
+        )
+
+        # The value has to be assigned to a name, and that name has to
+        # reach a `.send(...)`. Building it and dropping it is the
+        # defect with extra steps.
+        assigned = {
+            t.id
+            for n in ast.walk(handle_issue)
+            if isinstance(n, ast.Assign)
+            for t in n.targets
+            if isinstance(t, ast.Name)
+            and any(
+                isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Name)
+                and c.func.id == "unreviewed_pr_warning"
+                for c in ast.walk(n.value)
+            )
+        }
+        assert len(assigned) == 1, assigned
+        name = assigned.pop()
+
+        sent = [
+            n
+            for n in ast.walk(handle_issue)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "send"
+            and any(
+                isinstance(a, ast.Name) and a.id == name for a in n.args
+            )
+        ]
+        assert sent, (
+            f"{name!r} is built and never sent — the warning exists and "
+            "nobody is told, which is #196 with extra steps"
+        )
+
+    def test_the_routine_success_line_is_still_there(self) -> None:
+        """It was never missing, and replacing it was not this ticket.
+
+        The claim at the top of #196 — that nothing announces a pull
+        request the dev lane opens — came from searching the live
+        config for `notify`/`announce` keys instead of reading the send
+        path. This pins the line that was already there, so a later
+        change cannot quietly fold the two messages into one and lose
+        the separation the warning depends on.
+        """
+        import ast
+
+        handle_issue = self._handle_issue()
+        literals = [
+            n.value
+            for n in ast.walk(handle_issue)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        ]
+        joined = " ".join(literals)
+        assert "PR ready" in joined, joined[:400]
+
+    def test_the_warning_goes_out_as_its_own_message(self) -> None:
+        """Not appended to the routine line.
+
+        A warning concatenated onto a success message is read as part
+        of the success message. Two sends, so the second cannot be
+        skimmed past with the first.
+        """
+        import ast
+
+        handle_issue = self._handle_issue()
+        for node in ast.walk(handle_issue):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "send"
+            ):
+                continue
+            for arg in node.args:
+                mentions = {
+                    n.id
+                    for n in ast.walk(arg)
+                    if isinstance(n, ast.Name)
+                }
+                if "warning" in mentions:
+                    # The warning's own send must carry the warning and
+                    # nothing else interpolated with it.
+                    assert isinstance(arg, ast.Name), ast.dump(arg)[:200]
+
+
+class TestTheSafeDefault:
+    """The initial value is a guard for a branch nobody has added yet.
+
+    It survives a mutation because every branch today overwrites it —
+    which is the point. Removing the initialisation entirely would be
+    worse than a wrong default: a new branch that forgot to set the
+    name would raise `UnboundLocalError` out of `run_dev_issue`, and
+    the poller marks an issue seen before handling it, so that drops
+    the issue's work rather than losing a message.
+    """
+
+    def test_it_starts_as_not_reported(self) -> None:
+        import ast
+        from pathlib import Path as _Path
+
+        import ctrlrelay.pipelines.dev as dev_module
+
+        tree = ast.parse(_Path(dev_module.__file__).read_text())
+        func = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef)
+            and n.name == "run_dev_issue"
+        )
+        firsts = [
+            n.value
+            for n in ast.walk(func)
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "review_report"
+                for t in n.targets
+            )
+        ]
+        assert firsts, "review_report is never assigned in run_dev_issue"
+        assert isinstance(firsts[0], ast.Name), ast.dump(firsts[0])[:200]
+        assert firsts[0].id == "REVIEW_NOT_REPORTED", firsts[0].id
