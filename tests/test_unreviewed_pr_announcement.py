@@ -156,7 +156,13 @@ class TestWhenItStaysQuiet:
     def test_findings_kept_in_the_log_on_purpose_is_not_announced(
         self,
     ) -> None:
-        """`comment_on_pr: false` means the review ran and was read."""
+        """`comment_on_pr: false` is a setting, so its outcome is not news.
+
+        A classification test, and it says so: it fabricates the
+        status rather than running a reviewer. It does NOT establish
+        that anybody read the log — nothing in the product guarantees
+        that, and claiming it would be a sentence no code backs.
+        """
         assert (
             unreviewed_pr_warning(
                 "o/r",
@@ -172,11 +178,13 @@ class TestWhenItStaysQuiet:
 
 class TestTheReportItself:
     def test_is_failure_excludes_only_the_two_deliberate_cases(self) -> None:
-        assert not ReviewReport(True, "reviewed").is_failure
-        assert not ReviewReport(False, "skipped").is_failure
-        assert not ReviewReport(False, "not_commented").is_failure
-        assert ReviewReport(False, "failed").is_failure
-        assert ReviewReport(False, "anything_new").is_failure
+        # `is False` / `is True`, because `not x` and `assert x` both
+        # pass for a property that returns None.
+        assert ReviewReport(True, "reviewed").is_failure is False
+        assert ReviewReport(False, "skipped").is_failure is False
+        assert ReviewReport(False, "not_commented").is_failure is False
+        assert ReviewReport(False, "failed").is_failure is True
+        assert ReviewReport(False, "anything_new").is_failure is True
 
     def test_a_status_nobody_has_written_yet_reads_as_a_failure(
         self,
@@ -187,7 +195,7 @@ class TestTheReportItself:
         announced rather than swallowed — the opposite of an
         allowlist, where the unknown case disappears.
         """
-        assert ReviewReport(False, "some_future_status").is_failure
+        assert ReviewReport(False, "some_future_status").is_failure is True
 
     def test_the_sentence_survives_an_empty_detail(self) -> None:
         """`detail` comes from an exception string and can be blank."""
@@ -388,18 +396,34 @@ class TestEveryExitReports:
             f"line(s) {bad} leave _review_and_comment without saying what "
             "happened to the review, which is #196"
         )
-        # And every one of them builds a report, so a future exit
-        # cannot return some other truthy thing the caller misreads.
-        shapes = set()
-        for n in returns:
-            v = n.value
-            if isinstance(v, ast.Call) and isinstance(v.func, ast.Name):
-                shapes.add(v.func.id)
-            elif isinstance(v, ast.Name):
-                shapes.add(v.id)
-            else:
-                shapes.add(ast.dump(v)[:40])
-        assert shapes <= {"ReviewReport", "REVIEW_NOT_REPORTED"}, shapes
+
+        # And it cannot fall off the end, which returns None without
+        # any `Return` for the check above to see. Wrapping the whole
+        # body in an `if` is the mutation that shape misses.
+        last = func.body[-1]
+        assert isinstance(last, (ast.Return, ast.Raise, ast.Try)), (
+            "_review_and_comment can fall through to the end of its "
+            f"body, which returns None; last statement is "
+            f"{type(last).__name__} at line {last.lineno}"
+        )
+        if isinstance(last, ast.Try):
+            # The real shape today: a try whose body and handler both
+            # return. Every branch of it has to.
+            for block_name in ("body", "handlers", "orelse"):
+                for block in (
+                    getattr(last, block_name, []) or []
+                ):
+                    stmts = (
+                        block.body
+                        if isinstance(block, ast.ExceptHandler)
+                        else [block]
+                    )
+                    assert any(
+                        isinstance(st, (ast.Return, ast.Raise))
+                        for st in stmts
+                    ) or block_name == "body", (
+                        f"the final try's {block_name} can fall through"
+                    )
 
 
 class TestTheOutcomeReachesTheCaller:
@@ -428,19 +452,51 @@ class TestTheOutcomeReachesTheCaller:
             if isinstance(n, ast.AsyncFunctionDef)
             and n.name == "run_dev_issue"
         )
-        keys = {
-            node.slice.value
-            for node in ast.walk(func)
-            if isinstance(node, ast.Subscript)
-            and isinstance(node.slice, ast.Constant)
-            and isinstance(node.slice.value, str)
-            and node.slice.value.startswith("review_")
-        }
+        # Assigned, not merely mentioned: a dead read of these keys
+        # would satisfy a search for the strings alone.
+        written: dict[str, set[str]] = {}
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and isinstance(target.slice, ast.Constant)
+                    and isinstance(target.slice.value, str)
+                    and target.slice.value.startswith("review_")
+                ):
+                    written.setdefault(target.value.id, set()).add(
+                        target.slice.value
+                    )
+        assert len(written) == 1, (
+            f"the review keys are written to {len(written)} different "
+            f"names: {written}"
+        )
+        holder, keys = next(iter(written.items()))
         assert keys == {
             "review_posted",
             "review_status",
             "review_detail",
         }, keys
+
+        # And that name has to become a PipelineResult's outputs, or
+        # the keys are written somewhere nobody reads.
+        passed_on = [
+            kw
+            for node in ast.walk(func)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "PipelineResult"
+            for kw in node.keywords
+            if kw.arg == "outputs"
+            and isinstance(kw.value, ast.Name)
+            and kw.value.id == holder
+        ]
+        assert passed_on, (
+            f"{holder!r} is populated and never passed as a "
+            "PipelineResult's outputs"
+        )
 
 
 class TestTheWarningIsActuallySent:
@@ -512,19 +568,38 @@ class TestTheWarningIsActuallySent:
         assert len(assigned) == 1, assigned
         name = assigned.pop()
 
-        sent = [
-            n
+        # Awaited, and on the same object the routine line is sent on.
+        # `if False: bogus.send(warning)` satisfies a looser check.
+        routine_targets = {
+            n.func.value.id
             for n in ast.walk(handle_issue)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "send"
+            if isinstance(n, ast.Await)
+            and isinstance(n.value, ast.Call)
+            and isinstance(n.value.func, ast.Attribute)
+            and n.value.func.attr == "send"
+            and isinstance(n.value.func.value, ast.Name)
+            for n in [n.value]
+        }
+        assert routine_targets, "nothing in handle_issue awaits a send"
+
+        sent = [
+            a
+            for a in ast.walk(handle_issue)
+            if isinstance(a, ast.Await)
+            and isinstance(a.value, ast.Call)
+            and isinstance(a.value.func, ast.Attribute)
+            and a.value.func.attr == "send"
+            and isinstance(a.value.func.value, ast.Name)
+            and a.value.func.value.id in routine_targets
             and any(
-                isinstance(a, ast.Name) and a.id == name for a in n.args
+                isinstance(x, ast.Name) and x.id == name
+                for x in a.value.args
             )
         ]
         assert sent, (
-            f"{name!r} is built and never sent — the warning exists and "
-            "nobody is told, which is #196 with extra steps"
+            f"{name!r} is built and never awaited on a send — the "
+            "warning exists and nobody is told, which is #196 with "
+            "extra steps"
         )
 
     def test_the_routine_success_line_is_still_there(self) -> None:
@@ -601,15 +676,38 @@ class TestTheSafeDefault:
             if isinstance(n, ast.AsyncFunctionDef)
             and n.name == "run_dev_issue"
         )
-        firsts = [
-            n.value
+        # Sorted by line, because `ast.walk` is breadth-first and NOT
+        # source order — measured: three assignments at lines 4, 5, 6
+        # come back as [5, 6, 4]. An earlier version of this test took
+        # `[0]` off the walk and was reading an arbitrary assignment.
+        assigns = sorted(
+            (
+                n
+                for n in ast.walk(func)
+                if isinstance(n, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "review_report"
+                    for t in n.targets
+                )
+            ),
+            key=lambda n: (n.lineno, n.col_offset),
+        )
+        assert assigns, "review_report is never assigned in run_dev_issue"
+        first = assigns[0].value
+        assert isinstance(first, ast.Name), ast.dump(first)[:200]
+        assert first.id == "REVIEW_NOT_REPORTED", first.id
+
+        # And it comes before every USE of the name, so it really is
+        # the default rather than an unreachable line somewhere above.
+        uses = [
+            n.lineno
             for n in ast.walk(func)
-            if isinstance(n, ast.Assign)
-            and any(
-                isinstance(t, ast.Name) and t.id == "review_report"
-                for t in n.targets
-            )
+            if isinstance(n, ast.Name)
+            and n.id == "review_report"
+            and isinstance(n.ctx, ast.Load)
         ]
-        assert firsts, "review_report is never assigned in run_dev_issue"
-        assert isinstance(firsts[0], ast.Name), ast.dump(firsts[0])[:200]
-        assert firsts[0].id == "REVIEW_NOT_REPORTED", firsts[0].id
+        assert uses, "review_report is assigned and never read"
+        assert assigns[0].lineno < min(uses), (
+            f"the default is assigned at line {assigns[0].lineno} but "
+            f"the name is read from line {min(uses)}"
+        )

@@ -545,7 +545,13 @@ def unreviewed_pr_warning(repo: str, result) -> str | None:
         report = REVIEW_NOT_REPORTED
     else:
         report = ReviewReport(
-            posted=bool(outputs.get("review_posted")),
+            # `is True`, not `bool(...)`: these outputs are merged with
+            # an agent's own checkpoint `outputs`, so the value can be
+            # a string it wrote. `bool("false")` is True, which would
+            # silence the warning — the exact direction this ticket
+            # exists to prevent. Anything that is not the boolean
+            # `True` reads as "not posted".
+            posted=outputs.get("review_posted") is True,
             status=str(outputs.get("review_status") or "unknown"),
             detail=str(outputs.get("review_detail") or ""),
         )
@@ -2076,18 +2082,22 @@ def poller_start(
                                 )
                             else:
                                 pr_url = result.outputs.get("pr_url", "")
-                                await connected_transport.send(
-                                    f"✅ PR ready: {pr_url}"
-                                )
-                                # A second, separate message, and only
-                                # when there is something to say. #196:
-                                # a review that could not run left no
-                                # trace an operator would see.
+                                # Its own message, and FIRST. Both
+                                # sends share one `except`, so whichever
+                                # goes second is the one a mid-sequence
+                                # transport failure loses — and of the
+                                # two, the warning is the one #196 is
+                                # about. The routine line is a
+                                # convenience; this one is the reason
+                                # somebody opens the pull request.
                                 warning = unreviewed_pr_warning(
                                     repo, result
                                 )
                                 if warning is not None:
                                     await connected_transport.send(warning)
+                                await connected_transport.send(
+                                    f"✅ PR ready: {pr_url}"
+                                )
                         elif result.blocked:
                             await connected_transport.send(
                                 f"⏸️ Blocked on #{issue_number}: {result.question}"

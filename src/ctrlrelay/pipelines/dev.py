@@ -638,8 +638,13 @@ class ReviewReport:
 
         ``skipped`` is the operator's own decision and not a fault.
         ``not_commented`` means the review ran and the repo asked for
-        the findings to stay in the log. Everything else means nobody
-        has looked at the branch.
+        the findings to stay in the log.
+
+        Everything else means the pull request carries nothing a reader
+        can use — which is not always the same as nobody having looked:
+        on ``comment_failed`` the reviewer finished and only the posting
+        failed. The reader is in the same position either way, which is
+        why both are announced.
         """
         return not self.posted and self.status not in (
             "skipped",
