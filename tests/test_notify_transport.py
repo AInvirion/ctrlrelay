@@ -648,6 +648,35 @@ class TestItNeverCostsTheRun:
         )
 
     @pytest.mark.asyncio
+    async def test_a_logging_failure_falls_through_to_stderr(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        """A bare `except: pass` would be #198 inside its own guard.
+
+        If the structured logger cannot be used, every loss path goes
+        silent and the silence is indistinguishable from an uneventful
+        day — which is the fault this whole change exists to remove.
+        So the guard has a fallback sink, and the event name reaches it.
+
+        Found by mutation: replacing the fallback with `pass` left all
+        nineteen other cases in this file green.
+        """
+        import ctrlrelay.cli as cli_module
+        from ctrlrelay.cli import connect_notify_transport
+
+        config = _config(tmp_path, _mattermost(tmp_path / "absent.sock"))
+
+        class _AngryLogger:
+            def info(self, *_a, **_kw) -> None:
+                raise KeyError("name")
+
+        monkeypatch.setattr(cli_module, "_logger", _AngryLogger())
+        assert await connect_notify_transport(config) is None
+
+        captured = capsys.readouterr()
+        assert "notify.transport.socket_missing" in captured.err, captured
+
+    @pytest.mark.asyncio
     async def test_an_exception_that_cannot_be_printed_is_still_reported(
         self, caplog
     ) -> None:
