@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 import uuid
 from dataclasses import dataclass
@@ -631,14 +632,24 @@ class ReviewReport:
     posted: bool
     status: str
     detail: str = ""
+    # Set only by the two branches that KNOW the outcome was somebody's
+    # configuration. Deciding this by matching ``status`` against a
+    # list of strings was wrong in a way no test here could see:
+    # :class:`~ctrlrelay.core.code_review.ReviewStatus` has a member
+    # whose value is literally ``"skipped"``, and the branch that
+    # forwards that enum does not know whether the operator chose it.
+    # A reviewer that started returning it would have silenced the
+    # warning about a pull request nobody read. An explicit flag set at
+    # the site that knows cannot collide with anything.
+    deliberate: bool = False
 
     @property
     def is_failure(self) -> bool:
         """Whether the operator needs telling.
 
-        ``skipped`` is the operator's own decision and not a fault.
-        ``not_commented`` means the review ran and the repo asked for
-        the findings to stay in the log.
+        Two outcomes are somebody's own decision and not a fault:
+        review switched off for the repo, and ``comment_on_pr`` off so
+        the findings stay in the log. Both set ``deliberate``.
 
         Everything else means the pull request carries nothing a reader
         can use — which is not always the same as nobody having looked:
@@ -646,10 +657,7 @@ class ReviewReport:
         failed. The reader is in the same position either way, which is
         why both are announced.
         """
-        return not self.posted and self.status not in (
-            "skipped",
-            "not_commented",
-        )
+        return not self.posted and not self.deliberate
 
     def failure_sentence(self) -> str:
         """One line for a chat notification, ending in what to do.
@@ -709,6 +717,7 @@ async def _review_and_comment(
             posted=False,
             status="skipped",
             detail="code_review.method is 'off' for this repo",
+            deliberate=True,
         )
 
     outcome = await run_code_review(
@@ -751,6 +760,7 @@ async def _review_and_comment(
             posted=False,
             status="not_commented",
             detail="comment_on_pr is off for this repo",
+            deliberate=True,
         )
 
     try:
@@ -1175,26 +1185,28 @@ async def run_dev_issue(
                             error=str(e)[:200],
                         )
 
-                # Carry the outcome out with the result so whoever
-                # announces the pull request can say whether it was
-                # reviewed. Written on every path above, including the
-                # ones that never reached the reviewer: an absent key
-                # reads as `not_reported`, which is a failure, because
-                # rounding "I do not know" towards "reviewed" is #196.
-                review_outputs = dict(result.outputs)
-                review_outputs["review_posted"] = review_report.posted
-                review_outputs["review_status"] = review_report.status
-                review_outputs["review_detail"] = review_report.detail
-                result = PipelineResult(
-                    success=result.success,
-                    session_id=result.session_id,
-                    summary=result.summary,
-                    blocked=result.blocked,
-                    question=result.question,
-                    error=result.error,
-                    outputs=review_outputs,
-                    exit_code=result.exit_code,
-                )
+            # Carry the outcome out on the result's own field so
+            # whoever announces the pull request can say whether it was
+            # reviewed.
+            #
+            # A FIELD, not keys in `outputs`: `outputs` is merged with
+            # the coding agent's own checkpoint, and the agent is the
+            # party whose branch is being reviewed. An agent writing
+            # `review_posted: true` would otherwise silence the warning
+            # about its own unreviewed pull request — the adversary
+            # `core.code_review`'s docstring is about, reaching the
+            # announcement instead of the label.
+            #
+            # Outside the inner `if` as well, so every path that got as
+            # far as having a pull request carries an outcome. The
+            # branches above all set `review_report`; this line is what
+            # makes "written on every path" true rather than a claim
+            # about the paths I happened to look at.
+            #
+            # `replace` rather than re-listing the fields: a field
+            # added to PipelineResult later is carried by construction
+            # instead of being silently reset to its default.
+            result = dataclasses.replace(result, review=review_report)
 
         # Reacquire the lock for the post-verify cleanup phase (remove
         # worktree / delete branch). Usually SHORT budget (cleanup is

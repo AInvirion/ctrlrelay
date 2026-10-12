@@ -42,6 +42,18 @@ class PipelineResult:
     # never 0, because exiting 0 and writing no checkpoint is the exact
     # case this field exists to make visible (#174).
     exit_code: int | None = None
+    # What happened to the automated review, when one was attempted.
+    # A FIELD rather than a key in `outputs`, because `outputs` is
+    # merged with the coding agent's own checkpoint and the agent is
+    # the party whose branch is being reviewed — see the module
+    # docstring of `ctrlrelay.core.code_review` on that adversary. An
+    # agent that wrote `review_posted: true` could otherwise silence
+    # the warning about its own unreviewed pull request.
+    #
+    # `None` means no review outcome was recorded, which is a
+    # different fact from a review that found nothing, and reads as a
+    # failure downstream.
+    review: Any = None
 
 
 def failure_text(result: PipelineResult) -> str:

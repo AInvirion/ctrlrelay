@@ -567,33 +567,37 @@ def unreviewed_pr_warning(repo: str, result) -> str | None:
     left exactly as it was, because it already existed and replacing it
     was not this ticket.
 
-    An ABSENT `review_posted` returns a warning rather than ``None``.
-    The dev lane writes that key on every path, so its absence means
-    something did not report, and rounding "I do not know" towards
-    "reviewed" is the whole defect.
+    No recorded outcome returns a warning rather than ``None``. The
+    dev lane sets the field on every path that got as far as having a
+    pull request, so its absence means something did not report — and
+    rounding "I do not know" towards "reviewed" is the whole defect.
     """
+    # Read off the result's own field. It used to come out of
+    # `result.outputs`, which is merged with the coding agent's own
+    # checkpoint — so an agent could write `review_posted: true` and
+    # silence the warning about its own unreviewed pull request. The
+    # agent is exactly the adversary `core.code_review`'s docstring is
+    # about, and nothing it writes can reach a dataclass field.
+    #
+    # `None` means no outcome was recorded, which is a different fact
+    # from a review that found nothing. Rounding "I do not know"
+    # towards "reviewed" is the defect this exists to remove.
     from ctrlrelay.pipelines.dev import REVIEW_NOT_REPORTED, ReviewReport
 
-    outputs = getattr(result, "outputs", None) or {}
-    if "review_posted" not in outputs:
+    report = getattr(result, "review", None)
+    if not isinstance(report, ReviewReport):
+        # Covers `None` and anything else that ever ends up in the
+        # field. Reading `.is_failure` off whatever is there would
+        # either raise into the announcement path or believe a duck.
         report = REVIEW_NOT_REPORTED
-    else:
-        report = ReviewReport(
-            # `is True`, not `bool(...)`: these outputs are merged with
-            # an agent's own checkpoint `outputs`, so the value can be
-            # a string it wrote. `bool("false")` is True, which would
-            # silence the warning — the exact direction this ticket
-            # exists to prevent. Anything that is not the boolean
-            # `True` reads as "not posted".
-            posted=outputs.get("review_posted") is True,
-            status=str(outputs.get("review_status") or "unknown"),
-            detail=str(outputs.get("review_detail") or ""),
-        )
 
     if not report.is_failure:
         return None
 
-    pr_number = outputs.get("pr_number")
+    # The PR number is still read from `outputs` — it comes from the
+    # agent by design, it only decorates the message, and getting it
+    # wrong costs a slightly worse line rather than a wrong verdict.
+    pr_number = (getattr(result, "outputs", None) or {}).get("pr_number")
     where = f"{repo}#{pr_number}" if pr_number is not None else repo
     return f"⚠️ {where} — {report.failure_sentence()}"
 
