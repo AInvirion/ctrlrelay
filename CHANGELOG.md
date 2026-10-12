@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-10-12
+
+### Added
+
+- Announce a pull request whose review could not run (#202, closes #196)
+
+### Fixed
+
+- Resolve the reviewer binary before exec, and ship a unit PATH that finds
+  it (#201, closes #197)
+- Resolve the notification transport at use, not at boot (#199, closes #198)
+
 ## [0.12.2] - 2026-10-06
 
 ### Fixed
@@ -1689,7 +1701,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.3...HEAD
+[0.12.3]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.11.3...v0.12.0
