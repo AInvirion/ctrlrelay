@@ -1,5 +1,6 @@
 """CLI entry point for ctrlrelay."""
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -279,6 +280,41 @@ def _bridge_socket_settings(config) -> tuple[Path, int] | None:
     )
 
 
+# Bounds on talking to the bridge socket. Both exist because a
+# notification must never fail or stall an issue: `open_unix_connection`
+# on a listening socket with a saturated backlog can stay pending, and
+# `wait_closed` can stay pending against a bridge that has stopped
+# reading. Catching exceptions does not help with a coroutine that
+# never finishes. These are local-socket operations, so a wait of this
+# length means the bridge is wedged, not busy.
+_NOTIFY_CONNECT_TIMEOUT_SECONDS = 10
+_NOTIFY_CLOSE_TIMEOUT_SECONDS = 5
+
+
+async def _close_notify_transport(transport: Transport | None) -> None:
+    """Close a notification transport without letting it affect the run.
+
+    Separate from the connect side because the failure costs differ: a
+    connect that fails loses a message, and a close that fails or hangs
+    holds up an issue whose work has already finished. Both are logged;
+    neither is allowed to escape.
+    """
+    if transport is None:
+        return
+    try:
+        await asyncio.wait_for(
+            transport.close(), timeout=_NOTIFY_CLOSE_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        log_event(
+            _logger,
+            "notify.transport.close_failed",
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+            detail="notification channel left open; the run is unaffected",
+        )
+
+
 async def connect_notify_transport(config) -> Transport | None:
     """A connected transport for lane notifications, or ``None``.
 
@@ -304,11 +340,33 @@ async def connect_notify_transport(config) -> Transport | None:
     indistinguishable from an uneventful day, and that is why it ran
     for a day unnoticed rather than being spotted in the log.
 
-    Never raises. A notification must not fail a pipeline run, so a
-    connect error is logged and swallowed; the log line is what keeps
-    the swallow from being invisible.
+    Never raises, and never waits unboundedly. A notification must not
+    fail or delay a pipeline run, so reading the config, asking the
+    filesystem and connecting are all guarded and the connect is
+    bounded. Every failure is logged; the log line is what keeps the
+    swallow from being invisible.
     """
-    settings = _bridge_socket_settings(config)
+    # Reading the config and asking the filesystem are both inside the
+    # guard, not only the connect. `Path.exists()` propagates
+    # PermissionError — it only swallows the not-found family — so a
+    # socket under a directory this process cannot stat raises here, and
+    # `expanduser().resolve()` has its own ways to fail. Before this
+    # was called per notification that would have crashed the daemon at
+    # boot, loudly; now it would kill the issue whose work it was about
+    # to announce, which is worse than losing the message.
+    try:
+        settings = _bridge_socket_settings(config)
+    except Exception as e:
+        log_event(
+            _logger,
+            "notify.transport.unreadable",
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+            detail="could not resolve the bridge socket; "
+            "this notification is not sent",
+        )
+        return None
+
     if settings is None:
         log_event(
             _logger,
@@ -320,7 +378,21 @@ async def connect_notify_transport(config) -> Transport | None:
         return None
 
     socket_path, ask_timeout = settings
-    if not socket_path.exists():
+    try:
+        present = socket_path.exists()
+    except Exception as e:
+        log_event(
+            _logger,
+            "notify.transport.unreadable",
+            socket_path=str(socket_path),
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+            detail="could not stat the bridge socket; "
+            "this notification is not sent",
+        )
+        return None
+
+    if not present:
         log_event(
             _logger,
             "notify.transport.socket_missing",
@@ -333,7 +405,9 @@ async def connect_notify_transport(config) -> Transport | None:
 
     candidate = SocketTransport(socket_path, ask_timeout_seconds=ask_timeout)
     try:
-        await candidate.connect()
+        await asyncio.wait_for(
+            candidate.connect(), timeout=_NOTIFY_CONNECT_TIMEOUT_SECONDS
+        )
     except Exception as e:
         log_event(
             _logger,
@@ -344,6 +418,10 @@ async def connect_notify_transport(config) -> Transport | None:
             detail="bridge did not accept the connection; "
             "this notification is not sent",
         )
+        # A wait_for timeout cancels the connect, but a connect that got
+        # as far as a socket leaves one behind; close it rather than
+        # waiting for the garbage collector to complain.
+        await _close_notify_transport(candidate)
         return None
 
     log_event(
@@ -1281,12 +1359,17 @@ def poller_start(
                     f"[dim]{name} transport via {socket_path}[/dim]"
                 )
             else:
-                # Not fatal and no longer sticky: the bridge may still be
-                # starting, and the next notification re-checks.
+                # Not fatal and no longer sticky: the bridge may still
+                # be starting, and the next notification re-checks. The
+                # wording stops at what this line knows — the socket is
+                # absent now, and the check is re-made per notification.
+                # It cannot promise a later connection will succeed; a
+                # stale socket file from a dead bridge exists and
+                # refuses, which is the connect_failed branch.
                 console.print(
-                    f"[yellow]{name} socket not present yet at "
-                    f"{socket_path} — notifications will connect when the "
-                    "bridge creates it.[/yellow]"
+                    f"[yellow]{name} socket not present at {socket_path}. "
+                    "Each notification re-checks, so this resolves itself "
+                    "once the bridge is up.[/yellow]"
                 )
 
         # Track in-flight PR-watch background tasks so they outlive
@@ -1408,39 +1491,46 @@ def poller_start(
             # at daemon startup, so a bridge that came up after this
             # process did is still reachable (#198).
             connected_transport = await connect_notify_transport(config)
-            if connected_transport is not None:
-                try:
-                    await connected_transport.send(
-                        f"🔔 New issue #{issue_number} in {repo}: {title}"
-                    )
-                except Exception as e:
-                    console.print(f"[yellow]Transport error: {e}[/yellow]")
-
-            # Find matching repo config
-            repo_configs = [r for r in config.repos if r.name == repo]
-            if not repo_configs:
-                console.print(f"[yellow]No config found for repo {repo}, skipping.[/yellow]")
-                if connected_transport is not None:
-                    await connected_transport.close()
-                return
-
-            repo_config = repo_configs[0]
-
-            # Route by label: task_labels → task pipeline (report-only,
-            # no PR), otherwise dev pipeline. Case-insensitive match on
-            # the issue's label names. exclude_labels was already
-            # applied in poller.poll() so any issue reaching
-            # handle_issue is a candidate.
-            issue_labels = {
-                (lbl.get("name") or "").lower()
-                for lbl in (issue.get("labels") or [])
-            }
-            task_labels_lower = {
-                lbl.lower() for lbl in repo_config.automation.task_labels
-            }
-            is_task = bool(issue_labels & task_labels_lower)
-
+            # Nothing may sit between that line and this `try`. The old
+            # code reused ONE transport owned by the poller, so an
+            # exception here cost nothing; this one creates a connection
+            # per issue, and an early return or a CancelledError between
+            # the two would leak a socket every poll. The `finally` is
+            # the only close in this function.
             try:
+                if connected_transport is not None:
+                    try:
+                        await connected_transport.send(
+                            f"🔔 New issue #{issue_number} in {repo}: {title}"
+                        )
+                    except Exception as e:
+                        console.print(f"[yellow]Transport error: {e}[/yellow]")
+
+                # Find matching repo config
+                repo_configs = [r for r in config.repos if r.name == repo]
+                if not repo_configs:
+                    console.print(
+                        f"[yellow]No config found for repo {repo}, "
+                        "skipping.[/yellow]"
+                    )
+                    return
+
+                repo_config = repo_configs[0]
+
+                # Route by label: task_labels → task pipeline (report-only,
+                # no PR), otherwise dev pipeline. Case-insensitive match on
+                # the issue's label names. exclude_labels was already
+                # applied in poller.poll() so any issue reaching
+                # handle_issue is a candidate.
+                issue_labels = {
+                    (lbl.get("name") or "").lower()
+                    for lbl in (issue.get("labels") or [])
+                }
+                task_labels_lower = {
+                    lbl.lower() for lbl in repo_config.automation.task_labels
+                }
+                is_task = bool(issue_labels & task_labels_lower)
+
                 if is_task:
                     from ctrlrelay.pipelines.base import failure_text
                     from ctrlrelay.pipelines.task import run_task_issue
@@ -1619,8 +1709,10 @@ def poller_start(
                             f"[yellow]Transport error sending result: {e}[/yellow]"
                         )
             finally:
-                if connected_transport is not None:
-                    await connected_transport.close()
+                # Best-effort and bounded: closing a notification
+                # channel must not fail or stall an issue whose work
+                # is already done.
+                await _close_notify_transport(connected_transport)
 
         console.print(f"[green]Starting poller[/green] for {len(repo_names)} repo(s) as {username}")
         console.print(f"  Interval: {interval}s | Press Ctrl+C to stop")
