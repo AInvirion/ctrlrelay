@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 import uuid
 from dataclasses import dataclass
@@ -608,6 +609,88 @@ def _build_fix_prompt(pr_number: int, verification: VerificationResult) -> str:
     )
 
 
+@dataclass(frozen=True)
+class ReviewReport:
+    """What happened to the review, in a form the operator can be told.
+
+    This exists because the old signature returned ``None``: every
+    outcome — findings posted, reviewer missing, review switched off —
+    produced the same value, so a caller could not tell a pull request
+    that had been looked at from one that had not.
+
+    On the forge those two are also indistinguishable, because both
+    carry zero reviews and zero comments. That is #196, and the cost
+    was ``AInvirion/zzsites#842``, which read as finished for forty
+    minutes having never been looked at.
+
+    ``posted`` is the only field that means "findings reached the pull
+    request". ``status`` is deliberately wider than
+    :class:`~ctrlrelay.core.code_review.ReviewStatus` — it also names
+    the ways the review never got as far as running.
+    """
+
+    posted: bool
+    status: str
+    detail: str = ""
+    # Set only by the two branches that KNOW the outcome was somebody's
+    # configuration. Deciding this by matching ``status`` against a
+    # list of strings was wrong in a way no test here could see:
+    # :class:`~ctrlrelay.core.code_review.ReviewStatus` has a member
+    # whose value is literally ``"skipped"``, and the branch that
+    # forwards that enum does not know whether the operator chose it.
+    # A reviewer that started returning it would have silenced the
+    # warning about a pull request nobody read. An explicit flag set at
+    # the site that knows cannot collide with anything.
+    deliberate: bool = False
+
+    @property
+    def is_failure(self) -> bool:
+        """Whether the operator needs telling.
+
+        Two outcomes are somebody's own decision and not a fault:
+        review switched off for the repo, and ``comment_on_pr`` off so
+        the findings stay in the log. Both set ``deliberate``.
+
+        Everything else means the pull request carries nothing a reader
+        can use — which is not always the same as nobody having looked:
+        on ``comment_failed`` the reviewer finished and only the posting
+        failed. The reader is in the same position either way, which is
+        why both are announced.
+        """
+        return not self.posted and not self.deliberate
+
+    def failure_sentence(self) -> str:
+        """One line for a chat notification, ending in what to do.
+
+        A warning with no action in it gets dismissed, and a dismissed
+        warning is the silent pass this ticket exists to remove.
+
+        Only the failure case, because only the failure case is ever
+        announced. An earlier version also had branches for a posted
+        review, a switched-off one and a log-only one — none of which
+        any caller could reach, since every caller checks
+        :attr:`is_failure` first. Prose that cannot be printed reads as
+        coverage to the next person.
+        """
+        reason = self.detail.strip() or self.status
+        return (
+            f"NO REVIEW ON THIS PR — the reviewer did not post ({reason}). "
+            "Zero comments here does not mean it is clean. Read the diff "
+            "before you merge."
+        )
+
+
+# What a caller believes when the dev lane never reported. Absent is
+# not the same fact as reviewed, and rounding it towards "fine" is the
+# defect this ticket is about — so it has a status of its own and reads
+# as a failure.
+REVIEW_NOT_REPORTED = ReviewReport(
+    posted=False,
+    status="not_reported",
+    detail="the dev lane recorded no review outcome",
+)
+
+
 async def _review_and_comment(
     *,
     github: GitHubCLI,
@@ -617,7 +700,7 @@ async def _review_and_comment(
     worktree_path: Path,
     base_branch: str,
     config: Any = None,
-) -> None:
+) -> ReviewReport:
     """Run the configured review and post what it found.
 
     No label, and no claim that a review happened — see
@@ -625,10 +708,17 @@ async def _review_and_comment(
     against a branch the reviewed party authored.
 
     Best-effort throughout: a reviewer that is missing, wedged or broken
-    must never fail a PR whose code and CI are already fine.
+    must never fail a PR whose code and CI are already fine. It must,
+    however, SAY so — the return value is how, and every exit from this
+    function carries one.
     """
     if getattr(config, "method", "cli") == "off":
-        return
+        return ReviewReport(
+            posted=False,
+            status="skipped",
+            detail="code_review.method is 'off' for this repo",
+            deliberate=True,
+        )
 
     outcome = await run_code_review(
         repo=repo,
@@ -651,7 +741,11 @@ async def _review_and_comment(
             status=outcome.status.value,
             error=outcome.error[:200],
         )
-        return
+        return ReviewReport(
+            posted=False,
+            status=outcome.status.value,
+            detail=outcome.error[:200],
+        )
 
     if not getattr(config, "comment_on_pr", True):
         log_event(
@@ -662,7 +756,12 @@ async def _review_and_comment(
             pr_number=pr_number,
             findings=extract_verdict(outcome.output)[:2000],
         )
-        return
+        return ReviewReport(
+            posted=False,
+            status="not_commented",
+            detail="comment_on_pr is off for this repo",
+            deliberate=True,
+        )
 
     try:
         await github.comment_on_pr(
@@ -677,6 +776,7 @@ async def _review_and_comment(
             repo=repo,
             pr_number=pr_number,
         )
+        return ReviewReport(posted=True, status="reviewed")
     except Exception as e:
         log_event(
             _logger,
@@ -686,6 +786,11 @@ async def _review_and_comment(
             pr_number=pr_number,
             error_type=type(e).__name__,
             error=str(e)[:200],
+        )
+        return ReviewReport(
+            posted=False,
+            status="comment_failed",
+            detail=f"{type(e).__name__}: {str(e)[:200]}",
         )
 
 
@@ -1012,6 +1117,10 @@ async def run_dev_issue(
         # the same repo can now run their own git-op phases while we wait.
         if result.success and result.outputs.get("pr_number") is not None:
             pr_number_for_review = int(result.outputs["pr_number"])
+            # Starts as a failure, not as "fine". Every branch below
+            # overwrites it; this value is what survives if a new
+            # branch is ever added that forgets to.
+            review_report = REVIEW_NOT_REPORTED
             verifier = pr_verifier or PRVerifier(github=github)
             result = await _verify_and_fix_pr(
                 pipeline=pipeline,
@@ -1035,6 +1144,14 @@ async def run_dev_issue(
                     review_base = await worktree.get_default_branch(repo)
                 except Exception as e:
                     review_base = None
+                    review_report = ReviewReport(
+                        posted=False,
+                        status="base_unknown",
+                        detail=(
+                            "could not resolve the base branch "
+                            f"({type(e).__name__})"
+                        ),
+                    )
                     log_event(
                         _logger,
                         "dev.code_review.base_unknown",
@@ -1044,7 +1161,7 @@ async def run_dev_issue(
                     )
                 if review_base is not None:
                     try:
-                        await _review_and_comment(
+                        review_report = await _review_and_comment(
                             github=github,
                             repo=repo,
                             session_id=session_id,
@@ -1054,6 +1171,11 @@ async def run_dev_issue(
                             config=code_review,
                         )
                     except Exception as e:
+                        review_report = ReviewReport(
+                            posted=False,
+                            status="errored",
+                            detail=f"{type(e).__name__}: {str(e)[:200]}",
+                        )
                         log_event(
                             _logger,
                             "dev.code_review.errored",
@@ -1062,6 +1184,29 @@ async def run_dev_issue(
                             error_type=type(e).__name__,
                             error=str(e)[:200],
                         )
+
+            # Carry the outcome out on the result's own field so
+            # whoever announces the pull request can say whether it was
+            # reviewed.
+            #
+            # A FIELD, not keys in `outputs`: `outputs` is merged with
+            # the coding agent's own checkpoint, and the agent is the
+            # party whose branch is being reviewed. An agent writing
+            # `review_posted: true` would otherwise silence the warning
+            # about its own unreviewed pull request — the adversary
+            # `core.code_review`'s docstring is about, reaching the
+            # announcement instead of the label.
+            #
+            # Outside the inner `if` as well, so every path that got as
+            # far as having a pull request carries an outcome. The
+            # branches above all set `review_report`; this line is what
+            # makes "written on every path" true rather than a claim
+            # about the paths I happened to look at.
+            #
+            # `replace` rather than re-listing the fields: a field
+            # added to PipelineResult later is carried by construction
+            # instead of being silently reset to its default.
+            result = dataclasses.replace(result, review=review_report)
 
         # Reacquire the lock for the post-verify cleanup phase (remove
         # worktree / delete branch). Usually SHORT budget (cleanup is

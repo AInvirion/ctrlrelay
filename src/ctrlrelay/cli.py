@@ -518,6 +518,90 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
     }
 
 
+async def announce_dev_success(
+    transport, *, repo: str, result
+) -> list[str]:
+    """Send the dev lane's success messages and return what was sent.
+
+    A function rather than inline statements so the SEQUENCE is
+    testable, not only the strings. Three rounds of review kept finding
+    the same thing about the `ast` guards that stood in for this: they
+    can show a call exists and cannot show it runs. `if False: await
+    transport.send(warning)` satisfied every structural check while
+    restoring the original silence. A fake transport settles it.
+
+    The warning goes FIRST. Both sends sit inside one ``except`` in the
+    caller, so whichever is second is what a mid-sequence transport
+    failure loses — and of the two, the routine line is the
+    convenience while the warning is the reason somebody opens the
+    pull request.
+
+    Returns the messages in the order they were sent, which is what
+    the caller's tests assert on.
+    """
+    sent: list[str] = []
+    warning = unreviewed_pr_warning(repo, result)
+    if warning is not None:
+        await transport.send(warning)
+        sent.append(warning)
+
+    pr_url = (getattr(result, "outputs", None) or {}).get("pr_url", "")
+    routine = f"✅ PR ready: {pr_url}"
+    await transport.send(routine)
+    sent.append(routine)
+    return sent
+
+
+def unreviewed_pr_warning(repo: str, result) -> str | None:
+    """The line to post when a pull request has no review, or ``None``.
+
+    #196: the dev lane logged `code_review.spawn_failed` and carried
+    on. The pull request then had zero reviews and zero comments, which
+    on the forge is indistinguishable from a review that has not run
+    yet — so `AInvirion/zzsites#842` read as finished for forty minutes
+    having never been looked at. A log line nobody is watching is not
+    an announcement.
+
+    Sent as its OWN message rather than appended to the routine "PR
+    ready" line, so it cannot be skimmed past — and the routine line is
+    left exactly as it was, because it already existed and replacing it
+    was not this ticket.
+
+    No recorded outcome returns a warning rather than ``None``. The
+    dev lane sets the field on every path that got as far as having a
+    pull request, so its absence means something did not report — and
+    rounding "I do not know" towards "reviewed" is the whole defect.
+    """
+    # Read off the result's own field. It used to come out of
+    # `result.outputs`, which is merged with the coding agent's own
+    # checkpoint — so an agent could write `review_posted: true` and
+    # silence the warning about its own unreviewed pull request. The
+    # agent is exactly the adversary `core.code_review`'s docstring is
+    # about, and nothing it writes can reach a dataclass field.
+    #
+    # `None` means no outcome was recorded, which is a different fact
+    # from a review that found nothing. Rounding "I do not know"
+    # towards "reviewed" is the defect this exists to remove.
+    from ctrlrelay.pipelines.dev import REVIEW_NOT_REPORTED, ReviewReport
+
+    report = getattr(result, "review", None)
+    if not isinstance(report, ReviewReport):
+        # Covers `None` and anything else that ever ends up in the
+        # field. Reading `.is_failure` off whatever is there would
+        # either raise into the announcement path or believe a duck.
+        report = REVIEW_NOT_REPORTED
+
+    if not report.is_failure:
+        return None
+
+    # The PR number is still read from `outputs` — it comes from the
+    # agent by design, it only decorates the message, and getting it
+    # wrong costs a slightly worse line rather than a wrong verdict.
+    pr_number = (getattr(result, "outputs", None) or {}).get("pr_number")
+    where = f"{repo}#{pr_number}" if pr_number is not None else repo
+    return f"⚠️ {where} — {report.failure_sentence()}"
+
+
 def describe_unresolved_reviewer(
     program: str, repos: list[str]
 ) -> tuple[str, str]:
@@ -2035,9 +2119,13 @@ def poller_start(
                                     f"({repo}): {result.summary}"
                                 )
                             else:
-                                pr_url = result.outputs.get("pr_url", "")
-                                await connected_transport.send(
-                                    f"✅ PR ready: {pr_url}"
+                                # The order and the two-message shape
+                                # live in `announce_dev_success`, where
+                                # a fake transport can watch them.
+                                await announce_dev_success(
+                                    connected_transport,
+                                    repo=repo,
+                                    result=result,
                                 )
                         elif result.blocked:
                             await connected_transport.send(
