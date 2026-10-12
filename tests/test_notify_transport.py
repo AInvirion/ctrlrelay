@@ -618,6 +618,43 @@ class TestItNeverCostsTheRun:
         )
 
     @pytest.mark.asyncio
+    async def test_an_exception_that_cannot_be_printed_is_still_reported(
+        self, caplog
+    ) -> None:
+        """Formatting the exception is part of what can fail.
+
+        Every loss path used to hand the logger ``error=str(e)[:200]``,
+        evaluated at the call site — outside the guard. A class whose
+        ``__str__`` raises therefore escaped the handler written to
+        contain failures and dropped the issue.
+
+        Found by mutation: removing the inner guard left all eighteen
+        other cases in this file green.
+        """
+        from ctrlrelay.cli import connect_notify_transport
+
+        class _UnprintableError(Exception):
+            def __str__(self) -> str:
+                raise RuntimeError("cannot be printed")
+
+        class _BadConfig:
+            @property
+            def transport(self):
+                raise _UnprintableError
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            assert await connect_notify_transport(_BadConfig()) is None
+
+        events = [
+            r
+            for r in _ctrlrelay_events(caplog)
+            if r.getMessage() == "notify.transport.unreadable"
+        ]
+        assert events, _event_names(caplog)
+        assert getattr(events[0], "error", None) == "<unprintable>"
+        assert getattr(events[0], "error_type", None) == "_UnprintableError"
+
+    @pytest.mark.asyncio
     async def test_an_interrupt_before_the_connect_propagates_and_says_so(
         self, caplog
     ) -> None:
