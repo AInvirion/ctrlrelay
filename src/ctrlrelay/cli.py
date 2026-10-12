@@ -299,8 +299,17 @@ _NOTIFY_CONNECT_TIMEOUT_SECONDS = 10
 # arrives at interpreter exit with no context.
 _NOTIFY_CLOSE_TASKS: set[asyncio.Task] = set()
 
+# And a ceiling on it, because `SocketTransport.close` can stay
+# suspended in `wait_closed()` against a bridge that stopped reading.
+# One retained task per issue, each holding a socket, is a slow leak on
+# a daemon that runs for days. Over the ceiling the oldest is cancelled
+# — which reports `close_cancelled`, so the leak becomes a log line
+# rather than memory. Generous on purpose: reaching it at all means
+# something is wrong with the bridge, not with the poller.
+_NOTIFY_CLOSE_MAX_PENDING = 32
 
-def _log_quietly(event: str, **fields) -> None:
+
+def _log_quietly(event: str, *, cause: BaseException | None = None, **fields) -> None:
     """``log_event`` that cannot become the reason an issue failed.
 
     Every loss path in this module ends in a log line, including the
@@ -309,8 +318,21 @@ def _log_quietly(event: str, **fields) -> None:
     raises `KeyError` — would otherwise escape from inside the very
     handler written to contain failures, and kill the issue rather than
     the message.
+
+    ``cause`` is the exception itself rather than a formatted string,
+    because formatting it is part of what can fail: a class whose
+    ``__str__`` raises turns ``error=str(e)[:200]`` at the call site
+    into an exception the guard never sees, and on one path into a
+    second scheduled close. Named ``cause`` rather than ``error`` so it
+    cannot collide with the field it produces.
     """
     try:
+        if cause is not None:
+            fields["error_type"] = type(cause).__name__
+            try:
+                fields["error"] = str(cause)[:200]
+            except Exception:
+                fields["error"] = "<unprintable>"
         log_event(_logger, event, **fields)
     except Exception:
         pass
@@ -348,13 +370,35 @@ def _close_notify_transport(transport: Transport | None) -> None:
         # its first await.
         _log_quietly(
             "notify.transport.close_failed",
-            error_type=type(e).__name__,
-            error=str(e)[:200],
+            cause=e,
             detail="notification channel left open; the run is unaffected",
         )
         return
+    _evict_oldest_pending_close()
     _NOTIFY_CLOSE_TASKS.add(task)
     task.add_done_callback(_notify_close_finished)
+
+
+def _evict_oldest_pending_close() -> None:
+    """Keep the set of unfinished closes bounded.
+
+    Cancelling is enough: the done callback reports it, and
+    `SocketTransport.close` absorbing the cancellation only means the
+    socket may stay open — which the log then says.
+    """
+    while len(_NOTIFY_CLOSE_TASKS) >= _NOTIFY_CLOSE_MAX_PENDING:
+        oldest = next(iter(_NOTIFY_CLOSE_TASKS), None)
+        if oldest is None:
+            return
+        _NOTIFY_CLOSE_TASKS.discard(oldest)
+        if not oldest.done():
+            oldest.cancel()
+            _log_quietly(
+                "notify.transport.close_evicted",
+                pending=_NOTIFY_CLOSE_MAX_PENDING,
+                detail="too many unfinished closes; the oldest was dropped "
+                "and its notification channel may be left open",
+            )
 
 
 def _notify_close_finished(task: asyncio.Task) -> None:
@@ -379,8 +423,7 @@ def _notify_close_finished(task: asyncio.Task) -> None:
         return
     _log_quietly(
         "notify.transport.close_failed",
-        error_type=type(error).__name__,
-        error=str(error)[:200],
+        cause=error,
         detail="notification channel left open; the run is unaffected",
     )
 
@@ -411,9 +454,12 @@ async def connect_notify_transport(config) -> Transport | None:
     for a day unnoticed rather than being spotted in the log.
 
     Never raises except to pass on a cancellation or an interpreter-exit
-    signal, and never delays the caller. A notification must not fail or
-    hold up a pipeline run, so the whole body is guarded, the connect is
-    bounded, and the close is scheduled rather than awaited. The
+    signal, and never delays the caller for longer than
+    ``_NOTIFY_CONNECT_TIMEOUT_SECONDS`` — bounded, not instant: a socket
+    that exists and stalls costs the issue that wait. A notification
+    must not fail or hold up a pipeline run, so the whole body is
+    guarded, the connect is bounded, and the close is scheduled rather
+    than awaited. The
     enclosing ``handle_issue`` is worse off than the old code if this
     throws: the poller marks an issue seen BEFORE handling it, so an
     exception here drops the issue permanently instead of losing one
@@ -458,8 +504,7 @@ async def connect_notify_transport(config) -> Transport | None:
             _log_quietly(
                 "notify.transport.connect_failed",
                 socket_path=str(socket_path),
-                error_type=type(e).__name__,
-                error=str(e)[:200],
+                cause=e,
                 detail="bridge did not accept the connection; "
                 "this notification is not sent",
             )
@@ -497,8 +542,7 @@ async def connect_notify_transport(config) -> Transport | None:
         _close_notify_transport(candidate)
         _log_quietly(
             "notify.transport.unreadable",
-            error_type=type(e).__name__,
-            error=str(e)[:200],
+            cause=e,
             detail="could not resolve the bridge socket; "
             "this notification is not sent",
         )

@@ -569,12 +569,18 @@ class TestItNeverCostsTheRun:
 
         config = _config(tmp_path, _mattermost(tmp_path / "absent.sock"))
 
+        calls: list[str] = []
+
         class _AngryLogger:
             def info(self, *_a, **_kw) -> None:
+                calls.append("info")
                 raise KeyError("name")
 
         monkeypatch.setattr(cli_module, "_logger", _AngryLogger())
         assert await connect_notify_transport(config) is None
+        # Observed, so this cannot pass for a resolver that returned
+        # None without ever trying to log.
+        assert calls, "the throwing logger was never reached"
 
     @pytest.mark.asyncio
     async def test_a_close_that_is_cancelled_is_reported(self, caplog) -> None:
@@ -612,49 +618,117 @@ class TestItNeverCostsTheRun:
         )
 
     @pytest.mark.asyncio
-    async def test_an_interrupt_propagates_after_closing_and_saying_so(
-        self, tmp_path: Path, monkeypatch, caplog
+    async def test_an_interrupt_before_the_connect_propagates_and_says_so(
+        self, caplog
     ) -> None:
         """KeyboardInterrupt and SystemExit are not swallowed.
 
-        A process being told to stop should stop — but the transport is
-        held only by a statement that never completed, so it has to be
-        closed on the way out, and the operator still needs to know a
-        notification went missing. `_log_quietly` catches `Exception`,
-        not `BaseException`, so this path is reached by a logging
-        handler raising one of these too.
+        A process told to stop should stop, and the operator still
+        needs to know a notification went missing. `_log_quietly`
+        catches `Exception`, not `BaseException`, so this path is also
+        how a logging handler raising one of these behaves.
+
+        Raised from reading the config rather than from inside the
+        connect: `asyncio.wait_for` runs the connect in a Task, and a
+        Task re-raises `KeyboardInterrupt` through the event loop
+        rather than delivering it to the awaiting frame, so a test
+        written that way exercises the clause unreliably and can take
+        the test runner with it.
         """
+        from ctrlrelay.cli import connect_notify_transport
+
+        class _InterruptingConfig:
+            @property
+            def transport(self):
+                raise KeyboardInterrupt
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            with pytest.raises(KeyboardInterrupt):
+                await connect_notify_transport(_InterruptingConfig())
+        assert "notify.transport.interrupted" in _event_names(caplog)
+
+    @pytest.mark.asyncio
+    async def test_an_interrupt_after_the_connect_still_closes_it(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The transport is closed on the way out.
+
+        At this point it is held only by a statement that never
+        completed, so `handle_issue`'s try/finally has not begun and
+        nothing else will close it. Driven through the success log,
+        which is the realistic trigger the docstring names and is not
+        inside a Task.
+        """
+        import ctrlrelay.cli as cli_module
         import ctrlrelay.transports as transports
         from ctrlrelay.cli import connect_notify_transport
 
         sock = tmp_path / "mm.sock"
-        sock.write_text("placeholder so the existence check passes")
         config = _config(tmp_path, _mattermost(sock))
 
         built: list[object] = []
 
-        class _InterruptedTransport:
+        class _FakeTransport:
             def __init__(self, *_a, **_kw) -> None:
                 self.closed = False
                 built.append(self)
 
             async def connect(self) -> None:
-                raise KeyboardInterrupt
+                return None
 
             async def close(self) -> None:
                 self.closed = True
 
-        monkeypatch.setattr(
-            transports, "SocketTransport", _InterruptedTransport
-        )
+        def _interrupting_log_event(_logger, event, **_fields):
+            if event == "notify.transport.connected":
+                raise KeyboardInterrupt
+            return None
 
-        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+        # A real socket, so the existence check passes for the right
+        # reason rather than because the check was skipped.
+        server = await asyncio.start_unix_server(
+            lambda r, w: w.close(), path=str(sock)
+        )
+        try:
+            monkeypatch.setattr(transports, "SocketTransport", _FakeTransport)
+            monkeypatch.setattr(
+                cli_module, "log_event", _interrupting_log_event
+            )
             with pytest.raises(KeyboardInterrupt):
                 await connect_notify_transport(config)
             await _settle(lambda: bool(built) and built[0].closed)
+        finally:
+            server.close()
+            await server.wait_closed()
 
-        assert built and built[0].closed, "the transport was left open"
-        assert "notify.transport.interrupted" in _event_names(caplog)
+        assert built, "the resolver never built a transport"
+        assert built[0].closed, "an interrupted connect left the socket open"
+
+    @pytest.mark.asyncio
+    async def test_unfinished_closes_do_not_pile_up(self, monkeypatch) -> None:
+        """`SocketTransport.close` can stay suspended in wait_closed().
+
+        One retained task per issue, each holding a socket, is a slow
+        leak on a daemon that runs for days. Over the ceiling the
+        oldest is cancelled, which the done callback reports.
+        """
+        import ctrlrelay.cli as cli_module
+        from ctrlrelay.cli import _close_notify_transport
+
+        monkeypatch.setattr(cli_module, "_NOTIFY_CLOSE_MAX_PENDING", 4)
+
+        class _WedgedTransport:
+            async def close(self) -> None:
+                await asyncio.Event().wait()
+
+        for _ in range(20):
+            _close_notify_transport(_WedgedTransport())
+            await asyncio.sleep(0)
+        assert len(cli_module._NOTIFY_CLOSE_TASKS) <= 4, len(
+            cli_module._NOTIFY_CLOSE_TASKS
+        )
+        for task in list(cli_module._NOTIFY_CLOSE_TASKS):
+            task.cancel()
 
     def test_closing_nothing_is_a_no_op(self) -> None:
         """Closing `None` does nothing and says nothing.
