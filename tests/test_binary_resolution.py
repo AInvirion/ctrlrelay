@@ -258,6 +258,54 @@ class TestResolveAndSaySo:
         assert got == str(target)
         assert log.events() == []
 
+    def test_a_relative_path_entry_still_yields_an_absolute_answer(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The caller execs with its own cwd, so a relative answer is a
+        different file.
+
+        With a relative PATH entry, `shutil.which` inspects a file
+        under the DAEMON's directory and hands back a relative name.
+        `create_subprocess_exec(cwd=worktree_path)` would then resolve
+        that name under the worktree — running a different program than
+        the one just checked, or none.
+        """
+        from ctrlrelay.core import binaries
+
+        _executable(tmp_path / "relbin", "review")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("PATH", "relbin")
+
+        log = _Recorder()
+        got = binaries.resolve_binary(
+            "review", logger=log, event_prefix="code_review.binary"
+        )
+        assert os.path.isabs(got), got
+        assert got == str(tmp_path / "relbin" / "review")
+        assert log.events() == []
+
+    def test_a_relative_operator_path_is_not_claimed_about(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Only an absolute operator-given path is answerable here.
+
+        A relative one is resolved by the child against the worktree,
+        so reporting a miss from the daemon's directory would be a
+        claim about the wrong tree — and the first version of this
+        reported it.
+        """
+        from ctrlrelay.core import binaries
+
+        monkeypatch.chdir(tmp_path)
+        log = _Recorder()
+        got = binaries.resolve_binary(
+            os.path.join("tools", "review"),
+            logger=log,
+            event_prefix="code_review.binary",
+        )
+        assert got == os.path.join("tools", "review")
+        assert log.events() == []
+
     def test_on_path_says_nothing(self, monkeypatch) -> None:
         """The ordinary case must not add a line per spawn."""
         from ctrlrelay.core import binaries
@@ -465,16 +513,16 @@ class TestTheStartupCheck:
         )
         assert unresolved_review_programs(config) == {}
 
-    def test_a_program_with_a_path_separator_is_not_answered_for(
+    def test_a_relative_program_is_not_answered_for(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         """`exec` resolves it against the CHILD's cwd, not the daemon's.
 
-        The child's cwd is the repo's worktree, which does not exist at
-        startup. Probing from the daemon's own directory answers a
-        different question: it would report a script that is present in
-        the repo as missing, and stay quiet when a same-named file
-        happens to sit beside the daemon.
+        The child's cwd is the repo's worktree. Probing `./tools/review`
+        from the daemon's own directory answers a different question: it
+        would report a script that is present in the repo as missing,
+        and stay quiet when a same-named file happens to sit beside the
+        daemon.
         """
         from ctrlrelay.cli import unresolved_review_programs
         from ctrlrelay.core import binaries
@@ -488,14 +536,63 @@ class TestTheStartupCheck:
                 {
                     "name": "o/a",
                     "code_review": {"cli_command": "./tools/review --x"},
-                },
-                {
-                    "name": "o/b",
-                    "code_review": {"cli_command": "/opt/nope/review"},
-                },
+                }
             ],
         )
         assert unresolved_review_programs(config) == {}
+
+    def test_an_absolute_program_is_answered_for(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The other half, and the one the first version got wrong.
+
+        An absolute path does not depend on anybody's working
+        directory, so startup can answer it — and skipping it meant the
+        configuration an operator is most likely to typo stayed silent
+        until the first issue of the day.
+        """
+        from ctrlrelay.cli import unresolved_review_programs
+        from ctrlrelay.core import binaries
+
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(binaries, "USER_INSTALL_DIRS", (str(tmp_path),))
+
+        missing = str(tmp_path / "nope" / "review")
+        present = _executable(tmp_path / "opt", "review")
+        config = self._config(
+            tmp_path,
+            [
+                {"name": "o/a", "code_review": {"cli_command": missing}},
+                {
+                    "name": "o/b",
+                    "code_review": {"cli_command": f"{present} --x"},
+                },
+            ],
+        )
+        # Both directions in one call: the missing one is reported and
+        # the usable one is not.
+        assert unresolved_review_programs(config) == {missing: ["o/a"]}
+
+    def test_a_blank_command_is_reported_at_startup(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """It fails every review deterministically, so it is boot news.
+
+        Skipping it left exactly the silence this change removes: the
+        runtime guard returns FAILED for every review and nothing at
+        startup said why.
+        """
+        from ctrlrelay.cli import unresolved_review_programs
+        from ctrlrelay.core import binaries
+
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(binaries, "USER_INSTALL_DIRS", (str(tmp_path),))
+
+        config = self._config(
+            tmp_path,
+            [{"name": "o/a", "code_review": {"cli_command": "   "}}],
+        )
+        assert unresolved_review_programs(config) == {"": ["o/a"]}
 
     def test_an_unbalanced_quote_is_not_reported_as_missing(
         self, tmp_path: Path, monkeypatch
@@ -558,15 +655,22 @@ class TestTheUnitsCarryTheUserBinDir:
 
         from ctrlrelay.install import render_launchd, render_systemd
 
+        examined = 0
         for unit in render_systemd(workdir=tmp_path):
             for line in unit.content.splitlines():
                 if line.startswith("Environment=PATH="):
                     assert "${" not in line, (unit.service, line)
+                    examined += 1
         for unit in render_launchd(workdir=tmp_path):
             value = plistlib.loads(unit.content.encode())[
                 "EnvironmentVariables"
             ]["PATH"]
             assert "${" not in value, (unit.service, value)
+            examined += 1
+        # Four units, four PATHs. Without this the whole test passes if
+        # a renderer returns nothing, or stops emitting a PATH at all —
+        # an absence assertion over an empty set.
+        assert examined == 4, examined
 
     def test_launchd_jobs_put_the_user_bin_dir_first(
         self, tmp_path: Path

@@ -472,30 +472,42 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
         try:
             argv = shlex.split(command)
         except ValueError:
-            # An unbalanced quote is a different fault, and
+            # A malformed command — an unbalanced quote, or a dangling
+            # backslash, which `shlex` also refuses. Either way it is a
+            # different fault from a missing program, and
             # `run_code_review` already reports it per run with the
-            # repo named. Do not re-report it as a missing program.
+            # repo named. Do not re-report it as something to install.
             continue
         if not argv:
+            # A review-enabled repo whose command is blank fails every
+            # review deterministically, so it is a startup problem and
+            # not something to discover on the first issue of the day.
+            # Named distinctly because the fix is different: there is
+            # nothing to install.
+            wanted.setdefault("", []).append(repo.name)
             continue
-        program = argv[0]
-        # A program with a path separator is resolved by `exec` against
-        # the CHILD's working directory, which is the repo's worktree
-        # and does not exist yet at startup. Probing it from the
-        # daemon's own directory answers a different question, and
-        # would report a script that is present as missing — or, worse,
-        # stay quiet because a same-named file sits next to the daemon.
-        # Not answerable here, so not answered.
-        import os as _os
 
-        if _os.sep in program or (_os.altsep and _os.altsep in program):
+        program = argv[0]
+        # A RELATIVE program with a separator is resolved by `exec`
+        # against the CHILD's working directory, which is the repo's
+        # worktree. Probing it from the daemon's own directory answers
+        # a different question, and would report a script that is
+        # present as missing — or stay quiet because a same-named file
+        # sits next to the daemon. Not answerable here, so not
+        # answered. An ABSOLUTE path is answerable, and is answered.
+        if not os.path.isabs(program) and (
+            os.sep in program or (os.altsep and os.altsep in program)
+        ):
             continue
         wanted.setdefault(program, []).append(repo.name)
 
     return {
         program: repos
         for program, repos in wanted.items()
-        if probe_binary(program) is None
+        # A blank program is already known to be unusable; asking
+        # `probe_binary("")` would be asking the filesystem a question
+        # about nothing.
+        if program == "" or probe_binary(program) is None
     }
 
 
@@ -1617,22 +1629,39 @@ def poller_start(
         # review that simply has not run yet.
         missing_reviewers = unresolved_review_programs(config)
         for program, repos in sorted(missing_reviewers.items()):
+            blank = program == ""
+            # Phrased as of now, not as a prediction. Installing the
+            # tool later makes the next review work — the resolution is
+            # re-done per spawn — so "will fail" would be a claim this
+            # probe cannot keep, and repo_count is the number of repos
+            # that asked for it, not a count of future failures.
+            detail = (
+                "a review-enabled repo has a blank cli_command, so its "
+                "reviews cannot run and there is nothing to install"
+                if blank
+                else (
+                    f"{program!r} was not found on PATH or in the usual "
+                    "user install directories as of startup; reviews "
+                    "needing it cannot spawn until it is installed"
+                )
+            )
             log_event(
                 _logger,
                 "code_review.binary.unresolved_at_startup",
                 program=program,
-                repo_count=len(repos),
-                detail=(
-                    f"{program!r} is not on PATH and not in the usual "
-                    "user install directories; every review on these "
-                    "repos will fail to spawn"
-                ),
+                repos_configured=len(repos),
+                detail=detail,
             )
             shown = ", ".join(sorted(repos)[:3])
             more = "" if len(repos) <= 3 else f" and {len(repos) - 3} more"
+            what = (
+                "has a blank cli_command"
+                if blank
+                else f"{program!r} not found"
+            )
             console.print(
-                f"[yellow]Review tool {program!r} not found — reviews "
-                f"will not run for {shown}{more}. Install it, or set "
+                f"[yellow]Review tool {what} for {shown}{more} — reviews "
+                "there cannot spawn. Install it, fix cli_command, or set "
                 "code_review.method to 'off' for those repos.[/yellow]"
             )
 

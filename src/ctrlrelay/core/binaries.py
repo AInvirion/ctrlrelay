@@ -72,10 +72,12 @@ def probe_binary(name: str) -> str | None:
 def resolve_binary(name: str, *, logger, event_prefix: str) -> str:
     """Where to find ``name``, or ``name`` unchanged.
 
-    Usually absolute, and not promised to be: ``shutil.which`` answers
-    out of ``PATH``, and a ``PATH`` carrying a relative entry yields a
-    relative answer. The caller execs it with a ``cwd`` of its own, so
-    saying "absolute" here would be a claim this function cannot keep.
+    A resolved name comes back absolute, because the caller execs with
+    a ``cwd`` of its own: ``shutil.which`` answers out of ``PATH``, and
+    a ``PATH`` carrying a relative entry would otherwise yield a
+    relative answer that the child resolves against a different
+    directory — running a different file than the one inspected here.
+    A name that resolves nowhere comes back exactly as given.
 
     Returning the bare name on failure is deliberate. The caller then
     fails exactly as it did before — ``FileNotFoundError`` out of
@@ -89,9 +91,15 @@ def resolve_binary(name: str, *, logger, event_prefix: str) -> str:
     for it somewhere else would override them.
     """
     if os.sep in name or (os.altsep and os.altsep in name):
-        # Not searched for elsewhere — but a miss is still a miss, and
-        # saying nothing here was the one loss path that stayed quiet.
-        if probe_binary(name) is None:
+        # Not searched for elsewhere. A miss is still reported — saying
+        # nothing here was the one loss path that stayed quiet — but
+        # only for an ABSOLUTE name, which is the only one this process
+        # can answer about. A relative name is resolved by `exec`
+        # against the CHILD's working directory, which is the repo's
+        # worktree, so probing it from here would report a script that
+        # is present as missing and stay quiet when a same-named file
+        # happens to sit beside the daemon.
+        if os.path.isabs(name) and probe_binary(name) is None:
             logger.warning(
                 f"{event_prefix}.unresolved",
                 extra={"binary": name, "reason": "not_a_usable_file"},
@@ -100,8 +108,12 @@ def resolve_binary(name: str, *, logger, event_prefix: str) -> str:
 
     on_path = shutil.which(name)
     if on_path:
-        # The ordinary case, and not worth a log line.
-        return on_path
+        # Absolute, deliberately. `shutil.which` answers out of PATH,
+        # and a PATH carrying a relative entry yields a relative
+        # answer — which the caller would then exec against ITS cwd,
+        # not ours, and so could run a different file than the one
+        # just inspected. Anchor it to the file we actually looked at.
+        return os.path.abspath(on_path)
 
     found = probe_binary(name)
     if found is not None:
