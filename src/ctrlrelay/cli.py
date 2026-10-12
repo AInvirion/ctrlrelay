@@ -543,11 +543,29 @@ def describe_unresolved_reviewer(
     if program == "":
         detail = (
             "a review-enabled repo has a blank cli_command, so its "
-            "reviews cannot run and there is nothing to install"
+            "reviews cannot spawn and there is nothing to install"
         )
         line = (
             f"Review tool: blank cli_command for {safe_repos} — reviews "
             "there cannot spawn. Set cli_command, or set "
+            "code_review.method to 'off' for those repos."
+        )
+        return detail, line
+
+    if os.path.isabs(program):
+        # Only that one path was examined — deliberately, since the
+        # operator named a file. Telling them it was not found "on PATH
+        # or in the usual user install directories" would be false, and
+        # "install it" is usually the wrong fix: the path has a typo.
+        detail = (
+            f"{program!r} is not an executable file as of startup; it "
+            "was the exact path configured, and nowhere else was "
+            "searched, so reviews needing it cannot spawn"
+        )
+        line = (
+            f"Review tool {rich_escape(repr(program))} is not an "
+            f"executable file — reviews for {safe_repos} cannot spawn. "
+            "Check the path in cli_command, or set "
             "code_review.method to 'off' for those repos."
         )
         return detail, line

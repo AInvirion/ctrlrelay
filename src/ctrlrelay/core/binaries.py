@@ -30,6 +30,12 @@ import shutil
 # fix is the unit's own PATH, and the installer templates now carry
 # `~/.local/bin`. This is the fallback for a daemon whose unit predates
 # that, which is every unit already on disk.
+#
+# Known gap, named rather than guessed at: a per-user pip install on a
+# macOS framework Python puts scripts under `~/Library/Python/X.Y/bin`,
+# which is version dependent and so cannot be a fixed entry here. The
+# fleet is Linux; globbing for it would be machinery larger than the
+# defect.
 # Order matters and is the dispatcher's original order, unchanged: this
 # helper replaced a private copy there, and a different order is a
 # different program on a box that has two. `~/.local/share/uv/tools` is
@@ -70,23 +76,6 @@ def _search(name: str) -> tuple[str | None, str]:
     return None, "fallback"
 
 
-def _anchor(found: str) -> str:
-    """Make ``found`` independent of whoever's cwd reads it next.
-
-    ``os.path.join`` rather than ``os.path.abspath``: ``abspath``
-    collapses ``..`` LEXICALLY, so with a ``PATH`` entry like
-    ``link/../bin`` where ``link`` is a symlink, it returns a path to a
-    different file than the one just inspected. Measured:
-    ``abspath("link/../bin/review")`` from ``/srv/relay`` gives
-    ``/srv/relay/bin/review`` while the real target is
-    ``/opt/tool/bin/review``. Joining leaves ``link/..`` for the
-    operating system to resolve, which gets it right.
-    """
-    if os.path.isabs(found):
-        return found
-    return os.path.join(os.getcwd(), found)
-
-
 def probe_binary(name: str) -> str | None:
     """Where ``name`` would be found, or ``None``. Logs nothing.
 
@@ -102,13 +91,13 @@ def probe_binary(name: str) -> str | None:
 def resolve_binary(name: str, *, logger, event_prefix: str) -> str:
     """Where to find ``name``, or ``name`` unchanged.
 
-    A name this function SEARCHED for comes back absolute, because the
-    caller execs with a ``cwd`` of its own: ``shutil.which`` answers out
-    of ``PATH``, and a ``PATH`` carrying a relative entry would
-    otherwise yield a relative answer that the child resolves against a
-    different directory — running a different file than the one
-    inspected here. A name that resolves nowhere comes back exactly as
-    given.
+    A name found in one of the fallback directories comes back
+    absolute, which is what this function is for. Everything else comes
+    back exactly as given — including a name found through a RELATIVE
+    ``PATH`` entry, because ``shutil.which`` searched that entry from
+    THIS process's directory while ``exec`` would search it from the
+    child's, and those are two different programs. Handing the name
+    back leaves that case behaving exactly as it did before.
 
     Returning the bare name on failure is deliberate. The caller then
     fails exactly as it did before — ``FileNotFoundError`` out of
@@ -127,18 +116,35 @@ def resolve_binary(name: str, *, logger, event_prefix: str) -> str:
 
     if found is not None:
         if how == "given":
-            # Handed back exactly as written. Anchoring a RELATIVE path
+            # Handed back exactly as written. Rewriting a RELATIVE path
             # the operator gave would resolve it against the daemon's
             # directory when they meant the child's — overriding them
             # with a different file, which is the opposite of honouring
             # a path they named.
             return found
+
+        if how == "path" and not os.path.isabs(found):
+            # A relative PATH entry. `shutil.which` searched it from
+            # OUR directory; `exec` would search it from the CHILD's,
+            # and those are different programs. Measured: with
+            # `PATH=bin` and an executable under both, a child started
+            # with `cwd=<worktree>` runs the WORKTREE-side one.
+            #
+            # So hand the name back untouched and let exec do exactly
+            # what it did before this change. Rewriting it either way
+            # would be this function picking a winner, and the thing
+            # #197 is about is a tool that is on no PATH at all.
+            return name
+
         if how == "fallback":
             logger.warning(
                 f"{event_prefix}.fallback",
                 extra={"binary": found, "reason": "not_on_path"},
             )
-        return _anchor(found)
+        # Every candidate from USER_INSTALL_DIRS is built on an
+        # expanduser'd absolute directory, and a `which` hit that
+        # reaches here is absolute, so there is nothing left to anchor.
+        return found
 
     if how == "given":
         # Not searched for elsewhere. A miss is still reported — saying

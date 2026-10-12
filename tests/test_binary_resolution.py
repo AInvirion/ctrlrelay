@@ -134,13 +134,17 @@ class TestProbe:
         Found by mutation: deleting the guard left every other case in
         this file green.
 
-        This is the probe's own defensive rule. Both callers reject a
-        relative separator-containing name before they get here, so
-        deleting this guard alone cannot make the daemon run the decoy
-        — the operator-visible claims are
+        This is the probe's own defensive rule, and the three callers
+        do NOT all reject such a name before reaching it: the startup
+        collector does, but `resolve_binary` calls the search first and
+        only afterwards hands the relative name back, and
+        `probe_binary` exposes the search's daemon-directory answer
+        directly. What they agree on is the OUTCOME — nobody acts on
+        that answer — which is asserted by
         `test_a_relative_operator_path_is_not_claimed_about` and
-        `test_a_relative_program_is_not_answered_for`. Kept because the
-        probe is public and the next caller will not know the rule.
+        `test_a_relative_program_is_not_answered_for`. Kept here
+        because the probe is public and the next caller will not know
+        the rule.
         """
         from ctrlrelay.core import binaries
 
@@ -266,17 +270,22 @@ class TestResolveAndSaySo:
         assert got == str(target)
         assert log.events() == []
 
-    def test_a_relative_path_entry_still_yields_an_absolute_answer(
+    def test_a_relative_path_hit_is_handed_back_untouched(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """The caller execs with its own cwd, so a relative answer is a
-        different file.
+        """`which` searches a relative PATH entry from OUR directory.
 
-        With a relative PATH entry, `shutil.which` inspects a file
-        under the DAEMON's directory and hands back a relative name.
-        `create_subprocess_exec(cwd=worktree_path)` would then resolve
-        that name under the worktree — running a different program than
-        the one just checked, or none.
+        `exec` searches it from the CHILD's, and those are different
+        programs. Measured with `PATH=bin` and an executable under
+        both: a child started with `cwd=<worktree>` runs the
+        WORKTREE-side one. So rewriting the name here would make this
+        function pick a winner, and the thing #197 is about is a tool
+        that is on no PATH at all.
+
+        An earlier version of this change anchored it, which silently
+        changed which program ran — and then needed a second fix
+        because `os.path.abspath` collapses `..` lexically through a
+        symlink. Not rewriting it removes both.
         """
         from ctrlrelay.core import binaries
 
@@ -288,51 +297,35 @@ class TestResolveAndSaySo:
         got = binaries.resolve_binary(
             "review", logger=log, event_prefix="code_review.binary"
         )
-        assert os.path.isabs(got), got
-        assert got == str(tmp_path / "relbin" / "review")
+        assert got == "review", got
         assert log.events() == []
 
-    def test_anchoring_does_not_collapse_a_symlinked_parent(
+    def test_a_fallback_hit_is_absolute(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """`os.path.abspath` resolves `..` LEXICALLY, which is wrong here.
+        """The claim that survives: what this function is actually for.
 
-        With a PATH entry of `link/../bin` where `link` is a symlink,
-        `abspath` strips `link/..` as text and names a file in the
-        daemon's own tree — a DIFFERENT executable from the one
-        `shutil.which` just inspected. Measured from /srv/relay:
-        `abspath("link/../bin/review")` gives `/srv/relay/bin/review`
-        while the real target is `/opt/tool/bin/review`.
-
-        Joining the cwd leaves `link/..` for the operating system,
-        which follows the symlink and gets the right file.
-
-        Found by mutation: going back to `abspath` left every other
-        case in this file green.
+        A tool found in one of the fallback directories comes back as
+        an absolute path, because the caller execs with a `cwd` of its
+        own and a bare name would be searched again from there — which
+        is the failure this whole change exists to remove.
         """
         from ctrlrelay.core import binaries
 
-        # The file PATH actually selects, reached through the symlink.
-        real = _executable(tmp_path / "opt" / "tool" / "bin", "review")
-        (tmp_path / "opt" / "tool" / "subdir").mkdir(parents=True)
-        # A decoy at the path a lexical collapse would name instead.
-        decoy = _executable(tmp_path / "daemon" / "bin", "review")
-        (tmp_path / "daemon" / "link").symlink_to(
-            tmp_path / "opt" / "tool" / "subdir"
+        target = _executable(tmp_path / "userbin", "fakereviewer")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(
+            binaries, "USER_INSTALL_DIRS", (str(tmp_path / "userbin"),)
         )
-
-        monkeypatch.chdir(tmp_path / "daemon")
-        monkeypatch.setenv("PATH", os.path.join("link", "..", "bin"))
+        monkeypatch.chdir(tmp_path)
 
         log = _Recorder()
         got = binaries.resolve_binary(
-            "review", logger=log, event_prefix="code_review.binary"
+            "fakereviewer", logger=log, event_prefix="code_review.binary"
         )
         assert os.path.isabs(got), got
-        # Compared by identity, not by string: the whole point is which
-        # FILE this names, and both candidates exist.
-        assert os.path.realpath(got) == os.path.realpath(str(real)), got
-        assert os.path.realpath(got) != os.path.realpath(str(decoy)), got
+        assert got == str(target)
+        assert log.events() == ["code_review.binary.fallback"]
 
     def test_an_operator_given_relative_path_is_returned_as_written(
         self, tmp_path: Path, monkeypatch
@@ -802,19 +795,35 @@ class TestWhatTheOperatorIsTold:
         """
         from ctrlrelay.cli import describe_unresolved_reviewer
 
-        for program in ("", "ghostly"):
+        for program in ("", "ghostly", "/opt/nope/review"):
             detail, line = describe_unresolved_reviewer(program, ["o/a"])
             for text in (detail, line):
                 assert "will fail" not in text, text
                 assert "will not run" not in text, text
+            # Positive too: an all-negative test passes for a function
+            # that returns ("", "").
+            assert "cannot spawn" in detail, detail
+            assert "cannot spawn" in line, line
+            assert "o/a" in line, line
+            # Only the two that depend on the filesystem are dated. A
+            # blank cli_command is blank whenever you look, so stamping
+            # it "as of startup" would imply it might change on its own.
+            if program != "":
+                assert "as of startup" in detail, detail
 
     def test_a_program_name_cannot_break_the_console(self) -> None:
         """The name comes from config and is interpolated into markup.
 
-        `[bold]reviewer` opens a tag that is never closed, and
-        `console.print` raises `MarkupError` — turning a missing
-        reviewer into a daemon that will not start, which is the one
-        outcome worse than the bug being fixed.
+        Measured, because the obvious case is not the dangerous one:
+        Rich tolerates an unclosed `[bold]`, a stray `[` and an
+        unterminated `[red` to end of string. **`[/]` is what raises
+        `MarkupError`** — an implicit close with nothing open — and a
+        program name containing it would turn a missing reviewer into a
+        daemon that will not start, which is the one outcome worse than
+        the bug being fixed.
+
+        The other three are kept as the cases that must NOT raise, so
+        this does not become a test that only knows one string.
         """
         from rich.console import Console
 
