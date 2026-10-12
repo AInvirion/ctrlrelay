@@ -292,6 +292,75 @@ class TestResolveAndSaySo:
         assert got == str(tmp_path / "relbin" / "review")
         assert log.events() == []
 
+    def test_anchoring_does_not_collapse_a_symlinked_parent(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """`os.path.abspath` resolves `..` LEXICALLY, which is wrong here.
+
+        With a PATH entry of `link/../bin` where `link` is a symlink,
+        `abspath` strips `link/..` as text and names a file in the
+        daemon's own tree — a DIFFERENT executable from the one
+        `shutil.which` just inspected. Measured from /srv/relay:
+        `abspath("link/../bin/review")` gives `/srv/relay/bin/review`
+        while the real target is `/opt/tool/bin/review`.
+
+        Joining the cwd leaves `link/..` for the operating system,
+        which follows the symlink and gets the right file.
+
+        Found by mutation: going back to `abspath` left every other
+        case in this file green.
+        """
+        from ctrlrelay.core import binaries
+
+        # The file PATH actually selects, reached through the symlink.
+        real = _executable(tmp_path / "opt" / "tool" / "bin", "review")
+        (tmp_path / "opt" / "tool" / "subdir").mkdir(parents=True)
+        # A decoy at the path a lexical collapse would name instead.
+        decoy = _executable(tmp_path / "daemon" / "bin", "review")
+        (tmp_path / "daemon" / "link").symlink_to(
+            tmp_path / "opt" / "tool" / "subdir"
+        )
+
+        monkeypatch.chdir(tmp_path / "daemon")
+        monkeypatch.setenv("PATH", os.path.join("link", "..", "bin"))
+
+        log = _Recorder()
+        got = binaries.resolve_binary(
+            "review", logger=log, event_prefix="code_review.binary"
+        )
+        assert os.path.isabs(got), got
+        # Compared by identity, not by string: the whole point is which
+        # FILE this names, and both candidates exist.
+        assert os.path.realpath(got) == os.path.realpath(str(real)), got
+        assert os.path.realpath(got) != os.path.realpath(str(decoy)), got
+
+    def test_an_operator_given_relative_path_is_returned_as_written(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Anchoring it would override what the operator meant.
+
+        They wrote it relative to the directory the child runs in — the
+        repo's worktree. Resolving it against the daemon's directory
+        hands the child an absolute path to a different file that
+        happens to sit beside the daemon.
+
+        Found by mutation: anchoring the given branch too left every
+        other case green.
+        """
+        from ctrlrelay.core import binaries
+
+        _executable(tmp_path / "tools", "review")
+        monkeypatch.chdir(tmp_path)
+
+        asked = os.path.join("tools", "review")
+        log = _Recorder()
+        got = binaries.resolve_binary(
+            asked, logger=log, event_prefix="code_review.binary"
+        )
+        assert got == asked, got
+        assert not os.path.isabs(got), got
+        assert log.events() == []
+
     def test_a_relative_operator_path_is_not_claimed_about(
         self, tmp_path: Path, monkeypatch
     ) -> None:
