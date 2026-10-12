@@ -115,6 +115,34 @@ class TestProbe:
         _executable(asked.parent, "review")
         assert binaries.probe_binary(str(asked)) == str(asked)
 
+    def test_a_relative_path_is_not_searched_for_either(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The case the absolute one above cannot see.
+
+        `os.path.join(user_dir, "/abs/path")` discards the user dir, so
+        an absolute path is immune to the fallback search whether or
+        not anything guards it — and a test using one passes with the
+        guard deleted. A RELATIVE path with a separator is not immune:
+        `join(user_dir, "bin/review")` is a real place to look, so
+        without the guard an operator who configured `bin/review` would
+        silently run a different `bin/review` out of a user directory.
+
+        Found by mutation: deleting the guard left every other case in
+        this file green.
+        """
+        from ctrlrelay.core import binaries
+
+        userbin = tmp_path / "userbin"
+        _executable(userbin / "bin", "review")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(binaries, "USER_INSTALL_DIRS", (str(userbin),))
+        monkeypatch.chdir(tmp_path)
+
+        # Nothing at ./bin/review relative to the cwd, and the decoy at
+        # <userbin>/bin/review must not stand in for it.
+        assert binaries.probe_binary(os.path.join("bin", "review")) is None
+
 
 class TestResolveAndSaySo:
     def test_a_fallback_is_logged_with_the_path_it_used(
