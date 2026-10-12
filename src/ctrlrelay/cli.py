@@ -443,6 +443,49 @@ def _notify_close_finished(task: asyncio.Task) -> None:
     )
 
 
+def unresolved_review_programs(config) -> dict[str, list[str]]:
+    """Reviewer programs that cannot be found, to the repos that want them.
+
+    Asked once at startup rather than once per pull request. The fault
+    in #197 was visible only as a `code_review.spawn_failed` line on the
+    first issue of the day, hours after the daemon came up and with
+    nothing at boot to say the reviewer was unreachable — and the pull
+    request it affected carried zero reviews, which on the forge reads
+    as a review that has not run yet rather than one that cannot.
+
+    Repos with review switched off are skipped: a reviewer nobody asked
+    for being absent is not a fault. An empty dict means every
+    configured reviewer resolved, which is a different fact from no
+    repo configuring one.
+    """
+    import shlex
+
+    from ctrlrelay.core.binaries import probe_binary
+
+    wanted: dict[str, list[str]] = {}
+    for repo in getattr(config, "repos", []) or []:
+        review = getattr(repo, "code_review", None)
+        if review is None or getattr(review, "method", "cli") == "off":
+            continue
+        command = getattr(review, "cli_command", "") or ""
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            # An unbalanced quote is a different fault, and
+            # `run_code_review` already reports it per run with the
+            # repo named. Do not re-report it as a missing program.
+            continue
+        if not argv:
+            continue
+        wanted.setdefault(argv[0], []).append(repo.name)
+
+    return {
+        program: repos
+        for program, repos in wanted.items()
+        if probe_binary(program) is None
+    }
+
+
 async def connect_notify_transport(config) -> Transport | None:
     """A connected transport for lane notifications, or ``None``.
 
@@ -1553,6 +1596,32 @@ def poller_start(
                     "Each notification re-checks, so this resolves itself "
                     "once the bridge is up.[/yellow]"
                 )
+
+        # Say once, at boot, which reviewers cannot be found. #197: the
+        # only symptom was a `code_review.spawn_failed` line on the
+        # first issue of the day, and the pull request it affected
+        # carried zero reviews — indistinguishable on the forge from a
+        # review that simply has not run yet.
+        missing_reviewers = unresolved_review_programs(config)
+        for program, repos in sorted(missing_reviewers.items()):
+            log_event(
+                _logger,
+                "code_review.binary.unresolved_at_startup",
+                program=program,
+                repo_count=len(repos),
+                detail=(
+                    f"{program!r} is not on PATH and not in the usual "
+                    "user install directories; every review on these "
+                    "repos will fail to spawn"
+                ),
+            )
+            shown = ", ".join(sorted(repos)[:3])
+            more = "" if len(repos) <= 3 else f" and {len(repos) - 3} more"
+            console.print(
+                f"[yellow]Review tool {program!r} not found — reviews "
+                f"will not run for {shown}{more}. Install it, or set "
+                "code_review.method to 'off' for those repos.[/yellow]"
+            )
 
         # Track in-flight PR-watch background tasks so they outlive
         # handle_issue and aren't garbage-collected. Cleared via

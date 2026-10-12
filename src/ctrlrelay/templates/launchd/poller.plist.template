@@ -17,8 +17,13 @@
     <dict>
         <key>CTRLRELAY_TELEGRAM_TOKEN</key>
         <string>${CTRLRELAY_TELEGRAM_TOKEN}</string>
+        <!-- ~/.local/bin first: a per-user pip install, uv tool and
+             pipx all put shims there, and a launchd job does not
+             read ~/.bashrc. Omitting it is #197 on this platform
+             too. Note an XML comment may not contain two adjacent
+             hyphens, which is why the flag is spelled out. -->
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>${HOME}/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <!-- Without PYTHONUNBUFFERED, ctrlrelay's stdout sits in Python's
              stdio buffer instead of flushing line-by-line, making
              `tail -f ~/.ctrlrelay/logs/poller.log` lag noticeably. -->

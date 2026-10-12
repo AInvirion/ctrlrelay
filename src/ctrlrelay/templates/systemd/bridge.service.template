@@ -10,6 +10,14 @@ Environment=CTRLRELAY_TELEGRAM_TOKEN=${CTRLRELAY_TELEGRAM_TOKEN}
 # buffer instead of flushing line-by-line, making `tail -f` and
 # `journalctl -f` lag noticeably.
 Environment=PYTHONUNBUFFERED=1
+# A systemd user unit gets a minimal PATH and does not read ~/.bashrc,
+# so anything under ~/.local/bin is invisible to the daemon while
+# working in the operator's terminal. That is #197: every code_review
+# spawn failed with FileNotFoundError on the configured reviewer's
+# name, which was installed under ~/.local/bin. ctrlrelay's own
+# fallback search covers a unit that predates this line; a fresh
+# install should not need it.
+Environment=PATH=${HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=${CTRLRELAY_BIN} bridge start --foreground
 Restart=always
 RestartSec=5
