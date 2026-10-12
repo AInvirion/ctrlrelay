@@ -209,6 +209,65 @@ class TestWhenItWarns:
                 is None
             ), status
 
+    def test_only_the_three_intended_outcomes_are_quiet(self) -> None:
+        """Each quiet status pinned to the branch that may emit it.
+
+        The test above derives its expectations from the code it is
+        checking, so a MISLABELLED producer is self-consistent with
+        it: relabel the base_unknown branch to `status="skipped"` and
+        a real failure goes silent while the derived set still adds up.
+        Found by mutation.
+
+        So this one is deliberately an enumeration — of intent, checked
+        against the code. Adding a `ReviewReport` construction, or
+        changing one's status, breaks it and forces a decision here
+        rather than silently widening what is quiet.
+        """
+        import ast
+        from pathlib import Path as _Path
+
+        import ctrlrelay.pipelines.dev as dev_module
+
+        tree = ast.parse(_Path(dev_module.__file__).read_text())
+        built: list[tuple[object, object]] = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "ReviewReport"
+            ):
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            status = kw.get("status")
+            posted = kw.get("posted")
+            built.append(
+                (
+                    status.value
+                    if isinstance(status, ast.Constant)
+                    else "<computed>",
+                    posted.value
+                    if isinstance(posted, ast.Constant)
+                    else "<computed>",
+                )
+            )
+
+        quiet = [
+            pair
+            for pair in built
+            if pair[0] in {"reviewed", "skipped", "not_commented"}
+        ]
+        # Exactly three, one per reason:
+        #   reviewed       — findings reached the pull request
+        #   skipped        — code_review.method is 'off' for this repo
+        #   not_commented  — comment_on_pr is off, findings in the log
+        assert sorted(quiet) == sorted(
+            [
+                ("reviewed", True),
+                ("skipped", False),
+                ("not_commented", False),
+            ]
+        ), quiet
+
 
 class TestWhenItStaysQuiet:
     """The other direction. A check that can only say yes is half a check.
