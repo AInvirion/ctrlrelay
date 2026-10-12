@@ -30,9 +30,14 @@ import shutil
 # fix is the unit's own PATH, and the installer templates now carry
 # `~/.local/bin`. This is the fallback for a daemon whose unit predates
 # that, which is every unit already on disk.
+# Order matters and is the dispatcher's original order, unchanged: this
+# helper replaced a private copy there, and a different order is a
+# different program on a box that has two. `~/.local/share/uv/tools` is
+# NOT here on purpose — that directory holds one subdirectory per tool,
+# so a candidate built from it is never a file, and adding it only
+# reordered the search.
 USER_INSTALL_DIRS: tuple[str, ...] = (
     "~/.local/bin",
-    "~/.local/share/uv/tools",
     "/usr/local/bin",
     "/opt/homebrew/bin",
 )
@@ -65,7 +70,12 @@ def probe_binary(name: str) -> str | None:
 
 
 def resolve_binary(name: str, *, logger, event_prefix: str) -> str:
-    """An absolute path to ``name``, or ``name`` unchanged.
+    """Where to find ``name``, or ``name`` unchanged.
+
+    Usually absolute, and not promised to be: ``shutil.which`` answers
+    out of ``PATH``, and a ``PATH`` carrying a relative entry yields a
+    relative answer. The caller execs it with a ``cwd`` of its own, so
+    saying "absolute" here would be a claim this function cannot keep.
 
     Returning the bare name on failure is deliberate. The caller then
     fails exactly as it did before — ``FileNotFoundError`` out of
@@ -79,6 +89,13 @@ def resolve_binary(name: str, *, logger, event_prefix: str) -> str:
     for it somewhere else would override them.
     """
     if os.sep in name or (os.altsep and os.altsep in name):
+        # Not searched for elsewhere — but a miss is still a miss, and
+        # saying nothing here was the one loss path that stayed quiet.
+        if probe_binary(name) is None:
+            logger.warning(
+                f"{event_prefix}.unresolved",
+                extra={"binary": name, "reason": "not_a_usable_file"},
+            )
         return name
 
     on_path = shutil.which(name)

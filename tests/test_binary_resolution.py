@@ -94,14 +94,17 @@ class TestProbe:
         monkeypatch.setattr(binaries, "USER_INSTALL_DIRS", (str(userbin),))
         assert binaries.probe_binary("fakereviewer") is None
 
-    def test_an_absolute_path_the_operator_gave_is_not_searched_for(
+    def test_an_absolute_path_is_answered_about_itself(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """A path names a file. Searching elsewhere would override them.
+        """A path names a file: the answer is about that file.
 
-        Without this, configuring `/opt/vendor/bin/review` on a box
-        where that file is missing would silently run a DIFFERENT
-        `review` from a user directory.
+        This does NOT establish the separator guard, and it used to
+        claim it did. An absolute name is immune to the fallback search
+        either way, because `os.path.join(user_dir, "/abs")` discards
+        `user_dir` — so this passes with the guard deleted.
+        `test_a_relative_path_is_not_searched_for_either` is the one
+        that detects that.
         """
         from ctrlrelay.core import binaries
 
@@ -142,6 +145,42 @@ class TestProbe:
         # Nothing at ./bin/review relative to the cwd, and the decoy at
         # <userbin>/bin/review must not stand in for it.
         assert binaries.probe_binary(os.path.join("bin", "review")) is None
+
+
+class TestTheSearchOrderIsTheDispatchersOwn:
+    """This helper replaced a private copy in the dispatcher.
+
+    A different candidate order is a different program on a box that
+    has two, so the order is part of the behaviour rather than an
+    implementation detail. An earlier version of this change inserted
+    `~/.local/share/uv/tools` ahead of `/usr/local/bin` — which also
+    could never match, because that directory holds one subdirectory
+    per tool and a candidate built from it is never a file.
+    """
+
+    def test_the_order_is_user_bin_then_usr_local_then_homebrew(self) -> None:
+        from ctrlrelay.core.binaries import USER_INSTALL_DIRS
+
+        assert USER_INSTALL_DIRS == (
+            "~/.local/bin",
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+        )
+
+    def test_the_earlier_directory_wins(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Not just the list — that the search honours it."""
+        from ctrlrelay.core import binaries
+
+        first, second = tmp_path / "first", tmp_path / "second"
+        _executable(first, "dup")
+        _executable(second, "dup")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(
+            binaries, "USER_INSTALL_DIRS", (str(first), str(second))
+        )
+        assert binaries.probe_binary("dup") == str(first / "dup")
 
 
 class TestResolveAndSaySo:
@@ -185,6 +224,39 @@ class TestResolveAndSaySo:
         )
         assert got == "definitely-not-a-tool"
         assert log.events() == ["code_review.binary.unresolved"]
+
+    def test_an_operator_given_path_that_is_missing_still_reports(
+        self, tmp_path: Path
+    ) -> None:
+        """Not searched for elsewhere, but a miss is still a miss.
+
+        The separator guard returned before any logging, so the one
+        configuration an operator is most likely to get wrong — a full
+        path with a typo in it — was the one that said nothing.
+        """
+        from ctrlrelay.core import binaries
+
+        log = _Recorder()
+        asked = str(tmp_path / "nope" / "review")
+        got = binaries.resolve_binary(
+            asked, logger=log, event_prefix="code_review.binary"
+        )
+        assert got == asked
+        assert log.events() == ["code_review.binary.unresolved"]
+        assert log.calls[0][1]["reason"] == "not_a_usable_file"
+
+    def test_an_operator_given_path_that_works_says_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core import binaries
+
+        target = _executable(tmp_path / "opt", "review")
+        log = _Recorder()
+        got = binaries.resolve_binary(
+            str(target), logger=log, event_prefix="code_review.binary"
+        )
+        assert got == str(target)
+        assert log.events() == []
 
     def test_on_path_says_nothing(self, monkeypatch) -> None:
         """The ordinary case must not add a line per spawn."""
@@ -393,6 +465,38 @@ class TestTheStartupCheck:
         )
         assert unresolved_review_programs(config) == {}
 
+    def test_a_program_with_a_path_separator_is_not_answered_for(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """`exec` resolves it against the CHILD's cwd, not the daemon's.
+
+        The child's cwd is the repo's worktree, which does not exist at
+        startup. Probing from the daemon's own directory answers a
+        different question: it would report a script that is present in
+        the repo as missing, and stay quiet when a same-named file
+        happens to sit beside the daemon.
+        """
+        from ctrlrelay.cli import unresolved_review_programs
+        from ctrlrelay.core import binaries
+
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(binaries, "USER_INSTALL_DIRS", (str(tmp_path),))
+
+        config = self._config(
+            tmp_path,
+            [
+                {
+                    "name": "o/a",
+                    "code_review": {"cli_command": "./tools/review --x"},
+                },
+                {
+                    "name": "o/b",
+                    "code_review": {"cli_command": "/opt/nope/review"},
+                },
+            ],
+        )
+        assert unresolved_review_programs(config) == {}
+
     def test_an_unbalanced_quote_is_not_reported_as_missing(
         self, tmp_path: Path, monkeypatch
     ) -> None:
@@ -438,6 +542,31 @@ class TestTheUnitsCarryTheUserBinDir:
             assert len(lines) == 1, (unit.service, lines)
             value = lines[0].split("=", 2)[2]
             assert value.split(":")[0] == expected, (unit.service, value)
+
+    def test_no_rendered_path_carries_an_unsubstituted_variable(
+        self, tmp_path: Path
+    ) -> None:
+        """Neither systemd nor launchd expands a shell-style reference.
+
+        `safe_substitute` leaves an unknown `${VAR}` intact by design,
+        so a `HOME` missing from the mapping would render a PATH whose
+        first entry is the literal text `${HOME}/.local/bin` — a
+        directory that does not exist, silently undoing the fix on a
+        fresh install while every substring check still passes.
+        """
+        import plistlib
+
+        from ctrlrelay.install import render_launchd, render_systemd
+
+        for unit in render_systemd(workdir=tmp_path):
+            for line in unit.content.splitlines():
+                if line.startswith("Environment=PATH="):
+                    assert "${" not in line, (unit.service, line)
+        for unit in render_launchd(workdir=tmp_path):
+            value = plistlib.loads(unit.content.encode())[
+                "EnvironmentVariables"
+            ]["PATH"]
+            assert "${" not in value, (unit.service, value)
 
     def test_launchd_jobs_put_the_user_bin_dir_first(
         self, tmp_path: Path

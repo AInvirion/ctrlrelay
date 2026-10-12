@@ -454,9 +454,10 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
     as a review that has not run yet rather than one that cannot.
 
     Repos with review switched off are skipped: a reviewer nobody asked
-    for being absent is not a fault. An empty dict means every
-    configured reviewer resolved, which is a different fact from no
-    repo configuring one.
+    for being absent is not a fault. A program named with a path
+    separator is skipped too — see below. An empty dict means every
+    reviewer this check can answer for resolved, which is a different
+    fact from no repo configuring one.
     """
     import shlex
 
@@ -477,7 +478,19 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
             continue
         if not argv:
             continue
-        wanted.setdefault(argv[0], []).append(repo.name)
+        program = argv[0]
+        # A program with a path separator is resolved by `exec` against
+        # the CHILD's working directory, which is the repo's worktree
+        # and does not exist yet at startup. Probing it from the
+        # daemon's own directory answers a different question, and
+        # would report a script that is present as missing — or, worse,
+        # stay quiet because a same-named file sits next to the daemon.
+        # Not answerable here, so not answered.
+        import os as _os
+
+        if _os.sep in program or (_os.altsep and _os.altsep in program):
+            continue
+        wanted.setdefault(program, []).append(repo.name)
 
     return {
         program: repos
