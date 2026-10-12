@@ -501,13 +501,16 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
             continue
         wanted.setdefault(program, []).append(repo.name)
 
+    # The blank-command key needs no special case: `probe_binary("")`
+    # finds nothing on PATH and `os.path.join(dir, "")` is a directory,
+    # so it answers None and the entry is kept. An earlier version
+    # short-circuited it, and a mutation showed the short-circuit
+    # changed no outcome — a guard that cannot fire reads as coverage
+    # to the next person.
     return {
         program: repos
         for program, repos in wanted.items()
-        # A blank program is already known to be unusable; asking
-        # `probe_binary("")` would be asking the filesystem a question
-        # about nothing.
-        if program == "" or probe_binary(program) is None
+        if probe_binary(program) is None
     }
 
 
