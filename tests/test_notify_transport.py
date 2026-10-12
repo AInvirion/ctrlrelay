@@ -33,6 +33,24 @@ import pytest
 import yaml
 
 
+@pytest.fixture(autouse=True)
+def _no_pending_closes_between_tests():
+    """Keep the module-global close set out of the arithmetic.
+
+    Eight cases here read it as `after - before` or assert a ceiling on
+    it, and a real close task left pending when pytest-asyncio closes a
+    per-test loop would otherwise sit in it for the rest of the
+    session.
+    """
+    import ctrlrelay.cli as cli_module
+
+    cli_module._NOTIFY_CLOSE_TASKS.clear()
+    yield
+    for task in list(cli_module._NOTIFY_CLOSE_TASKS):
+        task.cancel()
+    cli_module._NOTIFY_CLOSE_TASKS.clear()
+
+
 def _config(tmp_path: Path, transport: dict) -> object:
     from ctrlrelay.core.config import load_config
 
@@ -86,6 +104,12 @@ def _literal_text(node) -> str | None:
         if left is not None and right is not None:
             return left + right
     return None
+
+
+def _pending_closes() -> list:
+    import ctrlrelay.cli as cli_module
+
+    return [t for t in cli_module._NOTIFY_CLOSE_TASKS if not t.done()]
 
 
 async def _settle(predicate, *, tries: int = 100) -> None:
@@ -227,6 +251,11 @@ class TestEveryFailureSaysSo:
 
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             assert await connect_notify_transport(config) is None
+            # Let the scheduled close run before the set is read.
+            # Without this the assertion below is complete only by
+            # timing: a close that logged something would be missed on
+            # a fast machine and caught on a slow one.
+            await _settle(lambda: not _pending_closes())
         # The whole set, not "connected is absent": an absence
         # assertion here would also pass for a function that logged
         # nothing at all, which is the defect.
@@ -277,6 +306,7 @@ class TestEveryFailureSaysSo:
             caplog.clear()
             with caplog.at_level(logging.INFO, logger="ctrlrelay"):
                 assert await connect_notify_transport(config) is None
+                await _settle(lambda: not _pending_closes())
             lost = [
                 r
                 for r in _ctrlrelay_events(caplog)
@@ -666,11 +696,13 @@ class TestItNeverCostsTheRun:
         how a logging handler raising one of these behaves.
 
         Raised from reading the config rather than from inside the
-        connect: `asyncio.wait_for` runs the connect in a Task, and a
-        Task re-raises `KeyboardInterrupt` through the event loop
-        rather than delivering it to the awaiting frame, so a test
-        written that way exercises the clause unreliably and can take
-        the test runner with it.
+        connect, because a `KeyboardInterrupt` raised inside a coroutine
+        the event loop is driving is not reliably delivered to the
+        awaiting frame and can take the test runner with it. This path
+        has no loop machinery between the raise and the handler. (An
+        earlier version of this docstring explained the choice by
+        saying `wait_for` wraps the coroutine in a Task — true up to
+        3.11, and this project requires 3.12.)
         """
         from ctrlrelay.cli import connect_notify_transport
 
@@ -742,7 +774,9 @@ class TestItNeverCostsTheRun:
         assert built[0].closed, "an interrupted connect left the socket open"
 
     @pytest.mark.asyncio
-    async def test_unfinished_closes_do_not_pile_up(self, monkeypatch) -> None:
+    async def test_unfinished_closes_do_not_pile_up(
+        self, monkeypatch, caplog
+    ) -> None:
         """`SocketTransport.close` can stay suspended in wait_closed().
 
         One retained task per issue, each holding a socket, is a slow
@@ -758,22 +792,36 @@ class TestItNeverCostsTheRun:
             async def close(self) -> None:
                 await asyncio.Event().wait()
 
-        for _ in range(20):
-            _close_notify_transport(_WedgedTransport())
-            await asyncio.sleep(0)
-        assert len(cli_module._NOTIFY_CLOSE_TASKS) <= 4, len(
-            cli_module._NOTIFY_CLOSE_TASKS
-        )
-        for task in list(cli_module._NOTIFY_CLOSE_TASKS):
-            task.cancel()
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            for _ in range(20):
+                _close_notify_transport(_WedgedTransport())
+                await asyncio.sleep(0)
+            # Exactly the ceiling, not merely under it: `<= 4` also
+            # passes for a close that never schedules anything.
+            assert len(cli_module._NOTIFY_CLOSE_TASKS) == 4, len(
+                cli_module._NOTIFY_CLOSE_TASKS
+            )
+            await _settle(
+                lambda: _event_names(caplog).count(
+                    "notify.transport.close_evicted"
+                )
+                >= 16
+            )
+        # 20 scheduled, 4 retained, so 16 were evicted and each one
+        # said so.
+        assert (
+            _event_names(caplog).count("notify.transport.close_evicted") == 16
+        ), _event_names(caplog)
 
-    def test_closing_nothing_is_a_no_op(self) -> None:
+    def test_closing_nothing_is_a_no_op(self, caplog) -> None:
         """Closing `None` does nothing and says nothing.
 
-        This is what lets `handle_issue`'s `finally` be unconditional:
-        it runs on the path where no channel was ever opened too, and
-        the old code's `if connected_transport is not None` around each
-        close is what left one of them behind. It does not exercise
+        This is what lets `handle_issue`'s `finally` be unconditional,
+        so it can also run on the path where no channel was ever
+        opened. The old code's `if connected_transport is not None`
+        around each close was correct whenever the name was set — what
+        leaked was an exception in the statements that sat OUTSIDE the
+        try at all. It does not exercise
         `handle_issue` — `TestTheTransportIsClosedOnEveryPath` is the
         guard that reads that function.
         """
@@ -781,11 +829,14 @@ class TestItNeverCostsTheRun:
         from ctrlrelay.cli import _close_notify_transport
 
         before = set(cli_module._NOTIFY_CLOSE_TASKS)
-        _close_notify_transport(None)
-        # Observed, not merely survived: an empty function would pass a
-        # bare call. Nothing was scheduled, so nothing is pending and
-        # nothing will be reported.
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            _close_notify_transport(None)
+        # Both halves. The task-set assertion alone also passes with the
+        # `None` guard DELETED — `None.close()` raises AttributeError
+        # synchronously, the try around ensure_future swallows it, and
+        # the set is unchanged — so the silence is what discriminates.
         assert set(cli_module._NOTIFY_CLOSE_TASKS) == before
+        assert not _event_names(caplog), _event_names(caplog)
 
 
 class TestCancellationIsPassedOnAndCleanedUp:
@@ -926,7 +977,10 @@ class TestEveryLossPathSaysNotSent:
         was the good case.
         """
         if isinstance(stmt, ast.Raise):
-            return stmt.exc is None
+            # A bare `raise` and `raise e` re-raise the same thing, so
+            # rewriting a handler as `except X as e: raise e` with its
+            # log deleted must not slip past this.
+            return stmt.exc is None or isinstance(stmt.exc, ast.Name)
         if not isinstance(stmt, ast.Return):
             return False
         value = stmt.value
@@ -1088,6 +1142,40 @@ class TestTheTransportIsClosedOnEveryPath:
         assert passed[0].id in targets, (
             f"the finally closes {passed[0].id!r} but the connect was "
             f"assigned to {targets} — the connected transport is leaked"
+        )
+        # And it still holds the same object when the finally runs.
+        # `connected_transport = None` anywhere in the guarded block —
+        # the deferred branch is the tempting place — makes the finally
+        # close None and leak the socket every poll, with every
+        # assertion above green.
+        rebound = [
+            n
+            for stmt in following.body
+            for n in ast.walk(stmt)
+            if (
+                isinstance(n, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == passed[0].id
+                    for t in n.targets
+                )
+            )
+            or (
+                isinstance(n, (ast.AugAssign, ast.AnnAssign))
+                and isinstance(n.target, ast.Name)
+                and n.target.id == passed[0].id
+            )
+            or (
+                isinstance(n, ast.Delete)
+                and any(
+                    isinstance(t, ast.Name) and t.id == passed[0].id
+                    for t in n.targets
+                )
+            )
+        ]
+        assert not rebound, (
+            f"{passed[0].id!r} is reassigned or deleted inside the guarded "
+            f"block at line(s) {[n.lineno for n in rebound]}, so the "
+            "finally may close something other than what was opened"
         )
         # And it is the ONLY close, so no path can close it twice or
         # close it early and go on using it.

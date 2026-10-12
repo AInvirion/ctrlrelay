@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 
 import typer
@@ -297,7 +298,12 @@ _NOTIFY_CONNECT_TIMEOUT_SECONDS = 10
 # Strong references to close() tasks nobody is waiting for. Without
 # this the loop may drop a task mid-close, and the warning for it
 # arrives at interpreter exit with no context.
-_NOTIFY_CLOSE_TASKS: set[asyncio.Task] = set()
+# A dict, not a set: eviction below takes "the oldest", and
+# `next(iter(a_set))` returns an arbitrary member because Task hashing
+# is identity-based. With 31 wedged closes and one healthy close a turn
+# from finishing, a set could cancel the healthy one and keep a wedged
+# one. The values are unused; `dict` is the ordered set this needs.
+_NOTIFY_CLOSE_TASKS: dict[asyncio.Task, None] = {}
 
 # And a ceiling on it, because `SocketTransport.close` can stay
 # suspended in `wait_closed()` against a bridge that stopped reading.
@@ -334,6 +340,15 @@ def _log_quietly(event: str, *, cause: BaseException | None = None, **fields) ->
             except Exception:
                 fields["error"] = "<unprintable>"
         log_event(_logger, event, **fields)
+        return
+    except Exception:
+        pass
+    # Falling through to stderr rather than to nothing. A bare `pass`
+    # here would make a misconfigured handler turn every loss path
+    # silent again — #198's own shape, inside the guard written to
+    # prevent it. Guarded in turn, because stderr can be closed.
+    try:
+        print(f"{event} (structured logging failed)", file=sys.stderr)
     except Exception:
         pass
 
@@ -375,7 +390,7 @@ def _close_notify_transport(transport: Transport | None) -> None:
         )
         return
     _evict_oldest_pending_close()
-    _NOTIFY_CLOSE_TASKS.add(task)
+    _NOTIFY_CLOSE_TASKS[task] = None
     task.add_done_callback(_notify_close_finished)
 
 
@@ -390,7 +405,7 @@ def _evict_oldest_pending_close() -> None:
         oldest = next(iter(_NOTIFY_CLOSE_TASKS), None)
         if oldest is None:
             return
-        _NOTIFY_CLOSE_TASKS.discard(oldest)
+        _NOTIFY_CLOSE_TASKS.pop(oldest, None)
         if not oldest.done():
             oldest.cancel()
             _log_quietly(
@@ -411,7 +426,7 @@ def _notify_close_finished(task: asyncio.Task) -> None:
     there would make this function's own promise, that a close which
     did not finish stays visible, false.
     """
-    _NOTIFY_CLOSE_TASKS.discard(task)
+    _NOTIFY_CLOSE_TASKS.pop(task, None)
     if task.cancelled():
         _log_quietly(
             "notify.transport.close_cancelled",
@@ -1489,12 +1504,16 @@ def poller_start(
         settings = None
         banner_socket = None
         banner_present = False
+        banner_name = "chat"
         try:
             settings = _bridge_socket_settings(config)
             banner_socket = None if settings is None else settings[0]
             banner_present = (
                 banner_socket is not None and banner_socket.exists()
             )
+            # Inside the guard too, so the sentence above is true of
+            # everything below it rather than of most of it.
+            banner_name = config.transport.type.value
         except Exception as e:
             # "I could not look" is its own answer, and must not be
             # reported as "nothing is configured" — that is the same
@@ -1514,7 +1533,7 @@ def poller_start(
                 "not announce issues, pull requests or failures.[/yellow]"
             )
         else:
-            name = config.transport.type.value
+            name = banner_name
             socket_path = banner_socket
             if banner_present:
                 console.print(
