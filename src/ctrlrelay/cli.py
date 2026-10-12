@@ -1,6 +1,8 @@
 """CLI entry point for ctrlrelay."""
 
+import asyncio
 import os
+import sys
 from pathlib import Path
 
 import typer
@@ -11,8 +13,12 @@ from rich.table import Table
 from ctrlrelay import __version__
 from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 from ctrlrelay.core.github import GitHubCLI, GitHubError
+from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier
 from ctrlrelay.core.question_expiry import expire_stale_questions
+from ctrlrelay.transports.base import Transport
+
+_logger = get_logger("cli")
 
 # Startup probe cap. `GitHubCLI` uses 60s for ordinary calls; this one
 # gates daemon startup, so a hung gh must not wedge it indefinitely.
@@ -273,6 +279,307 @@ def _bridge_socket_settings(config) -> tuple[Path, int] | None:
         chat.socket_path.expanduser().resolve(),
         chat.ask_timeout_seconds,
     )
+
+
+# A bound on connecting to the bridge socket. `asyncio.wait_for` is a
+# real upper bound HERE and only here: `SocketTransport.connect` is
+# `open_unix_connection` plus a `create_task` and does nothing with
+# `CancelledError`, so the cancellation `wait_for` issues on timeout is
+# not absorbed. `SocketTransport.close` is the opposite — it wraps its
+# await of the receive task in `except asyncio.CancelledError: pass` —
+# which is why the close below is never awaited at all rather than
+# awaited with a timeout.
+#
+# The wait exists because a notification must not delay a pipeline run.
+# A local socket that takes this long means the bridge is wedged, not
+# busy.
+_NOTIFY_CONNECT_TIMEOUT_SECONDS = 10
+
+# Strong references to close() tasks nobody is waiting for. Without
+# this the loop may drop a task mid-close, and the warning for it
+# arrives at interpreter exit with no context.
+# A dict, not a set: eviction below takes "the oldest", and
+# `next(iter(a_set))` returns an arbitrary member because Task hashing
+# is identity-based. With 31 wedged closes and one healthy close a turn
+# from finishing, a set could cancel the healthy one and keep a wedged
+# one. The values are unused; `dict` is the ordered set this needs.
+_NOTIFY_CLOSE_TASKS: dict[asyncio.Task, None] = {}
+
+# And a ceiling on it, because `SocketTransport.close` can stay
+# suspended in `wait_closed()` against a bridge that stopped reading.
+# One retained task per issue, each holding a socket, is a slow leak on
+# a daemon that runs for days. Over the ceiling the oldest is cancelled
+# — which reports `close_cancelled`, so the leak becomes a log line
+# rather than memory. Generous on purpose: reaching it at all means
+# something is wrong with the bridge, not with the poller.
+_NOTIFY_CLOSE_MAX_PENDING = 32
+
+
+def _log_quietly(event: str, *, cause: BaseException | None = None, **fields) -> None:
+    """``log_event`` that cannot become the reason an issue failed.
+
+    Every loss path in this module ends in a log line, including the
+    handlers. A logging handler that throws — `log_event`'s own
+    docstring warns that a field colliding with a LogRecord attribute
+    raises `KeyError` — would otherwise escape from inside the very
+    handler written to contain failures, and kill the issue rather than
+    the message.
+
+    ``cause`` is the exception itself rather than a formatted string,
+    because formatting it is part of what can fail: a class whose
+    ``__str__`` raises turns ``error=str(e)[:200]`` at the call site
+    into an exception the guard never sees, and on one path into a
+    second scheduled close. Named ``cause`` rather than ``error`` so it
+    cannot collide with the field it produces.
+    """
+    try:
+        if cause is not None:
+            fields["error_type"] = type(cause).__name__
+            try:
+                fields["error"] = str(cause)[:200]
+            except Exception:
+                fields["error"] = "<unprintable>"
+        log_event(_logger, event, **fields)
+        return
+    except Exception:
+        pass
+    # Falling through to stderr rather than to nothing. A bare `pass`
+    # here would make a misconfigured handler turn every loss path
+    # silent again — #198's own shape, inside the guard written to
+    # prevent it. Guarded in turn, because stderr can be closed.
+    try:
+        print(f"{event} (structured logging failed)", file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _close_notify_transport(transport: Transport | None) -> None:
+    """Start closing a notification channel and stop thinking about it.
+
+    Deliberately NOT a coroutine, and deliberately not awaited.
+
+    Nothing downstream needs the socket to be shut before the issue is
+    finished, and every attempt to wait for it correctly was wrong in a
+    new way: `wait_for` waits for the cancellation it issued, which
+    `SocketTransport.close` absorbs; waiting with `asyncio.wait` and
+    abandoning the task leaves an orphan if the caller is itself
+    cancelled mid-wait, and a second close scheduled on top of the
+    first. Three versions, three different leaks, for a result nobody
+    reads.
+
+    Being synchronous is the other half: it is called from a `finally`,
+    and a `finally` with no `await` in it cannot be interrupted by the
+    cancellation that is unwinding the stack.
+
+    A close that throws, or that is cancelled before it finishes, is
+    reported from the done callback — so it stays visible without
+    anybody waiting for it.
+    """
+    if transport is None:
+        return
+    try:
+        task = asyncio.ensure_future(transport.close())
+    except Exception as e:
+        # No running loop (the process is going away and the operating
+        # system reclaims the socket), or a close() that threw before
+        # its first await.
+        _log_quietly(
+            "notify.transport.close_failed",
+            cause=e,
+            detail="notification channel left open; the run is unaffected",
+        )
+        return
+    _evict_oldest_pending_close()
+    _NOTIFY_CLOSE_TASKS[task] = None
+    task.add_done_callback(_notify_close_finished)
+
+
+def _evict_oldest_pending_close() -> None:
+    """Keep the set of unfinished closes bounded.
+
+    Cancelling is enough: the done callback reports it, and
+    `SocketTransport.close` absorbing the cancellation only means the
+    socket may stay open — which the log then says.
+    """
+    while len(_NOTIFY_CLOSE_TASKS) >= _NOTIFY_CLOSE_MAX_PENDING:
+        oldest = next(iter(_NOTIFY_CLOSE_TASKS), None)
+        if oldest is None:
+            return
+        _NOTIFY_CLOSE_TASKS.pop(oldest, None)
+        if not oldest.done():
+            oldest.cancel()
+            _log_quietly(
+                "notify.transport.close_evicted",
+                pending=_NOTIFY_CLOSE_MAX_PENDING,
+                detail="too many unfinished closes; the oldest was dropped "
+                "and its notification channel may be left open",
+            )
+
+
+def _notify_close_finished(task: asyncio.Task) -> None:
+    """Report a close that did not complete, and let go of the task.
+
+    A cancelled close is reported too. `SocketTransport.close` absorbs
+    a cancellation around its await of the receive task and carries on
+    into `wait_closed()`, so a second one arriving there — or the loop
+    shutting down — leaves the socket half-shut. Returning silently
+    there would make this function's own promise, that a close which
+    did not finish stays visible, false.
+    """
+    _NOTIFY_CLOSE_TASKS.pop(task, None)
+    if task.cancelled():
+        _log_quietly(
+            "notify.transport.close_cancelled",
+            detail="notification channel left open; the run is unaffected",
+        )
+        return
+    error = task.exception()
+    if error is None:
+        return
+    _log_quietly(
+        "notify.transport.close_failed",
+        cause=error,
+        detail="notification channel left open; the run is unaffected",
+    )
+
+
+async def connect_notify_transport(config) -> Transport | None:
+    """A connected transport for lane notifications, or ``None``.
+
+    Resolved on every call on purpose. The poller used to build this
+    once at startup behind a single ``socket_path.exists()`` and keep
+    the answer for the life of the process, so losing a boot race to
+    the bridge by a few seconds silenced every issue-lane announcement
+    until somebody restarted the daemon — #198. On alkaturbo the
+    poller's check logged ``mattermost socket not found`` at
+    2026-10-11T20:47:59-0700 and the bridge process started at
+    20:48:02, and the dev lane then said nothing for 24 hours.
+
+    Unit ordering is not the alternative: the unit already declares
+    ``After=ctrlrelay-bridge.service``, and the bridge is
+    ``Type=simple``, so systemd calls it started when the process forks
+    rather than when the socket exists. Any design that trusts one
+    ``exists()`` at startup is racing something it cannot order.
+
+    ``None`` means there is no channel RIGHT NOW, which is a different
+    fact from "nothing needed sending" — so every ``None`` returned
+    here logs an event naming what the operator loses. The original
+    fault's only symptom was an absent message, which is
+    indistinguishable from an uneventful day, and that is why it ran
+    for a day unnoticed rather than being spotted in the log.
+
+    Never raises except to pass on a cancellation or an interpreter-exit
+    signal, and never delays the caller for longer than
+    ``_NOTIFY_CONNECT_TIMEOUT_SECONDS`` — bounded, not instant: a socket
+    that exists and stalls costs the issue that wait. A notification
+    must not fail or hold up a pipeline run, so the whole body is
+    guarded, the connect is bounded, and the close is scheduled rather
+    than awaited. The
+    enclosing ``handle_issue`` is worse off than the old code if this
+    throws: the poller marks an issue seen BEFORE handling it, so an
+    exception here drops the issue permanently instead of losing one
+    message.
+    """
+    candidate: Transport | None = None
+    try:
+        settings = _bridge_socket_settings(config)
+        if settings is None:
+            _log_quietly(
+                "notify.transport.unconfigured",
+                detail=(
+                    "no chat transport configured; this notification is "
+                    "not sent"
+                ),
+            )
+            return None
+
+        socket_path, ask_timeout = settings
+        # `Path.exists()` propagates PermissionError — it swallows only
+        # the not-found family — so a socket under a directory this
+        # process cannot stat raises here.
+        if not socket_path.exists():
+            _log_quietly(
+                "notify.transport.socket_missing",
+                socket_path=str(socket_path),
+                detail="bridge socket absent; this notification is not sent",
+            )
+            return None
+
+        from ctrlrelay.transports import SocketTransport
+
+        candidate = SocketTransport(
+            socket_path, ask_timeout_seconds=ask_timeout
+        )
+        try:
+            await asyncio.wait_for(
+                candidate.connect(),
+                timeout=_NOTIFY_CONNECT_TIMEOUT_SECONDS,
+            )
+        except Exception as e:
+            _log_quietly(
+                "notify.transport.connect_failed",
+                socket_path=str(socket_path),
+                cause=e,
+                detail="bridge did not accept the connection; "
+                "this notification is not sent",
+            )
+            _close_notify_transport(candidate)
+            return None
+
+        _log_quietly(
+            "notify.transport.connected",
+            socket_path=str(socket_path),
+        )
+        return candidate
+
+    except asyncio.CancelledError:
+        # A cancellation is never swallowed — the poller is shutting
+        # down and the caller's own cleanup depends on it propagating.
+        # But `candidate` was created inside a statement that never
+        # completed, so `handle_issue`'s try/finally has not begun and
+        # the only other reference is the connect coroutine this
+        # cancellation is tearing down. Schedule the close and then
+        # propagate.
+        _close_notify_transport(candidate)
+        _log_quietly(
+            "notify.transport.cancelled",
+            detail="shutting down; this notification is not sent",
+        )
+        raise
+
+    except Exception as e:
+        # The catch-all is the point rather than an afterthought. Every
+        # step above can fail in a way nobody enumerated — a config
+        # object that raises on attribute access, an unstattable
+        # directory, a logging handler that throws, an import that
+        # fails under a half-torn-down interpreter — and each of those
+        # would otherwise drop the issue rather than the message.
+        _close_notify_transport(candidate)
+        _log_quietly(
+            "notify.transport.unreadable",
+            cause=e,
+            detail="could not resolve the bridge socket; "
+            "this notification is not sent",
+        )
+        return None
+
+    except BaseException:
+        # SystemExit and KeyboardInterrupt are NOT swallowed — a
+        # process being told to stop should stop — but the candidate is
+        # held only by a statement that never completed, so it is
+        # closed on the way out. `_log_quietly` does not catch these
+        # either, so a logging handler raising one of them lands here.
+        #
+        # It still logs, for the same reason every other exit does: a
+        # reader needs to know a notification went missing. If the
+        # logger is itself the thing raising, the replacement is the
+        # same kind of signal and still stops the process.
+        _close_notify_transport(candidate)
+        _log_quietly(
+            "notify.transport.interrupted",
+            detail="the process is stopping; this notification is not sent",
+        )
+        raise
 
 
 def _get_bridge_pid_file(socket_path: Path) -> Path:
@@ -1177,27 +1484,74 @@ def poller_start(
             bare_repos_dir=config.paths.bare_repos,
         )
 
-        # Set up transport for notifications
-        transport = None
-        settings = _bridge_socket_settings(config)
-        if settings is not None:
-            from ctrlrelay.transports import SocketTransport
-            socket_path, ask_timeout = settings
-            name = config.transport.type.value
-            if socket_path.exists():
-                transport = SocketTransport(
-                    socket_path,
-                    ask_timeout_seconds=ask_timeout,
-                )
+        # Report the notification channel at startup; do not DECIDE it
+        # here. `connect_notify_transport` resolves it per use, and
+        # these lines are a banner, not a gate — the previous version
+        # built the transport once here and a missing socket at that
+        # instant silenced the lane for the whole process (#198).
+        #
+        # The merge watcher, the scheduled secops sweep and the
+        # pending-resume sweeper already resolve theirs at use, and they
+        # kept working through the 24 hours this one was mute. That is
+        # the negative control: the transport, the credentials and
+        # Mattermost were all fine.
+        # Guarded, because the sentence above calls this a banner and a
+        # banner must not be able to stop the daemon. `exists()`
+        # propagates PermissionError and `_bridge_socket_settings`
+        # resolves a path, so both can throw on a config that the
+        # per-notification resolver handles perfectly well.
+        banner_readable = True
+        settings = None
+        banner_socket = None
+        banner_present = False
+        banner_name = "chat"
+        try:
+            settings = _bridge_socket_settings(config)
+            banner_socket = None if settings is None else settings[0]
+            banner_present = (
+                banner_socket is not None and banner_socket.exists()
+            )
+            # Inside the guard too, so the sentence above is true of
+            # everything below it rather than of most of it.
+            banner_name = config.transport.type.value
+        except Exception as e:
+            # "I could not look" is its own answer, and must not be
+            # reported as "nothing is configured" — that is the same
+            # collapse that made the original fault invisible, in a
+            # console line.
+            banner_readable = False
+            console.print(
+                f"[yellow]Could not read the bridge socket setting ({e}). "
+                "Each notification re-checks; see notify.transport.* in "
+                "the log.[/yellow]"
+            )
+        if not banner_readable:
+            pass
+        elif settings is None:
+            console.print(
+                "[yellow]No chat transport configured — the dev lane will "
+                "not announce issues, pull requests or failures.[/yellow]"
+            )
+        else:
+            name = banner_name
+            socket_path = banner_socket
+            if banner_present:
                 console.print(
-                    f"[dim]{name} transport enabled via {socket_path}[/dim]"
+                    f"[dim]{name} transport via {socket_path}[/dim]"
                 )
             else:
+                # Not fatal and no longer sticky: the bridge may still
+                # be starting, and the next notification re-checks. The
+                # wording stops at what this line knows — the socket is
+                # absent now, and the check is re-made per notification.
+                # It cannot promise a later connection will succeed; a
+                # stale socket file from a dead bridge exists and
+                # refuses, which is the connect_failed branch.
+                #
                 console.print(
-                    f"[yellow]{name} socket not found at {socket_path}[/yellow]"
-                )
-                console.print(
-                    "[yellow]Run 'ctrlrelay bridge start' to enable notifications[/yellow]"
+                    f"[yellow]{name} socket not present at {socket_path}. "
+                    "Each notification re-checks, so this resolves itself "
+                    "once the bridge is up.[/yellow]"
                 )
 
         # Track in-flight PR-watch background tasks so they outlive
@@ -1315,41 +1669,50 @@ def poller_start(
                 f"[green]New issue detected:[/green] #{issue_number} in {repo} — {title}"
             )
 
-            # Connect transport for notifications
-            connected_transport = None
-            if transport:
-                try:
-                    await transport.connect()
-                    connected_transport = transport
-                    await transport.send(f"🔔 New issue #{issue_number} in {repo}: {title}")
-                except Exception as e:
-                    console.print(f"[yellow]Transport error: {e}[/yellow]")
-
-            # Find matching repo config
-            repo_configs = [r for r in config.repos if r.name == repo]
-            if not repo_configs:
-                console.print(f"[yellow]No config found for repo {repo}, skipping.[/yellow]")
-                if connected_transport:
-                    await transport.close()
-                return
-
-            repo_config = repo_configs[0]
-
-            # Route by label: task_labels → task pipeline (report-only,
-            # no PR), otherwise dev pipeline. Case-insensitive match on
-            # the issue's label names. exclude_labels was already
-            # applied in poller.poll() so any issue reaching
-            # handle_issue is a candidate.
-            issue_labels = {
-                (lbl.get("name") or "").lower()
-                for lbl in (issue.get("labels") or [])
-            }
-            task_labels_lower = {
-                lbl.lower() for lbl in repo_config.automation.task_labels
-            }
-            is_task = bool(issue_labels & task_labels_lower)
-
+            # Connect a transport for notifications. Resolved now, not
+            # at daemon startup, so a bridge that came up after this
+            # process did is still reachable (#198).
+            connected_transport = await connect_notify_transport(config)
+            # Nothing may sit between that line and this `try`. The old
+            # code reused ONE transport owned by the poller, so an
+            # exception here cost nothing; this one creates a connection
+            # per issue, and an early return or a CancelledError between
+            # the two would leak a socket every poll. The `finally` is
+            # the only close in this function.
             try:
+                if connected_transport is not None:
+                    try:
+                        await connected_transport.send(
+                            f"🔔 New issue #{issue_number} in {repo}: {title}"
+                        )
+                    except Exception as e:
+                        console.print(f"[yellow]Transport error: {e}[/yellow]")
+
+                # Find matching repo config
+                repo_configs = [r for r in config.repos if r.name == repo]
+                if not repo_configs:
+                    console.print(
+                        f"[yellow]No config found for repo {repo}, "
+                        "skipping.[/yellow]"
+                    )
+                    return
+
+                repo_config = repo_configs[0]
+
+                # Route by label: task_labels → task pipeline (report-only,
+                # no PR), otherwise dev pipeline. Case-insensitive match on
+                # the issue's label names. exclude_labels was already
+                # applied in poller.poll() so any issue reaching
+                # handle_issue is a candidate.
+                issue_labels = {
+                    (lbl.get("name") or "").lower()
+                    for lbl in (issue.get("labels") or [])
+                }
+                task_labels_lower = {
+                    lbl.lower() for lbl in repo_config.automation.task_labels
+                }
+                is_task = bool(issue_labels & task_labels_lower)
+
                 if is_task:
                     from ctrlrelay.pipelines.base import failure_text
                     from ctrlrelay.pipelines.task import run_task_issue
@@ -1404,9 +1767,9 @@ def poller_start(
                         "(secops running?) — un-marked for retry next "
                         "poll.[/yellow]"
                     )
-                    if connected_transport:
+                    if connected_transport is not None:
                         try:
-                            await transport.send(
+                            await connected_transport.send(
                                 f"⏳ #{issue_number} in {repo} "
                                 "deferred (repo busy); will retry."
                             )
@@ -1501,25 +1864,25 @@ def poller_start(
                 # Send result notification — best-effort. A failed send
                 # must NOT prevent the merge watcher (spawned above)
                 # from running, so swallow transport errors here.
-                if connected_transport:
+                if connected_transport is not None:
                     try:
                         if result.success:
                             if is_task:
-                                await transport.send(
+                                await connected_transport.send(
                                     f"✅ Task done on #{issue_number} "
                                     f"({repo}): {result.summary}"
                                 )
                             else:
                                 pr_url = result.outputs.get("pr_url", "")
-                                await transport.send(
+                                await connected_transport.send(
                                     f"✅ PR ready: {pr_url}"
                                 )
                         elif result.blocked:
-                            await transport.send(
+                            await connected_transport.send(
                                 f"⏸️ Blocked on #{issue_number}: {result.question}"
                             )
                         else:
-                            await transport.send(
+                            await connected_transport.send(
                                 f"❌ Failed on #{issue_number}: "
                                 f"{failure_text(result)}"
                             )
@@ -1528,8 +1891,10 @@ def poller_start(
                             f"[yellow]Transport error sending result: {e}[/yellow]"
                         )
             finally:
-                if connected_transport:
-                    await transport.close()
+                # Best-effort and bounded: closing a notification
+                # channel must not fail or stall an issue whose work
+                # is already done.
+                _close_notify_transport(connected_transport)
 
         console.print(f"[green]Starting poller[/green] for {len(repo_names)} repo(s) as {username}")
         console.print(f"  Interval: {interval}s | Press Ctrl+C to stop")
