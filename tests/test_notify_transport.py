@@ -88,6 +88,19 @@ def _literal_text(node) -> str | None:
     return None
 
 
+async def _settle(predicate, *, tries: int = 100) -> None:
+    """Give the loop turns until ``predicate`` holds, or run out.
+
+    The close is scheduled rather than awaited, so its effect lands on
+    a later turn. This does not assert — the caller does, so a failure
+    reads as the missing effect rather than as a timeout.
+    """
+    for _ in range(tries):
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+
+
 def _ctrlrelay_events(caplog) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.name.startswith("ctrlrelay")]
 
@@ -411,9 +424,10 @@ class TestItNeverCostsTheRun:
     ) -> None:
         """Catching exceptions does not help with a coroutine that hangs.
 
-        A listening socket whose backlog is saturated leaves
-        `open_unix_connection` pending, and an unbounded await there
-        holds the issue open with no timeout anywhere above it.
+        `asyncio.wait_for` is a real bound here, and only here:
+        `SocketTransport.connect` does nothing with `CancelledError`, so
+        the cancellation the timeout issues is not absorbed. The close
+        side is the opposite and is never awaited at all.
         """
         import ctrlrelay.cli as cli_module
         import ctrlrelay.transports as transports
@@ -423,7 +437,7 @@ class TestItNeverCostsTheRun:
         sock.write_text("placeholder so the existence check passes")
         config = _config(tmp_path, _mattermost(sock))
 
-        built: list[_WedgedTransport] = []
+        built: list[object] = []
 
         class _WedgedTransport:
             def __init__(self, *_a, **_kw) -> None:
@@ -445,26 +459,30 @@ class TestItNeverCostsTheRun:
             result = await asyncio.wait_for(
                 connect_notify_transport(config), timeout=5
             )
-        assert result is None, (
-            "a connect nobody waited for is not a working channel"
-        )
+            assert result is None, (
+                "a connect nobody waited for is not a working channel"
+            )
+            await _settle(lambda: bool(built) and built[0].closed)
+
         events = _event_names(caplog)
-        assert "notify.transport.abandoned" in events
         assert "notify.transport.connect_failed" in events
         assert "notify.transport.connected" not in events
-        # The half-open transport is closed, not left for the garbage
-        # collector. Asserted on the object, because the previous
-        # version of this test asserted only that "connected" was
-        # absent — which stays true with the close deleted.
+        # Asserted on the object. A previous version asserted only that
+        # "connected" was absent, which stays true with the close
+        # deleted.
         assert built, "the resolver never got as far as building one"
         assert built[0].closed, "the abandoned transport was left open"
 
     @pytest.mark.asyncio
-    async def test_a_close_that_raises_does_not_escape(self, caplog) -> None:
+    async def test_a_close_that_raises_is_reported_and_does_not_escape(
+        self, caplog
+    ) -> None:
         """The close is the last thing an issue does.
 
         If it raised, a run whose work was already finished and
-        committed would report as failed.
+        committed would report as failed. The failure is reported from
+        the task's done callback, so it is still visible even though
+        nobody waits for it.
         """
         from ctrlrelay.cli import _close_notify_transport
 
@@ -473,29 +491,52 @@ class TestItNeverCostsTheRun:
                 raise OSError("bridge went away")
 
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
-            await _close_notify_transport(_AngryTransport())
-        assert "notify.transport.close_failed" in _event_names(caplog)
-
-    @pytest.mark.asyncio
-    async def test_a_close_that_hangs_is_bounded(
-        self, monkeypatch, caplog
-    ) -> None:
-        import ctrlrelay.cli as cli_module
-        from ctrlrelay.cli import _close_notify_transport
-
-        class _WedgedTransport:
-            async def close(self) -> None:
-                await asyncio.Event().wait()
-
-        monkeypatch.setattr(cli_module, "_NOTIFY_CLOSE_TIMEOUT_SECONDS", 0.05)
-        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
-            await asyncio.wait_for(
-                _close_notify_transport(_WedgedTransport()), timeout=5
+            _close_notify_transport(_AngryTransport())
+            await _settle(
+                lambda: "notify.transport.close_failed" in _event_names(caplog)
             )
         assert "notify.transport.close_failed" in _event_names(caplog)
 
     @pytest.mark.asyncio
-    async def test_closing_nothing_is_a_no_op(self) -> None:
+    async def test_a_close_that_hangs_does_not_hold_up_the_caller(
+        self, caplog
+    ) -> None:
+        """The reason the close is not awaited at all.
+
+        Waiting for it correctly was wrong three different ways —
+        `wait_for` waits for a cancellation `SocketTransport.close`
+        absorbs, and abandoning the task leaves an orphan if the caller
+        is itself cancelled mid-wait. Nothing downstream needs the
+        socket shut, so this returns before the close has finished.
+        """
+        from ctrlrelay.cli import _close_notify_transport
+
+        entered = asyncio.Event()
+
+        class _WedgedTransport:
+            async def close(self) -> None:
+                entered.set()
+                await asyncio.Event().wait()
+
+        import ctrlrelay.cli as cli_module
+
+        # No await on the call itself: a `finally` with no await in it
+        # cannot be interrupted by the cancellation unwinding the stack.
+        before = set(cli_module._NOTIFY_CLOSE_TASKS)
+        _close_notify_transport(_WedgedTransport())
+        started = set(cli_module._NOTIFY_CLOSE_TASKS) - before
+        assert len(started) == 1, (
+            "the close was not scheduled, so either it ran inline — which "
+            "is what holds up the caller — or it was dropped"
+        )
+        task = started.pop()
+        # It is still running. That is the whole claim: the caller got
+        # its turn back with the close unfinished.
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert not task.done(), "the close finished, so this proves nothing"
+        task.cancel()
+
+    def test_closing_nothing_is_a_no_op(self) -> None:
         """Closing `None` does nothing and says nothing.
 
         This is what lets `handle_issue`'s `finally` be unconditional:
@@ -507,7 +548,7 @@ class TestItNeverCostsTheRun:
         """
         from ctrlrelay.cli import _close_notify_transport
 
-        await _close_notify_transport(None)
+        _close_notify_transport(None)
 
 
 class TestCancellationIsPassedOnAndCleanedUp:
@@ -557,10 +598,7 @@ class TestCancellationIsPassedOnAndCleanedUp:
                 await task
             # The close is scheduled, not awaited, so give the loop a
             # turn to run it.
-            for _ in range(50):
-                if built and built[0].closed:
-                    break
-                await asyncio.sleep(0.01)
+            await _settle(lambda: bool(built) and built[0].closed)
 
         assert built, "the resolver never built a transport"
         assert built[0].closed, "a cancelled connect left the socket open"
@@ -605,15 +643,22 @@ class TestEveryLossPathSaysNotSent:
 
     @staticmethod
     def _loss_event(stmt) -> tuple[str, ast.Call] | None:
-        """``(event_name, call)`` if this statement logs a lost notification."""
-        for node in ast.walk(stmt):
+        """``(event_name, call)`` if this statement logs a lost notification.
+
+        Only a DIRECT statement of the block counts. Walking every
+        descendant accepted a log buried inside an `if`, followed by an
+        unconditional silent `return None` — so the log did not have to
+        run on the path that exited.
+        """
+        if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+            return None
+        for node in (stmt.value,):
             if not (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "log_event"
+                isinstance(node.func, ast.Name)
+                and node.func.id == "_log_quietly"
             ):
                 continue
-            name = node.args[1] if len(node.args) > 1 else None
+            name = node.args[0] if node.args else None
             if not (
                 isinstance(name, ast.Constant) and isinstance(name.value, str)
             ):
@@ -744,36 +789,43 @@ class TestTheTransportIsClosedOnEveryPath:
             "leak the connection"
         )
         assert following.finalbody, "the try has no finally to close it"
-        # A DIRECT statement of the finally, not nested in an `if`:
-        # a conditional close is how the old code left one path open.
+        # A DIRECT statement of the finally, not nested in an `if`: a
+        # conditional close is how the old code left one path open.
+        # Not awaited, either — `_close_notify_transport` is
+        # deliberately synchronous so an unwinding cancellation cannot
+        # interrupt the `finally`.
         closed = [
             stmt
             for stmt in following.finalbody
             if isinstance(stmt, ast.Expr)
-            and isinstance(stmt.value, ast.Await)
-            and isinstance(stmt.value.value, ast.Call)
-            and isinstance(stmt.value.value.func, ast.Name)
-            and stmt.value.value.func.id == "_close_notify_transport"
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Name)
+            and stmt.value.func.id == "_close_notify_transport"
         ]
         assert len(closed) == 1, (
             "the finally must close the transport unconditionally, as one "
             "of its own statements; _close_notify_transport handles None "
             "so no `if` is needed"
         )
-        passed = closed[0].value.value.args
+        passed = closed[0].value.args
         assert len(passed) == 1 and isinstance(passed[0], ast.Name), (
             "the finally closes something other than a plain local name"
         )
-        assigned = {
-            t.id
-            for stmt in body[: i + 1]
-            if isinstance(stmt, ast.Assign)
-            for t in stmt.targets
-            if isinstance(t, ast.Name)
-        }
-        assert passed[0].id in assigned, (
-            f"the finally closes {passed[0].id!r}, which is not what the "
-            "connect was assigned to"
+        # The exact name the connect was assigned to, not merely a name
+        # assigned somewhere earlier: otherwise
+        # `t = None; leaked = await connect(...); finally: close(t)`
+        # satisfies every assertion while leaking `leaked`.
+        connect_stmt = body[i]
+        assert isinstance(connect_stmt, ast.Assign), (
+            "the connect's result is not assigned to anything, so nothing "
+            "can close it"
+        )
+        targets = [
+            t.id for t in connect_stmt.targets if isinstance(t, ast.Name)
+        ]
+        assert passed[0].id in targets, (
+            f"the finally closes {passed[0].id!r} but the connect was "
+            f"assigned to {targets} — the connected transport is leaked"
         )
         # And it is the ONLY close, so no path can close it twice or
         # close it early and go on using it.

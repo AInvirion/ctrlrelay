@@ -280,111 +280,96 @@ def _bridge_socket_settings(config) -> tuple[Path, int] | None:
     )
 
 
-# Bounds on talking to the bridge socket. Both exist because a
-# notification must never fail or stall an issue: `open_unix_connection`
-# on a listening socket with a saturated backlog can stay pending, and
-# `wait_closed` can stay pending against a bridge that has stopped
-# reading. Catching exceptions does not help with a coroutine that
-# never finishes. These are local-socket operations, so a wait of this
-# length means the bridge is wedged, not busy.
+# A bound on connecting to the bridge socket. `asyncio.wait_for` is a
+# real upper bound HERE and only here: `SocketTransport.connect` is
+# `open_unix_connection` plus a `create_task` and does nothing with
+# `CancelledError`, so the cancellation `wait_for` issues on timeout is
+# not absorbed. `SocketTransport.close` is the opposite — it wraps its
+# await of the receive task in `except asyncio.CancelledError: pass` —
+# which is why the close below is never awaited at all rather than
+# awaited with a timeout.
+#
+# The wait exists because a notification must not delay a pipeline run.
+# A local socket that takes this long means the bridge is wedged, not
+# busy.
 _NOTIFY_CONNECT_TIMEOUT_SECONDS = 10
-_NOTIFY_CLOSE_TIMEOUT_SECONDS = 5
 
 # Strong references to close() tasks nobody is waiting for. Without
 # this the loop may drop a task mid-close, and the warning for it
 # arrives at interpreter exit with no context.
-_ABANDONED_NOTIFY_TASKS: set[asyncio.Task] = set()
+_NOTIFY_CLOSE_TASKS: set[asyncio.Task] = set()
 
 
-async def _await_bounded(coro, timeout: float, what: str) -> None:
-    """Wait at most ``timeout`` for ``coro``, then stop waiting.
+def _log_quietly(event: str, **fields) -> None:
+    """``log_event`` that cannot become the reason an issue failed.
 
-    `asyncio.wait_for` is NOT a hard upper bound: on timeout it cancels
-    the inner coroutine and then waits for the cancellation to finish.
-    `SocketTransport.close` contains `except asyncio.CancelledError:
-    pass` around its await of the receive task, so a cancellation
-    delivered there is swallowed and the call carries on into
-    `wait_closed()` — which is the thing that was hanging. `wait_for`
-    would then wait forever for a cancellation that was absorbed.
-
-    `asyncio.wait` returns the still-pending task instead, so this
-    returns on time whatever the coroutine does with cancellation. The
-    abandoned task is cancelled and NOT awaited; it belongs to a
-    notification channel nobody is reading any more, and the alternative
-    is holding up an issue whose work has already finished.
-
-    Raises ``TimeoutError`` when it gave up, so the caller cannot
-    mistake "I stopped waiting" for "it finished".
+    Every loss path in this module ends in a log line, including the
+    handlers. A logging handler that throws — `log_event`'s own
+    docstring warns that a field colliding with a LogRecord attribute
+    raises `KeyError` — would otherwise escape from inside the very
+    handler written to contain failures, and kill the issue rather than
+    the message.
     """
-    task = asyncio.ensure_future(coro)
-    _done, pending = await asyncio.wait({task}, timeout=timeout)
-    if not pending:
-        # It finished. Surface its exception to the caller's handler
-        # rather than leaving it to "never retrieved" at exit.
-        task.result()
-        return
-    task.cancel()
-    _ABANDONED_NOTIFY_TASKS.add(task)
-    task.add_done_callback(_ABANDONED_NOTIFY_TASKS.discard)
-    log_event(
-        _logger,
-        "notify.transport.abandoned",
-        operation=what,
-        timeout_seconds=timeout,
-        detail=f"{what} did not finish in time; abandoned so the run is "
-        "not held up",
-    )
-    # Raised, not returned: a caller that cannot tell "it finished" from
-    # "I stopped waiting" would treat an abandoned connect as a working
-    # channel and hand a half-open transport to the pipeline.
-    raise TimeoutError(f"{what} exceeded {timeout}s and was abandoned")
+    try:
+        log_event(_logger, event, **fields)
+    except Exception:
+        pass
 
 
-def _abandon_notify_transport(transport: Transport | None) -> None:
-    """Close a transport without awaiting it, for a cancellation path.
+def _close_notify_transport(transport: Transport | None) -> None:
+    """Start closing a notification channel and stop thinking about it.
 
-    Used where awaiting is not available or not safe: the task is being
-    cancelled, or the event loop is tearing down. A reference is held
-    until the task finishes so it is not garbage-collected mid-close.
+    Deliberately NOT a coroutine, and deliberately not awaited.
+
+    Nothing downstream needs the socket to be shut before the issue is
+    finished, and every attempt to wait for it correctly was wrong in a
+    new way: `wait_for` waits for the cancellation it issued, which
+    `SocketTransport.close` absorbs; waiting with `asyncio.wait` and
+    abandoning the task leaves an orphan if the caller is itself
+    cancelled mid-wait, and a second close scheduled on top of the
+    first. Three versions, three different leaks, for a result nobody
+    reads.
+
+    Being synchronous is the other half: it is called from a `finally`,
+    and a `finally` with no `await` in it cannot be interrupted by the
+    cancellation that is unwinding the stack.
+
+    A failure is reported from the done callback, so a close that
+    throws is still visible without anybody waiting for it.
     """
     if transport is None:
         return
     try:
         task = asyncio.ensure_future(transport.close())
-    except RuntimeError:
-        # No running loop — the process is going away and the operating
-        # system will reclaim the socket.
-        return
-    _ABANDONED_NOTIFY_TASKS.add(task)
-    task.add_done_callback(_ABANDONED_NOTIFY_TASKS.discard)
-
-
-async def _close_notify_transport(transport: Transport | None) -> None:
-    """Close a notification transport without letting it affect the run.
-
-    Separate from the connect side because the failure costs differ: a
-    connect that fails loses a message, and a close that fails or hangs
-    holds up an issue whose work has already finished. Both are logged;
-    neither is allowed to escape, and a cancellation arriving here is
-    not swallowed — it closes the channel first and then propagates.
-    """
-    if transport is None:
-        return
-    try:
-        await _await_bounded(
-            transport.close(), _NOTIFY_CLOSE_TIMEOUT_SECONDS, "close"
-        )
-    except asyncio.CancelledError:
-        _abandon_notify_transport(transport)
-        raise
     except Exception as e:
-        log_event(
-            _logger,
+        # No running loop (the process is going away and the operating
+        # system reclaims the socket), or a close() that threw before
+        # its first await.
+        _log_quietly(
             "notify.transport.close_failed",
             error_type=type(e).__name__,
             error=str(e)[:200],
             detail="notification channel left open; the run is unaffected",
         )
+        return
+    _NOTIFY_CLOSE_TASKS.add(task)
+    task.add_done_callback(_notify_close_finished)
+
+
+def _notify_close_finished(task: asyncio.Task) -> None:
+    """Report a close that failed, and let go of the task."""
+    _NOTIFY_CLOSE_TASKS.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is None:
+        return
+    _log_quietly(
+        "notify.transport.close_failed",
+        error_type=type(error).__name__,
+        error=str(error)[:200],
+        detail="notification channel left open; the run is unaffected",
+    )
 
 
 async def connect_notify_transport(config) -> Transport | None:
@@ -424,8 +409,7 @@ async def connect_notify_transport(config) -> Transport | None:
     try:
         settings = _bridge_socket_settings(config)
         if settings is None:
-            log_event(
-                _logger,
+            _log_quietly(
                 "notify.transport.unconfigured",
                 detail=(
                     "no chat transport configured; this notification is "
@@ -439,8 +423,7 @@ async def connect_notify_transport(config) -> Transport | None:
         # the not-found family — so a socket under a directory this
         # process cannot stat raises here.
         if not socket_path.exists():
-            log_event(
-                _logger,
+            _log_quietly(
                 "notify.transport.socket_missing",
                 socket_path=str(socket_path),
                 detail="bridge socket absent; this notification is not sent",
@@ -453,14 +436,12 @@ async def connect_notify_transport(config) -> Transport | None:
             socket_path, ask_timeout_seconds=ask_timeout
         )
         try:
-            await _await_bounded(
+            await asyncio.wait_for(
                 candidate.connect(),
-                _NOTIFY_CONNECT_TIMEOUT_SECONDS,
-                "connect",
+                timeout=_NOTIFY_CONNECT_TIMEOUT_SECONDS,
             )
         except Exception as e:
-            log_event(
-                _logger,
+            _log_quietly(
                 "notify.transport.connect_failed",
                 socket_path=str(socket_path),
                 error_type=type(e).__name__,
@@ -468,11 +449,10 @@ async def connect_notify_transport(config) -> Transport | None:
                 detail="bridge did not accept the connection; "
                 "this notification is not sent",
             )
-            await _close_notify_transport(candidate)
+            _close_notify_transport(candidate)
             return None
 
-        log_event(
-            _logger,
+        _log_quietly(
             "notify.transport.connected",
             socket_path=str(socket_path),
         )
@@ -483,12 +463,11 @@ async def connect_notify_transport(config) -> Transport | None:
         # down and the caller's own cleanup depends on it propagating.
         # But `candidate` was created inside a statement that never
         # completed, so `handle_issue`'s try/finally has not begun and
-        # nothing else holds a reference to it. Close it here, without
-        # awaiting, because awaiting inside a cancellation is not
-        # reliable.
-        _abandon_notify_transport(candidate)
-        log_event(
-            _logger,
+        # the only other reference is the connect coroutine this
+        # cancellation is tearing down. Schedule the close and then
+        # propagate.
+        _close_notify_transport(candidate)
+        _log_quietly(
             "notify.transport.cancelled",
             detail="shutting down; this notification is not sent",
         )
@@ -501,9 +480,8 @@ async def connect_notify_transport(config) -> Transport | None:
         # directory, a logging handler that throws, an import that
         # fails under a half-torn-down interpreter — and each of those
         # would otherwise drop the issue rather than the message.
-        _abandon_notify_transport(candidate)
-        log_event(
-            _logger,
+        _close_notify_transport(candidate)
+        _log_quietly(
             "notify.transport.unreadable",
             error_type=type(e).__name__,
             error=str(e)[:200],
@@ -1431,6 +1409,10 @@ def poller_start(
         # propagates PermissionError and `_bridge_socket_settings`
         # resolves a path, so both can throw on a config that the
         # per-notification resolver handles perfectly well.
+        banner_readable = True
+        settings = None
+        banner_socket = None
+        banner_present = False
         try:
             settings = _bridge_socket_settings(config)
             banner_socket = None if settings is None else settings[0]
@@ -1438,15 +1420,19 @@ def poller_start(
                 banner_socket is not None and banner_socket.exists()
             )
         except Exception as e:
-            settings = None
-            banner_socket = None
-            banner_present = False
+            # "I could not look" is its own answer, and must not be
+            # reported as "nothing is configured" — that is the same
+            # collapse that made the original fault invisible, in a
+            # console line.
+            banner_readable = False
             console.print(
                 f"[yellow]Could not read the bridge socket setting ({e}). "
                 "Each notification re-checks; see notify.transport.* in "
                 "the log.[/yellow]"
             )
-        if settings is None:
+        if not banner_readable:
+            pass
+        elif settings is None:
             console.print(
                 "[yellow]No chat transport configured — the dev lane will "
                 "not announce issues, pull requests or failures.[/yellow]"
@@ -1466,6 +1452,7 @@ def poller_start(
                 # It cannot promise a later connection will succeed; a
                 # stale socket file from a dead bridge exists and
                 # refuses, which is the connect_failed branch.
+                #
                 console.print(
                     f"[yellow]{name} socket not present at {socket_path}. "
                     "Each notification re-checks, so this resolves itself "
@@ -1812,7 +1799,7 @@ def poller_start(
                 # Best-effort and bounded: closing a notification
                 # channel must not fail or stall an issue whose work
                 # is already done.
-                await _close_notify_transport(connected_transport)
+                _close_notify_transport(connected_transport)
 
         console.print(f"[green]Starting poller[/green] for {len(repo_names)} repo(s) as {username}")
         console.print(f"  Interval: {interval}s | Press Ctrl+C to stop")
