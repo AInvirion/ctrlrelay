@@ -462,7 +462,7 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
     """
     import shlex
 
-    from ctrlrelay.core.binaries import probe_binary
+    from ctrlrelay.core.binaries import expand_named_file, probe_binary
 
     wanted: dict[str, list[str]] = {}
     for repo in getattr(config, "repos", []) or []:
@@ -488,7 +488,10 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
             wanted.setdefault("", []).append(repo.name)
             continue
 
-        program = argv[0]
+        # `~` expanded first, so a `~/.local/bin/...` command is
+        # answered here instead of falling into the relative branch and
+        # being reported nowhere at all.
+        program = expand_named_file(argv[0])
         # A RELATIVE program with a separator is resolved by `exec`
         # against the CHILD's working directory, which is the repo's
         # worktree. Probing it from the daemon's own directory answers
@@ -531,10 +534,12 @@ def describe_unresolved_reviewer(
     of failures to come.
 
     The program name comes from config and is interpolated into Rich
-    markup, so it is escaped: a name like ``[bold]reviewer`` opens a tag
-    that is never closed and `console.print` raises `MarkupError`,
-    which would turn a missing reviewer into a daemon that will not
-    start.
+    markup, so it is escaped. Measured, because the obvious case is not
+    the dangerous one: Rich tolerates an unclosed ``[bold]``, a stray
+    ``[`` and an unterminated ``[red``. ``[/]`` is what raises
+    ``MarkupError`` — an implicit close with nothing open — and a
+    program name carrying it would turn a missing reviewer into a
+    daemon that will not start.
     """
     shown = ", ".join(sorted(repos)[:3])
     more = "" if len(repos) <= 3 else f" and {len(repos) - 3} more"

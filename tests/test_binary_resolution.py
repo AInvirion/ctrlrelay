@@ -354,6 +354,51 @@ class TestResolveAndSaySo:
         assert not os.path.isabs(got), got
         assert log.events() == []
 
+    def test_a_tilde_path_is_expanded_and_answered_for(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """`exec` never expands `~`; only a shell does.
+
+        So `cli_command: ~/.local/bin/reviewer` could never work as
+        written — and before this it was invisible in both directions:
+        it has a separator so nothing searched elsewhere for it, and it
+        is not absolute so nothing reported the miss either. Total
+        silence, reached by the most natural reaction to reading #197.
+        """
+        from ctrlrelay.core import binaries
+
+        home = tmp_path / "home"
+        target = _executable(home / ".local" / "bin", "thereviewer")
+        monkeypatch.setenv("HOME", str(home))
+
+        log = _Recorder()
+        got = binaries.resolve_binary(
+            os.path.join("~", ".local", "bin", "thereviewer"),
+            logger=log,
+            event_prefix="code_review.binary",
+        )
+        # Expanded, because handing back the literal guarantees the
+        # FileNotFoundError this function exists to prevent.
+        assert got == str(target), got
+        assert log.events() == []
+
+    def test_a_tilde_path_that_is_missing_is_reported(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The other direction: once expanded it is absolute, so it is
+        answerable, so the miss is said out loud."""
+        from ctrlrelay.core import binaries
+
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+        log = _Recorder()
+        asked = os.path.join("~", ".local", "bin", "thereviewer")
+        got = binaries.resolve_binary(
+            asked, logger=log, event_prefix="code_review.binary"
+        )
+        assert got == os.path.expanduser(asked)
+        assert log.events() == ["code_review.binary.unresolved"]
+
     def test_a_relative_operator_path_is_not_claimed_about(
         self, tmp_path: Path, monkeypatch
     ) -> None:
@@ -643,6 +688,39 @@ class TestTheStartupCheck:
         # the usable one is not.
         assert unresolved_review_programs(config) == {missing: ["o/a"]}
 
+    def test_a_tilde_program_is_answered_for_at_startup(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """It used to fall into the relative branch and be skipped.
+
+        Which left an operator who wrote `~/.local/bin/<tool>` in
+        reaction to #197 with exactly #197's silence.
+        """
+        from ctrlrelay.cli import unresolved_review_programs
+        from ctrlrelay.core import binaries
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(binaries, "USER_INSTALL_DIRS", (str(tmp_path),))
+
+        asked = os.path.join("~", ".local", "bin", "thereviewer")
+        config = self._config(
+            tmp_path,
+            [{"name": "o/a", "code_review": {"cli_command": f"{asked} --x"}}],
+        )
+        # Reported under the EXPANDED name, which is what the operator
+        # needs to see: the literal `~/...` is not a path anything will
+        # look for.
+        assert unresolved_review_programs(config) == {
+            os.path.expanduser(asked): ["o/a"]
+        }
+
+        # And the other direction, so this cannot pass for a check that
+        # reports everything.
+        _executable(home / ".local" / "bin", "thereviewer")
+        assert unresolved_review_programs(config) == {}
+
     def test_a_blank_command_is_reported_at_startup(
         self, tmp_path: Path, monkeypatch
     ) -> None:
@@ -858,9 +936,13 @@ class TestWhatTheOperatorIsTold:
         console = Console(file=open(os.devnull, "w"), force_terminal=False)
         try:
             for program in ("[bold]reviewer", "[/]", "rev[iewer", "[red"):
-                _detail, line = describe_unresolved_reviewer(
+                detail, line = describe_unresolved_reviewer(
                     program, ["o/a"]
                 )
+                # The name has to be IN there, or this passes for a
+                # function that returns two empty strings.
+                assert program in detail, (program, detail)
+                assert "o/a" in line, (program, line)
                 # Raises MarkupError if the name was not escaped.
                 console.print(f"[yellow]{line}[/yellow]")
         finally:
@@ -870,6 +952,13 @@ class TestWhatTheOperatorIsTold:
         from ctrlrelay.cli import describe_unresolved_reviewer
 
         _detail, line = describe_unresolved_reviewer(
-            "ghostly", [f"o/r{i}" for i in range(7)]
+            "ghostly", [f"o/r{i}" for i in reversed(range(7))]
         )
         assert "and 4 more" in line, line
+        # WHICH three, not just how many were hidden: the cap is a
+        # `sorted(...)[:3]`, and passing an unsorted list is what shows
+        # the sort is there. An earlier version asserted only the
+        # suffix, so printing all seven and appending it would pass.
+        assert "o/r0, o/r1, o/r2" in line, line
+        for hidden in ("o/r3", "o/r4", "o/r5", "o/r6"):
+            assert hidden not in line, (hidden, line)

@@ -49,6 +49,27 @@ USER_INSTALL_DIRS: tuple[str, ...] = (
 )
 
 
+def expand_named_file(name: str) -> str:
+    """Expand a leading ``~``, and leave everything else alone.
+
+    ``exec`` never expands ``~`` — only a shell does — so a
+    ``cli_command`` of ``~/.local/bin/reviewer`` can never work as
+    written. Worse, before this it was invisible: it has a separator so
+    nothing searched for it elsewhere, and it is not absolute so nothing
+    reported the miss either. Total silence, which is the fault #197 is
+    about, reached by the most natural reaction to reading #197.
+
+    Expanding it is honouring the operator rather than overriding them:
+    ``~`` means their home directory in every shell, and it cannot
+    sensibly mean a file called ``~`` in a git worktree. A relative path
+    WITHOUT a ``~`` is still left exactly as written, because that one
+    genuinely belongs to the child's working directory.
+    """
+    if name.startswith("~"):
+        return os.path.expanduser(name)
+    return name
+
+
 def _search(name: str) -> tuple[str | None, str]:
     """``(where, how)`` for ``name``. The only search in this module.
 
@@ -58,6 +79,7 @@ def _search(name: str) -> tuple[str | None, str]:
     answers can differ if the filesystem changes between them, and the
     second answer was the one being returned.
     """
+    name = expand_named_file(name)
     if os.sep in name or (os.altsep and os.altsep in name):
         # The operator named a file. Report on that file, and do not go
         # looking for something of that name anywhere else.
@@ -92,11 +114,15 @@ def resolve_binary(name: str, *, logger, event_prefix: str) -> str:
     """Where to find ``name``, or ``name`` unchanged.
 
     A name found in one of the fallback directories comes back
-    absolute, which is what this function is for. Everything else comes
-    back exactly as given — including a name found through a RELATIVE
-    ``PATH`` entry, because ``shutil.which`` searched that entry from
-    THIS process's directory while ``exec`` would search it from the
-    child's, and those are two different programs. Handing the name
+    absolute, and so does a bare name found through an absolute
+    ``PATH`` entry — that is ``shutil.which``'s own answer. A leading
+    ``~`` is expanded, because ``exec`` cannot do it.
+
+    What comes back EXACTLY as given is a name found through a RELATIVE
+    ``PATH`` entry, and a relative path the operator wrote.
+    ``shutil.which`` searched a relative ``PATH`` entry from THIS
+    process's directory while ``exec`` would search it from the
+    child's, and those are two different programs — so handing the name
     back leaves that case behaving exactly as it did before.
 
     Returning the bare name on failure is deliberate. The caller then
@@ -112,6 +138,11 @@ def resolve_binary(name: str, *, logger, event_prefix: str) -> str:
     will run in, and both searching elsewhere and re-anchoring it here
     would override them.
     """
+    # Normalised here too, so the `given` branch below returns the
+    # expanded path — `exec` cannot expand `~` itself, so handing back
+    # the literal would guarantee the failure this function exists to
+    # prevent.
+    name = expand_named_file(name)
     found, how = _search(name)
 
     if found is not None:
