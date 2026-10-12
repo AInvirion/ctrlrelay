@@ -334,8 +334,9 @@ def _close_notify_transport(transport: Transport | None) -> None:
     and a `finally` with no `await` in it cannot be interrupted by the
     cancellation that is unwinding the stack.
 
-    A failure is reported from the done callback, so a close that
-    throws is still visible without anybody waiting for it.
+    A close that throws, or that is cancelled before it finishes, is
+    reported from the done callback — so it stays visible without
+    anybody waiting for it.
     """
     if transport is None:
         return
@@ -357,9 +358,21 @@ def _close_notify_transport(transport: Transport | None) -> None:
 
 
 def _notify_close_finished(task: asyncio.Task) -> None:
-    """Report a close that failed, and let go of the task."""
+    """Report a close that did not complete, and let go of the task.
+
+    A cancelled close is reported too. `SocketTransport.close` absorbs
+    a cancellation around its await of the receive task and carries on
+    into `wait_closed()`, so a second one arriving there — or the loop
+    shutting down — leaves the socket half-shut. Returning silently
+    there would make this function's own promise, that a close which
+    did not finish stays visible, false.
+    """
     _NOTIFY_CLOSE_TASKS.discard(task)
     if task.cancelled():
+        _log_quietly(
+            "notify.transport.close_cancelled",
+            detail="notification channel left open; the run is unaffected",
+        )
         return
     error = task.exception()
     if error is None:
@@ -397,9 +410,10 @@ async def connect_notify_transport(config) -> Transport | None:
     indistinguishable from an uneventful day, and that is why it ran
     for a day unnoticed rather than being spotted in the log.
 
-    Never raises except to pass a cancellation on, and never waits
-    unboundedly. A notification must not fail or delay a pipeline run,
-    so the whole body is guarded and both waits are bounded. The
+    Never raises except to pass on a cancellation or an interpreter-exit
+    signal, and never delays the caller. A notification must not fail or
+    hold up a pipeline run, so the whole body is guarded, the connect is
+    bounded, and the close is scheduled rather than awaited. The
     enclosing ``handle_issue`` is worse off than the old code if this
     throws: the poller marks an issue seen BEFORE handling it, so an
     exception here drops the issue permanently instead of losing one
@@ -489,6 +503,24 @@ async def connect_notify_transport(config) -> Transport | None:
             "this notification is not sent",
         )
         return None
+
+    except BaseException:
+        # SystemExit and KeyboardInterrupt are NOT swallowed — a
+        # process being told to stop should stop — but the candidate is
+        # held only by a statement that never completed, so it is
+        # closed on the way out. `_log_quietly` does not catch these
+        # either, so a logging handler raising one of them lands here.
+        #
+        # It still logs, for the same reason every other exit does: a
+        # reader needs to know a notification went missing. If the
+        # logger is itself the thing raising, the replacement is the
+        # same kind of signal and still stops the process.
+        _close_notify_transport(candidate)
+        _log_quietly(
+            "notify.transport.interrupted",
+            detail="the process is stopping; this notification is not sent",
+        )
+        raise
 
 
 def _get_bridge_pid_file(socket_path: Path) -> Path:

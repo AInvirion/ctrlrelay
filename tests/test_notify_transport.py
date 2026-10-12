@@ -363,13 +363,26 @@ class TestTheIssueLaneResolvesAtUse:
                 for inner in ast.walk(node):
                     nested.add(id(inner))
 
+        # Both spellings. An earlier version matched only an
+        # unqualified `SocketTransport(...)`, so
+        # `transports.SocketTransport(...)` in the same place would have
+        # recreated the outage with this assertion green. An alias or a
+        # factory is still out of reach — stated as a limit rather than
+        # implied away.
+        def _names_the_transport(call: ast.Call) -> bool:
+            func = call.func
+            if isinstance(func, ast.Name):
+                return func.id == "SocketTransport"
+            if isinstance(func, ast.Attribute):
+                return func.attr == "SocketTransport"
+            return False
+
         eager = [
             node
             for node in ast.walk(poller_start)
             if id(node) not in nested
             and isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "SocketTransport"
+            and _names_the_transport(node)
         ]
         assert not eager, (
             "SocketTransport is constructed directly in poller_start's "
@@ -563,6 +576,86 @@ class TestItNeverCostsTheRun:
         monkeypatch.setattr(cli_module, "_logger", _AngryLogger())
         assert await connect_notify_transport(config) is None
 
+    @pytest.mark.asyncio
+    async def test_a_close_that_is_cancelled_is_reported(self, caplog) -> None:
+        """A cancelled close left the socket half-shut and said nothing.
+
+        `SocketTransport.close` absorbs a cancellation around its await
+        of the receive task and carries on into `wait_closed()`, so a
+        second one arriving there leaves the socket open. Discarding
+        that case made `_close_notify_transport`'s own promise — that a
+        close which did not finish stays visible — false.
+        """
+        import ctrlrelay.cli as cli_module
+        from ctrlrelay.cli import _close_notify_transport
+
+        entered = asyncio.Event()
+
+        class _SlowTransport:
+            async def close(self) -> None:
+                entered.set()
+                await asyncio.Event().wait()
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            before = set(cli_module._NOTIFY_CLOSE_TASKS)
+            _close_notify_transport(_SlowTransport())
+            task = (set(cli_module._NOTIFY_CLOSE_TASKS) - before).pop()
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            task.cancel()
+            await _settle(
+                lambda: "notify.transport.close_cancelled"
+                in _event_names(caplog)
+            )
+        assert "notify.transport.close_cancelled" in _event_names(caplog)
+        assert task not in cli_module._NOTIFY_CLOSE_TASKS, (
+            "the finished task was not let go of"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_interrupt_propagates_after_closing_and_saying_so(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """KeyboardInterrupt and SystemExit are not swallowed.
+
+        A process being told to stop should stop — but the transport is
+        held only by a statement that never completed, so it has to be
+        closed on the way out, and the operator still needs to know a
+        notification went missing. `_log_quietly` catches `Exception`,
+        not `BaseException`, so this path is reached by a logging
+        handler raising one of these too.
+        """
+        import ctrlrelay.transports as transports
+        from ctrlrelay.cli import connect_notify_transport
+
+        sock = tmp_path / "mm.sock"
+        sock.write_text("placeholder so the existence check passes")
+        config = _config(tmp_path, _mattermost(sock))
+
+        built: list[object] = []
+
+        class _InterruptedTransport:
+            def __init__(self, *_a, **_kw) -> None:
+                self.closed = False
+                built.append(self)
+
+            async def connect(self) -> None:
+                raise KeyboardInterrupt
+
+            async def close(self) -> None:
+                self.closed = True
+
+        monkeypatch.setattr(
+            transports, "SocketTransport", _InterruptedTransport
+        )
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            with pytest.raises(KeyboardInterrupt):
+                await connect_notify_transport(config)
+            await _settle(lambda: bool(built) and built[0].closed)
+
+        assert built and built[0].closed, "the transport was left open"
+        assert "notify.transport.interrupted" in _event_names(caplog)
+
     def test_closing_nothing_is_a_no_op(self) -> None:
         """Closing `None` does nothing and says nothing.
 
@@ -573,9 +666,15 @@ class TestItNeverCostsTheRun:
         `handle_issue` — `TestTheTransportIsClosedOnEveryPath` is the
         guard that reads that function.
         """
+        import ctrlrelay.cli as cli_module
         from ctrlrelay.cli import _close_notify_transport
 
+        before = set(cli_module._NOTIFY_CLOSE_TASKS)
         _close_notify_transport(None)
+        # Observed, not merely survived: an empty function would pass a
+        # bare call. Nothing was scheduled, so nothing is pending and
+        # nothing will be reported.
+        assert set(cli_module._NOTIFY_CLOSE_TASKS) == before
 
 
 class TestCancellationIsPassedOnAndCleanedUp:
@@ -698,18 +797,43 @@ class TestEveryLossPathSaysNotSent:
                 return name.value, node
         return None
 
-    @staticmethod
-    def _is_loss_exit(stmt) -> bool:
+    # The one expression a `return` may carry without being a loss:
+    # the transport that was successfully connected.
+    _SUCCESS_RETURN = "candidate"
+
+    @classmethod
+    def _is_loss_exit(cls, stmt) -> bool:
         """A statement that leaves the function without a channel.
 
-        ``return None`` is the ordinary case; a bare ``raise`` is the
-        cancellation path, which must also say what went unsent.
+        ``return None`` is the ordinary case, a bare ``return`` is the
+        same thing written differently, and a bare ``raise`` is the
+        cancellation and interrupt paths — all three must say what went
+        unsent. Only the one return that hands back the connected
+        transport is exempt, and it is named rather than inferred: any
+        other returned expression fails loudly, because a guard that
+        cannot tell what is being returned must not quietly decide it
+        was the good case.
         """
-        if isinstance(stmt, ast.Return):
-            return isinstance(stmt.value, ast.Constant) and (
-                stmt.value.value is None
+        if isinstance(stmt, ast.Raise):
+            return stmt.exc is None
+        if not isinstance(stmt, ast.Return):
+            return False
+        value = stmt.value
+        if value is None:
+            return True
+        if isinstance(value, ast.Constant):
+            if value.value is None:
+                return True
+            raise AssertionError(
+                f"connect_notify_transport returns {value.value!r}; this "
+                "guard only knows None and the connected transport"
             )
-        return isinstance(stmt, ast.Raise) and stmt.exc is None
+        if isinstance(value, ast.Name) and value.id == cls._SUCCESS_RETURN:
+            return False
+        raise AssertionError(
+            "connect_notify_transport returns an expression this guard "
+            "cannot classify, so go and check the loss paths by hand"
+        )
 
     def test_each_loss_path_logs_before_it_exits(self) -> None:
         resolver = self._resolver()
@@ -866,4 +990,21 @@ class TestTheTransportIsClosedOnEveryPath:
         assert len(closes) == 1, (
             f"{len(closes)} close sites in handle_issue; the finally should "
             "be the only one"
+        )
+        # And nobody reaches past the helper. An earlier version counted
+        # only calls named `_close_notify_transport`, so
+        # `await connected_transport.close()` inside the guarded block
+        # would have double-closed with this assertion green.
+        direct = [
+            n
+            for n in ast.walk(handle_issue)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "close"
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == passed[0].id
+        ]
+        assert not direct, (
+            f"{passed[0].id}.close() is called directly at line(s) "
+            f"{[n.lineno for n in direct]}; the finally closes it too"
         )
