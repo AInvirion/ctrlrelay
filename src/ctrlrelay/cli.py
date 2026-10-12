@@ -518,6 +518,46 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
     }
 
 
+def unreviewed_pr_warning(repo: str, result) -> str | None:
+    """The line to post when a pull request has no review, or ``None``.
+
+    #196: the dev lane logged `code_review.spawn_failed` and carried
+    on. The pull request then had zero reviews and zero comments, which
+    on the forge is indistinguishable from a review that has not run
+    yet — so `AInvirion/zzsites#842` read as finished for forty minutes
+    having never been looked at. A log line nobody is watching is not
+    an announcement.
+
+    Sent as its OWN message rather than appended to the routine "PR
+    ready" line, so it cannot be skimmed past — and the routine line is
+    left exactly as it was, because it already existed and replacing it
+    was not this ticket.
+
+    An ABSENT `review_posted` returns a warning rather than ``None``.
+    The dev lane writes that key on every path, so its absence means
+    something did not report, and rounding "I do not know" towards
+    "reviewed" is the whole defect.
+    """
+    from ctrlrelay.pipelines.dev import REVIEW_NOT_REPORTED, ReviewReport
+
+    outputs = getattr(result, "outputs", None) or {}
+    if "review_posted" not in outputs:
+        report = REVIEW_NOT_REPORTED
+    else:
+        report = ReviewReport(
+            posted=bool(outputs.get("review_posted")),
+            status=str(outputs.get("review_status") or "unknown"),
+            detail=str(outputs.get("review_detail") or ""),
+        )
+
+    if not report.is_failure:
+        return None
+
+    pr_number = outputs.get("pr_number")
+    where = f"{repo}#{pr_number}" if pr_number is not None else repo
+    return f"⚠️ {where} — {report.failure_sentence()}"
+
+
 def describe_unresolved_reviewer(
     program: str, repos: list[str]
 ) -> tuple[str, str]:
@@ -2039,6 +2079,15 @@ def poller_start(
                                 await connected_transport.send(
                                     f"✅ PR ready: {pr_url}"
                                 )
+                                # A second, separate message, and only
+                                # when there is something to say. #196:
+                                # a review that could not run left no
+                                # trace an operator would see.
+                                warning = unreviewed_pr_warning(
+                                    repo, result
+                                )
+                                if warning is not None:
+                                    await connected_transport.send(warning)
                         elif result.blocked:
                             await connected_transport.send(
                                 f"⏸️ Blocked on #{issue_number}: {result.question}"
