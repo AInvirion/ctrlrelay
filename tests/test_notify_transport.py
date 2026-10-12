@@ -536,6 +536,33 @@ class TestItNeverCostsTheRun:
         assert not task.done(), "the close finished, so this proves nothing"
         task.cancel()
 
+    @pytest.mark.asyncio
+    async def test_a_logging_handler_that_throws_does_not_kill_the_issue(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Every loss path ends in a log line, including the handlers.
+
+        So a logger that raises escapes from inside the handler written
+        to contain failures — and kills the issue rather than the
+        message. `log_event`'s own docstring warns that a field
+        colliding with a LogRecord attribute raises `KeyError`, which
+        is how this happens for real.
+
+        Found by mutation: deleting the guard around the logging left
+        all fourteen other cases in this file green.
+        """
+        import ctrlrelay.cli as cli_module
+        from ctrlrelay.cli import connect_notify_transport
+
+        config = _config(tmp_path, _mattermost(tmp_path / "absent.sock"))
+
+        class _AngryLogger:
+            def info(self, *_a, **_kw) -> None:
+                raise KeyError("name")
+
+        monkeypatch.setattr(cli_module, "_logger", _AngryLogger())
+        assert await connect_notify_transport(config) is None
+
     def test_closing_nothing_is_a_no_op(self) -> None:
         """Closing `None` does nothing and says nothing.
 
