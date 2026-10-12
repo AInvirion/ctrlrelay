@@ -786,6 +786,32 @@ class TestWhatTheOperatorIsTold:
         assert "installed" in line
         assert "ghostly" in detail and "ghostly" in line
 
+    def test_an_absolute_path_is_not_described_as_unsearched_for(
+        self,
+    ) -> None:
+        """Only that one path was examined, so say that.
+
+        The bare-name wording — "not found on PATH or in the usual user
+        install directories" — is false for an absolute command,
+        because `_search` deliberately looks nowhere else. And "install
+        it" is the wrong fix: the usual cause is a typo in the path
+        somebody configured.
+
+        Found by mutation: routing an absolute path through the
+        bare-name message left every other case green.
+        """
+        from ctrlrelay.cli import describe_unresolved_reviewer
+
+        detail, line = describe_unresolved_reviewer(
+            "/opt/nope/review", ["o/a"]
+        )
+        assert "not found on PATH" not in detail, detail
+        assert "install" not in line.lower(), line
+        assert "cli_command" in line, line
+        # And it agrees with the reason the runtime path logs for the
+        # same condition.
+        assert "not an executable file" in detail, detail
+
     def test_neither_predicts_the_future(self) -> None:
         """Resolution is re-done per spawn, so "will fail" is unkeepable.
 
