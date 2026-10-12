@@ -820,6 +820,51 @@ class TestTheUnitsCarryTheUserBinDir:
         # an absence assertion over an empty set.
         assert examined == 4, examined
 
+    def test_the_systemd_path_loses_nothing_the_live_unit_carried(
+        self, tmp_path: Path
+    ) -> None:
+        """Setting PATH at all is a narrowing unless it is a superset.
+
+        Before this change the systemd units set no PATH and inherited
+        the user manager's. Measured from a live poller's
+        /proc/<pid>/environ on 2026-10-11, that was:
+
+            /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
+            /bin:/usr/games:/usr/local/games:/snap/bin
+
+        so a fixed list that dropped /snap/bin would break resolution
+        of anything installed by snap on a machine that already worked
+        — trading this bug for a different one.
+
+        Found by mutation: dropping /snap/bin and the games directories
+        left every other case in this file green.
+        """
+        from ctrlrelay.install import render_systemd
+
+        inherited = [
+            "/usr/local/sbin",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/usr/bin",
+            "/sbin",
+            "/bin",
+            "/usr/games",
+            "/usr/local/games",
+            "/snap/bin",
+        ]
+        rendered = render_systemd(workdir=tmp_path)
+        assert rendered, "render_systemd produced no units"
+        for unit in rendered:
+            lines = [
+                ln
+                for ln in unit.content.splitlines()
+                if ln.startswith("Environment=PATH=")
+            ]
+            assert len(lines) == 1, (unit.service, lines)
+            entries = lines[0].split("=", 2)[2].split(":")
+            missing = [d for d in inherited if d not in entries]
+            assert not missing, (unit.service, missing)
+
     def test_launchd_jobs_put_the_user_bin_dir_first(
         self, tmp_path: Path
     ) -> None:
