@@ -642,6 +642,41 @@ class TestTheOutcomeReachesTheCaller:
                 "on the result's field, not through agent-writable outputs"
             )
 
+        # And the stronger property, because renaming the key defeats
+        # the list above: inside `unreviewed_pr_warning`, the ONLY
+        # thing read out of `outputs` is the PR number, which merely
+        # decorates the message. Found by mutation — reading the
+        # report from `outputs["review"]` passed a name-based check.
+        cli_tree = ast.parse(Path(cli_module.__file__).read_text())
+        func = next(
+            n
+            for n in ast.walk(cli_tree)
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "unreviewed_pr_warning"
+        )
+        read_keys = set()
+        for node in ast.walk(func):
+            # `outputs.get("x")` / `(... or {}).get("x")`
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                read_keys.add(node.args[0].value)
+            # `outputs["x"]`
+            elif isinstance(node, ast.Subscript) and isinstance(
+                node.slice, ast.Constant
+            ):
+                read_keys.add(node.slice.value)
+        assert read_keys == {"pr_number"}, (
+            "unreviewed_pr_warning reads "
+            f"{sorted(read_keys)} out of the result; only 'pr_number' "
+            "may come from agent-writable outputs, because the verdict "
+            "must come from the field"
+        )
+
     def test_the_call_site_sets_the_field_with_replace(self) -> None:
         """`replace`, so a field added to PipelineResult later is
         carried by construction rather than reset to its default."""
@@ -682,7 +717,24 @@ class TestTheSafeDefault:
     work rather than losing a message.
     """
 
-    def test_the_default_dominates_every_path_to_the_use(self) -> None:
+    def test_the_default_is_set_and_not_unconditionally_overridden(
+        self,
+    ) -> None:
+        """What a structural guard can claim here, and no more.
+
+        It pins that the default exists, in a block the use is inside,
+        and that nothing between them replaces it as a DIRECT
+        statement. It cannot distinguish a branch that legitimately
+        records an outcome from one that wrongly records
+        `posted=True` — both are conditional assignments and the
+        difference is semantic. Found by mutation: inserting
+        `if result.success: review_report = ReviewReport(posted=True,
+        ...)` passes, and should, because that is the shape every real
+        branch has.
+
+        Closing that would mean driving `run_dev_issue` end to end.
+        Named as a limit rather than left implied.
+        """
         import ctrlrelay.pipelines.dev as dev_module
 
         tree = ast.parse(Path(dev_module.__file__).read_text())
