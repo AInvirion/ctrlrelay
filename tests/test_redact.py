@@ -481,3 +481,32 @@ class TestTheShapesAWorkersStdoutActuallyTakes:
         assert secret not in redact_secrets(f"key is {secret}")
         bare = "sk-" + "y" * 30
         assert bare not in redact_secrets(f"key is {bare}")
+
+
+class TestACredentialInsideAUrl:
+    """`postgres://user:pw@host` has no key, so the key/value rule
+    cannot see it."""
+
+    def test_a_connection_string_password_is_redacted(self) -> None:
+        out = redact_secrets(
+            "DATABASE_URL=postgres://user:s3cr3tpw@db.host:5432/app"
+        )
+        assert "s3cr3tpw" not in out
+
+    def test_a_token_in_a_clone_url_is_redacted(self) -> None:
+        secret = "ghp_" + "a" * 20
+        out = redact_secrets(
+            f"cloning https://x-access-token:{secret}@github.com/o/r"
+        )
+        assert secret not in out
+        # The scheme and the user survive, which is what names the
+        # failure as a clone-auth one.
+        assert "https://x-access-token" in out
+
+    def test_a_url_with_no_password_is_untouched(self) -> None:
+        """The control. Without it, "redact every URL" passes the two
+        tests above and the host — which is diagnostic — is lost."""
+        text = "connecting to postgres://app@db.host:5432/app"
+        assert redact_secrets(text) == text
+        plain = "fetching https://github.com/o/r"
+        assert redact_secrets(plain) == plain

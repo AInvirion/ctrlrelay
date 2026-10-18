@@ -388,6 +388,16 @@ class ClaudeDispatcher:
             raise
 
         elapsed_ms = _elapsed_ms(started)
+        # `or 0` is kept for `SessionResult`, whose `exit_code` is typed
+        # `int` and whose downstream readers predate this change. But a
+        # `None` returncode means the exit status was not obtained, and
+        # the HOOK must not be told 0 for it: `DispatchOutcome.ok` is
+        # `exit_code == 0`, so collapsing None to 0 reports a dispatch
+        # whose status nobody read as a healthy one, resets the failure
+        # run, and clears the alert. That is the "I could not see"
+        # becoming "there was nothing to see" collapse, in the one
+        # expression the whole alert rests on.
+        reported_exit_code = proc.returncode
         exit_code = proc.returncode or 0
         # `errors="replace"`, not a second exception handler. A child
         # emitting invalid UTF-8 raised `UnicodeDecodeError` here —
@@ -454,7 +464,7 @@ class ClaudeDispatcher:
             session_id=session_id,
             repo=repo,
             issue_number=issue_number,
-            exit_code=exit_code,
+            exit_code=reported_exit_code,
             stdout=stdout_text,
             stderr=stderr_text,
         )

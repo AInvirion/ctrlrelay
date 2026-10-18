@@ -418,13 +418,23 @@ class StateDB:
         # changed no outcome, which reads as coverage to the next
         # person.
         scrubbed = redact_secrets(output_tail) if output_tail else None
+        ours = False
         try:
+            # Join a caller's transaction rather than committing it —
+            # the same discipline `_begin_immediate` was corrected to,
+            # and this writer reintroduced the defect by committing
+            # unconditionally. The outcome hook runs mid-pipeline on
+            # the pipeline's own connection, so an unconditional commit
+            # here publishes whatever partial state that pipeline had
+            # open.
+            ours = not self._conn.in_transaction
             cursor = self._conn.execute(
                 "UPDATE sessions SET claude_exit_code = ?, output_tail = ? "
                 "WHERE id = ?",
                 (exit_code, scrubbed, session_id),
             )
-            self._conn.commit()
+            if ours:
+                self._conn.commit()
         except BaseException:
             # A `database is locked` out of the UPDATE or the commit
             # leaves the transaction open, and the caller
@@ -432,8 +442,10 @@ class StateDB:
             # nothing else would close it — leaving this connection
             # holding a write lock on a database the bridge also uses.
             # The same fault the read path had, arriving on an error
-            # path instead of a happy one.
-            if self._conn.in_transaction:
+            # path instead of a happy one. Only our own transaction:
+            # rolling back a caller's would discard work this method
+            # merely joined.
+            if ours and self._conn.in_transaction:
                 self._conn.rollback()
             raise
         return cursor.rowcount > 0
@@ -443,23 +455,35 @@ class StateDB:
     def _ensure_dispatch_health_row(self) -> None:
         """Create the single ``dispatch_health`` row if it is absent.
 
-        **Commits.** An earlier version left this INSERT uncommitted and
-        called it from the read accessors too, which opened a write
-        transaction on a method that only reads. SQLite then held a
-        RESERVED lock for the life of that connection's transaction, and
-        the next writer on ANY other connection to the same file failed
-        with ``database is locked`` — measured: a bare
-        ``dispatch_failure_count()`` on one connection made an ordinary
-        ``INSERT INTO sessions`` on a second one fail. The poller and the
-        bridge both open ``state.db``, so a read-shaped call could have
-        wedged the live relay's whole database. Called from the write
-        paths only, and it commits.
+        **Commits, but only a transaction of its own.** Two faults have
+        lived here and they pull in opposite directions:
+
+        - An early version left this INSERT uncommitted and was called
+          from the READ accessors too, so a method that only reads
+          opened a write transaction. SQLite then held a RESERVED lock
+          for the life of that connection's transaction, and the next
+          writer on ANY other connection to the same file failed with
+          ``database is locked`` — measured: a bare
+          ``dispatch_failure_count()`` on one connection made an
+          ordinary ``INSERT INTO sessions`` on a second one fail. So it
+          has to commit, and the reads must not call it.
+        - A later version committed unconditionally, which publishes a
+          caller's open transaction. The dispatch-outcome hook runs
+          mid-pipeline on the pipeline's own connection, so that is a
+          real caller and not a hypothetical one.
+
+        The flag is therefore captured BEFORE the INSERT. The INSERT
+        itself opens a transaction, so asking afterwards always answers
+        "one is open" and the commit would never run — a guard that
+        cannot fire, in the fix for a guard that fired too often.
         """
+        joined = self._conn.in_transaction
         self._conn.execute(
             "INSERT OR IGNORE INTO dispatch_health "
             "(id, consecutive_failures) VALUES (1, 0)"
         )
-        self._conn.commit()
+        if not joined:
+            self._conn.commit()
 
     def _begin_immediate(self) -> bool:
         """Start a write transaction, taking the lock up front.
@@ -704,12 +728,15 @@ class StateDB:
                 ),
             )
             return False
+        # Same discipline: do not commit a caller's open transaction.
+        ours = not self._conn.in_transaction
         cursor = self._conn.execute(
             "UPDATE dispatch_health SET alert_delivered_at = ? "
             "WHERE id = 1 AND alert_claim_token = ?",
             (int(time.time()), token),
         )
-        self._conn.commit()
+        if ours:
+            self._conn.commit()
         return cursor.rowcount > 0
 
     def get_dispatch_health(self) -> dict[str, Any]:

@@ -414,6 +414,9 @@ class TestPersistDispatchOutcome:
             )
             is False
         )
+        # It TRIED to write. Asserting only the False passes for a
+        # function that never touches the database.
+        db.record_session_outcome.assert_called_once()
 
 
 class SpyTransport:
@@ -1384,3 +1387,63 @@ class TestTheSweepAndTheCounterAgreeOnWhatFailedMeans:
             with pytest.raises(asyncio.CancelledError):
                 await alert_if_sweep_all_failed_guarded(_config(), db, [])
         db.close()
+
+
+class TestAnUnreadExitStatusIsNotReportedAsHealthy:
+    @pytest.mark.asyncio
+    async def test_a_none_returncode_is_reported_as_none(
+        self, tmp_path: Path
+    ) -> None:
+        """`proc.returncode or 0` collapses "not obtained" into 0.
+
+        `DispatchOutcome.ok` is `exit_code == 0`, so that collapse
+        reports a dispatch whose status nobody read as a healthy one —
+        resetting the failure run and clearing the alert. It is the
+        "I could not see" becoming "there was nothing to see" mistake,
+        in the one expression the whole alert rests on.
+        """
+        seen: list[DispatchOutcome] = []
+
+        async def hook(outcome):
+            seen.append(outcome)
+
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"", b"")
+        proc.returncode = None
+        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            await d.spawn_session(
+                session_id="s",
+                prompt="p",
+                working_dir=tmp_path,
+                state_file=tmp_path / "missing.json",
+            )
+        assert len(seen) == 1
+        assert seen[0].exit_code is None
+        assert seen[0].ok is False, (
+            "a dispatch whose exit status was never obtained counted as "
+            "healthy and would have cleared the alert"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_real_zero_is_still_healthy(self, tmp_path: Path) -> None:
+        """The control: distinguishing None from 0 must not make a
+        genuine clean exit look like a failure."""
+        seen: list[DispatchOutcome] = []
+
+        async def hook(outcome):
+            seen.append(outcome)
+
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"", b"")
+        proc.returncode = 0
+        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            await d.spawn_session(
+                session_id="s",
+                prompt="p",
+                working_dir=tmp_path,
+                state_file=tmp_path / "missing.json",
+            )
+        assert seen[0].exit_code == 0
+        assert seen[0].ok is True

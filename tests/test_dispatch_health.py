@@ -392,9 +392,13 @@ class TestAlertMessage:
         text = run_failures(DispatchHealth(state_db, threshold=1), 1)[0].message()
         assert "credential" in text
         assert "journalctl" in text
-        # And it says it will not nag, so a reader does not wait for a
-        # second one as confirmation.
-        assert "not be repeated" in text
+        # And it says what to expect next, so a reader does not wait
+        # for a second message as confirmation. The wording has to
+        # match what the code DOES: a failed delivery is retried once
+        # the lease expires, so "this will not be repeated until a
+        # dispatch succeeds" was false of its own implementation.
+        assert "one message per outage" in text
+        assert "retried only if this one did not reach you" in text
 
     def test_the_sweep_message_says_every_repo_failed(self, state_db) -> None:
         health = DispatchHealth(state_db, threshold=3)

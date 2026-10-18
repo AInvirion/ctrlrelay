@@ -138,6 +138,10 @@ class TestReconcileClaimOnFailure:
             exit_code=1,
         )
         assert wrote is False
+        # It TRIED. Asserting only `wrote is False` passes for a
+        # function that never calls GitHub at all, which is the
+        # opposite defect wearing the shape of success.
+        github.comment_on_issue.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_a_cancellation_still_propagates(self) -> None:

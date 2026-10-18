@@ -158,6 +158,14 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | object], ...] = (
         ),
         "-----BEGIN PRIVATE KEY----- [redacted] -----END PRIVATE KEY-----",
     ),
+    # A password inside a connection string: `postgres://user:pw@host`.
+    # The scheme, the user and the host are kept — those are the
+    # diagnosis — and only the password goes. Named because this shape
+    # is invisible to the key/value rule below: there is no key.
+    (
+        re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+):[^\s/@]+@"),
+        r"\1:" + REDACTION + "@",
+    ),
     # `Authorization: Bearer <...>` and `Basic <...>`. The scheme is
     # kept; the credential is not.
     #

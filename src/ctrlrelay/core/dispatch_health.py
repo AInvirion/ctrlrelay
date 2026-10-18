@@ -104,7 +104,9 @@ class DispatchAlert:
             "seconds — then `journalctl --user -u ctrlrelay-poller` and the "
             "`claude_exit_code` / `output_tail` columns on the `sessions` "
             "table for the cause.\n"
-            "This will not be repeated until a dispatch succeeds."
+            "You will not be told again while this keeps failing — one "
+            "message per outage, retried only if this one did not reach "
+            "you."
         )
 
 
