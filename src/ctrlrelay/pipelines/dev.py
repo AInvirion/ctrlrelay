@@ -23,7 +23,11 @@ from ctrlrelay.core.pr_verifier import PRVerifier, VerificationResult
 from ctrlrelay.core.state import StateDB
 from ctrlrelay.core.worktree import WorktreeManager
 from ctrlrelay.dashboard.client import DashboardClient, EventPayload
-from ctrlrelay.pipelines.base import PipelineContext, PipelineResult
+from ctrlrelay.pipelines.base import (
+    PipelineContext,
+    PipelineResult,
+    failure_text,
+)
 from ctrlrelay.transports.base import Transport
 
 DEFAULT_MAX_FIX_ATTEMPTS = 3
@@ -215,6 +219,154 @@ AGENT_CLAIM_COMMENT = (
     f"{AGENT_CLAIM_MARKER}"
 )
 
+# The claim above is posted BEFORE the worker starts, and that stays:
+# it is what stops two workers taking one issue. #204 is about the other
+# end of it. On `AInvirion/zzsites#853` the claim went up two seconds
+# before the worker started, the worker exited 1 four seconds later, and
+# the beta tester's own ticket said a pull request was coming for
+# EIGHTEEN HOURS. It was noticed only because a person went looking for
+# the pull request and could not find it.
+#
+# From outside the machine the issue is the only visible surface, and
+# `ctrlrelay:auto` + a claim comment + no branch is indistinguishable
+# from work in progress. A reader cannot tell a dispatch that is running
+# from one that died in four seconds.
+#
+# A marker of its own so a later run — or a person — can find the
+# retraction, the same way `AGENT_CLAIM_MARKER` is findable. The claim
+# comment is NOT deleted: deleting it would lose the record that the
+# issue was taken, and `format_issue_comments` already drops both
+# markers from the prompt so neither becomes agent input.
+AGENT_OUTCOME_MARKER = "<!-- ctrlrelay:dispatch-failed -->"
+
+# Every marker that identifies a comment the relay wrote itself. Read by
+# `format_issue_comments` so none of our own prose is ever fed back to an
+# agent as though an operator had written it. One tuple, so adding a
+# marker is one edit rather than one edit plus remembering this filter.
+OUR_COMMENT_MARKERS = (AGENT_CLAIM_MARKER, AGENT_OUTCOME_MARKER)
+
+
+def claim_failure_comment(
+    session_id: str,
+    *,
+    reason: str,
+    exit_code: int | None,
+    pr_number: int | None = None,
+) -> str:
+    """The comment that reconciles the claim with a failed outcome.
+
+    Names the session id and the exit code because those are what
+    make the row in `sessions` findable afterwards, and says plainly
+    whether a pull request exists — a run that opened one and then
+    failed to finish verifying it is a different situation for the
+    reader than one that produced nothing, and the claim comment is
+    equally wrong about both.
+
+    Ends in what happens next. A retraction that only says "it
+    failed" leaves a reader with the same question they started with.
+    """
+    if pr_number is not None:
+        opening = (
+            f"⚠️ **CTRLRelay did not finish this run.** Pull request "
+            f"#{pr_number} was opened but the run ended before handover, "
+            "so the claim above is out of date."
+        )
+        next_step = (
+            f"Review PR #{pr_number} on its own merits — it is not "
+            "waiting on anything from this relay."
+        )
+    else:
+        opening = (
+            "⚠️ **CTRLRelay did not finish this run, and no pull request "
+            "was opened.** The claim above is out of date — nothing is "
+            "working on this issue."
+        )
+        next_step = (
+            "This issue is free to pick up. Re-assign it (or re-apply the "
+            "automation label) to have the relay try again."
+        )
+
+    exit_line = (
+        f"- Agent exit code: `{exit_code}`"
+        if exit_code is not None
+        else "- Agent exit code: not recorded (the worker never started)"
+    )
+
+    return (
+        f"{opening}\n\n"
+        f"- Session: `{session_id}`\n"
+        f"{exit_line}\n"
+        f"- Reason: {reason}\n\n"
+        f"{next_step}\n\n"
+        f"{AGENT_OUTCOME_MARKER}"
+    )
+
+
+async def reconcile_claim_on_failure(
+    github: GitHubCLI,
+    *,
+    repo: str,
+    issue_number: int,
+    session_id: str,
+    reason: str,
+    exit_code: int | None,
+    pr_number: int | None = None,
+    claim_posted: bool = True,
+) -> bool:
+    """Post the retraction. Returns whether a comment was written.
+
+    Best-effort by construction: this runs on a path that is already
+    failing, and a `gh` call that throws here must not replace the
+    pipeline's own failure with a different one — the caller would then
+    report the wrong cause for the run. Every exception is logged and
+    swallowed; a cancellation propagates.
+
+    ``claim_posted=False`` skips the write. There is nothing to retract
+    when no claim was ever made, and a bare "this failed" comment on an
+    issue the relay never touched is noise on somebody else's ticket.
+    The default is ``True`` because every current caller reaches this
+    only after the claim block has run.
+    """
+    if not claim_posted:
+        return False
+    try:
+        await github.comment_on_issue(
+            repo=repo,
+            issue_number=issue_number,
+            body=claim_failure_comment(
+                session_id,
+                reason=reason,
+                exit_code=exit_code,
+                pr_number=pr_number,
+            ),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # Logged loudly: the whole point of the ticket is that an
+        # unretracted claim is invisible, so a retraction that failed
+        # silently would reproduce it exactly.
+        log_event(
+            _logger,
+            "dev.claim.retraction_failed",
+            session_id=session_id,
+            repo=repo,
+            issue_number=issue_number,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        return False
+    log_event(
+        _logger,
+        "dev.claim.retracted",
+        session_id=session_id,
+        repo=repo,
+        issue_number=issue_number,
+        exit_code=exit_code,
+        pr_number=pr_number,
+    )
+    return True
+
 # Discussion budget for the prompt. Newest comments are kept because a
 # redirect is far likelier to be the latest word than the first reply,
 # and each body is clipped so one pasted log dump can't crowd out the
@@ -241,16 +393,23 @@ def format_issue_comments(
     so the agent spent a full session building the plan that had already
     been rejected in writing.
 
-    Drops our own claim comment — it is our noise, not the operator's.
+    Drops our own claim comment, and the failure retraction that #204
+    added beside it — both are our noise, not the operator's, and the
+    retraction is the more harmful of the two to leave in: a resumed
+    or retried agent would read "CTRLRelay did not finish this run" as
+    operator guidance about the work it is being asked to do.
     Keeps the newest ``max_comments`` but renders them oldest-first so
     the thread still reads in order.
     """
     if not comments:
         return "_No comments._"
 
+    # Checked against the tuple rather than two `not in` clauses, so a
+    # third marker added later is dropped by adding it to the tuple
+    # instead of by remembering to extend a boolean expression.
     kept = [
         c for c in comments
-        if AGENT_CLAIM_MARKER not in (c.get("body") or "")
+        if not any(m in (c.get("body") or "") for m in OUR_COMMENT_MARKERS)
     ]
     if not kept:
         return "_No comments._"
@@ -564,6 +723,13 @@ printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
             session_id=result.session_id,
             summary="Failed",
             error=result.state.error,
+            # #204: carried here too. An agent that writes a FAILED
+            # checkpoint and exits non-zero is a different fault from
+            # one that writes FAILED and exits 0, and this branch used
+            # to drop the number that tells them apart — so the
+            # operator-facing text said "exit code not recorded" about
+            # a run whose exit code was right there.
+            exit_code=result.exit_code,
         )
 
 
@@ -968,6 +1134,15 @@ async def run_dev_issue(
     # wins over this snapshot.
     branch_existed_before = True
 
+    # Whether a claim comment stands on the issue, and therefore
+    # whether there is anything for the failure path to reconcile
+    # (#204). Set once the claim block below has run — either because
+    # this call posted the comment or because a previous attempt's
+    # marker was already there. Starts False so the early failures
+    # (lock contention, an unreadable issue) do not comment on an
+    # issue the relay never claimed.
+    claim_posted = False
+
     try:
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
@@ -986,6 +1161,12 @@ async def run_dev_issue(
                 issue_number=issue_number,
                 body=AGENT_CLAIM_COMMENT,
             )
+        # True in both branches: a claim left by a previous attempt is
+        # just as stale as one this call posted, and the reader of the
+        # issue cannot tell them apart. Set AFTER the await, so a
+        # `comment_on_issue` that raised does not leave us claiming to
+        # have posted something.
+        claim_posted = True
 
         # Issue #51: ownership is signaled by ``created_fresh`` returned
         # from create_worktree_with_new_branch. True when this call
@@ -1329,6 +1510,32 @@ async def run_dev_issue(
                 ):
                     await worktree.delete_branch(repo, branch_name)
 
+        # Reconcile the claim with the outcome (#204). BLOCKED is not a
+        # failure — the operator is being asked something and the claim
+        # is still true — and success speaks for itself through the
+        # announcement. Only a run that ended without finishing leaves
+        # the claim saying something false.
+        if not result.success and not result.blocked:
+            pr_raw = result.outputs.get("pr_number")
+            try:
+                pr_for_comment = None if pr_raw is None else int(pr_raw)
+            except (TypeError, ValueError):
+                # A non-numeric pr_number comes from the agent's own
+                # checkpoint `outputs`, so it is untrusted input. Report
+                # it as absent rather than letting a crash here replace
+                # the run's real failure.
+                pr_for_comment = None
+            await reconcile_claim_on_failure(
+                github,
+                repo=repo,
+                issue_number=issue_number,
+                session_id=session_id,
+                reason=failure_text(result),
+                exit_code=result.exit_code,
+                pr_number=pr_for_comment,
+                claim_posted=claim_posted,
+            )
+
         return result
 
     except Exception as e:
@@ -1409,6 +1616,26 @@ async def run_dev_issue(
                         await worktree.delete_branch(repo, branch_name)
                     except Exception:
                         pass
+
+        # Same reconciliation as the normal failure path. This branch is
+        # the one that actually ran on `zzsites#853`'s sibling faults —
+        # an exception out of the worktree or `gh` layer leaves the claim
+        # standing just as surely as a non-zero exit does, and it is
+        # reached by more causes.
+        #
+        # No exit code is available here: the exception came from
+        # somewhere other than the child's return value, so reporting a
+        # number would mean inventing one. `None` prints as "not
+        # recorded", which is the truth.
+        await reconcile_claim_on_failure(
+            github,
+            repo=repo,
+            issue_number=issue_number,
+            session_id=session_id,
+            reason=f"{type(e).__name__}: {str(e)[:200]}",
+            exit_code=None,
+            claim_posted=claim_posted,
+        )
 
         return PipelineResult(
             success=False,

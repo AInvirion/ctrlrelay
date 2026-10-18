@@ -543,6 +543,13 @@ printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
             session_id=result.session_id,
             summary="Failed",
             error=result.state.error,
+            # #204: carried here too. An agent that writes a FAILED
+            # checkpoint and exits non-zero is a different fault from
+            # one that writes FAILED and exits 0, and this branch used
+            # to drop the number that tells them apart — so the
+            # operator-facing text said "exit code not recorded" about
+            # a run whose exit code was right there.
+            exit_code=result.exit_code,
         )
 
 

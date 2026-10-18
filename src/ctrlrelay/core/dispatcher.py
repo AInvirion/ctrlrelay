@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -50,6 +51,49 @@ def _find_claude() -> str:
     return resolve_binary(
         "claude", logger=_logger, event_prefix="dispatcher.binary"
     )
+
+
+@dataclass(frozen=True)
+class DispatchOutcome:
+    """What one spawn did, handed to the outcome hook (#204).
+
+    Reported from the dispatcher rather than from each pipeline on
+    purpose. Three lanes spawn workers (dev, task, secops) and resumes
+    and fix rounds spawn more, so recording the outcome at the call
+    sites means a lane added later is silently exempt — and "silently
+    exempt" is precisely how a two-day outage went unreported. Here
+    every spawn is covered by construction.
+
+    ``exit_code`` is ``None`` when the child never started (the binary
+    could not be exec'd), which is a dispatch failure with no exit
+    code rather than a dispatch that succeeded. ``-1`` is the existing
+    convention for a timeout.
+    """
+
+    session_id: str
+    repo: str | None
+    issue_number: int | None
+    exit_code: int | None
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        """True only for a child that ran and exited 0.
+
+        Says nothing about whether the work succeeded — an agent can
+        exit 0 having written no checkpoint (#174). The question this
+        answers is narrower and is the one the alert needs: can this
+        relay still run a worker at all.
+        """
+        return self.exit_code == 0
+
+
+# An async callback invoked once per spawn. It must not raise and must
+# not block for long; the dispatcher guards it anyway, because a
+# notification that breaks a pipeline is worse than a notification
+# nobody gets.
+DispatchOutcomeHook = Callable[[DispatchOutcome], Awaitable[None]]
 
 
 @dataclass
@@ -94,6 +138,14 @@ class ClaudeDispatcher:
     claude_binary: str = field(default_factory=_find_claude)
     default_timeout: int = 1800
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Called once per spawn with a :class:`DispatchOutcome`. ``None``
+    # means nothing records dispatch health for this dispatcher, which
+    # is right for the one-shot `ctrlrelay dev`/`secops` commands an
+    # operator is watching and wrong for the daemon.
+    # `make_agent_dispatcher` takes it as a REQUIRED keyword so every
+    # construction site has to say which of those it is, rather than
+    # inheriting the pre-#204 silence by omission.
+    outcome_hook: DispatchOutcomeHook | None = None
 
     def __post_init__(self) -> None:
         # Only auto-resolve the bare default. Absolute paths, relative paths
@@ -102,6 +154,51 @@ class ClaudeDispatcher:
         if self.claude_binary == "claude":
             resolved = shutil.which("claude")
             self.claude_binary = resolved or _find_claude()
+
+    async def _report_outcome(
+        self,
+        *,
+        session_id: str,
+        repo: str | None,
+        issue_number: int | None,
+        exit_code: int | None,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        """Hand the outcome to the hook, swallowing anything it throws.
+
+        Guarded rather than trusted. The hook writes to the state
+        database and may post to a chat transport, and both can fail in
+        ways nobody enumerated — but a dispatch that already ran must
+        not be turned into an exception by the code that reports on it.
+        A cancellation still propagates: the daemon is shutting down and
+        the caller's own cleanup depends on it.
+        """
+        if self.outcome_hook is None:
+            return
+        try:
+            await self.outcome_hook(
+                DispatchOutcome(
+                    session_id=session_id,
+                    repo=repo,
+                    issue_number=issue_number,
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _logger.error(
+                "dispatcher.outcome_hook_failed",
+                extra={
+                    "session_id": session_id,
+                    "repo": repo,
+                    "error_type": type(e).__name__,
+                    "error": str(e)[:200],
+                },
+            )
 
     async def spawn_session(
         self,
@@ -180,6 +277,20 @@ class ClaudeDispatcher:
                     "error": str(e)[:200],
                 },
             )
+            # A binary that cannot be exec'd fails every dispatch
+            # identically, so a run of these is exactly the outage the
+            # alert exists for — reported before the raise, with no
+            # exit code, because the child never ran. #197's startup
+            # probe catches the common cause at boot; this catches it
+            # when the binary disappears mid-day.
+            await self._report_outcome(
+                session_id=session_id,
+                repo=repo,
+                issue_number=issue_number,
+                exit_code=None,
+                stdout="",
+                stderr=f"{type(e).__name__}: {e}",
+            )
             raise
 
         try:
@@ -197,6 +308,14 @@ class ClaudeDispatcher:
                     "timeout": timeout,
                     "elapsed_ms": _elapsed_ms(started),
                 },
+            )
+            await self._report_outcome(
+                session_id=session_id,
+                repo=repo,
+                issue_number=issue_number,
+                exit_code=-1,
+                stdout="",
+                stderr=f"Session timed out after {timeout}s",
             )
             return SessionResult(
                 session_id=session_id,
@@ -280,6 +399,15 @@ class ClaudeDispatcher:
             stdout_len=len(stdout_text),
         )
 
+        await self._report_outcome(
+            session_id=session_id,
+            repo=repo,
+            issue_number=issue_number,
+            exit_code=exit_code,
+            stdout=stdout_text,
+            stderr=stderr_text,
+        )
+
         return SessionResult(
             session_id=session_id,
             exit_code=exit_code,
@@ -343,18 +471,31 @@ class AgentAdapter(Protocol):
         ...
 
 
-def make_agent_dispatcher(agent_config: "AgentConfig") -> AgentAdapter:
+def make_agent_dispatcher(
+    agent_config: "AgentConfig",
+    *,
+    outcome_hook: DispatchOutcomeHook | None,
+) -> AgentAdapter:
     """Build an adapter for the configured ``agent.type``.
 
     Raises :class:`NotImplementedError` with a clear error message if
     the configured type has no adapter — makes a typo surface loudly
     at daemon startup instead of silently falling back to Claude.
+
+    ``outcome_hook`` is a REQUIRED keyword that may be explicitly
+    ``None``. It carries #204's correctness — without it nothing
+    notices a run of failed dispatches — and an optional parameter
+    whose default is the pre-fix behaviour is a silent opt-out that
+    reads as an ordinary call. Making it required hands the
+    enumeration of call sites to the interpreter and the suite instead
+    of to whoever remembers.
     """
     t = agent_config.type
     if t == "claude":
         return ClaudeDispatcher(
             claude_binary=agent_config.binary,
             default_timeout=agent_config.default_timeout_seconds,
+            outcome_hook=outcome_hook,
         )
     raise NotImplementedError(
         f"agent.type={t!r} has no adapter yet. Implement one that "

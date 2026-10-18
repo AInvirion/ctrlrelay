@@ -1,0 +1,222 @@
+"""Consecutive-dispatch-failure alerting.
+
+#204: between 2026-10-17 06:00 and 2026-10-18 06:05 PDT every dispatch
+this relay made exited non-zero — 163 of them, across every repo in the
+scope list and both the secops and dev lanes — and nothing told anybody.
+Both systemd units stayed ``active (running)`` throughout and the daily
+sweeps kept firing on schedule, so a two-day fleet-wide outage of
+everything the tool does was indistinguishable from a quiet week.
+
+#198 fixed the case where the notification transport is missing. This is
+the other half: the transport is fine and **nothing asks it to say
+anything**.
+
+What this module is careful about, in order of how much it cost to learn:
+
+- **One message, not one per repo.** The sweep already fans out a line
+  per failing repo, and 88 of those is how an operator learns to skim
+  the channel. The alert here is about the relay, so it is sent once.
+- **No re-send until a success intervenes.** #200 measured the opposite
+  shape on this very deployment: an expired question re-asked unchanged
+  every morning, one approval asked **thirteen times** over a fortnight,
+  which trained its reader to skip the channel — so the questions that
+  were *not* repeats went unanswered too. A daily "still broken" is that
+  bug with a different payload.
+- **The latch has to be able to re-arm.** A dedup that never clears is a
+  guard that fires once in the lifetime of a database, and the next
+  outage is silent again. A success clears it, which is also the only
+  event that means the relay recovered.
+- **An all-failed sweep needs at least one repo in it.** `0 of 0 failed`
+  satisfies "every repo failed" arithmetically. A zero-repo sweep is an
+  empty answer sheet, not an outage, and alerting on one would make the
+  alert fire on a config with no repos — see the fleet rule about a wait
+  loop that cannot tell an empty result from a complete one.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from ctrlrelay.core.obs import get_logger, log_event
+
+if TYPE_CHECKING:
+    from ctrlrelay.core.state import StateDB
+
+_logger = get_logger("core.dispatch_health")
+
+# Reasons, as they appear on the alert and in the log event.
+REASON_CONSECUTIVE = "consecutive_failures"
+REASON_SWEEP_ALL_FAILED = "sweep_all_failed"
+
+
+@dataclass(frozen=True)
+class DispatchAlert:
+    """One operator-facing alert about the relay itself.
+
+    ``consecutive`` is the run length at the moment the alert was
+    raised, and ``threshold`` the configured trip point, so the message
+    can say which rule fired rather than asserting a severity.
+    """
+
+    reason: str
+    consecutive: int
+    threshold: int
+    detail: str
+
+    def message(self) -> str:
+        """The line to post on the chat transport.
+
+        Ends in what to do. A warning with no action in it is a shrug,
+        and a shrug in a channel that already carries routine sweep
+        chatter is read as routine sweep chatter.
+        """
+        if self.reason == REASON_SWEEP_ALL_FAILED:
+            headline = (
+                f"🚨 CTRLRelay: every repo failed in one sweep "
+                f"({self.detail})."
+            )
+        else:
+            headline = (
+                f"🚨 CTRLRelay: {self.consecutive} dispatches in a row have "
+                f"failed (threshold {self.threshold}). {self.detail}"
+            )
+        return (
+            f"{headline}\n"
+            "Nothing is being worked until this clears. Check the agent "
+            "credential first — an expired one exits non-zero in about two "
+            "seconds — then `journalctl --user -u ctrlrelay-poller` and the "
+            "`claude_exit_code` / `output_tail` columns on the `sessions` "
+            "table for the cause.\n"
+            "This will not be repeated until a dispatch succeeds."
+        )
+
+
+class DispatchHealth:
+    """Tracks the dispatch failure run and decides when to alert.
+
+    The run length lives in the state database rather than in memory on
+    purpose: the poller restarts (redeploys, reboots, a `systemctl
+    restart`), and an in-memory counter would reset the run to zero
+    every time — so a relay that is broken *because* it keeps being
+    restarted is exactly the one that would never reach the threshold.
+    It also means the latch survives, so a restart loop cannot re-send
+    the same alert on every boot.
+
+    ``threshold`` is required and has no default. A default here would
+    be a second place for the trip point to be configured, and the one
+    callers forgot to pass would silently keep the old no-alert
+    behaviour.
+    """
+
+    __slots__ = ("state_db", "threshold")
+
+    def __init__(self, state_db: "StateDB", *, threshold: int) -> None:
+        if threshold < 1:
+            raise ValueError(
+                f"threshold must be at least 1, got {threshold!r}. "
+                "Set alerts.enabled to false to switch alerting off; a "
+                "zero or negative threshold would mean either 'alert on "
+                "everything' or 'alert on nothing' depending on how the "
+                "comparison is written, and neither is a setting anybody "
+                "asked for."
+            )
+        self.state_db = state_db
+        self.threshold = threshold
+
+    def record_success(self, *, repo: str | None = None) -> None:
+        """Clear the run and re-arm the latch.
+
+        Called on every dispatch that exits 0, including ones whose
+        pipeline then failed for its own reasons — the question this
+        tracker answers is "can the relay still run a worker at all",
+        not "did the work succeed".
+        """
+        previous = self.state_db.reset_dispatch_failures()
+        if previous:
+            log_event(
+                _logger,
+                "dispatch_health.recovered",
+                repo=repo,
+                previous_consecutive_failures=previous,
+            )
+
+    def record_failure(
+        self,
+        *,
+        repo: str | None = None,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> DispatchAlert | None:
+        """Extend the run; return an alert the first time it trips.
+
+        Returns ``None`` when the run is still under the threshold, and
+        ``None`` again on every later failure in the same run — the
+        latch is set by the first alert and cleared only by
+        :meth:`record_success`.
+        """
+        consecutive = self.state_db.increment_dispatch_failures()
+        log_event(
+            _logger,
+            "dispatch_health.failure",
+            repo=repo,
+            session_id=session_id,
+            exit_code=exit_code,
+            consecutive_failures=consecutive,
+            threshold=self.threshold,
+        )
+        if consecutive < self.threshold:
+            return None
+        if not self.state_db.claim_dispatch_alert():
+            # Already alerted and no success since. Logged, because
+            # "the alert was suppressed" and "the alert was never
+            # reached" are different facts and only one of them means
+            # the dedup is working.
+            log_event(
+                _logger,
+                "dispatch_health.alert_suppressed",
+                repo=repo,
+                consecutive_failures=consecutive,
+                reason=REASON_CONSECUTIVE,
+            )
+            return None
+        detail = (
+            f"Last failure was {repo or 'an unnamed repo'}"
+            + (f", exit code {exit_code}" if exit_code is not None else "")
+            + "."
+        )
+        return DispatchAlert(
+            reason=REASON_CONSECUTIVE,
+            consecutive=consecutive,
+            threshold=self.threshold,
+            detail=detail,
+        )
+
+    def record_sweep(self, *, total: int, failed: int) -> DispatchAlert | None:
+        """Alert when a whole sweep failed, regardless of the run length.
+
+        A sweep that fails on every repo is already an outage even if
+        the configured threshold has not been reached — 88 repos is one
+        scheduler fire, and waiting for a second day of it is the
+        behaviour this ticket exists to remove.
+
+        ``total`` must be at least 1 and ``failed`` must equal it.
+        A zero-repo sweep returns ``None``: nothing ran, which is not
+        the same as everything failing.
+        """
+        if total < 1 or failed < total:
+            return None
+        if not self.state_db.claim_dispatch_alert():
+            log_event(
+                _logger,
+                "dispatch_health.alert_suppressed",
+                consecutive_failures=self.state_db.dispatch_failure_count(),
+                reason=REASON_SWEEP_ALL_FAILED,
+            )
+            return None
+        return DispatchAlert(
+            reason=REASON_SWEEP_ALL_FAILED,
+            consecutive=self.state_db.dispatch_failure_count(),
+            threshold=self.threshold,
+            detail=f"all {total} of {total} repos failed",
+        )

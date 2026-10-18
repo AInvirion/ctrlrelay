@@ -20,7 +20,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at INTEGER,
     claude_exit_code INTEGER,
     summary TEXT,
-    agent_session_id TEXT
+    agent_session_id TEXT,
+    -- Scrubbed, capped tail of the worker's final stdout/stderr (#204).
+    -- The exit-code column above was declared from the start and left
+    -- NULL on the failure path, so the row for the session that broke
+    -- `zzsites#853` held `None` while the log line for the SAME session
+    -- recorded `exit_code 1`. With no output kept anywhere either —
+    -- `stderr_tail` was `""` and the log keeps a hash and a length, not
+    -- the text — the only durable evidence of why 163 dispatches failed
+    -- was that each took about two seconds. See
+    -- `ctrlrelay.core.redact` for what is removed before it is stored.
+    output_tail TEXT
 );
 
 CREATE TABLE IF NOT EXISTS repo_locks (
@@ -98,6 +108,30 @@ CREATE TABLE IF NOT EXISTS pr_watches (
     PRIMARY KEY (repo, pr_number)
 );
 
+-- Whether the relay can still run a worker at all, as one row (#204).
+-- Separate from `sessions` because the question is about the relay and
+-- not about any one run: 163 consecutive non-zero exits spread across
+-- 88 repos and two pipelines is one outage, and counting it per-session
+-- is what made it invisible.
+--
+-- In the database rather than in the poller's memory because the poller
+-- restarts. An in-memory run length resets on every restart, so a relay
+-- that is broken AND being restarted is precisely the one that would
+-- never reach the threshold — and the `alerted_at` latch would re-fire
+-- on every boot.
+CREATE TABLE IF NOT EXISTS dispatch_health (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    -- Set when an alert has been sent and not yet cleared by a success.
+    -- NULL means "an alert may be sent", which is what makes the latch
+    -- re-armable: a dedup that never clears is a guard that fires once
+    -- per database lifetime (#200 is the opposite failure — the same
+    -- message re-sent every morning).
+    alerted_at INTEGER,
+    last_failure_at INTEGER,
+    last_success_at INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_repo ON sessions(repo);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_automation_repo ON automation_decisions(repo);
@@ -147,6 +181,10 @@ class StateDB:
             self._conn.execute(
                 "ALTER TABLE sessions ADD COLUMN agent_session_id TEXT"
             )
+        if "output_tail" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN output_tail TEXT"
+            )
 
         pr_watches_cols = {
             row[1]
@@ -173,6 +211,8 @@ class StateDB:
             self._conn.execute(
                 "ALTER TABLE pending_resumes ADD COLUMN expired_reason TEXT"
             )
+
+        self._ensure_dispatch_health_row()
 
     def close(self) -> None:
         """Close the database connection."""
@@ -297,6 +337,125 @@ class StateDB:
             (session_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    def record_session_outcome(
+        self,
+        session_id: str,
+        *,
+        exit_code: int | None,
+        output_tail: str | None,
+    ) -> bool:
+        """Persist a worker's exit code and the tail of its output.
+
+        Returns ``True`` when a row was updated. The boolean is not
+        decoration: the UPDATE is keyed on ``session_id``, and an
+        UPDATE that matches nothing is SQLite's idea of success. A
+        dispatch whose session row was never inserted — the failure
+        landed before the INSERT — would otherwise have its exit code
+        recorded nowhere while this call reported fine, which is the
+        same silence #204 is about, one layer in. The caller logs the
+        miss.
+
+        ``output_tail`` must already be scrubbed and capped by
+        :func:`ctrlrelay.core.redact.worker_output_tail`. This method
+        does not sanitise, deliberately: a sanitiser that lives in the
+        writer is one that a second writer can bypass without
+        noticing, and the scrubbing has its own tests.
+
+        An empty ``output_tail`` is stored as ``NULL`` rather than
+        ``""`` — "the agent wrote nothing before it died" is a real
+        and differently-shaped failure, and the two should not read
+        the same on inspection.
+        """
+        cursor = self._conn.execute(
+            "UPDATE sessions SET claude_exit_code = ?, output_tail = ? "
+            "WHERE id = ?",
+            (exit_code, output_tail or None, session_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    # Dispatch health (#204 — is the relay able to run a worker at all)
+
+    def _ensure_dispatch_health_row(self) -> None:
+        """Create the single ``dispatch_health`` row if it is absent.
+
+        Called from ``_migrate`` for a fresh or upgraded database, and
+        again at the top of every accessor below. The repeat is cheap
+        (an INSERT OR IGNORE on a one-row table) and it means a
+        database whose row was deleted by hand re-arms instead of
+        silently never counting — a counter that cannot count is the
+        fault this table exists to detect.
+        """
+        self._conn.execute(
+            "INSERT OR IGNORE INTO dispatch_health "
+            "(id, consecutive_failures) VALUES (1, 0)"
+        )
+
+    def dispatch_failure_count(self) -> int:
+        """Length of the current run of failed dispatches (0 when healthy)."""
+        self._ensure_dispatch_health_row()
+        row = self._conn.execute(
+            "SELECT consecutive_failures FROM dispatch_health WHERE id = 1"
+        ).fetchone()
+        return int(row["consecutive_failures"]) if row else 0
+
+    def increment_dispatch_failures(self) -> int:
+        """Extend the failure run by one and return the new length."""
+        self._ensure_dispatch_health_row()
+        self._conn.execute(
+            "UPDATE dispatch_health SET "
+            "consecutive_failures = consecutive_failures + 1, "
+            "last_failure_at = ? WHERE id = 1",
+            (int(time.time()),),
+        )
+        self._conn.commit()
+        return self.dispatch_failure_count()
+
+    def reset_dispatch_failures(self) -> int:
+        """Clear the run and the alert latch; return the previous length.
+
+        The return value is what lets the caller log a recovery only
+        when there was something to recover from — otherwise every
+        successful dispatch on a healthy relay would log one, and a
+        line that appears constantly is a line nobody reads.
+        """
+        self._ensure_dispatch_health_row()
+        previous = self.dispatch_failure_count()
+        self._conn.execute(
+            "UPDATE dispatch_health SET consecutive_failures = 0, "
+            "alerted_at = NULL, last_success_at = ? WHERE id = 1",
+            (int(time.time()),),
+        )
+        self._conn.commit()
+        return previous
+
+    def claim_dispatch_alert(self) -> bool:
+        """Take the right to send one alert, or return ``False``.
+
+        ``True`` exactly once per failure run: the UPDATE is
+        conditional on ``alerted_at IS NULL``, so the claim and the
+        test are one statement and two callers racing cannot both
+        win. Cleared by :meth:`reset_dispatch_failures`, which is to
+        say by a dispatch that succeeds — the only event that means
+        the relay came back.
+        """
+        self._ensure_dispatch_health_row()
+        cursor = self._conn.execute(
+            "UPDATE dispatch_health SET alerted_at = ? "
+            "WHERE id = 1 AND alerted_at IS NULL",
+            (int(time.time()),),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def get_dispatch_health(self) -> dict[str, Any]:
+        """The whole row, for `ctrlrelay status` and for tests."""
+        self._ensure_dispatch_health_row()
+        row = self._conn.execute(
+            "SELECT * FROM dispatch_health WHERE id = 1"
+        ).fetchone()
+        return dict(row) if row else {}
 
     # Pending resumes (BLOCKED sessions awaiting an operator answer)
 
