@@ -403,3 +403,37 @@ class TestAlertMessage:
         text = alert.message()
         assert "every repo failed" in text
         assert "88" in text
+
+
+class TestTheTransactionLeftOpenBranchIsVisible:
+    def test_an_already_open_transaction_is_reported(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """`_begin_immediate`'s docstring says it logs this. It must.
+
+        A caller leaving a transaction open is a bug somewhere else,
+        and committing it quietly is how that bug stays unfound. An
+        earlier version claimed the log in prose and did not emit it,
+        which made the sentence false and the branch invisible.
+        """
+        import logging
+
+        db = StateDB(tmp_path / "state.db")
+        # A caller mid-write, as `StateDB.execute` leaves it.
+        db.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("left-open", "dev", "o/r", "running", 0),
+        )
+        assert db._conn.in_transaction
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            DispatchHealth(db, threshold=3).record_failure(repo="o/r")
+        assert any(
+            r.getMessage() == "state.transaction_left_open"
+            for r in caplog.records
+        ), "the open transaction was committed without being reported"
+        # And the caller's pending write was COMMITTED, not discarded.
+        # Rolling it back would destroy data to tidy up a lock.
+        assert db.get_session_row("left-open") is not None
+        assert not db._conn.in_transaction
+        db.close()

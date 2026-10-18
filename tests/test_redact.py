@@ -325,3 +325,53 @@ class TestMetricsSurviveWhileCredentialsDoNot:
         """
         out = redact_secrets("token_count_secret=abcdef1234567890")
         assert "abcdef1234567890" not in out
+
+
+class TestShortValuesAndMetricNames:
+    """The key/value rule's two remaining edges, both found by review."""
+
+    def test_a_short_credential_value_is_not_let_through(self) -> None:
+        """A four-character minimum let these reach the database.
+
+        A short secret is still a secret, and a credential name plus an
+        assignment operator is already the whole evidence that this is
+        one.
+        """
+        for text, value in (
+            ("password=x", "x"),
+            ("TOKEN=abc", "abc"),
+            ("api_key=1", "1"),
+        ):
+            out = redact_secrets(text)
+            assert "[redacted]" in out, f"{text} was not redacted"
+            assert not out.endswith(value), f"{text} leaked its value"
+
+    def test_a_credential_name_ending_in_a_metric_suffix_is_redacted(
+        self,
+    ) -> None:
+        """The metric exemption needs BOTH halves.
+
+        Exempting on the name alone leaked `API_KEY_COUNT=hunter2`,
+        because the suffix was the whole test. A measurement is a
+        NUMBER, so the value has to be one too.
+        """
+        for text, secret in (
+            ("API_KEY_COUNT=hunter2", "hunter2"),
+            ("token_count=ghp_abcdefghijklmnopqrstuvwx", "ghp_abcdef"),
+            ("secret_total=abcdef", "abcdef"),
+            # Not a number, even though it starts with digits.
+            ("token_size=8192abc", "8192abc"),
+        ):
+            out = redact_secrets(text)
+            assert secret not in out, f"{text} leaked"
+
+    def test_a_metric_with_a_numeric_value_still_survives(self) -> None:
+        """The control for the test above. Without it, "always redact"
+        passes it and the metrics are lost again."""
+        for text in (
+            "token_count=8192",
+            "auth_token_ms=1500",
+            "secret_bytes=-1",
+            "credential_cache_size=1.5e3",
+        ):
+            assert redact_secrets(text) == text, f"{text} lost its value"

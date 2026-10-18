@@ -20,6 +20,7 @@ turns on:
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1018,3 +1019,163 @@ class TestTheWriterIsTheChokepoint:
         assert "[redacted]" in tail
         # And the surrounding text still reads.
         assert "straight in" in tail
+
+
+class TestAFailedWriteDoesNotHoldTheLock:
+    """A real `database is locked`, produced by a second connection
+    holding the write lock — not a simulated one.
+
+    `sqlite3.Connection.commit` cannot be monkeypatched, and that is
+    the better outcome: this reproduces the condition the daemon
+    actually meets, two processes on one file.
+    """
+
+    @staticmethod
+    def _locked_pair(tmp_path: Path):
+        path = tmp_path / "state.db"
+        a = StateDB(path)
+        a.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("s", "dev", "o/r", "running", 0),
+        )
+        a.commit()
+        # Fail fast instead of waiting out the default five seconds.
+        a._conn.execute("PRAGMA busy_timeout = 50")
+        blocker = StateDB(path)
+        blocker._conn.execute("BEGIN IMMEDIATE")
+        blocker._conn.execute(
+            "UPDATE dispatch_health SET consecutive_failures = 99 WHERE id = 1"
+        )
+        return a, blocker
+
+    def test_a_failing_update_rolls_back(self, tmp_path: Path) -> None:
+        a, blocker = self._locked_pair(tmp_path)
+        try:
+            with pytest.raises(sqlite3.OperationalError) as excinfo:
+                a.record_session_outcome("s", exit_code=1, output_tail="x")
+            assert "locked" in str(excinfo.value)
+            assert not a._conn.in_transaction, (
+                "a failed write left the transaction open, holding a write "
+                "lock on the shared database"
+            )
+        finally:
+            blocker._conn.rollback()
+            blocker.close()
+            a.close()
+
+    def test_the_swallowing_caller_still_leaves_no_transaction(
+        self, tmp_path: Path
+    ) -> None:
+        """The path that actually runs in the daemon.
+
+        `persist_dispatch_outcome` swallows the exception, so if the
+        rollback were missing nothing else would ever close that
+        transaction.
+        """
+        from ctrlrelay.cli import persist_dispatch_outcome
+
+        a, blocker = self._locked_pair(tmp_path)
+        try:
+            assert (
+                persist_dispatch_outcome(
+                    a,
+                    DispatchOutcome(
+                        session_id="s",
+                        repo="o/r",
+                        issue_number=None,
+                        exit_code=1,
+                        stdout="",
+                        stderr="x",
+                    ),
+                )
+                is False
+            )
+            assert not a._conn.in_transaction
+        finally:
+            blocker._conn.rollback()
+            blocker.close()
+            a.close()
+
+    def test_an_unblocked_write_still_succeeds(self, tmp_path: Path) -> None:
+        """The control: the pair above must fail because of the lock,
+        not because `record_session_outcome` is broken."""
+        a, blocker = self._locked_pair(tmp_path)
+        blocker._conn.rollback()
+        blocker.close()
+        try:
+            assert a.record_session_outcome(
+                "s", exit_code=1, output_tail="x"
+            ) is True
+            assert a.get_session_row("s")["claude_exit_code"] == 1
+        finally:
+            a.close()
+
+
+class TestTheChildIsReapedWithoutLosingTheCause:
+    @pytest.mark.asyncio
+    async def test_a_child_that_exited_before_the_kill_is_tolerated(
+        self, tmp_path: Path
+    ) -> None:
+        """The child can exit between the returncode check and the
+        signal.
+
+        A bare `ProcessLookupError` from `kill()` would REPLACE the
+        original `communicate()` failure and skip the outcome report —
+        losing both the cause and the count.
+        """
+        seen: list[DispatchOutcome] = []
+
+        async def hook(outcome):
+            seen.append(outcome)
+
+        proc = AsyncMock()
+        proc.communicate.side_effect = OSError("read failed on the pipe")
+        proc.returncode = None
+        proc.kill = MagicMock(side_effect=ProcessLookupError())
+        proc.wait = AsyncMock()
+        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(OSError) as excinfo:
+                await d.spawn_session(
+                    session_id="s",
+                    prompt="p",
+                    working_dir=tmp_path,
+                    state_file=tmp_path / "missing.json",
+                )
+        # The ORIGINAL cause survives, not the reaping error.
+        assert "read failed on the pipe" in str(excinfo.value)
+        assert len(seen) == 1
+        assert "read failed on the pipe" in seen[0].stderr
+
+
+class TestInvalidUtf8FromAChildIsNotLost:
+    @pytest.mark.asyncio
+    async def test_undecodable_output_still_reports_an_outcome(
+        self, tmp_path: Path
+    ) -> None:
+        """A `UnicodeDecodeError` landed after the guarded
+        `communicate()` and before the outcome report, so that dispatch
+        was neither persisted nor counted."""
+        seen: list[DispatchOutcome] = []
+
+        async def hook(outcome):
+            seen.append(outcome)
+
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"\xff\xfe not utf-8", b"\x80bad")
+        proc.returncode = 1
+        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            result = await d.spawn_session(
+                session_id="s",
+                prompt="p",
+                working_dir=tmp_path,
+                state_file=tmp_path / "missing.json",
+            )
+        assert result.exit_code == 1
+        assert len(seen) == 1
+        assert seen[0].exit_code == 1
+        # The readable part of the output survives.
+        assert "not utf-8" in seen[0].stdout
+        assert "bad" in seen[0].stderr
