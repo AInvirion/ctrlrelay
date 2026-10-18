@@ -47,7 +47,13 @@ class TestClaimFailureComment:
         assert "free to pick up" in body
         # The sentence that was false for eighteen hours is contradicted
         # explicitly, not merely followed by a different one.
-        assert "out of date" in body
+        #
+        # "any claim above", not "the claim above": the flag that
+        # triggers this is deliberately optimistic about a claim
+        # existing, because a `gh` call can create the comment and lose
+        # the response. The wording therefore must not assert that one
+        # is visible.
+        assert "supersedes any claim above" in body
 
     def test_with_a_pr_it_does_not_claim_nothing_was_opened(self) -> None:
         """A run that opened a PR and then failed to finish verifying it

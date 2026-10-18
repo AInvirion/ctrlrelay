@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +133,13 @@ CREATE TABLE IF NOT EXISTS dispatch_health (
     -- per database lifetime (#200 is the opposite failure — the same
     -- message re-sent every morning).
     alerted_at INTEGER,
+    -- Identifies WHICH claim the latch holds, so a failed delivery
+    -- releases its own and not a newer one. Separate from `alerted_at`
+    -- because that is a timestamp in seconds like every other `*_at`
+    -- column here, and two processes claiming inside one second are
+    -- indistinguishable by it -- which would let A's failed delivery
+    -- clear B's claim and announce one outage twice.
+    alert_claim_token TEXT,
     last_failure_at INTEGER,
     last_success_at INTEGER
 );
@@ -214,6 +222,17 @@ class StateDB:
         if pending_cols and "expired_reason" not in pending_cols:
             self._conn.execute(
                 "ALTER TABLE pending_resumes ADD COLUMN expired_reason TEXT"
+            )
+
+        health_cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(dispatch_health)"
+            ).fetchall()
+        }
+        if health_cols and "alert_claim_token" not in health_cols:
+            self._conn.execute(
+                "ALTER TABLE dispatch_health ADD COLUMN alert_claim_token TEXT"
             )
 
         self._ensure_dispatch_health_row()
@@ -385,12 +404,24 @@ class StateDB:
         # changed no outcome, which reads as coverage to the next
         # person.
         scrubbed = redact_secrets(output_tail) if output_tail else None
-        cursor = self._conn.execute(
-            "UPDATE sessions SET claude_exit_code = ?, output_tail = ? "
-            "WHERE id = ?",
-            (exit_code, scrubbed, session_id),
-        )
-        self._conn.commit()
+        try:
+            cursor = self._conn.execute(
+                "UPDATE sessions SET claude_exit_code = ?, output_tail = ? "
+                "WHERE id = ?",
+                (exit_code, scrubbed, session_id),
+            )
+            self._conn.commit()
+        except BaseException:
+            # A `database is locked` out of the UPDATE or the commit
+            # leaves the transaction open, and the caller
+            # (`persist_dispatch_outcome`) swallows the exception so
+            # nothing else would close it — leaving this connection
+            # holding a write lock on a database the bridge also uses.
+            # The same fault the read path had, arriving on an error
+            # path instead of a happy one.
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
         return cursor.rowcount > 0
 
     # Dispatch health (#204 — is the relay able to run a worker at all)
@@ -436,6 +467,19 @@ class StateDB:
         open and that is worth seeing rather than smoothing over.
         """
         if self._conn.in_transaction:
+            # The log the docstring above promises. Without it the
+            # sentence was false and this branch was invisible: a
+            # caller leaving a transaction open is a bug somewhere
+            # else, and committing it quietly is how that bug stays
+            # unfound.
+            log_event(
+                _logger,
+                "state.transaction_left_open",
+                detail=(
+                    "a caller left a transaction open on this connection; "
+                    "committing it so the write lock can be taken"
+                ),
+            )
             self._conn.commit()
         self._conn.execute("BEGIN IMMEDIATE")
 
@@ -454,10 +498,10 @@ class StateDB:
 
     def record_dispatch_failure(
         self, threshold: int
-    ) -> tuple[int, int | None]:
+    ) -> tuple[int, str | None]:
         """Extend the failure run and decide, in ONE transaction.
 
-        Returns ``(consecutive_failures, claim_stamp)``, where the stamp
+        Returns ``(consecutive_failures, claim_token)``, where the token
         is ``None`` when no alert may be sent and otherwise identifies
         the claim for :meth:`release_dispatch_alert`.
 
@@ -470,7 +514,7 @@ class StateDB:
         back in a separate statement had the same hazard pointed the
         other way.
 
-        A stamp is handed out at most once per failure run. It is the
+        A token is handed out at most once per failure run. It is the
         right to ATTEMPT one delivery, not a record that one happened —
         see :meth:`release_dispatch_alert`.
         """
@@ -493,12 +537,13 @@ class StateDB:
                 "FROM dispatch_health WHERE id = 1"
             ).fetchone()
             consecutive = int(row["consecutive_failures"])
-            claimed: int | None = None
+            claimed: str | None = None
             if consecutive >= threshold and row["alerted_at"] is None:
-                claimed = int(time.time())
+                claimed = uuid.uuid4().hex
                 self._conn.execute(
-                    "UPDATE dispatch_health SET alerted_at = ? WHERE id = 1",
-                    (claimed,),
+                    "UPDATE dispatch_health SET alerted_at = ?, "
+                    "alert_claim_token = ? WHERE id = 1",
+                    (int(time.time()), claimed),
                 )
             self._conn.commit()
         except BaseException:
@@ -546,8 +591,8 @@ class StateDB:
             raise
         return previous
 
-    def claim_dispatch_alert(self) -> int | None:
-        """Take the right to attempt one alert; return the claim stamp.
+    def claim_dispatch_alert(self) -> str | None:
+        """Take the right to attempt one alert; return the claim token.
 
         ``None`` means somebody already holds it.
 
@@ -561,16 +606,17 @@ class StateDB:
         cannot be separated.
         """
         self._ensure_dispatch_health_row()
-        stamp = int(time.time())
+        token = uuid.uuid4().hex
         cursor = self._conn.execute(
-            "UPDATE dispatch_health SET alerted_at = ? "
+            "UPDATE dispatch_health SET alerted_at = ?, "
+            "alert_claim_token = ? "
             "WHERE id = 1 AND alerted_at IS NULL",
-            (stamp,),
+            (int(time.time()), token),
         )
         self._conn.commit()
-        return stamp if cursor.rowcount > 0 else None
+        return token if cursor.rowcount > 0 else None
 
-    def release_dispatch_alert(self, stamp: int | None = None) -> None:
+    def release_dispatch_alert(self, token: str | None = None) -> None:
         """Give the claim back, because delivery failed.
 
         Claiming the latch is the right to ATTEMPT one message, not a
@@ -586,7 +632,7 @@ class StateDB:
         right to announce it is handed back, so the next failure tries
         again.
         """
-        if stamp is None:
+        if token is None:
             # A caller that cannot say which claim it took must not
             # clear one — and this is a caller BUG, so it is reported
             # rather than silently returning.
@@ -608,22 +654,22 @@ class StateDB:
                 ),
             )
             return
-        # Conditional on the stamp we wrote, so this releases OUR claim
+        # Conditional on the token we wrote, so this releases OUR claim
         # and not a newer one. Two pollers share this row: A claims, a
         # success resets the run, B starts a new outage and claims, and
         # an unconditional release from A would then clear B's latch and
         # let the same outage be announced twice.
         #
-        # The residual limit, stated rather than papered over: the stamp
-        # is a whole second, so two processes claiming within the same
-        # second are indistinguishable here. Closing that needs an
-        # ownership column, and what it buys is the avoidance of a
-        # DUPLICATE message — the safe direction — so it is recorded as
-        # a known limit instead.
+        # A uuid rather than `alerted_at`. An earlier version compared
+        # the whole-second timestamp, which cannot separate two claims
+        # made inside the same second — and a one-second window during
+        # an outage where dispatches fail in about two seconds each is
+        # not a remote one.
         self._conn.execute(
-            "UPDATE dispatch_health SET alerted_at = NULL "
-            "WHERE id = 1 AND alerted_at = ?",
-            (stamp,),
+            "UPDATE dispatch_health SET alerted_at = NULL, "
+            "alert_claim_token = NULL "
+            "WHERE id = 1 AND alert_claim_token = ?",
+            (token,),
         )
         self._conn.commit()
 

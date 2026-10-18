@@ -960,11 +960,11 @@ class TestTheWarningIsActuallySent:
             for n in ast.walk(handle_issue)
             if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Name)
-            and n.func.id in ("announce_issue_outcome", "announce_dev_success")
+            and n.func.id == "announce_issue_outcome"
         ]
         assert len(calls) == 1, (
-            "expected exactly one announcement call in handle_issue, got "
-            f"{len(calls)}"
+            "expected exactly one announce_issue_outcome call in "
+            f"handle_issue, got {len(calls)}"
         )
         # And it does not hand-roll the routine line, which is how the
         # two messages would drift apart again.

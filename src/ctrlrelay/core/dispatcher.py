@@ -356,12 +356,17 @@ class ClaudeDispatcher:
             # longer reading its output, and leaving it running against
             # the worktree is what the cancellation arm above exists to
             # prevent.
-            if proc.returncode is None:
-                proc.kill()
-                try:
+            # The kill is guarded. The child can exit between the
+            # returncode check and the signal, and a bare
+            # `ProcessLookupError` from here would REPLACE the original
+            # `communicate()` failure and skip the outcome report
+            # below — losing both the cause and the count.
+            try:
+                if proc.returncode is None:
+                    proc.kill()
                     await proc.wait()
-                except Exception:
-                    pass
+            except Exception:
+                pass
             _logger.error(
                 "dispatcher.session.communicate_failed",
                 extra={
@@ -383,8 +388,15 @@ class ClaudeDispatcher:
 
         elapsed_ms = _elapsed_ms(started)
         exit_code = proc.returncode or 0
-        stdout_text = stdout.decode()
-        stderr_text = stderr.decode()
+        # `errors="replace"`, not a second exception handler. A child
+        # emitting invalid UTF-8 raised `UnicodeDecodeError` here —
+        # AFTER the guarded `communicate()` and BEFORE the outcome
+        # report, so that dispatch was neither persisted nor counted.
+        # Replacing the bytes removes the failure mode instead of
+        # catching it, and `_extract_agent_session_id` already returns
+        # `None` for stdout that will not parse as JSON.
+        stdout_text = stdout.decode(errors="replace")
+        stderr_text = stderr.decode(errors="replace")
 
         state = None
         if state_file.exists():

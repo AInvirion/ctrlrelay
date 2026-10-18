@@ -870,7 +870,7 @@ class TestTheLatchReleaseIsOwned:
         ), "a release that named no claim was not reported"
         db.close()
 
-    def test_the_release_is_conditional_on_the_stamp_in_sql(
+    def test_the_release_is_conditional_on_the_token_in_sql(
         self, tmp_path: Path
     ) -> None:
         """The WHERE clause, not the early return, is what protects a
@@ -881,37 +881,63 @@ class TestTheLatchReleaseIsOwned:
         is what makes a wrong stamp harmless even without it.
         """
         db = StateDB(tmp_path / "state.db")
-        stamp = db.claim_dispatch_alert()
-        assert stamp is not None
-        db.release_dispatch_alert(stamp + 1000)
-        assert db.get_dispatch_health()["alerted_at"] == stamp
+        token = db.claim_dispatch_alert()
+        assert token is not None
+        db.release_dispatch_alert("0" * 32)
+        assert db.get_dispatch_health()["alert_claim_token"] == token
         db.close()
 
-    def test_releasing_a_superseded_stamp_clears_nothing(
+    def test_releasing_a_superseded_claim_clears_nothing(
         self, tmp_path: Path
     ) -> None:
         db = StateDB(tmp_path / "state.db")
-        stamp = db.claim_dispatch_alert()
-        assert stamp is not None
+        ours = db.claim_dispatch_alert()
+        assert ours is not None
         # Somebody else's newer claim, after a success cleared ours.
         db.reset_dispatch_failures()
         newer = db.claim_dispatch_alert()
         assert newer is not None
-        db.release_dispatch_alert(stamp - 1)
-        assert db.get_dispatch_health()["alerted_at"] == newer
+        assert newer != ours
+        db.release_dispatch_alert(ours)
+        assert db.get_dispatch_health()["alert_claim_token"] == newer
         db.close()
 
-    def test_releasing_our_own_stamp_does_clear_it(
+    def test_two_claims_in_the_same_second_are_distinguishable(
         self, tmp_path: Path
     ) -> None:
-        """The control. Without it, "never release" passes both tests
+        """The token is a uuid, not the `alerted_at` second.
+
+        Comparing the whole-second timestamp cannot separate two claims
+        made inside one second — and during an outage where dispatches
+        fail in about two seconds each, that window is not remote. A's
+        failed delivery would then clear B's claim and the same outage
+        would be announced twice.
+        """
+        db = StateDB(tmp_path / "state.db")
+        first = db.claim_dispatch_alert()
+        db.reset_dispatch_failures()
+        second = db.claim_dispatch_alert()
+        row = db.get_dispatch_health()
+        db.close()
+        assert first is not None and second is not None
+        assert first != second
+        # Same second, different claim: the timestamp alone could not
+        # have told them apart.
+        assert row["alert_claim_token"] == second
+
+    def test_releasing_our_own_claim_does_clear_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The control. Without it, "never release" passes every test
         above and the failed-delivery fix is undone."""
         db = StateDB(tmp_path / "state.db")
-        stamp = db.claim_dispatch_alert()
-        assert stamp is not None
-        db.release_dispatch_alert(stamp)
-        assert db.get_dispatch_health()["alerted_at"] is None
+        token = db.claim_dispatch_alert()
+        assert token is not None
+        db.release_dispatch_alert(token)
+        row = db.get_dispatch_health()
         db.close()
+        assert row["alerted_at"] is None
+        assert row["alert_claim_token"] is None
 
     def test_a_second_claim_is_refused_while_one_is_held(
         self, tmp_path: Path
@@ -934,8 +960,11 @@ class TestAStalledSendCannotHangADispatch:
         import ctrlrelay.cli as cli_module
         from ctrlrelay.cli import make_dispatch_outcome_hook
 
+        entered: list[str] = []
+
         class Stalls(SpyTransport):
             async def send(self, text: str, **kwargs) -> None:
+                entered.append(text)
                 await asyncio.sleep(3600)
 
         db = StateDB(tmp_path / "state.db")
@@ -948,6 +977,10 @@ class TestAStalledSendCannotHangADispatch:
             ),
         ):
             await asyncio.wait_for(hook(_outcome("s-0", 1)), timeout=10)
+        # The send was ENTERED, not merely skipped. Without this the
+        # test passes for an alert implementation that never tries at
+        # all, because the latch is clear either way.
+        assert len(entered) == 1
         # Undelivered, so the latch went back and the next failure
         # will try again.
         assert db.get_dispatch_health()["alerted_at"] is None

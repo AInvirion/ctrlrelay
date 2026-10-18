@@ -268,8 +268,8 @@ def claim_failure_comment(
     if pr_number is not None:
         opening = (
             f"⚠️ **CTRLRelay did not finish this run.** Pull request "
-            f"#{pr_number} was opened but the run ended before handover, "
-            "so the claim above is out of date."
+            f"#{pr_number} was opened but the run ended before handover. "
+            "This supersedes any claim above."
         )
         next_step = (
             f"Review PR #{pr_number} on its own merits — it is not "
@@ -278,7 +278,7 @@ def claim_failure_comment(
     else:
         opening = (
             "⚠️ **CTRLRelay did not finish this run, and no pull request "
-            "was opened.** The claim above is out of date — nothing is "
+            "was opened.** This supersedes any claim above — nothing is "
             "working on this issue."
         )
         next_step = (

@@ -45,7 +45,42 @@ REDACTION = "[redacted]"
 # base64 diffs, which is most of what makes a failure readable; it
 # would trade this ticket's defect for a redacted blob that diagnoses
 # nothing. Known credential shapes are what gets matched.
-_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+# A name that ends in one of these is a measurement, not a secret —
+# but only when its value is a number. See the key/value rule below.
+_METRIC_SUFFIXES = (
+    "_count",
+    "_len",
+    "_length",
+    "_size",
+    "_bytes",
+    "_ms",
+    "_seconds",
+    "_limit",
+    "_total",
+)
+
+# Digits, with an optional sign, decimal point or exponent: what a
+# measurement looks like. Anchored, so `8192abc` is not a number.
+_NUMERIC_VALUE = re.compile(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
+
+
+def _redact_unless_metric(match: "re.Match[str]") -> str:
+    """Keep `token_count=8192`; redact `API_KEY_COUNT=hunter2`.
+
+    Both halves are required: a metric-shaped NAME and a numeric
+    VALUE. The name list can therefore only ever add a redaction — a
+    metric whose suffix nobody listed — and never remove one, because
+    the numeric test is what does the protecting.
+    """
+    name, sep, value = match.group(1), match.group(2), match.group(3)
+    bare = value.strip("\"'")
+    looks_like_a_metric = name.lower().endswith(_METRIC_SUFFIXES)
+    if looks_like_a_metric and _NUMERIC_VALUE.match(bare):
+        return match.group(0)
+    return f"{name}{sep}{REDACTION}"
+
+
+_PATTERNS: tuple[tuple[re.Pattern[str], str | object], ...] = (
     # JSON Web Tokens — three dot-separated base64url segments starting
     # with the `{"` header prefix. Before the generic key/value rule so
     # a JWT in a header value is matched as a whole.
@@ -117,30 +152,44 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # has no boundary after `TOKEN`. What bounds the match instead is
     # the assignment operator that must follow, which is what makes
     # this pattern a key/value rule rather than a word list.
-    # `(?![A-Za-z0-9_]*(?:_count|_len|...))` exempts an unambiguous
-    # METRIC suffix, so `token_count=8192` and `credential_cache_size=
-    # 4096` survive. Losing those was a real cost: this module exists
-    # so an operator can tell a credential failure from a crash, and a
-    # token count is exactly the kind of number that explains one.
+    # A metric is exempted by its VALUE being a number, not by its name
+    # alone. This rule reached its third patch, so the discriminator
+    # changed rather than the list growing again:
     #
-    # The exemption list is of METRIC names, not of credential names.
-    # That direction matters: the credential side must stay open-ended
-    # because the next secret will have a name nobody listed, while a
-    # key literally ending in `_count` or `_bytes` holding a secret
-    # would be perverse. An enumeration is safe only where being
-    # incomplete costs a redaction rather than a leak.
+    #   1. `\bsecret\b` missed `AWS_SECRET_ACCESS_KEY`, because an
+    #      underscore is a word character. Boundaries dropped.
+    #   2. The widened rule then ate `token_count=8192`, which is
+    #      exactly the kind of number that explains a failure. A
+    #      metric-suffix exemption was added.
+    #   3. That exemption leaked `API_KEY_COUNT=hunter2`, because the
+    #      suffix was the whole test.
+    #
+    # The question the rule is actually answering is "is this value a
+    # measurement or a credential", and a measurement is a NUMBER. So
+    # the exemption requires both halves: a metric-shaped name AND a
+    # numeric value. `token_count=8192` survives; `API_KEY_COUNT=
+    # hunter2` is redacted; `password=12345678` is redacted, because
+    # no metric suffix matches.
+    #
+    # Keeping the name list matters for the direction of its failure.
+    # It can only ever ADD a redaction (a metric whose suffix nobody
+    # listed), never remove one, because the numeric condition does the
+    # protecting. The credential side stays open-ended, which is the
+    # half that must not be an enumeration.
+    #
+    # The value takes `{1,}`, not `{4,}`. A four-character minimum let
+    # `password=x` and `TOKEN=abc` through unchanged — a short secret
+    # is still a secret, and the assignment operator plus a credential
+    # name is already the whole evidence that this is one.
     (
         re.compile(
             r"(?i)([A-Za-z0-9_]*(?:api[_-]?key|access[_-]?key|access[_-]?token"
             r"|refresh[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret"
-            r"|password|passwd|secret|token|credential)"
-            r"(?![A-Za-z0-9_]*(?:_count|_len|_length|_size|_bytes|_ms"
-            r"|_seconds|_limit|_total)\b)"
-            r"[A-Za-z0-9_]*)"
+            r"|password|passwd|secret|token|credential)[A-Za-z0-9_]*)"
             r"(\s*[:=]\s*|\s+is\s+)"
-            r"(\"[^\"\n]{4,}\"|'[^'\n]{4,}'|[^\s,;}\"'\n]{4,})"
+            r"(\"[^\"\n]{1,}\"|'[^'\n]{1,}'|[^\s,;}\"'\n]{1,})"
         ),
-        r"\1\2" + REDACTION,
+        _redact_unless_metric,
     ),
 )
 

@@ -90,7 +90,17 @@ class TestThresholdTrip:
 
 class TestHealthyRelaySaysNothing:
     def test_successes_alone_produce_no_alert(self, state_db) -> None:
+        """Land a failure first, so the assertions are not true by
+        default.
+
+        Starting from a clean database, "no alert and a zero counter"
+        is also satisfied by a `record_success` that does nothing at
+        all. The first two failures make the state non-trivial, and the
+        successes then have something to clear.
+        """
         health = DispatchHealth(state_db, threshold=3)
+        run_failures(health, 2)
+        assert state_db.dispatch_failure_count() == 2
         for _ in range(20):
             health.record_success(repo="o/r")
         assert state_db.get_dispatch_health()["alerted_at"] is None

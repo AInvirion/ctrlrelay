@@ -66,7 +66,7 @@ class DispatchAlert:
     # Identifies the latch claim this alert holds, so a delivery that
     # fails can release THAT claim and not a newer one taken by another
     # process. See `StateDB.release_dispatch_alert`.
-    claim_stamp: int | None = None
+    claim_token: str | None = None
 
     def message(self) -> str:
         """The line to post on the chat transport.
@@ -165,7 +165,7 @@ class DispatchHealth:
         one database and a success landing between this one's read and
         its claim would announce a relay that had just recovered.
         """
-        consecutive, claim_stamp = self.state_db.record_dispatch_failure(
+        consecutive, claim_token = self.state_db.record_dispatch_failure(
             self.threshold
         )
         log_event(
@@ -177,7 +177,7 @@ class DispatchHealth:
             consecutive_failures=consecutive,
             threshold=self.threshold,
         )
-        if claim_stamp is None:
+        if claim_token is None:
             # Either under the threshold, or already latched. Logged
             # once the threshold is passed, because "the alert was
             # suppressed" and "the alert was never reached" are
@@ -202,7 +202,7 @@ class DispatchHealth:
             consecutive=consecutive,
             threshold=self.threshold,
             detail=detail,
-            claim_stamp=claim_stamp,
+            claim_token=claim_token,
         )
 
     def record_sweep(self, *, total: int, failed: int) -> DispatchAlert | None:
@@ -227,8 +227,8 @@ class DispatchHealth:
         """
         if total < 1 or failed < 0 or failed != total:
             return None
-        claim_stamp = self.state_db.claim_dispatch_alert()
-        if claim_stamp is None:
+        claim_token = self.state_db.claim_dispatch_alert()
+        if claim_token is None:
             log_event(
                 _logger,
                 "dispatch_health.alert_suppressed",
@@ -241,5 +241,5 @@ class DispatchHealth:
             consecutive=self.state_db.dispatch_failure_count(),
             threshold=self.threshold,
             detail=f"all {total} of {total} repos failed",
-            claim_stamp=claim_stamp,
+            claim_token=claim_token,
         )

@@ -275,6 +275,12 @@ class TestWorkerOutputTail:
         out = worker_output_tail("", payload)
         assert payload in out
         assert "[...truncated]" not in out
+        # And the cap is ENFORCED, not merely large. Preservation alone
+        # passes for a `worker_output_tail` that ignores the limit and
+        # returns everything.
+        over = worker_output_tail("", "F" * (DEFAULT_TAIL_CHARS + 50))
+        assert "[...truncated]" in over
+        assert len(over) < DEFAULT_TAIL_CHARS + 50
 
 
 class TestMetricsSurviveWhileCredentialsDoNot:

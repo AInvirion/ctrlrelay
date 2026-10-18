@@ -301,7 +301,16 @@ _NOTIFY_CONNECT_TIMEOUT_SECONDS = 10
 # exited and while the pipeline still holds the repo lock — so an
 # unbounded send there would stall the serial poll cycle to deliver a
 # notification.
-_NOTIFY_SEND_TIMEOUT_SECONDS = 10
+#
+# Shorter than the connect bound, because this one is paid REPEATEDLY:
+# a delivery that fails hands the latch back, so the next failed
+# dispatch tries again. The known limit, which is not closed here: on
+# an outage where dispatches fail in ~2 s against a wedged bridge, the
+# connect and send bounds add up to ~15 s per dispatch. That is
+# latency added to work that is already failing, which is the cheap
+# direction — the alternative is a backoff whose own state is a second
+# thing that can go wrong silently.
+_NOTIFY_SEND_TIMEOUT_SECONDS = 5
 
 # Strong references to close() tasks nobody is waiting for. Without
 # this the loop may drop a task mid-close, and the warning for it
@@ -1013,11 +1022,13 @@ async def deliver_relay_alert(config, state_db, alert) -> bool:
         # away. Propagated so the caller's cleanup runs.
         raise
     except BaseException:
-        # `send_relay_alert` is guarded and `connect_notify_transport`
-        # documents that it does not raise — but this function's whole
-        # job is that an undelivered alert does not keep the latch, and
-        # that must not rest on another function's promise. The release
-        # below runs for a raise exactly as it does for a `False`.
+        # `send_relay_alert` is guarded, and `connect_notify_transport`
+        # says in its own docstring that it does not raise. Neither of
+        # those is a reason to rely on it: this function's whole job is
+        # that an undelivered alert does not keep the latch, and a
+        # guarantee written in somebody else's docstring is not a
+        # mechanism. The release below runs for a raise exactly as it
+        # does for a `False`.
         _log_quietly(
             "dispatch_health.alert_send_raised",
             reason=alert.reason,
@@ -1026,7 +1037,7 @@ async def deliver_relay_alert(config, state_db, alert) -> bool:
     if delivered:
         return True
     try:
-        state_db.release_dispatch_alert(alert.claim_stamp)
+        state_db.release_dispatch_alert(alert.claim_token)
     except Exception as e:
         _log_quietly(
             "dispatch_health.alert_latch_stuck",
