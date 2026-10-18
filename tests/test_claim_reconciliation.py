@@ -437,13 +437,54 @@ class TestRunDevIssueReconcilesTheClaim:
         assert "not recorded" in bodies[0]
 
     @pytest.mark.asyncio
-    async def test_a_failure_before_the_claim_leaves_no_comment(
+    async def test_a_failure_before_the_claim_is_posted_leaves_no_comment(
         self, tmp_path: Path
     ) -> None:
-        """Lock contention returns before the claim block runs.
+        """The `claim_posted = False` guard, exercised where it is read.
 
-        A bare "this failed" comment on an issue the relay never
-        claimed is noise on somebody else's ticket.
+        `get_issue` raises, so the run enters the `try`, never reaches
+        the claim block, and lands in the `except` — which is the one
+        place that reads the flag. A bare "this failed" comment on an
+        issue the relay never claimed is noise on somebody else's
+        ticket.
+
+        Found by mutation: the lock-contention test below returns
+        BEFORE `claim_posted` is even assigned, so flipping its initial
+        value to `True` changed nothing and the guard was unguarded.
+        """
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        worktree, github, dispatcher = _dev_issue_harness(
+            tmp_path, checkpoint=None, exit_code=1
+        )
+        github.get_issue.side_effect = RuntimeError("gh api 502")
+        state_db = StateDB(tmp_path / "state.db")
+        result = await run_dev_issue(
+            repo="owner/repo",
+            issue_number=853,
+            branch_template="fix/issue-{n}",
+            dispatcher=dispatcher,
+            github=github,
+            worktree=worktree,
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+        )
+        state_db.close()
+        assert not result.success
+        github.comment_on_issue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_lock_contention_returns_without_touching_the_issue(
+        self, tmp_path: Path
+    ) -> None:
+        """A peer holds the repo lock, so this run never starts.
+
+        It returns before the `try` block, so it does not reach the
+        claim OR the retraction. Kept as a separate claim from the
+        test above, which is the one that covers the flag.
         """
         from ctrlrelay.core.state import StateDB
         from ctrlrelay.pipelines.dev import run_dev_issue

@@ -170,6 +170,24 @@ class TestRedactionHappensBeforeTruncation:
         )
         assert "[redacted]" in out
 
+    def test_worker_output_tail_composes_them_in_that_order(self) -> None:
+        """The test above composes the two calls ITSELF, so it proves a
+        property of the test's own arrangement.
+
+        Found by mutation: swapping the order inside
+        `worker_output_tail` to `redact_secrets(tail(text, limit))`
+        left the test above green, because that test never calls
+        `worker_output_tail`. The ordering that ships had no guard —
+        the right topic, one hop from its own claim.
+        """
+        secret = "ghp_" + "B" * 40
+        out = worker_output_tail("", "A" * 100 + secret, limit=20)
+        assert "B" * 20 not in out, (
+            "worker_output_tail truncated before redacting, storing the "
+            "tail of a credential verbatim"
+        )
+        assert "[redacted]" in out
+
 
 class TestWorkerOutputTail:
     def test_both_streams_empty_gives_empty_string(self) -> None:
