@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-10-18
+
+Carries 0.12.3's entries too: v0.12.3 was never tagged, so nothing has
+shipped since v0.12.2 and this is the first release to reach a running
+daemon with any of it.
+
+### Fixed
+
+- Reconcile the claim comment with a failed dispatch, alert on a run of
+  failures, and keep the exit code and the worker's output (#206, closes
+  #204)
+
+  The dev lane posted *"a PR will be opened for review"* before the
+  worker started and never returned to the issue when the worker
+  exited non-zero, so that sentence stood on a beta tester's own ticket
+  for eighteen hours. Separately, 163 consecutive failed dispatches over
+  two days told nobody while both units stayed `active (running)`.
+  Separately again, `sessions.claude_exit_code` was never written on the
+  failure path and no worker output was retained, so the only durable
+  evidence of why they failed was that each took about two seconds.
+
+  New: `sessions.output_tail`, the `dispatch_health` table, and an
+  `alerts` config block (`alerts.enabled`,
+  `alerts.consecutive_dispatch_failures`, default 3). All additive and
+  defaulted — no config edit is needed.
+
+  **Known limits**, stated because they are decisions rather than
+  oversights: the relay-health alert is awaited inside the dispatcher,
+  so it can hold the per-repo lock for up to ~15 s against a wedged
+  bridge; delivery is at-least-once, so an alert that is sent but whose
+  delivery cannot be recorded may be sent once more; and the output
+  scrubber removes known credential shapes, which is not a proof that
+  nothing sensitive remains. A numeric value under a credential key is
+  kept, because treating every number as a possible secret destroyed the
+  token counts in an API error.
+
+### Added
+
+- Announce a pull request whose review could not run (#202, closes #196)
+
+### Fixed (0.12.3, never released)
+
+- Resolve the reviewer binary before exec, and ship a unit PATH that finds
+  it (#201, closes #197)
+- Resolve the notification transport at use, not at boot (#199, closes #198)
+
 ## [0.12.3] - 2026-10-12
 
 ### Added
