@@ -1266,3 +1266,121 @@ class TestInvalidUtf8FromAChildIsNotLost:
         # The readable part of the output survives.
         assert "not utf-8" in seen[0].stdout
         assert "bad" in seen[0].stderr
+
+
+class TestTheSweepAndTheCounterAgreeOnWhatFailedMeans:
+    """Two definitions of "failed" sharing one latch produced a message
+    that was false of its own input and repeated every sweep.
+
+    The sweep counted PIPELINE failures, which include an agent that
+    exits 0 and writes a FAILED checkpoint (#174). The counter counts a
+    non-zero exit. A sweep of exit-0 FAILED results would have sent
+    "every repo failed... check the agent credential... this will not
+    be repeated until a dispatch succeeds" — and every dispatch DID
+    succeed by the counter's definition, so the next sweep would clear
+    the latch and send it again.
+    """
+
+    @staticmethod
+    def _result(*, success=False, blocked=False, exit_code=None, n=0):
+        from ctrlrelay.pipelines.base import PipelineResult
+
+        return PipelineResult(
+            success=success,
+            blocked=blocked,
+            session_id=f"s{n}",
+            summary="x",
+            exit_code=exit_code,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_of_exit_zero_failures_does_not_alert(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.cli import alert_if_sweep_all_failed
+
+        db = StateDB(tmp_path / "state.db")
+        spy = SpyTransport()
+        results = [self._result(exit_code=0, n=i) for i in range(88)]
+        with patch(
+            "ctrlrelay.cli.connect_notify_transport",
+            new=AsyncMock(return_value=spy),
+        ):
+            assert (
+                await alert_if_sweep_all_failed(_config(), db, results) is False
+            )
+        db.close()
+        assert spy.sent == []
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_of_nonzero_exits_does_alert(
+        self, tmp_path: Path
+    ) -> None:
+        """The control. Without it, "never alert on a sweep" passes the
+        test above."""
+        from ctrlrelay.cli import alert_if_sweep_all_failed
+
+        db = StateDB(tmp_path / "state.db")
+        spy = SpyTransport()
+        results = [self._result(exit_code=1, n=i) for i in range(88)]
+        with patch(
+            "ctrlrelay.cli.connect_notify_transport",
+            new=AsyncMock(return_value=spy),
+        ):
+            assert await alert_if_sweep_all_failed(_config(), db, results) is True
+        db.close()
+        assert len(spy.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_absent_exit_code_counts_as_a_dispatch_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """The child never reported one — the binary-missing and
+        pipe-error case, not a healthy run."""
+        from ctrlrelay.cli import alert_if_sweep_all_failed
+
+        db = StateDB(tmp_path / "state.db")
+        spy = SpyTransport()
+        results = [self._result(exit_code=None, n=i) for i in range(5)]
+        with patch(
+            "ctrlrelay.cli.connect_notify_transport",
+            new=AsyncMock(return_value=spy),
+        ):
+            assert await alert_if_sweep_all_failed(_config(), db, results) is True
+        db.close()
+        assert len(spy.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_alert_cannot_cost_the_per_repo_messages(
+        self, tmp_path: Path
+    ) -> None:
+        """The sweep calls this before its per-repo fan-out, and that
+        fan-out wraps its whole loop in one `except`. An exception
+        escaping here would skip every per-repo notification."""
+        from ctrlrelay.cli import alert_if_sweep_all_failed_guarded
+
+        db = StateDB(tmp_path / "state.db")
+        with patch(
+            "ctrlrelay.cli.alert_if_sweep_all_failed",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            assert (
+                await alert_if_sweep_all_failed_guarded(_config(), db, [])
+                is False
+            )
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_cancellation_through_the_guard_still_propagates(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.cli import alert_if_sweep_all_failed_guarded
+
+        db = StateDB(tmp_path / "state.db")
+        with patch(
+            "ctrlrelay.cli.alert_if_sweep_all_failed",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await alert_if_sweep_all_failed_guarded(_config(), db, [])
+        db.close()

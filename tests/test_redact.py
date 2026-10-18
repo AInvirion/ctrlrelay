@@ -390,3 +390,94 @@ class TestShortValuesAndMetricNames:
             "credential_cache_size=1.5e3",
         ):
             assert redact_secrets(text) == text, f"{text} lost its value"
+
+
+class TestTheShapesAWorkersStdoutActuallyTakes:
+    """`claude -p --output-format json` emits JSON, and a nested
+    payload arrives inside another JSON string. Verified by running the
+    patterns, because reading them is how the first three versions of
+    this module were believed correct."""
+
+    def test_a_credential_in_a_json_body_is_redacted(self) -> None:
+        """A quote sits between the key and the separator, so the
+        separator never matched and every credential in a JSON body
+        was stored verbatim — the dominant shape of this output."""
+        for text, secret in (
+            ('{"client_secret": "abcdef1234"}', "abcdef1234"),
+            ('{"api_key": "abcdef1234", "password": "hunter2"}', "hunter2"),
+            ("{'token': 'abcdef1234'}", "abcdef1234"),
+        ):
+            out = redact_secrets(text)
+            assert secret not in out, f"{text} leaked"
+
+    def test_a_credential_in_escaped_json_is_redacted(self) -> None:
+        out = redact_secrets('{\\"token\\": \\"abcdef1234\\"}')
+        assert "abcdef1234" not in out
+        assert "[redacted]" in out
+
+    def test_the_key_and_its_quote_survive_so_the_line_still_reads(
+        self,
+    ) -> None:
+        out = redact_secrets('{"client_secret": "abcdef1234"}')
+        assert '"client_secret":' in out
+
+    def test_the_numbers_in_an_api_error_survive(self) -> None:
+        """What the alert tells the operator to go and read.
+
+        None of these was in the metric-suffix list the rule used to
+        carry, which is why the list is gone and the discriminator is
+        the value.
+        """
+        for text in (
+            "max_tokens: 100000",
+            "input_tokens=1500",
+            "total_tokens=1700",
+            "retry_after: 30",
+            "token_count=8192",
+        ):
+            assert redact_secrets(text) == text, f"{text} lost its number"
+
+    def test_a_numeric_secret_is_still_redacted(self) -> None:
+        """The control for the test above: a numeric value is a
+        measurement EXCEPT under a key whose secret is numeric."""
+        for text, secret in (
+            ("password=12345678", "12345678"),
+            ("pin=4921", "4921"),
+            ("otp: 192837", "192837"),
+            ("passcode=0000", "0000"),
+        ):
+            assert secret not in redact_secrets(text), f"{text} leaked"
+
+    def test_the_word_token_in_prose_is_not_eaten(self) -> None:
+        """`Token` is an auth scheme for some APIs and, case
+        insensitively, the English word. Keeping it in the scheme list
+        turned "the token provided was rejected" — a sentence that is
+        the diagnosis — into "the token [redacted] was rejected"."""
+        for text in (
+            "the token provided was rejected",
+            "no token available for this request",
+        ):
+            assert redact_secrets(text) == text, f"{text} was eaten"
+
+    def test_a_bearer_credential_is_still_redacted(self) -> None:
+        """The control: dropping `Token` must not drop the schemes that
+        are unambiguous."""
+        out = redact_secrets("Authorization: Bearer abcdef0123456789")
+        assert "abcdef0123456789" not in out
+        assert "Bearer" in out
+
+    def test_sk_inside_an_ordinary_word_is_not_eaten(self) -> None:
+        """`sk-` is two letters and a hyphen, so unlike `ghp_` it
+        collides with ordinary words."""
+        for text in (
+            "disk-usage-1234567890abcdef",
+            "risk-score-9988776655443322",
+        ):
+            assert redact_secrets(text) == text, f"{text} was eaten"
+
+    def test_a_real_sk_key_is_still_redacted(self) -> None:
+        """The control for the lookbehind."""
+        secret = "sk-ant-api03-" + "x" * 40
+        assert secret not in redact_secrets(f"key is {secret}")
+        bare = "sk-" + "y" * 30
+        assert bare not in redact_secrets(f"key is {bare}")

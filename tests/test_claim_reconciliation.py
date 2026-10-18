@@ -746,3 +746,132 @@ class TestTheRealPipelineRecordsTheExitCode:
         # test is about the record, not the notification.
         assert health["alert_delivered_at"] is None
         assert health["consecutive_failures"] == 1
+
+
+class TestARetractionCancelsTheClaim:
+    """`already_claimed` cannot be "any comment carries the marker".
+
+    The claim comment is deliberately never deleted, so after a
+    reconciliation the marker is still there — and the retraction's own
+    closing line invites a retry. On that retry a marker-only test says
+    the issue is already claimed, no fresh claim is posted, and the
+    issue's LAST relay comment stays "nothing is working on this
+    issue" while a worker runs, and after it succeeds too, because
+    success is announced on chat and not on the issue.
+    """
+
+    @staticmethod
+    def _claim() -> dict:
+        from ctrlrelay.pipelines.dev import AGENT_CLAIM_COMMENT
+
+        return {"author": {"login": "bot"}, "body": AGENT_CLAIM_COMMENT}
+
+    @staticmethod
+    def _retraction() -> dict:
+        return {
+            "author": {"login": "bot"},
+            "body": claim_failure_comment("s", reason="r", exit_code=1),
+        }
+
+    def test_no_comments_is_not_a_claim(self) -> None:
+        from ctrlrelay.pipelines.dev import claim_is_live
+
+        assert claim_is_live([]) is False
+        assert claim_is_live(None) is False
+
+    def test_a_claim_alone_is_live(self) -> None:
+        from ctrlrelay.pipelines.dev import claim_is_live
+
+        assert claim_is_live([self._claim()]) is True
+
+    def test_a_claim_followed_by_a_retraction_is_not_live(self) -> None:
+        from ctrlrelay.pipelines.dev import claim_is_live
+
+        assert claim_is_live([self._claim(), self._retraction()]) is False
+
+    def test_a_fresh_claim_after_a_retraction_is_live_again(self) -> None:
+        from ctrlrelay.pipelines.dev import claim_is_live
+
+        assert (
+            claim_is_live(
+                [self._claim(), self._retraction(), self._claim()]
+            )
+            is True
+        )
+
+    def test_operator_comments_in_between_change_nothing(self) -> None:
+        from ctrlrelay.pipelines.dev import claim_is_live
+
+        chatter = {"author": {"login": "ovalenzuela"}, "body": "any news?"}
+        assert (
+            claim_is_live([self._claim(), chatter, self._retraction(), chatter])
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_retried_run_posts_a_fresh_claim(
+        self, tmp_path: Path
+    ) -> None:
+        """Driven through `run_dev_issue`, because whether the retry
+        posts a claim is a property of that function and not of the
+        helper."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import AGENT_CLAIM_MARKER, run_dev_issue
+
+        worktree, github, dispatcher = _dev_issue_harness(
+            tmp_path, checkpoint=None, exit_code=1
+        )
+        # The issue as the previous failed run left it.
+        github.get_issue.return_value = {
+            "number": 853,
+            "title": "t",
+            "body": "b",
+            "comments": [self._claim(), self._retraction()],
+        }
+        state_db = StateDB(tmp_path / "state.db")
+        with (
+            patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock),
+            patch.object(
+                worktree,
+                "create_worktree_with_new_branch",
+                new_callable=AsyncMock,
+            ) as create,
+            patch.object(worktree, "remove_worktree", new_callable=AsyncMock),
+            patch.object(
+                worktree, "branch_exists_locally", new_callable=AsyncMock
+            ) as exists_local,
+            patch.object(
+                worktree, "branch_exists_on_remote", new_callable=AsyncMock
+            ) as exists_remote,
+            patch.object(worktree, "delete_branch", new_callable=AsyncMock),
+            patch.object(worktree, "symlink_context"),
+            patch.object(worktree, "remove_context_symlink"),
+        ):
+            wt = tmp_path / "worktrees" / "wt"
+            wt.mkdir(parents=True)
+            create.return_value = (wt, True)
+            exists_local.return_value = False
+            exists_remote.return_value = False
+            await run_dev_issue(
+                repo="owner/repo",
+                issue_number=853,
+                branch_template="fix/issue-{n}",
+                dispatcher=dispatcher,
+                github=github,
+                worktree=worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+        state_db.close()
+        posted = [
+            c.kwargs["body"] for c in github.comment_on_issue.await_args_list
+        ]
+        assert any(AGENT_CLAIM_MARKER in b for b in posted), (
+            "a retry after a retraction posted no fresh claim, so the "
+            "issue's last relay comment says nothing is working on it"
+        )
+        # And the claim comes before this run's own retraction.
+        assert AGENT_CLAIM_MARKER in posted[0]
+        assert AGENT_OUTCOME_MARKER in posted[-1]
