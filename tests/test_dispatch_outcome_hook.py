@@ -766,3 +766,192 @@ class TestSweepAllFailedAlert:
             assert await alert_if_sweep_all_failed(_config(), db, []) is False
         db.close()
         assert spy.sent == []
+
+
+class TestCommunicateFailuresAreReported:
+    @pytest.mark.asyncio
+    async def test_an_oserror_reading_the_pipes_reports_an_outcome(
+        self, tmp_path: Path
+    ) -> None:
+        """Only the spawn failure, the timeout and a normal exit used to
+        report.
+
+        An `OSError` out of `communicate()` propagated with no
+        `DispatchOutcome`, so a run of those would have been this
+        ticket's own defect in a narrower window: dispatches failing
+        with nothing counting them and no exit code recorded.
+        """
+        seen: list[DispatchOutcome] = []
+
+        async def hook(outcome):
+            seen.append(outcome)
+
+        proc = AsyncMock()
+        proc.communicate.side_effect = OSError("read failed on the pipe")
+        proc.returncode = None
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(OSError):
+                await d.spawn_session(
+                    session_id="s",
+                    prompt="p",
+                    working_dir=tmp_path,
+                    state_file=tmp_path / "missing.json",
+                )
+        assert len(seen) == 1
+        assert seen[0].ok is False
+        assert "read failed on the pipe" in seen[0].stderr
+        # The child is killed: we are no longer reading its output, and
+        # leaving it running against the worktree is what the
+        # cancellation arm exists to prevent.
+        proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_cancellation_is_not_swallowed_by_that_arm(
+        self, tmp_path: Path
+    ) -> None:
+        """The control: the broad `except Exception` must not take
+        precedence over the cancellation handling above it."""
+        proc = AsyncMock()
+        proc.communicate.side_effect = asyncio.CancelledError()
+        proc.returncode = None
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        seen: list[DispatchOutcome] = []
+
+        async def hook(outcome):
+            seen.append(outcome)
+
+        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(asyncio.CancelledError):
+                await d.spawn_session(
+                    session_id="s",
+                    prompt="p",
+                    working_dir=tmp_path,
+                    state_file=tmp_path / "missing.json",
+                )
+        # A shutdown is not a dispatch failure and must not count
+        # toward the outage threshold.
+        assert seen == []
+
+
+class TestTheLatchReleaseIsOwned:
+    def test_releasing_without_a_stamp_clears_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """A caller that cannot say which claim it took must not clear
+        one.
+
+        Two pollers share this row: A claims, a success resets the run,
+        B starts a new outage and claims — and an unconditional release
+        from A would clear B's latch and let the same outage be
+        announced twice.
+        """
+        db = StateDB(tmp_path / "state.db")
+        stamp = db.claim_dispatch_alert()
+        assert stamp is not None
+        db.release_dispatch_alert(None)
+        assert db.get_dispatch_health()["alerted_at"] is not None
+        db.close()
+
+    def test_releasing_a_superseded_stamp_clears_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        stamp = db.claim_dispatch_alert()
+        assert stamp is not None
+        # Somebody else's newer claim, after a success cleared ours.
+        db.reset_dispatch_failures()
+        newer = db.claim_dispatch_alert()
+        assert newer is not None
+        db.release_dispatch_alert(stamp - 1)
+        assert db.get_dispatch_health()["alerted_at"] == newer
+        db.close()
+
+    def test_releasing_our_own_stamp_does_clear_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The control. Without it, "never release" passes both tests
+        above and the failed-delivery fix is undone."""
+        db = StateDB(tmp_path / "state.db")
+        stamp = db.claim_dispatch_alert()
+        assert stamp is not None
+        db.release_dispatch_alert(stamp)
+        assert db.get_dispatch_health()["alerted_at"] is None
+        db.close()
+
+    def test_a_second_claim_is_refused_while_one_is_held(
+        self, tmp_path: Path
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        assert db.claim_dispatch_alert() is not None
+        assert db.claim_dispatch_alert() is None
+        db.close()
+
+
+class TestAStalledSendCannotHangADispatch:
+    @pytest.mark.asyncio
+    async def test_the_send_is_bounded(self, tmp_path: Path) -> None:
+        """The alert is awaited from inside the dispatcher, after the
+        child has exited and while the pipeline holds the repo lock.
+
+        An unbounded send on an accepted-then-stalled socket would
+        stall the whole serial poll cycle to deliver a notification.
+        """
+        import ctrlrelay.cli as cli_module
+        from ctrlrelay.cli import make_dispatch_outcome_hook
+
+        class Stalls(SpyTransport):
+            async def send(self, text: str, **kwargs) -> None:
+                await asyncio.sleep(3600)
+
+        db = StateDB(tmp_path / "state.db")
+        hook = make_dispatch_outcome_hook(_config(threshold=1), db)
+        with (
+            patch.object(cli_module, "_NOTIFY_SEND_TIMEOUT_SECONDS", 0.05),
+            patch(
+                "ctrlrelay.cli.connect_notify_transport",
+                new=AsyncMock(return_value=Stalls()),
+            ),
+        ):
+            await asyncio.wait_for(hook(_outcome("s-0", 1)), timeout=10)
+        # Undelivered, so the latch went back and the next failure
+        # will try again.
+        assert db.get_dispatch_health()["alerted_at"] is None
+        db.close()
+
+
+class TestTheWriterIsTheChokepoint:
+    def test_record_session_outcome_scrubs_what_it_is_given(
+        self, tmp_path: Path
+    ) -> None:
+        """Defence in depth at the one place every writer goes through.
+
+        `persist_dispatch_outcome` already scrubs, so this is the
+        second pass — and it is the one that holds for a caller added
+        later. Redaction is idempotent, so it costs nothing. The
+        original docstring argued the opposite, that a sanitiser in
+        the writer could be bypassed; it is the CALLERS that can be
+        added without one.
+        """
+        secret = "ghp_" + "q" * 36
+        db = StateDB(tmp_path / "state.db")
+        db.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("s", "dev", "o/r", "running", 0),
+        )
+        db.commit()
+        # Deliberately unscrubbed, as a future careless caller would.
+        db.record_session_outcome(
+            "s", exit_code=1, output_tail=f"raw {secret} straight in"
+        )
+        tail = db.get_session_row("s")["output_tail"]
+        db.close()
+        assert secret not in tail
+        assert "[redacted]" in tail
+        # And the surrounding text still reads.
+        assert "straight in" in tail

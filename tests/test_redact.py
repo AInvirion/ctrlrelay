@@ -275,3 +275,47 @@ class TestWorkerOutputTail:
         out = worker_output_tail("", payload)
         assert payload in out
         assert "[...truncated]" not in out
+
+
+class TestMetricsSurviveWhileCredentialsDoNot:
+    """The scrubber exists so an operator can tell a credential failure
+    from a crash. Losing the numbers that explain one is a real cost,
+    so both directions are pinned."""
+
+    def test_a_metric_suffix_is_not_redacted(self) -> None:
+        for text in (
+            "token_count=8192",
+            "credential_cache_size=4096",
+            "output_token_total=4096",
+            "auth_token_ms=1500",
+            "secret_bytes=512",
+        ):
+            assert redact_secrets(text) == text, f"{text} lost its value"
+
+    def test_the_credential_spellings_still_go(self) -> None:
+        """The control. Without it, exempting metrics could be
+        implemented as "never redact a key/value pair" and the test
+        above would still pass."""
+        for name, value in (
+            ("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCY"),
+            ("GITHUB_TOKEN", "abcdef1234567890"),
+            ("MY_API_KEY", "abcdef1234567890"),
+            ("client_secret", "abcdef1234567890"),
+        ):
+            out = redact_secrets(f"{name}={value}")
+            assert value not in out, f"{name} leaked"
+
+    def test_the_exemption_is_of_metric_names_not_credential_names(
+        self,
+    ) -> None:
+        """A key whose name merely CONTAINS a metric word is not exempt
+        unless the name ENDS in one.
+
+        The direction matters: the credential side has to stay
+        open-ended because the next secret will have a name nobody
+        listed, while a key ending in `_count` holding a secret would
+        be perverse. An enumeration is only safe where being incomplete
+        costs a redaction rather than a leak.
+        """
+        out = redact_secrets("token_count_secret=abcdef1234567890")
+        assert "abcdef1234567890" not in out

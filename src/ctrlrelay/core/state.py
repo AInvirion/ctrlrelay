@@ -356,21 +356,29 @@ class StateDB:
         same silence #204 is about, one layer in. The caller logs the
         miss.
 
-        ``output_tail`` must already be scrubbed and capped by
-        :func:`ctrlrelay.core.redact.worker_output_tail`. This method
-        does not sanitise, deliberately: a sanitiser that lives in the
-        writer is one that a second writer can bypass without
-        noticing, and the scrubbing has its own tests.
+        ``output_tail`` is expected to have been scrubbed and capped
+        already by :func:`ctrlrelay.core.redact.worker_output_tail`,
+        and is scrubbed AGAIN here. Redaction is idempotent, so the
+        second pass costs nothing and it means the invariant "no
+        credential shape reaches the database" is enforced at the one
+        place every writer must go through, rather than depending on
+        each caller remembering. An earlier version of this docstring
+        argued the opposite — that a sanitiser in the writer can be
+        bypassed — which is backwards: the writer is the chokepoint,
+        and it is the CALLERS that can be added without it.
 
         An empty ``output_tail`` is stored as ``NULL`` rather than
         ``""`` — "the agent wrote nothing before it died" is a real
         and differently-shaped failure, and the two should not read
         the same on inspection.
         """
+        from ctrlrelay.core.redact import redact_secrets
+
+        scrubbed = redact_secrets(output_tail) if output_tail else None
         cursor = self._conn.execute(
             "UPDATE sessions SET claude_exit_code = ?, output_tail = ? "
             "WHERE id = ?",
-            (exit_code, output_tail or None, session_id),
+            (exit_code, scrubbed or None, session_id),
         )
         self._conn.commit()
         return cursor.rowcount > 0
@@ -398,6 +406,29 @@ class StateDB:
         )
         self._conn.commit()
 
+    def _begin_immediate(self) -> None:
+        """Start a write transaction, taking the lock up front.
+
+        ``isolation_level`` is sqlite3's default here, so an explicit
+        ``BEGIN IMMEDIATE`` is what takes the write lock at the start
+        rather than upgrading mid-transaction, which is how two writers
+        deadlock.
+
+        If a transaction is already open on this connection, ``BEGIN``
+        raises ``cannot start a transaction within a transaction`` — and
+        on the old code that happened BEFORE the ``try``, so no rollback
+        ran and the existing transaction kept its lock. It is committed
+        here instead of rolled back: every writer in this class commits
+        immediately after its ``execute``, so a transaction still open
+        at this point is a write whose commit is pending, and rolling it
+        back would discard somebody's data to tidy up a lock. Logged,
+        because arriving here at all means a caller left a transaction
+        open and that is worth seeing rather than smoothing over.
+        """
+        if self._conn.in_transaction:
+            self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+
     def dispatch_failure_count(self) -> int:
         """Length of the current run of failed dispatches (0 when healthy).
 
@@ -411,10 +442,14 @@ class StateDB:
         ).fetchone()
         return int(row["consecutive_failures"]) if row else 0
 
-    def record_dispatch_failure(self, threshold: int) -> tuple[int, bool]:
+    def record_dispatch_failure(
+        self, threshold: int
+    ) -> tuple[int, int | None]:
         """Extend the failure run and decide, in ONE transaction.
 
-        Returns ``(consecutive_failures, may_alert)``.
+        Returns ``(consecutive_failures, claim_stamp)``, where the stamp
+        is ``None`` when no alert may be sent and otherwise identifies
+        the claim for :meth:`release_dispatch_alert`.
 
         The increment, the threshold comparison and the latch claim are
         a single ``BEGIN IMMEDIATE`` transaction because two pollers can
@@ -425,18 +460,14 @@ class StateDB:
         back in a separate statement had the same hazard pointed the
         other way.
 
-        ``may_alert`` is ``True`` at most once per failure run. It is the
+        A stamp is handed out at most once per failure run. It is the
         right to ATTEMPT one delivery, not a record that one happened —
         see :meth:`release_dispatch_alert`.
         """
         if threshold < 1:
             raise ValueError(f"threshold must be at least 1, got {threshold!r}")
-        # `isolation_level` is sqlite3's default, so an explicit
-        # BEGIN IMMEDIATE is needed to take the write lock up front
-        # rather than upgrading mid-transaction and risking a deadlock
-        # between two writers.
-        self._conn.execute("BEGIN IMMEDIATE")
         try:
+            self._begin_immediate()
             self._conn.execute(
                 "INSERT OR IGNORE INTO dispatch_health "
                 "(id, consecutive_failures) VALUES (1, 0)"
@@ -452,17 +483,22 @@ class StateDB:
                 "FROM dispatch_health WHERE id = 1"
             ).fetchone()
             consecutive = int(row["consecutive_failures"])
-            may_alert = consecutive >= threshold and row["alerted_at"] is None
-            if may_alert:
+            claimed: int | None = None
+            if consecutive >= threshold and row["alerted_at"] is None:
+                claimed = int(time.time())
                 self._conn.execute(
                     "UPDATE dispatch_health SET alerted_at = ? WHERE id = 1",
-                    (int(time.time()),),
+                    (claimed,),
                 )
             self._conn.commit()
         except BaseException:
-            self._conn.rollback()
+            # Only when there is a transaction to undo. `BEGIN` itself
+            # can be what raised, and a bare rollback then discards a
+            # transaction this method never started.
+            if self._conn.in_transaction:
+                self._conn.rollback()
             raise
-        return consecutive, may_alert
+        return consecutive, claimed
 
     def reset_dispatch_failures(self) -> int:
         """Clear the run and the alert latch; return the previous length.
@@ -475,8 +511,8 @@ class StateDB:
         One transaction, for the same reason as
         :meth:`record_dispatch_failure`.
         """
-        self._conn.execute("BEGIN IMMEDIATE")
         try:
+            self._begin_immediate()
             self._conn.execute(
                 "INSERT OR IGNORE INTO dispatch_health "
                 "(id, consecutive_failures) VALUES (1, 0)"
@@ -492,12 +528,18 @@ class StateDB:
             )
             self._conn.commit()
         except BaseException:
-            self._conn.rollback()
+            # Only when there is a transaction to undo. `BEGIN` itself
+            # can be what raised, and a bare rollback then discards a
+            # transaction this method never started.
+            if self._conn.in_transaction:
+                self._conn.rollback()
             raise
         return previous
 
-    def claim_dispatch_alert(self) -> bool:
-        """Take the right to attempt one alert, or return ``False``.
+    def claim_dispatch_alert(self) -> int | None:
+        """Take the right to attempt one alert; return the claim stamp.
+
+        ``None`` means somebody already holds it.
 
         ``True`` at most once per failure run: the UPDATE is conditional
         on ``alerted_at IS NULL``, so the claim and the test are one
@@ -509,15 +551,16 @@ class StateDB:
         cannot be separated.
         """
         self._ensure_dispatch_health_row()
+        stamp = int(time.time())
         cursor = self._conn.execute(
             "UPDATE dispatch_health SET alerted_at = ? "
             "WHERE id = 1 AND alerted_at IS NULL",
-            (int(time.time()),),
+            (stamp,),
         )
         self._conn.commit()
-        return cursor.rowcount > 0
+        return stamp if cursor.rowcount > 0 else None
 
-    def release_dispatch_alert(self) -> None:
+    def release_dispatch_alert(self, stamp: int | None = None) -> None:
         """Give the claim back, because delivery failed.
 
         Claiming the latch is the right to ATTEMPT one message, not a
@@ -533,8 +576,26 @@ class StateDB:
         right to announce it is handed back, so the next failure tries
         again.
         """
+        if stamp is None:
+            # No claim identified, so nothing is released. A caller that
+            # cannot say which claim it took must not clear one.
+            return
+        # Conditional on the stamp we wrote, so this releases OUR claim
+        # and not a newer one. Two pollers share this row: A claims, a
+        # success resets the run, B starts a new outage and claims, and
+        # an unconditional release from A would then clear B's latch and
+        # let the same outage be announced twice.
+        #
+        # The residual limit, stated rather than papered over: the stamp
+        # is a whole second, so two processes claiming within the same
+        # second are indistinguishable here. Closing that needs an
+        # ownership column, and what it buys is the avoidance of a
+        # DUPLICATE message — the safe direction — so it is recorded as
+        # a known limit instead.
         self._conn.execute(
-            "UPDATE dispatch_health SET alerted_at = NULL WHERE id = 1"
+            "UPDATE dispatch_health SET alerted_at = NULL "
+            "WHERE id = 1 AND alerted_at = ?",
+            (stamp,),
         )
         self._conn.commit()
 

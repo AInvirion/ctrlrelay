@@ -343,6 +343,44 @@ class ClaudeDispatcher:
                     pass
             raise
 
+        except Exception as e:
+            # Anything else out of `communicate()` — an OSError reading
+            # the pipes, a decode fault, a broken pipe. The child ran
+            # and this dispatch failed, so it MUST be reported: the
+            # previous version only reported the spawn failure, the
+            # timeout and a normal exit, so a run of these would have
+            # been the ticket's own defect in a narrower window —
+            # dispatches failing with nothing counting them.
+            #
+            # Kill the child first. The exception means we are no
+            # longer reading its output, and leaving it running against
+            # the worktree is what the cancellation arm above exists to
+            # prevent.
+            if proc.returncode is None:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+            _logger.error(
+                "dispatcher.session.communicate_failed",
+                extra={
+                    **ident,
+                    "error_type": type(e).__name__,
+                    "error": str(e)[:200],
+                    "elapsed_ms": _elapsed_ms(started),
+                },
+            )
+            await self._report_outcome(
+                session_id=session_id,
+                repo=repo,
+                issue_number=issue_number,
+                exit_code=None,
+                stdout="",
+                stderr=f"{type(e).__name__}: {e}",
+            )
+            raise
+
         elapsed_ms = _elapsed_ms(started)
         exit_code = proc.returncode or 0
         stdout_text = stdout.decode()

@@ -117,11 +117,26 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # has no boundary after `TOKEN`. What bounds the match instead is
     # the assignment operator that must follow, which is what makes
     # this pattern a key/value rule rather than a word list.
+    # `(?![A-Za-z0-9_]*(?:_count|_len|...))` exempts an unambiguous
+    # METRIC suffix, so `token_count=8192` and `credential_cache_size=
+    # 4096` survive. Losing those was a real cost: this module exists
+    # so an operator can tell a credential failure from a crash, and a
+    # token count is exactly the kind of number that explains one.
+    #
+    # The exemption list is of METRIC names, not of credential names.
+    # That direction matters: the credential side must stay open-ended
+    # because the next secret will have a name nobody listed, while a
+    # key literally ending in `_count` or `_bytes` holding a secret
+    # would be perverse. An enumeration is safe only where being
+    # incomplete costs a redaction rather than a leak.
     (
         re.compile(
             r"(?i)([A-Za-z0-9_]*(?:api[_-]?key|access[_-]?key|access[_-]?token"
             r"|refresh[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret"
-            r"|password|passwd|secret|token|credential)[A-Za-z0-9_]*)"
+            r"|password|passwd|secret|token|credential)"
+            r"(?![A-Za-z0-9_]*(?:_count|_len|_length|_size|_bytes|_ms"
+            r"|_seconds|_limit|_total)\b)"
+            r"[A-Za-z0-9_]*)"
             r"(\s*[:=]\s*|\s+is\s+)"
             r"(\"[^\"\n]{4,}\"|'[^'\n]{4,}'|[^\s,;}\"'\n]{4,})"
         ),

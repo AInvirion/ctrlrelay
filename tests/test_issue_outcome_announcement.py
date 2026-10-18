@@ -120,6 +120,34 @@ class TestOtherOutcomesAreUnchanged:
         assert t.sent == ["✅ Task done on #853 (o/r): report posted"]
 
     @pytest.mark.asyncio
+    async def test_a_dev_success_calls_announce_dev_success(self) -> None:
+        """The delegation itself, not just its output.
+
+        Asserting only the two resulting messages would pass for a
+        duplicated implementation inlined here — which is exactly the
+        drift the extraction exists to prevent.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        import ctrlrelay.cli as cli_module
+
+        t = FakeTransport()
+        with patch.object(
+            cli_module, "announce_dev_success", new=AsyncMock(return_value=[])
+        ) as delegate:
+            await announce_issue_outcome(
+                t,
+                repo="o/r",
+                issue_number=853,
+                is_task=False,
+                result=PipelineResult(
+                    success=True, session_id="s", summary="PR #42 opened"
+                ),
+            )
+        delegate.assert_awaited_once()
+        assert delegate.await_args.kwargs["repo"] == "o/r"
+
+    @pytest.mark.asyncio
     async def test_a_dev_success_goes_through_announce_dev_success(
         self,
     ) -> None:

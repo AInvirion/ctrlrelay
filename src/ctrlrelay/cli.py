@@ -295,6 +295,14 @@ def _bridge_socket_settings(config) -> tuple[Path, int] | None:
 # busy.
 _NOTIFY_CONNECT_TIMEOUT_SECONDS = 10
 
+# The same reasoning one step later: a socket that ACCEPTED and then
+# stalls costs whatever is awaiting the send. The relay-health alert
+# (#204) is awaited from inside the dispatcher, after the child has
+# exited and while the pipeline still holds the repo lock — so an
+# unbounded send there would stall the serial poll cycle to deliver a
+# notification.
+_NOTIFY_SEND_TIMEOUT_SECONDS = 10
+
 # Strong references to close() tasks nobody is waiting for. Without
 # this the loop may drop a task mid-close, and the warning for it
 # arrives at interpreter exit with no context.
@@ -946,7 +954,16 @@ async def send_relay_alert(config, alert) -> bool:
         )
         return False
     try:
-        await transport.send(alert.message())
+        # BOUNDED. `connect_notify_transport` already caps its connect,
+        # but an accepted socket that then stalls would hold this call
+        # open — and this call is awaited from inside the dispatcher,
+        # after the child has exited, while the pipeline still holds
+        # the repo lock. A hanging send would stall the whole serial
+        # poll cycle to deliver a notification.
+        await asyncio.wait_for(
+            transport.send(alert.message()),
+            timeout=_NOTIFY_SEND_TIMEOUT_SECONDS,
+        )
     except Exception as e:
         _log_quietly(
             "dispatch_health.alert_send_failed",
@@ -987,10 +1004,29 @@ async def deliver_relay_alert(config, state_db, alert) -> bool:
     A duplicate is the safe direction here; silence is the one that
     cost two days.
     """
-    if await send_relay_alert(config, alert):
+    delivered = False
+    try:
+        delivered = await send_relay_alert(config, alert)
+    except asyncio.CancelledError:
+        # Shutting down. The latch is left as it is on purpose: there
+        # is no next failure to retry on, and the process is going
+        # away. Propagated so the caller's cleanup runs.
+        raise
+    except BaseException:
+        # `send_relay_alert` is guarded and `connect_notify_transport`
+        # documents that it does not raise — but this function's whole
+        # job is that an undelivered alert does not keep the latch, and
+        # that must not rest on another function's promise. The release
+        # below runs for a raise exactly as it does for a `False`.
+        _log_quietly(
+            "dispatch_health.alert_send_raised",
+            reason=alert.reason,
+            detail="the alert was not delivered; releasing the latch",
+        )
+    if delivered:
         return True
     try:
-        state_db.release_dispatch_alert()
+        state_db.release_dispatch_alert(alert.claim_stamp)
     except Exception as e:
         _log_quietly(
             "dispatch_health.alert_latch_stuck",

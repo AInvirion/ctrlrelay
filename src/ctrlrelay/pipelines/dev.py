@@ -1134,14 +1134,35 @@ async def run_dev_issue(
     # wins over this snapshot.
     branch_existed_before = True
 
-    # Whether a claim comment stands on the issue, and therefore
+    # Whether a claim comment MAY stand on the issue, and therefore
     # whether there is anything for the failure path to reconcile
-    # (#204). Set once the claim block below has run — either because
-    # this call posted the comment or because a previous attempt's
-    # marker was already there. Starts False so the early failures
-    # (lock contention, an unreadable issue) do not comment on an
-    # issue the relay never claimed.
-    claim_posted = False
+    # (#204). Starts False so the early failures — lock contention, an
+    # unreadable issue — do not comment on an issue the relay never
+    # touched.
+    #
+    # Set BEFORE the `comment_on_issue` await, not after. `gh` can
+    # create the comment and then lose the response, and the two
+    # mistakes are not symmetrical: a claim left standing with nothing
+    # working on the issue is the eighteen-hour defect this ticket
+    # exists for, while a reconciliation posted when the claim never
+    # landed says "nothing is working on this issue" — which is true
+    # either way. So the flag is deliberately optimistic about a claim
+    # existing and the wording below does not depend on one being
+    # visible.
+    #
+    # Also True when a previous attempt's marker was already there: a
+    # stale claim from an earlier run is just as wrong, and the reader
+    # of the issue cannot tell them apart.
+    claim_may_stand = False
+
+    # The last exit code a worker actually reported, for the exception
+    # path's reconciliation comment. The exception path used to pass
+    # `None` unconditionally under a comment claiming no exit code was
+    # available — false whenever `pipeline.run` had already returned
+    # one and a later step (verification, review, cleanup, a `gh` call)
+    # raised. The comment then told a reader "not recorded" about a
+    # number that was sitting in the result.
+    last_exit_code: int | None = None
 
     try:
         # Get issue details
@@ -1155,18 +1176,13 @@ async def run_dev_issue(
             AGENT_CLAIM_MARKER in (c.get("body") or "")
             for c in existing_comments
         )
+        claim_may_stand = True
         if not already_claimed:
             await github.comment_on_issue(
                 repo=repo,
                 issue_number=issue_number,
                 body=AGENT_CLAIM_COMMENT,
             )
-        # True in both branches: a claim left by a previous attempt is
-        # just as stale as one this call posted, and the reader of the
-        # issue cannot tell them apart. Set AFTER the await, so a
-        # `comment_on_issue` that raised does not leave us claiming to
-        # have posted something.
-        claim_posted = True
 
         # Issue #51: ownership is signaled by ``created_fresh`` returned
         # from create_worktree_with_new_branch. True when this call
@@ -1243,6 +1259,7 @@ async def run_dev_issue(
             transport=transport,
         )
         result = await pipeline.run(ctx)
+        last_exit_code = result.exit_code
 
         # BLOCKED loop: if Claude needs input, post the question to the
         # transport (Telegram), wait for the operator's reply, and resume
@@ -1533,7 +1550,7 @@ async def run_dev_issue(
                 reason=failure_text(result),
                 exit_code=result.exit_code,
                 pr_number=pr_for_comment,
-                claim_posted=claim_posted,
+                claim_posted=claim_may_stand,
             )
 
         return result
@@ -1623,18 +1640,20 @@ async def run_dev_issue(
         # standing just as surely as a non-zero exit does, and it is
         # reached by more causes.
         #
-        # No exit code is available here: the exception came from
-        # somewhere other than the child's return value, so reporting a
-        # number would mean inventing one. `None` prints as "not
-        # recorded", which is the truth.
+        # The exit code is whatever the worker last reported, which is
+        # `None` only when it never got as far as running. Passing
+        # `None` unconditionally here was wrong in the common case: an
+        # exception out of verification, review or cleanup arrives
+        # AFTER `pipeline.run` returned an exit code, and the comment
+        # then said "not recorded" about a number it had.
         await reconcile_claim_on_failure(
             github,
             repo=repo,
             issue_number=issue_number,
             session_id=session_id,
             reason=f"{type(e).__name__}: {str(e)[:200]}",
-            exit_code=None,
-            claim_posted=claim_posted,
+            exit_code=last_exit_code,
+            claim_posted=claim_may_stand,
         )
 
         return PipelineResult(

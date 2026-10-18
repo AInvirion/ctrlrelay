@@ -511,3 +511,124 @@ class TestRunDevIssueReconcilesTheClaim:
         assert not result.success
         assert "locked by another session" in (result.error or "")
         github.comment_on_issue.assert_not_awaited()
+
+
+class TestTheExceptionPathNamesTheExitCodeItHas:
+    """The exception path used to pass `exit_code=None` unconditionally,
+    under a comment claiming no exit code was available.
+
+    That is false whenever the worker already ran: an exception out of
+    verification, review or cleanup arrives after `pipeline.run` has
+    returned a result carrying the code, and the reconciliation comment
+    then told a reader "not recorded" about a number it was holding.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_late_exception_still_reports_the_workers_exit_code(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        worktree, github, dispatcher = _dev_issue_harness(
+            tmp_path, checkpoint=None, exit_code=7
+        )
+        state_db = StateDB(tmp_path / "state.db")
+        with (
+            patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock),
+            patch.object(
+                worktree, "branch_exists_locally", new_callable=AsyncMock
+            ) as exists_local,
+            patch.object(
+                worktree,
+                "create_worktree_with_new_branch",
+                new_callable=AsyncMock,
+            ) as create,
+            patch.object(
+                worktree, "remove_worktree", new_callable=AsyncMock
+            ) as remove,
+            patch.object(
+                worktree, "branch_exists_on_remote", new_callable=AsyncMock
+            ) as exists_remote,
+            patch.object(worktree, "delete_branch", new_callable=AsyncMock),
+            patch.object(worktree, "symlink_context"),
+            patch.object(worktree, "remove_context_symlink"),
+        ):
+            wt = tmp_path / "worktrees" / "wt"
+            wt.mkdir(parents=True)
+            create.return_value = (wt, True)
+            exists_local.return_value = False
+            exists_remote.return_value = False
+            # The worker ran and exited 7; cleanup is what blows up, so
+            # the exception arrives AFTER the exit code is known.
+            remove.side_effect = RuntimeError("worktree remove failed")
+            result = await run_dev_issue(
+                repo="owner/repo",
+                issue_number=853,
+                branch_template="fix/issue-{n}",
+                dispatcher=dispatcher,
+                github=github,
+                worktree=worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+        state_db.close()
+        assert not result.success
+        bodies = _retraction_bodies(github)
+        assert len(bodies) == 1
+        assert "`7`" in bodies[0], (
+            "the exception path reported no exit code although the worker "
+            "had returned one"
+        )
+        assert "not recorded" not in bodies[0]
+
+
+class TestAClaimWhoseResponseWasLostIsStillReconciled:
+    @pytest.mark.asyncio
+    async def test_a_comment_call_that_raises_still_reconciles(
+        self, tmp_path: Path
+    ) -> None:
+        """`gh` can create the comment and then lose the response.
+
+        The flag is therefore set BEFORE the await. The two mistakes
+        are not symmetrical: a claim left standing with nothing working
+        on the issue is the eighteen-hour defect this ticket exists
+        for, while a reconciliation posted when the claim never landed
+        still says only that nothing is working on the issue — true
+        either way.
+        """
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        worktree, github, dispatcher = _dev_issue_harness(
+            tmp_path, checkpoint=None, exit_code=1
+        )
+        calls: list[str] = []
+
+        async def flaky_comment(*, repo, issue_number, body):
+            calls.append(body)
+            if AGENT_CLAIM_MARKER in body:
+                # Created on the server, lost on the wire.
+                raise RuntimeError("timed out waiting for the response")
+
+        github.comment_on_issue.side_effect = flaky_comment
+        state_db = StateDB(tmp_path / "state.db")
+        result = await run_dev_issue(
+            repo="owner/repo",
+            issue_number=853,
+            branch_template="fix/issue-{n}",
+            dispatcher=dispatcher,
+            github=github,
+            worktree=worktree,
+            dashboard=None,
+            state_db=state_db,
+            transport=None,
+            contexts_dir=tmp_path / "contexts",
+        )
+        state_db.close()
+        assert not result.success
+        assert any(AGENT_OUTCOME_MARKER in b for b in calls), (
+            "a claim whose response was lost left no reconciliation"
+        )
