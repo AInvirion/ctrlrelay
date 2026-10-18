@@ -839,8 +839,8 @@ class TestCommunicateFailuresAreReported:
 
 
 class TestTheLatchReleaseIsOwned:
-    def test_releasing_without_a_stamp_clears_nothing(
-        self, tmp_path: Path
+    def test_releasing_without_a_stamp_clears_nothing_and_says_so(
+        self, tmp_path: Path, caplog
     ) -> None:
         """A caller that cannot say which claim it took must not clear
         one.
@@ -849,12 +849,42 @@ class TestTheLatchReleaseIsOwned:
         B starts a new outage and claims — and an unconditional release
         from A would clear B's latch and let the same outage be
         announced twice.
+
+        The LOG is asserted as well as the state, because the state
+        alone cannot catch a regression here: `WHERE alerted_at = NULL`
+        never matches in SQL, so deleting the early return changes no
+        outcome. A mutation of it survived on exactly that, and the log
+        is what turns the branch into a guard that can fail.
+        """
+        import logging
+
+        db = StateDB(tmp_path / "state.db")
+        stamp = db.claim_dispatch_alert()
+        assert stamp is not None
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            db.release_dispatch_alert(None)
+        assert db.get_dispatch_health()["alerted_at"] is not None
+        assert any(
+            r.getMessage() == "dispatch_health.release_without_claim"
+            for r in caplog.records
+        ), "a release that named no claim was not reported"
+        db.close()
+
+    def test_the_release_is_conditional_on_the_stamp_in_sql(
+        self, tmp_path: Path
+    ) -> None:
+        """The WHERE clause, not the early return, is what protects a
+        newer claim.
+
+        Asserted separately so the two mechanisms are pinned
+        independently: the early return reports a caller bug, and this
+        is what makes a wrong stamp harmless even without it.
         """
         db = StateDB(tmp_path / "state.db")
         stamp = db.claim_dispatch_alert()
         assert stamp is not None
-        db.release_dispatch_alert(None)
-        assert db.get_dispatch_health()["alerted_at"] is not None
+        db.release_dispatch_alert(stamp + 1000)
+        assert db.get_dispatch_health()["alerted_at"] == stamp
         db.close()
 
     def test_releasing_a_superseded_stamp_clears_nothing(

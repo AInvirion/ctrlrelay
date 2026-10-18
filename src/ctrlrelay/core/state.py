@@ -7,6 +7,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ctrlrelay.core.obs import get_logger, log_event
+
+_logger = get_logger("core.state")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -374,11 +378,17 @@ class StateDB:
         """
         from ctrlrelay.core.redact import redact_secrets
 
+        # `None` when and only when there was no output: an empty or
+        # absent `output_tail` skips the call, and `redact_secrets`
+        # never maps a non-empty string to an empty one. A trailing
+        # `or None` here was dead code — a mutation replacing it
+        # changed no outcome, which reads as coverage to the next
+        # person.
         scrubbed = redact_secrets(output_tail) if output_tail else None
         cursor = self._conn.execute(
             "UPDATE sessions SET claude_exit_code = ?, output_tail = ? "
             "WHERE id = ?",
-            (exit_code, scrubbed or None, session_id),
+            (exit_code, scrubbed, session_id),
         )
         self._conn.commit()
         return cursor.rowcount > 0
@@ -577,8 +587,26 @@ class StateDB:
         again.
         """
         if stamp is None:
-            # No claim identified, so nothing is released. A caller that
-            # cannot say which claim it took must not clear one.
+            # A caller that cannot say which claim it took must not
+            # clear one — and this is a caller BUG, so it is reported
+            # rather than silently returning.
+            #
+            # It is logged because without the log the branch could not
+            # fail: `WHERE alerted_at = NULL` never matches in SQL, so
+            # deleting this early return changed no outcome and a
+            # mutation of it survived. A guard whose removal changes
+            # nothing is a sentence pretending to be a guard, and the
+            # next person cites it as coverage. The log is what makes it
+            # a real one.
+            log_event(
+                _logger,
+                "dispatch_health.release_without_claim",
+                detail=(
+                    "a relay-health alert release named no claim, so the "
+                    "latch was left alone; the caller lost track of the "
+                    "claim it took"
+                ),
+            )
             return
         # Conditional on the stamp we wrote, so this releases OUR claim
         # and not a newer one. Two pollers share this row: A claims, a
