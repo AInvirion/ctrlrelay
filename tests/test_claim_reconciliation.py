@@ -875,3 +875,121 @@ class TestARetractionCancelsTheClaim:
         # And the claim comes before this run's own retraction.
         assert AGENT_CLAIM_MARKER in posted[0]
         assert AGENT_OUTCOME_MARKER in posted[-1]
+
+
+class TestAResumedWorkersExitCodeIsTheOneReported:
+    @pytest.mark.asyncio
+    async def test_a_late_exception_names_the_resumed_workers_code(
+        self, tmp_path: Path
+    ) -> None:
+        """`last_exit_code` is assigned once before the BLOCKED loop and
+        again after each resume.
+
+        Without the second assignment a late exception reported the
+        FIRST worker's exit code for a session that had since been
+        resumed — a number that was real and about a run that had been
+        superseded.
+        """
+        import json as _json
+
+        from ctrlrelay.core.checkpoint import read_checkpoint
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.core.worktree import WorktreeManager
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        worktree = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        bare = tmp_path / "repos" / "owner-repo.git"
+        bare.mkdir(parents=True)
+        (bare / "HEAD").write_text("ref: refs/heads/main\n")
+
+        github = AsyncMock(spec=GitHubCLI)
+        github.get_issue.return_value = {
+            "number": 853, "title": "t", "body": "b", "comments": [],
+        }
+
+        # First spawn BLOCKS with exit 3; the resume exits 9.
+        calls = {"n": 0}
+        dispatcher = AsyncMock(spec=ClaudeDispatcher)
+
+        async def spawn(**kwargs):
+            calls["n"] += 1
+            state_file = kwargs["state_file"]
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            if calls["n"] == 1:
+                state_file.write_text(_json.dumps({
+                    "version": "1",
+                    "status": "BLOCKED_NEEDS_INPUT",
+                    "session_id": kwargs["session_id"],
+                    "timestamp": "2026-10-18T00:00:00Z",
+                    "question": "which column?",
+                }))
+                return SessionResult(
+                    session_id=kwargs["session_id"], exit_code=3,
+                    stdout="", stderr="", state=read_checkpoint(state_file),
+                )
+            # The resumed worker: no checkpoint, exit 9.
+            return SessionResult(
+                session_id=kwargs["session_id"], exit_code=9,
+                stdout="", stderr="", state=None,
+            )
+
+        dispatcher.spawn_session.side_effect = spawn
+
+        transport = AsyncMock()
+        transport.ask.return_value = "use the second column"
+
+        state_db = StateDB(tmp_path / "state.db")
+        with (
+            patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock),
+            patch.object(
+                worktree,
+                "create_worktree_with_new_branch",
+                new_callable=AsyncMock,
+            ) as create,
+            patch.object(
+                worktree, "remove_worktree", new_callable=AsyncMock
+            ) as remove,
+            patch.object(
+                worktree, "branch_exists_locally", new_callable=AsyncMock
+            ) as exists_local,
+            patch.object(
+                worktree, "branch_exists_on_remote", new_callable=AsyncMock
+            ) as exists_remote,
+            patch.object(worktree, "delete_branch", new_callable=AsyncMock),
+            patch.object(worktree, "symlink_context"),
+            patch.object(worktree, "remove_context_symlink"),
+        ):
+            wt = tmp_path / "worktrees" / "wt"
+            wt.mkdir(parents=True)
+            create.return_value = (wt, True)
+            exists_local.return_value = False
+            exists_remote.return_value = False
+            # The late exception, after the resume has reported exit 9.
+            remove.side_effect = RuntimeError("worktree remove failed")
+            result = await run_dev_issue(
+                repo="owner/repo",
+                issue_number=853,
+                branch_template="fix/issue-{n}",
+                dispatcher=dispatcher,
+                github=github,
+                worktree=worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=transport,
+                contexts_dir=tmp_path / "contexts",
+            )
+        state_db.close()
+        assert not result.success
+        assert calls["n"] == 2, "the session was never resumed"
+        bodies = _retraction_bodies(github)
+        assert len(bodies) == 1
+        assert "`9`" in bodies[0], (
+            "the comment named the first worker's exit code for a session "
+            "that had since been resumed"
+        )
+        assert "`3`" not in bodies[0]
