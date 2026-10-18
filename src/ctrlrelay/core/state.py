@@ -140,6 +140,15 @@ CREATE TABLE IF NOT EXISTS dispatch_health (
     -- indistinguishable by it -- which would let A's failed delivery
     -- clear B's claim and announce one outage twice.
     alert_claim_token TEXT,
+    -- When an alert was actually DELIVERED. This, not the claim, is
+    -- what suppresses a repeat. Claiming the latch and delivering on
+    -- it are two facts, and conflating them meant a poller stopped
+    -- mid-send (a `systemctl restart`, which is the first thing an
+    -- operator does) came back with the latch held and nothing sent --
+    -- so the rest of the outage was silent. Measured: cancel during
+    -- the send, then 59 further failures against a healthy channel,
+    -- zero messages.
+    alert_delivered_at INTEGER,
     last_failure_at INTEGER,
     last_success_at INTEGER
 );
@@ -233,6 +242,11 @@ class StateDB:
         if health_cols and "alert_claim_token" not in health_cols:
             self._conn.execute(
                 "ALTER TABLE dispatch_health ADD COLUMN alert_claim_token TEXT"
+            )
+        if health_cols and "alert_delivered_at" not in health_cols:
+            self._conn.execute(
+                "ALTER TABLE dispatch_health "
+                "ADD COLUMN alert_delivered_at INTEGER"
             )
 
         self._ensure_dispatch_health_row()
@@ -447,41 +461,46 @@ class StateDB:
         )
         self._conn.commit()
 
-    def _begin_immediate(self) -> None:
+    def _begin_immediate(self) -> bool:
         """Start a write transaction, taking the lock up front.
+
+        Returns whether WE started it, so the caller knows whether the
+        commit is its to make.
 
         ``isolation_level`` is sqlite3's default here, so an explicit
         ``BEGIN IMMEDIATE`` is what takes the write lock at the start
         rather than upgrading mid-transaction, which is how two writers
         deadlock.
 
-        If a transaction is already open on this connection, ``BEGIN``
-        raises ``cannot start a transaction within a transaction`` — and
-        on the old code that happened BEFORE the ``try``, so no rollback
-        ran and the existing transaction kept its lock. It is committed
-        here instead of rolled back: every writer in this class commits
-        immediately after its ``execute``, so a transaction still open
-        at this point is a write whose commit is pending, and rolling it
-        back would discard somebody's data to tidy up a lock. Logged,
-        because arriving here at all means a caller left a transaction
-        open and that is worth seeing rather than smoothing over.
+        **If a transaction is already open, this joins it rather than
+        committing it.** An earlier version committed, on the stated
+        premise that "every writer in this class commits immediately
+        after its execute" — which is false: ``StateDB.execute`` is
+        public, callers commit separately, and the dispatch-outcome
+        hook runs on the pipeline's own connection mid-pipeline. So
+        that commit could publish a caller's half-finished write. It
+        is logged either way, because a caller holding an open
+        transaction when this is reached is a fact worth seeing.
+
+        Joining costs the atomicity guarantee to the caller's
+        transaction instead of ours, and if the caller rolls back we
+        lose a counter increment — which delays an alert by one
+        failure and is not silent. Publishing somebody's partial write
+        is not recoverable, so this is the safe direction.
         """
         if self._conn.in_transaction:
-            # The log the docstring above promises. Without it the
-            # sentence was false and this branch was invisible: a
-            # caller leaving a transaction open is a bug somewhere
-            # else, and committing it quietly is how that bug stays
-            # unfound.
             log_event(
                 _logger,
                 "state.transaction_left_open",
                 detail=(
-                    "a caller left a transaction open on this connection; "
-                    "committing it so the write lock can be taken"
+                    "a caller holds an open transaction on this "
+                    "connection; joining it rather than committing it, so "
+                    "this write is published by whoever commits theirs"
                 ),
             )
-            self._conn.commit()
+            return False
         self._conn.execute("BEGIN IMMEDIATE")
+        return True
 
     def dispatch_failure_count(self) -> int:
         """Length of the current run of failed dispatches (0 when healthy).
@@ -497,31 +516,27 @@ class StateDB:
         return int(row["consecutive_failures"]) if row else 0
 
     def record_dispatch_failure(
-        self, threshold: int
+        self, threshold: int, *, lease_seconds: int
     ) -> tuple[int, str | None]:
         """Extend the failure run and decide, in ONE transaction.
 
-        Returns ``(consecutive_failures, claim_token)``, where the token
-        is ``None`` when no alert may be sent and otherwise identifies
-        the claim for :meth:`release_dispatch_alert`.
+        Returns ``(consecutive_failures, claim_token)``. The token is
+        ``None`` when no alert may be attempted, and otherwise is a
+        LEASE on the right to attempt one — see
+        :meth:`_may_claim_alert`.
 
-        The increment, the threshold comparison and the latch claim are
-        a single ``BEGIN IMMEDIATE`` transaction because two pollers can
-        share one ``state.db`` — it has happened on this deployment. Done
-        as three statements, a success recorded by the other process can
-        land between this one's read and its claim, and a relay that has
-        just recovered is announced as still failing. Reading the count
-        back in a separate statement had the same hazard pointed the
-        other way.
-
-        A token is handed out at most once per failure run. It is the
-        right to ATTEMPT one delivery, not a record that one happened —
-        see :meth:`release_dispatch_alert`.
+        The increment, the threshold comparison and the claim are a
+        single transaction because two pollers can share one
+        ``state.db``. Done as three statements, a success recorded by
+        the other process can land between this one's read and its
+        claim, and a relay that has just recovered is announced as
+        still failing.
         """
         if threshold < 1:
             raise ValueError(f"threshold must be at least 1, got {threshold!r}")
+        ours = False
         try:
-            self._begin_immediate()
+            ours = self._begin_immediate()
             self._conn.execute(
                 "INSERT OR IGNORE INTO dispatch_health "
                 "(id, consecutive_failures) VALUES (1, 0)"
@@ -533,41 +548,80 @@ class StateDB:
                 (int(time.time()),),
             )
             row = self._conn.execute(
-                "SELECT consecutive_failures, alerted_at "
+                "SELECT consecutive_failures, alerted_at, "
+                "alert_claim_token, alert_delivered_at "
                 "FROM dispatch_health WHERE id = 1"
             ).fetchone()
             consecutive = int(row["consecutive_failures"])
             claimed: str | None = None
-            if consecutive >= threshold and row["alerted_at"] is None:
+            if consecutive >= threshold and self._may_claim_alert(
+                row, lease_seconds
+            ):
                 claimed = uuid.uuid4().hex
                 self._conn.execute(
                     "UPDATE dispatch_health SET alerted_at = ?, "
                     "alert_claim_token = ? WHERE id = 1",
                     (int(time.time()), claimed),
                 )
-            self._conn.commit()
+            if ours:
+                self._conn.commit()
         except BaseException:
-            # Only when there is a transaction to undo. `BEGIN` itself
-            # can be what raised, and a bare rollback then discards a
-            # transaction this method never started.
-            if self._conn.in_transaction:
+            if ours and self._conn.in_transaction:
                 self._conn.rollback()
             raise
         return consecutive, claimed
 
-    def reset_dispatch_failures(self) -> int:
-        """Clear the run and the alert latch; return the previous length.
+    @staticmethod
+    def _may_claim_alert(row: Any, lease_seconds: int) -> bool:
+        """Whether the right to attempt one alert is available.
 
-        The return value is what lets the caller log a recovery only
-        when there was something to recover from — otherwise every
-        successful dispatch on a healthy relay would log one, and a
-        line that appears constantly is a line nobody reads.
+        Two conditions, and separating them is the whole point:
+
+        - **Nothing has been DELIVERED for this run.** Delivery is what
+          suppresses a repeat, not the claim. Latching on the claim
+          meant a poller stopped mid-send — a ``systemctl restart``,
+          which is the first thing an operator does — came back with
+          the latch held and nothing sent, so the rest of the outage
+          was silent. Measured: cancel during the send, then 59 more
+          failures against a healthy channel, zero messages.
+        - **No live claim.** A claim is a LEASE, so one abandoned by a
+          process that was killed mid-send expires and the next failure
+          retries. That is also what stops a retry storm: a delivery
+          that fails leaves its claim to expire rather than releasing
+          it, so during an outage at most one attempt is made per
+          lease window instead of one per failed dispatch.
+
+        One mechanism for both, which replaced an explicit release
+        that handled neither the kill nor the storm.
+        """
+        if row["alert_delivered_at"] is not None:
+            return False
+        if row["alert_claim_token"] is None:
+            return True
+        held_since = row["alerted_at"]
+        if held_since is None:
+            # A token with no timestamp cannot be aged, so treat it as
+            # expired rather than as permanent. "I cannot tell how old
+            # this is" must not read as "it is current" — that is the
+            # direction that goes silent.
+            return True
+        return int(time.time()) - int(held_since) >= lease_seconds
+
+    def reset_dispatch_failures(self) -> int:
+        """Clear the run, the claim and the delivery record.
+
+        Returns the previous run length, which is what lets the caller
+        log a recovery only when there was something to recover from —
+        otherwise every successful dispatch on a healthy relay would
+        log one, and a line that appears constantly is a line nobody
+        reads.
 
         One transaction, for the same reason as
         :meth:`record_dispatch_failure`.
         """
+        ours = False
         try:
-            self._begin_immediate()
+            ours = self._begin_immediate()
             self._conn.execute(
                 "INSERT OR IGNORE INTO dispatch_health "
                 "(id, consecutive_failures) VALUES (1, 0)"
@@ -578,103 +632,93 @@ class StateDB:
             previous = int(row["consecutive_failures"]) if row else 0
             self._conn.execute(
                 "UPDATE dispatch_health SET consecutive_failures = 0, "
-                "alerted_at = NULL, last_success_at = ? WHERE id = 1",
+                "alerted_at = NULL, alert_claim_token = NULL, "
+                "alert_delivered_at = NULL, last_success_at = ? "
+                "WHERE id = 1",
                 (int(time.time()),),
             )
-            self._conn.commit()
+            if ours:
+                self._conn.commit()
         except BaseException:
-            # Only when there is a transaction to undo. `BEGIN` itself
-            # can be what raised, and a bare rollback then discards a
-            # transaction this method never started.
-            if self._conn.in_transaction:
+            if ours and self._conn.in_transaction:
                 self._conn.rollback()
             raise
         return previous
 
-    def claim_dispatch_alert(self) -> str | None:
-        """Take the right to attempt one alert; return the claim token.
-
-        ``None`` means somebody already holds it.
-
-        ``True`` at most once per failure run: the UPDATE is conditional
-        on ``alerted_at IS NULL``, so the claim and the test are one
-        statement and two processes racing cannot both win.
+    def claim_dispatch_alert(self, *, lease_seconds: int) -> str | None:
+        """Lease the right to attempt one alert, or return ``None``.
 
         Used by the whole-sweep check, which has no counter to
         increment. The per-failure path uses
         :meth:`record_dispatch_failure` so its increment and its claim
         cannot be separated.
         """
-        self._ensure_dispatch_health_row()
-        token = uuid.uuid4().hex
+        ours = False
+        try:
+            ours = self._begin_immediate()
+            self._conn.execute(
+                "INSERT OR IGNORE INTO dispatch_health "
+                "(id, consecutive_failures) VALUES (1, 0)"
+            )
+            row = self._conn.execute(
+                "SELECT alerted_at, alert_claim_token, alert_delivered_at "
+                "FROM dispatch_health WHERE id = 1"
+            ).fetchone()
+            token: str | None = None
+            if self._may_claim_alert(row, lease_seconds):
+                token = uuid.uuid4().hex
+                self._conn.execute(
+                    "UPDATE dispatch_health SET alerted_at = ?, "
+                    "alert_claim_token = ? WHERE id = 1",
+                    (int(time.time()), token),
+                )
+            if ours:
+                self._conn.commit()
+        except BaseException:
+            if ours and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return token
+
+    def mark_dispatch_alert_delivered(self, token: str | None) -> bool:
+        """Record that an alert actually reached the operator.
+
+        This is the durable fact that suppresses a repeat until a
+        dispatch succeeds. Conditional on the token, so a process whose
+        claim has already expired cannot mark a delivery against a
+        newer one's claim.
+
+        Returns whether the row was updated. ``False`` means the claim
+        was superseded while the send was in flight — the message did
+        go out, but another process now owns the latch, so a duplicate
+        is possible. That is the safe direction and it is the one this
+        design chooses.
+        """
+        if token is None:
+            log_event(
+                _logger,
+                "dispatch_health.delivery_without_claim",
+                detail=(
+                    "an alert delivery named no claim, so nothing was "
+                    "recorded; the caller lost track of the claim it took"
+                ),
+            )
+            return False
         cursor = self._conn.execute(
-            "UPDATE dispatch_health SET alerted_at = ?, "
-            "alert_claim_token = ? "
-            "WHERE id = 1 AND alerted_at IS NULL",
+            "UPDATE dispatch_health SET alert_delivered_at = ? "
+            "WHERE id = 1 AND alert_claim_token = ?",
             (int(time.time()), token),
         )
         self._conn.commit()
-        return token if cursor.rowcount > 0 else None
-
-    def release_dispatch_alert(self, token: str | None = None) -> None:
-        """Give the claim back, because delivery failed.
-
-        Claiming the latch is the right to ATTEMPT one message, not a
-        record that one arrived. Latching on the attempt means a single
-        failed `send` — a bridge mid-restart, a socket that is not there
-        yet — silences the alert for the whole outage, which is this
-        ticket's own defect reproduced inside the fix for it. Measured
-        before this method existed: with the channel absent for the
-        first failure and healthy for the next fifty, zero messages were
-        ever delivered.
-
-        Does NOT clear the counter. The run is still running; only the
-        right to announce it is handed back, so the next failure tries
-        again.
-        """
-        if token is None:
-            # A caller that cannot say which claim it took must not
-            # clear one — and this is a caller BUG, so it is reported
-            # rather than silently returning.
-            #
-            # It is logged because without the log the branch could not
-            # fail: `WHERE alerted_at = NULL` never matches in SQL, so
-            # deleting this early return changed no outcome and a
-            # mutation of it survived. A guard whose removal changes
-            # nothing is a sentence pretending to be a guard, and the
-            # next person cites it as coverage. The log is what makes it
-            # a real one.
-            log_event(
-                _logger,
-                "dispatch_health.release_without_claim",
-                detail=(
-                    "a relay-health alert release named no claim, so the "
-                    "latch was left alone; the caller lost track of the "
-                    "claim it took"
-                ),
-            )
-            return
-        # Conditional on the token we wrote, so this releases OUR claim
-        # and not a newer one. Two pollers share this row: A claims, a
-        # success resets the run, B starts a new outage and claims, and
-        # an unconditional release from A would then clear B's latch and
-        # let the same outage be announced twice.
-        #
-        # A uuid rather than `alerted_at`. An earlier version compared
-        # the whole-second timestamp, which cannot separate two claims
-        # made inside the same second — and a one-second window during
-        # an outage where dispatches fail in about two seconds each is
-        # not a remote one.
-        self._conn.execute(
-            "UPDATE dispatch_health SET alerted_at = NULL, "
-            "alert_claim_token = NULL "
-            "WHERE id = 1 AND alert_claim_token = ?",
-            (token,),
-        )
-        self._conn.commit()
+        return cursor.rowcount > 0
 
     def get_dispatch_health(self) -> dict[str, Any]:
-        """The whole row, for `ctrlrelay status` and for tests. A pure read."""
+        """The whole row. A pure read, used by the tests.
+
+        Nothing in the CLI surfaces this yet. Said plainly because an
+        earlier version of this line claimed `ctrlrelay status` reads
+        it, which it does not.
+        """
         row = self._conn.execute(
             "SELECT * FROM dispatch_health WHERE id = 1"
         ).fetchone()

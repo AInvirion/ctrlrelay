@@ -405,16 +405,24 @@ class TestAlertMessage:
         assert "88" in text
 
 
-class TestTheTransactionLeftOpenBranchIsVisible:
+class TestACallersTransactionIsJoinedNotCommitted:
     def test_an_already_open_transaction_is_reported(
         self, tmp_path: Path, caplog
     ) -> None:
-        """`_begin_immediate`'s docstring says it logs this. It must.
+        """`_begin_immediate` logs this, and does NOT commit it.
 
-        A caller leaving a transaction open is a bug somewhere else,
-        and committing it quietly is how that bug stays unfound. An
-        earlier version claimed the log in prose and did not emit it,
-        which made the sentence false and the branch invisible.
+        An earlier version committed, on the stated premise that
+        "every writer in this class commits immediately after its
+        execute" — false: `StateDB.execute` is public, callers commit
+        separately, and the dispatch-outcome hook runs on the
+        pipeline's own connection mid-pipeline. That commit could
+        publish a caller's half-finished write, which is not
+        recoverable. Joining costs a counter increment if the caller
+        rolls back, which delays an alert by one failure and is not
+        silent.
+
+        The log is asserted as well as the behaviour, because an
+        earlier version promised it in prose and did not emit it.
         """
         import logging
 
@@ -431,9 +439,20 @@ class TestTheTransactionLeftOpenBranchIsVisible:
         assert any(
             r.getMessage() == "state.transaction_left_open"
             for r in caplog.records
-        ), "the open transaction was committed without being reported"
-        # And the caller's pending write was COMMITTED, not discarded.
-        # Rolling it back would destroy data to tidy up a lock.
-        assert db.get_session_row("left-open") is not None
+        ), "the open transaction was joined without being reported"
+        # Still the caller's to commit — we did not publish it, and we
+        # did not discard it either.
+        assert db._conn.in_transaction
+        db._conn.rollback()
+        assert db.get_session_row("left-open") is None
+        db.close()
+
+    def test_our_own_transaction_is_committed(self, tmp_path: Path) -> None:
+        """The control: with no caller transaction open, the write is
+        ours to commit and is committed."""
+        db = StateDB(tmp_path / "state.db")
         assert not db._conn.in_transaction
+        DispatchHealth(db, threshold=3).record_failure(repo="o/r")
+        assert not db._conn.in_transaction
+        assert db.dispatch_failure_count() == 1
         db.close()

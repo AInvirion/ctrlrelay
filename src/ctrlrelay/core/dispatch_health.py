@@ -49,6 +49,18 @@ _logger = get_logger("core.dispatch_health")
 REASON_CONSECUTIVE = "consecutive_failures"
 REASON_SWEEP_ALL_FAILED = "sweep_all_failed"
 
+# How long a claim on the right to send one alert is held before it is
+# considered abandoned. It does two jobs:
+#
+#   - a process killed mid-send does not hold the claim forever, so the
+#     outage is still announced once it comes back;
+#   - a delivery that FAILS leaves its claim to expire rather than
+#     releasing it, so during an outage at most one attempt is made per
+#     minute instead of one per failed dispatch -- which at ~2 s per
+#     failure and a ~15 s connect-plus-send bound would otherwise be
+#     most of the poll cycle.
+DEFAULT_ALERT_LEASE_SECONDS = 60
+
 
 @dataclass(frozen=True)
 class DispatchAlert:
@@ -63,9 +75,9 @@ class DispatchAlert:
     consecutive: int
     threshold: int
     detail: str
-    # Identifies the latch claim this alert holds, so a delivery that
-    # fails can release THAT claim and not a newer one taken by another
-    # process. See `StateDB.release_dispatch_alert`.
+    # Identifies the lease this alert holds, so a DELIVERY is recorded
+    # against our own claim and not a newer one taken by another
+    # process. See `StateDB.mark_dispatch_alert_delivered`.
     claim_token: str | None = None
 
     def message(self) -> str:
@@ -87,7 +99,7 @@ class DispatchAlert:
             )
         return (
             f"{headline}\n"
-            "Nothing is being worked until this clears. Check the agent "
+            "Nothing is dispatching until this clears. Check the agent "
             "credential first — an expired one exits non-zero in about two "
             "seconds — then `journalctl --user -u ctrlrelay-poller` and the "
             "`claude_exit_code` / `output_tail` columns on the `sessions` "
@@ -113,9 +125,15 @@ class DispatchHealth:
     behaviour.
     """
 
-    __slots__ = ("state_db", "threshold")
+    __slots__ = ("state_db", "threshold", "lease_seconds")
 
-    def __init__(self, state_db: "StateDB", *, threshold: int) -> None:
+    def __init__(
+        self,
+        state_db: "StateDB",
+        *,
+        threshold: int,
+        lease_seconds: int = DEFAULT_ALERT_LEASE_SECONDS,
+    ) -> None:
         if threshold < 1:
             raise ValueError(
                 f"threshold must be at least 1, got {threshold!r}. "
@@ -125,8 +143,16 @@ class DispatchHealth:
                 "comparison is written, and neither is a setting anybody "
                 "asked for."
             )
+        if lease_seconds < 1:
+            raise ValueError(
+                f"lease_seconds must be at least 1, got {lease_seconds!r}. "
+                "A zero lease makes every claim instantly expired, so two "
+                "processes could both attempt the same alert and a failed "
+                "delivery would retry on every dispatch."
+            )
         self.state_db = state_db
         self.threshold = threshold
+        self.lease_seconds = lease_seconds
 
     def record_success(self, *, repo: str | None = None) -> None:
         """Clear the run and re-arm the latch.
@@ -156,9 +182,10 @@ class DispatchHealth:
 
         Returns ``None`` when the run is still under the threshold, and
         ``None`` again on every later failure in the same run — the
-        latch is set by the first alert and cleared either by
-        :meth:`record_success` or by a delivery that failed (see
-        :meth:`StateDB.release_dispatch_alert`).
+        latch that suppresses a repeat is DELIVERY, not this claim —
+        see :meth:`StateDB._may_claim_alert`. A claim is a lease, so an
+        attempt that is killed or that fails is retried once the lease
+        expires.
 
         The increment, the comparison and the claim happen in one
         transaction inside ``StateDB``, because two pollers can share
@@ -166,7 +193,7 @@ class DispatchHealth:
         its claim would announce a relay that had just recovered.
         """
         consecutive, claim_token = self.state_db.record_dispatch_failure(
-            self.threshold
+            self.threshold, lease_seconds=self.lease_seconds
         )
         log_event(
             _logger,
@@ -227,7 +254,9 @@ class DispatchHealth:
         """
         if total < 1 or failed < 0 or failed != total:
             return None
-        claim_token = self.state_db.claim_dispatch_alert()
+        claim_token = self.state_db.claim_dispatch_alert(
+            lease_seconds=self.lease_seconds
+        )
         if claim_token is None:
             log_event(
                 _logger,

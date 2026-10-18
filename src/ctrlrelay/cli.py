@@ -995,61 +995,69 @@ async def send_relay_alert(config, alert) -> bool:
 
 
 async def deliver_relay_alert(config, state_db, alert) -> bool:
-    """Send the alert, and hand the latch back if it did not arrive.
+    """Send the alert, and record the DELIVERY rather than the attempt.
 
-    The latch is the right to ATTEMPT one message, not a record that
-    one was delivered. Without this release, a single failed `send` —
-    a bridge mid-restart, a socket that is not there yet, a websocket
-    reconnecting — silences the alert for the entire outage.
+    The claim taken before this call is a lease on the right to try. It
+    is delivery that suppresses a repeat, and keeping those two facts
+    apart is what this function is for.
 
-    Measured before this existed: with the channel absent for the
-    first failure and healthy for the next fifty, **zero** messages
-    were ever delivered. That is this ticket's own defect reproduced
-    inside the fix for it, which is why the release exists rather than
-    a comment promising the send is reliable.
+    Latching on the attempt instead meant a poller stopped mid-send —
+    a ``systemctl restart``, which is the first thing an operator does
+    — came back with the latch held and nothing sent, so the rest of
+    the outage was silent. Measured: cancel during the send, then 59
+    further failures against a healthy channel, zero messages.
 
-    The counter is NOT reset — the run is still running. Only the
-    right to announce it goes back, so the next failure tries again.
-    A duplicate is the safe direction here; silence is the one that
-    cost two days.
+    A failed or cancelled delivery records nothing, so the claim simply
+    expires and a later failure retries. Nothing is released here on
+    purpose: the lease covers the killed process and the failed send
+    with one mechanism, and it also bounds the retry rate, which an
+    explicit release did not.
     """
     delivered = False
     try:
         delivered = await send_relay_alert(config, alert)
-    except asyncio.CancelledError:
-        # Shutting down. The latch is left as it is on purpose: there
-        # is no next failure to retry on, and the process is going
-        # away. Propagated so the caller's cleanup runs.
+    except (asyncio.CancelledError, SystemExit, KeyboardInterrupt):
+        # The process is stopping. Nothing is recorded, so the claim
+        # ages out and the alert is attempted again after the restart —
+        # which is the case the whole lease exists for. Propagated so
+        # the caller's cleanup runs.
+        _log_quietly(
+            "dispatch_health.alert_interrupted",
+            reason=alert.reason,
+            detail=(
+                "stopped while delivering the relay-health alert; the "
+                "claim will expire and a later failure retries"
+            ),
+        )
         raise
-    except BaseException:
+    except Exception:
         # `send_relay_alert` is guarded, and `connect_notify_transport`
-        # says in its own docstring that it does not raise. Neither of
-        # those is a reason to rely on it: this function's whole job is
-        # that an undelivered alert does not keep the latch, and a
-        # guarantee written in somebody else's docstring is not a
-        # mechanism. The release below runs for a raise exactly as it
-        # does for a `False`.
+        # says in its own docstring that it does not raise. Neither is
+        # a reason to rely on it: a guarantee written in somebody
+        # else's docstring is not a mechanism.
         _log_quietly(
             "dispatch_health.alert_send_raised",
             reason=alert.reason,
-            detail="the alert was not delivered; releasing the latch",
+            detail="the alert was not delivered; the claim will expire",
         )
-    if delivered:
-        return True
+    if not delivered:
+        return False
     try:
-        state_db.release_dispatch_alert(alert.claim_token)
+        state_db.mark_dispatch_alert_delivered(alert.claim_token)
     except Exception as e:
+        # The message HAS gone out. Failing to record that means the
+        # next failure may send a second one, which is a duplicate —
+        # the safe direction, and the one this design chooses.
         _log_quietly(
-            "dispatch_health.alert_latch_stuck",
+            "dispatch_health.delivery_unrecorded",
             cause=e,
             reason=alert.reason,
             detail=(
-                "the alert was not delivered AND the latch could not be "
-                "released, so this outage will not be announced again "
-                "until a dispatch succeeds"
+                "the alert was delivered but the delivery could not be "
+                "recorded, so it may be sent once more"
             ),
         )
-    return False
+    return True
 
 
 async def alert_if_sweep_all_failed(config, state_db, results) -> bool:
@@ -1061,9 +1069,25 @@ async def alert_if_sweep_all_failed(config, state_db, results) -> bool:
     when the configured threshold has not been reached. Waiting for a
     second day of it is the behaviour being removed.
 
-    A BLOCKED result does NOT count as a failure. The agent ran and
-    asked a question, which means the relay works — counting it would
-    alert on a healthy sweep that happened to need input everywhere.
+    "Failed" here means the DISPATCH failed — the agent exited
+    non-zero — which is the same definition the consecutive-failure
+    counter uses. It is deliberately NOT "the pipeline failed":
+
+    - A BLOCKED result is not a failure at all. The agent ran and asked
+      a question, so the relay works, and counting it would alert on a
+      healthy sweep that happened to need input everywhere.
+    - An agent that exits 0 and writes a FAILED checkpoint (#174) is
+      also not a dispatch failure. Counting it would send a message
+      saying "every repo failed, check the agent credential, this will
+      not be repeated until a dispatch succeeds" — and every dispatch
+      DID succeed by the counter's definition, so the next sweep would
+      clear the latch and send it again. That is the #200 daily repeat
+      this module exists to avoid, with a last sentence that is untrue
+      of its own input.
+
+    An `exit_code` of ``None`` counts as a dispatch failure: the child
+    never reported one, which is the binary-missing and pipe-error
+    case, not a healthy run.
 
     A sweep with no results returns ``False``: ``0 of 0 failed``
     satisfies "every repo failed" arithmetically, and alerting on it
@@ -1076,7 +1100,11 @@ async def alert_if_sweep_all_failed(config, state_db, results) -> bool:
     if not bool(getattr(alerts, "enabled", False)):
         return False
     total = len(results)
-    failed = sum(1 for r in results if not r.success and not r.blocked)
+    failed = sum(
+        1
+        for r in results
+        if not r.success and not r.blocked and r.exit_code != 0
+    )
     try:
         health = DispatchHealth(
             state_db, threshold=alerts.consecutive_dispatch_failures
@@ -1092,6 +1120,27 @@ async def alert_if_sweep_all_failed(config, state_db, results) -> bool:
     if alert is None:
         return False
     return await deliver_relay_alert(config, state_db, alert)
+
+
+async def alert_if_sweep_all_failed_guarded(config, state_db, results) -> bool:
+    """`alert_if_sweep_all_failed`, unable to disturb its caller.
+
+    The sweep calls this BEFORE its per-repo fan-out, and that fan-out
+    wraps its whole loop in one `except` — so an exception escaping
+    here would skip every per-repo notification in the sweep. The alert
+    must not be able to cost the messages it sits in front of.
+    """
+    try:
+        return await alert_if_sweep_all_failed(config, state_db, results)
+    except (asyncio.CancelledError, SystemExit, KeyboardInterrupt):
+        raise
+    except Exception as e:
+        _log_quietly(
+            "dispatch_health.sweep_alert_failed",
+            cause=e,
+            detail="the whole-sweep alert was not sent; the sweep continues",
+        )
+        return False
 
 
 def make_dispatch_outcome_hook(config, state_db):
@@ -2589,7 +2638,9 @@ def poller_start(
                 # it would be lost in precisely the conditions it
                 # exists to report. It resolves its own transport, so
                 # it does not depend on `secops_transport` either.
-                await alert_if_sweep_all_failed(config, state_db, results)
+                await alert_if_sweep_all_failed_guarded(
+                    config, state_db, results
+                )
 
                 # Per-repo notifications for the cases an operator must
                 # act on. The aggregate "N blocked" message we used to

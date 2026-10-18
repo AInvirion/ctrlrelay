@@ -64,8 +64,9 @@ class DispatchOutcome:
     exempt" is precisely how a two-day outage went unreported. Here
     every spawn is covered by construction.
 
-    ``exit_code`` is ``None`` when the child never started (the binary
-    could not be exec'd), which is a dispatch failure with no exit
+    ``exit_code`` is ``None`` whenever no exit code was obtained: the
+    binary could not be exec'd, or the child ran and reading its
+    output failed. Either way it is a dispatch failure with no exit
     code rather than a dispatch that succeeded. ``-1`` is the existing
     convention for a timeout.
     """

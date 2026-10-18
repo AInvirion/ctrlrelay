@@ -638,3 +638,111 @@ class TestAClaimWhoseResponseWasLostIsStillReconciled:
         assert any(AGENT_OUTCOME_MARKER in b for b in calls), (
             "a claim whose response was lost left no reconciliation"
         )
+
+
+class TestTheRealPipelineRecordsTheExitCode:
+    """Every other persistence test inserts the `sessions` row by hand.
+
+    That leaves two things unshown: whether the row exists at the
+    moment the hook fires, and whether the pipeline's own end-of-run
+    UPDATE overwrites what the hook wrote. Both are orderings inside
+    `run_dev_issue`, so only driving it can answer them.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_columns_are_readable_after_a_failed_run(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.cli import make_dispatch_outcome_hook
+        from ctrlrelay.core.config import AlertsConfig
+        from ctrlrelay.core.dispatcher import DispatchOutcome
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        state_db = StateDB(tmp_path / "state.db")
+        config = MagicMock()
+        config.alerts = AlertsConfig(
+            enabled=True, consecutive_dispatch_failures=99
+        )
+        hook = make_dispatch_outcome_hook(config, state_db)
+
+        worktree, github, dispatcher = _dev_issue_harness(
+            tmp_path, checkpoint=None, exit_code=1
+        )
+
+        # The dispatcher calls the hook, as ClaudeDispatcher does — so
+        # the hook fires at the real point in the pipeline's ordering.
+        inner = dispatcher.spawn_session.side_effect
+        secret = "ghp_" + "s" * 36
+
+        async def spawn_and_report(**kwargs):
+            result = await inner(**kwargs)
+            await hook(
+                DispatchOutcome(
+                    session_id=kwargs["session_id"],
+                    repo=kwargs.get("repo"),
+                    issue_number=kwargs.get("issue_number"),
+                    exit_code=1,
+                    stdout="",
+                    stderr=f"Invalid API key {secret} - please run /login",
+                )
+            )
+            return result
+
+        dispatcher.spawn_session.side_effect = spawn_and_report
+
+        with (
+            patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock),
+            patch.object(
+                worktree,
+                "create_worktree_with_new_branch",
+                new_callable=AsyncMock,
+            ) as create,
+            patch.object(worktree, "remove_worktree", new_callable=AsyncMock),
+            patch.object(
+                worktree, "branch_exists_locally", new_callable=AsyncMock
+            ) as exists_local,
+            patch.object(
+                worktree, "branch_exists_on_remote", new_callable=AsyncMock
+            ) as exists_remote,
+            patch.object(worktree, "delete_branch", new_callable=AsyncMock),
+            patch.object(worktree, "symlink_context"),
+            patch.object(worktree, "remove_context_symlink"),
+        ):
+            wt = tmp_path / "worktrees" / "wt"
+            wt.mkdir(parents=True)
+            create.return_value = (wt, True)
+            exists_local.return_value = False
+            exists_remote.return_value = False
+            result = await run_dev_issue(
+                repo="owner/repo",
+                issue_number=853,
+                branch_template="fix/issue-{n}",
+                dispatcher=dispatcher,
+                github=github,
+                worktree=worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+
+        row = state_db.get_session_row(result.session_id)
+        health = state_db.get_dispatch_health()
+        state_db.close()
+        assert not result.success
+        # The row existed when the hook fired.
+        assert row is not None
+        # And the pipeline's own end-of-run UPDATE (status, summary,
+        # ended_at) did not clear what the hook wrote.
+        assert row["status"] == "failed"
+        assert row["claude_exit_code"] == 1, (
+            "the exit code the hook recorded is not on the row after the "
+            "pipeline finished"
+        )
+        assert "Invalid API key" in row["output_tail"]
+        assert secret not in row["output_tail"]
+        # The alert threshold is 99, so nothing was announced — this
+        # test is about the record, not the notification.
+        assert health["alert_delivered_at"] is None
+        assert health["consecutive_failures"] == 1

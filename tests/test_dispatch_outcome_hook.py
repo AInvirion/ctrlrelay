@@ -21,6 +21,7 @@ turns on:
 import asyncio
 import json
 import sqlite3
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -562,33 +563,38 @@ class TestTheHookAlertsExactlyOnce:
     async def test_a_failed_delivery_does_not_silence_the_outage(
         self, tmp_path: Path
     ) -> None:
-        """The latch is the right to ATTEMPT one message.
+        """Nothing delivered means nothing latched.
 
-        Measured before the release existed: the channel was absent for
-        the first failure and healthy for the next fifty, and **zero**
-        messages were ever delivered — the alert latched on the attempt,
-        so the relay was dead, the channel was up, and nobody was ever
-        told. That is this ticket's own defect reproduced inside the fix
-        for it.
+        Measured before claim and delivery were separated: the channel
+        absent for the first failure and healthy for the next fifty
+        delivered **zero** messages, because the latch closed on the
+        attempt. The claim is a lease now, so the attempt leaves no
+        durable mark and a later failure retries once it expires.
         """
         from ctrlrelay.cli import make_dispatch_outcome_hook
 
         db = StateDB(tmp_path / "state.db")
         spy = SpyTransport()
         hook = make_dispatch_outcome_hook(_config(threshold=1), db)
-        # No channel for the first failure.
         with patch(
             "ctrlrelay.cli.connect_notify_transport",
             new=AsyncMock(return_value=None),
         ):
             await hook(_outcome("s-0", 1))
-        assert db.get_dispatch_health()["alerted_at"] is None, (
-            "the latch was kept although nothing was delivered"
+        assert db.get_dispatch_health()["alert_delivered_at"] is None, (
+            "an undelivered attempt latched the alert"
         )
-        # Channel recovers. Exactly one message, then quiet again.
-        with patch(
-            "ctrlrelay.cli.connect_notify_transport",
-            new=AsyncMock(return_value=spy),
+        # The channel recovers. The lease has to expire first, which is
+        # what bounds the retry rate — then exactly one message.
+        with (
+            patch(
+                "ctrlrelay.cli.connect_notify_transport",
+                new=AsyncMock(return_value=spy),
+            ),
+            patch(
+                "ctrlrelay.core.state.time.time",
+                return_value=time.time() + 120,
+            ),
         ):
             for i in range(1, 51):
                 await hook(_outcome(f"s-{i}", 1))
@@ -596,7 +602,7 @@ class TestTheHookAlertsExactlyOnce:
         assert len(spy.sent) == 1
 
     @pytest.mark.asyncio
-    async def test_a_send_that_throws_also_hands_the_latch_back(
+    async def test_a_send_that_throws_leaves_no_delivery_recorded(
         self, tmp_path: Path
     ) -> None:
         """The other way delivery fails: a connected transport whose
@@ -614,38 +620,71 @@ class TestTheHookAlertsExactlyOnce:
             new=AsyncMock(return_value=Broken()),
         ):
             await hook(_outcome("s-0", 1))
-        assert db.get_dispatch_health()["alerted_at"] is None
-        # And the run is NOT reset — only the right to announce it went
-        # back. A cleared counter would restart the countdown and delay
-        # the alert by another full threshold.
+        row = db.get_dispatch_health()
+        assert row["alert_delivered_at"] is None
+        # And the run is NOT reset — a cleared counter would restart
+        # the countdown and delay the alert by another full threshold.
         assert db.dispatch_failure_count() == 1
         db.close()
 
     @pytest.mark.asyncio
-    async def test_a_delivered_alert_does_keep_the_latch(
+    async def test_a_restart_during_delivery_does_not_silence_the_outage(
         self, tmp_path: Path
     ) -> None:
-        """The control for the two tests above.
+        """The cold review's BLOCKING finding, reproduced then fixed.
 
-        Without it, "always release the latch" passes both of them —
-        and would send one message per failure, which is the per-repo
-        noise the ticket rules out.
+        The claim is committed before the send is awaited, and the send
+        window is up to 15 s. During a wedged-bridge outage the poller
+        is inside that window most of the time, so a `systemctl
+        restart` — the first thing an operator does — almost certainly
+        lands there.
+
+        Measured on the pre-fix code: cancel mid-delivery, then 59
+        further failures against a **healthy** channel delivered zero
+        messages, for the whole remaining outage.
         """
         from ctrlrelay.cli import make_dispatch_outcome_hook
 
-        db = StateDB(tmp_path / "state.db")
-        spy = SpyTransport()
+        class Stalls(SpyTransport):
+            async def send(self, text: str, **kwargs) -> None:
+                await asyncio.sleep(3600)
+
+        path = tmp_path / "state.db"
+        db = StateDB(path)
         hook = make_dispatch_outcome_hook(_config(threshold=1), db)
         with patch(
             "ctrlrelay.cli.connect_notify_transport",
-            new=AsyncMock(return_value=spy),
+            new=AsyncMock(return_value=Stalls()),
         ):
-            await hook(_outcome("s-0", 1))
-            assert db.get_dispatch_health()["alerted_at"] is not None
-            for i in range(1, 20):
+            task = asyncio.ensure_future(hook(_outcome("s-0", 1)))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert db.get_dispatch_health()["alert_delivered_at"] is None
+        db.close()
+
+        # The process comes back, the bridge is healthy, the outage
+        # continues. The claim from the killed attempt must not hold.
+        db = StateDB(path)
+        spy = SpyTransport()
+        hook = make_dispatch_outcome_hook(_config(threshold=1), db)
+        with (
+            patch(
+                "ctrlrelay.cli.connect_notify_transport",
+                new=AsyncMock(return_value=spy),
+            ),
+            patch(
+                "ctrlrelay.core.state.time.time",
+                return_value=time.time() + 120,
+            ),
+        ):
+            for i in range(1, 60):
                 await hook(_outcome(f"s-{i}", 1))
         db.close()
-        assert len(spy.sent) == 1
+        assert len(spy.sent) == 1, (
+            "the outage stayed silent after a restart during delivery"
+        )
 
     @pytest.mark.asyncio
     async def test_an_undeliverable_alert_is_logged(
@@ -839,68 +878,108 @@ class TestCommunicateFailuresAreReported:
         assert seen == []
 
 
-class TestTheLatchReleaseIsOwned:
-    def test_releasing_without_a_stamp_clears_nothing_and_says_so(
+class TestTheClaimIsALeaseAndOnlyDeliveryLatches:
+    """Claiming the right to send and having sent are two facts.
+
+    Latching on the claim meant a poller stopped mid-send — a
+    `systemctl restart`, the first thing an operator does — came back
+    with the latch held and nothing sent, so the rest of the outage was
+    silent. Measured before the split: cancel during the send, then 59
+    further failures against a healthy channel, zero messages.
+    """
+
+    def test_a_delivery_suppresses_the_next_claim(
+        self, tmp_path: Path
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        token = db.claim_dispatch_alert(lease_seconds=60)
+        assert token is not None
+        assert db.mark_dispatch_alert_delivered(token) is True
+        assert db.claim_dispatch_alert(lease_seconds=60) is None
+        db.close()
+
+    def test_a_claim_with_no_delivery_expires(self, tmp_path: Path) -> None:
+        """The whole point of a lease.
+
+        A process killed between claiming and sending must not hold the
+        latch forever — and the same mechanism bounds the retry rate
+        after a delivery that merely failed.
+        """
+        db = StateDB(tmp_path / "state.db")
+        first = db.claim_dispatch_alert(lease_seconds=60)
+        assert first is not None
+        # Still held inside the lease.
+        assert db.claim_dispatch_alert(lease_seconds=60) is None
+        # Expired once the lease is up.
+        second = db.claim_dispatch_alert(lease_seconds=0 + 1) if False else None
+        with patch(
+            "ctrlrelay.core.state.time.time",
+            return_value=__import__("time").time() + 120,
+        ):
+            second = db.claim_dispatch_alert(lease_seconds=60)
+        assert second is not None
+        assert second != first
+        db.close()
+
+    def test_an_expired_claim_cannot_record_a_delivery(
+        self, tmp_path: Path
+    ) -> None:
+        """A process whose claim aged out must not mark a delivery
+        against the newer owner's claim."""
+        db = StateDB(tmp_path / "state.db")
+        stale = db.claim_dispatch_alert(lease_seconds=60)
+        with patch(
+            "ctrlrelay.core.state.time.time",
+            return_value=__import__("time").time() + 120,
+        ):
+            fresh = db.claim_dispatch_alert(lease_seconds=60)
+        assert stale is not None and fresh is not None
+        assert db.mark_dispatch_alert_delivered(stale) is False
+        assert db.get_dispatch_health()["alert_delivered_at"] is None
+        assert db.mark_dispatch_alert_delivered(fresh) is True
+        db.close()
+
+    def test_a_delivery_naming_no_claim_records_nothing_and_says_so(
         self, tmp_path: Path, caplog
     ) -> None:
-        """A caller that cannot say which claim it took must not clear
-        one.
-
-        Two pollers share this row: A claims, a success resets the run,
-        B starts a new outage and claims — and an unconditional release
-        from A would clear B's latch and let the same outage be
-        announced twice.
-
-        The LOG is asserted as well as the state, because the state
-        alone cannot catch a regression here: `WHERE alerted_at = NULL`
-        never matches in SQL, so deleting the early return changes no
-        outcome. A mutation of it survived on exactly that, and the log
-        is what turns the branch into a guard that can fail.
-        """
         import logging
 
         db = StateDB(tmp_path / "state.db")
-        stamp = db.claim_dispatch_alert()
-        assert stamp is not None
+        db.claim_dispatch_alert(lease_seconds=60)
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
-            db.release_dispatch_alert(None)
-        assert db.get_dispatch_health()["alerted_at"] is not None
+            assert db.mark_dispatch_alert_delivered(None) is False
+        assert db.get_dispatch_health()["alert_delivered_at"] is None
         assert any(
-            r.getMessage() == "dispatch_health.release_without_claim"
+            r.getMessage() == "dispatch_health.delivery_without_claim"
             for r in caplog.records
-        ), "a release that named no claim was not reported"
+        )
         db.close()
 
-    def test_the_release_is_conditional_on_the_token_in_sql(
+    def test_a_success_clears_the_delivery_record_too(
         self, tmp_path: Path
     ) -> None:
-        """The WHERE clause, not the early return, is what protects a
-        newer claim.
-
-        Asserted separately so the two mechanisms are pinned
-        independently: the early return reports a caller bug, and this
-        is what makes a wrong stamp harmless even without it.
-        """
+        """Otherwise the alert fires once per database: a delivered
+        alert would suppress every later outage forever."""
         db = StateDB(tmp_path / "state.db")
-        token = db.claim_dispatch_alert()
-        assert token is not None
-        db.release_dispatch_alert("0" * 32)
-        assert db.get_dispatch_health()["alert_claim_token"] == token
-        db.close()
-
-    def test_releasing_a_superseded_claim_clears_nothing(
-        self, tmp_path: Path
-    ) -> None:
-        db = StateDB(tmp_path / "state.db")
-        ours = db.claim_dispatch_alert()
-        assert ours is not None
-        # Somebody else's newer claim, after a success cleared ours.
+        token = db.claim_dispatch_alert(lease_seconds=60)
+        db.mark_dispatch_alert_delivered(token)
         db.reset_dispatch_failures()
-        newer = db.claim_dispatch_alert()
-        assert newer is not None
-        assert newer != ours
-        db.release_dispatch_alert(ours)
-        assert db.get_dispatch_health()["alert_claim_token"] == newer
+        row = db.get_dispatch_health()
+        assert row["alert_delivered_at"] is None
+        assert row["alert_claim_token"] is None
+        assert db.claim_dispatch_alert(lease_seconds=60) is not None
+        db.close()
+
+    def test_a_claim_with_no_timestamp_is_treated_as_expired(
+        self, tmp_path: Path
+    ) -> None:
+        """"I cannot tell how old this is" must not read as "it is
+        current" — that is the direction that goes silent."""
+        db = StateDB(tmp_path / "state.db")
+        db.claim_dispatch_alert(lease_seconds=60)
+        db.execute("UPDATE dispatch_health SET alerted_at = NULL WHERE id = 1")
+        db.commit()
+        assert db.claim_dispatch_alert(lease_seconds=60) is not None
         db.close()
 
     def test_two_claims_in_the_same_second_are_distinguishable(
@@ -908,38 +987,23 @@ class TestTheLatchReleaseIsOwned:
     ) -> None:
         """The token is a uuid, not the `alerted_at` second.
 
-        Comparing the whole-second timestamp cannot separate two claims
-        made inside one second — and during an outage where dispatches
-        fail in about two seconds each, that window is not remote. A's
-        failed delivery would then clear B's claim and the same outage
-        would be announced twice.
-
-        **The clock is frozen.** An earlier version of this test just
-        made two claims back to back and asserted they differed, which
-        is a STREAK and not a mechanism: with a timestamp token it
-        passes whenever the two calls happen to straddle a second
-        boundary. A mutation sweep duly reported it as surviving on one
-        run and failing on another. Freezing `time.time` makes "inside
-        the same second" true by construction, so the assertion
-        discriminates every time.
+        **The clock is frozen.** Making two claims back to back and
+        asserting they differ is a STREAK and not a mechanism: with a
+        timestamp token it passes whenever the two calls straddle a
+        second boundary, and a mutation sweep duly reported it
+        surviving on one run and failing on another.
         """
-        from unittest.mock import patch as _patch
-
         db = StateDB(tmp_path / "state.db")
-        with _patch("ctrlrelay.core.state.time.time", return_value=1_792_364_533.0):
-            first = db.claim_dispatch_alert()
+        with patch(
+            "ctrlrelay.core.state.time.time", return_value=1_792_364_533.0
+        ):
+            first = db.claim_dispatch_alert(lease_seconds=60)
             db.reset_dispatch_failures()
-            second = db.claim_dispatch_alert()
+            second = db.claim_dispatch_alert(lease_seconds=60)
             row = db.get_dispatch_health()
         db.close()
         assert first is not None and second is not None
-        assert first != second, (
-            "two claims in one second share a token, so one poller's "
-            "failed delivery can release another's claim"
-        )
-        assert row["alert_claim_token"] == second
-        # Same second on both, which is what makes the timestamp
-        # unusable as an identity and is asserted rather than assumed.
+        assert first != second
         assert row["alerted_at"] == 1_792_364_533
 
     def test_the_per_failure_path_also_mints_a_unique_token(
@@ -947,40 +1011,28 @@ class TestTheLatchReleaseIsOwned:
     ) -> None:
         """`record_dispatch_failure` mints its own claim, so it needs
         the same property — and nothing else can observe it, because a
-        timestamp token still releases correctly against itself. A
-        mutation of that line survived until this test existed.
-        """
-        from unittest.mock import patch as _patch
-
+        timestamp token still records a delivery against itself. A
+        mutation of that line survived until this test existed."""
         db = StateDB(tmp_path / "state.db")
-        with _patch("ctrlrelay.core.state.time.time", return_value=1_792_364_533.0):
-            _, first = db.record_dispatch_failure(1)
+        with patch(
+            "ctrlrelay.core.state.time.time", return_value=1_792_364_533.0
+        ):
+            _, first = db.record_dispatch_failure(1, lease_seconds=60)
             db.reset_dispatch_failures()
-            _, second = db.record_dispatch_failure(1)
+            _, second = db.record_dispatch_failure(1, lease_seconds=60)
         db.close()
         assert first is not None and second is not None
         assert first != second
 
-    def test_releasing_our_own_claim_does_clear_it(
-        self, tmp_path: Path
-    ) -> None:
-        """The control. Without it, "never release" passes every test
-        above and the failed-delivery fix is undone."""
+    def test_a_zero_lease_is_refused_loudly(self, tmp_path: Path) -> None:
+        """Not silently coerced. A zero lease makes every claim
+        instantly expired, so two processes could both attempt the same
+        alert and a failed delivery would retry on every dispatch."""
         db = StateDB(tmp_path / "state.db")
-        token = db.claim_dispatch_alert()
-        assert token is not None
-        db.release_dispatch_alert(token)
-        row = db.get_dispatch_health()
-        db.close()
-        assert row["alerted_at"] is None
-        assert row["alert_claim_token"] is None
+        from ctrlrelay.core.dispatch_health import DispatchHealth
 
-    def test_a_second_claim_is_refused_while_one_is_held(
-        self, tmp_path: Path
-    ) -> None:
-        db = StateDB(tmp_path / "state.db")
-        assert db.claim_dispatch_alert() is not None
-        assert db.claim_dispatch_alert() is None
+        with pytest.raises(ValueError):
+            DispatchHealth(db, threshold=3, lease_seconds=0)
         db.close()
 
 
@@ -1015,11 +1067,11 @@ class TestAStalledSendCannotHangADispatch:
             await asyncio.wait_for(hook(_outcome("s-0", 1)), timeout=10)
         # The send was ENTERED, not merely skipped. Without this the
         # test passes for an alert implementation that never tries at
-        # all, because the latch is clear either way.
+        # all, because nothing is recorded either way.
         assert len(entered) == 1
-        # Undelivered, so the latch went back and the next failure
-        # will try again.
-        assert db.get_dispatch_health()["alerted_at"] is None
+        # Nothing delivered, so nothing latched: the claim expires and
+        # a later failure retries.
+        assert db.get_dispatch_health()["alert_delivered_at"] is None
         db.close()
 
 

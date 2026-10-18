@@ -12,8 +12,12 @@ which is the lane `zzsites#853` was dispatched on.
 A *task* failure sent it fine, which is why the branch read as
 working, and the only symptom was an absent message.
 
-`test_a_dev_failure_is_announced` is the regression: on the pre-fix
-code it raises NameError rather than failing an assertion.
+`test_a_dev_failure_is_announced` is the regression. On the pre-fix
+code the dev branch reached `failure_text` with the name unbound, so
+it failed rather than asserting — whether that surfaces as a
+`NameError` depends on how the import is removed, which is why the
+test asserts on the message that must be sent and not on an exception
+type.
 """
 
 import pytest
@@ -49,7 +53,8 @@ def failed(**kw) -> PipelineResult:
 class TestFailureIsAnnounced:
     @pytest.mark.asyncio
     async def test_a_dev_failure_is_announced(self) -> None:
-        """The regression. Raises NameError on the pre-fix code."""
+        """The regression. Fails on the pre-fix code, where the dev
+        branch reached `failure_text` with the name unbound."""
         t = FakeTransport()
         sent = await announce_issue_outcome(
             t, repo="o/r", issue_number=853, is_task=False, result=failed(exit_code=1)

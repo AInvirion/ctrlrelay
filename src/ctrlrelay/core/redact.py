@@ -45,18 +45,17 @@ REDACTION = "[redacted]"
 # base64 diffs, which is most of what makes a failure readable; it
 # would trade this ticket's defect for a redacted blob that diagnoses
 # nothing. Known credential shapes are what gets matched.
-# A name that ends in one of these is a measurement, not a secret —
-# but only when its value is a number. See the key/value rule below.
-_METRIC_SUFFIXES = (
-    "_count",
-    "_len",
-    "_length",
-    "_size",
-    "_bytes",
-    "_ms",
-    "_seconds",
-    "_limit",
-    "_total",
+# Keys whose value is plausibly a NUMBER and still a secret: a PIN, a
+# one-time code, a numeric password. Everywhere else a numeric value is
+# a measurement, which is the rule below.
+#
+# This list is on the dangerous side of the decision deliberately. Being
+# incomplete here costs a leak only for a numeric secret under an
+# unusual key name; being incomplete on the other side would destroy
+# every diagnostic number in the output, which is most of what makes a
+# failure readable.
+_NUMERIC_SECRET_KEYS = re.compile(
+    r"(?i)(?:password|passwd|passphrase|passcode|pin|otp)[A-Za-z0-9_]*$"
 )
 
 # Digits, with an optional sign, decimal point or exponent: what a
@@ -64,20 +63,40 @@ _METRIC_SUFFIXES = (
 _NUMERIC_VALUE = re.compile(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
 
 
-def _redact_unless_metric(match: "re.Match[str]") -> str:
-    """Keep `token_count=8192`; redact `API_KEY_COUNT=hunter2`.
+def _redact_unless_measurement(match: "re.Match[str]") -> str:
+    """Keep `max_tokens: 100000`; redact `client_secret="abc"`.
 
-    Both halves are required: a metric-shaped NAME and a numeric
-    VALUE. The name list can therefore only ever add a redaction — a
-    metric whose suffix nobody listed — and never remove one, because
-    the numeric test is what does the protecting.
+    **The discriminator is the VALUE, not the key.** This rule has been
+    patched four times and each patch was a longer name list, so the
+    list is gone:
+
+      1. `\bsecret\b` missed `AWS_SECRET_ACCESS_KEY` — an underscore
+         is a word character. Boundaries dropped.
+      2. The widened rule then ate `token_count=8192`. A metric-suffix
+         exemption was added.
+      3. That exemption leaked `API_KEY_COUNT=hunter2`, because the
+         suffix was the whole test. The value had to be numeric too.
+      4. And the suffix list still did not contain `max_tokens`,
+         `input_tokens` or `total_tokens` — the exact numbers in the
+         API error the alert tells the operator to go and read.
+
+    The fourth correction is the argument for deleting the mechanism.
+    A credential in these shapes — a key, a token, a PAT, a client
+    secret — is never a bare number, so **a numeric value is a
+    measurement** and needs no name list at all. The only exception is
+    a key whose secret genuinely is numeric, and that is a short list
+    on the side where being wrong costs one redaction.
     """
-    name, sep, value = match.group(1), match.group(2), match.group(3)
+    name, quote, sep, value = (
+        match.group(1),
+        match.group(2),
+        match.group(3),
+        match.group(4),
+    )
     bare = value.strip("\"'")
-    looks_like_a_metric = name.lower().endswith(_METRIC_SUFFIXES)
-    if looks_like_a_metric and _NUMERIC_VALUE.match(bare):
+    if _NUMERIC_VALUE.match(bare) and not _NUMERIC_SECRET_KEYS.search(name):
         return match.group(0)
-    return f"{name}{sep}{REDACTION}"
+    return f"{name}{quote}{sep}{REDACTION}"
 
 
 _PATTERNS: tuple[tuple[re.Pattern[str], str | object], ...] = (
@@ -104,11 +123,25 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | object], ...] = (
     # redacted too. That costs one `[redacted]` in diagnostic text. The
     # boundary version costs a leaked credential, and only one of those
     # is recoverable.
+    # NO leading boundary or lookbehind on the DISTINCTIVE prefixes. A
+    # token can land flush against surrounding output with no
+    # separator, and `\b` needs a non-word character before it, so the
+    # first version of this file stored `...contextghp_AAA...` intact.
+    # `ghp_`, `github_pat_`, `xox?-` and `AKIA` plus their length are
+    # specific enough that a mid-word match is a real credential.
     (re.compile(r"gh[pousr]_[A-Za-z0-9]{16,}"), REDACTION),
     (re.compile(r"github_pat_[A-Za-z0-9_]{16,}"), REDACTION),
-    # Anthropic, OpenAI and the generic `sk-` family.
+    # Anthropic, and the generic `sk-` family.
     (re.compile(r"sk-ant-[A-Za-z0-9_-]{16,}"), REDACTION),
-    (re.compile(r"sk-[A-Za-z0-9_-]{16,}"), REDACTION),
+    # `sk-` alone is two letters and a hyphen, so unlike the prefixes
+    # above it collides with ordinary words: it matches inside
+    # `disk-usage-1234567890abcdef` and `risk-score-...`, eating
+    # diagnostics. This ONE pattern therefore takes a lookbehind
+    # excluding letters and digits — which still allows `_sk-...` and
+    # a line start, and refuses the mid-word case. The distinctive
+    # prefixes do not need it and must not have it, because that is
+    # what reintroduces the glued-token leak.
+    (re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}"), REDACTION),
     # Slack.
     (re.compile(r"xox[baprs]-[A-Za-z0-9-]{8,}"), REDACTION),
     # AWS access key id. An AKIA key is exactly 20 characters, but the
@@ -127,8 +160,15 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | object], ...] = (
     ),
     # `Authorization: Bearer <...>` and `Basic <...>`. The scheme is
     # kept; the credential is not.
+    #
+    # `Token` is NOT in this list, although some APIs use it as a
+    # scheme. Case-insensitively it is also the English word, so
+    # "the token provided was rejected" became "the token [redacted]
+    # was rejected" — destroying a sentence that is the diagnosis.
+    # `Authorization: Token ghp_...` is still caught, by the GitHub
+    # prefix above and by the key/value rule below.
     (
-        re.compile(r"\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+        re.compile(r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
         r"\1 " + REDACTION,
     ),
     # Generic `key = value` shapes. The KEY is kept so the reader can
@@ -185,11 +225,29 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | object], ...] = (
         re.compile(
             r"(?i)([A-Za-z0-9_]*(?:api[_-]?key|access[_-]?key|access[_-]?token"
             r"|refresh[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret"
-            r"|password|passwd|secret|token|credential)[A-Za-z0-9_]*)"
-            r"(\s*[:=]\s*|\s+is\s+)"
-            r"(\"[^\"\n]{1,}\"|'[^'\n]{1,}'|[^\s,;}\"'\n]{1,})"
+            r"|password|passwd|passphrase|passcode|secret|token|credential"
+            r"|pin|otp)[A-Za-z0-9_]*)"
+            # A closing quote may sit between the key and the
+            # separator: `{"client_secret": "abc"}` is the dominant
+            # shape of a worker's stdout, and without it the separator
+            # never matched, so every credential in a JSON body was
+            # stored verbatim. The backslash covers the ESCAPED form,
+            # `{\\"token\\": ...}`, which is how a nested payload
+            # arrives inside another JSON string — and that is the
+            # shape `claude -p --output-format json` emits.
+            #
+            # Captured, not discarded, so the quote is put back and the
+            # line still reads as JSON.
+            r"(\\?[\"']?)(\s*[:=]\s*|\s+is\s+)"
+            # The escaped-quoted form comes FIRST, so a value written
+            # as \\"secret\\" is taken whole. Without it the bare-token
+            # alternative matched the single leading backslash, the
+            # backslash was replaced, and the credential was left
+            # sitting beside the redaction marker.
+            r"(\\\"[^\"\n]{1,}\\\"|\"[^\"\n]{1,}\""
+            r"|'[^'\n]{1,}'|[^\s,;}\"'\n]{1,})"
         ),
-        _redact_unless_metric,
+        _redact_unless_measurement,
     ),
 )
 

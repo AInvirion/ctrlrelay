@@ -246,6 +246,36 @@ AGENT_OUTCOME_MARKER = "<!-- ctrlrelay:dispatch-failed -->"
 OUR_COMMENT_MARKERS = (AGENT_CLAIM_MARKER, AGENT_OUTCOME_MARKER)
 
 
+def claim_is_live(comments: list[dict[str, Any]] | None) -> bool:
+    """Whether a claim stands on this issue with no retraction after it.
+
+    Not "any comment carries the claim marker". The claim comment is
+    deliberately never deleted, so after a reconciliation the marker is
+    still there — and the retraction's own closing line invites a retry
+    ("free to pick up... re-apply the automation label"). On that retry
+    a marker-only test says the issue is already claimed, no fresh
+    claim is posted, and the issue's LAST relay comment stays the
+    retraction: "nothing is working on this issue", while a worker is
+    running, and still after it succeeds, because success is announced
+    on chat and not on the issue.
+
+    For the beta tester, whose only surface is the issue, that is the
+    eighteen-hour defect mirrored — so the question has to be which of
+    the two markers came last.
+
+    Comments arrive oldest-first from `gh issue view --json comments`,
+    so the last marker wins.
+    """
+    live = False
+    for comment in comments or []:
+        body = comment.get("body") or ""
+        if AGENT_CLAIM_MARKER in body:
+            live = True
+        elif AGENT_OUTCOME_MARKER in body:
+            live = False
+    return live
+
+
 def claim_failure_comment(
     session_id: str,
     *,
@@ -289,7 +319,7 @@ def claim_failure_comment(
     exit_line = (
         f"- Agent exit code: `{exit_code}`"
         if exit_code is not None
-        else "- Agent exit code: not recorded (the worker never started)"
+        else "- Agent exit code: not recorded"
     )
 
     return (
@@ -1172,10 +1202,7 @@ async def run_dev_issue(
         # Skip if a previous attempt already left the marker — keeps it idempotent
         # across retries / resumed sessions.
         existing_comments = issue.get("comments") or []
-        already_claimed = any(
-            AGENT_CLAIM_MARKER in (c.get("body") or "")
-            for c in existing_comments
-        )
+        already_claimed = claim_is_live(existing_comments)
         claim_may_stand = True
         if not already_claimed:
             await github.comment_on_issue(
@@ -1305,6 +1332,11 @@ async def run_dev_issue(
                 break
             rounds += 1
             result = await pipeline.resume(ctx, answer)
+            # A resumed worker is the one whose exit code the failure
+            # comment should name. Assigned once before this loop, a
+            # late exception reported the FIRST worker's code for a
+            # session that had since been resumed several times.
+            last_exit_code = result.exit_code
 
         # Verify PR is green & conflict-free before handing off. Resume the
         # session with a fix request if either is broken, up to max_fix_attempts.

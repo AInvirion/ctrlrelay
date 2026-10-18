@@ -340,11 +340,26 @@ class TestShortValuesAndMetricNames:
         for text, value in (
             ("password=x", "x"),
             ("TOKEN=abc", "abc"),
-            ("api_key=1", "1"),
+            ("api_key=ab", "ab"),
         ):
             out = redact_secrets(text)
             assert "[redacted]" in out, f"{text} was not redacted"
             assert not out.endswith(value), f"{text} leaked its value"
+
+    def test_a_numeric_value_is_a_measurement_even_under_a_key_name(
+        self,
+    ) -> None:
+        """`api_key=1` is kept, and that is the rule working.
+
+        The discriminator is the VALUE: a credential in these shapes —
+        a key, a token, a PAT, a client secret — is never a bare
+        number, and treating every number as a possible secret is what
+        destroyed `max_tokens: 100000`. The exception is a key whose
+        secret genuinely is numeric, which `_NUMERIC_SECRET_KEYS`
+        names and the test below covers.
+        """
+        assert redact_secrets("api_key=1") == "api_key=1"
+        assert redact_secrets("token: 0") == "token: 0"
 
     def test_a_credential_name_ending_in_a_metric_suffix_is_redacted(
         self,
