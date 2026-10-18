@@ -1447,3 +1447,66 @@ class TestAnUnreadExitStatusIsNotReportedAsHealthy:
             )
         assert seen[0].exit_code == 0
         assert seen[0].ok is True
+
+
+class TestTheOutcomeWriterJoinsACallersTransaction:
+    def test_it_does_not_publish_a_callers_pending_write(
+        self, tmp_path: Path
+    ) -> None:
+        """The outcome hook runs mid-pipeline on the pipeline's own
+        connection, so a caller with an open transaction is real and
+        not hypothetical.
+
+        `_begin_immediate` was corrected for this and the writers
+        beside it committed unconditionally, reintroducing it. A
+        mutation of the flag survived until this test existed, because
+        the only coverage drove `record_dispatch_failure` instead.
+        """
+        db = StateDB(tmp_path / "state.db")
+        db.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("target", "dev", "o/r", "running", 0),
+        )
+        db.commit()
+        # A caller mid-write, as `StateDB.execute` leaves it.
+        db.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("callers-pending-row", "dev", "o/r", "running", 0),
+        )
+        assert db._conn.in_transaction
+
+        db.record_session_outcome("target", exit_code=1, output_tail="x")
+
+        # Still the caller's to commit: not published, not discarded.
+        assert db._conn.in_transaction, (
+            "the outcome writer committed a transaction it only joined"
+        )
+        db._conn.rollback()
+        assert db.get_session_row("callers-pending-row") is None
+        # And our own write went with it, which is the accepted cost:
+        # losing an exit code to a caller's rollback is recoverable,
+        # publishing their partial write is not.
+        assert db.get_session_row("target")["claude_exit_code"] is None
+        db.close()
+
+    def test_it_commits_its_own_transaction(self, tmp_path: Path) -> None:
+        """The control: with no caller transaction open, the write is
+        ours and is published."""
+        db = StateDB(tmp_path / "state.db")
+        db.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("target", "dev", "o/r", "running", 0),
+        )
+        db.commit()
+        assert not db._conn.in_transaction
+        assert db.record_session_outcome(
+            "target", exit_code=1, output_tail="x"
+        ) is True
+        assert not db._conn.in_transaction
+        db.close()
+        reopened = StateDB(tmp_path / "state.db")
+        assert reopened.get_session_row("target")["claude_exit_code"] == 1
+        reopened.close()
