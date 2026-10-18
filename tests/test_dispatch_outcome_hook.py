@@ -558,6 +558,95 @@ class TestTheHookAlertsExactlyOnce:
         assert "boom" in row["output_tail"]
 
     @pytest.mark.asyncio
+    async def test_a_failed_delivery_does_not_silence_the_outage(
+        self, tmp_path: Path
+    ) -> None:
+        """The latch is the right to ATTEMPT one message.
+
+        Measured before the release existed: the channel was absent for
+        the first failure and healthy for the next fifty, and **zero**
+        messages were ever delivered — the alert latched on the attempt,
+        so the relay was dead, the channel was up, and nobody was ever
+        told. That is this ticket's own defect reproduced inside the fix
+        for it.
+        """
+        from ctrlrelay.cli import make_dispatch_outcome_hook
+
+        db = StateDB(tmp_path / "state.db")
+        spy = SpyTransport()
+        hook = make_dispatch_outcome_hook(_config(threshold=1), db)
+        # No channel for the first failure.
+        with patch(
+            "ctrlrelay.cli.connect_notify_transport",
+            new=AsyncMock(return_value=None),
+        ):
+            await hook(_outcome("s-0", 1))
+        assert db.get_dispatch_health()["alerted_at"] is None, (
+            "the latch was kept although nothing was delivered"
+        )
+        # Channel recovers. Exactly one message, then quiet again.
+        with patch(
+            "ctrlrelay.cli.connect_notify_transport",
+            new=AsyncMock(return_value=spy),
+        ):
+            for i in range(1, 51):
+                await hook(_outcome(f"s-{i}", 1))
+        db.close()
+        assert len(spy.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_send_that_throws_also_hands_the_latch_back(
+        self, tmp_path: Path
+    ) -> None:
+        """The other way delivery fails: a connected transport whose
+        `send` raises — a bridge whose websocket is reconnecting."""
+        from ctrlrelay.cli import make_dispatch_outcome_hook
+
+        class Broken(SpyTransport):
+            async def send(self, text: str, **kwargs) -> None:
+                raise RuntimeError("websocket reconnecting")
+
+        db = StateDB(tmp_path / "state.db")
+        hook = make_dispatch_outcome_hook(_config(threshold=1), db)
+        with patch(
+            "ctrlrelay.cli.connect_notify_transport",
+            new=AsyncMock(return_value=Broken()),
+        ):
+            await hook(_outcome("s-0", 1))
+        assert db.get_dispatch_health()["alerted_at"] is None
+        # And the run is NOT reset — only the right to announce it went
+        # back. A cleared counter would restart the countdown and delay
+        # the alert by another full threshold.
+        assert db.dispatch_failure_count() == 1
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_delivered_alert_does_keep_the_latch(
+        self, tmp_path: Path
+    ) -> None:
+        """The control for the two tests above.
+
+        Without it, "always release the latch" passes both of them —
+        and would send one message per failure, which is the per-repo
+        noise the ticket rules out.
+        """
+        from ctrlrelay.cli import make_dispatch_outcome_hook
+
+        db = StateDB(tmp_path / "state.db")
+        spy = SpyTransport()
+        hook = make_dispatch_outcome_hook(_config(threshold=1), db)
+        with patch(
+            "ctrlrelay.cli.connect_notify_transport",
+            new=AsyncMock(return_value=spy),
+        ):
+            await hook(_outcome("s-0", 1))
+            assert db.get_dispatch_health()["alerted_at"] is not None
+            for i in range(1, 20):
+                await hook(_outcome(f"s-{i}", 1))
+        db.close()
+        assert len(spy.sent) == 1
+
+    @pytest.mark.asyncio
     async def test_an_undeliverable_alert_is_logged(
         self, tmp_path: Path, caplog
     ) -> None:

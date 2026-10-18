@@ -210,6 +210,23 @@ class TestSweepAllFailed:
         assert health.record_sweep(total=0, failed=0) is None
         assert state_db.get_dispatch_health()["alerted_at"] is None
 
+    def test_more_failures_than_repos_is_declined_not_reported(
+        self, state_db
+    ) -> None:
+        """`total=1, failed=2` used to produce an alert reading
+        "all 1 of 1 repos failed" — a sentence that was not true of its
+        own inputs, because the docstring said "must equal" and the
+        comparison was `failed < total`.
+
+        A count larger than the total is a caller bug, and the honest
+        answer to one is to decline rather than to publish a number
+        nobody measured.
+        """
+        health = DispatchHealth(state_db, threshold=3)
+        assert health.record_sweep(total=1, failed=2) is None
+        assert health.record_sweep(total=5, failed=-1) is None
+        assert state_db.get_dispatch_health()["alerted_at"] is None
+
     def test_a_single_repo_sweep_that_failed_does_alert(
         self, state_db
     ) -> None:
@@ -236,6 +253,89 @@ class TestSweepAllFailed:
         assert health.record_sweep(total=5, failed=5) is not None
         health.record_success()
         assert health.record_sweep(total=5, failed=5) is not None
+
+
+class TestTheSharedDatabaseIsNotWedged:
+    """The poller and the bridge both open `state.db`, and two pollers
+    against one database has happened on this deployment. Every method
+    here has to leave the connection with no transaction open."""
+
+    def test_reading_the_count_does_not_open_a_write_transaction(
+        self, tmp_path: Path
+    ) -> None:
+        """A read that writes takes a RESERVED lock for the life of the
+        transaction, and then EVERY other connection to the file fails
+        with `database is locked`.
+
+        Measured on the first version: a bare `dispatch_failure_count()`
+        on one connection made an ordinary `INSERT INTO sessions` on a
+        second one fail. A read-shaped call could have wedged the live
+        relay's whole database — far worse than the alert it was part of.
+        """
+        path = tmp_path / "state.db"
+        a = StateDB(path)
+        b = StateDB(path)
+        try:
+            a.dispatch_failure_count()
+            a.get_dispatch_health()
+            assert not a._conn.in_transaction, (
+                "a read left a transaction open on the shared database"
+            )
+            # The observable consequence, asserted as well as the
+            # internal flag: another connection can still write.
+            b.execute(
+                "INSERT INTO sessions (id, pipeline, repo, status, started_at)"
+                " VALUES ('x', 'dev', 'o/r', 'running', 0)"
+            )
+            b.commit()
+            assert b.get_session_row("x") is not None
+        finally:
+            a.close()
+            b.close()
+
+    def test_recording_a_failure_leaves_no_transaction_open(
+        self, tmp_path: Path
+    ) -> None:
+        """The write path takes BEGIN IMMEDIATE, so it must commit."""
+        path = tmp_path / "state.db"
+        a = StateDB(path)
+        b = StateDB(path)
+        try:
+            DispatchHealth(a, threshold=3).record_failure(repo="o/r")
+            assert not a._conn.in_transaction
+            b.execute(
+                "INSERT INTO sessions (id, pipeline, repo, status, started_at)"
+                " VALUES ('y', 'dev', 'o/r', 'running', 0)"
+            )
+            b.commit()
+        finally:
+            a.close()
+            b.close()
+
+    def test_a_success_recorded_elsewhere_is_seen_by_the_next_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """The increment, the comparison and the claim are one
+        transaction, so a peer's success cannot land inside them.
+
+        What this can assert from one thread is the consequence: a
+        reset committed by connection B is visible to A's next
+        decision, so A does not announce a relay that has recovered.
+        """
+        path = tmp_path / "state.db"
+        a = StateDB(path)
+        b = StateDB(path)
+        try:
+            ha = DispatchHealth(a, threshold=3)
+            run_failures(ha, 2)
+            b.reset_dispatch_failures()
+            # A's next failure starts the run again from B's reset, so
+            # it is the first of a new run and must not alert.
+            assert ha.record_failure(repo="o/r") is None
+            assert a.dispatch_failure_count() == 1
+        finally:
+            a.close()
+            b.close()
 
 
 class TestThresholdValidation:

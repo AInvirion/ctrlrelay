@@ -95,6 +95,45 @@ class TestRedactSecrets:
         assert "hunter2hunter2" not in out
         assert "password" in out
 
+    def test_a_namespaced_environment_variable_is_redacted(self) -> None:
+        """The normal shape in a worker's output, and it was leaking.
+
+        `\\bsecret\\b` does not match inside `AWS_SECRET_ACCESS_KEY`,
+        because an underscore is a word character and so there is no
+        boundary before `SECRET`. Measured: every one of these stored
+        its value verbatim, while the bare `password=` case passed —
+        so the pattern covered the rare spelling and missed the
+        common one.
+        """
+        leaky = {
+            "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "GITHUB_TOKEN": "abcdef1234567890",
+            "MY_API_KEY": "abcdef1234567890",
+            "X_PASSWORD": "hunter2hunter2",
+            "CTRLRELAY_CLIENT_SECRET": "abcdef1234567890",
+            # Trailing text after the name, which a trailing `\\b` would
+            # also have missed.
+            "TOKEN_FOR_GH": "abcdef1234567890",
+        }
+        for name, value in leaky.items():
+            out = redact_secrets(f"{name}={value}")
+            assert value not in out, f"{name} leaked its value"
+            assert name in out, f"{name} lost its own name"
+
+    def test_a_non_credential_word_ending_in_secret_is_over_redacted(
+        self,
+    ) -> None:
+        """An accepted cost, asserted so it is a decision and not a
+        surprise.
+
+        Dropping the word boundaries to catch `AWS_SECRET_ACCESS_KEY`
+        also matches `secretary=`. The trade is one-directional: a
+        false positive costs one `[redacted]` in diagnostic text, and
+        a false negative costs a stored credential. Only one of those
+        is recoverable.
+        """
+        assert "alice" not in redact_secrets("secretary=alice")
+
     def test_one_assignment_does_not_swallow_the_rest_of_the_line(self) -> None:
         """The value match stops at a comma.
 

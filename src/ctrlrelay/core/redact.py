@@ -100,10 +100,28 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # see which setting was wrong. Stops at whitespace, a quote, a
     # comma or a closing brace so one assignment on a crowded line
     # cannot swallow the rest of it.
+    #
+    # The key is matched with a `[A-Za-z0-9_]*` PREFIX rather than a
+    # leading `\b`, and this is the same fault as the token prefixes
+    # above — fixed there and left here. A word boundary needs a
+    # non-word character before the name, and an underscore is a word
+    # character, so `\bsecret\b` does not match inside
+    # `AWS_SECRET_ACCESS_KEY`. Measured on the first version of this
+    # file: `AWS_SECRET_ACCESS_KEY=`, `GITHUB_TOKEN=`, `MY_API_KEY=`
+    # and `X_PASSWORD=` ALL stored their values verbatim. Namespaced
+    # environment variables are the overwhelmingly common shape in a
+    # worker's output, so the boundary version missed the normal case
+    # and matched only the bare one.
+    #
+    # The trailing boundary goes for the mirror reason: `TOKEN_FOR_GH=`
+    # has no boundary after `TOKEN`. What bounds the match instead is
+    # the assignment operator that must follow, which is what makes
+    # this pattern a key/value rule rather than a word list.
     (
         re.compile(
-            r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token"
-            r"|secret[_-]?key|client[_-]?secret|password|passwd|secret|token)\b"
+            r"(?i)([A-Za-z0-9_]*(?:api[_-]?key|access[_-]?key|access[_-]?token"
+            r"|refresh[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret"
+            r"|password|passwd|secret|token|credential)[A-Za-z0-9_]*)"
             r"(\s*[:=]\s*|\s+is\s+)"
             r"(\"[^\"\n]{4,}\"|'[^'\n]{4,}'|[^\s,;}\"'\n]{4,})"
         ),

@@ -380,37 +380,89 @@ class StateDB:
     def _ensure_dispatch_health_row(self) -> None:
         """Create the single ``dispatch_health`` row if it is absent.
 
-        Called from ``_migrate`` for a fresh or upgraded database, and
-        again at the top of every accessor below. The repeat is cheap
-        (an INSERT OR IGNORE on a one-row table) and it means a
-        database whose row was deleted by hand re-arms instead of
-        silently never counting — a counter that cannot count is the
-        fault this table exists to detect.
+        **Commits.** An earlier version left this INSERT uncommitted and
+        called it from the read accessors too, which opened a write
+        transaction on a method that only reads. SQLite then held a
+        RESERVED lock for the life of that connection's transaction, and
+        the next writer on ANY other connection to the same file failed
+        with ``database is locked`` — measured: a bare
+        ``dispatch_failure_count()`` on one connection made an ordinary
+        ``INSERT INTO sessions`` on a second one fail. The poller and the
+        bridge both open ``state.db``, so a read-shaped call could have
+        wedged the live relay's whole database. Called from the write
+        paths only, and it commits.
         """
         self._conn.execute(
             "INSERT OR IGNORE INTO dispatch_health "
             "(id, consecutive_failures) VALUES (1, 0)"
         )
+        self._conn.commit()
 
     def dispatch_failure_count(self) -> int:
-        """Length of the current run of failed dispatches (0 when healthy)."""
-        self._ensure_dispatch_health_row()
+        """Length of the current run of failed dispatches (0 when healthy).
+
+        A pure read. A missing row reads as 0 rather than being created
+        here — see ``_ensure_dispatch_health_row`` on why a read must
+        not write. ``_migrate`` creates the row, and the write paths
+        re-create it if somebody deletes it by hand.
+        """
         row = self._conn.execute(
             "SELECT consecutive_failures FROM dispatch_health WHERE id = 1"
         ).fetchone()
         return int(row["consecutive_failures"]) if row else 0
 
-    def increment_dispatch_failures(self) -> int:
-        """Extend the failure run by one and return the new length."""
-        self._ensure_dispatch_health_row()
-        self._conn.execute(
-            "UPDATE dispatch_health SET "
-            "consecutive_failures = consecutive_failures + 1, "
-            "last_failure_at = ? WHERE id = 1",
-            (int(time.time()),),
-        )
-        self._conn.commit()
-        return self.dispatch_failure_count()
+    def record_dispatch_failure(self, threshold: int) -> tuple[int, bool]:
+        """Extend the failure run and decide, in ONE transaction.
+
+        Returns ``(consecutive_failures, may_alert)``.
+
+        The increment, the threshold comparison and the latch claim are
+        a single ``BEGIN IMMEDIATE`` transaction because two pollers can
+        share one ``state.db`` — it has happened on this deployment. Done
+        as three statements, a success recorded by the other process can
+        land between this one's read and its claim, and a relay that has
+        just recovered is announced as still failing. Reading the count
+        back in a separate statement had the same hazard pointed the
+        other way.
+
+        ``may_alert`` is ``True`` at most once per failure run. It is the
+        right to ATTEMPT one delivery, not a record that one happened —
+        see :meth:`release_dispatch_alert`.
+        """
+        if threshold < 1:
+            raise ValueError(f"threshold must be at least 1, got {threshold!r}")
+        # `isolation_level` is sqlite3's default, so an explicit
+        # BEGIN IMMEDIATE is needed to take the write lock up front
+        # rather than upgrading mid-transaction and risking a deadlock
+        # between two writers.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO dispatch_health "
+                "(id, consecutive_failures) VALUES (1, 0)"
+            )
+            self._conn.execute(
+                "UPDATE dispatch_health SET "
+                "consecutive_failures = consecutive_failures + 1, "
+                "last_failure_at = ? WHERE id = 1",
+                (int(time.time()),),
+            )
+            row = self._conn.execute(
+                "SELECT consecutive_failures, alerted_at "
+                "FROM dispatch_health WHERE id = 1"
+            ).fetchone()
+            consecutive = int(row["consecutive_failures"])
+            may_alert = consecutive >= threshold and row["alerted_at"] is None
+            if may_alert:
+                self._conn.execute(
+                    "UPDATE dispatch_health SET alerted_at = ? WHERE id = 1",
+                    (int(time.time()),),
+                )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        return consecutive, may_alert
 
     def reset_dispatch_failures(self) -> int:
         """Clear the run and the alert latch; return the previous length.
@@ -419,26 +471,42 @@ class StateDB:
         when there was something to recover from — otherwise every
         successful dispatch on a healthy relay would log one, and a
         line that appears constantly is a line nobody reads.
+
+        One transaction, for the same reason as
+        :meth:`record_dispatch_failure`.
         """
-        self._ensure_dispatch_health_row()
-        previous = self.dispatch_failure_count()
-        self._conn.execute(
-            "UPDATE dispatch_health SET consecutive_failures = 0, "
-            "alerted_at = NULL, last_success_at = ? WHERE id = 1",
-            (int(time.time()),),
-        )
-        self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO dispatch_health "
+                "(id, consecutive_failures) VALUES (1, 0)"
+            )
+            row = self._conn.execute(
+                "SELECT consecutive_failures FROM dispatch_health WHERE id = 1"
+            ).fetchone()
+            previous = int(row["consecutive_failures"]) if row else 0
+            self._conn.execute(
+                "UPDATE dispatch_health SET consecutive_failures = 0, "
+                "alerted_at = NULL, last_success_at = ? WHERE id = 1",
+                (int(time.time()),),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
         return previous
 
     def claim_dispatch_alert(self) -> bool:
-        """Take the right to send one alert, or return ``False``.
+        """Take the right to attempt one alert, or return ``False``.
 
-        ``True`` exactly once per failure run: the UPDATE is
-        conditional on ``alerted_at IS NULL``, so the claim and the
-        test are one statement and two callers racing cannot both
-        win. Cleared by :meth:`reset_dispatch_failures`, which is to
-        say by a dispatch that succeeds — the only event that means
-        the relay came back.
+        ``True`` at most once per failure run: the UPDATE is conditional
+        on ``alerted_at IS NULL``, so the claim and the test are one
+        statement and two processes racing cannot both win.
+
+        Used by the whole-sweep check, which has no counter to
+        increment. The per-failure path uses
+        :meth:`record_dispatch_failure` so its increment and its claim
+        cannot be separated.
         """
         self._ensure_dispatch_health_row()
         cursor = self._conn.execute(
@@ -449,13 +517,34 @@ class StateDB:
         self._conn.commit()
         return cursor.rowcount > 0
 
+    def release_dispatch_alert(self) -> None:
+        """Give the claim back, because delivery failed.
+
+        Claiming the latch is the right to ATTEMPT one message, not a
+        record that one arrived. Latching on the attempt means a single
+        failed `send` — a bridge mid-restart, a socket that is not there
+        yet — silences the alert for the whole outage, which is this
+        ticket's own defect reproduced inside the fix for it. Measured
+        before this method existed: with the channel absent for the
+        first failure and healthy for the next fifty, zero messages were
+        ever delivered.
+
+        Does NOT clear the counter. The run is still running; only the
+        right to announce it is handed back, so the next failure tries
+        again.
+        """
+        self._conn.execute(
+            "UPDATE dispatch_health SET alerted_at = NULL WHERE id = 1"
+        )
+        self._conn.commit()
+
     def get_dispatch_health(self) -> dict[str, Any]:
-        """The whole row, for `ctrlrelay status` and for tests."""
-        self._ensure_dispatch_health_row()
+        """The whole row, for `ctrlrelay status` and for tests. A pure read."""
         row = self._conn.execute(
             "SELECT * FROM dispatch_health WHERE id = 1"
         ).fetchone()
         return dict(row) if row else {}
+
 
     # Pending resumes (BLOCKED sessions awaiting an operator answer)
 

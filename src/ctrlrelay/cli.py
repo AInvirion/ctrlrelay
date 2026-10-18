@@ -968,6 +968,43 @@ async def send_relay_alert(config, alert) -> bool:
     return True
 
 
+async def deliver_relay_alert(config, state_db, alert) -> bool:
+    """Send the alert, and hand the latch back if it did not arrive.
+
+    The latch is the right to ATTEMPT one message, not a record that
+    one was delivered. Without this release, a single failed `send` —
+    a bridge mid-restart, a socket that is not there yet, a websocket
+    reconnecting — silences the alert for the entire outage.
+
+    Measured before this existed: with the channel absent for the
+    first failure and healthy for the next fifty, **zero** messages
+    were ever delivered. That is this ticket's own defect reproduced
+    inside the fix for it, which is why the release exists rather than
+    a comment promising the send is reliable.
+
+    The counter is NOT reset — the run is still running. Only the
+    right to announce it goes back, so the next failure tries again.
+    A duplicate is the safe direction here; silence is the one that
+    cost two days.
+    """
+    if await send_relay_alert(config, alert):
+        return True
+    try:
+        state_db.release_dispatch_alert()
+    except Exception as e:
+        _log_quietly(
+            "dispatch_health.alert_latch_stuck",
+            cause=e,
+            reason=alert.reason,
+            detail=(
+                "the alert was not delivered AND the latch could not be "
+                "released, so this outage will not be announced again "
+                "until a dispatch succeeds"
+            ),
+        )
+    return False
+
+
 async def alert_if_sweep_all_failed(config, state_db, results) -> bool:
     """One alert when a whole sweep failed. Returns whether it was sent.
 
@@ -1007,7 +1044,7 @@ async def alert_if_sweep_all_failed(config, state_db, results) -> bool:
         return False
     if alert is None:
         return False
-    return await send_relay_alert(config, alert)
+    return await deliver_relay_alert(config, state_db, alert)
 
 
 def make_dispatch_outcome_hook(config, state_db):
@@ -1053,7 +1090,7 @@ def make_dispatch_outcome_hook(config, state_db):
             exit_code=outcome.exit_code,
         )
         if alert is not None:
-            await send_relay_alert(config, alert)
+            await deliver_relay_alert(config, state_db, alert)
 
     return _hook
 

@@ -152,10 +152,18 @@ class DispatchHealth:
 
         Returns ``None`` when the run is still under the threshold, and
         ``None`` again on every later failure in the same run — the
-        latch is set by the first alert and cleared only by
-        :meth:`record_success`.
+        latch is set by the first alert and cleared either by
+        :meth:`record_success` or by a delivery that failed (see
+        :meth:`StateDB.release_dispatch_alert`).
+
+        The increment, the comparison and the claim happen in one
+        transaction inside ``StateDB``, because two pollers can share
+        one database and a success landing between this one's read and
+        its claim would announce a relay that had just recovered.
         """
-        consecutive = self.state_db.increment_dispatch_failures()
+        consecutive, may_alert = self.state_db.record_dispatch_failure(
+            self.threshold
+        )
         log_event(
             _logger,
             "dispatch_health.failure",
@@ -165,20 +173,20 @@ class DispatchHealth:
             consecutive_failures=consecutive,
             threshold=self.threshold,
         )
-        if consecutive < self.threshold:
-            return None
-        if not self.state_db.claim_dispatch_alert():
-            # Already alerted and no success since. Logged, because
-            # "the alert was suppressed" and "the alert was never
-            # reached" are different facts and only one of them means
-            # the dedup is working.
-            log_event(
-                _logger,
-                "dispatch_health.alert_suppressed",
-                repo=repo,
-                consecutive_failures=consecutive,
-                reason=REASON_CONSECUTIVE,
-            )
+        if not may_alert:
+            # Either under the threshold, or already latched. Logged
+            # once the threshold is passed, because "the alert was
+            # suppressed" and "the alert was never reached" are
+            # different facts and only one of them means the dedup is
+            # working.
+            if consecutive >= self.threshold:
+                log_event(
+                    _logger,
+                    "dispatch_health.alert_suppressed",
+                    repo=repo,
+                    consecutive_failures=consecutive,
+                    reason=REASON_CONSECUTIVE,
+                )
             return None
         detail = (
             f"Last failure was {repo or 'an unnamed repo'}"
@@ -200,11 +208,19 @@ class DispatchHealth:
         scheduler fire, and waiting for a second day of it is the
         behaviour this ticket exists to remove.
 
-        ``total`` must be at least 1 and ``failed`` must equal it.
+        ``total`` must be at least 1 and ``failed`` must EQUAL it.
         A zero-repo sweep returns ``None``: nothing ran, which is not
         the same as everything failing.
+
+        The comparison is ``!=``, not ``<``. An earlier version said
+        "must equal" in this docstring and tested ``failed < total``,
+        so ``total=1, failed=2`` produced an alert reading "all 1 of 1
+        repos failed" — a sentence that was not true of its own inputs.
+        A count larger than the total is a caller bug, and the honest
+        answer to one is to decline rather than to report a number
+        nobody measured.
         """
-        if total < 1 or failed < total:
+        if total < 1 or failed < 0 or failed != total:
             return None
         if not self.state_db.claim_dispatch_alert():
             log_event(
