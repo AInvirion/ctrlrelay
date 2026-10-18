@@ -263,6 +263,28 @@ class TransportConfig(BaseModel):
         return getattr(block, "socket_path", None)
 
 
+class AlertsConfig(BaseModel):
+    """When to alert that the relay itself has stopped working (#204).
+
+    Distinct from per-run notifications, which report what a pipeline
+    did. These report that no pipeline can run at all — the case that
+    went unreported for two days and 163 consecutive failed dispatches
+    while both daemons stayed ``active (running)``.
+    """
+
+    # `enabled` is the switch, NOT a zero threshold. Turning alerting
+    # off by setting the count to 0 would depend on whether the
+    # comparison is `>=` or `>`, and `DispatchHealth` refuses a value
+    # below 1 for that reason.
+    enabled: bool = True
+
+    # Three, so one transient failure and one retry do not page anybody
+    # while a genuine outage is caught inside a single poll cycle rather
+    # than a day. At the measured ~2 s per failed dispatch this trips in
+    # seconds; the 163-failure run would have alerted on the third.
+    consecutive_dispatch_failures: int = Field(default=3, ge=1)
+
+
 class DashboardConfig(BaseModel):
     """Dashboard client configuration."""
 
@@ -666,6 +688,7 @@ class Config(BaseModel):
     agent: AgentConfig = Field(default_factory=AgentConfig)
     transport: TransportConfig
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
     personalization: Personalization | None = None
     repos: list[RepoConfig] = Field(default_factory=list)

@@ -285,7 +285,11 @@ class TestMakeAgentDispatcher:
         from ctrlrelay.core.dispatcher import ClaudeDispatcher, make_agent_dispatcher
 
         cfg = AgentConfig(type="claude", binary="claude", default_timeout_seconds=60)
-        adapter = make_agent_dispatcher(cfg)
+        # `outcome_hook` is a required keyword (#204) so every call site
+        # has to say whether dispatch health is recorded. Explicit None
+        # here: this test is about the adapter type, not the hook, and
+        # `tests/test_dispatch_outcome_hook.py` owns the hook's wiring.
+        adapter = make_agent_dispatcher(cfg, outcome_hook=None)
         assert isinstance(adapter, ClaudeDispatcher)
         assert adapter.default_timeout == 60
 
@@ -295,7 +299,7 @@ class TestMakeAgentDispatcher:
 
         cfg = AgentConfig(type="codex")
         with pytest.raises(NotImplementedError) as excinfo:
-            make_agent_dispatcher(cfg)
+            make_agent_dispatcher(cfg, outcome_hook=None)
         msg = str(excinfo.value).lower()
         assert "codex" in msg
         assert "agentadapter" in msg or "adapter" in msg

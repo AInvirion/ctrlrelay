@@ -924,6 +924,23 @@ class TestTheWarningIsActuallySent:
         It cannot show the call is reachable. Nothing structural can,
         which is why the behaviour moved out rather than the guard
         getting a fourth patch.
+
+        **The delegation moved one hop in #204.** `handle_issue` now
+        calls `announce_issue_outcome`, which chooses the branch and
+        calls `announce_dev_success` for a dev success. The reason it
+        moved is this file's own lesson arriving again: the branch
+        selection was inline, and the failure branch referenced
+        `failure_text`, imported only inside `if is_task:`. A dev-lane
+        failure raised NameError into a swallowing `except`, so the
+        failure message could never be sent — and no structural check
+        here could have seen it, because the call was present and
+        correct.
+
+        That `announce_issue_outcome` really reaches
+        `announce_dev_success` is asserted behaviourally, against a
+        fake transport, in `tests/test_issue_outcome_announcement.py`.
+        This stays as the one thing a behavioural test cannot say:
+        that `handle_issue` has not grown its own copy.
         """
         import ctrlrelay.cli as cli_module
 
@@ -943,10 +960,11 @@ class TestTheWarningIsActuallySent:
             for n in ast.walk(handle_issue)
             if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Name)
-            and n.func.id == "announce_dev_success"
+            and n.func.id == "announce_issue_outcome"
         ]
         assert len(calls) == 1, (
-            f"expected one announce_dev_success call, got {len(calls)}"
+            "expected exactly one announce_issue_outcome call in "
+            f"handle_issue, got {len(calls)}"
         )
         # And it does not hand-roll the routine line, which is how the
         # two messages would drift apart again.

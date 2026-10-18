@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any
+
+from ctrlrelay.core.obs import get_logger, log_event
+
+_logger = get_logger("core.state")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -20,7 +25,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at INTEGER,
     claude_exit_code INTEGER,
     summary TEXT,
-    agent_session_id TEXT
+    agent_session_id TEXT,
+    -- Scrubbed, capped tail of the worker's final stdout/stderr (#204).
+    -- The exit-code column above was declared from the start and left
+    -- NULL on the failure path, so the row for the session that broke
+    -- `zzsites#853` held `None` while the log line for the SAME session
+    -- recorded `exit_code 1`. With no output kept anywhere either —
+    -- `stderr_tail` was `""` and the log keeps a hash and a length, not
+    -- the text — the only durable evidence of why 163 dispatches failed
+    -- was that each took about two seconds. See
+    -- `ctrlrelay.core.redact` for what is removed before it is stored.
+    output_tail TEXT
 );
 
 CREATE TABLE IF NOT EXISTS repo_locks (
@@ -98,6 +113,46 @@ CREATE TABLE IF NOT EXISTS pr_watches (
     PRIMARY KEY (repo, pr_number)
 );
 
+-- Whether the relay can still run a worker at all, as one row (#204).
+-- Separate from `sessions` because the question is about the relay and
+-- not about any one run: 163 consecutive non-zero exits spread across
+-- 88 repos and two pipelines is one outage, and counting it per-session
+-- is what made it invisible.
+--
+-- In the database rather than in the poller's memory because the poller
+-- restarts. An in-memory run length resets on every restart, so a relay
+-- that is broken AND being restarted is precisely the one that would
+-- never reach the threshold — and the `alerted_at` latch would re-fire
+-- on every boot.
+CREATE TABLE IF NOT EXISTS dispatch_health (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    -- Set when an alert has been sent and not yet cleared by a success.
+    -- NULL means "an alert may be sent", which is what makes the latch
+    -- re-armable: a dedup that never clears is a guard that fires once
+    -- per database lifetime (#200 is the opposite failure — the same
+    -- message re-sent every morning).
+    alerted_at INTEGER,
+    -- Identifies WHICH claim the latch holds, so a failed delivery
+    -- releases its own and not a newer one. Separate from `alerted_at`
+    -- because that is a timestamp in seconds like every other `*_at`
+    -- column here, and two processes claiming inside one second are
+    -- indistinguishable by it -- which would let A's failed delivery
+    -- clear B's claim and announce one outage twice.
+    alert_claim_token TEXT,
+    -- When an alert was actually DELIVERED. This, not the claim, is
+    -- what suppresses a repeat. Claiming the latch and delivering on
+    -- it are two facts, and conflating them meant a poller stopped
+    -- mid-send (a `systemctl restart`, which is the first thing an
+    -- operator does) came back with the latch held and nothing sent --
+    -- so the rest of the outage was silent. Measured: cancel during
+    -- the send, then 59 further failures against a healthy channel,
+    -- zero messages.
+    alert_delivered_at INTEGER,
+    last_failure_at INTEGER,
+    last_success_at INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_repo ON sessions(repo);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_automation_repo ON automation_decisions(repo);
@@ -147,6 +202,10 @@ class StateDB:
             self._conn.execute(
                 "ALTER TABLE sessions ADD COLUMN agent_session_id TEXT"
             )
+        if "output_tail" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN output_tail TEXT"
+            )
 
         pr_watches_cols = {
             row[1]
@@ -173,6 +232,24 @@ class StateDB:
             self._conn.execute(
                 "ALTER TABLE pending_resumes ADD COLUMN expired_reason TEXT"
             )
+
+        health_cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(dispatch_health)"
+            ).fetchall()
+        }
+        if health_cols and "alert_claim_token" not in health_cols:
+            self._conn.execute(
+                "ALTER TABLE dispatch_health ADD COLUMN alert_claim_token TEXT"
+            )
+        if health_cols and "alert_delivered_at" not in health_cols:
+            self._conn.execute(
+                "ALTER TABLE dispatch_health "
+                "ADD COLUMN alert_delivered_at INTEGER"
+            )
+
+        self._ensure_dispatch_health_row()
 
     def close(self) -> None:
         """Close the database connection."""
@@ -297,6 +374,383 @@ class StateDB:
             (session_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    def record_session_outcome(
+        self,
+        session_id: str,
+        *,
+        exit_code: int | None,
+        output_tail: str | None,
+    ) -> bool:
+        """Persist a worker's exit code and the tail of its output.
+
+        Returns ``True`` when a row was updated. The boolean is not
+        decoration: the UPDATE is keyed on ``session_id``, and an
+        UPDATE that matches nothing is SQLite's idea of success. A
+        dispatch whose session row was never inserted — the failure
+        landed before the INSERT — would otherwise have its exit code
+        recorded nowhere while this call reported fine, which is the
+        same silence #204 is about, one layer in. The caller logs the
+        miss.
+
+        ``output_tail`` is expected to have been scrubbed and capped
+        already by :func:`ctrlrelay.core.redact.worker_output_tail`,
+        and is scrubbed AGAIN here. Redaction is idempotent, so the
+        second pass costs nothing and it means the invariant "no
+        credential shape reaches the database" is enforced at the one
+        place every writer must go through, rather than depending on
+        each caller remembering. An earlier version of this docstring
+        argued the opposite — that a sanitiser in the writer can be
+        bypassed — which is backwards: the writer is the chokepoint,
+        and it is the CALLERS that can be added without it.
+
+        An empty ``output_tail`` is stored as ``NULL`` rather than
+        ``""`` — "the agent wrote nothing before it died" is a real
+        and differently-shaped failure, and the two should not read
+        the same on inspection.
+        """
+        from ctrlrelay.core.redact import redact_secrets
+
+        # `None` when and only when there was no output: an empty or
+        # absent `output_tail` skips the call, and `redact_secrets`
+        # never maps a non-empty string to an empty one. A trailing
+        # `or None` here was dead code — a mutation replacing it
+        # changed no outcome, which reads as coverage to the next
+        # person.
+        scrubbed = redact_secrets(output_tail) if output_tail else None
+        ours = False
+        try:
+            # Join a caller's transaction rather than committing it —
+            # the same discipline `_begin_immediate` was corrected to,
+            # and this writer reintroduced the defect by committing
+            # unconditionally. The outcome hook runs mid-pipeline on
+            # the pipeline's own connection, so an unconditional commit
+            # here publishes whatever partial state that pipeline had
+            # open.
+            ours = not self._conn.in_transaction
+            cursor = self._conn.execute(
+                "UPDATE sessions SET claude_exit_code = ?, output_tail = ? "
+                "WHERE id = ?",
+                (exit_code, scrubbed, session_id),
+            )
+            if ours:
+                self._conn.commit()
+        except BaseException:
+            # A `database is locked` out of the UPDATE or the commit
+            # leaves the transaction open, and the caller
+            # (`persist_dispatch_outcome`) swallows the exception so
+            # nothing else would close it — leaving this connection
+            # holding a write lock on a database the bridge also uses.
+            # The same fault the read path had, arriving on an error
+            # path instead of a happy one. Only our own transaction:
+            # rolling back a caller's would discard work this method
+            # merely joined.
+            if ours and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return cursor.rowcount > 0
+
+    # Dispatch health (#204 — is the relay able to run a worker at all)
+
+    def _ensure_dispatch_health_row(self) -> None:
+        """Create the single ``dispatch_health`` row if it is absent.
+
+        **Commits, but only a transaction of its own.** Two faults have
+        lived here and they pull in opposite directions:
+
+        - An early version left this INSERT uncommitted and was called
+          from the READ accessors too, so a method that only reads
+          opened a write transaction. SQLite then held a RESERVED lock
+          for the life of that connection's transaction, and the next
+          writer on ANY other connection to the same file failed with
+          ``database is locked`` — measured: a bare
+          ``dispatch_failure_count()`` on one connection made an
+          ordinary ``INSERT INTO sessions`` on a second one fail. So it
+          has to commit, and the reads must not call it.
+        - A later version committed unconditionally, which publishes a
+          caller's open transaction. The dispatch-outcome hook runs
+          mid-pipeline on the pipeline's own connection, so that is a
+          real caller and not a hypothetical one.
+
+        The flag is therefore captured BEFORE the INSERT. The INSERT
+        itself opens a transaction, so asking afterwards always answers
+        "one is open" and the commit would never run — a guard that
+        cannot fire, in the fix for a guard that fired too often.
+        """
+        joined = self._conn.in_transaction
+        self._conn.execute(
+            "INSERT OR IGNORE INTO dispatch_health "
+            "(id, consecutive_failures) VALUES (1, 0)"
+        )
+        if not joined:
+            self._conn.commit()
+
+    def _begin_immediate(self) -> bool:
+        """Start a write transaction, taking the lock up front.
+
+        Returns whether WE started it, so the caller knows whether the
+        commit is its to make.
+
+        ``isolation_level`` is sqlite3's default here, so an explicit
+        ``BEGIN IMMEDIATE`` is what takes the write lock at the start
+        rather than upgrading mid-transaction, which is how two writers
+        deadlock.
+
+        **If a transaction is already open, this joins it rather than
+        committing it.** An earlier version committed, on the stated
+        premise that "every writer in this class commits immediately
+        after its execute" — which is false: ``StateDB.execute`` is
+        public, callers commit separately, and the dispatch-outcome
+        hook runs on the pipeline's own connection mid-pipeline. So
+        that commit could publish a caller's half-finished write. It
+        is logged either way, because a caller holding an open
+        transaction when this is reached is a fact worth seeing.
+
+        Joining costs the atomicity guarantee to the caller's
+        transaction instead of ours, and if the caller rolls back we
+        lose a counter increment — which delays an alert by one
+        failure and is not silent. Publishing somebody's partial write
+        is not recoverable, so this is the safe direction.
+        """
+        if self._conn.in_transaction:
+            log_event(
+                _logger,
+                "state.transaction_left_open",
+                detail=(
+                    "a caller holds an open transaction on this "
+                    "connection; joining it rather than committing it, so "
+                    "this write is published by whoever commits theirs"
+                ),
+            )
+            return False
+        self._conn.execute("BEGIN IMMEDIATE")
+        return True
+
+    def dispatch_failure_count(self) -> int:
+        """Length of the current run of failed dispatches (0 when healthy).
+
+        A pure read. A missing row reads as 0 rather than being created
+        here — see ``_ensure_dispatch_health_row`` on why a read must
+        not write. ``_migrate`` creates the row, and the write paths
+        re-create it if somebody deletes it by hand.
+        """
+        row = self._conn.execute(
+            "SELECT consecutive_failures FROM dispatch_health WHERE id = 1"
+        ).fetchone()
+        return int(row["consecutive_failures"]) if row else 0
+
+    def record_dispatch_failure(
+        self, threshold: int, *, lease_seconds: int
+    ) -> tuple[int, str | None]:
+        """Extend the failure run and decide, in ONE transaction.
+
+        Returns ``(consecutive_failures, claim_token)``. The token is
+        ``None`` when no alert may be attempted, and otherwise is a
+        LEASE on the right to attempt one — see
+        :meth:`_may_claim_alert`.
+
+        The increment, the threshold comparison and the claim are a
+        single transaction because two pollers can share one
+        ``state.db``. Done as three statements, a success recorded by
+        the other process can land between this one's read and its
+        claim, and a relay that has just recovered is announced as
+        still failing.
+        """
+        if threshold < 1:
+            raise ValueError(f"threshold must be at least 1, got {threshold!r}")
+        ours = False
+        try:
+            ours = self._begin_immediate()
+            self._conn.execute(
+                "INSERT OR IGNORE INTO dispatch_health "
+                "(id, consecutive_failures) VALUES (1, 0)"
+            )
+            self._conn.execute(
+                "UPDATE dispatch_health SET "
+                "consecutive_failures = consecutive_failures + 1, "
+                "last_failure_at = ? WHERE id = 1",
+                (int(time.time()),),
+            )
+            row = self._conn.execute(
+                "SELECT consecutive_failures, alerted_at, "
+                "alert_claim_token, alert_delivered_at "
+                "FROM dispatch_health WHERE id = 1"
+            ).fetchone()
+            consecutive = int(row["consecutive_failures"])
+            claimed: str | None = None
+            if consecutive >= threshold and self._may_claim_alert(
+                row, lease_seconds
+            ):
+                claimed = uuid.uuid4().hex
+                self._conn.execute(
+                    "UPDATE dispatch_health SET alerted_at = ?, "
+                    "alert_claim_token = ? WHERE id = 1",
+                    (int(time.time()), claimed),
+                )
+            if ours:
+                self._conn.commit()
+        except BaseException:
+            if ours and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return consecutive, claimed
+
+    @staticmethod
+    def _may_claim_alert(row: Any, lease_seconds: int) -> bool:
+        """Whether the right to attempt one alert is available.
+
+        Two conditions, and separating them is the whole point:
+
+        - **Nothing has been DELIVERED for this run.** Delivery is what
+          suppresses a repeat, not the claim. Latching on the claim
+          meant a poller stopped mid-send — a ``systemctl restart``,
+          which is the first thing an operator does — came back with
+          the latch held and nothing sent, so the rest of the outage
+          was silent. Measured: cancel during the send, then 59 more
+          failures against a healthy channel, zero messages.
+        - **No live claim.** A claim is a LEASE, so one abandoned by a
+          process that was killed mid-send expires and the next failure
+          retries. That is also what stops a retry storm: a delivery
+          that fails leaves its claim to expire rather than releasing
+          it, so during an outage at most one attempt is made per
+          lease window instead of one per failed dispatch.
+
+        One mechanism for both, which replaced an explicit release
+        that handled neither the kill nor the storm.
+        """
+        if row["alert_delivered_at"] is not None:
+            return False
+        if row["alert_claim_token"] is None:
+            return True
+        held_since = row["alerted_at"]
+        if held_since is None:
+            # A token with no timestamp cannot be aged, so treat it as
+            # expired rather than as permanent. "I cannot tell how old
+            # this is" must not read as "it is current" — that is the
+            # direction that goes silent.
+            return True
+        return int(time.time()) - int(held_since) >= lease_seconds
+
+    def reset_dispatch_failures(self) -> int:
+        """Clear the run, the claim and the delivery record.
+
+        Returns the previous run length, which is what lets the caller
+        log a recovery only when there was something to recover from —
+        otherwise every successful dispatch on a healthy relay would
+        log one, and a line that appears constantly is a line nobody
+        reads.
+
+        One transaction, for the same reason as
+        :meth:`record_dispatch_failure`.
+        """
+        ours = False
+        try:
+            ours = self._begin_immediate()
+            self._conn.execute(
+                "INSERT OR IGNORE INTO dispatch_health "
+                "(id, consecutive_failures) VALUES (1, 0)"
+            )
+            row = self._conn.execute(
+                "SELECT consecutive_failures FROM dispatch_health WHERE id = 1"
+            ).fetchone()
+            previous = int(row["consecutive_failures"]) if row else 0
+            self._conn.execute(
+                "UPDATE dispatch_health SET consecutive_failures = 0, "
+                "alerted_at = NULL, alert_claim_token = NULL, "
+                "alert_delivered_at = NULL, last_success_at = ? "
+                "WHERE id = 1",
+                (int(time.time()),),
+            )
+            if ours:
+                self._conn.commit()
+        except BaseException:
+            if ours and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return previous
+
+    def claim_dispatch_alert(self, *, lease_seconds: int) -> str | None:
+        """Lease the right to attempt one alert, or return ``None``.
+
+        Used by the whole-sweep check, which has no counter to
+        increment. The per-failure path uses
+        :meth:`record_dispatch_failure` so its increment and its claim
+        cannot be separated.
+        """
+        ours = False
+        try:
+            ours = self._begin_immediate()
+            self._conn.execute(
+                "INSERT OR IGNORE INTO dispatch_health "
+                "(id, consecutive_failures) VALUES (1, 0)"
+            )
+            row = self._conn.execute(
+                "SELECT alerted_at, alert_claim_token, alert_delivered_at "
+                "FROM dispatch_health WHERE id = 1"
+            ).fetchone()
+            token: str | None = None
+            if self._may_claim_alert(row, lease_seconds):
+                token = uuid.uuid4().hex
+                self._conn.execute(
+                    "UPDATE dispatch_health SET alerted_at = ?, "
+                    "alert_claim_token = ? WHERE id = 1",
+                    (int(time.time()), token),
+                )
+            if ours:
+                self._conn.commit()
+        except BaseException:
+            if ours and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return token
+
+    def mark_dispatch_alert_delivered(self, token: str | None) -> bool:
+        """Record that an alert actually reached the operator.
+
+        This is the durable fact that suppresses a repeat until a
+        dispatch succeeds. Conditional on the token, so a process whose
+        claim has already expired cannot mark a delivery against a
+        newer one's claim.
+
+        Returns whether the row was updated. ``False`` means the claim
+        was superseded while the send was in flight — the message did
+        go out, but another process now owns the latch, so a duplicate
+        is possible. That is the safe direction and it is the one this
+        design chooses.
+        """
+        if token is None:
+            log_event(
+                _logger,
+                "dispatch_health.delivery_without_claim",
+                detail=(
+                    "an alert delivery named no claim, so nothing was "
+                    "recorded; the caller lost track of the claim it took"
+                ),
+            )
+            return False
+        # Same discipline: do not commit a caller's open transaction.
+        ours = not self._conn.in_transaction
+        cursor = self._conn.execute(
+            "UPDATE dispatch_health SET alert_delivered_at = ? "
+            "WHERE id = 1 AND alert_claim_token = ?",
+            (int(time.time()), token),
+        )
+        if ours:
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def get_dispatch_health(self) -> dict[str, Any]:
+        """The whole row. A pure read, used by the tests.
+
+        Nothing in the CLI surfaces this yet. Said plainly because an
+        earlier version of this line claimed `ctrlrelay status` reads
+        it, which it does not.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM dispatch_health WHERE id = 1"
+        ).fetchone()
+        return dict(row) if row else {}
+
 
     # Pending resumes (BLOCKED sessions awaiting an operator answer)
 

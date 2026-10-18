@@ -295,6 +295,23 @@ def _bridge_socket_settings(config) -> tuple[Path, int] | None:
 # busy.
 _NOTIFY_CONNECT_TIMEOUT_SECONDS = 10
 
+# The same reasoning one step later: a socket that ACCEPTED and then
+# stalls costs whatever is awaiting the send. The relay-health alert
+# (#204) is awaited from inside the dispatcher, after the child has
+# exited and while the pipeline still holds the repo lock — so an
+# unbounded send there would stall the serial poll cycle to deliver a
+# notification.
+#
+# Shorter than the connect bound, because this one is paid REPEATEDLY:
+# a delivery that fails hands the latch back, so the next failed
+# dispatch tries again. The known limit, which is not closed here: on
+# an outage where dispatches fail in ~2 s against a wedged bridge, the
+# connect and send bounds add up to ~15 s per dispatch. That is
+# latency added to work that is already failing, which is the cheap
+# direction — the alternative is a backoff whose own state is a second
+# thing that can go wrong silently.
+_NOTIFY_SEND_TIMEOUT_SECONDS = 5
+
 # Strong references to close() tasks nobody is waiting for. Without
 # this the loop may drop a task mid-close, and the warning for it
 # arrives at interpreter exit with no context.
@@ -549,6 +566,61 @@ async def announce_dev_success(
     routine = f"✅ PR ready: {pr_url}"
     await transport.send(routine)
     sent.append(routine)
+    return sent
+
+
+async def announce_issue_outcome(
+    transport, *, repo: str, issue_number: int, is_task: bool, result
+) -> list[str]:
+    """Send the issue lane's outcome message(s) and return what was sent.
+
+    Lifted out of `handle_issue` for the reason `announce_dev_success`
+    was: inline statements inside a closure inside a Typer command
+    cannot be tested, and this block had a defect that no test could
+    reach.
+
+    **The defect, found while fixing #204.** `failure_text` was
+    imported inside `if is_task:` and called in the shared failure
+    branch, so a DEV-lane failure raised `NameError: name
+    'failure_text' is not defined` — swallowed by the surrounding
+    `except Exception` into a yellow console line. The `❌ Failed on
+    #N` message therefore could not be sent for any dev issue, which
+    is the lane `zzsites#853` was dispatched on. A *task* failure sent
+    it fine, which is why the branch read as working.
+
+    That is the same fault class as the ticket it was found in: the
+    only symptom was an absent message, and an absent message is
+    indistinguishable from an uneventful run. The import is now at the
+    top of this function, so the name is bound on every path by
+    construction rather than by whichever branch happened to run.
+
+    Returns the messages in the order they were sent, which is what
+    the tests assert on.
+    """
+    from ctrlrelay.pipelines.base import failure_text
+
+    sent: list[str] = []
+    if result.success:
+        if is_task:
+            line = (
+                f"✅ Task done on #{issue_number} ({repo}): {result.summary}"
+            )
+            await transport.send(line)
+            sent.append(line)
+        else:
+            sent.extend(
+                await announce_dev_success(
+                    transport, repo=repo, result=result
+                )
+            )
+    elif result.blocked:
+        line = f"⏸️ Blocked on #{issue_number}: {result.question}"
+        await transport.send(line)
+        sent.append(line)
+    else:
+        line = f"❌ Failed on #{issue_number}: {failure_text(result)}"
+        await transport.send(line)
+        sent.append(line)
     return sent
 
 
@@ -809,6 +881,314 @@ async def connect_notify_transport(config) -> Transport | None:
             detail="the process is stopping; this notification is not sent",
         )
         raise
+
+
+def persist_dispatch_outcome(state_db, outcome) -> bool:
+    """Write a spawn's exit code and scrubbed output tail to `sessions`.
+
+    #204: `sessions.claude_exit_code` was declared from the start and
+    never written on the failure path, so the row for the run that
+    broke `zzsites#853` held `None` while the log line for the SAME
+    session recorded `exit_code 1`. Nothing kept the output either, so
+    the only durable evidence of why 163 dispatches failed was that
+    each took about two seconds — enough to eliminate causes, not to
+    read one.
+
+    Returns whether a row was updated. A miss is logged rather than
+    ignored: the UPDATE is keyed on session id, an UPDATE matching
+    nothing is a success as far as SQLite is concerned, and a dispatch
+    whose row was never inserted would otherwise record its exit code
+    nowhere while this reported fine.
+
+    Never raises. A failure to record diagnostics must not become the
+    failure the operator sees instead of the real one.
+    """
+    from ctrlrelay.core.redact import worker_output_tail
+
+    try:
+        tail = worker_output_tail(outcome.stdout, outcome.stderr)
+        wrote = state_db.record_session_outcome(
+            outcome.session_id,
+            exit_code=outcome.exit_code,
+            output_tail=tail,
+        )
+    except Exception as e:
+        _log_quietly(
+            "dispatch.outcome.persist_failed",
+            cause=e,
+            session_id=outcome.session_id,
+            detail="exit code and output tail were not recorded",
+        )
+        return False
+    if not wrote:
+        _log_quietly(
+            "dispatch.outcome.row_missing",
+            session_id=outcome.session_id,
+            repo=outcome.repo,
+            detail=(
+                "no sessions row to record the exit code against; the "
+                "dispatch failed before the row was inserted"
+            ),
+        )
+    return wrote
+
+
+async def send_relay_alert(config, alert) -> bool:
+    """Post one relay-health alert on the chat transport.
+
+    Resolved at use, like every other notification since #198 — an
+    alert that says the relay is broken is the last thing that should
+    depend on a transport built at boot.
+
+    Deliberately NOT inside the scheduled sweep's notification block.
+    That block wraps its whole per-repo fan-out in one `try`, so the
+    first failing `send` drops every later message in the sweep. An
+    alert sharing that block would be lost in exactly the conditions
+    it exists to report.
+
+    Returns whether the message went out. ``False`` is logged with
+    what the operator loses, because a silent failure here recreates
+    the ticket.
+    """
+    transport = await connect_notify_transport(config)
+    if transport is None:
+        _log_quietly(
+            "dispatch_health.alert_undelivered",
+            reason=alert.reason,
+            consecutive_failures=alert.consecutive,
+            detail=(
+                "no channel to send the relay-health alert on; the relay "
+                "is failing every dispatch and nobody has been told"
+            ),
+        )
+        return False
+    try:
+        # BOUNDED. `connect_notify_transport` already caps its connect,
+        # but an accepted socket that then stalls would hold this call
+        # open — and this call is awaited from inside the dispatcher,
+        # after the child has exited, while the pipeline still holds
+        # the repo lock. A hanging send would stall the whole serial
+        # poll cycle to deliver a notification.
+        await asyncio.wait_for(
+            transport.send(alert.message()),
+            timeout=_NOTIFY_SEND_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        _log_quietly(
+            "dispatch_health.alert_send_failed",
+            cause=e,
+            reason=alert.reason,
+            consecutive_failures=alert.consecutive,
+            detail="the relay-health alert was not delivered",
+        )
+        return False
+    finally:
+        _close_notify_transport(transport)
+    log_event(
+        _logger,
+        "dispatch_health.alert_sent",
+        reason=alert.reason,
+        consecutive_failures=alert.consecutive,
+        threshold=alert.threshold,
+    )
+    return True
+
+
+async def deliver_relay_alert(config, state_db, alert) -> bool:
+    """Send the alert, and record the DELIVERY rather than the attempt.
+
+    The claim taken before this call is a lease on the right to try. It
+    is delivery that suppresses a repeat, and keeping those two facts
+    apart is what this function is for.
+
+    Latching on the attempt instead meant a poller stopped mid-send —
+    a ``systemctl restart``, which is the first thing an operator does
+    — came back with the latch held and nothing sent, so the rest of
+    the outage was silent. Measured: cancel during the send, then 59
+    further failures against a healthy channel, zero messages.
+
+    A failed or cancelled delivery records nothing, so the claim simply
+    expires and a later failure retries. Nothing is released here on
+    purpose: the lease covers the killed process and the failed send
+    with one mechanism, and it also bounds the retry rate, which an
+    explicit release did not.
+    """
+    delivered = False
+    try:
+        delivered = await send_relay_alert(config, alert)
+    except (asyncio.CancelledError, SystemExit, KeyboardInterrupt):
+        # The process is stopping. Nothing is recorded, so the claim
+        # ages out and the alert is attempted again after the restart —
+        # which is the case the whole lease exists for. Propagated so
+        # the caller's cleanup runs.
+        _log_quietly(
+            "dispatch_health.alert_interrupted",
+            reason=alert.reason,
+            detail=(
+                "stopped while delivering the relay-health alert; the "
+                "claim will expire and a later failure retries"
+            ),
+        )
+        raise
+    except Exception:
+        # `send_relay_alert` is guarded, and `connect_notify_transport`
+        # says in its own docstring that it does not raise. Neither is
+        # a reason to rely on it: a guarantee written in somebody
+        # else's docstring is not a mechanism.
+        _log_quietly(
+            "dispatch_health.alert_send_raised",
+            reason=alert.reason,
+            detail="the alert was not delivered; the claim will expire",
+        )
+    if not delivered:
+        return False
+    try:
+        state_db.mark_dispatch_alert_delivered(alert.claim_token)
+    except Exception as e:
+        # The message HAS gone out. Failing to record that means the
+        # next failure may send a second one, which is a duplicate —
+        # the safe direction, and the one this design chooses.
+        _log_quietly(
+            "dispatch_health.delivery_unrecorded",
+            cause=e,
+            reason=alert.reason,
+            detail=(
+                "the alert was delivered but the delivery could not be "
+                "recorded, so it may be sent once more"
+            ),
+        )
+    return True
+
+
+async def alert_if_sweep_all_failed(config, state_db, results) -> bool:
+    """One alert when a whole sweep failed. Returns whether it was sent.
+
+    The second trigger #204 asks for, and it is not redundant with the
+    consecutive-failure count: 88 repos is a single scheduler fire, so
+    a sweep that fails on every one of them is already an outage even
+    when the configured threshold has not been reached. Waiting for a
+    second day of it is the behaviour being removed.
+
+    "Failed" here means the DISPATCH failed — the agent exited
+    non-zero — which is the same definition the consecutive-failure
+    counter uses. It is deliberately NOT "the pipeline failed":
+
+    - A BLOCKED result is not a failure at all. The agent ran and asked
+      a question, so the relay works, and counting it would alert on a
+      healthy sweep that happened to need input everywhere.
+    - An agent that exits 0 and writes a FAILED checkpoint (#174) is
+      also not a dispatch failure. Counting it would send a message
+      saying "every repo failed, check the agent credential, this will
+      not be repeated until a dispatch succeeds" — and every dispatch
+      DID succeed by the counter's definition, so the next sweep would
+      clear the latch and send it again. That is the #200 daily repeat
+      this module exists to avoid, with a last sentence that is untrue
+      of its own input.
+
+    An `exit_code` of ``None`` counts as a dispatch failure: the child
+    never reported one, which is the binary-missing and pipe-error
+    case, not a healthy run.
+
+    A sweep with no results returns ``False``: ``0 of 0 failed``
+    satisfies "every repo failed" arithmetically, and alerting on it
+    would fire the alarm on a config with no repos. Nothing ran is not
+    the same fact as everything failed.
+    """
+    from ctrlrelay.core.dispatch_health import DispatchHealth
+
+    alerts = getattr(config, "alerts", None)
+    if not bool(getattr(alerts, "enabled", False)):
+        return False
+    total = len(results)
+    failed = sum(
+        1
+        for r in results
+        if not r.success and not r.blocked and r.exit_code != 0
+    )
+    try:
+        health = DispatchHealth(
+            state_db, threshold=alerts.consecutive_dispatch_failures
+        )
+        alert = health.record_sweep(total=total, failed=failed)
+    except Exception as e:
+        _log_quietly(
+            "dispatch_health.sweep_check_failed",
+            cause=e,
+            detail="could not decide whether the whole sweep failed",
+        )
+        return False
+    if alert is None:
+        return False
+    return await deliver_relay_alert(config, state_db, alert)
+
+
+async def alert_if_sweep_all_failed_guarded(config, state_db, results) -> bool:
+    """`alert_if_sweep_all_failed`, unable to disturb its caller.
+
+    The sweep calls this BEFORE its per-repo fan-out, and that fan-out
+    wraps its whole loop in one `except` — so an exception escaping
+    here would skip every per-repo notification in the sweep. The alert
+    must not be able to cost the messages it sits in front of.
+    """
+    try:
+        return await alert_if_sweep_all_failed(config, state_db, results)
+    except (asyncio.CancelledError, SystemExit, KeyboardInterrupt):
+        raise
+    except Exception as e:
+        _log_quietly(
+            "dispatch_health.sweep_alert_failed",
+            cause=e,
+            detail="the whole-sweep alert was not sent; the sweep continues",
+        )
+        return False
+
+
+def make_dispatch_outcome_hook(config, state_db):
+    """The per-spawn callback the poller hands to its dispatcher (#204).
+
+    Two jobs, and they are separate on purpose:
+
+    1. **Record** the exit code and a scrubbed tail of the output, for
+       every spawn including successful ones. This happens whether or
+       not alerting is enabled — it is diagnostics, not a notification,
+       and the ticket's third defect is about the record.
+    2. **Count** the run of failures and send ONE alert when it trips.
+
+    When ``alerts.enabled`` is false the health table is not touched at
+    all, rather than counted-but-not-sent. Counting while suppressing
+    would let the one-alert latch close with nothing sent, so turning
+    alerting back on would arm a guard that then stays quiet — the
+    class of fault this whole ticket is about.
+    """
+    from ctrlrelay.core.dispatch_health import DispatchHealth
+
+    alerts = getattr(config, "alerts", None)
+    enabled = bool(getattr(alerts, "enabled", False))
+    health = (
+        DispatchHealth(
+            state_db,
+            threshold=alerts.consecutive_dispatch_failures,
+        )
+        if enabled
+        else None
+    )
+
+    async def _hook(outcome) -> None:
+        persist_dispatch_outcome(state_db, outcome)
+        if health is None:
+            return
+        if outcome.ok:
+            health.record_success(repo=outcome.repo)
+            return
+        alert = health.record_failure(
+            repo=outcome.repo,
+            session_id=outcome.session_id,
+            exit_code=outcome.exit_code,
+        )
+        if alert is not None:
+            await deliver_relay_alert(config, state_db, alert)
+
+    return _hook
 
 
 def _get_bridge_pid_file(socket_path: Path) -> Path:
@@ -1172,7 +1552,12 @@ def run_secops(
         return
 
     db = StateDB(config.paths.state_db)
-    dispatcher = make_agent_dispatcher(config.agent)
+    # `outcome_hook=None`: this is the one-shot command an operator
+    # is watching in a terminal, so the exit code is in front of them
+    # and a relay-health alert about their own single run would be
+    # noise. The keyword is required, so choosing None is explicit
+    # rather than inherited by omission (#204).
+    dispatcher = make_agent_dispatcher(config.agent, outcome_hook=None)
     github = GitHubCLI()
     worktree = WorktreeManager(
         worktrees_dir=config.paths.worktrees,
@@ -1319,7 +1704,12 @@ def run_dev(
     branch_template = repo_config.dev_branch_template
 
     db = StateDB(config.paths.state_db)
-    dispatcher = make_agent_dispatcher(config.agent)
+    # `outcome_hook=None`: this is the one-shot command an operator
+    # is watching in a terminal, so the exit code is in front of them
+    # and a relay-health alert about their own single run would be
+    # noise. The keyword is required, so choosing None is explicit
+    # rather than inherited by omission (#204).
+    dispatcher = make_agent_dispatcher(config.agent, outcome_hook=None)
     github = GitHubCLI()
     worktree = WorktreeManager(
         worktrees_dir=config.paths.worktrees,
@@ -1707,7 +2097,13 @@ def poller_start(
         # grace only catches up on fires that happened AFTER registration.
 
         state_db = StateDB(config.paths.state_db)
-        dispatcher = make_agent_dispatcher(config.agent)
+        # The daemon is the case #204 is about: nothing is watching,
+        # so every spawn's exit code and output tail are recorded and
+        # a run of failures raises one alert.
+        dispatcher = make_agent_dispatcher(
+            config.agent,
+            outcome_hook=make_dispatch_outcome_hook(config, state_db),
+        )
         worktree = WorktreeManager(
             worktrees_dir=config.paths.worktrees,
             bare_repos_dir=config.paths.bare_repos,
@@ -1960,7 +2356,6 @@ def poller_start(
                 is_task = bool(issue_labels & task_labels_lower)
 
                 if is_task:
-                    from ctrlrelay.pipelines.base import failure_text
                     from ctrlrelay.pipelines.task import run_task_issue
                     console.print(
                         f"[dim]#{issue_number} routed to task "
@@ -2112,30 +2507,19 @@ def poller_start(
                 # from running, so swallow transport errors here.
                 if connected_transport is not None:
                     try:
-                        if result.success:
-                            if is_task:
-                                await connected_transport.send(
-                                    f"✅ Task done on #{issue_number} "
-                                    f"({repo}): {result.summary}"
-                                )
-                            else:
-                                # The order and the two-message shape
-                                # live in `announce_dev_success`, where
-                                # a fake transport can watch them.
-                                await announce_dev_success(
-                                    connected_transport,
-                                    repo=repo,
-                                    result=result,
-                                )
-                        elif result.blocked:
-                            await connected_transport.send(
-                                f"⏸️ Blocked on #{issue_number}: {result.question}"
-                            )
-                        else:
-                            await connected_transport.send(
-                                f"❌ Failed on #{issue_number}: "
-                                f"{failure_text(result)}"
-                            )
+                        # The branch selection and the message shapes
+                        # live in `announce_issue_outcome`, where a
+                        # fake transport can watch them. Inline here,
+                        # the failure branch referenced a name bound
+                        # only in the task branch and no test could
+                        # reach it — see that function's docstring.
+                        await announce_issue_outcome(
+                            connected_transport,
+                            repo=repo,
+                            issue_number=issue_number,
+                            is_task=is_task,
+                            result=result,
+                        )
                     except Exception as e:
                         console.print(
                             f"[yellow]Transport error sending result: {e}[/yellow]"
@@ -2243,6 +2627,19 @@ def poller_start(
                 ok = sum(1 for r in results if r.success)
                 console.print(
                     f"[dim]Scheduled secops: {ok}/{len(results)} succeeded[/dim]"
+                )
+
+                # Before the per-repo fan-out, and outside its `try`
+                # (#204). That block wraps the whole loop in one
+                # `except`, so the first failing `send` drops every
+                # later message in the sweep — which is how a sweep
+                # where everything failed can also be a sweep where
+                # almost nothing was reported. An alert placed inside
+                # it would be lost in precisely the conditions it
+                # exists to report. It resolves its own transport, so
+                # it does not depend on `secops_transport` either.
+                await alert_if_sweep_all_failed_guarded(
+                    config, state_db, results
                 )
 
                 # Per-repo notifications for the cases an operator must
