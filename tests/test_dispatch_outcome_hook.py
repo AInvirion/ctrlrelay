@@ -913,18 +913,53 @@ class TestTheLatchReleaseIsOwned:
         fail in about two seconds each, that window is not remote. A's
         failed delivery would then clear B's claim and the same outage
         would be announced twice.
+
+        **The clock is frozen.** An earlier version of this test just
+        made two claims back to back and asserted they differed, which
+        is a STREAK and not a mechanism: with a timestamp token it
+        passes whenever the two calls happen to straddle a second
+        boundary. A mutation sweep duly reported it as surviving on one
+        run and failing on another. Freezing `time.time` makes "inside
+        the same second" true by construction, so the assertion
+        discriminates every time.
         """
+        from unittest.mock import patch as _patch
+
         db = StateDB(tmp_path / "state.db")
-        first = db.claim_dispatch_alert()
-        db.reset_dispatch_failures()
-        second = db.claim_dispatch_alert()
-        row = db.get_dispatch_health()
+        with _patch("ctrlrelay.core.state.time.time", return_value=1_792_364_533.0):
+            first = db.claim_dispatch_alert()
+            db.reset_dispatch_failures()
+            second = db.claim_dispatch_alert()
+            row = db.get_dispatch_health()
+        db.close()
+        assert first is not None and second is not None
+        assert first != second, (
+            "two claims in one second share a token, so one poller's "
+            "failed delivery can release another's claim"
+        )
+        assert row["alert_claim_token"] == second
+        # Same second on both, which is what makes the timestamp
+        # unusable as an identity and is asserted rather than assumed.
+        assert row["alerted_at"] == 1_792_364_533
+
+    def test_the_per_failure_path_also_mints_a_unique_token(
+        self, tmp_path: Path
+    ) -> None:
+        """`record_dispatch_failure` mints its own claim, so it needs
+        the same property — and nothing else can observe it, because a
+        timestamp token still releases correctly against itself. A
+        mutation of that line survived until this test existed.
+        """
+        from unittest.mock import patch as _patch
+
+        db = StateDB(tmp_path / "state.db")
+        with _patch("ctrlrelay.core.state.time.time", return_value=1_792_364_533.0):
+            _, first = db.record_dispatch_failure(1)
+            db.reset_dispatch_failures()
+            _, second = db.record_dispatch_failure(1)
         db.close()
         assert first is not None and second is not None
         assert first != second
-        # Same second, different claim: the timestamp alone could not
-        # have told them apart.
-        assert row["alert_claim_token"] == second
 
     def test_releasing_our_own_claim_does_clear_it(
         self, tmp_path: Path
