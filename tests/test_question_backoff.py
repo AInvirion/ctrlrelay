@@ -74,35 +74,66 @@ def _hold(db: StateDB, now: int, session: str = "now"):
 
 
 class TestSchedule:
-    """1 day after the first unanswered expiry, then 2, then 4, then a
-    week from there on. "now" is a day boundary plus a little, the way a
-    daily cron lands."""
+    """1 day after the first unanswered post, then 2, then 4, then a week
+    from there on. "now" is a day boundary plus a little, the way a daily
+    cron lands."""
 
     T0 = 1793188800  # 28 Oct 2026 12:00 UTC
 
-    def _chain(self, db: StateDB, expiries: int) -> int:
-        """`expiries` posts a day apart, all expired unanswered. Returns
-        the last post's time."""
-        for i in range(expiries):
+    def _chain(self, db: StateDB, posts: int) -> int:
+        """`posts` posts a day apart, all expired unanswered. Returns the
+        last post's time."""
+        for i in range(posts):
             _posted(
                 db, f"d{i}", MINER_Q[i % 3],
                 created_at=self.T0 + i * DAY, expired=EXPIRY_REASON_TTL,
             )
-        return self.T0 + (expiries - 1) * DAY
+        return self.T0 + (posts - 1) * DAY
 
     @pytest.mark.parametrize(
-        ("expiries", "days"), [(1, 1), (2, 2), (3, 4), (4, 7), (9, 7)],
+        "jitter", [0, -40 * 60, 40 * 60], ids=["on-time", "early", "late"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_daily_sweep_posts_on_days_0_1_3_7_14_21(
+        self, db: StateDB, jitter: int,
+    ) -> None:
+        """Every morning's sweep reaches the same question, nobody ever
+        answers, and the hourly expiry runs in between. The question is
+        posted on these days and held on the rest. `jitter` moves every
+        other morning's sweep earlier or later, as an agent's run length
+        does."""
+        posted_days = []
+        for day in range(23):
+            now = self.T0 + day * DAY + (jitter if day % 2 else 0)
+            await expire_stale_questions(db, None, ttl_seconds=TTL, now=now)
+            session = f"secops-ai-miner-{day}"
+            hold = find_question_hold(
+                db, repo=MINER, question=MINER_Q[day % 3],
+                exclude_session_id=session, now=now,
+            )
+            if hold is None:
+                posted_days.append(day)
+            # The session's row, written after the ask or the hold.
+            _posted(
+                db, session, MINER_Q[day % 3], created_at=now,
+                held_until=None if hold is None else hold.next_post_at,
+            )
+
+        assert posted_days == [0, 1, 3, 7, 14, 21]
+
+    @pytest.mark.parametrize(
+        ("posts", "days"), [(1, 1), (2, 2), (3, 4), (4, 7), (9, 7)],
     )
     def test_held_until_the_delay_then_posted(
-        self, db: StateDB, expiries: int, days: int,
+        self, db: StateDB, posts: int, days: int,
     ) -> None:
-        last = self._chain(db, expiries)
+        last = self._chain(db, posts)
 
         # The day before it is due: held, and it says when.
         if days > 1:
             hold = _hold(db, now=last + (days - 1) * DAY + 10 * 60)
             assert hold is not None
-            assert hold.ttl_expiries == expiries
+            assert hold.missed_posts == posts
             assert hold.last_posted_at == last
             assert hold.next_post_at > last + (days - 1) * DAY
             assert hold.next_post_at <= last + days * DAY
@@ -113,15 +144,36 @@ class TestSchedule:
     def test_a_first_ask_is_never_held(self, db: StateDB) -> None:
         assert _hold(db, now=self.T0) is None
 
-    def test_a_post_still_open_is_not_a_missed_answer(
+    def test_a_post_still_open_is_a_missed_answer(self, db: StateDB) -> None:
+        """Day 0 and day 1 were posted and are still open, inside the
+        48h TTL. Nobody answered either: on day 2 that is two misses,
+        so the next post waits 2 days from day 1."""
+        _posted(db, "d0", MINER_Q[0], created_at=self.T0)
+        _posted(db, "d1", MINER_Q[2], created_at=self.T0 + DAY)
+
+        hold = _hold(db, now=self.T0 + 2 * DAY)
+        assert hold is not None
+        assert hold.missed_posts == 2
+        assert hold.last_posted_at == self.T0 + DAY
+
+    def test_a_post_younger_than_the_slack_is_not_yet_missed(
         self, db: StateDB,
     ) -> None:
-        """Yesterday's post has not expired yet: nobody has failed to
-        answer it, so nothing is held and the sweep asks as it does
-        today."""
+        """Posted two hours ago: nobody has had the time to answer."""
         _posted(db, "d0", MINER_Q[0], created_at=self.T0)
 
-        assert _hold(db, now=self.T0 + DAY) is None
+        assert _hold(db, now=self.T0 + 2 * HOUR) is None
+
+    def test_the_asking_sessions_own_row_never_counts(
+        self, db: StateDB,
+    ) -> None:
+        """A row for the session asking now, open and old, is this very
+        question, not an earlier post of it."""
+        _posted(db, "now", MINER_Q[0], created_at=self.T0)
+
+        assert _hold(db, now=self.T0 + DAY + HOUR, session="now") is None
+        assert _hold(db, now=self.T0 + DAY + HOUR, session="other") is None
+        assert _hold(db, now=self.T0 + 12 * HOUR, session="other") is not None
 
     def test_resolved_elsewhere_is_not_a_missed_answer(
         self, db: StateDB,
@@ -132,14 +184,16 @@ class TestSchedule:
         assert _hold(db, now=self.T0 + 10 * 60) is None
 
     def test_the_delay_runs_from_the_latest_post(self, db: StateDB) -> None:
-        """Two expiries, then a third post still open: the 2-day wait is
-        counted from that newest post, not from the expired ones."""
+        """Two expiries, then a third post still open: three misses, and
+        the 4-day wait is counted from that newest post."""
         last = self._chain(db, 2)
         _posted(db, "open", MINER_Q[2], created_at=last + 2 * DAY)
 
-        hold = _hold(db, now=last + 3 * DAY)
+        hold = _hold(db, now=last + 5 * DAY)
         assert hold is not None
+        assert hold.missed_posts == 3
         assert hold.last_posted_at == last + 2 * DAY
+        assert _hold(db, now=last + 6 * DAY - 20 * 60) is None
 
     def test_a_held_row_does_not_extend_the_hold(self, db: StateDB) -> None:
         """Held rows were never posted. If they counted as posts, each
@@ -170,6 +224,21 @@ class TestSchedule:
 
 class TestAnAnswerResets:
     T0 = TestSchedule.T0
+
+    def test_an_answer_on_the_asking_sessions_own_row_resets(
+        self, db: StateDB,
+    ) -> None:
+        """The resume path asks again before it rewrites its row, so
+        the answer that drove the resume is on that row. Nothing before
+        it is a miss."""
+        for i in range(3):
+            _posted(db, f"d{i}", MINER_Q[i], created_at=self.T0 + i * DAY,
+                    expired=EXPIRY_REASON_TTL)
+        _posted(db, "now", MINER_Q[0], created_at=self.T0 + 3 * DAY,
+                answered_at=self.T0 + 3 * DAY + HOUR)
+
+        assert _hold(db, now=self.T0 + 3 * DAY + 2 * HOUR,
+                     session="now") is None
 
     def test_an_answer_resets_the_schedule(self, db: StateDB) -> None:
         for i in range(3):

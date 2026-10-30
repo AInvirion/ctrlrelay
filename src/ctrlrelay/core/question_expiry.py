@@ -216,11 +216,12 @@ def find_repeat_history(
     )
 
 
-# How long the next post of a question waits after its Nth unanswered
-# TTL expiry: 1 day after the first, 2 after the second, 4 after the
-# third, then a week from there on. Constants rather than config: the
-# chat blocks carry per-deployment timings, and this is a policy about
-# how often to repeat ourselves, not something a deployment tunes.
+# How long the next post of a question waits after N unanswered posts
+# of it: 1 day after the first, 2 after the second, 4 after the third,
+# then a week from there on. On a daily sweep that posts on days 0, 1,
+# 3, 7, 14, 21. Constants rather than config: the chat blocks carry
+# per-deployment timings, and this is a policy about how often to
+# repeat ourselves, not something a deployment tunes.
 BACKOFF_DAYS = (1, 2, 4, 7)
 
 # A daily sweep does not reach the same question at the same second each
@@ -228,6 +229,8 @@ BACKOFF_DAYS = (1, 2, 4, 7)
 # ask's wait ENDS (up to `ask_timeout_seconds` after the post). Without
 # slack, "wait one day" lands a few minutes short and holds it for a
 # second day. Six hours absorbs that and cannot merge two days into one.
+# A post younger than this is also not yet a miss: nobody has had the
+# time to answer it.
 _SCHEDULE_SLACK_SECONDS = 6 * 3600
 
 
@@ -235,9 +238,22 @@ _SCHEDULE_SLACK_SECONDS = 6 * 3600
 class QuestionHold:
     """A question that is not to be posted yet."""
 
-    ttl_expiries: int
+    missed_posts: int
     last_posted_at: int
     next_post_at: int
+
+
+def _is_miss(row: dict[str, Any], now: int) -> bool:
+    """A post of the question the operator has had time to answer and
+    did not: retired on TTL, or still open, once it is older than the
+    slack. Retired as resolved elsewhere is not a miss; its subject went
+    away. ``row`` is already known unanswered (it is after the latest
+    answer)."""
+    if int(row["created_at"]) > now - _SCHEDULE_SLACK_SECONDS:
+        return False
+    if row.get("expired_at") is None:
+        return True
+    return row.get("expired_reason") == EXPIRY_REASON_TTL
 
 
 def find_question_hold(
@@ -250,15 +266,16 @@ def find_question_hold(
 ) -> QuestionHold | None:
     """Whether to hold this question back instead of posting it again.
 
-    Counts the posts of the same question since its latest answer that
-    expired on TTL, which is the operator not answering, and waits
+    Counts the earlier posts of the same question in ``repo`` since its
+    latest answer that went unanswered (see ``_is_miss``), and waits
     ``BACKOFF_DAYS[n-1]`` days (capped at the last entry) from the most
-    recent post before posting again. An answer anywhere in the chain
-    resets it, because ``_unanswered_asks`` starts after the answer.
+    recent post before posting again. An answer on any matching row,
+    including the asking session's own, resets it, because
+    ``_unanswered_asks`` starts after the latest answer. The asking
+    session's own row never counts as a post of it.
 
-    A post still open, or retired as resolved elsewhere, is not a
-    missed answer: it sets ``last_posted_at`` but adds no expiry. Held
-    rows are neither, so a hold never extends itself.
+    Held rows were never posted, so they are neither a miss nor the
+    last post: a hold never extends itself.
 
     Raises on a lookup failure. The caller must post the question then:
     "could not check" is not "asked too recently".
@@ -270,18 +287,16 @@ def find_question_hold(
         question=question,
         exclude_session_id=exclude_session_id,
     )
-    expiries = sum(
-        1 for r in posted if r.get("expired_reason") == EXPIRY_REASON_TTL
-    )
-    if expiries == 0:
+    misses = sum(1 for r in posted if _is_miss(r, now))
+    if misses == 0:
         return None
     last_posted = max(int(r["created_at"]) for r in posted)
-    delay = BACKOFF_DAYS[min(expiries, len(BACKOFF_DAYS)) - 1] * 86400
+    delay = BACKOFF_DAYS[min(misses, len(BACKOFF_DAYS)) - 1] * 86400
     next_post_at = last_posted + delay - _SCHEDULE_SLACK_SECONDS
     if now >= next_post_at:
         return None
     return QuestionHold(
-        ttl_expiries=expiries,
+        missed_posts=misses,
         last_posted_at=last_posted,
         next_post_at=next_post_at,
     )

@@ -123,7 +123,7 @@ def _question_hold(
             session_id=session_id,
             repo=repo,
             question_hash=hash_text(question),
-            ttl_expiries=hold.ttl_expiries,
+            missed_posts=hold.missed_posts,
             last_posted_at=hold.last_posted_at,
             next_post_at=hold.next_post_at,
             next_post_after=format_utc_timestamp(hold.next_post_at),
