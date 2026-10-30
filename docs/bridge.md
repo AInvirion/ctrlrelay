@@ -260,7 +260,8 @@ can still count too high). The history this reads is kept for
 secops sweep, each earlier post of the same question that got no answer
 counts as a miss: one that expired on `question_ttl_seconds`, or one
 still open and more than 6 hours old (one closed as resolved elsewhere
-does not count). After one miss the next post waits 1 day from the last
+does not count, and neither does one that never reached the chat
+because the bridge was down or the post failed). After one miss the next post waits 1 day from the last
 post, after two 2 days, after three 4 days, then once a week, so a daily
 sweep posts it on days 0, 1, 3, 7, 14, 21. An answer to any post of it
 resets the count. A held question is not posted and
