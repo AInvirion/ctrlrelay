@@ -261,7 +261,10 @@ def test_every_checkpoint_snippet_creates_its_own_directory(mod: str) -> None:
 
 # Paths the shell has to be careful with, as (id, path, relative). A
 # relative path is resolved against the cwd the snippet runs in, which
-# is `tmp_path`; an absolute one is placed under `tmp_path`.
+# is `tmp_path / "work"`; an absolute one is placed under that same
+# directory. The leading-dash case needs no quoting at all; it is here
+# for the `mkdir -p --`, which is what keeps it from being read as an
+# option.
 #
 # - apostrophe: closes a single-quoted string. With hand-written quotes
 #   it is a syntax error, or (paired) a silently different path.
@@ -310,7 +313,7 @@ def test_every_snippet_writes_a_checkpoint_at_a_path_needing_quotes(
     else. Either way the agent did its work and looked like it crashed.
 
     Asserts the artifact, not the absence of a syntax error: each block
-    runs under `bash -c` from `tmp_path`, must exit 0, and must leave a
+    runs under `bash -c` from `tmp_path / "work"`, must exit 0, and must leave a
     JSON file at that exact path carrying the status the block is named
     for. The file's directory is removed between blocks and does not
     exist before the first, so every block is proven to create it.
