@@ -392,6 +392,14 @@ class TestASendThatIgnoresCancellation:
                 )
                 assert outer[0].result() is False
                 assert stuck.active == 1
+                # Its own event, and not reported as a timeout: the send
+                # has not ended, so nothing has said how it ended.
+                ends = [
+                    r.getMessage()
+                    for r in caplog.records
+                    if r.getMessage().startswith("dispatch_health.alert_")
+                ]
+                assert ends == ["dispatch_health.alert_send_stuck"], ends
 
                 # The lease expires and the outage continues. No second
                 # send may start beside the one that is still alive.
