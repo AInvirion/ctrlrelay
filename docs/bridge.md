@@ -257,10 +257,13 @@ can still count too high). The history this reads is kept for
 `question_retention_days`.
 
 **A question nobody answers is asked less often.** On the scheduled
-secops sweep, once a post of a question has expired on
-`question_ttl_seconds` without an answer, the next post waits 1 day from
-the last post; after two such expiries 2 days, after three 4 days, then
-once a week. Any answer resets it. A held question is not posted and
+secops sweep, each earlier post of the same question that got no answer
+counts as a miss: one that expired on `question_ttl_seconds`, or one
+still open and more than 6 hours old (one closed as resolved elsewhere
+does not count). After one miss the next post waits 1 day from the last
+post, after two 2 days, after three 4 days, then once a week, so a daily
+sweep posts it on days 0, 1, 3, 7, 14, 21. An answer to any post of it
+resets the count. A held question is not posted and
 gets no `blocked on <repo>` message; the sweep summary lists it with the
 time it is next due, and the poller logs `secops.question.held`. The
 session still ends blocked with its row saved, so it stays answerable
