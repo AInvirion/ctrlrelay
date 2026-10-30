@@ -76,6 +76,9 @@ transport:
     # Read from whichever transport is active, so a Mattermost deployment
     # takes this value and not the telegram block's.
     question_ttl_seconds: 172800
+    # How long a finished (expired or resumed) question is kept before it
+    # is deleted. Open questions are never deleted.
+    question_retention_days: 90
   file_mock:
     inbox: "~/.ctrlrelay/inbox.txt"
     outbox: "~/.ctrlrelay/outbox.txt"

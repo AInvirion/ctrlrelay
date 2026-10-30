@@ -15,12 +15,21 @@ retired those rows, so two failure modes accumulated:
 
 This module retires both. It only ever sets ``expired_at`` on rows that
 are still unanswered, so a reply that lands in the same tick wins.
+
+Retiring a row does not stop the question coming back. A scheduled sweep
+starts a fresh session the next morning, the agent reaches the same
+blocker, and asks again in new words. Two things here deal with that:
+``find_repeat_history`` lets whoever posts the question say it is a
+repeat, and the sweep prunes finished rows past a retention window so
+that history stays a window rather than the whole life of the install.
 """
 
 from __future__ import annotations
 
 import re
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from ctrlrelay.core.github import GitHubCLI, GitHubError
@@ -52,6 +61,13 @@ _MAX_RESOLVED_PROBES_PER_RUN = 200
 EXPIRY_REASON_TTL = "ttl"
 EXPIRY_REASON_RESOLVED = "resolved_elsewhere"
 
+DEFAULT_RETENTION_DAYS = 90
+
+_MONTHS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
 
 def extract_referenced_numbers(question: str) -> list[str]:
     """Pull deduplicated issue/PR numbers out of a question, in the
@@ -64,6 +80,144 @@ def extract_referenced_numbers(question: str) -> list[str]:
         seen.add(n)
         out.append(n)
     return out
+
+
+def _normalise(question: str) -> str:
+    return re.sub(r"\s+", " ", (question or "").lower()).strip(" .?!")
+
+
+def same_substance(a: str, b: str) -> bool:
+    """Whether two BLOCKED questions ask about the same thing.
+
+    The agent rewords the question every run, so comparing text finds
+    almost nothing. What it keeps is the PR and issue numbers: a
+    question that cites at least one number the other cites is about the
+    same thing. Only when NEITHER cites a number does the text decide,
+    after lowercasing and collapsing whitespace.
+
+    Known limits, both in the direction of a missed repeat or an extra
+    one, never of a lost question: a reworded question with no numbers
+    is not matched; and an incidental shared number (an alert id cited
+    in two unrelated questions) is matched.
+    """
+    na = set(extract_referenced_numbers(a))
+    nb = set(extract_referenced_numbers(b))
+    if na or nb:
+        return bool(na & nb)
+    return bool(_normalise(a)) and _normalise(a) == _normalise(b)
+
+
+@dataclass(frozen=True)
+class RepeatHistory:
+    """Earlier, unanswered asks of the same question in the same repo."""
+
+    times_asked_before: int
+    last_asked_at: int
+
+
+def find_repeat_history(
+    state_db: StateDB,
+    *,
+    repo: str,
+    question: str,
+    exclude_session_id: str | None,
+) -> RepeatHistory | None:
+    """How many times this question was asked in ``repo`` since it was
+    last answered, or None when there is no such ask: either it was
+    never asked before, or every earlier ask came before an answer.
+
+    Counts every earlier row of the same substance asked after the
+    latest answer: still open, retired on TTL, or retired as resolved
+    elsewhere (which did not stop it coming back, so it was not
+    resolved). The cutoff is when the answer was GIVEN, not when the
+    answered question was asked: an operator who answers Monday's
+    question on Tuesday evening has also answered Tuesday morning's
+    re-ask of it.
+
+    ``exclude_session_id`` is the session asking now. Its own row is
+    never counted as an earlier ask, but an answer on it still resets
+    the count: the dev and task resume paths ask again BEFORE they
+    rewrite the row, so at that moment it carries the very answer that
+    drove the resume. It is required so a caller cannot forget it and
+    count the question as a repeat of itself.
+
+    Accepted limit: when a resume re-blocks, the pipeline rewrites the
+    session's row (``add_pending_resume`` is INSERT OR REPLACE and
+    clears ``answered_at``), so that answer leaves the table. A later
+    ask can then count asks from before it, and the count can be too
+    high. It never hides a question.
+
+    Rare edge: the retention prune ages a row by its LAST activity and
+    this count compares ``created_at`` against ``answered_at``. A row
+    pruned out of the window takes its answer with it, so an ask from
+    before that answer which is still inside the window (an open row,
+    which is never pruned) counts again.
+    """
+    matches = [
+        row
+        for row in state_db.list_pending_resumes_for_repo(repo)
+        if same_substance(question, row["question"])
+    ]
+    last_answer = max(
+        (int(r["answered_at"]) for r in matches if r["answered_at"] is not None),
+        default=None,
+    )
+    # A row is answered after it is created, so every answered row was
+    # created at or before `last_answer` and the rows after it are
+    # unanswered by construction; no separate check.
+    unanswered = [
+        r
+        for r in matches
+        if r["session_id"] != exclude_session_id
+        and (last_answer is None or int(r["created_at"]) > last_answer)
+    ]
+    if not unanswered:
+        return None
+    return RepeatHistory(
+        times_asked_before=len(unanswered),
+        last_asked_at=max(int(r["created_at"]) for r in unanswered),
+    )
+
+
+def format_repeat_note(history: RepeatHistory) -> str:
+    """One plain-text line telling the reader this is not a new question.
+
+    The date is UTC and says so: the bridge host's zone is not the
+    reader's, and an unlabelled date can be a day off either way.
+    Raises on a timestamp ``datetime`` cannot represent; the caller
+    owns that, because the question must post without the note.
+    """
+    n = history.times_asked_before
+    times = "once" if n == 1 else f"{n} times"
+    when = datetime.fromtimestamp(history.last_asked_at, timezone.utc)
+    # Not `%b`: that follows the process locale, and the line is the
+    # same English sentence whatever the host is set to.
+    month = _MONTHS[when.month - 1]
+    return (
+        f"Repeat: asked {times} before, last on {month} {when.day} UTC, "
+        f"no answer yet."
+    )
+
+
+def prune_finished_questions(
+    state_db: StateDB,
+    *,
+    retention_days: int,
+    now: int | None = None,
+) -> int:
+    """Delete finished questions older than the retention window."""
+    now = int(time.time()) if now is None else now
+    pruned = state_db.prune_finished_pending_resumes(
+        now - retention_days * 86400
+    )
+    if pruned:
+        log_event(
+            _logger,
+            "question.pruned",
+            rows=pruned,
+            retention_days=retention_days,
+        )
+    return pruned
 
 
 async def _all_references_resolved(
@@ -107,6 +261,7 @@ async def expire_stale_questions(
     github: GitHubCLI | None,
     *,
     ttl_seconds: int,
+    retention_days: int = DEFAULT_RETENTION_DAYS,
     now: int | None = None,
 ) -> list[dict[str, Any]]:
     """Retire questions that aged out or whose subject is already
@@ -114,7 +269,8 @@ async def expire_stale_questions(
 
     TTL runs first and needs no network, so a GitHub outage still lets
     the age-based sweep make progress. ``github=None`` disables only the
-    resolved-elsewhere pass.
+    resolved-elsewhere pass. Finished rows past ``retention_days`` are
+    pruned next, also before any network call.
     """
     now = int(time.time()) if now is None else now
     expired: list[dict[str, Any]] = []
@@ -131,6 +287,20 @@ async def expire_stale_questions(
                 reason=EXPIRY_REASON_TTL,
                 age_seconds=now - int(row["created_at"]),
             )
+
+    try:
+        prune_finished_questions(
+            state_db, retention_days=retention_days, now=now
+        )
+    except Exception as e:
+        # Housekeeping. A failed delete must not stop the expiry passes,
+        # and it is logged so a table that keeps growing has a cause.
+        log_event(
+            _logger,
+            "question.prune_failed",
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
 
     if github is None:
         return expired
