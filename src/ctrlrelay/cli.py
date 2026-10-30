@@ -1063,7 +1063,11 @@ async def deliver_relay_alert(config, state_db, alert) -> bool:
 # the outer one. Tracking it separately is what lets a new delivery see
 # that an old send is still alive, and lets shutdown say so.
 _RELAY_ALERT_TASKS: dict[asyncio.Task, None] = {}
-_RELAY_ALERT_SENDS: dict[asyncio.Task, None] = {}
+# The value says why a send was cancelled: `_DEADLINE` when the overall
+# deadline did it, ``None`` otherwise. The send's done callback reads it
+# so the one line it logs names the real cause.
+_RELAY_ALERT_SENDS: dict[asyncio.Task, str | None] = {}
+_DEADLINE = "deadline"
 
 # How long a cancelled send gets to wind down before it is reported as
 # stuck and left. Never an unbounded await: `asyncio.wait_for` and
@@ -1115,6 +1119,9 @@ async def _deliver_relay_alert_bounded(config, state_db, alert) -> bool:
         raise
     if done:
         return send.result()
+    # Marked before the cancel, so the send's callback logs this end as
+    # a timeout and nothing else logs it again.
+    _RELAY_ALERT_SENDS[send] = _DEADLINE
     send.cancel()
     _, stuck = await asyncio.wait(
         {send}, timeout=_RELAY_ALERT_CANCEL_GRACE_SECONDS
@@ -1129,36 +1136,40 @@ async def _deliver_relay_alert_bounded(config, state_db, alert) -> bool:
                 "the poller restarts"
             ),
         )
-    else:
-        _log_quietly(
-            "dispatch_health.alert_timed_out",
-            reason=alert.reason,
-            detail=(
-                "the relay-health alert did not finish in time; nothing "
-                "was recorded, so the claim expires and a later failure "
-                "retries"
-            ),
-        )
     return False
 
 
 def _relay_alert_send_finished(task: asyncio.Task) -> None:
-    """Let go of a finished send, and report one that did not finish.
+    """Let go of a finished send, and log it if it was cancelled or raised.
 
-    The one place a send's end is logged, because the send task is the
-    only thing that knows whether the delivery was recorded. The outer
-    task can be cancelled in the same tick a send records its delivery,
-    and logging from there said "cancelled before it was delivered"
-    about a message that was delivered.
+    A send that returns, delivered or not, logs nothing here:
+    `deliver_relay_alert` and `send_relay_alert` already logged that.
+    This callback adds exactly one line for the two endings they cannot
+    report themselves:
 
-    A cancelled send never reached the record: `deliver_relay_alert`
-    has no await between a successful send and the record, so a
-    cancellation cannot land between them. `deliver_relay_alert` logs
-    its own ordinary failures; what reaches this callback as an
-    exception escaped every guard in it.
+    - **Cancelled.** ``alert_timed_out`` when the overall deadline did
+      it, ``alert_cancelled`` otherwise (shutdown). Logged here rather
+      than from the outer task, because the outer task can be cancelled
+      in the same tick its send records a delivery, and then a line from
+      there would call a delivered message undelivered. A cancelled send
+      never reached the record: `deliver_relay_alert` has no await
+      between a successful send and the record.
+    - **Raised.** ``alert_task_failed``. `deliver_relay_alert` catches
+      ``Exception``, so this is a ``BaseException`` it re-raised, or a
+      replacement that does not guard itself.
     """
-    _RELAY_ALERT_SENDS.pop(task, None)
+    why = _RELAY_ALERT_SENDS.pop(task, None)
     if task.cancelled():
+        if why == _DEADLINE:
+            _log_quietly(
+                "dispatch_health.alert_timed_out",
+                detail=(
+                    "the relay-health alert did not finish in time; nothing "
+                    "was recorded, so the claim expires and a later failure "
+                    "retries"
+                ),
+            )
+            return
         _log_quietly(
             "dispatch_health.alert_cancelled",
             detail=(
@@ -1221,10 +1232,18 @@ def start_relay_alert(config, state_db, alert) -> asyncio.Task | None:
 def _relay_alert_finished(task: asyncio.Task) -> None:
     """Let go of a finished outer delivery task. Logs nothing.
 
-    Its only exception is the send's own, re-raised by ``result()``, and
-    its cancellation always comes with the send's. Both are reported
-    once, by `_relay_alert_send_finished`. Reading the exception here
-    keeps asyncio from reporting it as never retrieved.
+    Every way it ends is already reported once elsewhere:
+
+    - an exception can only be the send's, re-raised by ``result()``,
+      and `_relay_alert_send_finished` logged it;
+    - a cancellation is either a shutdown that also cancelled the send,
+      which that callback logs, or one that arrived after the send had
+      already finished and logged its own end;
+    - a send stuck past the deadline was logged by the outer task as
+      ``alert_send_stuck`` before it returned.
+
+    Reading the exception keeps asyncio from reporting it as never
+    retrieved.
     """
     _RELAY_ALERT_TASKS.pop(task, None)
     if not task.cancelled():
@@ -1248,6 +1267,8 @@ async def _cancel_relay_alerts() -> None:
     finally:
         # In a `finally` so a second stop during this wait still says
         # what it is leaving behind.
+        # One per delivery in practice: a cancelled outer task re-raises
+        # within a tick, so only a send can still be alive here.
         stuck = [t for t in live if not t.done()]
         if stuck:
             _log_quietly(

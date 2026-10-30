@@ -162,8 +162,12 @@ class TestAnUnobservedDeliveryDoesNotSuppressTheNextAlert:
         """The issue's claim, asserted rather than assumed.
 
         A detached send whose outcome nobody observes must not latch.
-        Shutdown cancels it, nothing is recorded, the lease expires, and
-        the outage is announced exactly once on a healthy channel.
+        Shutdown cancels it and nothing is recorded. Once the lease has
+        expired, a later failure on a healthy channel is delivered and
+        recorded. (The later failures all run at one frozen instant, so
+        the single message there comes from the new claim's lease, not
+        from the delivery latch; the latch is proven in
+        `test_a_run_of_failures_sends_one_message`.)
         """
         db = StateDB(tmp_path / "state.db")
         hook = cli_module.make_dispatch_outcome_hook(_config(threshold=1), db)
@@ -206,10 +210,15 @@ class TestAnUnobservedDeliveryDoesNotSuppressTheNextAlert:
 
 class TestTheBackgroundDeliveryIsBoundedAndVisible:
     @pytest.mark.asyncio
-    async def test_a_stalled_connect_hits_the_overall_deadline(
+    async def test_an_unbounded_step_is_caught_by_the_backstop_deadline(
         self, tmp_path: Path, caplog
     ) -> None:
-        """The backstop for a step the inner bounds do not cover."""
+        """The overall deadline, for a step with no bound of its own.
+
+        `connect_notify_transport` is replaced by one that never returns
+        and has no timeout, so the only thing that can end this is the
+        deadline around the whole delivery.
+        """
         db = StateDB(tmp_path / "state.db")
         hook = cli_module.make_dispatch_outcome_hook(_config(threshold=1), db)
 
@@ -407,10 +416,16 @@ class TestASendThatIgnoresCancellation:
                 )
                 took = time.monotonic() - started
             assert took < 3.0, f"shutdown waited {took:.2f}s"
-            assert any(
-                r.getMessage() == "dispatch_health.alert_stuck_at_shutdown"
+            stuck_lines = [
+                r
                 for r in caplog.records
-            )
+                if r.getMessage() == "dispatch_health.alert_stuck_at_shutdown"
+            ]
+            assert len(stuck_lines) == 1
+            # One delivery, counted once. Pins current behaviour: the
+            # outer task ends within a tick of its cancel, so only the
+            # send is still alive when the count is taken.
+            assert stuck_lines[0].stuck == 1
         finally:
             stuck.release.set()
             await asyncio.sleep(0)
@@ -565,3 +580,51 @@ class TestEachEndIsLoggedOnceAndTruly:
             await asyncio.sleep(0)
             await _cancel_leftovers()
             db.close()
+
+
+class TestATimedOutDeliveryIsLoggedAsATimeout:
+    @pytest.mark.asyncio
+    async def test_the_deadline_path_logs_one_ending(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A send cancelled at the overall deadline ended because of the
+        deadline, so it is logged as a timeout and not also as a
+        cancellation. ``alert_interrupted`` is the delivery's own line,
+        written by `deliver_relay_alert` whenever it is cancelled; it is
+        shared with the whole-sweep path and says nothing about why."""
+        from ctrlrelay.core.dispatch_health import DispatchAlert
+
+        async def never_finishes(config, state_db, alert):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cli_module._log_quietly("dispatch_health.alert_interrupted")
+                raise
+
+        alert = DispatchAlert(
+            reason="consecutive_failures",
+            consecutive=1,
+            threshold=1,
+            detail="d",
+            claim_token="t",
+        )
+        with (
+            patch.object(cli_module, "deliver_relay_alert", new=never_finishes),
+            patch.object(cli_module, "_NOTIFY_CONNECT_TIMEOUT_SECONDS", 0),
+            patch.object(cli_module, "_NOTIFY_SEND_TIMEOUT_SECONDS", 0),
+            caplog.at_level(logging.INFO, logger="ctrlrelay"),
+        ):
+            task = cli_module.start_relay_alert(MagicMock(), MagicMock(), alert)
+            done, _ = await asyncio.wait([task], timeout=10)
+            assert done == {task}
+            assert task.result() is False
+            await asyncio.sleep(0)
+        ends = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("dispatch_health.alert_")
+        ]
+        assert ends == [
+            "dispatch_health.alert_interrupted",
+            "dispatch_health.alert_timed_out",
+        ], ends
