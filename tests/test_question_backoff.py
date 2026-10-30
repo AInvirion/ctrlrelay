@@ -18,7 +18,11 @@ from ctrlrelay.core.question_expiry import (
     find_repeat_history,
 )
 from ctrlrelay.core.state import StateDB
-from ctrlrelay.transports.base import TransportError, TransportTimeoutError
+from ctrlrelay.transports.base import (
+    TransportError,
+    TransportTimeoutError,
+    TransportUnansweredError,
+)
 from tests.test_question_expiry import MINER, MINER_Q
 
 DAY = 86400
@@ -408,7 +412,7 @@ class TestTheSweepHoldsARepeat:
         # Two missed answers, the last post a day ago: due in 2 days.
         _ttl_expired_chain(db, 2, last_posted=now - DAY)
         transport = AsyncMock()
-        transport.ask.side_effect = TransportTimeoutError("nobody answered")
+        transport.ask.side_effect = TransportUnansweredError("nobody answered")
 
         held = await _sweep(tmp_path, db, transport)
 
@@ -494,11 +498,28 @@ class TestTheSweepHoldsARepeat:
             "UPDATE pending_resumes SET created_at = created_at - ?", (DAY,),
         )
         db.commit()
-        transport.ask.side_effect = TransportTimeoutError("nobody answered")
+        transport.ask.side_effect = TransportUnansweredError("nobody answered")
 
         await _sweep(tmp_path, db, transport)
 
         assert transport.ask.await_count == 2, "held on the strength of an outage"
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_the_bridge_never_acked_is_not_a_post(
+        self, tmp_path: Path, db: StateDB,
+    ) -> None:
+        """The wait ran out with no ACK, so nobody knows whether the
+        question was posted. It is not counted as one."""
+        now = int(time.time())
+        _ttl_expired_chain(db, 3, last_posted=now - 5 * DAY)
+        transport = AsyncMock()
+        transport.ask.side_effect = TransportTimeoutError(
+            "Timeout waiting for response"
+        )
+
+        result = await _sweep(tmp_path, db, transport)
+
+        assert db.get_pending_resume(result.session_id)["posted"] == 0
 
     @pytest.mark.asyncio
     async def test_a_lookup_failure_posts_the_question(
@@ -510,7 +531,7 @@ class TestTheSweepHoldsARepeat:
             side_effect=RuntimeError("database is locked"),
         )
         transport = AsyncMock()
-        transport.ask.side_effect = TransportTimeoutError("nobody answered")
+        transport.ask.side_effect = TransportUnansweredError("nobody answered")
 
         result = await _sweep(tmp_path, db, transport)
 
@@ -524,7 +545,7 @@ class TestTheSweepHoldsARepeat:
         now = int(time.time())
         _ttl_expired_chain(db, 3, last_posted=now - DAY)
         transport = AsyncMock()
-        transport.ask.side_effect = TransportTimeoutError("nobody answered")
+        transport.ask.side_effect = TransportUnansweredError("nobody answered")
 
         await _sweep(tmp_path, db, transport, hold_repeats=False)
 
@@ -603,8 +624,9 @@ class TestTheFanOutHoldsToo:
         assert sent[1] == (
             "📋 Scheduled secops sweep done: 0/2 ok, 2 blocked\n\n"
             "Not re-posted, asked before with no answer (reply to the "
-            "earlier post to answer):\n"
-            f"  - {MINER}: not before 2026-10-30 12:00 UTC"
+            "earlier post, or name the session):\n"
+            f"  - {MINER} (session: secops-held): not before "
+            "2026-10-30 12:00 UTC"
         )
 
     @pytest.mark.asyncio
@@ -676,7 +698,7 @@ class TestOneResultPerRepo:
             r.automation = None
             repos.append(r)
         transport = AsyncMock()
-        transport.ask.side_effect = TransportTimeoutError("nobody answered")
+        transport.ask.side_effect = TransportUnansweredError("nobody answered")
 
         results = await run_secops_all(
             repos=repos, dispatcher=dispatcher, github=MagicMock(),
@@ -691,3 +713,51 @@ class TestOneResultPerRepo:
         )
         assert "dashboard down" in results[0].error
         assert results[1].blocked
+
+
+class TestTheTransportSaysWhetherItWasPosted:
+    """`posted` rests on the bridge's ACK, which it sends only once the
+    chat app accepted the post. A real socket and a fake bridge."""
+
+    @staticmethod
+    async def _ask_against(bridge_acks: bool):
+        import asyncio
+        import json
+        import tempfile
+        import uuid
+
+        from ctrlrelay.transports.socket_client import SocketTransport
+
+        sock = Path(tempfile.gettempdir()) / f"cr-{uuid.uuid4().hex[:8]}.sock"
+
+        async def fake_bridge(reader, writer):
+            msg = json.loads((await reader.readline()).decode())
+            if bridge_acks:
+                writer.write((json.dumps({
+                    "op": "ack", "request_id": msg["request_id"],
+                    "status": "pending",
+                }) + "\n").encode())
+                await writer.drain()
+            await asyncio.sleep(5)  # nobody answers
+
+        server = await asyncio.start_unix_server(fake_bridge, path=str(sock))
+        transport = SocketTransport(sock)
+        try:
+            await transport.connect()
+            with pytest.raises(TransportTimeoutError) as caught:
+                await transport.ask("Approve #201?", timeout=1)
+            return caught.value
+        finally:
+            await transport.close()
+            server.close()
+            sock.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_acked_and_unanswered(self) -> None:
+        e = await self._ask_against(bridge_acks=True)
+        assert isinstance(e, TransportUnansweredError)
+
+    @pytest.mark.asyncio
+    async def test_never_acked_is_only_a_timeout(self) -> None:
+        e = await self._ask_against(bridge_acks=False)
+        assert not isinstance(e, TransportUnansweredError)

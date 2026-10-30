@@ -261,17 +261,20 @@ secops sweep, each earlier post of the same question that got no answer
 counts as a miss: one that expired on `question_ttl_seconds`, or one
 still open and more than 6 hours old (one closed as resolved elsewhere
 does not count, and neither does one that never reached the chat
-because the bridge was down or the post failed). After one miss the next post waits 1 day from the last
+because the bridge was down, the post failed, or the bridge never
+confirmed it). After one miss the next post waits 1 day from the last
 post, after two 2 days, after three 4 days, then once a week, so a daily
 sweep posts it on days 0, 1, 3, 7, 14, 21. An answer to any post of it
 resets the count. A held question is not posted and
-gets no `blocked on <repo>` message; the sweep summary lists it with the
-time it is next due, and the poller logs `secops.question.held`. The
-session still ends blocked with its row saved, so it stays answerable
-and expires on the TTL like any unanswered question. To answer it,
-reply to the earlier post: a reply to a post whose session expired
-without an answer goes to the newest open session asking the same thing
-in that repo, and the confirmation says so. A manual
+gets no `blocked on <repo>` message; the sweep summary lists it with its
+session id and the time it is next due, and the poller logs
+`secops.question.held`. The session still ends blocked with its row
+saved, so it stays answerable and expires on the TTL like any unanswered
+question. To answer it, name its session in a message, or reply to the
+earlier post: while that post's own session is still open the reply
+answers that session; once it has expired without an answer, the reply
+goes to the newest open session asking the same thing in that repo, and
+the confirmation says so. A manual
 `ctrlrelay run secops` never holds a question back.
 
 For the full BLOCKED → answer → resume mechanics, see

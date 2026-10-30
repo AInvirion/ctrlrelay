@@ -29,7 +29,7 @@ from ctrlrelay.pipelines.base import (
     PipelineResult,
     failure_text,
 )
-from ctrlrelay.transports.base import Transport, TransportTimeoutError
+from ctrlrelay.transports.base import Transport, TransportUnansweredError
 
 _logger = get_logger("pipeline.secops")
 
@@ -764,9 +764,9 @@ async def run_secops_all(
             rounds = 0
             held_until: int | None = None
             # Whether the question the row will carry reached the
-            # operator. Only an ask that timed out waiting for an
-            # answer did: the bridge accepted it and nobody replied.
-            # Any other failure (bridge down, chat API error) never
+            # operator. Only an ask the bridge ACKed and nobody
+            # answered did (TransportUnansweredError). Any other
+            # failure, including a timeout with no ACK, may never have
             # put it in front of anyone, and counting it as a post
             # would stretch the backoff over an outage (#214).
             question_posted = False
@@ -815,7 +815,7 @@ async def run_secops_all(
                         repo=repo,
                     )
                 except Exception as e:
-                    question_posted = isinstance(e, TransportTimeoutError)
+                    question_posted = isinstance(e, TransportUnansweredError)
                     log_event(
                         _logger,
                         "secops.transport.ask_failed",

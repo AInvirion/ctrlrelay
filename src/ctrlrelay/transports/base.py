@@ -30,6 +30,17 @@ class TransportTimeoutError(TransportUnknownDeliveryError):
     """
 
 
+class TransportUnansweredError(TransportTimeoutError):
+    """An ask the far side acknowledged, with no answer in time.
+
+    Unlike its parent, delivery is known: the bridge ACKs an ask only
+    after the chat app accepted the post, so the question was in front
+    of the operator and nobody replied. A timeout with no ACK stays a
+    plain ``TransportTimeoutError``, because then nobody knows whether
+    it was posted. Subclassing keeps every existing handler working.
+    """
+
+
 @runtime_checkable
 class Transport(Protocol):
     """Protocol for orchestrator-to-human communication.

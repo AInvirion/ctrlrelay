@@ -19,6 +19,7 @@ from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.transports.base import (
     TransportError,
     TransportTimeoutError,
+    TransportUnansweredError,
     TransportUnknownDeliveryError,
 )
 
@@ -243,6 +244,13 @@ class SocketTransport:
                     reason=type(e).__name__ if unknown else "send_failed",
                     error=str(e)[:200],
                 )
+            elif isinstance(e, TransportTimeoutError) and not isinstance(
+                e, TransportUnansweredError
+            ):
+                # The bridge ACKed, so the question was posted and the
+                # wait ran out with no reply. Say so: a plain timeout
+                # cannot tell this from a post that never landed (#214).
+                raise TransportUnansweredError(str(e)) from e
             raise
 
         if response.op == BridgeOp.ERROR:

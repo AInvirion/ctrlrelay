@@ -634,9 +634,12 @@ async def announce_secops_sweep(transport, *, repos, results) -> list[str]:
     A blocked result whose question was held back as an unanswered
     repeat (#214) gets no per-repo message: that message carries the
     question, so sending it would be the daily re-post the hold exists
-    to stop. It is counted in the summary instead, so a held repo is
-    still visible, and the earlier post still takes the answer (the
-    bridge routes a reply to it onto the newest open row).
+    to stop. It is listed in the summary instead, with its session id,
+    so a held repo is still visible and can be answered by naming the
+    session. A reply to the earlier post also works: while that post's
+    own session is open it takes the answer itself, and once it has
+    expired unanswered the bridge routes the reply to the newest open
+    session asking the same thing in that repo.
 
     ``run_secops_all`` returns results in the same order as the input
     ``repos`` list, so zip is safe. Raises on the first failed send,
@@ -652,12 +655,14 @@ async def announce_secops_sweep(transport, *, repos, results) -> list[str]:
         await transport.send(text, **kwargs)
         sent.append(text)
 
-    held: list[tuple[str, int]] = []
+    held: list[tuple[str, str, int]] = []
     for repo_cfg, result in zip(repos, results, strict=False):
         if result.blocked:
             held_until = (result.outputs or {}).get(QUESTION_HELD_UNTIL)
             if held_until is not None:
-                held.append((repo_cfg.name, int(held_until)))
+                held.append(
+                    (repo_cfg.name, result.session_id, int(held_until))
+                )
                 continue
             question = result.question or "(no question text)"
             # session_id makes this message reply-to-able: the bridge
@@ -697,12 +702,13 @@ async def announce_secops_sweep(transport, *, repos, results) -> list[str]:
         )
         if held:
             lines = "\n".join(
-                f"  - {name}: not before {format_utc_timestamp(until)}"
-                for name, until in held
+                f"  - {name} (session: {sid}): not before "
+                f"{format_utc_timestamp(until)}"
+                for name, sid, until in held
             )
             text += (
-                f"\n\nNot re-posted, asked before with no answer "
-                f"(reply to the earlier post to answer):\n{lines}"
+                f"\n\nNot re-posted, asked before with no answer (reply "
+                f"to the earlier post, or name the session):\n{lines}"
             )
         await _send(text)
     else:
