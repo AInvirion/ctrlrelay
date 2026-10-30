@@ -628,7 +628,7 @@ async def run_secops_all(
     max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
     archived: ArchivedRepoTracker | None = None,
     *,
-    hold_repeats: bool,
+    hold_repeats: bool = False,
 ) -> list[PipelineResult]:
     """Run secops pipeline on all configured repos.
 
@@ -638,8 +638,9 @@ async def run_secops_all(
     blocked with its row persisted, exactly as when nobody answers, so
     it stays answerable and expires on TTL as usual. The scheduled
     sweep passes True; a run an operator started by hand passes False,
-    because they are waiting for the question. Required so no caller
-    gets either behaviour by omission.
+    because they are waiting for the question. Both pass it
+    explicitly; the default keeps today's behaviour (always post) for
+    callers outside this package.
 
     ``archived`` (#163) skips repos that GitHub confirms are archived —
     the alerts API answers 403 for them, so the sweep spends a whole

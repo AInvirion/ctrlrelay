@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The scheduled secops sweep holds back a question nobody answered, posting it again after 1, 2, 4, then 7 days (#214)
+
 ## [0.12.4] - 2026-10-18
 
 Carries 0.12.3's entries too: v0.12.3 was never tagged, so nothing has
