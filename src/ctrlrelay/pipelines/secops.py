@@ -15,7 +15,12 @@ from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
-from ctrlrelay.core.question_expiry import extract_referenced_numbers
+from ctrlrelay.core.question_expiry import (
+    QuestionHold,
+    extract_referenced_numbers,
+    find_question_hold,
+    format_utc_timestamp,
+)
 from ctrlrelay.core.state import StateDB
 from ctrlrelay.core.worktree import WorktreeManager
 from ctrlrelay.dashboard.client import DashboardClient, EventPayload
@@ -80,6 +85,50 @@ def _record_decisions_from_answer(
                 error_type=type(e).__name__,
                 error=str(e)[:200],
             )
+
+
+# Key on a blocked result's outputs when its question was held back
+# rather than posted. The sweep's fan-out reads it so it does not post
+# the question either; the value is the hold's `next_post_at`.
+QUESTION_HELD_UNTIL = "question_held_until"
+
+
+def _question_hold(
+    state_db: StateDB, *, repo: str, question: str, session_id: str,
+) -> QuestionHold | None:
+    """The backoff decision for a question about to be posted, or None
+    to post it. A lookup failure posts: a question nobody can see is
+    the one outcome the backoff must never produce by accident."""
+    try:
+        hold = find_question_hold(
+            state_db,
+            repo=repo,
+            question=question,
+            exclude_session_id=session_id,
+        )
+    except Exception as e:
+        log_event(
+            _logger,
+            "secops.question.hold_lookup_failed",
+            session_id=session_id,
+            repo=repo,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        return None
+    if hold is not None:
+        log_event(
+            _logger,
+            "secops.question.held",
+            session_id=session_id,
+            repo=repo,
+            question_hash=hash_text(question),
+            ttl_expiries=hold.ttl_expiries,
+            last_posted_at=hold.last_posted_at,
+            next_post_at=hold.next_post_at,
+            next_post_after=format_utc_timestamp(hold.next_post_at),
+        )
+    return hold
 
 
 def _question_for_persist(session_id: str, result: PipelineResult) -> str:
@@ -578,8 +627,19 @@ async def run_secops_all(
     contexts_dir: Path,
     max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
     archived: ArchivedRepoTracker | None = None,
+    *,
+    hold_repeats: bool,
 ) -> list[PipelineResult]:
     """Run secops pipeline on all configured repos.
+
+    ``hold_repeats`` (#214) holds back a question that went unanswered
+    on earlier sweeps instead of posting it every morning; see
+    ``find_question_hold`` for the schedule. A held session ends
+    blocked with its row persisted, exactly as when nobody answers, so
+    it stays answerable and expires on TTL as usual. The scheduled
+    sweep passes True; a run an operator started by hand passes False,
+    because they are waiting for the question. Required so no caller
+    gets either behaviour by omission.
 
     ``archived`` (#163) skips repos that GitHub confirms are archived —
     the alerts API answers 403 for them, so the sweep spends a whole
@@ -696,12 +756,45 @@ async def run_secops_all(
             # writes a pending_resumes row that a later out-of-band reply
             # could resume via the sweeper.
             rounds = 0
+            held_until: int | None = None
             while (
                 result.blocked
                 and transport is not None
                 and rounds < max_blocked_rounds
             ):
                 question = _question_for_persist(session_id, result)
+                # Only before the first ask. Once the operator has
+                # answered in this session the follow-up is a new
+                # exchange, and that answer is not in the table yet to
+                # reset the count.
+                hold = (
+                    _question_hold(
+                        state_db,
+                        repo=repo,
+                        question=question,
+                        session_id=session_id,
+                    )
+                    if hold_repeats and rounds == 0
+                    else None
+                )
+                if hold is not None:
+                    held_until = hold.next_post_at
+                    result = PipelineResult(
+                        success=False,
+                        blocked=True,
+                        session_id=session_id,
+                        summary=(
+                            "Blocked; same question as an earlier "
+                            "unanswered post, held until "
+                            f"{format_utc_timestamp(hold.next_post_at)}"
+                        ),
+                        question=question,
+                        outputs={
+                            **result.outputs,
+                            QUESTION_HELD_UNTIL: hold.next_post_at,
+                        },
+                    )
+                    break
                 try:
                     answer = await transport.ask(
                         question,
@@ -801,6 +894,7 @@ async def run_secops_all(
                         pipeline="secops",
                         repo=repo,
                         question=_question_for_persist(session_id, result),
+                        held_until=held_until,
                     )
                 except Exception as e:
                     log_event(

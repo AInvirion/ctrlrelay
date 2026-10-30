@@ -2312,3 +2312,148 @@ class TestARepeatedQuestionSaysSo:
         )
         assert lines[2] == "Session: secops-ai-miner-new"
         assert sent.endswith(self.NOW_Q)
+
+
+class TestAReplyToAnOlderPostReachesTheOpenOne:
+    """#214. A question held back as a repeat leaves the operator looking
+    at an OLDER post of it, whose session has since expired. A reply to
+    that post must reach the newest open row asking the same thing in
+    the same repo, not be refused as "expired"."""
+
+    REPO = "AInvirion/ai-miner"
+    OLD_Q = (
+        "ai-miner is not a self-merge repo (repo rules, merge authority: "
+        "work stops at the PR), so I did not auto-merge the patch tier. "
+        "Approve merging #201 ruff 0.17.1->0.17.2 (patch, all 7 checks "
+        "green)? Prior ruff approval was #168 0.16.8->0.16.10, a different "
+        "bump, so I am re-asking."
+    )
+    NEW_Q = (
+        "ai-miner is not a self-merge repo (repo rules, merge authority: "
+        "work stops at the PR), so I did not auto-merge the patch tier. "
+        "Approve merging #201 ruff 0.17.1->0.17.2 (patch, all 7 checks "
+        "green, MERGEABLE/CLEAN)?"
+    )
+
+    def _server(self, tmp_path, *, old_answered: bool = False):
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        now = 1793188800
+        rows = [
+            # The post on the operator's screen, three days old, expired.
+            ("secops-old", self.REPO, self.OLD_Q, now - 3 * 86400),
+            # The same question, open on two newer sessions.
+            ("secops-mid", self.REPO, self.NEW_Q, now - 86400),
+            ("secops-new", self.REPO, self.NEW_Q, now),
+            # Newer still, but another question, and another repo.
+            ("secops-other", self.REPO, "Approve merging #197 torch?",
+             now + 60),
+            ("secops-zz", "AInvirion/zzsites", self.NEW_Q, now + 120),
+        ]
+        for sid, repo, q, created in rows:
+            db.add_pending_resume(
+                session_id=sid, pipeline="secops", repo=repo, question=q,
+            )
+            db.execute(
+                "UPDATE pending_resumes SET created_at = ? "
+                "WHERE session_id = ?", (created, sid),
+            )
+        db.commit()
+        if old_answered:
+            assert db.answer_pending_resume("secops-old", "approved")
+        db.execute(
+            "UPDATE pending_resumes SET expired_at = ?, expired_reason = "
+            "'ttl' WHERE session_id = 'secops-old'", (now - 86400,),
+        )
+        db.commit()
+        server = BridgeServer(
+            socket_path=tmp_path / "b.sock", handler=FakeChatHandler(),
+            state_db=db,
+        )
+        server.handler.send = AsyncMock()  # type: ignore[attr-defined]
+        server._asked_sessions["555"] = "secops-old"
+        return server, db
+
+    def _answered(self, db) -> list[str]:
+        return [r["session_id"] for r in db.list_pending_resumes_to_execute()]
+
+    @pytest.mark.asyncio
+    async def test_the_reply_lands_on_the_newest_open_row(
+        self, tmp_path,
+    ) -> None:
+        server, db = self._server(tmp_path)
+
+        await server._on_reply("yes, merge it", reply_to_post_id="555")
+
+        assert self._answered(db) == ["secops-new"]
+        assert db.get_pending_resume("secops-new")["answer"] == "yes, merge it"
+        sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "`secops-new`" in sent
+        assert "`secops-old` had expired" in sent
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_an_answered_older_post_still_refuses(
+        self, tmp_path,
+    ) -> None:
+        """Answering a question twice is not answering the next one."""
+        server, db = self._server(tmp_path, old_answered=True)
+        db.execute(
+            "UPDATE pending_resumes SET resumed_at = 1 "
+            "WHERE session_id = 'secops-old'"
+        )
+        db.commit()
+
+        await server._on_reply("yes, merge it", reply_to_post_id="555")
+
+        assert self._answered(db) == []
+        sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "already been answered" in sent
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_with_no_open_repeat_it_is_still_refused_as_expired(
+        self, tmp_path,
+    ) -> None:
+        server, db = self._server(tmp_path)
+        for sid in ("secops-mid", "secops-new"):
+            assert db.expire_pending_resume(sid, "ttl")
+
+        await server._on_reply("yes, merge it", reply_to_post_id="555")
+
+        assert self._answered(db) == []
+        sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "`secops-old` expired before this reply arrived" in sent
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_failure_refuses_rather_than_guessing(
+        self, tmp_path,
+    ) -> None:
+        """Could not look is not "here is a row": nothing is routed and
+        the operator gets the reason the stale-hint path can give."""
+        from unittest.mock import MagicMock
+
+        server, db = self._server(tmp_path)
+        real_get = db.get_pending_resume
+        calls = {"n": 0}
+
+        def flaky(sid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_get(sid)
+
+        db.get_pending_resume = MagicMock(side_effect=flaky)  # type: ignore[method-assign]
+
+        await server._on_reply("yes, merge it", reply_to_post_id="555")
+
+        assert calls["n"] == 2, "the redirect lookup and the stale hint"
+        assert self._answered(db) == []
+        sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "expired" in sent
+        db.close()
