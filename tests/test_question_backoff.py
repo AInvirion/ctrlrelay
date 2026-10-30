@@ -428,15 +428,15 @@ class TestTheSweepHoldsARepeat:
     async def test_a_follow_up_after_an_inline_answer_is_asked(
         self, tmp_path: Path, db: StateDB,
     ) -> None:
-        """The operator answered in-session and the agent asks a
-        follow-up about the same PR. That answer is not in the table yet,
-        so the history still looks unanswered; the follow-up must not be
-        held on the strength of it."""
+        """The operator is answering in-session, and the agent's
+        follow-up is a question with a held history. They are engaged
+        right now; the follow-up is asked, not held. (The first question
+        is a new one, so it is posted either way.)"""
         from ctrlrelay.core.checkpoint import CheckpointStatus
 
         now = int(time.time())
-        # Due now, so the FIRST ask is posted.
-        _ttl_expired_chain(db, 3, last_posted=now - 5 * DAY)
+        # TODAY_Q alone would be held: three misses, last post yesterday.
+        _ttl_expired_chain(db, 3, last_posted=now - DAY)
         done = MagicMock()
         done.status = CheckpointStatus.DONE
         done.summary = "merged"
@@ -447,7 +447,8 @@ class TestTheSweepHoldsARepeat:
 
         result = await _sweep(
             tmp_path, db, transport,
-            states=[_blocked(TODAY_Q), _blocked(MINER_Q[2]), done],
+            states=[_blocked("Approve merging #197 torch 2.5?"),
+                    _blocked(TODAY_Q), done],
         )
 
         assert transport.ask.await_count == 2
