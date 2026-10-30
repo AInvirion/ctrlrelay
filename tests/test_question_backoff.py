@@ -171,9 +171,10 @@ class TestSchedule:
         question, not an earlier post of it."""
         _posted(db, "now", MINER_Q[0], created_at=self.T0)
 
-        assert _hold(db, now=self.T0 + DAY + HOUR, session="now") is None
-        assert _hold(db, now=self.T0 + DAY + HOUR, session="other") is None
+        # Inside the 1-day wait: another session would be held by it,
+        # the session that owns it is not.
         assert _hold(db, now=self.T0 + 12 * HOUR, session="other") is not None
+        assert _hold(db, now=self.T0 + 12 * HOUR, session="now") is None
 
     def test_resolved_elsewhere_is_not_a_missed_answer(
         self, db: StateDB,
@@ -181,7 +182,8 @@ class TestSchedule:
         _posted(db, "d0", MINER_Q[0], created_at=self.T0,
                 expired=EXPIRY_REASON_RESOLVED)
 
-        assert _hold(db, now=self.T0 + 10 * 60) is None
+        # Inside the 1-day wait a miss would hold it; this is not one.
+        assert _hold(db, now=self.T0 + 12 * HOUR) is None
 
     def test_the_delay_runs_from_the_latest_post(self, db: StateDB) -> None:
         """Two expiries, then a third post still open: three misses, and
