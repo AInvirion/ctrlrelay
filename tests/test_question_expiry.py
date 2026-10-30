@@ -445,16 +445,16 @@ class TestExpiredRowsNeverResume:
 # agent each run, citing #168 on some days and not on others.
 MINER = "AInvirion/ai-miner"
 MINER_Q = [
-    "ai-miner is not a self-merge repo (CLAUDE.md merge authority: work "
+    "ai-miner is not a self-merge repo (repo rules, merge authority: work "
     "stops at the PR), so I did not auto-merge the patch tier. Approve "
     "merging #201 ruff 0.17.1->0.17.2 (patch, all 7 checks green)? Prior "
     "ruff approval was #168 0.16.8->0.16.10, a different bump, so I am "
     "re-asking.",
-    "ai-miner is not a self-merge repo (CLAUDE.md merge authority: work "
+    "ai-miner is not a self-merge repo (repo rules, merge authority: work "
     "stops at the PR), so I did not auto-merge the patch tier. Approve "
     "merging #201 ruff 0.17.1->0.17.2 (patch, all 7 checks green, "
     "MERGEABLE/CLEAN)?",
-    "ai-miner is not a self-merge repo (CLAUDE.md merge authority: work "
+    "ai-miner is not a self-merge repo (repo rules, merge authority: work "
     "stops at the PR), so I did not auto-merge the patch tier. Approve "
     "merging #201 ruff 0.17.1->0.17.2 (patch, all 7 checks green)? Prior "
     "ruff approval was a different range (0.16.8->0.16.10 on 2026-10-06), "
