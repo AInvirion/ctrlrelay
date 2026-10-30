@@ -15,7 +15,10 @@ from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier
-from ctrlrelay.core.question_expiry import expire_stale_questions
+from ctrlrelay.core.question_expiry import (
+    DEFAULT_RETENTION_DAYS,
+    expire_stale_questions,
+)
 from ctrlrelay.transports.base import Transport
 
 _logger = get_logger("cli")
@@ -2996,7 +2999,10 @@ def poller_start(
             try:
                 expired = await expire_stale_questions(
                     state_db, github, ttl_seconds=ttl,
-                    retention_days=chat.question_retention_days,
+                    retention_days=getattr(
+                        chat, "question_retention_days",
+                        DEFAULT_RETENTION_DAYS,
+                    ),
                 )
             except Exception as e:
                 console.print(

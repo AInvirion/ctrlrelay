@@ -607,6 +607,50 @@ class TestRepeatHistory:
         assert h.times_asked_before == 1
         assert h.last_asked_at == OCT_28_NOON - DAY
 
+    def test_an_answer_on_the_asking_sessions_own_row_resets_it(
+        self, db: StateDB,
+    ) -> None:
+        """The dev/task resume path asks again before it rewrites its
+        row, so the answer that drove the resume is on that row when the
+        re-ask is posted. It is the latest answer; nothing before it is
+        a repeat."""
+        _row(db, "d1", MINER_Q[0], created_at=OCT_28_NOON - 2 * DAY,
+             expired_at=OCT_28_NOON, expired_reason=EXPIRY_REASON_TTL)
+        _row(db, "now", MINER_Q[1], created_at=OCT_28_NOON - DAY,
+             answered_at=OCT_28_NOON)
+
+        assert self._history(db, MINER_Q[2], session="now") is None
+
+    def test_the_month_does_not_follow_the_locale(self, monkeypatch) -> None:
+        """`%b` follows the process locale. No non-English locale is
+        installed on our hosts, so a real setlocale() would only ever
+        skip; instead the module's datetime is swapped for one whose
+        `%b` answers as a German host would, which is exactly what the
+        C library does under de_DE."""
+        from datetime import datetime
+
+        import ctrlrelay.core.question_expiry as qe
+
+        class GermanDatetime(datetime):
+            def strftime(self, fmt: str) -> str:
+                return super().strftime(fmt.replace("%b", "Dez"))
+
+            def __format__(self, fmt: str) -> str:
+                return self.strftime(fmt) if fmt else str(self)
+
+        monkeypatch.setattr(qe, "datetime", GermanDatetime)
+        dec = 1796299200  # 3 Dec 2026, noon UTC
+        # Prove the stand-in bites: `%b` through it is no longer English.
+        assert f"{GermanDatetime.fromtimestamp(dec):%b}" == "Dez"
+
+        note = qe.format_repeat_note(
+            qe.RepeatHistory(times_asked_before=1, last_asked_at=dec)
+        )
+
+        assert note == (
+            "Repeat: asked once before, last on Dec 3 UTC, no answer yet."
+        )
+
     def test_the_note_names_the_count_and_the_date(self) -> None:
         from ctrlrelay.core.question_expiry import (
             RepeatHistory,
@@ -631,6 +675,10 @@ class TestRepeatHistory:
         monkeypatch.setenv("TZ", "America/Los_Angeles")
         time.tzset()
         try:
+            # Prove the zone took: without zone data TZ silently falls
+            # back to UTC and this test would pass for any implementation.
+            if time.localtime(OCT_28_NOON + 14 * 3600).tm_mday != 28:
+                pytest.skip("America/Los_Angeles zone data not available")
             note = format_repeat_note(RepeatHistory(
                 times_asked_before=2, last_asked_at=OCT_28_NOON + 14 * 3600,
             ))

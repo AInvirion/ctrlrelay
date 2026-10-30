@@ -873,7 +873,8 @@ class StateDB:
         ones (an answer resets the count), which every other reader here
         hides. The retention prune bounds the AGE of finished rows, not
         their number: a repo's history is however many questions it was
-        asked inside the window, plus every row still open.
+        asked inside the window, plus every row the prune never deletes
+        whatever its age (open, and answered but not yet resumed).
         """
         rows = self._conn.execute(
             "SELECT * FROM pending_resumes WHERE repo = ? "

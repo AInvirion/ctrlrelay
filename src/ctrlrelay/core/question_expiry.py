@@ -63,6 +63,11 @@ EXPIRY_REASON_RESOLVED = "resolved_elsewhere"
 
 DEFAULT_RETENTION_DAYS = 90
 
+_MONTHS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
 
 def extract_referenced_numbers(question: str) -> list[str]:
     """Pull deduplicated issue/PR numbers out of a question, in the
@@ -127,16 +132,19 @@ def find_repeat_history(
     resolved). The cutoff is when the answer was GIVEN, not when the
     answered question was asked: an operator who answers Monday's
     question on Tuesday evening has also answered Tuesday morning's
-    re-ask of it. ``exclude_session_id`` is the session asking now;
-    its own row, when a resume re-blocked and rewrote it, is not an
-    earlier ask. It is required so a caller cannot forget it and count
-    the question as a repeat of itself.
+    re-ask of it.
+
+    ``exclude_session_id`` is the session asking now. Its own row is
+    never counted as an earlier ask, but an answer on it still resets
+    the count: the dev and task resume paths ask again BEFORE they
+    rewrite the row, so at that moment it carries the very answer that
+    drove the resume. It is required so a caller cannot forget it and
+    count the question as a repeat of itself.
     """
     matches = [
         row
         for row in state_db.list_pending_resumes_for_repo(repo)
-        if row["session_id"] != exclude_session_id
-        and same_substance(question, row["question"])
+        if same_substance(question, row["question"])
     ]
     last_answer = max(
         (int(r["answered_at"]) for r in matches if r["answered_at"] is not None),
@@ -148,7 +156,8 @@ def find_repeat_history(
     unanswered = [
         r
         for r in matches
-        if last_answer is None or int(r["created_at"]) > last_answer
+        if r["session_id"] != exclude_session_id
+        and (last_answer is None or int(r["created_at"]) > last_answer)
     ]
     if not unanswered:
         return None
@@ -169,8 +178,11 @@ def format_repeat_note(history: RepeatHistory) -> str:
     n = history.times_asked_before
     times = "once" if n == 1 else f"{n} times"
     when = datetime.fromtimestamp(history.last_asked_at, timezone.utc)
+    # Not `%b`: that follows the process locale, and the line is the
+    # same English sentence whatever the host is set to.
+    month = _MONTHS[when.month - 1]
     return (
-        f"Repeat: asked {times} before, last on {when:%b} {when.day} UTC, "
+        f"Repeat: asked {times} before, last on {month} {when.day} UTC, "
         f"no answer yet."
     )
 

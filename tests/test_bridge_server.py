@@ -2151,6 +2151,49 @@ class TestARepeatedQuestionSaysSo:
         assert sent == f"Answer applied on {self.REPO}\n\n{self.NOW_Q}"
 
     @pytest.mark.asyncio
+    async def test_a_malformed_row_does_not_stop_the_send(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """A row read back without the columns the note needs costs the
+        note, never the message."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import (
+            BridgeMessage,
+            BridgeOp,
+            parse_message,
+            serialize_message,
+        )
+        from ctrlrelay.bridge.server import BridgeServer
+
+        db = self._db(tmp_path, earlier_question=self.EARLIER)
+        db.get_pending_resume = lambda sid: {"session_id": sid}  # type: ignore[method-assign]
+        server = BridgeServer(
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server.handler.send = AsyncMock(return_value="903")  # type: ignore[attr-defined]
+        text = f"⏸️ Scheduled secops blocked on {self.REPO}\n\n{self.NOW_Q}"
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.SEND, request_id="r-bad",
+                text=text, session_id="secops-ai-miner-new", repo=self.REPO,
+            )).encode())
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=1)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            db.close()
+            await server.stop()
+            task.cancel()
+
+        assert parse_message(line.decode()).op == BridgeOp.ACK
+        assert server.handler.send.await_args.args[0] == text  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
     async def test_the_sweep_fanout_send_carries_it_too(
         self, socket_path, tmp_path,
     ) -> None:

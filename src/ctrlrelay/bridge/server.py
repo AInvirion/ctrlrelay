@@ -217,10 +217,11 @@ def format_question(
     here would reach a Telegram operator as literal backticks. Mattermost
     renders it, which is a difference the question text must not depend on.
 
-    ``repeat_note`` says this question was asked before and never
-    answered. It goes straight under the repo line, ahead of everything
-    else, because a reader skimming a channel decides from the first
-    lines whether a message is new.
+    ``repeat_note`` says this question was asked before, with no
+    answer since the last time it was answered (if it ever was). It
+    goes straight under the repo line, ahead of everything else,
+    because a reader skimming a channel decides from the first lines
+    whether a message is new.
     """
     header: list[str] = []
     if repo:
@@ -643,11 +644,20 @@ class BridgeServer:
         carrying a session is the secops "blocked on <repo>" fan-out,
         but a session id on a SEND exists to make a message answerable,
         and an "answer applied" or "expired" notice that gains one later
-        must not be told the question is still waiting."""
+        must not be told the question is still waiting. Today that holds
+        because the fan-out is the only SEND with a session and a repo;
+        the open-row check is what keeps it true if that changes."""
         if self.state_db is None:
             return None
         try:
             row = self.state_db.get_pending_resume(session_id)
+            if (
+                row is None
+                or row["answered_at"] is not None
+                or row["expired_at"] is not None
+            ):
+                return None
+            question = row["question"]
         except Exception as e:
             log_event(
                 _logger,
@@ -658,13 +668,7 @@ class BridgeServer:
                 error=str(e)[:200],
             )
             return None
-        if (
-            row is None
-            or row["answered_at"] is not None
-            or row["expired_at"] is not None
-        ):
-            return None
-        return self._repeat_note(repo, row["question"], session_id)
+        return self._repeat_note(repo, question, session_id)
 
     def _error_code(self, unknown: bool) -> str:
         """The ERROR frame's ``error`` field for a failed post.
