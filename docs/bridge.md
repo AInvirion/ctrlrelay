@@ -251,10 +251,24 @@ again, in new words. When that happens the post carries a line such as
 `Repeat: asked 3 times before, last on Oct 28 UTC, no answer yet.` Two
 questions count as the same if they cite at least one PR or issue number
 in common (or, when neither cites a number, have the same text). The
-count runs from the last answer to that question. One known limit: when
-a resume re-blocks, its row is rewritten and the answer that drove it
-leaves the table, so a later count can be too high. The history this
-reads is kept for `question_retention_days`.
+count runs from the last answer to that question, including an answer
+on a row a later re-block rewrote (rows rewritten before this was kept
+can still count too high). The history this reads is kept for
+`question_retention_days`.
+
+**A question nobody answers is asked less often.** On the scheduled
+secops sweep, once a post of a question has expired on
+`question_ttl_seconds` without an answer, the next post waits 1 day from
+the last post; after two such expiries 2 days, after three 4 days, then
+once a week. Any answer resets it. A held question is not posted and
+gets no `blocked on <repo>` message; the sweep summary lists it with the
+time it is next due, and the poller logs `secops.question.held`. The
+session still ends blocked with its row saved, so it stays answerable
+and expires on the TTL like any unanswered question. To answer it,
+reply to the earlier post: a reply to a post whose session expired
+without an answer goes to the newest open session asking the same thing
+in that repo, and the confirmation says so. A manual
+`ctrlrelay run secops` never holds a question back.
 
 For the full BLOCKED → answer → resume mechanics, see
 [Feedback loop]({{ '/feedback-loop/' | relative_url }}).
