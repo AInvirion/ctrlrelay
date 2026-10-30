@@ -21,6 +21,10 @@ resume failed, which was wrong in both directions.
 
 from __future__ import annotations
 
+import json
+import re
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -253,3 +257,75 @@ def test_every_checkpoint_snippet_creates_its_own_directory(mod: str) -> None:
         assert mk < pf, (
             f"{mod}: block {i} creates the directory AFTER writing to it"
         )
+
+
+# A path with each character that ends or confuses a shell quote: an
+# apostrophe (closes a single-quoted string), a space (splits an
+# unquoted word) and a double quote (closes a double-quoted one).
+_HOSTILE_DIR = "O'Reilly dir \"q\""
+
+# What the agent is told to replace. `<PR_NUM>` sits unquoted in a
+# `%d` slot, so it must become a number; everything else is a quoted
+# string argument.
+_PLACEHOLDER = re.compile(r"<[A-Z][A-Z_ -]*>")
+
+
+def _fill(block: str) -> str:
+    return _PLACEHOLDER.sub(
+        lambda m: "42" if m.group(0) == "<PR_NUM>" else "filled in",
+        block,
+    )
+
+
+@pytest.mark.parametrize("mod", PIPELINES)
+def test_every_snippet_writes_a_checkpoint_at_a_path_needing_quotes(
+    mod: str, tmp_path: Path
+) -> None:
+    """A state-file path the shell has to quote must still be writable (#191).
+
+    The snippets hand-wrapped the path in single quotes, so an apostrophe
+    in it closed the quote early and bash refused the whole snippet - no
+    DONE, no BLOCKED, no FAILED. The agent did its work and then looked
+    exactly like it crashed.
+
+    Asserts the artifact, not the absence of a syntax error: each block
+    runs under `bash -c`, must exit 0, and must leave a JSON file at that
+    exact path carrying the status the block is named for. The file is
+    removed between blocks, and its directory does not exist before the
+    first one, so every block is proven to create both.
+    """
+    state_file = tmp_path / _HOSTILE_DIR / ".ctrlrelay" / "state.json"
+    assert not state_file.parent.exists()
+
+    contract = _pipeline(mod)._checkpoint_contract(str(state_file), "sid-1")
+    blocks = [
+        b.split("```")[0] for b in contract.split("```bash")[1:]
+    ]
+    assert len(blocks) == 3, f"{mod}: found {len(blocks)} shell blocks"
+
+    expected = ["DONE", "BLOCKED_NEEDS_INPUT", "FAILED"]
+    for block, status in zip(blocks, expected, strict=True):
+        if state_file.parent.exists():
+            shutil.rmtree(state_file.parent)
+
+        script = _fill(block)
+        assert "<" not in script, (
+            f"{mod}/{status}: an unfilled placeholder is left in {script!r}"
+        )
+        run = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert run.returncode == 0, (
+            f"{mod}/{status}: snippet failed with exit {run.returncode}:\n"
+            f"{run.stderr}\n--- script ---\n{script}"
+        )
+        assert state_file.is_file(), (
+            f"{mod}/{status}: exit 0 but no checkpoint at {state_file}; "
+            f"directory holds {list(tmp_path.rglob('*'))}"
+        )
+        data = json.loads(state_file.read_text())
+        assert data["status"] == status
+        assert data["session_id"] == "sid-1"

@@ -23,6 +23,7 @@ Intentionally NOT shared with dev:
 from __future__ import annotations
 
 import asyncio
+import shlex
 import time
 import uuid
 from dataclasses import dataclass
@@ -221,6 +222,10 @@ pipeline. Don't BLOCK on things you can figure out yourself.
         conditions for DONE. One shared block would have quietly changed
         what two of them promise.
         """
+        # Quoted for the shell rather than hand-wrapped in single quotes:
+        # an apostrophe in the path closed the quote early and made every
+        # snippet a syntax error, so no checkpoint could be written (#191).
+        quoted_path = shlex.quote(state_file_path)
         return f"""**CRITICAL**: Before exiting, write a checkpoint file.
 
 STATE_FILE: {state_file_path}
@@ -228,26 +233,26 @@ SESSION_ID: {session_id}
 
 **DONE** (task complete, comment posted):
 ```bash
-mkdir -p "$(dirname '{state_file_path}')"
+mkdir -p "$(dirname {quoted_path})"
 printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\\
 '"timestamp":"%s","summary":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ONE-LINE SUMMARY>" > '{state_file_path}'
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ONE-LINE SUMMARY>" > {quoted_path}
 ```
 
 **BLOCKED** (need operator input):
 ```bash
-mkdir -p "$(dirname '{state_file_path}')"
+mkdir -p "$(dirname {quoted_path})"
 printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\\
 '"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > '{state_file_path}'
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > {quoted_path}
 ```
 
 **FAILED** (genuine failure, no way forward):
 ```bash
-mkdir -p "$(dirname '{state_file_path}')"
+mkdir -p "$(dirname {quoted_path})"
 printf '{{"version":"1","status":"FAILED",'\\
 '"session_id":"{session_id}","timestamp":"%s","error":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > '{state_file_path}'
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > {quoted_path}
 ```
 """
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import shlex
 import time
 import uuid
 from dataclasses import dataclass
@@ -674,6 +675,10 @@ finds the PR broken it will resume this session asking you to fix it.
         conditions for DONE. One shared block would have quietly changed
         what two of them promise.
         """
+        # Quoted for the shell rather than hand-wrapped in single quotes:
+        # an apostrophe in the path closed the quote early and made every
+        # snippet a syntax error, so no checkpoint could be written (#191).
+        quoted_path = shlex.quote(state_file_path)
         return f"""## Signaling Completion
 
 **CRITICAL**: Before exiting, you MUST write a checkpoint file to signal completion.
@@ -683,27 +688,27 @@ SESSION_ID: {session_id}
 
 **DONE** (PR opened AND verified green + conflict-free):
 ```bash
-mkdir -p "$(dirname '{state_file_path}')"
+mkdir -p "$(dirname {quoted_path})"
 printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\
 '"timestamp":"%s","summary":"PR opened",'\
 '"outputs":{{"pr_url":"%s","pr_number":%d}}}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<PR_URL>" <PR_NUM> > '{state_file_path}'
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<PR_URL>" <PR_NUM> > {quoted_path}
 ```
 
 **BLOCKED** (need input):
 ```bash
-mkdir -p "$(dirname '{state_file_path}')"
+mkdir -p "$(dirname {quoted_path})"
 printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
 '"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > '{state_file_path}'
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > {quoted_path}
 ```
 
 **FAILED**:
 ```bash
-mkdir -p "$(dirname '{state_file_path}')"
+mkdir -p "$(dirname {quoted_path})"
 printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
 '"timestamp":"%s","error":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > '{state_file_path}'
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > {quoted_path}
 ```"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
