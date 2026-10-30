@@ -21,6 +21,10 @@ from ctrlrelay.bridge.protocol import (
     serialize_message,
 )
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
+from ctrlrelay.core.question_expiry import (
+    find_repeat_history,
+    format_repeat_note,
+)
 
 if TYPE_CHECKING:
     from ctrlrelay.bridge.handler import ChatHandler
@@ -197,6 +201,7 @@ def format_question(
     repo: str | None = None,
     session_id: str | None = None,
     issue_number: int | None = None,
+    repeat_note: str | None = None,
 ) -> str:
     """Prefix an agent question with the repo and session it belongs to.
 
@@ -211,6 +216,11 @@ def format_question(
     Plain text on purpose — no handler sets a markup mode, so any Markdown
     here would reach a Telegram operator as literal backticks. Mattermost
     renders it, which is a difference the question text must not depend on.
+
+    ``repeat_note`` says this question was asked before and never
+    answered. It goes straight under the repo line, ahead of everything
+    else, because a reader skimming a channel decides from the first
+    lines whether a message is new.
     """
     header: list[str] = []
     if repo:
@@ -218,6 +228,8 @@ def format_question(
         if issue_number is not None:
             line += f" issue #{issue_number}"
         header.append(line)
+    if repeat_note:
+        header.append(repeat_note)
     if session_id:
         header.append(f"session: {session_id}")
     if not header:
@@ -436,8 +448,18 @@ class BridgeServer:
             return BridgeMessage(op=BridgeOp.PONG)
 
         if msg.op == BridgeOp.SEND:
+            text = msg.text or ""
+            # The secops sweep's "blocked on <repo>" fan-out is the second
+            # time the operator sees the question, so it carries the same
+            # repeat line the ASK did. Only a SEND naming a session can be
+            # that message; anything else is posted as given.
+            if msg.session_id and msg.repo:
+                note = self._repeat_note_for_session(msg.repo, msg.session_id)
+                if note:
+                    first, sep, rest = text.partition("\n")
+                    text = f"{first}\n{note}{sep}{rest}"
             try:
-                post_id = await self.handler.send(msg.text or "")
+                post_id = await self.handler.send(text)
                 # A SEND that names a session is answerable too: the secops
                 # sweep fans out one "blocked on <repo>" message per repo
                 # after the run, and that message is the most recent — and
@@ -478,6 +500,10 @@ class BridgeServer:
                 "question_hash": hash_text(question),
                 "options": msg.options,
             }
+            repeat_note = self._repeat_note(
+                msg.repo, question, msg.session_id
+            )
+            post_fields["repeat"] = repeat_note is not None
             try:
                 # Start the expiry clock before the chat round trip, not
                 # after it: the client began counting when it wrote the ASK
@@ -493,6 +519,7 @@ class BridgeServer:
                         repo=msg.repo,
                         session_id=msg.session_id,
                         issue_number=msg.issue_number,
+                        repeat_note=repeat_note,
                     ),
                     options=msg.options,
                 )
@@ -568,6 +595,64 @@ class BridgeServer:
                 )
 
         return None
+
+    def _repeat_note(
+        self,
+        repo: str | None,
+        question: str,
+        session_id: str | None,
+    ) -> str | None:
+        """The "asked N times before" line for a question about to be
+        posted, or None when it is new or there is nothing to look in.
+
+        A failed lookup posts the question without the line and logs
+        that it could not tell. The question reaching the operator
+        matters more than the note on it; the log is what separates
+        "first time asked" from "could not check".
+        """
+        if self.state_db is None or not repo:
+            return None
+        try:
+            history = find_repeat_history(
+                self.state_db,
+                repo=repo,
+                question=question,
+                exclude_session_id=session_id,
+            )
+        except Exception as e:
+            log_event(
+                _logger,
+                "bridge.repeat_lookup_failed",
+                session_id=session_id,
+                repo=repo,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
+            return None
+        return format_repeat_note(history) if history else None
+
+    def _repeat_note_for_session(
+        self, repo: str, session_id: str,
+    ) -> str | None:
+        """Repeat line for a SEND that names a session: the question is
+        read back from that session's persisted row."""
+        if self.state_db is None:
+            return None
+        try:
+            row = self.state_db.get_pending_resume(session_id)
+        except Exception as e:
+            log_event(
+                _logger,
+                "bridge.repeat_lookup_failed",
+                session_id=session_id,
+                repo=repo,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
+            return None
+        if row is None:
+            return None
+        return self._repeat_note(repo, row["question"], session_id)
 
     def _error_code(self, unknown: bool) -> str:
         """The ERROR frame's ``error`` field for a failed post.

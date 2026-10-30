@@ -129,6 +129,11 @@ class TelegramConfig(BaseModel):
     # act on a PR whose state has since moved on. Lower bound of 3600s:
     # anything shorter races the operator's own working day.
     question_ttl_seconds: int = Field(default=172800, ge=3600)
+    # How long a FINISHED question (expired or resumed) is kept before
+    # the hourly sweeper deletes it. Open questions are never deleted.
+    # The history is what marks a re-asked question as a repeat, so this
+    # is a window, not zero.
+    question_retention_days: int = Field(default=90, ge=1)
 
     @field_validator("socket_path", mode="before")
     @classmethod
@@ -164,6 +169,7 @@ class MattermostConfig(BaseModel):
     # operator is asleep".
     ask_timeout_seconds: int = Field(default=900, ge=60)
     question_ttl_seconds: int = Field(default=172800, ge=3600)
+    question_retention_days: int = Field(default=90, ge=1)
 
     @field_validator("socket_path", mode="before")
     @classmethod

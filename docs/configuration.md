@@ -147,6 +147,7 @@ reach anybody.
 | `socket_path` | path | `"~/.ctrlrelay/ctrlrelay.sock"` | Unix socket path the bridge listens on. Pipelines connect to this socket as clients. |
 | `ask_timeout_seconds` | int | `900` | How long a pipeline blocks waiting on your reply in-session. Minimum `60`. A reply arriving later still works: the question is persisted to `pending_resumes` and the every-minute sweeper drives the resume. |
 | `question_ttl_seconds` | int | `172800` (48h) | How long an **unanswered** question stays routable before it is retired. Minimum `3600`. Without a ceiling those rows never die — a question whose PR was merged by hand weeks ago stays a live target for an orphan reply. The hourly `question_expiry_sweeper` also retires a question early once every issue/PR it cites is closed or merged. |
+| `question_retention_days` | int | `90` | How long a **finished** question (expired, or answered and resumed) is kept before the hourly sweeper deletes it. Minimum `1`. Open questions are never deleted. The kept history is what lets a re-asked question be marked as a repeat. |
 
 See [Telegram bridge]({{ '/bridge/' | relative_url }}) for the full setup walkthrough.
 
@@ -160,6 +161,7 @@ See [Telegram bridge]({{ '/bridge/' | relative_url }}) for the full setup walkth
 | `socket_path` | path | `"~/.ctrlrelay/ctrlrelay.sock"` | Unix socket path the bridge listens on. Pipelines connect to this socket as clients. |
 | `ask_timeout_seconds` | int | `900` | Same meaning as the Telegram key above: it bounds only the in-session wait, and a later reply still resolves through `pending_resumes`. |
 | `question_ttl_seconds` | int | `172800` (48h) | Same meaning as the Telegram key above. |
+| `question_retention_days` | int | `90` | Same meaning as the Telegram key above. |
 
 **The bot must be a member of that channel.** A bot without `post:all` cannot
 post where it is not a member — and, the part that is easy to miss, it does not

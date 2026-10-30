@@ -2996,6 +2996,7 @@ def poller_start(
             try:
                 expired = await expire_stale_questions(
                     state_db, github, ttl_seconds=ttl,
+                    retention_days=chat.question_retention_days,
                 )
             except Exception as e:
                 console.print(

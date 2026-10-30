@@ -1924,3 +1924,204 @@ class TestTheBridgeSharesItsChannelWithPeople:
 
         assert "  • " in out
         assert "more." not in out
+
+
+class TestARepeatedQuestionSaysSo:
+    """#200: a scheduled sweep re-asks yesterday's unanswered question in
+    new words, and nothing on the post said it was the fourth time."""
+
+    @pytest.fixture
+    def socket_path(self):
+        d = tempfile.mkdtemp()
+        yield Path(d) / "b.sock"
+        shutil.rmtree(d, ignore_errors=True)
+
+    REPO = "AInvirion/ai-miner"
+    # Two real wordings of one approval from a live pending_resumes table.
+    EARLIER = (
+        "Approve merging #201 ruff 0.17.1->0.17.2 (patch, all 7 checks "
+        "green)? Prior ruff approval was #168 0.16.8->0.16.10."
+    )
+    NOW_Q = (
+        "Approve merging #201 ruff 0.17.1->0.17.2 (patch, all 7 checks "
+        "green, MERGEABLE/CLEAN)?"
+    )
+
+    def _db(self, tmp_path, *, earlier_question: str):
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        # Two earlier asks nobody answered, retired on TTL.
+        for i, created in enumerate((1793102400, 1793188800)):
+            db.add_pending_resume(
+                session_id=f"secops-ai-miner-old{i}",
+                pipeline="secops",
+                repo=self.REPO,
+                question=earlier_question,
+            )
+            db.execute(
+                "UPDATE pending_resumes SET created_at = ?, expired_at = ?, "
+                "expired_reason = 'ttl' WHERE session_id = ?",
+                (created, created + 172800, f"secops-ai-miner-old{i}"),
+            )
+        db.commit()
+        return db
+
+    async def _ask(self, server, socket_path) -> str:
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import (
+            BridgeMessage,
+            BridgeOp,
+            serialize_message,
+        )
+
+        server.handler.ask = AsyncMock(return_value="900")
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.ASK, request_id="r-1", question=self.NOW_Q,
+                repo=self.REPO, session_id="secops-ai-miner-new",
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        return server.handler.ask.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_ask_carries_the_count_and_last_date(
+        self, socket_path, tmp_path,
+    ) -> None:
+        from ctrlrelay.bridge.server import BridgeServer
+
+        db = self._db(tmp_path, earlier_question=self.EARLIER)
+        server = BridgeServer(
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        try:
+            posted = await self._ask(server, socket_path)
+        finally:
+            db.close()
+            await server.stop()
+            task.cancel()
+
+        lines = posted.split("\n")
+        assert lines[0] == f"[{self.REPO}]"
+        assert lines[1] == (
+            "Repeat: asked 2 times before, last on Oct 28, no answer yet."
+        )
+        assert self.NOW_Q in posted
+
+    @pytest.mark.asyncio
+    async def test_a_new_question_carries_no_repeat_line(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """Same history table, different PR: the line must come from the
+        match, not from the repo merely having history."""
+        from ctrlrelay.bridge.server import BridgeServer
+
+        db = self._db(
+            tmp_path, earlier_question=self.EARLIER
+            .replace("#201", "#197").replace("#168", "#150"),
+        )
+        server = BridgeServer(
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        try:
+            posted = await self._ask(server, socket_path)
+        finally:
+            db.close()
+            await server.stop()
+            task.cancel()
+
+        assert "Repeat" not in posted
+        assert self.NOW_Q in posted
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_still_posts_the_question(
+        self, socket_path, tmp_path,
+    ) -> None:
+        from ctrlrelay.bridge.server import BridgeServer
+
+        db = self._db(tmp_path, earlier_question=self.EARLIER)
+
+        def boom(repo):
+            raise sqlite3.OperationalError("database is locked")
+
+        db.list_pending_resumes_for_repo = boom  # type: ignore[method-assign]
+        server = BridgeServer(
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        try:
+            posted = await self._ask(server, socket_path)
+        finally:
+            db.close()
+            await server.stop()
+            task.cancel()
+
+        assert self.NOW_Q in posted
+        assert "Repeat" not in posted
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_fanout_send_carries_it_too(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """The secops sweep posts the question a second time as a
+        'blocked on <repo>' SEND, after this session's own row is
+        written. That row must not count as an earlier ask."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import (
+            BridgeMessage,
+            BridgeOp,
+            serialize_message,
+        )
+        from ctrlrelay.bridge.server import BridgeServer
+
+        db = self._db(tmp_path, earlier_question=self.EARLIER)
+        db.add_pending_resume(
+            session_id="secops-ai-miner-new", pipeline="secops",
+            repo=self.REPO, question=self.NOW_Q,
+        )
+        server = BridgeServer(
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server.handler.send = AsyncMock(return_value="901")  # type: ignore[attr-defined]
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.SEND, request_id="r-fan",
+                text=(
+                    f"⏸️ Scheduled secops blocked on {self.REPO}\n"
+                    "Session: secops-ai-miner-new\n"
+                    f"\nReply to this message to answer.\n\n{self.NOW_Q}"
+                ),
+                session_id="secops-ai-miner-new", repo=self.REPO,
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)
+            sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            db.close()
+            await server.stop()
+            task.cancel()
+
+        lines = sent.split("\n")
+        assert lines[0] == f"⏸️ Scheduled secops blocked on {self.REPO}"
+        assert lines[1] == (
+            "Repeat: asked 2 times before, last on Oct 28, no answer yet."
+        )
+        assert lines[2] == "Session: secops-ai-miner-new"
+        assert sent.endswith(self.NOW_Q)

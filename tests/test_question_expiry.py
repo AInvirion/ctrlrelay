@@ -436,3 +436,262 @@ class TestExpiredRowsNeverResume:
         assert [r["session_id"] for r in db.list_pending_resumes_to_execute()] == [
             "live"
         ]
+
+
+# --- #200: a question re-asked every morning, unmarked and never pruned ---
+#
+# Questions below are real rows from one deployment's pending_resumes
+# (AInvirion/ai-miner, 26-29 Oct 2026): the same approval, reworded by the
+# agent each run, citing #168 on some days and not on others.
+MINER = "AInvirion/ai-miner"
+MINER_Q = [
+    "ai-miner is not a self-merge repo (CLAUDE.md merge authority: work "
+    "stops at the PR), so I did not auto-merge the patch tier. Approve "
+    "merging #201 ruff 0.17.1->0.17.2 (patch, all 7 checks green)? Prior "
+    "ruff approval was #168 0.16.8->0.16.10, a different bump, so I am "
+    "re-asking.",
+    "ai-miner is not a self-merge repo (CLAUDE.md merge authority: work "
+    "stops at the PR), so I did not auto-merge the patch tier. Approve "
+    "merging #201 ruff 0.17.1->0.17.2 (patch, all 7 checks green, "
+    "MERGEABLE/CLEAN)?",
+    "ai-miner is not a self-merge repo (CLAUDE.md merge authority: work "
+    "stops at the PR), so I did not auto-merge the patch tier. Approve "
+    "merging #201 ruff 0.17.1->0.17.2 (patch, all 7 checks green)? Prior "
+    "ruff approval was a different range (0.16.8->0.16.10 on 2026-10-06), "
+    "so re-asking.",
+]
+DAY = 86400
+# Noon UTC on 28 Oct 2026, so the calendar date is 28 Oct in any zone
+# within twelve hours of UTC.
+OCT_28_NOON = 1793188800
+
+
+def _row(
+    db: StateDB,
+    session_id: str,
+    question: str,
+    *,
+    created_at: int,
+    repo: str = MINER,
+    answered_at: int | None = None,
+    resumed_at: int | None = None,
+    expired_at: int | None = None,
+    expired_reason: str | None = None,
+) -> None:
+    """Insert through the real writer, then stamp every timestamp the
+    test depends on rather than inheriting `time.time()`."""
+    db.add_pending_resume(
+        session_id=session_id, pipeline="secops", repo=repo, question=question,
+    )
+    db.execute(
+        "UPDATE pending_resumes SET created_at = ?, answered_at = ?, "
+        "answer = ?, resumed_at = ?, expired_at = ?, expired_reason = ? "
+        "WHERE session_id = ?",
+        (
+            created_at,
+            answered_at,
+            "yes" if answered_at is not None else None,
+            resumed_at,
+            expired_at,
+            expired_reason,
+            session_id,
+        ),
+    )
+    db.commit()
+
+
+class TestSameSubstance:
+    def test_reworded_question_citing_the_same_pr_matches(self) -> None:
+        from ctrlrelay.core.question_expiry import same_substance
+
+        # #168 is in the first and not the second: one shared number is
+        # enough, which is what makes this chain one question.
+        assert same_substance(MINER_Q[0], MINER_Q[1])
+        assert same_substance(MINER_Q[1], MINER_Q[2])
+
+    def test_different_prs_do_not_match(self) -> None:
+        from ctrlrelay.core.question_expiry import same_substance
+
+        assert not same_substance(
+            MINER_Q[1], MINER_Q[1].replace("#201", "#197")
+        )
+
+    def test_without_numbers_the_normalised_text_decides(self) -> None:
+        from ctrlrelay.core.question_expiry import same_substance
+
+        assert same_substance(
+            "Grant merge authority here?", "  grant MERGE authority   here "
+        )
+        assert not same_substance(
+            "Grant merge authority here?", "Leave it for Diego?"
+        )
+
+    def test_numbers_on_one_side_only_is_not_a_match(self) -> None:
+        from ctrlrelay.core.question_expiry import same_substance
+
+        assert not same_substance("Approve #201?", "Approve it?")
+
+
+class TestRepeatHistory:
+    def _history(self, db: StateDB, question: str, session: str = "now"):
+        from ctrlrelay.core.question_expiry import find_repeat_history
+
+        return find_repeat_history(
+            db, repo=MINER, question=question, exclude_session_id=session,
+        )
+
+    def test_a_first_ask_is_not_a_repeat(self, db: StateDB) -> None:
+        # Unrelated history in the same repo, and the same PR number in
+        # another repo, so "None" is not just an empty table talking.
+        _row(db, "other-pr", MINER_Q[1].replace("#201", "#197"),
+             created_at=OCT_28_NOON - 3 * DAY,
+             expired_at=OCT_28_NOON - DAY, expired_reason=EXPIRY_REASON_TTL)
+        _row(db, "other-repo", MINER_Q[1], repo="AInvirion/zzsites",
+             created_at=OCT_28_NOON - 3 * DAY,
+             expired_at=OCT_28_NOON - DAY, expired_reason=EXPIRY_REASON_TTL)
+
+        assert self._history(db, MINER_Q[2]) is None
+
+    def test_counts_every_unanswered_earlier_ask(self, db: StateDB) -> None:
+        """TTL-expired, resolved-elsewhere and still-open rows are all
+        asks nobody answered. Unrelated rows are not counted."""
+        _row(db, "d1", MINER_Q[0], created_at=OCT_28_NOON - 2 * DAY,
+             expired_at=OCT_28_NOON, expired_reason=EXPIRY_REASON_TTL)
+        _row(db, "d2", MINER_Q[1], created_at=OCT_28_NOON - DAY,
+             expired_at=OCT_28_NOON, expired_reason=EXPIRY_REASON_RESOLVED)
+        _row(db, "d3", MINER_Q[2], created_at=OCT_28_NOON)  # still open
+        _row(db, "other-pr", MINER_Q[1].replace("#201", "#197"),
+             created_at=OCT_28_NOON + 100)
+        _row(db, "other-repo", MINER_Q[1], repo="AInvirion/zzsites",
+             created_at=OCT_28_NOON + 200)
+
+        h = self._history(db, MINER_Q[1])
+
+        assert h is not None
+        assert h.times_asked_before == 3
+        assert h.last_asked_at == OCT_28_NOON
+
+    def test_an_answer_resets_the_count(self, db: StateDB) -> None:
+        _row(db, "old1", MINER_Q[0], created_at=OCT_28_NOON - 5 * DAY,
+             expired_at=OCT_28_NOON - 3 * DAY,
+             expired_reason=EXPIRY_REASON_TTL)
+        _row(db, "answered", MINER_Q[1], created_at=OCT_28_NOON - 4 * DAY,
+             answered_at=OCT_28_NOON - 4 * DAY + 60,
+             resumed_at=OCT_28_NOON - 4 * DAY + 120)
+        _row(db, "after", MINER_Q[2], created_at=OCT_28_NOON,
+             expired_at=OCT_28_NOON + DAY, expired_reason=EXPIRY_REASON_TTL)
+
+        h = self._history(db, MINER_Q[1])
+
+        assert h is not None
+        assert h.times_asked_before == 1
+        assert h.last_asked_at == OCT_28_NOON
+
+    def test_the_asking_session_is_not_its_own_repeat(
+        self, db: StateDB,
+    ) -> None:
+        """A resume that re-blocks rewrites the session's own row before
+        the next ask; that row is this question, not an earlier one."""
+        _row(db, "d1", MINER_Q[0], created_at=OCT_28_NOON - DAY,
+             expired_at=OCT_28_NOON, expired_reason=EXPIRY_REASON_TTL)
+        _row(db, "now", MINER_Q[1], created_at=OCT_28_NOON)
+
+        h = self._history(db, MINER_Q[1], session="now")
+
+        assert h is not None
+        assert h.times_asked_before == 1
+        assert h.last_asked_at == OCT_28_NOON - DAY
+
+    def test_the_note_names_the_count_and_the_date(self) -> None:
+        from ctrlrelay.core.question_expiry import (
+            RepeatHistory,
+            format_repeat_note,
+        )
+
+        assert format_repeat_note(
+            RepeatHistory(times_asked_before=6, last_asked_at=OCT_28_NOON)
+        ) == "Repeat: asked 6 times before, last on Oct 28, no answer yet."
+        assert format_repeat_note(
+            RepeatHistory(times_asked_before=1, last_asked_at=OCT_28_NOON)
+        ) == "Repeat: asked once before, last on Oct 28, no answer yet."
+
+
+class TestRetention:
+    # The real clock, not a fixed date: the TTL pass stamps `expired_at`
+    # with time.time(), and a row it retires must read as recent.
+    NOW = int(time.time())
+
+    def _seed(self, db: StateDB) -> None:
+        old = self.NOW - 120 * DAY
+        _row(db, "old-ttl", "Approve #1?", created_at=old,
+             expired_at=old + 2 * DAY, expired_reason=EXPIRY_REASON_TTL)
+        _row(db, "old-resumed", "Approve #2?", created_at=old,
+             answered_at=old + 60, resumed_at=old + 120)
+        # Finished, but only recently: asked long ago, retired last week.
+        _row(db, "late-finish", "Approve #3?", created_at=old,
+             expired_at=self.NOW - 7 * DAY,
+             expired_reason=EXPIRY_REASON_RESOLVED)
+        _row(db, "recent-ttl", "Approve #4?", created_at=self.NOW - 10 * DAY,
+             expired_at=self.NOW - 8 * DAY, expired_reason=EXPIRY_REASON_TTL)
+        # Not finished, however old: an open question, and an answered one
+        # the sweeper has not resumed yet.
+        _row(db, "old-open", "Approve #5?", created_at=old)
+        _row(db, "old-answered", "Approve #6?", created_at=old,
+             answered_at=old + 60)
+
+    def _ids(self, db: StateDB) -> set[str]:
+        return {
+            r["session_id"]
+            for r in db.execute("SELECT session_id FROM pending_resumes")
+        }
+
+    def test_prunes_only_finished_rows_past_the_window(
+        self, db: StateDB,
+    ) -> None:
+        self._seed(db)
+
+        deleted = db.prune_finished_pending_resumes(self.NOW - 90 * DAY)
+
+        assert deleted == 2
+        assert self._ids(db) == {
+            "late-finish", "recent-ttl", "old-open", "old-answered",
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_hourly_sweep_prunes_without_github(
+        self, db: StateDB,
+    ) -> None:
+        """Through the function the scheduler actually calls, with the
+        network pass disabled: retention must not depend on GitHub."""
+        self._seed(db)
+
+        await expire_stale_questions(
+            db, None, ttl_seconds=TTL, retention_days=90, now=self.NOW,
+        )
+
+        ids = self._ids(db)
+        assert "old-ttl" not in ids
+        assert "old-resumed" not in ids
+        assert {"late-finish", "recent-ttl", "old-answered"} <= ids
+        # The open row is retired on TTL by the same sweep (expired_at is
+        # stamped now), which makes it recent, so it is kept.
+        assert "old-open" in ids
+
+    @pytest.mark.asyncio
+    async def test_the_window_is_the_callers(self, db: StateDB) -> None:
+        self._seed(db)
+
+        await expire_stale_questions(
+            db, None, ttl_seconds=TTL, retention_days=5, now=self.NOW,
+        )
+
+        assert "recent-ttl" not in self._ids(db)
+        assert "late-finish" not in self._ids(db)
+
+    def test_retention_defaults_to_ninety_days_on_both_transports(
+        self,
+    ) -> None:
+        from ctrlrelay.core.config import MattermostConfig, TelegramConfig
+
+        assert TelegramConfig().question_retention_days == 90
+        assert MattermostConfig(url="https://x").question_retention_days == 90

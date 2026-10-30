@@ -861,6 +861,46 @@ class StateDB:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_pending_resumes_for_repo(self, repo: str) -> list[dict[str, Any]]:
+        """Every pending-resume row for one repo, whatever state it is
+        in, oldest first.
+
+        Unfiltered on purpose: deciding whether a question is a repeat
+        needs the expired rows (asked, never answered) and the answered
+        ones (an answer resets the count), which every other reader here
+        hides. Bounded by the retention prune, so a repo's history is a
+        few hundred rows at most.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM pending_resumes WHERE repo = ? "
+            "ORDER BY created_at ASC",
+            (repo,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def prune_finished_pending_resumes(self, older_than_ts: int) -> int:
+        """Delete finished questions whose last activity is at or before
+        ``older_than_ts``. Returns the number of rows deleted.
+
+        Finished means expired or resumed. An open question (unanswered
+        and unexpired) and an answered one still waiting for the sweeper
+        to resume it are never deleted, however old: either one is a
+        session somebody can still act on. Age is taken from the latest
+        of the row's timestamps, so a question asked long ago and
+        retired yesterday is kept for the whole window.
+        """
+        cursor = self._conn.execute(
+            """DELETE FROM pending_resumes
+               WHERE (expired_at IS NOT NULL OR resumed_at IS NOT NULL)
+                 AND MAX(created_at,
+                         COALESCE(answered_at, 0),
+                         COALESCE(resumed_at, 0),
+                         COALESCE(expired_at, 0)) <= ?""",
+            (older_than_ts,),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
     def answer_pending_resume(self, session_id: str, answer: str) -> bool:
         """Attach an operator's answer to a pending resume, marking it
         ready for the sweeper to execute. Returns True if a row was
