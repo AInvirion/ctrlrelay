@@ -139,11 +139,12 @@ def find_repeat_history(
         (int(r["created_at"]) for r in matches if r["answered_at"] is not None),
         default=None,
     )
+    # Every answered row was created at or before `last_answer`, so the
+    # rows after it are unanswered by construction; no separate check.
     unanswered = [
         r
         for r in matches
-        if r["answered_at"] is None
-        and (last_answer is None or int(r["created_at"]) > last_answer)
+        if last_answer is None or int(r["created_at"]) > last_answer
     ]
     if not unanswered:
         return None
