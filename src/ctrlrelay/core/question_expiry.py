@@ -130,8 +130,9 @@ def _unanswered_asks(
     exclude_session_id: str | None,
 ) -> list[dict[str, Any]]:
     """Earlier asks of the same question in ``repo`` since its latest
-    answer, oldest first. Rows that were held back (#214) are left out:
-    the operator never saw them, so they are not asks."""
+    answer, oldest first. Rows whose question never reached the
+    operator (held back, no bridge, or a failed ask; #214) are left
+    out: they are not asks."""
     matches = [
         row
         for row in state_db.list_pending_resumes_for_repo(repo)
@@ -141,14 +142,18 @@ def _unanswered_asks(
         (t for t in map(_answered_at, matches) if t is not None),
         default=None,
     )
-    # A row is answered after it is created, so every answered row was
-    # created at or before `last_answer` and the rows after it are
-    # unanswered by construction; no separate check.
+    # Every row created after `last_answer` is unanswered without a
+    # separate check: `answered_at` is stamped after `created_at`, so it
+    # would be later than `last_answer`, which is the latest. A row a
+    # re-block rewrote carries its answer in `last_answered_at`, before
+    # its new `created_at`; when that answer is the latest, the row is
+    # the open ask that came after it and is rightly counted.
     return [
         r
         for r in matches
         if r["session_id"] != exclude_session_id
         and r.get("held_until") is None
+        and r.get("posted") != 0
         and (last_answer is None or int(r["created_at"]) > last_answer)
     ]
 

@@ -18,6 +18,7 @@ from ctrlrelay.core.question_expiry import (
     find_repeat_history,
 )
 from ctrlrelay.core.state import StateDB
+from ctrlrelay.transports.base import TransportError, TransportTimeoutError
 from tests.test_question_expiry import MINER, MINER_Q
 
 DAY = 86400
@@ -129,14 +130,14 @@ class TestSchedule:
     ) -> None:
         last = self._chain(db, posts)
 
-        # The day before it is due: held, and it says when.
-        if days > 1:
-            hold = _hold(db, now=last + (days - 1) * DAY + 10 * 60)
-            assert hold is not None
-            assert hold.missed_posts == posts
-            assert hold.last_posted_at == last
-            assert hold.next_post_at > last + (days - 1) * DAY
-            assert hold.next_post_at <= last + days * DAY
+        # Inside the wait (the day before it is due, or later the same
+        # day for a 1-day wait): held, and it says when.
+        held_now = last + max((days - 1) * DAY + 10 * 60, 12 * HOUR)
+        hold = _hold(db, now=held_now)
+        assert hold is not None
+        assert hold.missed_posts == posts
+        assert hold.last_posted_at == last
+        assert held_now < hold.next_post_at <= last + days * DAY
         # The sweep that lands on the due day, a few minutes EARLIER in
         # the day than the last post was stamped: posted.
         assert _hold(db, now=last + days * DAY - 20 * 60) is None
@@ -407,7 +408,7 @@ class TestTheSweepHoldsARepeat:
         # Two missed answers, the last post a day ago: due in 2 days.
         _ttl_expired_chain(db, 2, last_posted=now - DAY)
         transport = AsyncMock()
-        transport.ask.side_effect = TimeoutError("nobody answered")
+        transport.ask.side_effect = TransportTimeoutError("nobody answered")
 
         held = await _sweep(tmp_path, db, transport)
 
@@ -435,7 +436,10 @@ class TestTheSweepHoldsARepeat:
 
         transport.ask.assert_awaited_once()
         assert QUESTION_HELD_UNTIL not in posted.outputs
-        assert db.get_pending_resume(posted.session_id)["held_until"] is None
+        row = db.get_pending_resume(posted.session_id)
+        assert row["held_until"] is None
+        assert row["posted"] == 1, "a timed-out ask was in front of the operator"
+        assert db.get_pending_resume(held.session_id)["posted"] == 0
 
     @pytest.mark.asyncio
     async def test_a_held_question_is_answerable_and_still_expires(
@@ -466,6 +470,37 @@ class TestTheSweepHoldsARepeat:
             EXPIRY_REASON_TTL
 
     @pytest.mark.asyncio
+    async def test_a_bridge_outage_does_not_push_the_next_post_later(
+        self, tmp_path: Path, db: StateDB,
+    ) -> None:
+        """Due today, but the bridge is down and the ask fails. Nobody
+        saw the question, so it is not a post: tomorrow's sweep posts
+        it, instead of treating the outage as a fourth miss and waiting
+        a week."""
+        now = int(time.time())
+        # Three misses, the last 5 days ago: the 4-day wait is over.
+        _ttl_expired_chain(db, 3, last_posted=now - 5 * DAY)
+        transport = AsyncMock()
+        transport.ask.side_effect = TransportError(
+            "Failed to connect to bridge: [Errno 111] Connection refused"
+        )
+
+        down = await _sweep(tmp_path, db, transport)
+        assert transport.ask.await_count == 1
+        assert db.get_pending_resume(down.session_id)["posted"] == 0
+
+        # A day later.
+        db.execute(
+            "UPDATE pending_resumes SET created_at = created_at - ?", (DAY,),
+        )
+        db.commit()
+        transport.ask.side_effect = TransportTimeoutError("nobody answered")
+
+        await _sweep(tmp_path, db, transport)
+
+        assert transport.ask.await_count == 2, "held on the strength of an outage"
+
+    @pytest.mark.asyncio
     async def test_a_lookup_failure_posts_the_question(
         self, tmp_path: Path, db: StateDB,
     ) -> None:
@@ -475,7 +510,7 @@ class TestTheSweepHoldsARepeat:
             side_effect=RuntimeError("database is locked"),
         )
         transport = AsyncMock()
-        transport.ask.side_effect = TimeoutError("nobody answered")
+        transport.ask.side_effect = TransportTimeoutError("nobody answered")
 
         result = await _sweep(tmp_path, db, transport)
 
@@ -489,7 +524,7 @@ class TestTheSweepHoldsARepeat:
         now = int(time.time())
         _ttl_expired_chain(db, 3, last_posted=now - DAY)
         transport = AsyncMock()
-        transport.ask.side_effect = TimeoutError("nobody answered")
+        transport.ask.side_effect = TransportTimeoutError("nobody answered")
 
         await _sweep(tmp_path, db, transport, hold_repeats=False)
 
@@ -573,20 +608,86 @@ class TestTheFanOutHoldsToo:
         )
 
     @pytest.mark.asyncio
-    async def test_a_failed_send_still_raises(self) -> None:
-        """Holding is not faking delivery: a send that fails surfaces."""
+    async def test_a_held_only_sweep_whose_summary_fails_still_raises(
+        self,
+    ) -> None:
+        """Holding is not faking delivery. With every blocked repo held
+        there is no per-repo message, so the summary is the one send,
+        and when it fails the caller is told, not handed a "sent"."""
         from ctrlrelay.cli import announce_secops_sweep
         from ctrlrelay.pipelines.base import PipelineResult
+        from ctrlrelay.pipelines.secops import QUESTION_HELD_UNTIL
 
         transport = AsyncMock()
         transport.send.side_effect = RuntimeError("bridge down")
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="bridge down"):
             await announce_secops_sweep(
                 transport,
                 repos=[self._repo(MINER)],
                 results=[PipelineResult(
                     success=False, blocked=True, session_id="s",
-                    summary="b", question="Approve #7?",
+                    summary="held", question=TODAY_Q,
+                    outputs={QUESTION_HELD_UNTIL: 1793361600},
                 )],
             )
+        transport.send.assert_awaited_once()
+        assert transport.send.await_args.args[0].startswith(
+            "📋 Scheduled secops sweep done"
+        )
+
+
+class TestOneResultPerRepo:
+    """The sweep's fan-out pairs `results` with the repo list by
+    position, so a held repo is named by where its result sits. A repo
+    that fails AFTER its result was recorded (here the dashboard push)
+    used to add a second result, and every repo after it was then
+    paired with its neighbour's result."""
+
+    @pytest.mark.asyncio
+    async def test_a_late_failure_does_not_shift_the_next_repo(
+        self, tmp_path: Path, db: StateDB,
+    ) -> None:
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.pipelines.secops import run_secops_all
+
+        done = MagicMock()
+        done.status = CheckpointStatus.DONE
+        done.summary = "nothing to do"
+        done.outputs = {}
+        done.error = None
+        dispatcher = AsyncMock()
+        dispatcher.spawn_session.side_effect = [
+            SessionResult(session_id="a", exit_code=0, state=done),
+            SessionResult(session_id="b", exit_code=0, state=_blocked(TODAY_Q)),
+        ]
+        worktree = AsyncMock()
+        worktree.create_worktree.return_value = tmp_path / "wt"
+        worktree.ensure_bare_repo.return_value = tmp_path / "bare"
+        worktree.symlink_context = MagicMock()
+        worktree.remove_context_symlink = MagicMock()
+        dashboard = AsyncMock()
+        dashboard.push_event.side_effect = RuntimeError("dashboard down")
+        repos = []
+        for name in ("AInvirion/zzsites", MINER):
+            r = MagicMock()
+            r.name = name
+            r.automation = None
+            repos.append(r)
+        transport = AsyncMock()
+        transport.ask.side_effect = TransportTimeoutError("nobody answered")
+
+        results = await run_secops_all(
+            repos=repos, dispatcher=dispatcher, github=MagicMock(),
+            worktree=worktree, dashboard=dashboard, state_db=db,
+            transport=transport, contexts_dir=tmp_path / "contexts",
+            hold_repeats=True,
+        )
+
+        assert len(results) == 2, "one result per repo, in repo order"
+        assert not results[0].success and not results[0].blocked, (
+            "the late failure is still reported, on its own repo"
+        )
+        assert "dashboard down" in results[0].error
+        assert results[1].blocked

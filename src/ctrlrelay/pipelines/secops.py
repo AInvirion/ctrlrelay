@@ -29,7 +29,7 @@ from ctrlrelay.pipelines.base import (
     PipelineResult,
     failure_text,
 )
-from ctrlrelay.transports.base import Transport
+from ctrlrelay.transports.base import Transport, TransportTimeoutError
 
 _logger = get_logger("pipeline.secops")
 
@@ -691,6 +691,11 @@ async def run_secops_all(
         worktree_path: Path | None = None
         session_row_inserted = False
         session_final_state_written = False
+        # Index of this repo's entry in `results` once recorded. The
+        # scheduled fan-out pairs results with repos by position, so a
+        # failure after this point must replace that entry, not add a
+        # second one and shift every later repo onto its neighbour.
+        result_index: int | None = None
         try:
             await worktree.ensure_bare_repo(repo)
             worktree_path = await worktree.create_worktree(repo, session_id)
@@ -757,6 +762,13 @@ async def run_secops_all(
             # could resume via the sweeper.
             rounds = 0
             held_until: int | None = None
+            # Whether the question the row will carry reached the
+            # operator. Only an ask that timed out waiting for an
+            # answer did: the bridge accepted it and nobody replied.
+            # Any other failure (bridge down, chat API error) never
+            # put it in front of anyone, and counting it as a post
+            # would stretch the backoff over an outage (#214).
+            question_posted = False
             while (
                 result.blocked
                 and transport is not None
@@ -790,7 +802,7 @@ async def run_secops_all(
                         ),
                         question=question,
                         outputs={
-                            **result.outputs,
+                            **(result.outputs or {}),
                             QUESTION_HELD_UNTIL: hold.next_post_at,
                         },
                     )
@@ -802,6 +814,7 @@ async def run_secops_all(
                         repo=repo,
                     )
                 except Exception as e:
+                    question_posted = isinstance(e, TransportTimeoutError)
                     log_event(
                         _logger,
                         "secops.transport.ask_failed",
@@ -874,6 +887,7 @@ async def run_secops_all(
                     )
 
             results.append(result)
+            result_index = len(results) - 1
 
             status = "done" if result.success else ("blocked" if result.blocked else "failed")
             state_db.execute(
@@ -895,6 +909,7 @@ async def run_secops_all(
                         repo=repo,
                         question=_question_for_persist(session_id, result),
                         held_until=held_until,
+                        posted=question_posted,
                     )
                 except Exception as e:
                     log_event(
@@ -978,7 +993,7 @@ async def run_secops_all(
                     ("failed", f"Error: {detail}", int(time.time()), session_id),
                 )
                 state_db.commit()
-            results.append(PipelineResult(
+            failure = PipelineResult(
                 success=False,
                 session_id=session_id,
                 summary=f"Error processing {repo}: {type(e).__name__}: {detail}",
@@ -987,7 +1002,11 @@ async def run_secops_all(
                 # error no longer decides the alert either way - but both
                 # are still filled so the exception type survives alone.
                 error=f"{type(e).__name__}: {detail}",
-            ))
+            )
+            if result_index is None:
+                results.append(failure)
+            else:
+                results[result_index] = failure
 
         finally:
             # Hold the per-repo lock THROUGH worktree cleanup so a

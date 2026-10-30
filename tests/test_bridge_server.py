@@ -2457,3 +2457,29 @@ class TestAReplyToAnOlderPostReachesTheOpenOne:
         sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
         assert "expired" in sent
         db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_redirect_that_loses_the_race_describes_the_newer_row(
+        self, tmp_path,
+    ) -> None:
+        """Another reply answers the newer row between the listing and
+        the write. This reply was for that row, so the notice says what
+        happened to it, not that the older post expired."""
+        server, db = self._server(tmp_path)
+        real_answer = db.answer_pending_resume
+
+        def answered_first(sid, text):
+            assert real_answer(sid, "answered by someone else")
+            return real_answer(sid, text)
+
+        db.answer_pending_resume = answered_first  # type: ignore[method-assign]
+
+        await server._on_reply("yes, merge it", reply_to_post_id="555")
+
+        assert db.get_pending_resume("secops-new")["answer"] == (
+            "answered by someone else"
+        )
+        sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
+        assert "session `secops-new` has already been answered" in sent
+        assert "secops-old" not in sent
+        db.close()

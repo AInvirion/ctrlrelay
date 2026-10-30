@@ -1105,6 +1105,11 @@ class BridgeServer:
                         repo=newer["repo"],
                     )
                     return {**outcome, "redirected_from": session_id}
+                # The newer row stopped taking answers between the two
+                # reads (answered by another reply, or expired). That
+                # row is what this reply was for, so say what happened
+                # to IT, not that the older post expired.
+                return self._describe_stale_hint(newer["session_id"])
             return self._describe_stale_hint(session_id)
 
         matched_by_id = [r for r in rows if names_session(text, r["session_id"])]
