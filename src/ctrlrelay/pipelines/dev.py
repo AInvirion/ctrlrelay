@@ -675,10 +675,19 @@ finds the PR broken it will resume this session asking you to fix it.
         conditions for DONE. One shared block would have quietly changed
         what two of them promise.
         """
-        # Quoted for the shell rather than hand-wrapped in single quotes:
-        # an apostrophe in the path closed the quote early and made every
-        # snippet a syntax error, so no checkpoint could be written (#191).
+        # Quoted for the shell rather than hand-wrapped in single quotes
+        # (#191). With hand quoting, an apostrophe in the path either
+        # closed the quote early (a syntax error, so no checkpoint at all)
+        # or, paired, parsed fine and wrote to a different path:
+        # /tmp/a'b'c/state.json landed in /tmp/abc/state.json.
+        #
+        # The directory is computed here rather than with `$(dirname)`,
+        # because command substitution strips trailing newlines from a
+        # directory name, and `--` stops a relative path starting with
+        # `-` being read as an option. The redirect target needs no `--`:
+        # the shell takes the word after `>` as a filename.
         quoted_path = shlex.quote(state_file_path)
+        quoted_dir = shlex.quote(str(Path(state_file_path).parent))
         return f"""## Signaling Completion
 
 **CRITICAL**: Before exiting, you MUST write a checkpoint file to signal completion.
@@ -688,7 +697,7 @@ SESSION_ID: {session_id}
 
 **DONE** (PR opened AND verified green + conflict-free):
 ```bash
-mkdir -p "$(dirname {quoted_path})"
+mkdir -p -- {quoted_dir}
 printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\
 '"timestamp":"%s","summary":"PR opened",'\
 '"outputs":{{"pr_url":"%s","pr_number":%d}}}}' \\
@@ -697,7 +706,7 @@ printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\
 
 **BLOCKED** (need input):
 ```bash
-mkdir -p "$(dirname {quoted_path})"
+mkdir -p -- {quoted_dir}
 printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
 '"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > {quoted_path}
@@ -705,7 +714,7 @@ printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
 
 **FAILED**:
 ```bash
-mkdir -p "$(dirname {quoted_path})"
+mkdir -p -- {quoted_dir}
 printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
 '"timestamp":"%s","error":"%s"}}' \\
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > {quoted_path}

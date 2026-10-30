@@ -248,7 +248,7 @@ def test_every_checkpoint_snippet_creates_its_own_directory(mod: str) -> None:
 
     for i, block in enumerate(blocks):
         assert "printf " in block, f"{mod}: block {i} writes nothing"
-        mk = block.find('mkdir -p "$(dirname ')
+        mk = block.find("mkdir -p -- ")
         pf = block.find("printf ")
         assert mk != -1, (
             f"{mod}: block {i} writes the checkpoint without creating its "
@@ -259,10 +259,26 @@ def test_every_checkpoint_snippet_creates_its_own_directory(mod: str) -> None:
         )
 
 
-# A path with each character that ends or confuses a shell quote: an
-# apostrophe (closes a single-quoted string), a space (splits an
-# unquoted word) and a double quote (closes a double-quoted one).
-_HOSTILE_DIR = "O'Reilly dir \"q\""
+# Paths the shell has to be careful with, as (id, path, relative). A
+# relative path is resolved against the cwd the snippet runs in, which
+# is `tmp_path`; an absolute one is placed under `tmp_path`.
+#
+# - apostrophe: closes a single-quoted string. With hand-written quotes
+#   it is a syntax error, or (paired) a silently different path.
+# - space and double quote: split an unquoted word / close a
+#   double-quoted one.
+# - `$` and backtick: expand inside double quotes.
+# - trailing newline on the directory that holds the file: `$(dirname
+#   ...)` strips trailing newlines, so mkdir made the wrong directory.
+# - leading `-` on a relative path: read as an option by dirname/mkdir.
+_HOSTILE_PATHS = [
+    ("apostrophe", "O'Reilly/.ctrlrelay/state.json", False),
+    ("paired-apostrophes", "a'b'c/.ctrlrelay/state.json", False),
+    ("space-and-double-quote", 'dir "q" x/.ctrlrelay/state.json', False),
+    ("dollar-and-backtick", "cost $HOME `id`/.ctrlrelay/state.json", False),
+    ("trailing-newline-dir", "run\n/state.json", False),
+    ("leading-dash-relative", "-dash/.ctrlrelay/state.json", True),
+]
 
 # What the agent is told to replace. `<PR_NUM>` sits unquoted in a
 # `%d` slot, so it must become a number; everything else is a quoted
@@ -278,26 +294,38 @@ def _fill(block: str) -> str:
 
 
 @pytest.mark.parametrize("mod", PIPELINES)
+@pytest.mark.parametrize(
+    ("case", "raw", "relative"),
+    _HOSTILE_PATHS,
+    ids=[c[0] for c in _HOSTILE_PATHS],
+)
 def test_every_snippet_writes_a_checkpoint_at_a_path_needing_quotes(
-    mod: str, tmp_path: Path
+    mod: str, case: str, raw: str, relative: bool, tmp_path: Path
 ) -> None:
     """A state-file path the shell has to quote must still be writable (#191).
 
     The snippets hand-wrapped the path in single quotes, so an apostrophe
-    in it closed the quote early and bash refused the whole snippet - no
-    DONE, no BLOCKED, no FAILED. The agent did its work and then looked
-    exactly like it crashed.
+    in it either closed the quote early (a syntax error: no DONE, no
+    BLOCKED, no FAILED) or, when paired, parsed fine and wrote somewhere
+    else. Either way the agent did its work and looked like it crashed.
 
     Asserts the artifact, not the absence of a syntax error: each block
-    runs under `bash -c`, must exit 0, and must leave a JSON file at that
-    exact path carrying the status the block is named for. The file is
-    removed between blocks, and its directory does not exist before the
-    first one, so every block is proven to create both.
+    runs under `bash -c` from `tmp_path`, must exit 0, and must leave a
+    JSON file at that exact path carrying the status the block is named
+    for. The file's directory is removed between blocks and does not
+    exist before the first, so every block is proven to create it.
     """
-    state_file = tmp_path / _HOSTILE_DIR / ".ctrlrelay" / "state.json"
+    work = tmp_path / "work"
+    work.mkdir()
+    if relative:
+        given = raw
+        state_file = work / raw
+    else:
+        state_file = work / raw
+        given = str(state_file)
     assert not state_file.parent.exists()
 
-    contract = _pipeline(mod)._checkpoint_contract(str(state_file), "sid-1")
+    contract = _pipeline(mod)._checkpoint_contract(given, "sid-1")
     blocks = [
         b.split("```")[0] for b in contract.split("```bash")[1:]
     ]
@@ -309,22 +337,23 @@ def test_every_snippet_writes_a_checkpoint_at_a_path_needing_quotes(
             shutil.rmtree(state_file.parent)
 
         script = _fill(block)
-        assert "<" not in script, (
-            f"{mod}/{status}: an unfilled placeholder is left in {script!r}"
+        assert not _PLACEHOLDER.search(script), (
+            f"{mod}/{case}/{status}: unfilled placeholder in {script!r}"
         )
         run = subprocess.run(
             ["bash", "-c", script],
             capture_output=True,
             text=True,
             timeout=10,
+            cwd=work,
         )
         assert run.returncode == 0, (
-            f"{mod}/{status}: snippet failed with exit {run.returncode}:\n"
-            f"{run.stderr}\n--- script ---\n{script}"
+            f"{mod}/{case}/{status}: snippet failed with exit "
+            f"{run.returncode}:\n{run.stderr}\n--- script ---\n{script}"
         )
         assert state_file.is_file(), (
-            f"{mod}/{status}: exit 0 but no checkpoint at {state_file}; "
-            f"directory holds {list(tmp_path.rglob('*'))}"
+            f"{mod}/{case}/{status}: exit 0 but no checkpoint at "
+            f"{state_file!r}; tree holds {sorted(map(str, work.rglob('*')))}"
         )
         data = json.loads(state_file.read_text())
         assert data["status"] == status
