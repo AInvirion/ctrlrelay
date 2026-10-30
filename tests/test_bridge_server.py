@@ -2104,12 +2104,18 @@ class TestARepeatedQuestionSaysSo:
         assert parse_message(reply[0].decode()).op == BridgeOp.ACK
 
     @pytest.mark.asyncio
-    async def test_a_send_about_an_answered_session_carries_no_note(
-        self, socket_path, tmp_path,
+    @pytest.mark.parametrize("finished", ["answered", "expired"])
+    async def test_a_send_about_a_finished_session_carries_no_note(
+        self, socket_path, tmp_path, finished,
     ) -> None:
         """Same history that earns the fan-out its note, but this
-        session's own row is answered: whatever the SEND says, it is not
-        a question still waiting."""
+        session's own row is finished: whatever the SEND says, it is not
+        a question still waiting.
+
+        The own row is stamped BEFORE both earlier asks, so its answer
+        does not reset their count: only the open-row check can keep the
+        note off. With a real-clock answer the reset alone would, and
+        the test would pass with that check deleted."""
         from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.protocol import (
@@ -2124,7 +2130,21 @@ class TestARepeatedQuestionSaysSo:
             session_id="secops-ai-miner-new", pipeline="secops",
             repo=self.REPO, question=self.NOW_Q,
         )
-        assert db.answer_pending_resume("secops-ai-miner-new", "yes")
+        early = 1793000000  # before both earlier rows' created_at
+        if finished == "answered":
+            db.execute(
+                "UPDATE pending_resumes SET created_at = ?, answer = 'yes', "
+                "answered_at = ? WHERE session_id = 'secops-ai-miner-new'",
+                (early, early + 100),
+            )
+        else:
+            db.execute(
+                "UPDATE pending_resumes SET created_at = ?, expired_at = ?, "
+                "expired_reason = 'ttl' "
+                "WHERE session_id = 'secops-ai-miner-new'",
+                (early, early + 100),
+            )
+        db.commit()
         server = BridgeServer(
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
@@ -2192,6 +2212,50 @@ class TestARepeatedQuestionSaysSo:
 
         assert parse_message(line.decode()).op == BridgeOp.ACK
         assert server.handler.send.await_args.args[0] == text  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_an_empty_send_gets_the_note_without_a_blank_line(
+        self, socket_path, tmp_path,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import (
+            BridgeMessage,
+            BridgeOp,
+            serialize_message,
+        )
+        from ctrlrelay.bridge.server import BridgeServer
+
+        db = self._db(tmp_path, earlier_question=self.EARLIER)
+        db.add_pending_resume(
+            session_id="secops-ai-miner-new", pipeline="secops",
+            repo=self.REPO, question=self.NOW_Q,
+        )
+        server = BridgeServer(
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server.handler.send = AsyncMock(return_value="904")  # type: ignore[attr-defined]
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.SEND, request_id="r-empty", text="",
+                session_id="secops-ai-miner-new", repo=self.REPO,
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)
+            sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            db.close()
+            await server.stop()
+            task.cancel()
+
+        assert sent == (
+            "Repeat: asked 2 times before, last on Oct 28 UTC, no answer yet."
+        )
 
     @pytest.mark.asyncio
     async def test_the_sweep_fanout_send_carries_it_too(

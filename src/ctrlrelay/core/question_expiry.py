@@ -140,6 +140,18 @@ def find_repeat_history(
     rewrite the row, so at that moment it carries the very answer that
     drove the resume. It is required so a caller cannot forget it and
     count the question as a repeat of itself.
+
+    Accepted limit: when a resume re-blocks, the pipeline rewrites the
+    session's row (``add_pending_resume`` is INSERT OR REPLACE and
+    clears ``answered_at``), so that answer leaves the table. A later
+    ask can then count asks from before it, and the count can be too
+    high. It never hides a question.
+
+    Rare edge: the retention prune ages a row by its LAST activity and
+    this count compares ``created_at`` against ``answered_at``. A row
+    pruned out of the window takes its answer with it, so an ask from
+    before that answer which is still inside the window (an open row,
+    which is never pruned) counts again.
     """
     matches = [
         row

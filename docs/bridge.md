@@ -245,6 +245,17 @@ exists. Messages it sends:
 - `✅ PR ready: ...` — pipeline finished green.
 - `❌ Failed on #123: ...` — pipeline failed.
 
+**A question asked again is marked.** A scheduled sweep starts a fresh
+session each day and the agent often reaches the same blocker and asks
+again, in new words. When that happens the post carries a line such as
+`Repeat: asked 3 times before, last on Oct 28 UTC, no answer yet.` Two
+questions count as the same if they cite at least one PR or issue number
+in common (or, when neither cites a number, have the same text). The
+count runs from the last answer to that question. One known limit: when
+a resume re-blocks, its row is rewritten and the answer that drove it
+leaves the table, so a later count can be too high. The history this
+reads is kept for `question_retention_days`.
+
 For the full BLOCKED → answer → resume mechanics, see
 [Feedback loop]({{ '/feedback-loop/' | relative_url }}).
 

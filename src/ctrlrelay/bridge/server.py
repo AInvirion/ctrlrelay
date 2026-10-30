@@ -456,9 +456,11 @@ class BridgeServer:
             # that message; anything else is posted as given.
             if msg.session_id and msg.repo:
                 note = self._repeat_note_for_session(msg.repo, msg.session_id)
-                if note:
+                if note and text:
                     first, sep, rest = text.partition("\n")
                     text = f"{first}\n{note}{sep}{rest}"
+                elif note:
+                    text = note
             try:
                 post_id = await self.handler.send(text)
                 # A SEND that names a session is answerable too: the secops

@@ -595,8 +595,9 @@ class TestRepeatHistory:
     def test_the_asking_session_is_not_its_own_repeat(
         self, db: StateDB,
     ) -> None:
-        """A resume that re-blocks rewrites the session's own row before
-        the next ask; that row is this question, not an earlier one."""
+        """The session's own row, open and unanswered, is this question,
+        not an earlier ask of it. That is the shape the secops fan-out
+        SEND sees: the session persisted its row before the fan-out."""
         _row(db, "d1", MINER_Q[0], created_at=OCT_28_NOON - DAY,
              expired_at=OCT_28_NOON, expired_reason=EXPIRY_REASON_TTL)
         _row(db, "now", MINER_Q[1], created_at=OCT_28_NOON)
