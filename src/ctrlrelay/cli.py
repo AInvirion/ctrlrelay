@@ -958,9 +958,10 @@ async def send_relay_alert(config, alert) -> bool:
     try:
         # BOUNDED. `connect_notify_transport` already caps its connect,
         # but an accepted socket that then stalls would hold this call
-        # open. The whole-sweep alert awaits this directly, and the
-        # per-dispatch alert's background task is only bounded overall
-        # because this step is.
+        # open. The whole-sweep alert awaits this directly, so this is
+        # its only bound. The per-dispatch alert also has an overall
+        # deadline around it; this bound is what lets a stalled send
+        # give up, and log why, well before that deadline.
         await asyncio.wait_for(
             transport.send(alert.message()),
             timeout=_NOTIFY_SEND_TIMEOUT_SECONDS,
@@ -1142,20 +1143,39 @@ async def _deliver_relay_alert_bounded(config, state_db, alert) -> bool:
 
 
 def _relay_alert_send_finished(task: asyncio.Task) -> None:
-    """Let go of a finished send.
+    """Let go of a finished send, and report one that did not finish.
 
-    Reading the exception also stops asyncio from reporting it as never
-    retrieved when the outer task gave up before the send ended.
+    The one place a send's end is logged, because the send task is the
+    only thing that knows whether the delivery was recorded. The outer
+    task can be cancelled in the same tick a send records its delivery,
+    and logging from there said "cancelled before it was delivered"
+    about a message that was delivered.
+
+    A cancelled send never reached the record: `deliver_relay_alert`
+    has no await between a successful send and the record, so a
+    cancellation cannot land between them. `deliver_relay_alert` logs
+    its own ordinary failures; what reaches this callback as an
+    exception escaped every guard in it.
     """
     _RELAY_ALERT_SENDS.pop(task, None)
     if task.cancelled():
+        _log_quietly(
+            "dispatch_health.alert_cancelled",
+            detail=(
+                "the relay-health alert was cancelled before it was "
+                "delivered; the claim expires and a later failure retries"
+            ),
+        )
         return
     error = task.exception()
     if error is not None:
         _log_quietly(
-            "dispatch_health.alert_send_raised",
+            "dispatch_health.alert_task_failed",
             cause=error,
-            detail="the alert was not delivered; the claim will expire",
+            detail=(
+                "the relay-health alert task raised; nothing was recorded, "
+                "so the claim expires and a later failure retries"
+            ),
         )
 
 
@@ -1199,33 +1219,16 @@ def start_relay_alert(config, state_db, alert) -> asyncio.Task | None:
 
 
 def _relay_alert_finished(task: asyncio.Task) -> None:
-    """Let go of a finished delivery, and report one that did not finish.
+    """Let go of a finished outer delivery task. Logs nothing.
 
-    `deliver_relay_alert` logs its own failures. What only this callback
-    can see is a cancellation (shutdown) or an exception that escaped
-    every guard, and either one silent here is the absent-message fault
-    this alert exists to report.
+    Its only exception is the send's own, re-raised by ``result()``, and
+    its cancellation always comes with the send's. Both are reported
+    once, by `_relay_alert_send_finished`. Reading the exception here
+    keeps asyncio from reporting it as never retrieved.
     """
     _RELAY_ALERT_TASKS.pop(task, None)
-    if task.cancelled():
-        _log_quietly(
-            "dispatch_health.alert_cancelled",
-            detail=(
-                "the relay-health alert was cancelled before it was "
-                "delivered; the claim expires and a later failure retries"
-            ),
-        )
-        return
-    error = task.exception()
-    if error is not None:
-        _log_quietly(
-            "dispatch_health.alert_task_failed",
-            cause=error,
-            detail=(
-                "the relay-health alert task raised; nothing was recorded, "
-                "so the claim expires and a later failure retries"
-            ),
-        )
+    if not task.cancelled():
+        task.exception()
 
 
 async def _cancel_relay_alerts() -> None:
@@ -1240,19 +1243,23 @@ async def _cancel_relay_alerts() -> None:
         return
     for t in live:
         t.cancel()
-    _, stuck = await asyncio.wait(
-        live, timeout=_RELAY_ALERT_CANCEL_GRACE_SECONDS
-    )
-    if stuck:
-        _log_quietly(
-            "dispatch_health.alert_stuck_at_shutdown",
-            stuck=len(stuck),
-            detail=(
-                "a relay-health alert send ignored its cancellation; the "
-                "poller is stopping without it, and nothing was recorded, "
-                "so the alert is retried after the restart"
-            ),
-        )
+    try:
+        await asyncio.wait(live, timeout=_RELAY_ALERT_CANCEL_GRACE_SECONDS)
+    finally:
+        # In a `finally` so a second stop during this wait still says
+        # what it is leaving behind.
+        stuck = [t for t in live if not t.done()]
+        if stuck:
+            _log_quietly(
+                "dispatch_health.alert_stuck_at_shutdown",
+                stuck=len(stuck),
+                detail=(
+                    "a relay-health alert send did not finish after it was "
+                    "cancelled; the poller is stopping without it, and "
+                    "nothing was recorded, so the alert is retried after "
+                    "the restart"
+                ),
+            )
 
 
 async def drain_relay_alerts(grace_seconds: float) -> None:

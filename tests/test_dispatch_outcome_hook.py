@@ -470,8 +470,6 @@ class TestTheHookAlertsExactlyOnce:
     async def test_a_run_of_failures_sends_one_message(
         self, tmp_path: Path
     ) -> None:
-        from ctrlrelay.cli import make_dispatch_outcome_hook
-
         """The repeats are suppressed by the RECORDED delivery.
 
         The first alert is settled before anything else happens, and the
@@ -479,6 +477,8 @@ class TestTheHookAlertsExactlyOnce:
         claim that is still live suppresses the repeats on its own, and
         this test passes for code that never records a delivery.
         """
+        from ctrlrelay.cli import make_dispatch_outcome_hook
+
         db = StateDB(tmp_path / "state.db")
         spy = SpyTransport()
         hook = make_dispatch_outcome_hook(_config(threshold=3), db)
@@ -1081,14 +1081,20 @@ class TestTheClaimIsALeaseAndOnlyDeliveryLatches:
 
 class TestAStalledSendCannotHangADispatch:
     @pytest.mark.asyncio
-    async def test_the_send_is_bounded(self, tmp_path: Path) -> None:
-        """The send step is bounded on its own.
+    async def test_the_send_is_bounded(self, tmp_path: Path, caplog) -> None:
+        """The send step is bounded on its own, not only by the deadline.
 
         Since #208 the alert runs in a background task, off the repo
-        lock, but an unbounded send on an accepted-then-stalled socket
-        would still hang that task and its socket for as long as the
-        bridge stays wedged.
+        lock, and an overall deadline (connect + send + 1 s, about 16 s)
+        caps that task. Without this step's own bound a stalled send
+        would sit out that whole deadline, and the log would say the
+        delivery timed out rather than that the send stalled.
+
+        The delivery is awaited WITHOUT draining, because the drain
+        cancels whatever is left and would make an unbounded send pass.
         """
+        import logging
+
         import ctrlrelay.cli as cli_module
         from ctrlrelay.cli import make_dispatch_outcome_hook
 
@@ -1107,9 +1113,20 @@ class TestAStalledSendCannotHangADispatch:
                 "ctrlrelay.cli.connect_notify_transport",
                 new=AsyncMock(return_value=Stalls()),
             ),
+            caplog.at_level(logging.INFO, logger="ctrlrelay"),
         ):
             await asyncio.wait_for(hook(_outcome("s-0", 1)), timeout=10)
-            await asyncio.wait_for(_settle(), timeout=10)
+            tasks = list(cli_module._RELAY_ALERT_TASKS)
+            assert len(tasks) == 1
+            # Far under the ~11 s deadline these bounds give, so only
+            # the send's own bound can finish it in time.
+            done, _ = await asyncio.wait(tasks, timeout=2)
+            assert done == set(tasks), "the send step is not bounded"
+            assert tasks[0].result() is False
+        assert any(
+            r.getMessage() == "dispatch_health.alert_send_failed"
+            for r in caplog.records
+        )
         # The send was ENTERED, not merely skipped. Without this the
         # test passes for an alert implementation that never tries at
         # all, because nothing is recorded either way.

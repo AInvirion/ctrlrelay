@@ -124,3 +124,21 @@ class FakeChatHandler:
 @pytest.fixture
 def fake_handler() -> FakeChatHandler:
     return FakeChatHandler()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_relay_alert_registries():
+    """Start and end every test with no relay-health alerts in flight.
+
+    The registries live at module level in `ctrlrelay.cli` and outlive
+    the event loop each test runs on. A delivery left there by one test
+    is a task from a closed loop that never reports done, so the next
+    test's alert is refused as "already in flight" (#208).
+    """
+    import ctrlrelay.cli as cli_module
+
+    cli_module._RELAY_ALERT_TASKS.clear()
+    cli_module._RELAY_ALERT_SENDS.clear()
+    yield
+    cli_module._RELAY_ALERT_TASKS.clear()
+    cli_module._RELAY_ALERT_SENDS.clear()

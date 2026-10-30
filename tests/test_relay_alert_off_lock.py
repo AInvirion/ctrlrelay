@@ -456,3 +456,112 @@ class TestAShutdownThatIsItselfCancelled:
         finally:
             await _cancel_leftovers()
             db.close()
+
+
+class TestEachEndIsLoggedOnceAndTruly:
+    @pytest.mark.asyncio
+    async def test_a_delivery_that_raises_is_logged_once(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        async def raises(config, state_db, alert):
+            raise RuntimeError("escaped every guard")
+
+        from ctrlrelay.core.dispatch_health import DispatchAlert
+
+        alert = DispatchAlert(
+            reason="consecutive_failures",
+            consecutive=1,
+            threshold=1,
+            detail="d",
+            claim_token="t",
+        )
+        with (
+            patch.object(cli_module, "deliver_relay_alert", new=raises),
+            caplog.at_level(logging.INFO, logger="ctrlrelay"),
+        ):
+            task = cli_module.start_relay_alert(MagicMock(), MagicMock(), alert)
+            await asyncio.wait([task], timeout=5)
+            await asyncio.sleep(0)
+        ends = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("dispatch_health.alert_")
+        ]
+        assert ends == ["dispatch_health.alert_task_failed"], ends
+
+    @pytest.mark.asyncio
+    async def test_a_recorded_delivery_is_not_reported_as_cancelled(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The outer task cancelled in the same tick the send records:
+        the message went out, so the log must not say otherwise."""
+        from ctrlrelay.core.dispatch_health import DispatchAlert
+
+        recorded: list[bool] = []
+        go = asyncio.Event()
+
+        async def delivers(config, state_db, alert):
+            await go.wait()
+            recorded.append(True)
+            return True
+
+        alert = DispatchAlert(
+            reason="consecutive_failures",
+            consecutive=1,
+            threshold=1,
+            detail="d",
+            claim_token="t",
+        )
+        with (
+            patch.object(cli_module, "deliver_relay_alert", new=delivers),
+            caplog.at_level(logging.INFO, logger="ctrlrelay"),
+        ):
+            outer = cli_module.start_relay_alert(MagicMock(), MagicMock(), alert)
+            await asyncio.sleep(0)
+            go.set()
+            for _ in range(100):
+                if recorded:
+                    break
+                await asyncio.sleep(0)
+            assert recorded
+            # The send has recorded and returned; the outer task has not
+            # yet woken up to read it. Cancel it there.
+            assert not outer.done()
+            outer.cancel()
+            await asyncio.wait([outer], timeout=5)
+            await asyncio.sleep(0)
+        names = [r.getMessage() for r in caplog.records]
+        assert "dispatch_health.alert_cancelled" not in names, names
+
+    @pytest.mark.asyncio
+    async def test_a_second_stop_during_the_cancel_wait_still_reports_stuck(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        hook = cli_module.make_dispatch_outcome_hook(_config(threshold=1), db)
+        stuck = IgnoresCancel()
+        try:
+            with (
+                patch(
+                    "ctrlrelay.cli.connect_notify_transport",
+                    new=AsyncMock(return_value=stuck),
+                ),
+                caplog.at_level(logging.INFO, logger="ctrlrelay"),
+            ):
+                await hook(_outcome("s-0"))
+                await asyncio.wait_for(stuck.entered.wait(), timeout=5)
+                # Grace 0, so the drain goes straight into the 1 s
+                # cancel wait; the second stop lands inside it.
+                drain = asyncio.ensure_future(cli_module.drain_relay_alerts(0))
+                await asyncio.sleep(0.2)
+                assert not drain.done()
+                drain.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(drain, timeout=10)
+                names = [r.getMessage() for r in caplog.records]
+            assert "dispatch_health.alert_stuck_at_shutdown" in names
+        finally:
+            stuck.release.set()
+            await asyncio.sleep(0)
+            await _cancel_leftovers()
+            db.close()
