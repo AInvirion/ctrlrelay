@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import time
 import uuid
 from dataclasses import dataclass
@@ -465,6 +466,19 @@ speak to the author-filtered results.
         conditions for DONE. One shared block would have quietly changed
         what two of them promise.
         """
+        # Quoted for the shell rather than hand-wrapped in single quotes
+        # (#191). With hand quoting, an apostrophe in the path either
+        # closed the quote early (a syntax error, so no checkpoint at all)
+        # or, paired, parsed fine and wrote to a different path:
+        # /tmp/a'b'c/state.json landed in /tmp/abc/state.json.
+        #
+        # The directory is computed here rather than with `$(dirname)`,
+        # because command substitution strips trailing newlines from a
+        # directory name, and `--` stops a relative path starting with
+        # `-` being read as an option. The redirect target needs no `--`:
+        # the shell takes the word after `>` as a filename.
+        quoted_path = shlex.quote(state_file_path)
+        quoted_dir = shlex.quote(str(Path(state_file_path).parent))
         return f"""## Signaling Completion
 
 **CRITICAL**: Before exiting, you MUST write a checkpoint file to signal completion.
@@ -474,26 +488,26 @@ SESSION_ID: {session_id}
 
 **DONE** (completed):
 ```bash
-mkdir -p "$(dirname '{state_file_path}')"
+mkdir -p -- {quoted_dir}
 printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\
 '"timestamp":"%s","summary":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<SUMMARY>" > '{state_file_path}'
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<SUMMARY>" > {quoted_path}
 ```
 
 **BLOCKED** (need input):
 ```bash
-mkdir -p "$(dirname '{state_file_path}')"
+mkdir -p -- {quoted_dir}
 printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
 '"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > '{state_file_path}'
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > {quoted_path}
 ```
 
 **FAILED**:
 ```bash
-mkdir -p "$(dirname '{state_file_path}')"
+mkdir -p -- {quoted_dir}
 printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
 '"timestamp":"%s","error":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > '{state_file_path}'
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > {quoted_path}
 ```"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
