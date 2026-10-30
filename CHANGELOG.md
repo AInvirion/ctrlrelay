@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The scheduled secops sweep holds back a question nobody answered, posting it again after 1, 2, 4, then 7 days (#214)
+- A reply to an earlier post of a question whose session expired unanswered goes to the newest open session asking the same thing in that repo, instead of being refused (#214)
+
+### Fixed
+
+- A secops repo that failed after its result was recorded no longer adds a second result, which paired every later repo's notification with its neighbour's result (#214)
+
 ## [0.12.4] - 2026-10-18
 
 Carries 0.12.3's entries too: v0.12.3 was never tagged, so nothing has

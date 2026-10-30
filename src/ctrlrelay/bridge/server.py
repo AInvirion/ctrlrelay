@@ -24,6 +24,7 @@ from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.question_expiry import (
     find_repeat_history,
     format_repeat_note,
+    same_substance,
 )
 
 if TYPE_CHECKING:
@@ -860,10 +861,18 @@ class BridgeServer:
         )
         if outcome["status"] == "queued":
             row = outcome["row"]
+            redirected = (
+                f"The message you replied to was an earlier ask of the "
+                f"same question; its session "
+                f"`{outcome['redirected_from']}` had expired.\n"
+                if outcome.get("redirected_from")
+                else ""
+            )
             await self._send_notice(
                 "✅ Answer queued for BLOCKED session "
                 f"`{row['session_id']}` "
                 f"(pipeline={row['pipeline']}, repo={row['repo']}).\n"
+                f"{redirected}"
                 "The pending-resume sweeper will drive it on the next "
                 "tick — you'll get another message with the result."
             )
@@ -1025,8 +1034,10 @@ class BridgeServer:
         2. ``session_id`` was given and does NOT name an unanswered row.
            The operator pointed at something specific, so the only other
            pointer we accept is an equally explicit one: a session_id
-           written in the reply text. Failing that we stop at
-           ``"stale_hint"`` and route nothing.
+           written in the reply text, or (#214) the same question open
+           on a newer session in the same repo, when the row pointed at
+           expired unanswered. Failing that we stop at ``"stale_hint"``
+           and route nothing.
         3. No ``session_id`` at all: the reply text contains exactly one
            unanswered session_id as a substring — route there.
         4. No ``session_id`` at all and exactly one unanswered row exists —
@@ -1077,6 +1088,28 @@ class BridgeServer:
                 return await self._attach_orphan_answer(named[0], text)
             if len(named) > 1:
                 return {"status": "ambiguous", "rows": named}
+            # The post they replied to expired, but the same question
+            # may be open on a newer session: the next sweep asked it
+            # again, or held it back as a repeat and left the earlier
+            # post as the only one on screen (#214). That open row is
+            # what the operator is answering.
+            newer = self._newest_open_repeat(session_id, rows)
+            if newer is not None:
+                outcome = await self._attach_orphan_answer(newer, text)
+                if outcome["status"] == "queued":
+                    log_event(
+                        _logger,
+                        "bridge.reply.redirected",
+                        from_session_id=session_id,
+                        to_session_id=newer["session_id"],
+                        repo=newer["repo"],
+                    )
+                    return {**outcome, "redirected_from": session_id}
+                # The newer row stopped taking answers between the two
+                # reads (answered by another reply, or expired). That
+                # row is what this reply was for, so say what happened
+                # to IT, not that the older post expired.
+                return self._describe_stale_hint(newer["session_id"])
             return self._describe_stale_hint(session_id)
 
         matched_by_id = [r for r in rows if names_session(text, r["session_id"])]
@@ -1101,6 +1134,48 @@ class BridgeServer:
             return {"status": "unaddressed", "rows": rows}
 
         return await self._attach_orphan_answer(target, text)
+
+    def _newest_open_repeat(
+        self, session_id: str, open_rows: list[dict],
+    ) -> dict | None:
+        """The newest open row asking the same thing as ``session_id``'s
+        EXPIRED question in the same repo, or None.
+
+        Only an expired, unanswered row redirects. An answered one keeps
+        refusing: the operator already answered that question, and a
+        second reply to it is not an answer to the next one. A pruned
+        row has no question left to compare, so it keeps refusing too.
+
+        A failed lookup returns None, which keeps the refusal that was
+        the behaviour before this existed, and is logged.
+        """
+        assert self.state_db is not None
+        try:
+            old = self.state_db.get_pending_resume(session_id)
+            if (
+                old is None
+                or old["answered_at"] is not None
+                or old["expired_at"] is None
+            ):
+                return None
+            same = [
+                r for r in open_rows
+                if r["session_id"] != session_id
+                and r["repo"] == old["repo"]
+                and same_substance(old["question"], r["question"])
+            ]
+        except Exception as e:
+            log_event(
+                _logger,
+                "bridge.reply.redirect_lookup_failed",
+                session_id=session_id,
+                reason=type(e).__name__,
+                error=str(e)[:200],
+            )
+            return None
+        if not same:
+            return None
+        return max(same, key=lambda r: int(r["created_at"]))
 
     def _describe_stale_hint(self, session_id: str) -> dict:
         """Say WHY a resolved reply-to cannot take an answer.

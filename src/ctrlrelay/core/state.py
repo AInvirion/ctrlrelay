@@ -87,7 +87,19 @@ CREATE TABLE IF NOT EXISTS pending_resumes (
     answered_at INTEGER,
     resumed_at INTEGER,
     expired_at INTEGER,
-    expired_reason TEXT
+    expired_reason TEXT,
+    -- Set when the question was held back because the same question
+    -- went unanswered before (#214): the earliest time it is due again.
+    held_until INTEGER,
+    -- Whether this row's question reached the operator: 1 posted (the
+    -- ask timed out waiting for an answer), 0 not posted (held back, no
+    -- bridge, or the ask failed before delivery). NULL when the writer
+    -- does not say, which is read as posted, as before #214.
+    posted INTEGER,
+    -- The answer time this row carried before a re-block rewrote it.
+    -- The rewrite clears answered_at so the row can take a new answer;
+    -- this keeps the fact that the question WAS answered.
+    last_answered_at INTEGER
 );
 
 -- In-flight PR merge watchers that must survive a poller restart. Without
@@ -234,6 +246,19 @@ class StateDB:
         if pending_cols and "expired_reason" not in pending_cols:
             self._conn.execute(
                 "ALTER TABLE pending_resumes ADD COLUMN expired_reason TEXT"
+            )
+        if pending_cols and "held_until" not in pending_cols:
+            self._conn.execute(
+                "ALTER TABLE pending_resumes ADD COLUMN held_until INTEGER"
+            )
+        if pending_cols and "posted" not in pending_cols:
+            self._conn.execute(
+                "ALTER TABLE pending_resumes ADD COLUMN posted INTEGER"
+            )
+        if pending_cols and "last_answered_at" not in pending_cols:
+            self._conn.execute(
+                "ALTER TABLE pending_resumes "
+                "ADD COLUMN last_answered_at INTEGER"
             )
 
         health_cols = {
@@ -763,17 +788,51 @@ class StateDB:
         pipeline: str,
         repo: str,
         question: str,
+        held_until: int | None = None,
+        posted: bool | None = None,
     ) -> None:
         """Record that a session exited BLOCKED_NEEDS_INPUT and can be
         resumed if an operator reply arrives later. Idempotent: re-inserting
         the same session_id refreshes ``created_at`` and clears any stale
-        answer so a new BLOCKED on the same session_id starts fresh."""
+        answer so a new BLOCKED on the same session_id starts fresh.
+
+        ``held_until`` is set only by a caller that held the question
+        back (a repeat inside its backoff window). ``posted`` says
+        whether the question reached the operator; the backoff counts
+        only rows that did, so a bridge outage cannot stretch the
+        silence. ``None`` means the caller does not track it and the
+        row is read as posted, which is what every row was before.
+
+        A re-block rewrites the row, and the answer that drove the resume
+        used to leave the table with it. Its time is kept in
+        ``last_answered_at``: repeat counting and backoff both reset at
+        the latest answer, and losing it made a question the operator
+        had just answered look like one nobody ever answered."""
         self._conn.execute(
-            """INSERT OR REPLACE INTO pending_resumes
+            """INSERT INTO pending_resumes
                (session_id, pipeline, repo, question, created_at,
-                answer, answered_at, resumed_at)
-               VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)""",
-            (session_id, pipeline, repo, question, int(time.time())),
+                answer, answered_at, resumed_at, expired_at,
+                expired_reason, held_until, posted, last_answered_at)
+               VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?,
+                       NULL)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 pipeline = excluded.pipeline,
+                 repo = excluded.repo,
+                 question = excluded.question,
+                 created_at = excluded.created_at,
+                 answer = NULL,
+                 answered_at = NULL,
+                 resumed_at = NULL,
+                 expired_at = NULL,
+                 expired_reason = NULL,
+                 held_until = excluded.held_until,
+                 posted = excluded.posted,
+                 last_answered_at = COALESCE(
+                     pending_resumes.answered_at,
+                     pending_resumes.last_answered_at
+                 )""",
+            (session_id, pipeline, repo, question, int(time.time()),
+             held_until, None if posted is None else int(posted)),
         )
         self._conn.commit()
 

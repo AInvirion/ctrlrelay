@@ -620,6 +620,104 @@ async def announce_issue_outcome(
     return sent
 
 
+async def announce_secops_sweep(transport, *, repos, results) -> list[str]:
+    """Send the scheduled sweep's per-repo messages and its summary, and
+    return what was sent.
+
+    Per-repo notifications for the cases an operator must act on. The
+    aggregate "N blocked" message we used to send was useless on its
+    own: it didn't say which repos blocked or what the question was. So
+    one message goes out per blocked or failed result, with the actual
+    question or error and the session id, so the operator can respond
+    directly via the bridge.
+
+    A blocked result whose question was held back as an unanswered
+    repeat (#214) gets no per-repo message: that message carries the
+    question, so sending it would be the daily re-post the hold exists
+    to stop. It is listed in the summary instead, with its session id,
+    so a held repo is still visible and can be answered by naming the
+    session. A reply to the earlier post also works: while that post's
+    own session is open it takes the answer itself, and once it has
+    expired unanswered the bridge routes the reply to the newest open
+    session asking the same thing in that repo.
+
+    ``run_secops_all`` returns results in the same order as the input
+    ``repos`` list, so zip is safe. Raises on the first failed send,
+    as the inline block this was lifted from did; the caller owns that.
+    """
+    from ctrlrelay.core.question_expiry import format_utc_timestamp
+    from ctrlrelay.pipelines.base import failure_text
+    from ctrlrelay.pipelines.secops import QUESTION_HELD_UNTIL
+
+    sent: list[str] = []
+
+    async def _send(text: str, **kwargs) -> None:
+        await transport.send(text, **kwargs)
+        sent.append(text)
+
+    held: list[tuple[str, str, int]] = []
+    for repo_cfg, result in zip(repos, results, strict=False):
+        if result.blocked:
+            held_until = (result.outputs or {}).get(QUESTION_HELD_UNTIL)
+            if held_until is not None:
+                held.append(
+                    (repo_cfg.name, result.session_id, int(held_until))
+                )
+                continue
+            question = result.question or "(no question text)"
+            # session_id makes this message reply-to-able: the bridge
+            # records it, so answering the fan-out resolves the same
+            # pending_resumes row as answering the original question
+            # would have.
+            await _send(
+                f"⏸️ Scheduled secops blocked on {repo_cfg.name}\n"
+                f"Session: {result.session_id}\n"
+                f"\nReply to this message to answer."
+                f"\n\n{question}",
+                session_id=result.session_id,
+                repo=repo_cfg.name,
+            )
+        elif not result.success:
+            err = failure_text(result)
+            await _send(
+                f"❌ Scheduled secops failed on {repo_cfg.name}\n"
+                f"Session: `{result.session_id}`\n"
+                f"\n{err}"
+            )
+
+    # Final at-a-glance summary: the single message the operator scans
+    # first.
+    ok = sum(1 for r in results if r.success)
+    blocked_n = sum(1 for r in results if r.blocked)
+    failed_n = sum(1 for r in results if not r.success and not r.blocked)
+    if blocked_n or failed_n:
+        parts = []
+        if blocked_n:
+            parts.append(f"{blocked_n} blocked")
+        if failed_n:
+            parts.append(f"{failed_n} failed")
+        text = (
+            f"📋 Scheduled secops sweep done: "
+            f"{ok}/{len(results)} ok, {', '.join(parts)}"
+        )
+        if held:
+            lines = "\n".join(
+                f"  - {name} (session: {sid}): not before "
+                f"{format_utc_timestamp(until)}"
+                for name, sid, until in held
+            )
+            text += (
+                f"\n\nNot re-posted, asked before with no answer (reply "
+                f"to the earlier post, or name the session):\n{lines}"
+            )
+        await _send(text)
+    else:
+        await _send(
+            f"✅ Scheduled secops sweep done: {ok}/{len(results)} ok"
+        )
+    return sent
+
+
 def unreviewed_pr_warning(repo: str, result) -> str | None:
     """The line to post when a pull request has no review, or ``None``.
 
@@ -1867,6 +1965,9 @@ def run_secops(
             # Fresh tracker per invocation — the manual path is one-shot,
             # so there's nothing to cache across runs (#163).
             archived=ArchivedRepoTracker(github=github),
+            # Someone ran this by hand and is waiting for the question;
+            # holding a repeat back is for the unattended daily sweep.
+            hold_repeats=False,
         )
 
     try:
@@ -2805,8 +2906,6 @@ def poller_start(
                 f"[dim]Scheduled secops: starting across {n_repos} repo(s)[/dim]"
             )
 
-            from ctrlrelay.pipelines.base import failure_text
-
             secops_transport = None
             settings = _bridge_socket_settings(config)
             if settings is None:
@@ -2875,6 +2974,9 @@ def poller_start(
                     # archive is logged once and honored by both the
                     # 120s issue poll and the daily sweep (#163).
                     archived=poller.archived_tracker,
+                    # Unattended and daily: a question nobody answered
+                    # is held back on a widening schedule (#214).
+                    hold_repeats=True,
                 )
                 ok = sum(1 for r in results if r.success)
                 console.print(
@@ -2894,71 +2996,16 @@ def poller_start(
                     config, state_db, results
                 )
 
-                # Per-repo notifications for the cases an operator must
-                # act on. The aggregate "N blocked" message we used to
-                # send was useless on its own — it didn't say which
-                # repos blocked or what the question was. Fan out one
-                # message per blocked or failed result with the actual
-                # question/error and session id so the operator can
-                # respond directly via the bridge.
-                #
-                # `run_secops_all` returns results in the same order as
-                # the input `repos` list, so zip is safe — only repos
-                # with successful lock-acquisition produce results.
+                # Per-repo blocked/failed messages and the summary; see
+                # `announce_secops_sweep`. One `except` around all of it,
+                # as before: a failed send drops the rest of the fan-out.
                 if secops_transport:
                     try:
-                        for repo_cfg, result in zip(
-                            config.repos, results, strict=False
-                        ):
-                            if result.blocked:
-                                question = (
-                                    result.question or "(no question text)"
-                                )
-                                # session_id makes this message
-                                # reply-to-able: the bridge records it, so
-                                # answering the fan-out resolves the same
-                                # pending_resumes row as answering the
-                                # original question would have.
-                                await secops_transport.send(
-                                    f"⏸️ Scheduled secops blocked on "
-                                    f"{repo_cfg.name}\n"
-                                    f"Session: {result.session_id}\n"
-                                    f"\nReply to this message to answer."
-                                    f"\n\n{question}",
-                                    session_id=result.session_id,
-                                    repo=repo_cfg.name,
-                                )
-                            elif not result.success:
-                                err = failure_text(result)
-                                await secops_transport.send(
-                                    f"❌ Scheduled secops failed on "
-                                    f"{repo_cfg.name}\n"
-                                    f"Session: `{result.session_id}`\n"
-                                    f"\n{err}"
-                                )
-                        # Final at-a-glance summary — kept because it's
-                        # the single message the operator scans first.
-                        blocked_n = sum(1 for r in results if r.blocked)
-                        failed_n = sum(
-                            1 for r in results
-                            if not r.success and not r.blocked
+                        await announce_secops_sweep(
+                            secops_transport,
+                            repos=config.repos,
+                            results=results,
                         )
-                        if blocked_n or failed_n:
-                            parts = []
-                            if blocked_n:
-                                parts.append(f"{blocked_n} blocked")
-                            if failed_n:
-                                parts.append(f"{failed_n} failed")
-                            await secops_transport.send(
-                                f"📋 Scheduled secops sweep done: "
-                                f"{ok}/{len(results)} ok, "
-                                f"{', '.join(parts)}"
-                            )
-                        else:
-                            await secops_transport.send(
-                                f"✅ Scheduled secops sweep done: "
-                                f"{ok}/{len(results)} ok"
-                            )
                     except Exception as e:
                         console.print(
                             f"[yellow]Scheduled secops: notify failed: {e}[/yellow]"

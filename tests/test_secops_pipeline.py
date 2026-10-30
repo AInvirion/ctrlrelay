@@ -144,6 +144,7 @@ class TestSecopsPipeline:
         ]
 
         results = await run_secops_all(
+            hold_repeats=False,
             repos=repos,
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -168,6 +169,7 @@ class TestSecopsPipeline:
         repos = [MagicMock(name="owner/locked-repo")]
 
         results = await run_secops_all(
+            hold_repeats=False,
             repos=repos,
             dispatcher=MagicMock(),
             github=MagicMock(),
@@ -350,6 +352,7 @@ class TestSecopsBlockedDispatch:
         repo.name = "owner/repo"
 
         results = await run_secops_all(
+            hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -414,6 +417,7 @@ class TestSecopsBlockedDispatch:
         repo.name = "owner/repo"
 
         results = await run_secops_all(
+            hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -483,6 +487,7 @@ class TestSecopsInlineAnswerAck:
         repo.name = "owner/repo"
 
         return await run_secops_all(
+            hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -544,6 +549,7 @@ class TestSecopsInlineAnswerAck:
         repo.name = "owner/repo"
 
         results = await run_secops_all(
+            hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -593,6 +599,7 @@ class TestSecopsInlineAnswerAck:
         repo.name = "owner/repo"
 
         results = await run_secops_all(
+            hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -756,6 +763,7 @@ class TestSecopsPromptRespectsAutomationConfig:
         )
 
         await run_secops_all(
+            hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -815,6 +823,7 @@ class TestSecopsCleanupLogging:
 
         with patch("ctrlrelay.pipelines.secops._logger") as mock_logger:
             results = await run_secops_all(
+                hold_repeats=False,
                 repos=[repo],
                 dispatcher=mock_dispatcher,
                 github=MagicMock(),
@@ -885,6 +894,7 @@ class TestSecopsCancelDoesNotOverwriteCompletedStatus:
 
         task = asyncio.create_task(
             run_secops_all(
+                hold_repeats=False,
                 repos=[repo],
                 dispatcher=mock_dispatcher,
                 github=MagicMock(),
@@ -974,6 +984,7 @@ class TestSecopsLockHeldThroughCleanup:
         repo.name = "owner/repo"
 
         await run_secops_all(
+            hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -1036,6 +1047,7 @@ class TestSecopsLockHeldThroughCleanup:
         ):
             task = asyncio.create_task(
                 run_secops_all(
+                    hold_repeats=False,
                     repos=[repo],
                     dispatcher=AsyncMock(),
                     github=MagicMock(),
@@ -1101,6 +1113,7 @@ class TestSecopsCancellation:
         ):
             task = asyncio.create_task(
                 run_secops_all(
+                    hold_repeats=False,
                     repos=[repo],
                     dispatcher=AsyncMock(),
                     github=MagicMock(),
@@ -1226,6 +1239,7 @@ class TestSecopsDecisionPersistence:
         repo.name = "owner/repo"
 
         await run_secops_all(
+            hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -1290,6 +1304,7 @@ class TestSecopsDecisionPersistence:
         repo.name = "owner/repo"
 
         await run_secops_all(
+            hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -1456,6 +1471,7 @@ class TestSecopsPriorDecisionsInPrompt:
         repo.name = "owner/repo"
 
         await run_secops_all(
+            hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,
             github=MagicMock(),
@@ -1658,6 +1674,7 @@ class TestSecopsFailureIsDiagnosable:
 
         with patch("ctrlrelay.pipelines.secops.log_event") as mock_log:
             results = await run_secops_all(
+                hold_repeats=False,
                 repos=[repo],
                 dispatcher=MagicMock(),
                 github=MagicMock(),
@@ -1718,6 +1735,7 @@ class TestSecopsFailureIsDiagnosable:
             side_effect=RuntimeError("logging backend down"),
         ):
             results = await run_secops_all(
+                hold_repeats=False,
                 repos=[first, second],
                 dispatcher=MagicMock(),
                 github=MagicMock(),
@@ -1861,6 +1879,7 @@ class TestSecopsSkipsArchivedRepos:
         db.acquire_lock.return_value = False  # forces an early, cheap exit
 
         results = await run_secops_all(
+            hold_repeats=False,
             repos=[self._repo("owner/archived"), self._repo("owner/live")],
             dispatcher=dispatcher,
             github=github,
@@ -1900,6 +1919,7 @@ class TestSecopsSkipsArchivedRepos:
         db.acquire_lock.return_value = False
 
         results = await run_secops_all(
+            hold_repeats=False,
             repos=[self._repo("owner/live")],
             dispatcher=AsyncMock(),
             github=github,
@@ -1929,6 +1949,7 @@ class TestSecopsSkipsArchivedRepos:
         db.acquire_lock.return_value = False
 
         results = await run_secops_all(
+            hold_repeats=False,
             repos=[self._repo("owner/live")],
             dispatcher=AsyncMock(),
             github=github,

@@ -107,6 +107,57 @@ def same_substance(a: str, b: str) -> bool:
     return bool(_normalise(a)) and _normalise(a) == _normalise(b)
 
 
+def _answered_at(row: dict[str, Any]) -> int | None:
+    """When this row's question was last answered, if ever.
+
+    ``last_answered_at`` is the answer a re-block rewrite cleared from
+    ``answered_at``; either one is an answer the operator gave. A row
+    from before that column existed reads as None.
+    """
+    times = [
+        int(t)
+        for t in (row.get("answered_at"), row.get("last_answered_at"))
+        if t is not None
+    ]
+    return max(times, default=None)
+
+
+def _unanswered_asks(
+    state_db: StateDB,
+    *,
+    repo: str,
+    question: str,
+    exclude_session_id: str | None,
+) -> list[dict[str, Any]]:
+    """Earlier asks of the same question in ``repo`` since its latest
+    answer, oldest first. Rows whose question never reached the
+    operator (held back, no bridge, or a failed ask; #214) are left
+    out: they are not asks."""
+    matches = [
+        row
+        for row in state_db.list_pending_resumes_for_repo(repo)
+        if same_substance(question, row["question"])
+    ]
+    last_answer = max(
+        (t for t in map(_answered_at, matches) if t is not None),
+        default=None,
+    )
+    # Every row created after `last_answer` is unanswered without a
+    # separate check: `answered_at` is stamped after `created_at`, so it
+    # would be later than `last_answer`, which is the latest. A row a
+    # re-block rewrote carries its answer in `last_answered_at`, before
+    # its new `created_at`; when that answer is the latest, the row is
+    # the open ask that came after it and is rightly counted.
+    return [
+        r
+        for r in matches
+        if r["session_id"] != exclude_session_id
+        and r.get("held_until") is None
+        and r.get("posted") != 0
+        and (last_answer is None or int(r["created_at"]) > last_answer)
+    ]
+
+
 @dataclass(frozen=True)
 class RepeatHistory:
     """Earlier, unanswered asks of the same question in the same repo."""
@@ -141,11 +192,14 @@ def find_repeat_history(
     drove the resume. It is required so a caller cannot forget it and
     count the question as a repeat of itself.
 
-    Accepted limit: when a resume re-blocks, the pipeline rewrites the
-    session's row (``add_pending_resume`` is INSERT OR REPLACE and
-    clears ``answered_at``), so that answer leaves the table. A later
-    ask can then count asks from before it, and the count can be too
-    high. It never hides a question.
+    When a resume re-blocks, the pipeline rewrites the session's row
+    and clears ``answered_at``; the answer's time survives in
+    ``last_answered_at`` and still resets the count. A row rewritten
+    before that column existed has lost it, and for those the count can
+    be too high. It never hides a question.
+
+    Rows that were held back rather than posted are not counted: the
+    operator never saw them.
 
     Rare edge: the retention prune ages a row by its LAST activity and
     this count compares ``created_at`` against ``answered_at``. A row
@@ -153,29 +207,110 @@ def find_repeat_history(
     before that answer which is still inside the window (an open row,
     which is never pruned) counts again.
     """
-    matches = [
-        row
-        for row in state_db.list_pending_resumes_for_repo(repo)
-        if same_substance(question, row["question"])
-    ]
-    last_answer = max(
-        (int(r["answered_at"]) for r in matches if r["answered_at"] is not None),
-        default=None,
+    unanswered = _unanswered_asks(
+        state_db,
+        repo=repo,
+        question=question,
+        exclude_session_id=exclude_session_id,
     )
-    # A row is answered after it is created, so every answered row was
-    # created at or before `last_answer` and the rows after it are
-    # unanswered by construction; no separate check.
-    unanswered = [
-        r
-        for r in matches
-        if r["session_id"] != exclude_session_id
-        and (last_answer is None or int(r["created_at"]) > last_answer)
-    ]
     if not unanswered:
         return None
     return RepeatHistory(
         times_asked_before=len(unanswered),
         last_asked_at=max(int(r["created_at"]) for r in unanswered),
+    )
+
+
+# How long the next post of a question waits after N unanswered posts
+# of it: 1 day after the first, 2 after the second, 4 after the third,
+# then a week from there on. On a daily sweep that posts on days 0, 1,
+# 3, 7, 14, 21. Constants rather than config: the chat blocks carry
+# per-deployment timings, and this is a policy about how often to
+# repeat ourselves, not something a deployment tunes.
+BACKOFF_DAYS = (1, 2, 4, 7)
+
+# A daily sweep does not reach the same question at the same second each
+# day: the agent's run length moves it, and the row is stamped when the
+# ask's wait ENDS (up to `ask_timeout_seconds` after the post). Without
+# slack, "wait one day" lands a few minutes short and holds it for a
+# second day. Six hours absorbs that and cannot merge two days into one.
+# A post younger than this is also not yet a miss: nobody has had the
+# time to answer it.
+_SCHEDULE_SLACK_SECONDS = 6 * 3600
+
+
+@dataclass(frozen=True)
+class QuestionHold:
+    """A question that is not to be posted yet."""
+
+    missed_posts: int
+    last_posted_at: int
+    next_post_at: int
+
+
+def _is_miss(row: dict[str, Any], now: int) -> bool:
+    """A post of the question the operator has had time to answer and
+    did not: retired on TTL, or still open, once it is older than the
+    slack. Retired as resolved elsewhere is not a miss; its subject went
+    away. ``row`` is already known unanswered (it is after the latest
+    answer)."""
+    if int(row["created_at"]) > now - _SCHEDULE_SLACK_SECONDS:
+        return False
+    if row.get("expired_at") is None:
+        return True
+    return row.get("expired_reason") == EXPIRY_REASON_TTL
+
+
+def find_question_hold(
+    state_db: StateDB,
+    *,
+    repo: str,
+    question: str,
+    exclude_session_id: str | None,
+    now: int | None = None,
+) -> QuestionHold | None:
+    """Whether to hold this question back instead of posting it again.
+
+    Counts the earlier posts of the same question in ``repo`` since its
+    latest answer that went unanswered (see ``_is_miss``), and waits
+    ``BACKOFF_DAYS[n-1]`` days (capped at the last entry) from the most
+    recent post before posting again. An answer on any matching row,
+    including the asking session's own, resets it, because
+    ``_unanswered_asks`` starts after the latest answer. The asking
+    session's own row never counts as a post of it.
+
+    Held rows were never posted, so they are neither a miss nor the
+    last post: a hold never extends itself.
+
+    Raises on a lookup failure. The caller must post the question then:
+    "could not check" is not "asked too recently".
+    """
+    now = int(time.time()) if now is None else now
+    posted = _unanswered_asks(
+        state_db,
+        repo=repo,
+        question=question,
+        exclude_session_id=exclude_session_id,
+    )
+    misses = sum(1 for r in posted if _is_miss(r, now))
+    if misses == 0:
+        return None
+    last_posted = max(int(r["created_at"]) for r in posted)
+    delay = BACKOFF_DAYS[min(misses, len(BACKOFF_DAYS)) - 1] * 86400
+    next_post_at = last_posted + delay - _SCHEDULE_SLACK_SECONDS
+    if now >= next_post_at:
+        return None
+    return QuestionHold(
+        missed_posts=misses,
+        last_posted_at=last_posted,
+        next_post_at=next_post_at,
+    )
+
+
+def format_utc_timestamp(ts: int) -> str:
+    """``2026-10-28 12:00 UTC``, for logs and the sweep summary."""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
     )
 
 

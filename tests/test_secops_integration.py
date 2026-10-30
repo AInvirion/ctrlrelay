@@ -72,6 +72,7 @@ class TestSecopsIntegration:
              patch.object(worktree, "remove_worktree", new_callable=AsyncMock):
 
             results = await run_secops_all(
+                hold_repeats=False,
                 repos=[repo_config],
                 dispatcher=dispatcher,
                 github=github,

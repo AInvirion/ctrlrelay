@@ -15,7 +15,12 @@ from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
-from ctrlrelay.core.question_expiry import extract_referenced_numbers
+from ctrlrelay.core.question_expiry import (
+    QuestionHold,
+    extract_referenced_numbers,
+    find_question_hold,
+    format_utc_timestamp,
+)
 from ctrlrelay.core.state import StateDB
 from ctrlrelay.core.worktree import WorktreeManager
 from ctrlrelay.dashboard.client import DashboardClient, EventPayload
@@ -24,7 +29,7 @@ from ctrlrelay.pipelines.base import (
     PipelineResult,
     failure_text,
 )
-from ctrlrelay.transports.base import Transport
+from ctrlrelay.transports.base import Transport, TransportUnansweredError
 
 _logger = get_logger("pipeline.secops")
 
@@ -80,6 +85,50 @@ def _record_decisions_from_answer(
                 error_type=type(e).__name__,
                 error=str(e)[:200],
             )
+
+
+# Key on a blocked result's outputs when its question was held back
+# rather than posted. The sweep's fan-out reads it so it does not post
+# the question either; the value is the hold's `next_post_at`.
+QUESTION_HELD_UNTIL = "question_held_until"
+
+
+def _question_hold(
+    state_db: StateDB, *, repo: str, question: str, session_id: str,
+) -> QuestionHold | None:
+    """The backoff decision for a question about to be posted, or None
+    to post it. A lookup failure posts: a question nobody can see is
+    the one outcome the backoff must never produce by accident."""
+    try:
+        hold = find_question_hold(
+            state_db,
+            repo=repo,
+            question=question,
+            exclude_session_id=session_id,
+        )
+    except Exception as e:
+        log_event(
+            _logger,
+            "secops.question.hold_lookup_failed",
+            session_id=session_id,
+            repo=repo,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        return None
+    if hold is not None:
+        log_event(
+            _logger,
+            "secops.question.held",
+            session_id=session_id,
+            repo=repo,
+            question_hash=hash_text(question),
+            missed_posts=hold.missed_posts,
+            last_posted_at=hold.last_posted_at,
+            next_post_at=hold.next_post_at,
+            next_post_after=format_utc_timestamp(hold.next_post_at),
+        )
+    return hold
 
 
 def _question_for_persist(session_id: str, result: PipelineResult) -> str:
@@ -578,8 +627,20 @@ async def run_secops_all(
     contexts_dir: Path,
     max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
     archived: ArchivedRepoTracker | None = None,
+    *,
+    hold_repeats: bool = False,
 ) -> list[PipelineResult]:
     """Run secops pipeline on all configured repos.
+
+    ``hold_repeats`` (#214) holds back a question that went unanswered
+    on earlier sweeps instead of posting it every morning; see
+    ``find_question_hold`` for the schedule. A held session ends
+    blocked with its row persisted, exactly as when nobody answers, so
+    it stays answerable and expires on TTL as usual. The scheduled
+    sweep passes True; a run an operator started by hand passes False,
+    because they are waiting for the question. Both pass it
+    explicitly; the default keeps today's behaviour (always post) for
+    callers outside this package.
 
     ``archived`` (#163) skips repos that GitHub confirms are archived —
     the alerts API answers 403 for them, so the sweep spends a whole
@@ -631,6 +692,11 @@ async def run_secops_all(
         worktree_path: Path | None = None
         session_row_inserted = False
         session_final_state_written = False
+        # Index of this repo's entry in `results` once recorded. The
+        # scheduled fan-out pairs results with repos by position, so a
+        # failure after this point must replace that entry, not add a
+        # second one and shift every later repo onto its neighbour.
+        result_index: int | None = None
         try:
             await worktree.ensure_bare_repo(repo)
             worktree_path = await worktree.create_worktree(repo, session_id)
@@ -696,12 +762,52 @@ async def run_secops_all(
             # writes a pending_resumes row that a later out-of-band reply
             # could resume via the sweeper.
             rounds = 0
+            held_until: int | None = None
+            # Whether the question the row will carry reached the
+            # operator. Only an ask the bridge ACKed and nobody
+            # answered did (TransportUnansweredError). Any other
+            # failure, including a timeout with no ACK, may never have
+            # put it in front of anyone, and counting it as a post
+            # would stretch the backoff over an outage (#214).
+            question_posted = False
             while (
                 result.blocked
                 and transport is not None
                 and rounds < max_blocked_rounds
             ):
                 question = _question_for_persist(session_id, result)
+                # Only before the first ask. Once the operator has
+                # answered in this session the follow-up is a new
+                # exchange, and that answer is not in the table yet to
+                # reset the count.
+                hold = (
+                    _question_hold(
+                        state_db,
+                        repo=repo,
+                        question=question,
+                        session_id=session_id,
+                    )
+                    if hold_repeats and rounds == 0
+                    else None
+                )
+                if hold is not None:
+                    held_until = hold.next_post_at
+                    result = PipelineResult(
+                        success=False,
+                        blocked=True,
+                        session_id=session_id,
+                        summary=(
+                            "Blocked; same question as an earlier "
+                            "unanswered post, held until "
+                            f"{format_utc_timestamp(hold.next_post_at)}"
+                        ),
+                        question=question,
+                        outputs={
+                            **(result.outputs or {}),
+                            QUESTION_HELD_UNTIL: hold.next_post_at,
+                        },
+                    )
+                    break
                 try:
                     answer = await transport.ask(
                         question,
@@ -709,6 +815,7 @@ async def run_secops_all(
                         repo=repo,
                     )
                 except Exception as e:
+                    question_posted = isinstance(e, TransportUnansweredError)
                     log_event(
                         _logger,
                         "secops.transport.ask_failed",
@@ -781,6 +888,7 @@ async def run_secops_all(
                     )
 
             results.append(result)
+            result_index = len(results) - 1
 
             status = "done" if result.success else ("blocked" if result.blocked else "failed")
             state_db.execute(
@@ -801,6 +909,8 @@ async def run_secops_all(
                         pipeline="secops",
                         repo=repo,
                         question=_question_for_persist(session_id, result),
+                        held_until=held_until,
+                        posted=question_posted,
                     )
                 except Exception as e:
                     log_event(
@@ -884,7 +994,7 @@ async def run_secops_all(
                     ("failed", f"Error: {detail}", int(time.time()), session_id),
                 )
                 state_db.commit()
-            results.append(PipelineResult(
+            failure = PipelineResult(
                 success=False,
                 session_id=session_id,
                 summary=f"Error processing {repo}: {type(e).__name__}: {detail}",
@@ -893,7 +1003,11 @@ async def run_secops_all(
                 # error no longer decides the alert either way - but both
                 # are still filled so the exception type survives alone.
                 error=f"{type(e).__name__}: {detail}",
-            ))
+            )
+            if result_index is None:
+                results.append(failure)
+            else:
+                results[result_index] = failure
 
         finally:
             # Hold the per-repo lock THROUGH worktree cleanup so a
