@@ -440,6 +440,17 @@ def _config(*, enabled: bool = True, threshold: int = 3):
     return cfg
 
 
+async def _settle() -> None:
+    """Let the background alert deliveries finish (#208).
+
+    The hook no longer awaits the send, so a test that reads the spy
+    straight after the hook would read it before anything ran.
+    """
+    from ctrlrelay.cli import drain_relay_alerts
+
+    await drain_relay_alerts(10)
+
+
 def _outcome(session_id: str, exit_code: int):
     return DispatchOutcome(
         session_id=session_id,
@@ -470,6 +481,7 @@ class TestTheHookAlertsExactlyOnce:
         ):
             for i in range(50):
                 await hook(_outcome(f"s-{i}", 1))
+            await _settle()
         db.close()
         assert len(spy.sent) == 1
         assert "3 dispatches in a row" in spy.sent[0]
@@ -489,6 +501,7 @@ class TestTheHookAlertsExactlyOnce:
         ):
             for i in range(50):
                 await hook(_outcome(f"s-{i}", 0))
+            await _settle()
         db.close()
         assert spy.sent == []
 
@@ -507,9 +520,11 @@ class TestTheHookAlertsExactlyOnce:
         ):
             for i in range(3):
                 await hook(_outcome(f"a-{i}", 1))
+            await _settle()
             await hook(_outcome("recovered", 0))
             for i in range(3):
                 await hook(_outcome(f"b-{i}", 1))
+            await _settle()
         db.close()
         assert len(spy.sent) == 2
 
@@ -584,6 +599,7 @@ class TestTheHookAlertsExactlyOnce:
             new=AsyncMock(return_value=None),
         ):
             await hook(_outcome("s-0", 1))
+            await _settle()
         assert db.get_dispatch_health()["alert_delivered_at"] is None, (
             "an undelivered attempt latched the alert"
         )
@@ -601,6 +617,7 @@ class TestTheHookAlertsExactlyOnce:
         ):
             for i in range(1, 51):
                 await hook(_outcome(f"s-{i}", 1))
+            await _settle()
         db.close()
         assert len(spy.sent) == 1
 
@@ -623,6 +640,7 @@ class TestTheHookAlertsExactlyOnce:
             new=AsyncMock(return_value=Broken()),
         ):
             await hook(_outcome("s-0", 1))
+            await _settle()
         row = db.get_dispatch_health()
         assert row["alert_delivered_at"] is None
         # And the run is NOT reset — a cleared counter would restart
@@ -646,10 +664,13 @@ class TestTheHookAlertsExactlyOnce:
         further failures against a **healthy** channel delivered zero
         messages, for the whole remaining outage.
         """
-        from ctrlrelay.cli import make_dispatch_outcome_hook
+        from ctrlrelay.cli import drain_relay_alerts, make_dispatch_outcome_hook
+
+        entered = asyncio.Event()
 
         class Stalls(SpyTransport):
             async def send(self, text: str, **kwargs) -> None:
+                entered.set()
                 await asyncio.sleep(3600)
 
         path = tmp_path / "state.db"
@@ -659,11 +680,12 @@ class TestTheHookAlertsExactlyOnce:
             "ctrlrelay.cli.connect_notify_transport",
             new=AsyncMock(return_value=Stalls()),
         ):
-            task = asyncio.ensure_future(hook(_outcome("s-0", 1)))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            await hook(_outcome("s-0", 1))
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            # The delivery runs in the background since #208, so a
+            # restart reaches it through the poller's shutdown drain,
+            # which cancels a send that is still stuck.
+            await drain_relay_alerts(0)
         assert db.get_dispatch_health()["alert_delivered_at"] is None
         db.close()
 
@@ -684,6 +706,7 @@ class TestTheHookAlertsExactlyOnce:
         ):
             for i in range(1, 60):
                 await hook(_outcome(f"s-{i}", 1))
+            await _settle()
         db.close()
         assert len(spy.sent) == 1, (
             "the outage stayed silent after a restart during delivery"
@@ -712,6 +735,7 @@ class TestTheHookAlertsExactlyOnce:
             caplog.at_level(logging.INFO, logger="ctrlrelay"),
         ):
             await hook(_outcome("s", 1))
+            await _settle()
         db.close()
         assert any(
             r.getMessage() == "dispatch_health.alert_undelivered"
@@ -1042,11 +1066,12 @@ class TestTheClaimIsALeaseAndOnlyDeliveryLatches:
 class TestAStalledSendCannotHangADispatch:
     @pytest.mark.asyncio
     async def test_the_send_is_bounded(self, tmp_path: Path) -> None:
-        """The alert is awaited from inside the dispatcher, after the
-        child has exited and while the pipeline holds the repo lock.
+        """The send step is bounded on its own.
 
-        An unbounded send on an accepted-then-stalled socket would
-        stall the whole serial poll cycle to deliver a notification.
+        Since #208 the alert runs in a background task, off the repo
+        lock, but an unbounded send on an accepted-then-stalled socket
+        would still hang that task and its socket for as long as the
+        bridge stays wedged.
         """
         import ctrlrelay.cli as cli_module
         from ctrlrelay.cli import make_dispatch_outcome_hook
@@ -1068,6 +1093,7 @@ class TestAStalledSendCannotHangADispatch:
             ),
         ):
             await asyncio.wait_for(hook(_outcome("s-0", 1)), timeout=10)
+            await asyncio.wait_for(_settle(), timeout=10)
         # The send was ENTERED, not merely skipped. Without this the
         # test passes for an alert implementation that never tries at
         # all, because nothing is recorded either way.

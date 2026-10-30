@@ -296,20 +296,13 @@ def _bridge_socket_settings(config) -> tuple[Path, int] | None:
 _NOTIFY_CONNECT_TIMEOUT_SECONDS = 10
 
 # The same reasoning one step later: a socket that ACCEPTED and then
-# stalls costs whatever is awaiting the send. The relay-health alert
-# (#204) is awaited from inside the dispatcher, after the child has
-# exited and while the pipeline still holds the repo lock — so an
-# unbounded send there would stall the serial poll cycle to deliver a
-# notification.
+# stalls costs whatever is awaiting the send. An unbounded send would
+# hold that awaiter forever to deliver a notification.
 #
-# Shorter than the connect bound, because this one is paid REPEATEDLY:
-# a delivery that fails hands the latch back, so the next failed
-# dispatch tries again. The known limit, which is not closed here: on
-# an outage where dispatches fail in ~2 s against a wedged bridge, the
-# connect and send bounds add up to ~15 s per dispatch. That is
-# latency added to work that is already failing, which is the cheap
-# direction — the alternative is a backoff whose own state is a second
-# thing that can go wrong silently.
+# The per-dispatch relay-health alert (#204) no longer pays this on the
+# lock-holding path: the dispatch hook hands it to a tracked background
+# task (#208), so a wedged bridge costs the alert task up to the
+# connect and send bounds and costs the repo lock nothing.
 _NOTIFY_SEND_TIMEOUT_SECONDS = 5
 
 # Strong references to close() tasks nobody is waiting for. Without
@@ -965,10 +958,9 @@ async def send_relay_alert(config, alert) -> bool:
     try:
         # BOUNDED. `connect_notify_transport` already caps its connect,
         # but an accepted socket that then stalls would hold this call
-        # open — and this call is awaited from inside the dispatcher,
-        # after the child has exited, while the pipeline still holds
-        # the repo lock. A hanging send would stall the whole serial
-        # poll cycle to deliver a notification.
+        # open. The whole-sweep alert awaits this directly, and the
+        # per-dispatch alert's background task is only bounded overall
+        # because this step is.
         await asyncio.wait_for(
             transport.send(alert.message()),
             timeout=_NOTIFY_SEND_TIMEOUT_SECONDS,
@@ -1058,6 +1050,126 @@ async def deliver_relay_alert(config, state_db, alert) -> bool:
             ),
         )
     return True
+
+
+# Strong references to per-dispatch alert deliveries that run in the
+# background (#208). Same reason as `_NOTIFY_CLOSE_TASKS`: an
+# unreferenced task can be dropped by the loop mid-send. Also what
+# `drain_relay_alerts` walks at shutdown.
+_RELAY_ALERT_TASKS: dict[asyncio.Task, None] = {}
+
+
+def _relay_alert_deadline_seconds() -> float:
+    """The most one background delivery may take, connect plus send.
+
+    Read at call time so a test that shrinks either bound shrinks this
+    too. One second of slack so the inner bounds fire first and their
+    own log lines say which step stalled.
+    """
+    return _NOTIFY_CONNECT_TIMEOUT_SECONDS + _NOTIFY_SEND_TIMEOUT_SECONDS + 1
+
+
+async def _deliver_relay_alert_bounded(config, state_db, alert) -> bool:
+    """`deliver_relay_alert` with an overall deadline.
+
+    The inner connect and send are each bounded already. This is the
+    backstop for a step between them that is not, so the task can never
+    outlive the alert lease and overlap a second attempt.
+    """
+    try:
+        return await asyncio.wait_for(
+            deliver_relay_alert(config, state_db, alert),
+            timeout=_relay_alert_deadline_seconds(),
+        )
+    except TimeoutError:
+        _log_quietly(
+            "dispatch_health.alert_timed_out",
+            reason=alert.reason,
+            detail=(
+                "the relay-health alert did not finish in time; nothing "
+                "was recorded, so the claim expires and a later failure "
+                "retries"
+            ),
+        )
+        return False
+
+
+def start_relay_alert(config, state_db, alert) -> asyncio.Task:
+    """Deliver the alert in a tracked background task and return it.
+
+    The dispatch hook runs after the child has exited and while the
+    pipeline still holds the repo lock. Awaiting the send there meant a
+    bridge that accepts and never answers held that lock for up to the
+    connect plus send bounds on every failing dispatch, which during an
+    outage is every repository in turn (#208).
+
+    Detaching it is safe because of the lease from #206: only a
+    RECORDED delivery suppresses a repeat. A task that is cancelled,
+    times out, or never runs records nothing, so its claim expires and
+    a later failure retries.
+    """
+    task = asyncio.ensure_future(
+        _deliver_relay_alert_bounded(config, state_db, alert)
+    )
+    _RELAY_ALERT_TASKS[task] = None
+    task.add_done_callback(_relay_alert_finished)
+    return task
+
+
+def _relay_alert_finished(task: asyncio.Task) -> None:
+    """Let go of a finished delivery, and report one that did not finish.
+
+    `deliver_relay_alert` logs its own failures. What only this callback
+    can see is a cancellation (shutdown) or an exception that escaped
+    every guard, and either one silent here is the absent-message fault
+    this alert exists to report.
+    """
+    _RELAY_ALERT_TASKS.pop(task, None)
+    if task.cancelled():
+        _log_quietly(
+            "dispatch_health.alert_cancelled",
+            detail=(
+                "the relay-health alert was cancelled before it was "
+                "delivered; the claim expires and a later failure retries"
+            ),
+        )
+        return
+    error = task.exception()
+    if error is not None:
+        _log_quietly(
+            "dispatch_health.alert_task_failed",
+            cause=error,
+            detail=(
+                "the relay-health alert task raised; nothing was recorded, "
+                "so the claim expires and a later failure retries"
+            ),
+        )
+
+
+async def drain_relay_alerts(grace_seconds: float) -> None:
+    """Give in-flight alert deliveries a short grace, then cancel them.
+
+    Called when the poller stops. A healthy send finishes in
+    milliseconds, so a short wait keeps the message that was nearly out.
+    A wedged one is cancelled rather than waited for: it would delay a
+    stop the operator asked for, and under the lease a cancelled
+    delivery is retried after the restart. Awaits the cancelled tasks
+    so none is left pending when the loop closes.
+    """
+    pending = [t for t in _RELAY_ALERT_TASKS if not t.done()]
+    if not pending:
+        return
+    try:
+        _, still = await asyncio.wait(pending, timeout=grace_seconds)
+    except asyncio.CancelledError:
+        still = {t for t in pending if not t.done()}
+        for t in still:
+            t.cancel()
+        raise
+    for t in still:
+        t.cancel()
+    if still:
+        await asyncio.gather(*still, return_exceptions=True)
 
 
 async def alert_if_sweep_all_failed(config, state_db, results) -> bool:
@@ -1186,7 +1298,8 @@ def make_dispatch_outcome_hook(config, state_db):
             exit_code=outcome.exit_code,
         )
         if alert is not None:
-            await deliver_relay_alert(config, state_db, alert)
+            # Not awaited: this runs while the repo lock is held (#208).
+            start_relay_alert(config, state_db, alert)
 
     return _hook
 
@@ -3251,6 +3364,10 @@ def poller_start(
                     for t in list(pr_watch_tasks):
                         t.cancel()
                     await asyncio.gather(*list(pr_watch_tasks), return_exceptions=True)
+                # Relay-health alerts still in flight (#208): a short
+                # grace for one nearly out, then cancel. A cancelled
+                # delivery records nothing and is retried after restart.
+                await drain_relay_alerts(_NOTIFY_SEND_TIMEOUT_SECONDS)
 
         loop = asyncio.new_event_loop()
         try:
