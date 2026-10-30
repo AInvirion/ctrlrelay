@@ -1054,9 +1054,21 @@ async def deliver_relay_alert(config, state_db, alert) -> bool:
 
 # Strong references to per-dispatch alert deliveries that run in the
 # background (#208). Same reason as `_NOTIFY_CLOSE_TASKS`: an
-# unreferenced task can be dropped by the loop mid-send. Also what
-# `drain_relay_alerts` walks at shutdown.
+# unreferenced task can be dropped by the loop mid-send.
+#
+# Two registries because a delivery is two tasks. The outer one is
+# bounded and always finishes by its deadline. The inner one is the
+# send itself, and a send that swallows its cancellation can outlive
+# the outer one. Tracking it separately is what lets a new delivery see
+# that an old send is still alive, and lets shutdown say so.
 _RELAY_ALERT_TASKS: dict[asyncio.Task, None] = {}
+_RELAY_ALERT_SENDS: dict[asyncio.Task, None] = {}
+
+# How long a cancelled send gets to wind down before it is reported as
+# stuck and left. Never an unbounded await: `asyncio.wait_for` and
+# `gather` both wait for a cancelled coroutine to finish, so a send
+# that ignores the cancellation would hold them forever.
+_RELAY_ALERT_CANCEL_GRACE_SECONDS = 1.0
 
 
 def _relay_alert_deadline_seconds() -> float:
@@ -1069,19 +1081,54 @@ def _relay_alert_deadline_seconds() -> float:
     return _NOTIFY_CONNECT_TIMEOUT_SECONDS + _NOTIFY_SEND_TIMEOUT_SECONDS + 1
 
 
-async def _deliver_relay_alert_bounded(config, state_db, alert) -> bool:
-    """`deliver_relay_alert` with an overall deadline.
+def _live_relay_alert_tasks() -> list[asyncio.Task]:
+    return [
+        t
+        for t in (*_RELAY_ALERT_TASKS, *_RELAY_ALERT_SENDS)
+        if not t.done()
+    ]
 
-    The inner connect and send are each bounded already. This is the
-    backstop for a step between them that is not, so the task can never
-    outlive the alert lease and overlap a second attempt.
+
+async def _deliver_relay_alert_bounded(config, state_db, alert) -> bool:
+    """`deliver_relay_alert` with an overall deadline that really holds.
+
+    Returns within the deadline plus `_RELAY_ALERT_CANCEL_GRACE_SECONDS`,
+    which is well inside the alert lease. Built on `asyncio.wait` rather
+    than `wait_for`, because `wait_for` waits for the coroutine it
+    cancelled and so is no bound against a send that ignores it.
+
+    A send still alive after the cancel grace is logged and left. It
+    stays tracked, and `start_relay_alert` refuses to start another
+    while it lives, so two sends never overlap.
     """
+    send = asyncio.ensure_future(deliver_relay_alert(config, state_db, alert))
+    _RELAY_ALERT_SENDS[send] = None
+    send.add_done_callback(_relay_alert_send_finished)
     try:
-        return await asyncio.wait_for(
-            deliver_relay_alert(config, state_db, alert),
-            timeout=_relay_alert_deadline_seconds(),
+        done, _ = await asyncio.wait(
+            {send}, timeout=_relay_alert_deadline_seconds()
         )
-    except TimeoutError:
+    except asyncio.CancelledError:
+        # Shutdown. The drain waits on the send with its own bound.
+        send.cancel()
+        raise
+    if done:
+        return send.result()
+    send.cancel()
+    _, stuck = await asyncio.wait(
+        {send}, timeout=_RELAY_ALERT_CANCEL_GRACE_SECONDS
+    )
+    if stuck:
+        _log_quietly(
+            "dispatch_health.alert_send_stuck",
+            reason=alert.reason,
+            detail=(
+                "the relay-health alert send ignored its cancellation and "
+                "is still running; no new alert starts until it ends or "
+                "the poller restarts"
+            ),
+        )
+    else:
         _log_quietly(
             "dispatch_health.alert_timed_out",
             reason=alert.reason,
@@ -1091,10 +1138,28 @@ async def _deliver_relay_alert_bounded(config, state_db, alert) -> bool:
                 "retries"
             ),
         )
-        return False
+    return False
 
 
-def start_relay_alert(config, state_db, alert) -> asyncio.Task:
+def _relay_alert_send_finished(task: asyncio.Task) -> None:
+    """Let go of a finished send.
+
+    Reading the exception also stops asyncio from reporting it as never
+    retrieved when the outer task gave up before the send ended.
+    """
+    _RELAY_ALERT_SENDS.pop(task, None)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _log_quietly(
+            "dispatch_health.alert_send_raised",
+            cause=error,
+            detail="the alert was not delivered; the claim will expire",
+        )
+
+
+def start_relay_alert(config, state_db, alert) -> asyncio.Task | None:
     """Deliver the alert in a tracked background task and return it.
 
     The dispatch hook runs after the child has exited and while the
@@ -1107,7 +1172,24 @@ def start_relay_alert(config, state_db, alert) -> asyncio.Task:
     RECORDED delivery suppresses a repeat. A task that is cancelled,
     times out, or never runs records nothing, so its claim expires and
     a later failure retries.
+
+    Returns ``None``, and logs, when an earlier delivery is still alive.
+    Within the lease that cannot happen, because no second claim is
+    granted. Past it, it means a send that ignored its cancellation, and
+    starting another beside it would be two messages in flight.
     """
+    if _live_relay_alert_tasks():
+        _log_quietly(
+            "dispatch_health.alert_already_in_flight",
+            reason=alert.reason,
+            detail=(
+                "an earlier relay-health alert is still being delivered, "
+                "so this one was not started; its claim expires and a "
+                "later failure retries. If this repeats, the bridge is "
+                "holding a send open: restart the bridge or the poller"
+            ),
+        )
+        return None
     task = asyncio.ensure_future(
         _deliver_relay_alert_bounded(config, state_db, alert)
     )
@@ -1146,30 +1228,56 @@ def _relay_alert_finished(task: asyncio.Task) -> None:
         )
 
 
+async def _cancel_relay_alerts() -> None:
+    """Cancel every live delivery and wait for them, with a bound.
+
+    The bounded wait is also what lets their done callbacks run, so the
+    log says each one was cancelled. A send that is still alive after
+    it is reported and left rather than awaited.
+    """
+    live = _live_relay_alert_tasks()
+    if not live:
+        return
+    for t in live:
+        t.cancel()
+    _, stuck = await asyncio.wait(
+        live, timeout=_RELAY_ALERT_CANCEL_GRACE_SECONDS
+    )
+    if stuck:
+        _log_quietly(
+            "dispatch_health.alert_stuck_at_shutdown",
+            stuck=len(stuck),
+            detail=(
+                "a relay-health alert send ignored its cancellation; the "
+                "poller is stopping without it, and nothing was recorded, "
+                "so the alert is retried after the restart"
+            ),
+        )
+
+
 async def drain_relay_alerts(grace_seconds: float) -> None:
     """Give in-flight alert deliveries a short grace, then cancel them.
 
     Called when the poller stops. A healthy send finishes in
     milliseconds, so a short wait keeps the message that was nearly out.
-    A wedged one is cancelled rather than waited for: it would delay a
-    stop the operator asked for, and under the lease a cancelled
-    delivery is retried after the restart. Awaits the cancelled tasks
-    so none is left pending when the loop closes.
+    One still running after the grace is cancelled and given a short
+    bounded wait. One that ignores the cancellation is logged and left
+    rather than allowed to hold up a stop the operator asked for. Under
+    the lease, a delivery that did not finish is retried after the
+    restart.
+
+    If this is itself cancelled during the grace, the deliveries are
+    still cancelled and reported before the cancellation propagates.
     """
-    pending = [t for t in _RELAY_ALERT_TASKS if not t.done()]
+    pending = _live_relay_alert_tasks()
     if not pending:
         return
     try:
-        _, still = await asyncio.wait(pending, timeout=grace_seconds)
+        await asyncio.wait(pending, timeout=grace_seconds)
     except asyncio.CancelledError:
-        still = {t for t in pending if not t.done()}
-        for t in still:
-            t.cancel()
+        await _cancel_relay_alerts()
         raise
-    for t in still:
-        t.cancel()
-    if still:
-        await asyncio.gather(*still, return_exceptions=True)
+    await _cancel_relay_alerts()
 
 
 async def alert_if_sweep_all_failed(config, state_db, results) -> bool:

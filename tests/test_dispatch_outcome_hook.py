@@ -472,6 +472,13 @@ class TestTheHookAlertsExactlyOnce:
     ) -> None:
         from ctrlrelay.cli import make_dispatch_outcome_hook
 
+        """The repeats are suppressed by the RECORDED delivery.
+
+        The first alert is settled before anything else happens, and the
+        lease has expired before the next 47 failures. Without both, a
+        claim that is still live suppresses the repeats on its own, and
+        this test passes for code that never records a delivery.
+        """
         db = StateDB(tmp_path / "state.db")
         spy = SpyTransport()
         hook = make_dispatch_outcome_hook(_config(threshold=3), db)
@@ -479,9 +486,18 @@ class TestTheHookAlertsExactlyOnce:
             "ctrlrelay.cli.connect_notify_transport",
             new=AsyncMock(return_value=spy),
         ):
-            for i in range(50):
+            for i in range(3):
                 await hook(_outcome(f"s-{i}", 1))
             await _settle()
+            assert len(spy.sent) == 1
+            with patch(
+                "ctrlrelay.core.state.time.time",
+                return_value=time.time() + 120,
+            ):
+                for i in range(3, 50):
+                    await hook(_outcome(f"s-{i}", 1))
+                    await asyncio.sleep(0)
+                await _settle()
         db.close()
         assert len(spy.sent) == 1
         assert "3 dispatches in a row" in spy.sent[0]

@@ -85,10 +85,13 @@ async def _cancel_leftovers() -> None:
     # registry does not exist and the test must fail on its assertion
     # rather than on an import.
     tasks = list(getattr(cli_module, "_RELAY_ALERT_TASKS", {}))
+    tasks += list(getattr(cli_module, "_RELAY_ALERT_SENDS", {}))
     for t in tasks:
         t.cancel()
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Bounded: a send that ignores cancellation must not hang the
+        # cleanup. The test that builds one releases it first.
+        await asyncio.wait(tasks, timeout=5)
 
 
 class TestAWedgedBridgeDoesNotHoldTheLock:
@@ -240,12 +243,14 @@ class TestTheBackgroundDeliveryIsBoundedAndVisible:
             db.close()
 
     def test_the_deadline_is_shorter_than_the_lease(self) -> None:
-        """Otherwise a slow delivery could still be running when its
-        claim expires, and a second one would start beside it."""
+        """The deadline plus the cancel grace is the longest a delivery
+        can take to give up. Longer than the lease, and a slow delivery
+        could still be running when its claim expires."""
         from ctrlrelay.core.dispatch_health import DEFAULT_ALERT_LEASE_SECONDS
 
         assert (
             cli_module._relay_alert_deadline_seconds()
+            + cli_module._RELAY_ALERT_CANCEL_GRACE_SECONDS
             < DEFAULT_ALERT_LEASE_SECONDS
         )
 
@@ -307,6 +312,147 @@ class TestShutdown:
                 await cli_module.drain_relay_alerts(5)
             assert len(slowish.sent) == 1
             assert db.get_dispatch_health()["alert_delivered_at"] is not None
+        finally:
+            await _cancel_leftovers()
+            db.close()
+
+
+class IgnoresCancel:
+    """A send that swallows its cancellation and keeps waiting.
+
+    `asyncio.wait_for` waits for the coroutine it cancelled, so a bound
+    built on it is no bound against this. ``release`` is the test's own
+    way out, because nothing else can stop it.
+    """
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+
+    async def send(self, text: str, **kwargs) -> None:
+        self.calls += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self.entered.set()
+        try:
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    continue
+        finally:
+            self.active -= 1
+
+    async def close(self) -> None:
+        return None
+
+
+class TestASendThatIgnoresCancellation:
+    @pytest.mark.asyncio
+    async def test_it_is_bounded_never_overlapped_and_cannot_hang_shutdown(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        hook = cli_module.make_dispatch_outcome_hook(_config(threshold=1), db)
+        stuck = IgnoresCancel()
+        try:
+            with (
+                patch.object(cli_module, "_NOTIFY_CONNECT_TIMEOUT_SECONDS", 0),
+                patch.object(cli_module, "_NOTIFY_SEND_TIMEOUT_SECONDS", 0.1),
+                patch(
+                    "ctrlrelay.cli.connect_notify_transport",
+                    new=AsyncMock(return_value=stuck),
+                ),
+                caplog.at_level(logging.INFO, logger="ctrlrelay"),
+            ):
+                started = time.monotonic()
+                await hook(_outcome("s-0"))
+                assert time.monotonic() - started < 0.5
+                await asyncio.wait_for(stuck.entered.wait(), timeout=5)
+                outer = list(cli_module._RELAY_ALERT_TASKS)
+                assert len(outer) == 1
+
+                # The delivery gives up at its deadline even though the
+                # send it cancelled is still running.
+                done, _ = await asyncio.wait(outer, timeout=10)
+                assert done == set(outer), (
+                    "the delivery waited for a send that ignores cancellation"
+                )
+                assert outer[0].result() is False
+                assert stuck.active == 1
+
+                # The lease expires and the outage continues. No second
+                # send may start beside the one that is still alive.
+                with patch(
+                    "ctrlrelay.core.state.time.time",
+                    return_value=time.time() + 120,
+                ):
+                    for i in range(1, 5):
+                        await hook(_outcome(f"s-{i}"))
+                        await asyncio.sleep(0.05)
+                assert stuck.calls == 1
+                assert stuck.max_active == 1
+                assert any(
+                    r.getMessage() == "dispatch_health.alert_already_in_flight"
+                    for r in caplog.records
+                )
+
+                # Shutdown returns within its bound and says what it left.
+                started = time.monotonic()
+                await asyncio.wait_for(
+                    cli_module.drain_relay_alerts(0.1), timeout=10
+                )
+                took = time.monotonic() - started
+            assert took < 3.0, f"shutdown waited {took:.2f}s"
+            assert any(
+                r.getMessage() == "dispatch_health.alert_stuck_at_shutdown"
+                for r in caplog.records
+            )
+        finally:
+            stuck.release.set()
+            await asyncio.sleep(0)
+            await _cancel_leftovers()
+            sends = list(getattr(cli_module, "_RELAY_ALERT_SENDS", {}))
+            if sends:
+                await asyncio.wait(sends, timeout=5)
+            db.close()
+
+
+class TestAShutdownThatIsItselfCancelled:
+    @pytest.mark.asyncio
+    async def test_the_cancelled_deliveries_are_still_reported(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A second stop during the grace must not skip the log lines
+        that say the alert was not delivered."""
+        db = StateDB(tmp_path / "state.db")
+        hook = cli_module.make_dispatch_outcome_hook(_config(threshold=1), db)
+        wedged = Wedged()
+        try:
+            with (
+                patch(
+                    "ctrlrelay.cli.connect_notify_transport",
+                    new=AsyncMock(return_value=wedged),
+                ),
+                caplog.at_level(logging.INFO, logger="ctrlrelay"),
+            ):
+                await hook(_outcome("s-0"))
+                await asyncio.wait_for(wedged.entered.wait(), timeout=5)
+                drain = asyncio.ensure_future(
+                    cli_module.drain_relay_alerts(30)
+                )
+                await asyncio.sleep(0.05)
+                drain.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(drain, timeout=10)
+                # Read at once: no extra turn of the loop for the
+                # cancelled deliveries to report themselves late.
+                names = [r.getMessage() for r in caplog.records]
+            assert "dispatch_health.alert_cancelled" in names
+            assert cli_module._RELAY_ALERT_TASKS == {}
         finally:
             await _cancel_leftovers()
             db.close()
