@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from ctrlrelay.core.github import GitHubCLI, GitHubError
@@ -117,14 +117,17 @@ def find_repeat_history(
     question: str,
     exclude_session_id: str | None,
 ) -> RepeatHistory | None:
-    """How many times this question was asked before in ``repo`` and
-    never answered, or None when this is the first time.
+    """How many times this question was asked in ``repo`` since it was
+    last answered, or None when there is no such ask: either it was
+    never asked before, or every earlier ask came before an answer.
 
-    Counts every earlier row of the same substance that has no answer:
-    still open, retired on TTL, or retired as resolved elsewhere (which
-    did not stop it coming back, so it was not resolved). An answer
-    resets the count, so only rows created after the latest answered
-    one are counted. ``exclude_session_id`` is the session asking now;
+    Counts every earlier row of the same substance asked after the
+    latest answer: still open, retired on TTL, or retired as resolved
+    elsewhere (which did not stop it coming back, so it was not
+    resolved). The cutoff is when the answer was GIVEN, not when the
+    answered question was asked: an operator who answers Monday's
+    question on Tuesday evening has also answered Tuesday morning's
+    re-ask of it. ``exclude_session_id`` is the session asking now;
     its own row, when a resume re-blocked and rewrote it, is not an
     earlier ask. It is required so a caller cannot forget it and count
     the question as a repeat of itself.
@@ -136,11 +139,12 @@ def find_repeat_history(
         and same_substance(question, row["question"])
     ]
     last_answer = max(
-        (int(r["created_at"]) for r in matches if r["answered_at"] is not None),
+        (int(r["answered_at"]) for r in matches if r["answered_at"] is not None),
         default=None,
     )
-    # Every answered row was created at or before `last_answer`, so the
-    # rows after it are unanswered by construction; no separate check.
+    # A row is answered after it is created, so every answered row was
+    # created at or before `last_answer` and the rows after it are
+    # unanswered by construction; no separate check.
     unanswered = [
         r
         for r in matches
@@ -155,12 +159,18 @@ def find_repeat_history(
 
 
 def format_repeat_note(history: RepeatHistory) -> str:
-    """One plain-text line telling the reader this is not a new question."""
+    """One plain-text line telling the reader this is not a new question.
+
+    The date is UTC and says so: the bridge host's zone is not the
+    reader's, and an unlabelled date can be a day off either way.
+    Raises on a timestamp ``datetime`` cannot represent; the caller
+    owns that, because the question must post without the note.
+    """
     n = history.times_asked_before
     times = "once" if n == 1 else f"{n} times"
-    when = datetime.fromtimestamp(history.last_asked_at)
+    when = datetime.fromtimestamp(history.last_asked_at, timezone.utc)
     return (
-        f"Repeat: asked {times} before, last on {when:%b} {when.day}, "
+        f"Repeat: asked {times} before, last on {when:%b} {when.day} UTC, "
         f"no answer yet."
     )
 

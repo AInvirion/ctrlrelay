@@ -605,10 +605,12 @@ class BridgeServer:
         """The "asked N times before" line for a question about to be
         posted, or None when it is new or there is nothing to look in.
 
-        A failed lookup posts the question without the line and logs
-        that it could not tell. The question reaching the operator
-        matters more than the note on it; the log is what separates
-        "first time asked" from "could not check".
+        Anything that goes wrong, in the lookup OR in rendering the line
+        (a corrupt or millisecond ``created_at`` makes the date raise),
+        posts the question without the line and logs that it could not
+        tell. The question reaching the operator matters more than the
+        note on it; the log is what separates "first time asked" from
+        "could not check".
         """
         if self.state_db is None or not repo:
             return None
@@ -619,6 +621,7 @@ class BridgeServer:
                 question=question,
                 exclude_session_id=session_id,
             )
+            return format_repeat_note(history) if history else None
         except Exception as e:
             log_event(
                 _logger,
@@ -629,13 +632,18 @@ class BridgeServer:
                 error=str(e)[:200],
             )
             return None
-        return format_repeat_note(history) if history else None
 
     def _repeat_note_for_session(
         self, repo: str, session_id: str,
     ) -> str | None:
         """Repeat line for a SEND that names a session: the question is
-        read back from that session's persisted row."""
+        read back from that session's persisted row.
+
+        Only while that row is an open question. Today the one SEND
+        carrying a session is the secops "blocked on <repo>" fan-out,
+        but a session id on a SEND exists to make a message answerable,
+        and an "answer applied" or "expired" notice that gains one later
+        must not be told the question is still waiting."""
         if self.state_db is None:
             return None
         try:
@@ -650,7 +658,11 @@ class BridgeServer:
                 error=str(e)[:200],
             )
             return None
-        if row is None:
+        if (
+            row is None
+            or row["answered_at"] is not None
+            or row["expired_at"] is not None
+        ):
             return None
         return self._repeat_note(repo, row["question"], session_id)
 

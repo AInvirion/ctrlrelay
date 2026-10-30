@@ -1947,7 +1947,7 @@ class TestARepeatedQuestionSaysSo:
         "green, MERGEABLE/CLEAN)?"
     )
 
-    def _db(self, tmp_path, *, earlier_question: str):
+    def _db(self, tmp_path, *, earlier_question: str, scale: int = 1):
         from ctrlrelay.core.state import StateDB
 
         db = StateDB(tmp_path / "state.db")
@@ -1962,12 +1962,16 @@ class TestARepeatedQuestionSaysSo:
             db.execute(
                 "UPDATE pending_resumes SET created_at = ?, expired_at = ?, "
                 "expired_reason = 'ttl' WHERE session_id = ?",
-                (created, created + 172800, f"secops-ai-miner-old{i}"),
+                (
+                    created * scale,
+                    (created + 172800) * scale,
+                    f"secops-ai-miner-old{i}",
+                ),
             )
         db.commit()
         return db
 
-    async def _ask(self, server, socket_path) -> str:
+    async def _ask(self, server, socket_path, *, reply: list | None = None) -> str:
         from unittest.mock import AsyncMock
 
         from ctrlrelay.bridge.protocol import (
@@ -1984,7 +1988,9 @@ class TestARepeatedQuestionSaysSo:
                 repo=self.REPO, session_id="secops-ai-miner-new",
             )).encode())
             await writer.drain()
-            await asyncio.wait_for(reader.readline(), timeout=1)
+            line = await asyncio.wait_for(reader.readline(), timeout=1)
+            if reply is not None:
+                reply.append(line)
         finally:
             writer.close()
             await writer.wait_closed()
@@ -2012,7 +2018,7 @@ class TestARepeatedQuestionSaysSo:
         lines = posted.split("\n")
         assert lines[0] == f"[{self.REPO}]"
         assert lines[1] == (
-            "Repeat: asked 2 times before, last on Oct 28, no answer yet."
+            "Repeat: asked 2 times before, last on Oct 28 UTC, no answer yet."
         )
         assert self.NOW_Q in posted
 
@@ -2071,6 +2077,80 @@ class TestARepeatedQuestionSaysSo:
         assert "Repeat" not in posted
 
     @pytest.mark.asyncio
+    async def test_a_timestamp_the_date_cannot_render_still_posts(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """A millisecond epoch in created_at makes the date raise. That
+        must cost the note, never the question."""
+        from ctrlrelay.bridge.protocol import BridgeOp, parse_message
+        from ctrlrelay.bridge.server import BridgeServer
+
+        db = self._db(tmp_path, earlier_question=self.EARLIER, scale=1000)
+        server = BridgeServer(
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        reply: list = []
+        try:
+            posted = await self._ask(server, socket_path, reply=reply)
+        finally:
+            db.close()
+            await server.stop()
+            task.cancel()
+
+        assert self.NOW_Q in posted
+        assert "Repeat" not in posted
+        assert parse_message(reply[0].decode()).op == BridgeOp.ACK
+
+    @pytest.mark.asyncio
+    async def test_a_send_about_an_answered_session_carries_no_note(
+        self, socket_path, tmp_path,
+    ) -> None:
+        """Same history that earns the fan-out its note, but this
+        session's own row is answered: whatever the SEND says, it is not
+        a question still waiting."""
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.bridge.protocol import (
+            BridgeMessage,
+            BridgeOp,
+            serialize_message,
+        )
+        from ctrlrelay.bridge.server import BridgeServer
+
+        db = self._db(tmp_path, earlier_question=self.EARLIER)
+        db.add_pending_resume(
+            session_id="secops-ai-miner-new", pipeline="secops",
+            repo=self.REPO, question=self.NOW_Q,
+        )
+        assert db.answer_pending_resume("secops-ai-miner-new", "yes")
+        server = BridgeServer(
+            socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.1)
+        server.handler.send = AsyncMock(return_value="902")  # type: ignore[attr-defined]
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            writer.write(serialize_message(BridgeMessage(
+                op=BridgeOp.SEND, request_id="r-applied",
+                text=f"Answer applied on {self.REPO}\n\n{self.NOW_Q}",
+                session_id="secops-ai-miner-new", repo=self.REPO,
+            )).encode())
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=1)
+            sent = server.handler.send.await_args.args[0]  # type: ignore[attr-defined]
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            db.close()
+            await server.stop()
+            task.cancel()
+
+        assert sent == f"Answer applied on {self.REPO}\n\n{self.NOW_Q}"
+
+    @pytest.mark.asyncio
     async def test_the_sweep_fanout_send_carries_it_too(
         self, socket_path, tmp_path,
     ) -> None:
@@ -2121,7 +2201,7 @@ class TestARepeatedQuestionSaysSo:
         lines = sent.split("\n")
         assert lines[0] == f"⏸️ Scheduled secops blocked on {self.REPO}"
         assert lines[1] == (
-            "Repeat: asked 2 times before, last on Oct 28, no answer yet."
+            "Repeat: asked 2 times before, last on Oct 28 UTC, no answer yet."
         )
         assert lines[2] == "Session: secops-ai-miner-new"
         assert sent.endswith(self.NOW_Q)

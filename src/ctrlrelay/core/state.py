@@ -161,6 +161,9 @@ CREATE INDEX IF NOT EXISTS idx_pending_resumes_unanswered
 CREATE INDEX IF NOT EXISTS idx_pending_resumes_answered_unresumed
     ON pending_resumes(answered_at, resumed_at)
     WHERE answered_at IS NOT NULL AND resumed_at IS NULL;
+-- The repeat lookup reads one repo's history on every posted question.
+CREATE INDEX IF NOT EXISTS idx_pending_resumes_repo_created
+    ON pending_resumes(repo, created_at);
 """
 
 
@@ -868,8 +871,9 @@ class StateDB:
         Unfiltered on purpose: deciding whether a question is a repeat
         needs the expired rows (asked, never answered) and the answered
         ones (an answer resets the count), which every other reader here
-        hides. Bounded by the retention prune, so a repo's history is a
-        few hundred rows at most.
+        hides. The retention prune bounds the AGE of finished rows, not
+        their number: a repo's history is however many questions it was
+        asked inside the window, plus every row still open.
         """
         rows = self._conn.execute(
             "SELECT * FROM pending_resumes WHERE repo = ? "

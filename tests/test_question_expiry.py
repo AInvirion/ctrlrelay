@@ -572,12 +572,17 @@ class TestRepeatHistory:
         assert h.last_asked_at == OCT_28_NOON
 
     def test_an_answer_resets_the_count(self, db: StateDB) -> None:
+        """The cutoff is when the answer was given. Here the operator
+        answers day -4's question on day -2, AFTER day -3 re-asked it, so
+        day -3's ask is answered too and only day 0's counts."""
         _row(db, "old1", MINER_Q[0], created_at=OCT_28_NOON - 5 * DAY,
              expired_at=OCT_28_NOON - 3 * DAY,
              expired_reason=EXPIRY_REASON_TTL)
         _row(db, "answered", MINER_Q[1], created_at=OCT_28_NOON - 4 * DAY,
-             answered_at=OCT_28_NOON - 4 * DAY + 60,
-             resumed_at=OCT_28_NOON - 4 * DAY + 120)
+             answered_at=OCT_28_NOON - 2 * DAY,
+             resumed_at=OCT_28_NOON - 2 * DAY + 120)
+        _row(db, "before-answer", MINER_Q[0], created_at=OCT_28_NOON - 3 * DAY,
+             expired_at=OCT_28_NOON - DAY, expired_reason=EXPIRY_REASON_TTL)
         _row(db, "after", MINER_Q[2], created_at=OCT_28_NOON,
              expired_at=OCT_28_NOON + DAY, expired_reason=EXPIRY_REASON_TTL)
 
@@ -610,10 +615,32 @@ class TestRepeatHistory:
 
         assert format_repeat_note(
             RepeatHistory(times_asked_before=6, last_asked_at=OCT_28_NOON)
-        ) == "Repeat: asked 6 times before, last on Oct 28, no answer yet."
+        ) == "Repeat: asked 6 times before, last on Oct 28 UTC, no answer yet."
         assert format_repeat_note(
             RepeatHistory(times_asked_before=1, last_asked_at=OCT_28_NOON)
-        ) == "Repeat: asked once before, last on Oct 28, no answer yet."
+        ) == "Repeat: asked once before, last on Oct 28 UTC, no answer yet."
+
+    def test_the_date_is_utc_whatever_the_host_zone(self, monkeypatch) -> None:
+        """02:00 UTC on 29 Oct is still 28 Oct on a Pacific host. The note
+        says UTC, so it must be the UTC date."""
+        from ctrlrelay.core.question_expiry import (
+            RepeatHistory,
+            format_repeat_note,
+        )
+
+        monkeypatch.setenv("TZ", "America/Los_Angeles")
+        time.tzset()
+        try:
+            note = format_repeat_note(RepeatHistory(
+                times_asked_before=2, last_asked_at=OCT_28_NOON + 14 * 3600,
+            ))
+        finally:
+            monkeypatch.undo()
+            time.tzset()
+
+        assert note == (
+            "Repeat: asked 2 times before, last on Oct 29 UTC, no answer yet."
+        )
 
 
 class TestRetention:
