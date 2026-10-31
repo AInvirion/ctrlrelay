@@ -1694,7 +1694,7 @@ async def run_dev_issue(
             assert outcome.claim is not None
             claim_id = outcome.claim.claim_id
             claim_may_stand = True
-            keeper = ClaimKeeper(github, repo, outcome.claim, claims)
+            keeper = ClaimKeeper(github, repo, issue_number, outcome.claim, claims)
             keeper.start()
 
         # Issue #51: ownership is signaled by ``created_fresh`` returned

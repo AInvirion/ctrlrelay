@@ -1085,20 +1085,24 @@ async def peek_claim_owner(github, repo: str, issue_number: int, settings):
 
 
 def settle_claimed_elsewhere(
-    poller, repo: str, issue_number: int, owner: str, recheck_at,
+    poller, repo: str, issue_number: int, owner: str, recheck_at, settings,
 ) -> str:
     """What to do with an issue another machine holds (#245).
 
-    A claim that can go stale is looked at again when it could; one that
-    cannot (held, or from before #245) stays seen. Returns the log line.
+    A working claim is looked at again when it could go stale. A held
+    one never goes stale, but it can still be released or deleted by
+    hand, so it is looked at again after the stale time too rather than
+    never. Returns the log line.
     """
-    if recheck_at is not None:
-        poller.recheck_at(repo, issue_number, float(recheck_at))
-        return (
-            f"#{issue_number} in {repo} is claimed by {owner}; "
-            "looking again if that claim stops being refreshed."
-        )
-    return f"#{issue_number} in {repo} is claimed by {owner}; skipping."
+    import time as _time
+
+    if recheck_at is None:
+        recheck_at = _time.time() + settings.stale_after_seconds
+    poller.recheck_at(repo, issue_number, float(recheck_at))
+    return (
+        f"#{issue_number} in {repo} is claimed by {owner}; "
+        "skipping it for now."
+    )
 
 
 def settle_pre_dispatch_failure(poller, repo: str, issue_number: int, result):
@@ -2814,7 +2818,7 @@ def poller_start(
             if owner is not None:
                 skipped = settle_claimed_elsewhere(
                     poller, repo, issue_number, owner.node,
-                    owner.stale_at(claims.stale_after_seconds),
+                    owner.stale_at(claims.stale_after_seconds), claims,
                 )
                 console.print(f"[dim]{skipped}[/dim]")
                 return
@@ -2909,7 +2913,7 @@ def poller_start(
                     skipped = settle_claimed_elsewhere(
                         poller, repo, issue_number,
                         result.outputs["claimed_by"],
-                        result.outputs.get("recheck_at"),
+                        result.outputs.get("recheck_at"), claims,
                     )
                     console.print(f"[dim]{skipped}[/dim]")
                     return

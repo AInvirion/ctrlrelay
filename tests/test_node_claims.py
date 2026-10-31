@@ -128,17 +128,36 @@ class TestParsing:
         thread.add(release_marker("bbb"))
         assert [c.node for c in parse_claims(thread.comments, ACCOUNT)] == ["node-a"]
 
-    def test_the_old_failure_retraction_ends_every_claim_before_it(self) -> None:
+    def test_the_old_failure_retraction_ends_the_old_claims_only(self) -> None:
         clock = Clock()
         thread = Thread(clock)
         thread.add("<!-- ctrlrelay:claimed -->")
+        thread.add(claim_body("node-a", "aaa", WORKING, clock()))
+        # A machine still on the old version fails: it must not free node-a.
         thread.add(f"did not finish {DISPATCH_FAILED_MARKER}")
         thread.add(claim_body("node-b", "bbb", WORKING, clock()))
-        assert [c.node for c in parse_claims(thread.comments, ACCOUNT)] == ["node-b"]
+        assert [c.node for c in parse_claims(thread.comments, ACCOUNT)] == [
+            "node-a", "node-b",
+        ]
+
+    def test_a_failure_comment_releases_its_own_claim_and_no_other(self) -> None:
+        from ctrlrelay.pipelines.dev import claim_failure_comment
+
+        clock = Clock()
+        thread = Thread(clock)
+        thread.add(claim_body("node-c", "ccc", HELD, clock()))
+        thread.add(claim_body("node-a", "aaa", WORKING, clock()))
+        thread.add(claim_failure_comment("s", reason="r", exit_code=1, claim_id="aaa"))
+        assert [c.node for c in parse_claims(thread.comments, ACCOUNT)] == ["node-c"]
 
     def test_a_node_name_cannot_break_out_of_the_marker(self) -> None:
-        assert safe_node_name("my host --> x") == "my-host-----x"
-        assert safe_node_name("   ") == "unknown"
+        assert safe_node_name("my host --> x") == "my%20host%20--%3E%20x"
+        with pytest.raises(ValueError):
+            safe_node_name("   ")
+
+    def test_two_different_names_never_become_one(self) -> None:
+        names = ["host a", "host-a", "host_a", "host%20a", "host.a", "host/a"]
+        assert len({safe_node_name(n) for n in names}) == len(names)
 
 
 class TestStaleRule:
@@ -265,7 +284,7 @@ class TestAcquire:
                 raise asyncio.CancelledError
             await asyncio.sleep(0)
 
-        keeper = ClaimKeeper(thread, REPO, a.claim, settings("node-a"), clock=clock, sleep=tick)
+        keeper = ClaimKeeper(thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=tick)
         keeper.start()
         with pytest.raises(asyncio.CancelledError):
             await keeper._task
@@ -299,6 +318,30 @@ class TestAcquire:
         assert not out.won and out.owner.node == "unknown"
 
 
+class TestTheRaceCheckFailsClosed:
+    @pytest.mark.asyncio
+    async def test_a_read_back_that_does_not_show_our_claim_is_not_a_win(self) -> None:
+        from ctrlrelay.core.claims import ClaimNotVisible
+
+        clock = Clock()
+        thread = Thread(clock)
+        reads = 0
+        real_list = thread.list_issue_comments
+
+        async def list_comments(repo, n):
+            nonlocal reads
+            reads += 1
+            return [] if reads == 2 else await real_list(repo, n)
+
+        thread.list_issue_comments = list_comments
+        with pytest.raises(ClaimNotVisible):
+            await acquire_claim(
+                thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+            )
+        # And it released what it posted, so nothing is left holding the issue.
+        assert parse_claims(thread.comments, ACCOUNT) == []
+
+
 class TestKeeper:
     @pytest.mark.asyncio
     async def test_hold_marks_the_claim_held_so_it_never_goes_stale(self) -> None:
@@ -307,7 +350,7 @@ class TestKeeper:
         a = await acquire_claim(
             thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
         )
-        keeper = ClaimKeeper(thread, REPO, a.claim, settings("node-a"), clock=clock)
+        keeper = ClaimKeeper(thread, REPO, 1, a.claim, settings("node-a"), clock=clock)
         keeper.start()
         await keeper.hold()
         assert "state=held" in thread.comments[0]["body"]
@@ -322,8 +365,81 @@ class TestKeeper:
             thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
         )
         thread.comments.clear()  # the comment was deleted
-        keeper = ClaimKeeper(thread, REPO, a.claim, settings("node-a"), clock=clock)
-        await keeper.hold()  # logged, not raised
+        keeper = ClaimKeeper(
+            thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        assert await keeper.hold() is False  # logged, not raised
+
+    @pytest.mark.asyncio
+    async def test_hold_is_retried_so_a_blip_does_not_leave_the_claim_working(
+        self,
+    ) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        real_edit = thread.edit_issue_comment
+        fails = [2]
+
+        async def flaky(repo, cid, body):
+            if fails[0]:
+                fails[0] -= 1
+                raise RuntimeError("502")
+            await real_edit(repo, cid, body)
+
+        thread.edit_issue_comment = flaky
+        keeper = ClaimKeeper(
+            thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        assert await keeper.hold() is True
+        assert "state=held" in thread.comments[0]["body"]
+
+    @pytest.mark.asyncio
+    async def test_a_claim_taken_over_is_not_refreshed_back_into_first_place(
+        self,
+    ) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        # node-a cannot reach GitHub for longer than the stale time ...
+        clock.t += 1801
+        b = await acquire_claim(
+            thread, REPO, 1, settings("node-b"), clock=clock, sleep=no_sleep,
+        )
+        assert b.won
+        # ... then its refresher runs again.
+        ticks = 0
+
+        async def one_tick(_s: float) -> None:
+            nonlocal ticks
+            ticks += 1
+            if ticks > 1:
+                raise asyncio.CancelledError
+            await asyncio.sleep(0)
+
+        keeper = ClaimKeeper(
+            thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=one_tick,
+        )
+        keeper.start()
+        await keeper._task
+        assert keeper.taken_over_by == "node-b"
+        assert other_owner(thread.comments, settings("node-c"), clock()).node == "node-b"
+        assert await keeper.hold() is False
+
+    @pytest.mark.asyncio
+    async def test_a_race_losers_leftover_claim_is_not_a_takeover(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        # node-b lost a race and its release never landed.
+        thread.add(claim_body("node-b", "bbb", WORKING, clock()))
+        keeper = ClaimKeeper(thread, REPO, 1, a.claim, settings("node-a"), clock=clock)
+        assert await keeper._taken_over() is None
 
 
 # --- Through run_dev_issue: two machines, one account, one issue -----------
@@ -476,7 +592,9 @@ class TestThePollerLooksAgainWhenTheClaimCouldGoStale:
         poller = self._poller(tmp_path)
         assert [i["issue"]["number"] for i in await poller.poll()] == [7]
 
-        line = settle_claimed_elsewhere(poller, "o/r", 7, "node-a", 2800.0)
+        line = settle_claimed_elsewhere(
+            poller, "o/r", 7, "node-a", 2800.0, settings("node-b"),
+        )
         assert "node-a" in line
         now[0] = 2799.0
         assert await poller.poll() == []
@@ -484,16 +602,22 @@ class TestThePollerLooksAgainWhenTheClaimCouldGoStale:
         assert [i["issue"]["number"] for i in await poller.poll()] == [7]
 
     @pytest.mark.asyncio
-    async def test_a_claim_that_never_goes_stale_keeps_the_issue_seen(
-        self, tmp_path: Path,
+    async def test_a_held_claim_is_looked_at_again_after_the_stale_time(
+        self, tmp_path: Path, monkeypatch,
     ) -> None:
+        import ctrlrelay.core.poller as poller_mod
         from ctrlrelay.cli import settle_claimed_elsewhere
 
+        now = [1000.0]
+        monkeypatch.setattr(poller_mod.time, "time", lambda: now[0])
+        monkeypatch.setattr("time.time", lambda: now[0])
         poller = self._poller(tmp_path)
         await poller.poll()
-        settle_claimed_elsewhere(poller, "o/r", 7, "node-a", None)
+        settle_claimed_elsewhere(poller, "o/r", 7, "node-a", None, settings("node-b"))
+        now[0] = 2799.0
         assert await poller.poll() == []
-        assert 7 in poller.seen_issues["o/r"]
+        now[0] = 2800.0
+        assert [i["issue"]["number"] for i in await poller.poll()] == [7]
 
 
 class TestClaimsConfig:

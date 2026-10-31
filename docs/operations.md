@@ -361,20 +361,28 @@ start the run and does not announce the issue in chat. It logs
 `working` claim not refreshed for `claims.stale_after_seconds` is stale:
 that machine is treated as stopped, and another machine may take the issue
 (its claim says whose claim it replaced). A skipping machine looks again at
-exactly the time the claim could go stale, not on every poll.
+exactly the time the claim could go stale, not on every poll. If a machine
+whose claim was taken over is in fact still running, it stops refreshing
+its claim and logs `claims.taken_over`; its run is not stopped.
 
 When the run ends:
 
 - **finished, or waiting for an answer**: the claim is marked `held`. A held
   claim never goes stale, so a long wait for an answer never hands the issue
-  to another machine.
+  to another machine. If marking it held fails three times the machine logs
+  `claims.hold_failed`; the claim then goes stale like a working one.
 - **failed**: the failure comment releases that one claim
   (`<!-- ctrlrelay:released id=... -->`), and the issue is free again.
 
 A claim from a version before this (`<!-- ctrlrelay:claimed -->` with no
 machine name) counts as taken by `unknown` and never goes stale.
 
-To free an issue by hand, delete the claim comment.
+If the race check cannot see the claim it just posted, the machine does not
+assume it won: it releases its claim and the run fails before it starts, to
+be retried on a later poll.
+
+To free an issue by hand, delete the claim comment. Other machines look at a
+held issue again every `claims.stale_after_seconds`, and take it then.
 
 | setting | default | |
 |---|---|---|
@@ -390,8 +398,8 @@ Limits to know:
   keeps working can have the issue taken over. Raise
   `claims.stale_after_seconds` if that is likely.
 - Mixed versions: a machine on a version before this one reads every
-  failure comment as ending every claim, including another machine's.
-  Upgrade all machines together.
+  failure comment as ending every claim, including another machine's, and
+  posts claims without a machine name. Upgrade all machines together.
 
 ## Scheduled jobs
 

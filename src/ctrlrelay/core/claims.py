@@ -15,7 +15,8 @@ The rules, in the order they are applied:
   counts as taken by ``unknown`` and never goes stale, because nothing
   ever refreshed it and its age says nothing about whether it is done.
 * ``<!-- ctrlrelay:released id=... -->`` ends one claim. The older
-  failure retraction with no id ends every claim before it.
+  failure retraction with no id ends the older, unnamed claims before it,
+  and never a named one.
 * A ``working`` claim is refreshed by its owner every
   ``refresh_seconds``. One not refreshed for ``stale_after_seconds`` is
   stale: its machine stopped, and another may take the issue. A
@@ -37,6 +38,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 from ctrlrelay.core.obs import get_logger, log_event
 
@@ -57,17 +59,21 @@ HELD = "held"
 _CLAIM_RE = re.compile(r"<!-- ctrlrelay:claimed(?P<attrs>[^>]*?)-->")
 _RELEASE_RE = re.compile(r"<!-- ctrlrelay:released id=(?P<id>[A-Za-z0-9]+) -->")
 _ATTR_RE = re.compile(r"(\w+)=([^\s]+)")
-_NODE_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def safe_node_name(node: str) -> str:
     """The node name as it can sit inside an HTML comment marker.
 
     ``node_id`` is free-form in config (it defaults to the hostname), and
-    a ``>`` or a space would end the marker early or split it.
+    a ``>`` or a space would end the marker early or split it. Percent-
+    encoded rather than replaced, so two different names never become
+    one: ``host a`` and ``host-a`` would otherwise both read as
+    ``host-a``, and each machine would take the other's claim for its own.
     """
-    cleaned = _NODE_UNSAFE.sub("-", node.strip())[:64]
-    return cleaned or UNKNOWN_NODE
+    name = node.strip()
+    if not name:
+        raise ValueError("a machine needs a non-empty node_id to claim issues")
+    return quote(name, safe="._-")
 
 
 @dataclass(frozen=True)
@@ -95,6 +101,8 @@ class Claim:
     claim_id: str | None
     state: str
     updated_at: float | None
+    # The claim id this one took over from, when it replaced a stale one.
+    replaces: str | None = None
 
     def stale_at(self, stale_after: float) -> float | None:
         """When this claim goes stale, or ``None`` if it never does."""
@@ -131,7 +139,7 @@ def claim_body(
     state: str,
     now: float,
     *,
-    taking_over_from: str | None = None,
+    taking_over_from: Claim | None = None,
 ) -> str:
     """The claim comment. ``seen`` changes on every refresh, so the edit
     is a real change and GitHub moves the comment's ``updated_at``."""
@@ -146,14 +154,16 @@ def claim_body(
             "(finished, or waiting for an answer); this machine keeps the "
             "issue."
         )
+    replaces = ""
     if taking_over_from is not None:
         line += (
-            f" The earlier claim by {taking_over_from} was not refreshed "
+            f" The earlier claim by {taking_over_from.node} was not refreshed "
             "in time, so that machine is treated as stopped."
         )
+        replaces = f" replaces={taking_over_from.claim_id}"
     marker = (
-        f"{CLAIM_MARKER_PREFIX} node={node} id={claim_id} state={state} "
-        f"seen={_now_iso(now)} -->"
+        f"{CLAIM_MARKER_PREFIX} node={node} id={claim_id} state={state}"
+        f"{replaces} seen={_now_iso(now)} -->"
     )
     return f"{line}\n\n{marker}"
 
@@ -187,7 +197,11 @@ def parse_claims(comments: list[dict[str, Any]] | None, account: str) -> list[Cl
             claims = [c for c in claims if c.claim_id != gone]
             continue
         if DISPATCH_FAILED_MARKER in body:
-            claims = []
+            # A failure comment with no release id comes from a version
+            # before #245, whose own claim had no id either. It ends those
+            # claims only: on a shared account, a machine still on the old
+            # version must not free a newer machine's claim.
+            claims = [c for c in claims if c.claim_id is not None]
             continue
         match = _CLAIM_RE.search(body)
         if not match:
@@ -209,6 +223,7 @@ def parse_claims(comments: list[dict[str, Any]] | None, account: str) -> list[Cl
                 updated_at=_parse_time(
                     comment.get("updated_at") or comment.get("created_at")
                 ),
+                replaces=attrs.get("replaces"),
             )
         )
     return claims
@@ -243,11 +258,11 @@ def other_owner(
 
 def _stale_owner(
     comments: list[dict[str, Any]] | None, settings: ClaimSettings, now: float,
-) -> str | None:
+) -> Claim | None:
     for claim in parse_claims(comments, settings.account):
         stale_at = claim.stale_at(settings.stale_after_seconds)
         if claim.node != settings.node and stale_at is not None and now >= stale_at:
-            return claim.node
+            return claim
     return None
 
 
@@ -292,8 +307,17 @@ async def acquire_claim(
 
     comments = await github.list_issue_comments(repo, issue_number)
     live = live_claims(comments, settings, clock())
-    winner = live[0] if live else None
-    if winner is None or winner.claim_id == claim_id:
+    if not any(c.claim_id == claim_id for c in live):
+        # The read does not show the claim just posted, so it cannot say
+        # whether an older one is hiding from it too. Not a win: release
+        # ours and let the run fail before it starts, to be retried.
+        await _post_release(github, repo, issue_number, settings, claim_id, None)
+        raise ClaimNotVisible(
+            f"the claim posted on {repo}#{issue_number} was not in the "
+            "comments read back, so the race check could not be decided"
+        )
+    winner = live[0]
+    if winner.claim_id == claim_id:
         log_event(
             _logger, "claims.won", repo=repo, issue_number=issue_number,
             node=settings.node, claim_id=claim_id,
@@ -307,22 +331,42 @@ async def acquire_claim(
         _logger, "claims.lost", repo=repo, issue_number=issue_number,
         node=settings.node, owner=winner.node,
     )
-    try:
-        await github.post_issue_comment(
-            repo, issue_number,
-            backing_off_body(settings.node, winner.node, claim_id),
+    await _post_release(github, repo, issue_number, settings, claim_id, winner.node)
+    return ClaimOutcome(won=False, owner=winner)
+
+
+class ClaimNotVisible(Exception):
+    """The race check could not see the claim it had just posted."""
+
+
+async def _post_release(
+    github: Any,
+    repo: str,
+    issue_number: int,
+    settings: ClaimSettings,
+    claim_id: str,
+    owner: str | None,
+) -> None:
+    if owner is not None:
+        body = backing_off_body(settings.node, owner, claim_id)
+    else:
+        body = (
+            f"Backing off: ctrlrelay on **{settings.node}** could not confirm "
+            "its claim and will try again later.\n\n"
+            f"{release_marker(claim_id)}"
         )
+    try:
+        await github.post_issue_comment(repo, issue_number, body)
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        # Our claim then stands beside the winner's. It is younger, so it
-        # never outranks it, and as a working claim nobody refreshes it
-        # goes stale on its own.
+        # Our claim then stands unreleased. Nobody refreshes it, so as a
+        # working claim it goes stale on its own; until then it is younger
+        # than the winner's and never outranks it.
         log_event(
             _logger, "claims.backoff_failed", repo=repo,
             issue_number=issue_number, error=str(e)[:200],
         )
-    return ClaimOutcome(won=False, owner=winner)
 
 
 class ClaimKeeper:
@@ -337,6 +381,7 @@ class ClaimKeeper:
         self,
         github: Any,
         repo: str,
+        issue_number: int,
         claim: Claim,
         settings: ClaimSettings,
         *,
@@ -353,8 +398,13 @@ class ClaimKeeper:
         self._clock = clock
         self._sleep = sleep
         self._task: asyncio.Task[None] | None = None
+        self.issue_number = issue_number
+        # Set when another machine took the issue over while this run was
+        # still working: the claim went stale (GitHub unreachable for the
+        # whole stale time) and is no longer this machine's.
+        self.taken_over_by: str | None = None
 
-    async def _write(self, state: str) -> None:
+    async def _write(self, state: str) -> bool:
         try:
             await self.github.edit_issue_comment(
                 self.repo, self.claim.comment_id,
@@ -368,10 +418,43 @@ class ClaimKeeper:
                 comment_id=self.claim.comment_id, state=state,
                 error=str(e)[:200],
             )
+            return False
+        return True
+
+    async def _taken_over(self) -> str | None:
+        """Another machine's claim posted after ours and not released:
+        ours went stale and was taken. Refreshing ours now would make it
+        outrank the taker's in every other machine's eyes."""
+        try:
+            comments = await self.github.list_issue_comments(
+                self.repo, self.issue_number,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        # Only a claim that names ours as the one it replaced. A race
+        # loser whose release failed also leaves a later claim, and it
+        # took nothing.
+        for c in parse_claims(comments, self.settings.account):
+            if c.replaces == self.claim_id:
+                return c.node
+        return None
 
     async def _loop(self) -> None:
         while True:
             await self._sleep(self.settings.refresh_seconds)
+            taker = await self._taken_over()
+            if taker is not None:
+                self.taken_over_by = taker
+                _logger.error(
+                    "claims.taken_over",
+                    extra={
+                        "repo": self.repo, "issue_number": self.issue_number,
+                        "node": self.settings.node, "taker": taker,
+                    },
+                )
+                return
             await self._write(WORKING)
 
     def start(self) -> None:
@@ -387,8 +470,28 @@ class ClaimKeeper:
                 pass
             self._task = None
 
-    async def hold(self) -> None:
+    async def hold(self, attempts: int = 3) -> bool:
         """Stop refreshing and mark the claim ``held``: the run is over
-        or waiting on a question, and the issue stays with this machine."""
+        or waiting on a question, and the issue stays with this machine.
+
+        Retried, because a claim left ``working`` goes stale and another
+        machine would take an issue whose run already opened a pull
+        request or asked a question. Returns whether it was written; a
+        claim taken over is not reclaimed.
+        """
         await self.stop()
-        await self._write(HELD)
+        if self.taken_over_by is not None:
+            return False
+        for attempt in range(attempts):
+            if await self._write(HELD):
+                return True
+            if attempt < attempts - 1:
+                await self._sleep(min(5.0 * (attempt + 1), 30.0))
+        _logger.error(
+            "claims.hold_failed",
+            extra={
+                "repo": self.repo, "issue_number": self.issue_number,
+                "comment_id": self.claim.comment_id,
+            },
+        )
+        return False

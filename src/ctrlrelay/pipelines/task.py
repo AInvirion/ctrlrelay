@@ -463,7 +463,7 @@ async def run_task_issue(
                 )
             assert outcome.claim is not None
             claim_id = outcome.claim.claim_id
-            keeper = ClaimKeeper(github, repo, outcome.claim, claims)
+            keeper = ClaimKeeper(github, repo, issue_number, outcome.claim, claims)
             keeper.start()
 
         await worktree.ensure_bare_repo(repo)
