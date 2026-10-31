@@ -358,17 +358,146 @@ class TestKeeper:
         assert other_owner(thread.comments, settings("node-b"), clock()).node == "node-a"
 
     @pytest.mark.asyncio
-    async def test_a_failed_refresh_does_not_raise(self) -> None:
+    async def test_a_hold_that_keeps_failing_does_not_raise(self) -> None:
         clock = Clock()
         thread = Thread(clock)
         a = await acquire_claim(
             thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
         )
         thread.comments.clear()  # the comment was deleted
+
+        async def advance(s: float) -> None:
+            clock.t += s
+            await asyncio.sleep(0)
+
         keeper = ClaimKeeper(
-            thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=no_sleep,
+            thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=advance,
         )
         assert await keeper.hold() is False  # logged, not raised
+        from ctrlrelay.core.claims import _BACKGROUND_HOLDS
+        await asyncio.gather(*list(_BACKGROUND_HOLDS))  # gives up at the stale time
+
+    @pytest.mark.asyncio
+    async def test_a_hold_that_failed_is_written_later_in_the_background(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        real_edit = thread.edit_issue_comment
+        down = [True]
+
+        async def edit(repo, cid, body):
+            if down[0]:
+                raise RuntimeError("503")
+            await real_edit(repo, cid, body)
+
+        async def advance(s: float) -> None:
+            clock.t += s
+            down[0] = clock.t < clock_start + 600  # GitHub back after 10 minutes
+            await asyncio.sleep(0)
+
+        clock_start = clock.t
+        thread.edit_issue_comment = edit
+        keeper = ClaimKeeper(
+            thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=advance,
+        )
+        assert await keeper.hold() is False
+        from ctrlrelay.core.claims import _BACKGROUND_HOLDS
+        await asyncio.gather(*list(_BACKGROUND_HOLDS))
+        assert "state=held" in thread.comments[0]["body"]
+        clock.t += 86400
+        assert other_owner(thread.comments, settings("node-b"), clock()).node == "node-a"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_refresh_leaves_the_loop_running(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        real_edit = thread.edit_issue_comment
+        edits = []
+
+        async def edit(repo, cid, body):
+            edits.append(body)
+            if len(edits) == 1:
+                raise RuntimeError("502")
+            await real_edit(repo, cid, body)
+
+        thread.edit_issue_comment = edit
+        ticks = 0
+
+        async def tick(_s: float) -> None:
+            nonlocal ticks
+            ticks += 1
+            clock.t += 300
+            if ticks > 2:
+                raise asyncio.CancelledError
+            await asyncio.sleep(0)
+
+        keeper = ClaimKeeper(
+            thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=tick,
+        )
+        keeper.start()
+        with pytest.raises(asyncio.CancelledError):
+            await keeper._task
+        assert len(edits) == 2  # the second tick refreshed after the first failed
+        assert thread.comments[0]["updated_at"] != thread.comments[0]["created_at"]
+
+    @pytest.mark.asyncio
+    async def test_no_refresh_when_it_cannot_check_for_a_takeover(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+
+        async def cannot_read(repo, n):
+            raise RuntimeError("502")
+
+        thread.list_issue_comments = cannot_read
+        edits = []
+        real_edit = thread.edit_issue_comment
+
+        async def edit(repo, cid, body):
+            edits.append(body)
+            await real_edit(repo, cid, body)
+
+        thread.edit_issue_comment = edit
+        ticks = 0
+
+        async def tick(_s: float) -> None:
+            nonlocal ticks
+            ticks += 1
+            if ticks > 1:
+                raise asyncio.CancelledError
+            await asyncio.sleep(0)
+
+        keeper = ClaimKeeper(
+            thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=tick,
+        )
+        keeper.start()
+        with pytest.raises(asyncio.CancelledError):
+            await keeper._task
+        assert edits == []
+
+    @pytest.mark.asyncio
+    async def test_the_takeover_mark_survives_the_takers_refresh(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        clock.t += 1801
+        b = await acquire_claim(
+            thread, REPO, 1, settings("node-b"), clock=clock, sleep=no_sleep,
+        )
+        # node-b refreshes before node-a comes back.
+        b_keeper = ClaimKeeper(thread, REPO, 1, b.claim, settings("node-b"), clock=clock)
+        assert await b_keeper._write(WORKING)
+        a_keeper = ClaimKeeper(thread, REPO, 1, a.claim, settings("node-a"), clock=clock)
+        assert await a_keeper._taken_over() == (True, "node-b")
 
     @pytest.mark.asyncio
     async def test_hold_is_retried_so_a_blip_does_not_leave_the_claim_working(
@@ -439,7 +568,7 @@ class TestKeeper:
         # node-b lost a race and its release never landed.
         thread.add(claim_body("node-b", "bbb", WORKING, clock()))
         keeper = ClaimKeeper(thread, REPO, 1, a.claim, settings("node-a"), clock=clock)
-        assert await keeper._taken_over() is None
+        assert await keeper._taken_over() == (True, None)
 
 
 # --- Through run_dev_issue: two machines, one account, one issue -----------

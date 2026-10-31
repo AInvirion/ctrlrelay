@@ -101,7 +101,9 @@ class Claim:
     claim_id: str | None
     state: str
     updated_at: float | None
-    # The claim id this one took over from, when it replaced a stale one.
+    # The claim ids this one took over, comma-separated, when it replaced
+    # stale ones. Kept on every refresh: it is how a machine that comes
+    # back finds out its claim was taken.
     replaces: str | None = None
 
     def stale_at(self, stale_after: float) -> float | None:
@@ -139,7 +141,8 @@ def claim_body(
     state: str,
     now: float,
     *,
-    taking_over_from: Claim | None = None,
+    replaces: str | None = None,
+    taking_over_from: list[Claim] | None = None,
 ) -> str:
     """The claim comment. ``seen`` changes on every refresh, so the edit
     is a real change and GitHub moves the comment's ``updated_at``."""
@@ -154,16 +157,16 @@ def claim_body(
             "(finished, or waiting for an answer); this machine keeps the "
             "issue."
         )
-    replaces = ""
-    if taking_over_from is not None:
+    if taking_over_from:
+        nodes = ", ".join(sorted({c.node for c in taking_over_from}))
         line += (
-            f" The earlier claim by {taking_over_from.node} was not refreshed "
-            "in time, so that machine is treated as stopped."
+            f" The earlier claim by {nodes} was not refreshed in time, so "
+            "that machine is treated as stopped."
         )
-        replaces = f" replaces={taking_over_from.claim_id}"
+    replaced = f" replaces={replaces}" if replaces else ""
     marker = (
         f"{CLAIM_MARKER_PREFIX} node={node} id={claim_id} state={state}"
-        f"{replaces} seen={_now_iso(now)} -->"
+        f"{replaced} seen={_now_iso(now)} -->"
     )
     return f"{line}\n\n{marker}"
 
@@ -256,14 +259,19 @@ def other_owner(
     return None
 
 
-def _stale_owner(
+def _stale_claims(
     comments: list[dict[str, Any]] | None, settings: ClaimSettings, now: float,
-) -> Claim | None:
+) -> list[Claim]:
+    """Other machines' claims that went stale: the ones a new claim takes."""
+    out = []
     for claim in parse_claims(comments, settings.account):
         stale_at = claim.stale_at(settings.stale_after_seconds)
-        if claim.node != settings.node and stale_at is not None and now >= stale_at:
-            return claim
-    return None
+        if (
+            claim.node != settings.node and claim.claim_id is not None
+            and stale_at is not None and now >= stale_at
+        ):
+            out.append(claim)
+    return out
 
 
 async def acquire_claim(
@@ -291,16 +299,20 @@ async def acquire_claim(
         mine = live[0]
         await github.edit_issue_comment(
             repo, mine.comment_id,
-            claim_body(settings.node, mine.claim_id, WORKING, now),
+            claim_body(
+                settings.node, mine.claim_id, WORKING, now, replaces=mine.replaces,
+            ),
         )
         return ClaimOutcome(won=True, claim=mine)
 
     claim_id = secrets.token_hex(6)
+    stale = _stale_claims(comments, settings, now)
+    replaces = ",".join(c.claim_id for c in stale if c.claim_id) or None
     comment_id = await github.post_issue_comment(
         repo, issue_number,
         claim_body(
             settings.node, claim_id, WORKING, now,
-            taking_over_from=_stale_owner(comments, settings, now),
+            replaces=replaces, taking_over_from=stale,
         ),
     )
     await sleep(settings.race_wait_seconds)
@@ -324,7 +336,9 @@ async def acquire_claim(
         )
         return ClaimOutcome(
             won=True,
-            claim=Claim(comment_id, settings.node, claim_id, WORKING, now),
+            claim=Claim(
+                comment_id, settings.node, claim_id, WORKING, now, replaces=replaces,
+            ),
         )
 
     log_event(
@@ -408,7 +422,10 @@ class ClaimKeeper:
         try:
             await self.github.edit_issue_comment(
                 self.repo, self.claim.comment_id,
-                claim_body(self.settings.node, self.claim_id, state, self._clock()),
+                claim_body(
+                    self.settings.node, self.claim_id, state, self._clock(),
+                    replaces=self.claim.replaces,
+                ),
             )
         except asyncio.CancelledError:
             raise
@@ -421,30 +438,41 @@ class ClaimKeeper:
             return False
         return True
 
-    async def _taken_over(self) -> str | None:
-        """Another machine's claim posted after ours and not released:
-        ours went stale and was taken. Refreshing ours now would make it
-        outrank the taker's in every other machine's eyes."""
+    async def _taken_over(self) -> tuple[bool, str | None]:
+        """``(checked, taker)``: whether the comments could be read, and
+        the machine whose claim names ours as the one it replaced.
+
+        Refreshing a claim that was taken would make it outrank the
+        taker's in every other machine's eyes. Only a claim that names
+        ours counts: a race loser whose release failed also leaves a
+        later claim, and it took nothing.
+        """
         try:
             comments = await self.github.list_issue_comments(
                 self.repo, self.issue_number,
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            return None
-        # Only a claim that names ours as the one it replaced. A race
-        # loser whose release failed also leaves a later claim, and it
-        # took nothing.
+        except Exception as e:
+            log_event(
+                _logger, "claims.takeover_check_failed", repo=self.repo,
+                issue_number=self.issue_number, error=str(e)[:200],
+            )
+            return False, None
         for c in parse_claims(comments, self.settings.account):
-            if c.replaces == self.claim_id:
-                return c.node
-        return None
+            if c.replaces and self.claim_id in c.replaces.split(","):
+                return True, c.node
+        return True, None
 
     async def _loop(self) -> None:
         while True:
             await self._sleep(self.settings.refresh_seconds)
-            taker = await self._taken_over()
+            checked, taker = await self._taken_over()
+            if not checked:
+                # Could not tell whether the claim is still ours, so it is
+                # not refreshed this time. One missed tick is far inside
+                # the stale time; refreshing a taken claim is not.
+                continue
             if taker is not None:
                 self.taken_over_by = taker
                 _logger.error(
@@ -474,10 +502,13 @@ class ClaimKeeper:
         """Stop refreshing and mark the claim ``held``: the run is over
         or waiting on a question, and the issue stays with this machine.
 
-        Retried, because a claim left ``working`` goes stale and another
-        machine would take an issue whose run already opened a pull
-        request or asked a question. Returns whether it was written; a
-        claim taken over is not reclaimed.
+        A claim left ``working`` goes stale, and another machine would
+        then take an issue whose run already opened a pull request or
+        asked a question. So it is tried ``attempts`` times here, and if
+        GitHub is still refusing, again in the background every
+        ``refresh_seconds`` until the claim would have gone stale. That
+        background retry lives only as long as this process. Returns
+        whether it was written here; a claim taken over is not reclaimed.
         """
         await self.stop()
         if self.taken_over_by is not None:
@@ -494,4 +525,25 @@ class ClaimKeeper:
                 "comment_id": self.claim.comment_id,
             },
         )
+        task = asyncio.create_task(self._hold_later(self._clock()))
+        _BACKGROUND_HOLDS.add(task)
+        task.add_done_callback(_BACKGROUND_HOLDS.discard)
         return False
+
+    async def _hold_later(self, started: float) -> None:
+        deadline = started + self.settings.stale_after_seconds
+        while self._clock() < deadline:
+            await self._sleep(self.settings.refresh_seconds)
+            checked, taker = await self._taken_over()
+            if taker is not None:
+                return
+            if checked and await self._write(HELD):
+                log_event(
+                    _logger, "claims.hold_recovered", repo=self.repo,
+                    issue_number=self.issue_number,
+                )
+                return
+
+
+# Background hold retries, referenced so they are not collected mid-run.
+_BACKGROUND_HOLDS: set[asyncio.Task[None]] = set()

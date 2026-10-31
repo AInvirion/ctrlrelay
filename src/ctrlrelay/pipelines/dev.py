@@ -354,8 +354,8 @@ def claim_failure_comment(
         f"{next_step}\n\n"
         f"{AGENT_OUTCOME_MARKER}"
         # With a claim id it releases that one claim only (#245). Without
-        # one it ends every claim above it, which on a shared account
-        # would free another machine's claim too.
+        # one it is read as an old-version failure, which ends only the
+        # old, unnamed claims above it.
         + (f"\n{release_marker(claim_id)}" if claim_id else "")
     )
 
