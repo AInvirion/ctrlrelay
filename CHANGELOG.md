@@ -16,14 +16,16 @@ defaults, so **no config edit is required** to upgrade.
 
 ### Changed
 
-- Dev and task agents run with GitHub tokens, gh's login, git credential
-  helpers, SSH and the desktop keyring cut off. After the agent exits the
+- Dev and task agents run with GitHub tokens and gh's login removed from
+  their environment, git credential helpers and git's SSH disabled, and the
+  Linux desktop keyring unreachable. After the agent exits the
   relay pushes the run branch from a relay-private git dir to an explicit
   GitHub URL, opens the PR from the DONE checkpoint, pushes fix rounds,
   fetches failed CI logs and posts task reports. It refuses to push the
   default branch and only overwrites a remote branch whose head it recorded
   pushing. secops keeps GitHub access (#235, closes #219)
-- Status page: the phase bar keeps the furthest phase reached, CI waits are
+- Status page: the phase bar shows the furthest phase seen in the recent
+  transcript and pipeline events, CI waits are
   shown as waiting rather than reading, and the PR is linked (#239, closes
   #238)
 
@@ -39,7 +41,8 @@ defaults, so **no config edit is required** to upgrade.
 ### Known limits
 
 - An agent running as the same OS user can still read credential files on
-  disk unless the bwrap sandbox is on. Running the agent as a separate user
+  disk or run ssh directly unless the bwrap sandbox is on, and the macOS
+  keychain is not covered. Running the agent as a separate user
   is tracked in #236
 
 ## [0.14.0] - 2026-10-31
