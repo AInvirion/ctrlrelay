@@ -1,7 +1,7 @@
 ---
 title: Status page plan
 layout: default
-nav_order: 100
+nav_order: 101
 nav_exclude: true
 ---
 
