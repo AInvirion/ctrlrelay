@@ -8,6 +8,7 @@ back through ``StateDB.list_events``.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import shutil
 import sqlite3
@@ -166,8 +167,10 @@ async def test_dev_run_records_dispatched_pr_ci_review_done(
     result = await _dev_run(tmp_path, db, spawn=_done_state(7))
 
     assert result.success, result
+    # pr_opened lands inside the CI wait: the first verify that returns
+    # is the first time GitHub has answered about the PR.
     assert _kinds(db) == [
-        "dispatched", "pr_opened", "ci_started", "ci_finished",
+        "dispatched", "ci_started", "pr_opened", "ci_finished",
         "review_started", "review_finished", "done",
     ]
     events = _in_order(db)
@@ -176,10 +179,10 @@ async def test_dev_run_records_dispatched_pr_ci_review_done(
     assert {e["issue_number"] for e in events} == {1}
 
     assert events[0]["detail"] == {"pipeline": "dev"}
-    assert events[1]["detail"] == {
+    assert events[1]["detail"] == {"pr_number": 7}
+    assert events[2]["detail"] == {
         "pr_number": 7, "pr_url": "https://github.com/o/r/pull/7",
     }
-    assert events[2]["detail"] == {"pr_number": 7}
     assert events[3]["detail"] == {"pr_number": 7, "ok": True}
     assert events[4]["detail"] == {"pr_number": 7}
     assert events[5]["detail"] == {"pr_number": 7, "ok": True}
@@ -505,9 +508,10 @@ async def test_secops_hold_records_question_held(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_pr_watch_merge_records_merged(tmp_path: Path) -> None:
-    """One row per merge found: none for a watch that times out, one for a
-    merge, and none again for a watcher that resumes an interrupted
-    cleanup of a merge already recorded."""
+    """One row per merge, per session and PR: none for a PR seen open
+    until the watch times out, one for a merge, none again when a watcher
+    resumes the cleanup of a merge already recorded, and one when it
+    resumes the cleanup of a merge that was never recorded."""
     from ctrlrelay.pipelines.post_merge import pr_watch_task
 
     db = StateDB(tmp_path / "state.db")
@@ -519,40 +523,51 @@ async def test_pr_watch_merge_records_merged(tmp_path: Path) -> None:
     open_pr.get_pr_state.return_value = {"state": "OPEN"}
     timed_out = await pr_watch_task(
         repo="o/r", issue_number=76, pr_url="", pr_number=41,
-        session_id="sess-0", github=open_pr, poll_interval=0, timeout=0,
+        session_id="sess-0", github=open_pr, poll_interval=1, timeout=1,
         state_db=db,
     )
     assert timed_out["timed_out"] is True
+    # The watcher saw the PR open, rather than giving up before looking.
+    assert open_pr.get_pr_state.await_count >= 1
+    assert _by_kind(db, "merged") == []
 
     merged_pr = AsyncMock()
     merged_pr.get_pr_state.return_value = {"state": "MERGED"}
-    outcome = await pr_watch_task(
-        repo="o/r", issue_number=77,
-        pr_url="https://github.com/o/r/pull/42", pr_number=42,
-        session_id="sess-1", github=merged_pr, transport_factory=factory,
-        poll_interval=0, timeout=5, state_db=db,
-    )
-    assert outcome["merged"] is True
 
-    db.add_pr_watch(
-        repo="o/r", pr_number=43, issue_number=78, session_id="sess-2",
-        pr_url="https://github.com/o/r/pull/43",
-    )
-    db.set_pr_watch_cleanup_phase("o/r", 43, "commented")
-    resumed = await pr_watch_task(
-        repo="o/r", issue_number=78,
-        pr_url="https://github.com/o/r/pull/43", pr_number=43,
-        session_id="sess-2", github=merged_pr, transport_factory=factory,
-        poll_interval=0, timeout=5, state_db=db,
-    )
-    assert resumed["merged"] is True
+    async def watch(pr: int, issue: int, session: str):
+        return await pr_watch_task(
+            repo="o/r", issue_number=issue,
+            pr_url=f"https://github.com/o/r/pull/{pr}", pr_number=pr,
+            session_id=session, github=merged_pr, transport_factory=factory,
+            poll_interval=0, timeout=5, state_db=db,
+        )
 
-    [merged] = _by_kind(db, "merged")
-    assert merged["detail"] == {
-        "pr_number": 42, "pr_url": "https://github.com/o/r/pull/42",
-    }
-    assert merged["session_id"] == "sess-1"
-    assert merged["issue_number"] == 77
+    def resumable(pr: int, issue: int, session: str) -> None:
+        """A watch row whose cleanup an earlier run started."""
+        db.add_pr_watch(
+            repo="o/r", pr_number=pr, issue_number=issue, session_id=session,
+            pr_url=f"https://github.com/o/r/pull/{pr}",
+        )
+        db.set_pr_watch_cleanup_phase("o/r", pr, "commented")
+
+    assert (await watch(42, 77, "sess-1"))["merged"] is True
+    # Resumed after the merge was recorded: no second row.
+    resumable(42, 77, "sess-1")
+    assert (await watch(42, 77, "sess-1"))["merged"] is True
+    # Resumed after a run that found the merge but never recorded it.
+    resumable(43, 78, "sess-2")
+    assert (await watch(43, 78, "sess-2"))["merged"] is True
+
+    merged = _by_kind(db, "merged")
+    assert [(m["session_id"], m["detail"]) for m in merged] == [
+        ("sess-1", {
+            "pr_number": 42, "pr_url": "https://github.com/o/r/pull/42",
+        }),
+        ("sess-2", {
+            "pr_number": 43, "pr_url": "https://github.com/o/r/pull/43",
+        }),
+    ]
+    assert [m["issue_number"] for m in merged] == [77, 78]
 
 
 # --- bridge -------------------------------------------------------------
@@ -713,3 +728,239 @@ def test_hourly_sweep_prunes_events_past_history(tmp_path: Path) -> None:
     assert [r["detail"] for r in restart] == [
         {"process": "poller", "version": __version__},
     ]
+
+
+# --- review round on 0f47ef6 ----------------------------------------------
+
+
+def test_in_memory_event_write_never_commits_an_open_transaction(
+    caplog,
+) -> None:
+    """In-memory, event writes and prunes fall back to the main connection.
+    With somebody's transaction open there, they must skip rather than
+    join it and commit it."""
+    import logging
+
+    from ctrlrelay.core.events import EventKind, emit_event
+
+    db = StateDB(":memory:")
+    try:
+        db.record_event("dispatched", repo="o/r", ts=1)
+        # Somebody's half-finished write, not yet committed.
+        db.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+            "VALUES ('half', 'dev', 'o/r', 'running', 1)"
+        )
+        assert db._conn.in_transaction
+
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            emit_event(db, EventKind.DONE, lambda: {"repo": "o/r", "ts": 2})
+            assert db.prune_events_nowait(10) == 0
+
+        assert db._conn.in_transaction, "the open transaction was committed"
+        db._conn.rollback()
+        assert db.execute(
+            "SELECT COUNT(*) FROM sessions WHERE id = 'half'"
+        ).fetchone()[0] == 0
+        # Neither the event nor the prune happened.
+        assert [e["ts"] for e in db.list_events()] == [1]
+        skipped = [
+            r for r in caplog.records
+            if r.getMessage() == "events.write_skipped"
+        ]
+        assert [r.kind for r in skipped] == ["done", "prune"]
+
+        # With no transaction open, the fallback still writes and prunes.
+        emit_event(db, EventKind.DONE, lambda: {"repo": "o/r", "ts": 20})
+        assert db.prune_events_nowait(10) == 1
+        assert [e["ts"] for e in db.list_events()] == [20]
+    finally:
+        db.close()
+
+
+def _emit_calls() -> list[tuple[str, int, ast.Call]]:
+    import ctrlrelay
+
+    root = Path(ctrlrelay.__file__).parent
+    calls = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("emit_event", "emit_outcome")
+            ):
+                calls.append((str(path.relative_to(root)), node.lineno, node))
+    return calls
+
+
+def test_no_emit_call_site_evaluates_anything_outside_the_guard() -> None:
+    """Arguments are evaluated before the callee runs, so anything a call
+    site computes can raise in the caller. Every argument must be a bare
+    name, ``self.<name>``, an ``EventKind`` member, or the builder (a
+    lambda or a named local function) whose body runs inside the guard."""
+
+    def plain(node: ast.expr) -> bool:
+        return isinstance(node, ast.Name) or (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in ("self", "EventKind")
+        )
+
+    calls = _emit_calls()
+    # The sweep actually found the call sites (an empty sweep passes).
+    assert len(calls) >= 25, len(calls)
+    bad = []
+    for where, line, call in calls:
+        builder_ok = bool(call.args) and isinstance(
+            call.args[-1], (ast.Lambda, ast.Name)
+        )
+        if call.keywords or not builder_ok or not all(
+            plain(a) for a in call.args[:-1]
+        ):
+            bad.append(f"{where}:{line}")
+    assert bad == []
+
+
+@pytest.mark.asyncio
+async def test_an_alert_whose_fields_raise_is_still_delivered(
+    tmp_path: Path, caplog,
+) -> None:
+    import logging
+
+    import ctrlrelay.cli as cli_module
+
+    class _Alert:
+        reason = "x"
+
+        def __init__(self, token):
+            self.claim_token = token
+
+        @property
+        def consecutive(self):
+            raise RuntimeError("not countable")
+
+    db = StateDB(tmp_path / "state.db")
+    alert = _Alert(db.claim_dispatch_alert(lease_seconds=60))
+
+    with (
+        patch.object(
+            cli_module, "send_relay_alert", new=AsyncMock(return_value=True),
+        ),
+        caplog.at_level(logging.INFO, logger="ctrlrelay"),
+    ):
+        assert await cli_module.deliver_relay_alert(None, db, alert) is True
+
+    failed = [
+        r for r in caplog.records if r.getMessage() == "events.write_failed"
+    ]
+    assert [(r.kind, r.reason) for r in failed] == [("alert_sent", "RuntimeError")]
+    # Not mistaken for an unrecorded delivery: the claim was marked.
+    unrecorded = [
+        r for r in caplog.records
+        if r.getMessage() == "dispatch_health.delivery_unrecorded"
+    ]
+    assert unrecorded == []
+    assert db.list_events() == []
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_fails_before_its_session_exists_records_nothing(
+    tmp_path: Path,
+) -> None:
+    """Setup failures (issue fetch, worktree) end before the `sessions`
+    row is written. A `failed` event there would name a session nothing
+    else knows about."""
+    from ctrlrelay.pipelines.dev import run_dev_issue
+    from ctrlrelay.pipelines.secops import run_secops_all
+    from ctrlrelay.pipelines.task import run_task_issue
+
+    db = StateDB(tmp_path / "state.db")
+    db.record_event("dispatched", repo="o/r", ts=1)  # not an empty table
+
+    github = AsyncMock()
+    github.get_issue.side_effect = RuntimeError("gh down")
+    worktree = AsyncMock()
+    worktree.symlink_context = MagicMock()
+    worktree.remove_context_symlink = MagicMock()
+
+    dev = await run_dev_issue(
+        repo="o/r", issue_number=1, branch_template="fix/issue-{n}",
+        dispatcher=AsyncMock(), github=github, worktree=worktree,
+        dashboard=None, state_db=db, transport=None,
+        contexts_dir=tmp_path / "contexts",
+    )
+    task = await run_task_issue(
+        repo="o/t", issue_number=2, dispatcher=AsyncMock(), github=github,
+        worktree=worktree, dashboard=None, state_db=db, transport=None,
+        contexts_dir=tmp_path / "contexts",
+    )
+    sec_worktree = AsyncMock()
+    sec_worktree.ensure_bare_repo.side_effect = RuntimeError("clone failed")
+    sec_worktree.remove_context_symlink = MagicMock()
+    repo = MagicMock()
+    repo.name = "o/s"
+    repo.automation = None
+    [sec] = await run_secops_all(
+        repos=[repo], dispatcher=AsyncMock(), github=MagicMock(),
+        worktree=sec_worktree, dashboard=None, state_db=db, transport=None,
+        contexts_dir=tmp_path / "contexts",
+    )
+
+    assert not dev.success and not task.success and not sec.success
+    assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    assert _kinds(db) == ["dispatched"]
+
+
+@pytest.mark.asyncio
+async def test_pr_opened_waits_for_github_and_is_recorded_once(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The agent's word that it opened PR 7 is not enough: a verify that
+    never got an answer from GitHub records no pr_opened. Once one does,
+    the PR is recorded once, however many verify rounds follow."""
+    from ctrlrelay.core.pr_verifier import VerificationResult
+    from ctrlrelay.pipelines.dev import run_dev_issue
+
+    _reviewed(monkeypatch)
+
+    async def run(db: StateDB, verify_side_effect):
+        verifier = AsyncMock()
+        verifier.verify.side_effect = verify_side_effect
+        dispatcher = AsyncMock()
+        dispatcher.spawn_session.side_effect = _done_state(7)
+        worktree = AsyncMock()
+        worktree.create_worktree_with_new_branch.return_value = (
+            tmp_path / "wt", True,
+        )
+        worktree.get_default_branch.return_value = "main"
+        worktree.symlink_context = MagicMock()
+        worktree.remove_context_symlink = MagicMock()
+        github = AsyncMock()
+        github.get_issue.return_value = {"number": 1, "title": "x", "body": ""}
+        return await run_dev_issue(
+            repo="o/r", issue_number=1, branch_template="fix/issue-{n}",
+            dispatcher=dispatcher, github=github, worktree=worktree,
+            dashboard=None, state_db=db, transport=None,
+            contexts_dir=tmp_path / "contexts", pr_verifier=verifier,
+            code_review=SimpleNamespace(method="cli", comment_on_pr=False),
+        )
+
+    unconfirmed = StateDB(tmp_path / "a.db")
+    result = await run(unconfirmed, RuntimeError("gh: could not resolve PR"))
+    assert not result.success
+    assert "pr_opened" not in _kinds(unconfirmed)
+    assert "ci_finished" in _kinds(unconfirmed)
+
+    confirmed = StateDB(tmp_path / "b.db")
+    result = await run(confirmed, [
+        VerificationResult(ready=False, reason="1 check(s) failing: ci"),
+        VerificationResult(ready=True),
+    ])
+    assert result.success, result
+    assert _kinds(confirmed).count("ci_started") == 2
+    [opened] = _by_kind(confirmed, "pr_opened")
+    assert opened["detail"] == {
+        "pr_number": 7, "pr_url": "https://github.com/o/r/pull/7",
+    }

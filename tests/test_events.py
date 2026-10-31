@@ -164,7 +164,10 @@ def test_existing_db_gains_events_table(tmp_path: Path) -> None:
 def test_emit_event_writes_a_row(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "s.db")
     try:
-        emit_event(db, EventKind.PR_OPENED, repo="a/b", detail={"pr": 3}, ts=10)
+        emit_event(
+            db, EventKind.PR_OPENED,
+            lambda: {"repo": "a/b", "detail": {"pr": 3}, "ts": 10},
+        )
         events = db.list_events()
         assert len(events) == 1
         assert events[0]["kind"] == "pr_opened"
@@ -183,7 +186,7 @@ def test_emit_event_swallows_failure(
 
         monkeypatch.setattr(db, "record_event_nowait", boom)
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
-            assert emit_event(db, EventKind.DONE, repo="a/b") is None
+            assert emit_event(db, EventKind.DONE, lambda: {"repo": "a/b"}) is None
         failures = [
             r for r in caplog.records if r.getMessage() == "events.write_failed"
         ]
@@ -209,7 +212,7 @@ def test_emit_event_survives_a_broken_log_handler(
 
         monkeypatch.setattr(db, "record_event_nowait", boom)
         monkeypatch.setattr(events_mod, "log_event", broken_log)
-        assert emit_event(db, EventKind.DONE, repo="a/b") is None
+        assert emit_event(db, EventKind.DONE, lambda: {"repo": "a/b"}) is None
     finally:
         db.close()
 
@@ -255,7 +258,7 @@ def test_emit_event_under_a_held_write_lock_is_bounded(
             )
             with caplog.at_level(logging.INFO, logger="ctrlrelay"):
                 start = time.monotonic()
-                assert emit_event(db, EventKind.DONE, ts=200) is None
+                assert emit_event(db, EventKind.DONE, lambda: {"ts": 200}) is None
                 elapsed = time.monotonic() - start
             assert elapsed < 0.6
             # The bound comes from the side connection's own timeout, not
@@ -284,7 +287,7 @@ def test_emit_event_under_a_held_write_lock_is_bounded(
             holder.close()
 
         db.record_event("merged", ts=300)
-        emit_event(db, EventKind.DONE, ts=400)
+        emit_event(db, EventKind.DONE, lambda: {"ts": 400})
         assert [e["ts"] for e in db.list_events()] == [400, 300, 100]
     finally:
         db.close()
@@ -296,7 +299,7 @@ def test_in_memory_db_keeps_emitted_events() -> None:
     connection or the event is lost."""
     db = StateDB(":memory:")
     try:
-        emit_event(db, EventKind.DONE, repo="a/b", ts=10)
+        emit_event(db, EventKind.DONE, lambda: {"repo": "a/b", "ts": 10})
         db.record_event_nowait("merged", ts=20)
         assert [e["kind"] for e in db.list_events()] == ["merged", "done"]
         assert db._event_conn is None
@@ -308,7 +311,7 @@ def test_file_db_uses_a_side_connection(tmp_path: Path) -> None:
     """The in-memory fallback must not swallow the normal case."""
     db = StateDB(tmp_path / "s.db")
     try:
-        emit_event(db, EventKind.DONE, ts=10)
+        emit_event(db, EventKind.DONE, lambda: {"ts": 10})
         assert db._event_conn is not None
         assert db._event_conn is not db._conn
     finally:
@@ -317,7 +320,7 @@ def test_file_db_uses_a_side_connection(tmp_path: Path) -> None:
 
 def test_close_closes_the_event_connection(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "s.db")
-    emit_event(db, EventKind.DONE, ts=1)
+    emit_event(db, EventKind.DONE, lambda: {"ts": 1})
     side = db._event_conn
     assert side is not None
     db.close()
@@ -327,7 +330,7 @@ def test_close_closes_the_event_connection(tmp_path: Path) -> None:
 
 
 def test_emit_event_none_db_is_noop() -> None:
-    assert emit_event(None, EventKind.DONE, repo="a/b") is None
+    assert emit_event(None, EventKind.DONE, lambda: {"repo": "a/b"}) is None
 
 
 def test_event_kind_values() -> None:

@@ -1142,8 +1142,10 @@ async def deliver_relay_alert(config, state_db, alert) -> bool:
         state_db.mark_dispatch_alert_delivered(alert.claim_token)
         emit_event(
             state_db, EventKind.ALERT_SENT,
-            detail={
-                "consecutive_failures": getattr(alert, "consecutive", None),
+            lambda: {
+                "detail": {
+                    "consecutive_failures": getattr(alert, "consecutive", None),
+                },
             },
         )
     except Exception as e:
@@ -3465,7 +3467,9 @@ def poller_start(
             scheduler.start()
             emit_event(
                 state_db, EventKind.RESTART,
-                detail={"process": "poller", "version": __version__},
+                lambda: {
+                    "detail": {"process": "poller", "version": __version__},
+                },
             )
             console.print(
                 f"[dim]Scheduler: secops cron={config.schedules.secops_cron} "

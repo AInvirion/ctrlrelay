@@ -1264,8 +1264,14 @@ class StateDB:
         failure; the side connection is rolled back first.
 
         For an in-memory database there is no file to share, so this
-        falls back to the main connection (and its busy timeout)."""
+        falls back to the main connection (and its busy timeout) - but
+        only when no transaction is open there. Inserting would join that
+        transaction and the commit would publish somebody else's
+        half-finished write, so the event is skipped instead and
+        ``events.write_skipped`` logged."""
         if self._in_memory:
+            if self._main_busy_for_events(kind):
+                return
             self.record_event(
                 kind, repo=repo, issue_number=issue_number,
                 session_id=session_id, detail=detail, ts=ts,
@@ -1282,6 +1288,42 @@ class StateDB:
             except sqlite3.Error:
                 pass
             raise
+
+    def _main_busy_for_events(self, kind: str) -> bool:
+        """For an in-memory database: whether the main connection has a
+        transaction open, in which case an event write or prune must not
+        touch it. Logs ``events.write_skipped`` when it does."""
+        if not self._conn.in_transaction:
+            return False
+        log_event(
+            _logger,
+            "events.write_skipped",
+            kind=str(kind),
+            reason="main_connection_in_transaction",
+        )
+        return True
+
+    def has_pr_event_nowait(
+        self,
+        kind: str,
+        *,
+        repo: str | None,
+        session_id: str | None,
+        pr_number: int,
+    ) -> bool:
+        """Whether an event of ``kind`` exists for this repo, session and
+        ``detail.pr_number``. Read on the event side connection (a plain
+        SELECT on the main connection for an in-memory database, which
+        opens no transaction). Raises on failure."""
+        conn = self._conn if self._in_memory else self._event_connection()
+        row = conn.execute(
+            """SELECT 1 FROM events
+               WHERE kind = ? AND repo IS ? AND session_id IS ?
+                 AND json_extract(detail, '$.pr_number') = ?
+               LIMIT 1""",
+            (str(kind), repo, session_id, int(pr_number)),
+        ).fetchone()
+        return row is not None
 
     def _event_connection(self) -> sqlite3.Connection:
         """The short-timeout side connection for event writes, opened on
@@ -1330,6 +1372,11 @@ class StateDB:
         back first. An in-memory database falls back to the main
         connection, as for :meth:`record_event_nowait`."""
         if self._in_memory:
+            # Same rule as record_event_nowait: never commit a transaction
+            # somebody else has open on the main connection. Skipped, so
+            # nothing was deleted.
+            if self._main_busy_for_events("prune"):
+                return 0
             return self.prune_events(older_than_ts)
         conn = self._event_connection()
         try:

@@ -376,7 +376,9 @@ class BridgeServer:
         # Bound and accepting: this is the moment a restart took effect.
         emit_event(
             self.state_db, EventKind.RESTART,
-            detail={"process": "bridge", "version": __version__},
+            lambda: {
+                "detail": {"process": "bridge", "version": __version__},
+            },
         )
         async with self._server:
             await self._server.serve_forever()
@@ -484,9 +486,13 @@ class BridgeServer:
                         )
                 _log.info("bridge: SEND delivered, request_id=%s", msg.request_id)
                 emit_event(
-                    self.state_db, EventKind.MESSAGE_SENT, repo=msg.repo,
-                    issue_number=msg.issue_number, session_id=msg.session_id,
-                    detail={"request_id": msg.request_id, "chars": len(text)},
+                    self.state_db, EventKind.MESSAGE_SENT,
+                    lambda: {
+                        "repo": msg.repo,
+                        "issue_number": msg.issue_number,
+                        "session_id": msg.session_id,
+                        "detail": {"request_id": msg.request_id, "chars": len(text)},
+                    },
                 )
                 return BridgeMessage(op=BridgeOp.ACK, request_id=msg.request_id, status="sent")
             except Exception as e:
@@ -566,9 +572,13 @@ class BridgeServer:
                     post_id=post_id,
                 )
                 emit_event(
-                    self.state_db, EventKind.QUESTION_POSTED, repo=msg.repo,
-                    issue_number=msg.issue_number, session_id=msg.session_id,
-                    detail={"request_id": msg.request_id},
+                    self.state_db, EventKind.QUESTION_POSTED,
+                    lambda: {
+                        "repo": msg.repo,
+                        "issue_number": msg.issue_number,
+                        "session_id": msg.session_id,
+                        "detail": {"request_id": msg.request_id},
+                    },
                 )
                 return BridgeMessage(
                     op=BridgeOp.ACK, request_id=msg.request_id, status="pending",

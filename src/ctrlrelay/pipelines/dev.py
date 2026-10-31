@@ -18,7 +18,12 @@ from ctrlrelay.core.code_review import (
     run_code_review,
 )
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
-from ctrlrelay.core.events import EventKind, emit_event, emit_outcome
+from ctrlrelay.core.events import (
+    EventKind,
+    emit_event,
+    emit_outcome,
+    not_yet_recorded,
+)
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier, VerificationResult
@@ -936,9 +941,13 @@ async def _review_and_comment(
     # Status page: the review phase runs after the agent has exited, so
     # nothing in its transcript shows it. ``state_db`` None records nothing.
     emit_event(
-        state_db, EventKind.REVIEW_STARTED, repo=repo,
-        issue_number=issue_number, session_id=session_id,
-        detail={"pr_number": pr_number},
+        state_db, EventKind.REVIEW_STARTED,
+        lambda: {
+            "repo": repo,
+            "issue_number": issue_number,
+            "session_id": session_id,
+            "detail": {"pr_number": pr_number},
+        },
     )
     review_ok = False
     try:
@@ -956,9 +965,13 @@ async def _review_and_comment(
     finally:
         # Also on a raise, so the phase does not read as still open.
         emit_event(
-            state_db, EventKind.REVIEW_FINISHED, repo=repo,
-            issue_number=issue_number, session_id=session_id,
-            detail={"pr_number": pr_number, "ok": review_ok},
+            state_db, EventKind.REVIEW_FINISHED,
+            lambda: {
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "detail": {"pr_number": pr_number, "ok": review_ok},
+            },
         )
 
     if not outcome.worth_posting:
@@ -1036,9 +1049,15 @@ async def _verify_and_fix_pr(
 ) -> PipelineResult:
     """Loop: verify CI+mergeability, ask Claude to fix, re-verify.
 
-    ``state_db`` is where the CI-wait start and end events go (status
-    page); required so a caller cannot drop them by omission, and None
-    records nothing.
+    ``state_db`` is where the CI-wait start and end events and the
+    ``pr_opened`` event go (status page); required so a caller cannot
+    drop them by omission, and None records nothing.
+
+    ``pr_opened`` is recorded here, not where the agent first reports a
+    PR number, because this is the first point GitHub has answered about
+    that PR: ``verify`` returns only after at least one successful read of
+    its checks (``wait_for_checks`` raises when every read failed). Once
+    per session and PR, however many verify rounds or resumes reach here.
 
     Lock discipline (issue #29): the verify phase is pure `gh` polling
     and holds no git state, so callers pass a ``lock_handle`` whose
@@ -1058,6 +1077,26 @@ async def _verify_and_fix_pr(
     if pr_number_raw is None:
         return result
     pr_number = int(pr_number_raw)
+    # The agent's outputs that named this PR; `result` is replaced by fix
+    # rounds, whose outputs need not carry the URL.
+    reported_outputs = result.outputs
+
+    def _pr_confirmed() -> dict[str, Any] | None:
+        if not not_yet_recorded(
+            state_db, EventKind.PR_OPENED, repo=ctx.repo,
+            session_id=ctx.session_id, pr_number=pr_number,
+        ):
+            return None
+        pr_url = reported_outputs.get("pr_url")
+        return {
+            "repo": ctx.repo,
+            "issue_number": ctx.issue_number,
+            "session_id": ctx.session_id,
+            "detail": {
+                "pr_number": pr_number,
+                "pr_url": pr_url if isinstance(pr_url, str) else None,
+            },
+        }
 
     async def _run_verify() -> VerificationResult:
         """Release the lock around the pure-gh polling window, then
@@ -1067,13 +1106,18 @@ async def _verify_and_fix_pr(
         if lock_handle is not None:
             lock_handle.release()
         emit_event(
-            state_db, EventKind.CI_STARTED, repo=ctx.repo,
-            issue_number=ctx.issue_number, session_id=ctx.session_id,
-            detail={"pr_number": pr_number},
+            state_db, EventKind.CI_STARTED,
+            lambda: {
+                "repo": ctx.repo,
+                "issue_number": ctx.issue_number,
+                "session_id": ctx.session_id,
+                "detail": {"pr_number": pr_number},
+            },
         )
         ci_ok = False
         try:
             verification = await verifier.verify(ctx.repo, pr_number)
+            emit_event(state_db, EventKind.PR_OPENED, _pr_confirmed)
             ci_ok = verification.ready
             return verification
         except asyncio.CancelledError:
@@ -1084,9 +1128,13 @@ async def _verify_and_fix_pr(
         finally:
             # Also on a raise, so the CI wait does not read as still open.
             emit_event(
-                state_db, EventKind.CI_FINISHED, repo=ctx.repo,
-                issue_number=ctx.issue_number, session_id=ctx.session_id,
-                detail={"pr_number": pr_number, "ok": bool(ci_ok)},
+                state_db, EventKind.CI_FINISHED,
+                lambda: {
+                    "repo": ctx.repo,
+                    "issue_number": ctx.issue_number,
+                    "session_id": ctx.session_id,
+                    "detail": {"pr_number": pr_number, "ok": bool(ci_ok)},
+                },
             )
 
     verification = await _run_verify()
@@ -1248,6 +1296,10 @@ async def run_dev_issue(
     # number that was sitting in the result.
     last_exit_code: int | None = None
 
+    # Whether this run's `sessions` row exists. An event for a session
+    # that was never recorded would name a session nothing else knows.
+    session_row_inserted = False
+
     try:
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
@@ -1329,10 +1381,15 @@ async def run_dev_issue(
             ),
         )
         state_db.commit()
+        session_row_inserted = True
         emit_event(
-            state_db, EventKind.DISPATCHED, repo=repo,
-            issue_number=issue_number, session_id=session_id,
-            detail={"pipeline": "dev"},
+            state_db, EventKind.DISPATCHED,
+            lambda: {
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "detail": {"pipeline": "dev"},
+            },
         )
 
         # Run pipeline
@@ -1406,15 +1463,6 @@ async def run_dev_issue(
         # the same repo can now run their own git-op phases while we wait.
         if result.success and result.outputs.get("pr_number") is not None:
             pr_number_for_review = int(result.outputs["pr_number"])
-            pr_url_raw = result.outputs.get("pr_url")
-            emit_event(
-                state_db, EventKind.PR_OPENED, repo=repo,
-                issue_number=issue_number, session_id=session_id,
-                detail={
-                    "pr_number": pr_number_for_review,
-                    "pr_url": pr_url_raw if isinstance(pr_url_raw, str) else None,
-                },
-            )
             # Starts as a failure, not as "fine". Every branch below
             # overwrites it; this value is what survives if a new
             # branch is ever added that forgets to.
@@ -1589,9 +1637,16 @@ async def run_dev_issue(
                 )
 
         emit_outcome(
-            state_db, status, pipeline="dev", repo=repo,
-            issue_number=issue_number, session_id=session_id,
-            exit_code=result.exit_code, question=result.question,
+            state_db,
+            lambda: {
+                "status": status,
+                "pipeline": "dev",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "exit_code": result.exit_code,
+                "question": result.question,
+            },
         )
 
         # Push event to dashboard
@@ -1670,11 +1725,18 @@ async def run_dev_issue(
             ("failed", f"Error: {e}", int(time.time()), session_id),
         )
         state_db.commit()
-        emit_outcome(
-            state_db, "failed", pipeline="dev", repo=repo,
-            issue_number=issue_number, session_id=session_id,
-            exit_code=last_exit_code,
-        )
+        if session_row_inserted:
+            emit_outcome(
+                state_db,
+                lambda: {
+                    "status": "failed",
+                    "pipeline": "dev",
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "session_id": session_id,
+                    "exit_code": last_exit_code,
+                },
+            )
 
         # Best-effort cleanup so a retry isn't blocked by leftover state.
         # Only touch the branch if THIS session created it (issue #51 —
@@ -2017,9 +2079,16 @@ async def resume_dev_from_pending(
                 )
 
         emit_outcome(
-            state_db, status, pipeline="dev", repo=repo,
-            issue_number=issue_number, session_id=session_id,
-            exit_code=result.exit_code, question=result.question,
+            state_db,
+            lambda: {
+                "status": status,
+                "pipeline": "dev",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "exit_code": result.exit_code,
+                "question": result.question,
+            },
         )
         return result
 
@@ -2031,8 +2100,14 @@ async def resume_dev_from_pending(
         )
         state_db.commit()
         emit_outcome(
-            state_db, "failed", pipeline="dev", repo=repo,
-            issue_number=issue_number, session_id=session_id,
+            state_db,
+            lambda: {
+                "status": "failed",
+                "pipeline": "dev",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+            },
         )
         return PipelineResult(
             success=False,

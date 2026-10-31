@@ -130,9 +130,12 @@ def _question_hold(
             next_post_after=format_utc_timestamp(hold.next_post_at),
         )
         emit_event(
-            state_db, EventKind.QUESTION_HELD, repo=repo,
-            session_id=session_id,
-            detail={"held_until": hold.next_post_at},
+            state_db, EventKind.QUESTION_HELD,
+            lambda: {
+                "repo": repo,
+                "session_id": session_id,
+                "detail": {"held_until": hold.next_post_at},
+            },
         )
     return hold
 
@@ -756,8 +759,12 @@ async def run_secops_all(
             state_db.commit()
             session_row_inserted = True
             emit_event(
-                state_db, EventKind.DISPATCHED, repo=repo,
-                session_id=session_id, detail={"pipeline": "secops"},
+                state_db, EventKind.DISPATCHED,
+                lambda: {
+                    "repo": repo,
+                    "session_id": session_id,
+                    "detail": {"pipeline": "secops"},
+                },
             )
 
             result = await pipeline.run(ctx)
@@ -933,9 +940,16 @@ async def run_secops_all(
                     )
 
             emit_outcome(
-                state_db, status, pipeline="secops", repo=repo,
-                issue_number=None, session_id=session_id,
-                exit_code=result.exit_code, question=result.question,
+                state_db,
+                lambda: {
+                    "status": status,
+                    "pipeline": "secops",
+                    "repo": repo,
+                    "issue_number": None,
+                    "session_id": session_id,
+                    "exit_code": result.exit_code,
+                    "question": result.question,
+                },
             )
 
             if dashboard and result.success:
@@ -1010,10 +1024,16 @@ async def run_secops_all(
                     ("failed", f"Error: {detail}", int(time.time()), session_id),
                 )
                 state_db.commit()
-            emit_outcome(
-                state_db, "failed", pipeline="secops", repo=repo,
-                issue_number=None, session_id=session_id,
-            )
+                emit_outcome(
+                    state_db,
+                    lambda: {
+                        "status": "failed",
+                        "pipeline": "secops",
+                        "repo": repo,
+                        "issue_number": None,
+                        "session_id": session_id,
+                    },
+                )
             failure = PipelineResult(
                 success=False,
                 session_id=session_id,
@@ -1270,9 +1290,16 @@ async def resume_secops_from_pending(
                 )
 
         emit_outcome(
-            state_db, status, pipeline="secops", repo=repo,
-            issue_number=None, session_id=session_id,
-            exit_code=result.exit_code, question=result.question,
+            state_db,
+            lambda: {
+                "status": status,
+                "pipeline": "secops",
+                "repo": repo,
+                "issue_number": None,
+                "session_id": session_id,
+                "exit_code": result.exit_code,
+                "question": result.question,
+            },
         )
         return result
 
@@ -1284,8 +1311,14 @@ async def resume_secops_from_pending(
         )
         state_db.commit()
         emit_outcome(
-            state_db, "failed", pipeline="secops", repo=repo,
-            issue_number=None, session_id=session_id,
+            state_db,
+            lambda: {
+                "status": "failed",
+                "pipeline": "secops",
+                "repo": repo,
+                "issue_number": None,
+                "session_id": session_id,
+            },
         )
         return PipelineResult(
             success=False,

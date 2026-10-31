@@ -385,9 +385,13 @@ async def run_task_issue(
         state_db.commit()
         session_row_inserted = True
         emit_event(
-            state_db, EventKind.DISPATCHED, repo=repo,
-            issue_number=issue_number, session_id=session_id,
-            detail={"pipeline": "task"},
+            state_db, EventKind.DISPATCHED,
+            lambda: {
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "detail": {"pipeline": "task"},
+            },
         )
 
         pipeline = TaskPipeline(
@@ -460,9 +464,16 @@ async def run_task_issue(
                 )
 
         emit_outcome(
-            state_db, status, pipeline="task", repo=repo,
-            issue_number=issue_number, session_id=session_id,
-            exit_code=result.exit_code, question=result.question,
+            state_db,
+            lambda: {
+                "status": status,
+                "pipeline": "task",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "exit_code": result.exit_code,
+                "question": result.question,
+            },
         )
 
         if dashboard and result.success:
@@ -485,10 +496,16 @@ async def run_task_issue(
                 ("failed", f"Error: {e}", int(time.time()), session_id),
             )
             state_db.commit()
-        emit_outcome(
-            state_db, "failed", pipeline="task", repo=repo,
-            issue_number=issue_number, session_id=session_id,
-        )
+            emit_outcome(
+                state_db,
+                lambda: {
+                    "status": "failed",
+                    "pipeline": "task",
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "session_id": session_id,
+                },
+            )
         return PipelineResult(
             success=False,
             session_id=session_id,
@@ -728,9 +745,16 @@ async def resume_task_from_pending(
                 )
 
         emit_outcome(
-            state_db, status, pipeline="task", repo=repo,
-            issue_number=issue_number, session_id=session_id,
-            exit_code=result.exit_code, question=result.question,
+            state_db,
+            lambda: {
+                "status": status,
+                "pipeline": "task",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "exit_code": result.exit_code,
+                "question": result.question,
+            },
         )
         return result
 
@@ -742,8 +766,14 @@ async def resume_task_from_pending(
         )
         state_db.commit()
         emit_outcome(
-            state_db, "failed", pipeline="task", repo=repo,
-            issue_number=issue_number, session_id=session_id,
+            state_db,
+            lambda: {
+                "status": "failed",
+                "pipeline": "task",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+            },
         )
         return PipelineResult(
             success=False,
