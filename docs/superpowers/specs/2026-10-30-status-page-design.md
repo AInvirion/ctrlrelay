@@ -117,15 +117,33 @@ pattern) and a timestamp. Phase is derived from the most recent tool uses:
 - `Read`, `Grep`, `Glob`, read-only shell (`cat`, `sed -n`, `grep`, `ls`, `git log/diff/show`) → **reading**
 - `Edit`, `Write`, `NotebookEdit` → **coding**
 - shell running a test runner (`pytest`, `npm test`, `npx playwright`, `go test`, `cargo test`, `uv run pytest`, ...) → **testing**
+- `ctrlrelay ci wait`, `gh pr checks`, `gh run watch`, `gh run view`, `gh pr view --json statusCheckRollup` → **CI**
 - `git push`, `gh pr create` → **PR**
+
+The bar shows the furthest phase reached (transcript tail plus pipeline events), so it
+never moves back; the card also names the current activity, which can be earlier (a
+read after the PR, a fix round after review) (#238).
 
 If no transcript is found, phase is **unknown**. The agents need no change for this.
 
 ### CI wait and review: ctrlrelay says when it starts and stops them
 
 After the agent exits, the dev pipeline waits for CI and runs the review itself. It
-writes an event when each starts and ends. While one is open for a session, that is
-the session's phase, and the card is not "looks stuck".
+writes an event when each starts and ends. While one is open for a session the card
+is not "looks stuck", and it is the session's current activity if it started after the
+agent's latest transcript step.
+
+### Phase and current activity (#238)
+
+- **phase** (the bar) is the furthest step reached, in the order reading < coding <
+  testing < CI < review < PR, over the transcript tail plus the session's pipeline
+  events (CI wait, review, PR opened). It never moves back, and it can come from
+  history: a CI wait that has finished still counts as reached.
+- **current_activity** is the most recent step by time: an open CI wait or review
+  when it started after the agent's latest transcript step, else that transcript
+  step, else unknown. It can be earlier than the bar (a read after the PR, a fix
+  round after review). `phase_source` says where it came from: `pipeline`,
+  `transcript`, or `none`.
 
 ### Waiting line: the web process asks GitHub (Oscar's choice)
 

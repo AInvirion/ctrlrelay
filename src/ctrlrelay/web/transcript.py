@@ -41,9 +41,27 @@ class Phase(StrEnum):
     UNKNOWN = "unknown"
 
 
+# The order the phase bar moves in. UNKNOWN is not on it.
+PHASE_ORDER = (
+    Phase.READING, Phase.CODING, Phase.TESTING, Phase.CI, Phase.REVIEW, Phase.PR,
+)
+
+
+def furthest_of(*phases: Phase | None) -> Phase:
+    """The phase furthest along ``PHASE_ORDER``, or UNKNOWN when none is on it."""
+    ranked = [p for p in phases if p in PHASE_ORDER]
+    return max(ranked, key=PHASE_ORDER.index) if ranked else Phase.UNKNOWN
+
+
 @dataclass(frozen=True)
 class AgentActivity:
+    """``phase`` is the latest classified step (what the agent is doing now),
+    taken at ``phase_ts``; ``furthest`` is the furthest phase any step in
+    the tail reached (#238)."""
+
     phase: Phase
+    furthest: Phase
+    phase_ts: int | None
     last_command: str | None
     last_step_ts: int | None
     transcript: str | None
@@ -102,6 +120,10 @@ _GIT_WRITE = frozenset({
     "add", "commit", "checkout", "switch", "restore", "stash", "rebase", "merge",
     "reset", "cherry-pick", "apply",
 })
+# Commands that wait on or look at CI (#238). `gh pr view` counts only when
+# it asks for the check rollup.
+_GH_CI = frozenset({("pr", "checks"), ("run", "watch"), ("run", "view")})
+_CI_FIELD = "statusCheckRollup"
 _GH_READ = frozenset({("pr", "view"), ("pr", "list"), ("issue", "view"), ("issue", "list")})
 _INSTALLERS = {
     "npm": frozenset({"install", "add"}),
@@ -213,7 +235,24 @@ def _classify_segment(words: list[str]) -> Phase | None:
         return Phase.PR
     if head == "gh" and rest[:2] == ["pr", "create"]:
         return Phase.PR
+    if head == "ctrlrelay" and rest[:2] == ["ci", "wait"]:
+        return Phase.CI
+    if head == "gh" and tuple(rest[:2]) in _GH_CI:
+        return Phase.CI
+    if head == "gh" and rest[:2] == ["pr", "view"] and _CI_FIELD in _json_fields(rest[2:]):
+        return Phase.CI
     return _read_or_write(head, rest)
+
+
+def _json_fields(words: list[str]) -> set[str]:
+    """The field names a `gh ... --json a,b` asks for."""
+    fields: set[str] = set()
+    for i, word in enumerate(words):
+        if word == "--json" and i + 1 < len(words):
+            fields.update(words[i + 1].split(","))
+        elif word.startswith("--json="):
+            fields.update(word[len("--json="):].split(","))
+    return fields
 
 
 def _read_or_write(head: str, rest: list[str]) -> Phase | None:
@@ -422,6 +461,8 @@ def _tool_uses(lines: list[str]):
 def _unknown(reason: str, transcript: str | None = None) -> AgentActivity:
     return AgentActivity(
         phase=Phase.UNKNOWN,
+        furthest=Phase.UNKNOWN,
+        phase_ts=None,
         last_command=None,
         last_step_ts=None,
         transcript=transcript,
@@ -449,6 +490,8 @@ def read_activity(
         return _unknown(f"transcript unreadable: {exc.__class__.__name__}")
 
     phase: Phase | None = None
+    furthest = Phase.UNKNOWN
+    phase_ts: int | None = None
     last_command: str | None = None
     last_step_ts: int | None = None
     for name, tool_input, timestamp in _tool_uses(lines):
@@ -462,10 +505,14 @@ def read_activity(
             last_command = described
         if classified is not None:
             phase = classified
+            phase_ts = last_step_ts
+            furthest = furthest_of(furthest, classified)
 
     if phase is None:
         return AgentActivity(
             phase=Phase.UNKNOWN,
+            furthest=Phase.UNKNOWN,
+            phase_ts=None,
             last_command=last_command,
             last_step_ts=last_step_ts,
             transcript=str(newest),
@@ -473,6 +520,8 @@ def read_activity(
         )
     return AgentActivity(
         phase=phase,
+        furthest=furthest,
+        phase_ts=phase_ts,
         last_command=last_command,
         last_step_ts=last_step_ts,
         transcript=str(newest),

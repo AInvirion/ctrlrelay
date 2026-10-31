@@ -11,6 +11,7 @@ import pytest
 
 from ctrlrelay.web import transcript as transcript_module
 from ctrlrelay.web.transcript import (
+    OUTSIDE_REPO,
     AgentActivity,
     Phase,
     classify,
@@ -102,6 +103,8 @@ def test_read_activity_from_real_fixture(tmp_path: Path) -> None:
 
     assert activity == AgentActivity(
         phase=Phase.PR,
+        furthest=Phase.PR,
+        phase_ts=LAST_STEP_TS,
         last_command=LAST_COMMAND,
         last_step_ts=LAST_STEP_TS,
         transcript=str(d / "d9f6c0f2.jsonl"),
@@ -547,3 +550,96 @@ def test_a_shell_command_that_says_nothing_keeps_the_last_phase(
     ]
     (d / "t.jsonl").write_text("\n".join(rows) + "\n")
     assert read_activity(WORKTREE, home=tmp_path).phase is Phase.TESTING
+
+
+# --- #238: CI waits are CI, and the furthest phase is kept -------------------
+
+
+@pytest.mark.parametrize("command", [
+    "ctrlrelay ci wait --pr 239",
+    "uv run ctrlrelay ci wait --repo o/r --pr 239",
+    "gh pr checks 239 --watch",
+    "gh run watch 123",
+    "gh run view 123 --log-failed",
+    "gh pr view 239 --json statusCheckRollup",
+    "gh pr view 239 --json state,statusCheckRollup --jq .state",
+    "gh pr view --json=statusCheckRollup",
+    "sleep 30 && gh pr checks 239",
+    "gh pr checks 239 | tail -5",
+])
+def test_ci_watching_commands_are_ci(command: str) -> None:
+    assert classify("Bash", {"command": command}) is Phase.CI
+
+
+@pytest.mark.parametrize(("command", "expected"), [
+    # Neighbours that are not CI waits keep what they had.
+    ("gh pr view 239", Phase.READING),
+    ("gh pr view 239 --json title,body", Phase.READING),
+    ("gh run list", None),
+    ("ctrlrelay ci", None),
+    ("ctrlrelay status", None),
+    ("echo statusCheckRollup", None),
+])
+def test_neighbours_of_ci_commands_are_not_ci(command: str, expected: Phase | None) -> None:
+    assert classify("Bash", {"command": command}) is expected
+
+
+@pytest.mark.parametrize(("command", "shown"), [
+    ("ctrlrelay ci wait --pr 239", "ctrlrelay …"),
+    ("gh pr checks 239 --watch", "gh pr …"),
+    ("gh run watch 123", "gh run …"),
+    ("gh pr view 239 --json statusCheckRollup", "gh pr …"),
+])
+def test_ci_commands_summary_is_still_the_allowlist(command: str, shown: str) -> None:
+    assert summarize_command(command) == shown
+
+
+def _after_pr_rows() -> list[str]:
+    """The measured shape: the agent pushes and opens its PR, then waits on
+    CI and reads files outside its worktree."""
+    return [
+        _assistant_row("Edit", {"file_path": f"{WORKTREE}/src/app.py"},
+                       "2026-10-31T03:00:00.000Z"),
+        _assistant_row("Bash", {"command": "uv run pytest -q"}, "2026-10-31T03:01:00.000Z"),
+        _assistant_row("Bash", {"command": "git push -u origin fix/237"},
+                       "2026-10-31T03:02:00.000Z"),
+        _assistant_row("Bash", {"command": "gh pr create --fill"}, "2026-10-31T03:02:30.000Z"),
+        _assistant_row("Bash", {"command": "ctrlrelay ci wait --pr 239"},
+                       "2026-10-31T03:03:00.000Z"),
+        _assistant_row("Read", {"file_path": "/home/u/notes/README.md"},
+                       "2026-10-31T03:04:00.000Z"),
+    ]
+
+
+def test_reads_after_the_pr_keep_the_furthest_phase(tmp_path: Path) -> None:
+    d = _transcript_dir(tmp_path)
+    (d / "t.jsonl").write_text("\n".join(_after_pr_rows()) + "\n")
+
+    activity = read_activity(WORKTREE, home=tmp_path)
+
+    assert activity.furthest is Phase.PR
+    assert activity.phase is Phase.READING
+    assert activity.last_command == OUTSIDE_REPO
+
+
+def test_furthest_is_the_latest_when_work_only_moves_forward(tmp_path: Path) -> None:
+    """Control: with no step back, furthest and latest agree, so the field
+    is not simply pinned to PR."""
+    d = _transcript_dir(tmp_path)
+    (d / "t.jsonl").write_text("\n".join(_after_pr_rows()[:2]) + "\n")
+
+    activity = read_activity(WORKTREE, home=tmp_path)
+
+    assert activity.furthest is Phase.TESTING
+    assert activity.phase is Phase.TESTING
+
+
+def test_a_ci_wait_after_the_pr_is_the_current_step(tmp_path: Path) -> None:
+    d = _transcript_dir(tmp_path)
+    (d / "t.jsonl").write_text("\n".join(_after_pr_rows()[:5]) + "\n")
+
+    activity = read_activity(WORKTREE, home=tmp_path)
+
+    assert activity.phase is Phase.CI
+    assert activity.furthest is Phase.PR
+    assert activity.last_command == "ctrlrelay …"

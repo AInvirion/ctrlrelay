@@ -324,6 +324,15 @@ function nowOf(data) {
   return typeof data.generated_ts === "number" ? data.generated_ts : Date.now() / 1000;
 }
 
+// The label of a known phase, or null for "unknown" or anything else.
+function phaseLabel(phase) {
+  for (var i = 0; i < PHASES.length; i++) {
+    if (PHASES[i][0] === phase) { return PHASES[i][1]; }
+  }
+  return null;
+}
+
+// The bar shows the furthest phase reached; it never moves back (#238).
 function phaseBar(phase) {
   var bar = el("div", "phases");
   var at = -1;
@@ -348,6 +357,9 @@ function runningCard(card, now) {
     top.appendChild(ghLink(card.url, issueText(card.repo, card.issue_number, card.title), "title"));
   }
   top.appendChild(el("span", "tag", card.pipeline));
+  if (card.pr_url) {
+    top.appendChild(ghLink(card.pr_url, "PR", "tag"));
+  }
   top.appendChild(ticking(card.elapsed_s, "running ", ""));
   if (card.looks_stuck) {
     top.appendChild(el("span", "tag stuck", "looks stuck"));
@@ -356,9 +368,16 @@ function runningCard(card, now) {
   box.appendChild(phaseBar(card.phase));
 
   var last = el("div", "row");
+  // What is happening now, which can be earlier than the bar: a read
+  // after the PR, a fix round after review.
+  var current = phaseLabel(card.current_activity);
   if (card.phase === "unknown") {
     last.appendChild(el("span", "unknown", "phase unknown"));
+  } else if (current === null) {
+    last.appendChild(el("span", "unknown", "current step unknown"));
   } else {
+    last.appendChild(el("span", "muted", "now:"));
+    last.appendChild(el("span", "tag", current));
     last.appendChild(el("span", "muted", card.phase_source === "pipeline"
       ? "ctrlrelay is running this step" : "from the agent's transcript"));
   }

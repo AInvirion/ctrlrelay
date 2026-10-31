@@ -24,8 +24,9 @@ Contract (keys exactly; every timestamp is ``<name>_ts`` epoch seconds plus
     {"version", "host", "generated", "generated_ts",
      "running": [{"session_id", "pipeline", "repo", "issue_number", "title",
                   "started", "started_ts", "elapsed_s", "phase",
-                  "phase_source", "last_command", "last_step", "last_step_ts",
-                  "looks_stuck", "reason", "url"}] | null,
+                  "current_activity", "phase_source", "last_command",
+                  "last_step", "last_step_ts", "looks_stuck", "reason", "url",
+                  "pr_url"}] | null,
      "needs_you": [{"session_id", "pipeline", "repo", "issue_number",
                     "title", "question", "asked", "asked_ts", "held_until",
                     "held_until_ts", "url"}] | null,
@@ -62,12 +63,22 @@ is ``null`` (and ``errors`` says why) only when reading it failed as a
 whole; a single number it could not read is ``null`` inside it, with the
 reason in ``server.unavailable``.
 
-Phase: while ctrlrelay itself has a CI wait or a review open for a session
-(a ``ci_started``/``review_started`` event with no later matching
-``*_finished``, and no poller ``restart`` since), that is the phase
-(``phase_source: "pipeline"``) and the card is never ``looks_stuck``.
-Otherwise the phase comes from the agent's transcript, and the card looks
-stuck when its last step is older than ``stale_after_s``.
+Phase (#238): ``phase`` is the furthest step reached, in the order
+reading < coding < testing < ci < review < pr, over the transcript tail and
+the session's pipeline events (``ci_*``, ``review_*``, ``pr_opened``); the
+bar never moves back, and it can come from history (a CI wait that has
+finished). ``current_activity`` is the most recent step by time: an open
+CI wait or review run by ctrlrelay itself (a ``ci_started``/
+``review_started`` event with no later matching ``*_finished``, and no
+poller ``restart`` since) when it started after the transcript's latest
+classified step, else that transcript step. ``phase_source`` says where
+``current_activity`` came from: ``"pipeline"``, ``"transcript"``, or
+``"none"`` when it is ``"unknown"``. While such a wait or review is open the
+card is never ``looks_stuck``; otherwise it looks stuck when the agent's
+last step is older than ``stale_after_s``.
+``pr_url`` is the session's pull request, built by ``github_url`` from the
+repo and the last int ``pr_number`` its pipeline events carry, else
+``null``; a ``pr_url`` in an event's detail is never used.
 """
 
 from __future__ import annotations
@@ -82,7 +93,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from ctrlrelay.web.links import github_url
-from ctrlrelay.web.transcript import Phase, read_activity
+from ctrlrelay.web.transcript import Phase, furthest_of, read_activity
 from ctrlrelay.web.waiting import SessionsReader
 
 T = TypeVar("T")
@@ -105,6 +116,8 @@ _TODAY = {
 }
 _OPENS = {"ci_started": Phase.CI, "review_started": Phase.REVIEW}
 _CLOSES = {"ci_finished": Phase.CI, "review_finished": Phase.REVIEW}
+# The phase an event shows a session reached, whether or not it is still open.
+_REACHED = {**_OPENS, **_CLOSES, "pr_opened": Phase.PR}
 _EVENTS_UNKNOWN = "CI and review state unknown: events not readable"
 
 
@@ -292,7 +305,7 @@ def _read_needs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 def _read_phase_events(
     conn: sqlite3.Connection, since_ts: int,
 ) -> list[dict[str, Any]]:
-    kinds = [*_OPENS, *_CLOSES, "restart"]
+    kinds = [*_REACHED, "restart"]
     marks = ",".join("?" for _ in kinds)
     rows = conn.execute(
         f"""SELECT id, ts, kind, session_id, detail FROM events
@@ -380,9 +393,10 @@ def _local_day(now: int) -> tuple[int, int]:
     return int(start.timestamp()), int(end.timestamp())
 
 
-def _open_phases(events: list[dict[str, Any]]) -> dict[str, Phase]:
-    """Per session, the most recently started CI wait or review still open."""
-    open_: dict[str, dict[Phase, int]] = {}
+def _open_phases(events: list[dict[str, Any]]) -> dict[str, tuple[Phase, int]]:
+    """Per session, the most recently started CI wait or review still open,
+    and the ``ts`` of the event that started it."""
+    open_: dict[str, dict[Phase, tuple[int, int]]] = {}
     for order, ev in enumerate(events):
         kind = ev["kind"]
         if kind == "restart":
@@ -396,14 +410,37 @@ def _open_phases(events: list[dict[str, Any]]) -> dict[str, Phase]:
         if sid is None:
             continue
         if kind in _OPENS:
-            open_.setdefault(sid, {})[_OPENS[kind]] = order
+            open_.setdefault(sid, {})[_OPENS[kind]] = (order, int(ev["ts"]))
         elif kind in _CLOSES:
             open_.get(sid, {}).pop(_CLOSES[kind], None)
-    return {
-        sid: max(phases, key=phases.__getitem__)
-        for sid, phases in open_.items()
-        if phases
-    }
+    out: dict[str, tuple[Phase, int]] = {}
+    for sid, phases in open_.items():
+        if phases:
+            latest = max(phases, key=lambda p: phases[p][0])
+            out[sid] = (latest, phases[latest][1])
+    return out
+
+
+def _reached(
+    events: list[dict[str, Any]],
+) -> dict[str, tuple[Phase, int | None]]:
+    """Per session, the furthest phase its pipeline events show it reached,
+    and the PR number ctrlrelay recorded for it (the latest positive int
+    ``pr_number`` in those events' detail, else ``None``). A restart closes
+    a wait but does not undo having reached it."""
+    out: dict[str, tuple[Phase, int | None]] = {}
+    for ev in events:
+        sid = ev.get("session_id")
+        phase = _REACHED.get(ev["kind"])
+        if sid is None or phase is None:
+            continue
+        before, pr = out.get(sid, (Phase.UNKNOWN, None))
+        detail = _detail(ev.get("detail"))
+        number = detail.get("pr_number") if isinstance(detail, dict) else None
+        if type(number) is int and number > 0:
+            pr = number
+        out[sid] = (furthest_of(before, phase), pr)
+    return out
 
 
 def _titles(titles: Mapping[str, str] | None) -> dict[tuple[str, int], str]:
@@ -436,7 +473,8 @@ def _card(
     row: dict[str, Any],
     *,
     now: int,
-    pipeline_phases: dict[str, Phase] | None,
+    pipeline_phases: dict[str, tuple[Phase, int]] | None,
+    reached: dict[str, tuple[Phase, int | None]] | None,
     titles: dict[tuple[str, int], str],
     stale_after_s: int,
     home: Path | None,
@@ -447,17 +485,31 @@ def _card(
     reasons = [activity.reason] if activity.reason else []
 
     pipeline_phase = None
+    pipeline_ts: int | None = None
     if pipeline_phases is None:
         reasons.append(_EVENTS_UNKNOWN)
-    else:
-        pipeline_phase = pipeline_phases.get(sid)
+    elif sid in pipeline_phases:
+        pipeline_phase, pipeline_ts = pipeline_phases[sid]
 
-    if pipeline_phase is not None:
-        phase, source = pipeline_phase, "pipeline"
-    elif activity.phase != Phase.UNKNOWN:
-        phase, source = activity.phase, "transcript"
+    reached_phase, pr_number = (reached or {}).get(sid, (Phase.UNKNOWN, None))
+    # The bar shows the furthest phase reached (#238); current_activity
+    # shows what is happening now, which may legitimately be earlier (a
+    # read after the PR, a fix round after review).
+    phase = furthest_of(activity.furthest, pipeline_phase, reached_phase)
+    # The most recent step is the current activity: an open CI wait or
+    # review only when it started after the transcript's latest step.
+    transcript_known = activity.phase != Phase.UNKNOWN
+    pipeline_newer = pipeline_phase is not None and (
+        not transcript_known
+        or activity.phase_ts is None
+        or (pipeline_ts is not None and pipeline_ts > activity.phase_ts)
+    )
+    if pipeline_newer:
+        current, source = pipeline_phase, "pipeline"
+    elif transcript_known:
+        current, source = activity.phase, "transcript"
     else:
-        phase, source = Phase.UNKNOWN, "none"
+        current, source = Phase.UNKNOWN, "none"
 
     looks_stuck = (
         pipeline_phases is not None
@@ -477,6 +529,7 @@ def _card(
         "started_ts": started,
         "elapsed_s": max(0, now - started),
         "phase": str(phase),
+        "current_activity": str(current),
         "phase_source": source,
         "last_command": activity.last_command,
         "last_step": _iso(activity.last_step_ts),
@@ -484,6 +537,9 @@ def _card(
         "looks_stuck": looks_stuck,
         "reason": "; ".join(reasons) or None,
         "url": github_url(row["repo"], issue),
+        # Built from the session's repo and the number ctrlrelay recorded,
+        # never from a URL an agent reported.
+        "pr_url": github_url(row["repo"], pr_number, kind="pull"),
     }
 
 
@@ -587,16 +643,20 @@ def build_status(
                 errors.append(err)
         phase_events = snap["phase_events"]
         pipeline_phases = None
+        reached = None
         if not isinstance(phase_events, _Missing):
             phases = _section(errors, "events", lambda: _open_phases(phase_events))
             pipeline_phases = None if isinstance(phases, _Missing) else phases
+            got = _section(errors, "events", lambda: _reached(phase_events))
+            reached = None if isinstance(got, _Missing) else got
         title_map = _titles(titles)
         # Shaping happens inside the section guard: one row that cannot be
         # shaped makes the whole section unknown, never a shorter list.
         if not isinstance(snap["running"], _Missing):
             cards = _section(errors, "sessions", lambda: [
                 _card(
-                    row, now=now, pipeline_phases=pipeline_phases, titles=title_map,
+                    row, now=now, pipeline_phases=pipeline_phases, reached=reached,
+                    titles=title_map,
                     stale_after_s=stale_after_s, home=home,
                 )
                 for row in snap["running"]
