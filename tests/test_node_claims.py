@@ -549,11 +549,11 @@ class TestKeeper:
         b = await acquire_claim(
             thread, REPO, 1, settings("node-b"), clock=clock, sleep=no_sleep,
         )
-        # node-a comes back and refreshes once (fresh, but replaced).
         a_keeper = ClaimKeeper(thread, REPO, 1, a.claim, settings("node-a"), clock=clock)
-        assert await a_keeper._write(WORKING)
         clock.t += 1801
-        # node-b goes stale; node-c takes over from it ...
+        # node-a comes back and refreshes (fresh, but replaced) just
+        # before node-b, now stale itself, is taken over by node-c ...
+        assert await a_keeper._write(WORKING)
         c = await acquire_claim(
             thread, REPO, 1, settings("node-c"), clock=clock, sleep=no_sleep,
         )
