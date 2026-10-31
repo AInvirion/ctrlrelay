@@ -38,6 +38,7 @@ from typing import Any, Protocol
 from ctrlrelay import __version__
 from ctrlrelay.core.config import Config, WebConfig
 from ctrlrelay.core.obs import get_logger, log_event
+from ctrlrelay.web.health import read_server_health
 from ctrlrelay.web.status import build_status, list_feed
 
 _logger = get_logger("web.server")
@@ -253,11 +254,18 @@ class StatusServer(ThreadingHTTPServer):
     def default_since(self) -> int:
         return int(time.time()) - self.config.web.history_days * 86_400
 
+    def server_health(self) -> dict[str, Any]:
+        return read_server_health(disks=[
+            ("home", Path.home()),
+            ("worktrees", Path(self.config.paths.worktrees)),
+        ])
+
     def status(self) -> dict[str, Any]:
         web = self.config.web
         return build_status(
             db_path=self.config.paths.state_db,
             waiting=self.waiting.snapshot(),
+            server=self.server_health,
             titles=self.waiting.titles(),
             version=__version__,
             host=self.config.node_id,

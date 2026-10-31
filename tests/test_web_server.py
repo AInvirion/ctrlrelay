@@ -44,8 +44,8 @@ HOSTILE_TITLE = "<img src=x onerror=alert(1)>"
 HOSTILE_FILE = '"><script>alert(1)<'
 TOP_KEYS = {
     "version", "host", "generated", "generated_ts", "running", "needs_you",
-    "waiting", "today", "feed", "feed_total", "feed_truncated", "feed_limit",
-    "errors",
+    "waiting", "skipped", "server", "today", "feed", "feed_total",
+    "feed_truncated", "feed_limit", "errors",
 }
 
 
@@ -344,6 +344,10 @@ def test_api_status_contract(tmp_path: Path, serve) -> None:
     assert card["title"] == HOSTILE_TITLE
     assert card["last_command"] == HOSTILE_FILE
     assert out["waiting"]["status"] == "ok"
+    assert card["url"] == f"https://github.com/{ALPHA}/issues/215"
+    # Server health is measured for real, on this machine.
+    assert [d["name"] for d in out["server"]["disks"]] == ["home", "worktrees"]
+    assert out["skipped"] == []
 
 
 def test_api_status_uses_web_settings(tmp_path: Path, serve, monkeypatch) -> None:
@@ -362,6 +366,13 @@ def test_api_status_uses_web_settings(tmp_path: Path, serve, monkeypatch) -> Non
     assert seen["history_days"] == 2
     assert seen["db_path"] == config.paths.state_db
     assert seen["host"] == "test-node"
+    # The health reader measures the home folder and the configured
+    # worktrees folder, and is handed over uncalled, so build_status can
+    # turn a failure into a null section.
+    disks = seen["server"]()["disks"]
+    assert [(d["name"], d["path"]) for d in disks] == [
+        ("home", str(Path.home())), ("worktrees", str(config.paths.worktrees)),
+    ]
 
 
 def test_status_error_is_200_with_errors(tmp_path: Path, serve) -> None:
@@ -885,3 +896,154 @@ def test_all_interfaces_host_is_not_an_allowed_name(tmp_path: Path) -> None:
     assert "0.0.0.0" not in names
     assert {"localhost", "127.0.0.1", "[::1]"} <= names
     assert "192.168.1.20" in allowed_host_names(_config(tmp_path, host="192.168.1.20").web)
+
+
+# --- #232: live feel, links, skipped, server ------------------------------------
+
+
+def _run_js(functions: list[str], expr: str) -> object:
+    """Run some of the page's own functions in node and return ``expr``."""
+    node = shutil.which("node") or shutil.which("nodejs")
+    if node is None:
+        pytest.skip("node is not installed, so the page's script cannot run here")
+    script = _script()
+    defs = []
+    for name in functions:
+        m = re.search(r"\bfunction\s+" + re.escape(name) + r"\s*\(([^)]*)\)", script)
+        assert m, name
+        defs.append(f"function {name}({m.group(1)}) {{{_js_function(script, name)}}}")
+    consts = "\n".join(re.findall(r"^var [A-Z_]+ = /.*?/;$", script, re.M))
+    program = (
+        consts + "\n" + "\n".join(defs)
+        + f"\nprocess.stdout.write(JSON.stringify({expr}));"
+    )
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True,
+                          timeout=30, check=True)
+    return json.loads(done.stdout)
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/example-org/alpha/issues/5",
+    "https://github.com/Org_1.x-y/Repo.Name_2-z/pull/12",
+])
+def test_page_accepts_a_github_issue_or_pr_url(url: str) -> None:
+    assert _run_js(["safeGithubUrl"], f"safeGithubUrl({json.dumps(url)})") == url
+
+
+@pytest.mark.parametrize("url", [
+    "javascript:alert(1)",
+    "http://github.com/example-org/alpha/issues/5",
+    "https://github.com.evil.example/a/b/issues/5",
+    "https://github.com@evil.example/a/b/issues/5",
+    "https://evil.example/https://github.com/a/b/issues/5",
+    "https://github.com/a/b/issues/5\n",
+    "https://github.com/a/b/issues/5#x",
+    "https://github.com/a/b/issues/5?x",
+    "https://github.com/a/b/issues/05",
+    "https://github.com/a/b/issues/0",
+    "https://github.com/a/b/commit/5",
+    "https://github.com/a/b/c/issues/5",
+    "https://github.com/../b/issues/5",
+    "https://github.com/a/./issues/5",
+    "//github.com/a/b/issues/5",
+    "",
+    None,
+    5,
+])
+def test_page_refuses_any_other_url(url: object) -> None:
+    assert _run_js(["safeGithubUrl"], f"safeGithubUrl({json.dumps(url)})") is None
+
+
+def test_every_href_goes_through_one_helper() -> None:
+    """Only ``ghLink`` sets an href, and only to what ``safeGithubUrl``
+    returned; it makes the anchor with createElement, opens a new tab with
+    no opener and no referrer, and writes the text with textContent."""
+    script = _script()
+    helper = _js_function(script, "ghLink")
+    # Present case: the helper really does set an href.
+    assert len(re.findall(r"\.href\s*=", helper)) == 1
+    assert re.search(r"\.href\s*=\s*safe\s*;", helper), helper
+    assert re.search(r"var safe\s*=\s*safeGithubUrl\(url\)\s*;", helper), helper
+    assert 'createElement("a")' in helper or "el(\"a\"" in helper
+    assert re.search(r'\.rel\s*=\s*"noopener noreferrer"', helper)
+    assert re.search(r'\.target\s*=\s*"_blank"', helper)
+    assert "textContent" in helper or "el(" in helper
+    # Nowhere else: no href, no setAttribute of a URL-bearing attribute.
+    outside = script.replace(helper, "")
+    assert not re.search(r"\.href\b", outside), "href set outside ghLink"
+    assert not re.search(r"""setAttribute\(\s*["'](href|src|action|formaction)""", script)
+    assert not re.search(r"""\[\s*["']href["']\s*\]""", script)
+    # And the links are used: one call per section that links.
+    for renderer in ("runningCard", "renderNeeds", "renderWaiting", "renderSkipped",
+                     "renderFeed"):
+        assert "ghLink(" in _js_function(script, renderer), renderer
+
+
+def test_no_server_value_reaches_html_parsing() -> None:
+    """Every node is built with createElement and textContent. The scan for
+    HTML sinks is test_page_source_has_no_html_parsing_dom_sinks; this adds
+    that nothing is written through attributes that run or load code."""
+    script = _script()
+    assert "textContent" in script
+    for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", ".src =",
+                 "location =", "location.href", "window.open", "srcdoc"):
+        assert sink not in script, sink
+
+
+def test_the_header_ticks_every_second() -> None:
+    script = _script()
+    assert re.search(r"setInterval\(\s*tick\s*,\s*1000\s*\)", script)
+    tick = _js_function(script, "tick")
+    assert "updatedAgo(" in tick and "liveness(" in tick and "TICKING" in tick
+    html = _page_source()
+    assert 'id="live-dot"' in html and 'id="updated-ago"' in html
+
+
+@pytest.mark.parametrize(("ok_at", "now", "expected"), [
+    (None, 50_000, "never"),
+    (40_000, 50_000, "live"),       # 10 s: within two 5 s intervals
+    (40_000, 50_001, "stale"),      # just past two intervals
+])
+def test_live_dot_is_green_only_within_two_refresh_intervals(
+    ok_at: int | None, now: int, expected: str,
+) -> None:
+    assert _run_js(["liveness"], f"liveness({json.dumps(ok_at)}, {now}, 5)") == expected
+
+
+@pytest.mark.parametrize(("ok_at", "now", "expected"), [
+    (None, 50_000, "updated never"),
+    (50_000, 50_400, "updated 0s ago"),
+    (40_000, 52_999, "updated 12s ago"),
+    (0, 125_000, "updated 2m ago"),
+])
+def test_updated_ago_counts_seconds(ok_at, now, expected) -> None:
+    got = _run_js(["updatedAgo", "duration"], f"updatedAgo({json.dumps(ok_at)}, {now})")
+    assert got == expected
+
+
+def test_elapsed_times_tick_from_the_server_value() -> None:
+    """A running card's elapsed time is the server's ``elapsed_s`` plus the
+    whole seconds since that answer arrived, so it moves between polls."""
+    assert _run_js(["tickedSeconds"], "tickedSeconds(100, 1000, 4999)") == 103
+    assert _run_js(["tickedSeconds"], "tickedSeconds(100, 1000, 1000)") == 100
+    assert _run_js(["tickedSeconds"], "tickedSeconds(null, 1000, 4999)") is None
+    card = _js_function(_script(), "runningCard")
+    assert "ticking(" in card
+
+
+def test_skipped_section_is_collapsed_with_a_count() -> None:
+    html = _page_source()
+    m = re.search(r"<details[^>]*id=\"skipped-box\"[^>]*>", html)
+    assert m, "no skipped <details>"
+    assert " open" not in m.group(0)
+    assert 'id="skipped-count"' in html
+    body = _js_function(_script(), "renderSkipped")
+    assert re.search(r'setCount\("skipped-count",\s*null\)', body)
+
+
+def test_server_panel_flags_low_memory_and_disk() -> None:
+    body = _js_function(_script(), "renderServer")
+    assert re.search(r'm\.low === true \? " low"', body), body
+    assert re.search(r'd\.low === true \? " low"', body), body
+    assert ".server .line.low" in _page_source()
+    assert 'id="server"' in _page_source()

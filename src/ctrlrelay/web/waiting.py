@@ -27,9 +27,17 @@ from typing import Any
 from ctrlrelay.core.config import Config
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.poller import IssuePoller
+from ctrlrelay.web.links import github_url
 
 REASON_CONFIRM = "waits for the poller to confirm the assignment"
 REASON_NEXT_POLL = "next poll"
+
+# Why an assigned open issue will not be picked up (#232). With
+# "missing required label X" and "excluded label X" these are the only
+# reasons a skipped item carries.
+REASON_NOT_CONFIGURED = "repo not in config"
+REASON_SEEN = "already handled once (won't retry)"
+REASON_FOREIGN = "assigned by someone else"
 
 # How long a "not self-assigned" answer is trusted before it is asked again.
 # A "self-assigned" answer is kept while the issue is unchanged: the cache is
@@ -54,6 +62,18 @@ SessionsReader = Callable[[], tuple[list[dict[str, Any]], dict[str, str]]]
 
 @dataclass(frozen=True)
 class WaitingItem:
+    repo: str
+    issue_number: int
+    title: str
+    reason: str
+    updated_ts: int
+
+
+@dataclass(frozen=True)
+class SkippedItem:
+    """An open issue assigned to the operator that the poller will not
+    pick up, and why."""
+
     repo: str
     issue_number: int
     title: str
@@ -143,7 +163,31 @@ def compute_waiting(
     assignments: Mapping[str, bool] | None = None,
     username: str = "",
 ) -> list[WaitingItem]:
-    """What the poller would pick up next, in the order it would take it.
+    """What the poller would pick up next, in the order it would take it:
+    the waiting half of :func:`classify_issues`."""
+    return classify_issues(
+        config, issues, seen=seen, running=running, locks=locks,
+        assignments=assignments, username=username,
+    )[0]
+
+
+def _missing_required(require_labels: list[str]) -> str:
+    # The poller's check is any-of, so every label that would do is named.
+    return "missing required label " + " or ".join(require_labels)
+
+
+def classify_issues(
+    config: Config,
+    issues: list[dict[str, Any]],
+    *,
+    seen: set[str],
+    running: list[dict[str, Any]],
+    locks: dict[str, str],
+    assignments: Mapping[str, bool] | None = None,
+    username: str = "",
+) -> tuple[list[WaitingItem], list[SkippedItem]]:
+    """Every issue, sorted into what the poller would pick up next
+    (waiting) and the assigned issues it will not (skipped, with why).
 
     ``issues`` are ``GitHubCLI.search_assigned_issues`` rows, followed by
     rows from ``list_issues_by_label`` marked ``VIA_LABEL``. The search is
@@ -153,16 +197,27 @@ def compute_waiting(
 
     ``assignments`` holds the self-assignment check, keyed like ``seen``,
     for issues admitted by assignment alone in a repo that does not accept
-    foreign assignments: ``True`` waits normally, ``False`` is dropped (the
-    poller will not take it), and a missing key means the check could not
-    be made, so the item says it waits for that confirmation.
+    foreign assignments: ``True`` waits normally, ``False`` is skipped
+    (the poller will not take it), and a missing key means the check could
+    not be made, so the item waits for that confirmation.
 
-    Order: config repo order (the poller walks ``config.repos``), then
-    GitHub's order within a repo, assignee rows before label-only rows.
+    Each assignee-search row lands in exactly one of waiting, skipped or
+    running; a label-only row that nobody assigned to the operator is
+    never "skipped", because it was never assigned. The rules are the
+    poller's own static checks. A skipped issue's reason is the first that
+    applies of: repo not in config, excluded label, already handled once,
+    missing required label, assigned by someone else. An excluded issue is
+    also marked seen by the poller, so the label is checked first: it is
+    the reason the issue is held back.
+
+    Waiting order: config repo order (the poller walks ``config.repos``),
+    then GitHub's order within a repo, assignee rows before label-only
+    rows. Skipped order: the same for configured repos, then the issues of
+    repos not in the config, in GitHub's order.
     """
     assignments = assignments or {}
     running_keys = {
-        seen_key(s.get("repo") or "", int(s["issue_number"]))
+        seen_key(s.get("repo") or "", int(s["issue_number"])).lower()
         for s in running
         if s.get("issue_number") is not None
     }
@@ -171,8 +226,23 @@ def compute_waiting(
         by_repo.setdefault(str(issue.get("repo") or "").lower(), []).append(issue)
 
     items: list[WaitingItem] = []
+    skipped: list[SkippedItem] = []
+
+    def skip(repo: str, issue: dict[str, Any], number: int, reason: str) -> None:
+        if issue.get(VIA_LABEL):
+            return
+        skipped.append(SkippedItem(
+            repo=repo,
+            issue_number=number,
+            title=str(issue.get("title") or ""),
+            reason=reason,
+            updated_ts=_parse_ts(issue.get("updatedAt")),
+        ))
+
+    configured = set()
     for repo_cfg in config.repos:
         repo = repo_cfg.name
+        configured.add(repo.lower())
         auto = repo_cfg.automation
         exclude = {label.lower() for label in auto.exclude_labels}
         include = {label.lower() for label in auto.include_labels}
@@ -183,9 +253,14 @@ def compute_waiting(
             except (KeyError, TypeError, ValueError):
                 continue
             key = seen_key(repo, number)
-            if key in seen or key in running_keys:
+            if key.lower() in running_keys:
                 continue
-            if IssuePoller._matched_exclude_label(issue, exclude) is not None:
+            excluded = IssuePoller._matched_exclude_label(issue, exclude)
+            if excluded is not None:
+                skip(repo, issue, number, f"excluded label {excluded}")
+                continue
+            if key in seen:
+                skip(repo, issue, number, REASON_SEEN)
                 continue
             label_match = IssuePoller._matched_include_label(issue, include)
             if issue.get(VIA_LABEL):
@@ -197,6 +272,10 @@ def compute_waiting(
                 and require
                 and IssuePoller._matched_require_label(issue, require) is None
             ):
+                if label_match is None:
+                    skip(repo, issue, number,
+                         _missing_required(list(auto.require_labels)))
+                    continue
                 is_assigned = False
             if label_match is None and not is_assigned:
                 continue
@@ -205,6 +284,7 @@ def compute_waiting(
                 # assignment was self-made.
                 confirmed = assignments.get(key)
                 if confirmed is False:
+                    skip(repo, issue, number, REASON_FOREIGN)
                     continue
                 reason = (
                     REASON_CONFIRM if confirmed is None
@@ -219,7 +299,18 @@ def compute_waiting(
                 reason=reason,
                 updated_ts=_parse_ts(issue.get("updatedAt")),
             ))
-    return items
+    for issue in issues:
+        repo = str(issue.get("repo") or "")
+        if repo.lower() in configured:
+            continue
+        try:
+            number = int(issue["number"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if seen_key(repo, number).lower() in running_keys:
+            continue
+        skip(repo, issue, number, REASON_NOT_CONFIGURED)
+    return items, skipped
 
 
 def _titles_of(issues: list[dict[str, Any]]) -> dict[str, str]:
@@ -235,8 +326,9 @@ def _titles_of(issues: list[dict[str, Any]]) -> dict[str, str]:
     return out
 
 
-def _item_dict(item: WaitingItem) -> dict[str, Any]:
+def _item_dict(item: WaitingItem | SkippedItem) -> dict[str, Any]:
     out = asdict(item)
+    out["url"] = github_url(item.repo, item.issue_number)
     out["updated"] = _iso(item.updated_ts)
     return out
 
@@ -274,6 +366,7 @@ class WaitingTracker:
         # seen-key -> (self-assigned?, when it was checked, issue updated_ts)
         self._assignment_cache: dict[str, tuple[bool, int, int]] = {}
         self._last_good: list[dict[str, Any]] = []
+        self._last_good_skipped: list[dict[str, Any]] = []
         self._last_good_ts: int | None = None
         # "owner/repo#N" -> title, from the search of the last refresh
         # that succeeded, before any filtering: running issues are in it too.
@@ -287,6 +380,7 @@ class WaitingTracker:
     ) -> dict[str, Any]:
         return {
             "items": [dict(i) for i in self._last_good],
+            "skipped": [dict(i) for i in self._last_good_skipped],
             "status": status,
             "checked": _iso(checked_ts),
             "checked_ts": checked_ts,
@@ -323,7 +417,7 @@ class WaitingTracker:
                         item.updated_ts, now,
                     )
                 )
-            items = compute_waiting(
+            items, skipped = classify_issues(
                 self._config, issues, seen=seen, running=running, locks=locks,
                 assignments=assignments, username=username,
             )
@@ -341,6 +435,7 @@ class WaitingTracker:
         # unknown.
         self._titles = titles
         self._last_good = [_item_dict(i) for i in items]
+        self._last_good_skipped = [_item_dict(i) for i in skipped]
         self._last_good_ts = now
         self._snapshot = self._build(status="ok", checked_ts=now, error=None)
 
@@ -427,4 +522,8 @@ class WaitingTracker:
 
     def snapshot(self) -> dict[str, Any]:
         snap = self._snapshot
-        return {**snap, "items": [dict(i) for i in snap["items"]]}
+        return {
+            **snap,
+            "items": [dict(i) for i in snap["items"]],
+            "skipped": [dict(i) for i in snap["skipped"]],
+        }

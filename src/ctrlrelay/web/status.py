@@ -25,15 +25,18 @@ Contract (keys exactly; every timestamp is ``<name>_ts`` epoch seconds plus
      "running": [{"session_id", "pipeline", "repo", "issue_number", "title",
                   "started", "started_ts", "elapsed_s", "phase",
                   "phase_source", "last_command", "last_step", "last_step_ts",
-                  "looks_stuck", "reason"}] | null,
+                  "looks_stuck", "reason", "url"}] | null,
      "needs_you": [{"session_id", "pipeline", "repo", "issue_number",
                     "title", "question", "asked", "asked_ts", "held_until",
-                    "held_until_ts"}] | null,
-     "waiting": <WaitingTracker.snapshot()>,
+                    "held_until_ts", "url"}] | null,
+     "waiting": <WaitingTracker.snapshot() without "skipped">,
+     "skipped": [{"repo", "issue_number", "title", "reason", "url",
+                  "updated", "updated_ts"}] | null,
+     "server": <web.health.read_server_health()> | null,
      "today": {"dispatched", "pr_opened", "merged", "failed", "blocked",
                "messages_sent"},   # ints, or all null if unreadable
      "feed": [{"ts", "time", "kind", "repo", "issue_number", "session_id",
-               "detail"}] | null,   # newest first, at most FEED_LIMIT
+               "detail", "url"}] | null,   # newest first, at most FEED_LIMIT
      "feed_total": int | null,       # events in the history window
      "feed_truncated": bool,         # feed_total > len(feed)
      "feed_limit": int,              # the most events feed can hold
@@ -47,6 +50,17 @@ whenever ``feed`` is, and ``feed_truncated`` is then ``false``.
 (``null`` for secops, or when the row is gone). ``title`` (running and
 needs_you) comes from the ``titles`` map, ``WaitingTracker.titles()``, keyed
 ``"owner/repo#N"`` and matched case-insensitively; ``null`` when absent.
+
+``url`` (#232) is a github.com link built by ``web.links.github_url`` from
+the repo and a number, or ``null``: the issue for running, needs_you,
+waiting and skipped items; for a feed event, the PR when its detail has an
+int ``pr_number``, else its issue. ``skipped`` (assigned open issues the
+poller will not take, with why) is from the same GitHub answer as
+``waiting``, so ``waiting.status`` and ``waiting.last_good_ts`` say how
+current it is; it is ``null`` until GitHub has answered once. ``server``
+is ``null`` (and ``errors`` says why) only when reading it failed as a
+whole; a single number it could not read is ``null`` inside it, with the
+reason in ``server.unavailable``.
 
 Phase: while ctrlrelay itself has a CI wait or a review open for a session
 (a ``ci_started``/``review_started`` event with no later matching
@@ -67,6 +81,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
+from ctrlrelay.web.links import github_url
 from ctrlrelay.web.transcript import Phase, read_activity
 from ctrlrelay.web.waiting import SessionsReader
 
@@ -328,8 +343,20 @@ def _detail(raw: Any) -> Any:
         return None
 
 
+def _event_url(repo: Any, issue_number: Any, detail: Any) -> str | None:
+    """The PR when the event names one by number, else the issue, else
+    ``None``. Built from the parts only: a ``pr_url`` in the detail was
+    reported by an agent and is never used as a link."""
+    if isinstance(detail, dict):
+        pr = github_url(repo, detail.get("pr_number"), kind="pull")
+        if pr is not None:
+            return pr
+    return github_url(repo, issue_number)
+
+
 def _event(row: dict[str, Any]) -> dict[str, Any]:
     ts = int(row["ts"])
+    detail = _detail(row["detail"])
     return {
         "ts": ts,
         "time": _iso(ts),
@@ -337,7 +364,8 @@ def _event(row: dict[str, Any]) -> dict[str, Any]:
         "repo": row["repo"],
         "issue_number": row["issue_number"],
         "session_id": row["session_id"],
-        "detail": _detail(row["detail"]),
+        "detail": detail,
+        "url": _event_url(row["repo"], row["issue_number"], detail),
     }
 
 
@@ -455,6 +483,7 @@ def _card(
         "last_step_ts": activity.last_step_ts,
         "looks_stuck": looks_stuck,
         "reason": "; ".join(reasons) or None,
+        "url": github_url(row["repo"], issue),
     }
 
 
@@ -475,6 +504,7 @@ def _question(
         "asked_ts": asked,
         "held_until": _iso(held),
         "held_until_ts": held,
+        "url": github_url(row["repo"], issue),
     }
 
 
@@ -482,6 +512,7 @@ def build_status(
     *,
     db_path: Path,
     waiting: dict,
+    server: Callable[[], dict],
     version: str,
     host: str,
     now: int | None = None,
@@ -491,10 +522,25 @@ def build_status(
     titles: Mapping[str, str] | None = None,
 ) -> dict:
     """Everything the page shows, as the documented JSON contract. Never
-    raises for a database problem; see the module docstring."""
+    raises for a database problem; see the module docstring.
+
+    ``server`` reads the machine's health (``web.health``); it is called
+    here so that a reader that raises makes the section ``null`` with an
+    error, never a partial one. ``waiting`` is the tracker's snapshot; its
+    ``skipped`` list is published as the top-level ``skipped``."""
     if now is None:
         now = int(datetime.now(UTC).timestamp())
     errors: list[str] = []
+    waiting = dict(waiting)
+    skipped = waiting.pop("skipped", None)
+    if waiting.get("last_good_ts") is None or not isinstance(skipped, list):
+        # Before GitHub has answered once the list is empty, not "none".
+        skipped = None
+    try:
+        server_health: dict | None = server()
+    except Exception as exc:
+        errors.append(f"server: {type(exc).__name__}: {exc}"[:300])
+        server_health = None
     day_start, day_end = _local_day(now)
     feed_since = now - history_days * 86_400
     feed_limit = FEED_LIMIT
@@ -573,6 +619,8 @@ def build_status(
         "running": running,
         "needs_you": needs_you,
         "waiting": waiting,
+        "skipped": skipped,
+        "server": server_health,
         "today": today,
         "feed": feed,
         "feed_total": feed_total,

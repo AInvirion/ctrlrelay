@@ -92,6 +92,23 @@ ul.plain > li:last-child { border-bottom: 0; }
 .today .n { font-size: 22px; font-weight: 700; }
 .feed .when { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 4.5em; }
 .feed .detail { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+a { color: var(--accent); text-decoration: none; }
+a:hover, a:focus-visible { text-decoration: underline; }
+.dot {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  margin-right: 5px; vertical-align: baseline; background: var(--unknown);
+}
+.dot.live { background: #16a34a; box-shadow: 0 0 0 3px rgba(22, 163, 74, .18); }
+.dot.stale { background: var(--bad); box-shadow: 0 0 0 3px rgba(180, 35, 24, .18); }
+#updated-ago { font-variant-numeric: tabular-nums; }
+.server .line { padding: 3px 0; font-size: 14px; font-variant-numeric: tabular-nums; }
+.server .line.low { color: var(--bad); font-weight: 600; }
+.server .line.low::before { content: "low: "; }
+details > summary {
+  cursor: pointer; font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); margin: 0 0 8px; font-weight: 700;
+}
+details > summary .count { font-weight: 400; margin-left: 6px; }
 </style>
 </head>
 <body data-refresh-seconds="__REFRESH_SECONDS__">
@@ -99,7 +116,7 @@ ul.plain > li:last-child { border-bottom: 0; }
   <h1>ctrlrelay</h1>
   <span class="meta">host <strong id="host">…</strong></span>
   <span class="meta">version <span id="version">…</span></span>
-  <span class="meta">updated <span id="updated">never</span></span>
+  <span class="meta"><span id="live-dot" class="dot" role="img" aria-label="not connected yet"></span><span id="updated-ago">updated never</span></span>
   <span class="meta">busy with <span id="busy">…</span></span>
 </header>
 <p id="banner" role="alert"></p>
@@ -119,11 +136,21 @@ ul.plain > li:last-child { border-bottom: 0; }
       <div id="waiting"><p class="unknown">loading…</p></div>
     </section>
     <section>
+      <details id="skipped-box">
+        <summary>Skipped<span class="count" id="skipped-count"></span></summary>
+        <div id="skipped"><p class="unknown">loading…</p></div>
+      </details>
+    </section>
+    <section>
       <h2>Today</h2>
       <div id="today"><p class="unknown">loading…</p></div>
     </section>
   </div>
   <div>
+    <section class="server">
+      <h2>Server</h2>
+      <div id="server"><p class="unknown">loading…</p></div>
+    </section>
     <section class="feed">
       <h2>Live feed</h2>
       <div id="feed"><p class="unknown">loading…</p></div>
@@ -134,7 +161,8 @@ ul.plain > li:last-child { border-bottom: 0; }
 "use strict";
 // Every value from the server reaches the page through textContent or
 // createElement. Nothing here parses a string as HTML: titles come from
-// GitHub, where anyone can file an issue on a public repository.
+// GitHub, where anyone can file an issue on a public repository. Every link
+// is made by ghLink, and only to a github.com issue or PR address.
 
 var PHASES = [
   ["reading", "reading"], ["coding", "coding"], ["testing", "testing"],
@@ -153,10 +181,16 @@ var KIND_LABEL = {
   alert_sent: "alert sent", restart: "restart"
 };
 
+// A github.com issue or pull request address and nothing else: no query,
+// no fragment, no segment of dots (a URL resolves those away).
+var GITHUB_URL = /^https:\/\/github\.com\/(?!\.+\/)[A-Za-z0-9_.-]+\/(?!\.+\/)[A-Za-z0-9_.-]+\/(issues|pull)\/[1-9][0-9]*$/;
+
 var refreshSeconds = parseInt(document.body.getAttribute("data-refresh-seconds"), 10);
 if (!(refreshSeconds >= 1)) { refreshSeconds = 5; }
 var lastData = null;
 var lastOkAt = null;
+// Spans whose seconds move between polls: [{node, base, prefix, suffix}].
+var TICKING = [];
 
 function el(tag, cls, text) {
   var node = document.createElement(tag);
@@ -174,6 +208,62 @@ function put(parent, children) {
 // server could not read it). Never blank, which would read as "nothing".
 function setCount(id, value) {
   document.getElementById(id).textContent = typeof value === "number" ? String(value) : "unknown";
+}
+
+function safeGithubUrl(url) {
+  return typeof url === "string" && GITHUB_URL.test(url) ? url : null;
+}
+
+// The one place a link is made. Anything but a github.com issue or PR
+// address is plain text instead.
+function ghLink(url, text, cls) {
+  var safe = safeGithubUrl(url);
+  if (safe === null) { return el("span", cls, text); }
+  var a = el("a", cls, text);
+  a.href = safe;
+  a.rel = "noopener noreferrer";
+  a.target = "_blank";
+  return a;
+}
+
+// "live" when the last good answer is at most two refresh intervals old.
+function liveness(okAtMs, nowMs, seconds) {
+  if (typeof okAtMs !== "number") { return "never"; }
+  return nowMs - okAtMs <= 2 * seconds * 1000 ? "live" : "stale";
+}
+
+function updatedAgo(okAtMs, nowMs) {
+  if (typeof okAtMs !== "number") { return "updated never"; }
+  return "updated " + duration(Math.floor((nowMs - okAtMs) / 1000)) + " ago";
+}
+
+// A server count of seconds, moved on by the whole seconds since it arrived.
+function tickedSeconds(base, receivedAtMs, nowMs) {
+  if (typeof base !== "number" || !isFinite(base)) { return null; }
+  return base + Math.max(0, Math.floor((nowMs - receivedAtMs) / 1000));
+}
+
+function ticking(base, prefix, suffix, cls) {
+  var node = el("span", cls || "muted");
+  TICKING.push({ node: node, base: base, prefix: prefix, suffix: suffix });
+  node.textContent = prefix + duration(base) + suffix;
+  return node;
+}
+
+function tick() {
+  var now = Date.now();
+  var state = liveness(lastOkAt, now, refreshSeconds);
+  var dot = document.getElementById("live-dot");
+  dot.className = "dot " + state;
+  dot.setAttribute("aria-label", state === "live" ? "live" :
+    (state === "stale" ? "not reaching the server" : "not connected yet"));
+  document.getElementById("updated-ago").textContent = updatedAgo(lastOkAt, now);
+  for (var i = 0; i < TICKING.length; i++) {
+    var t = TICKING[i];
+    var secs = lastOkAt === null ? null : tickedSeconds(t.base, lastOkAt, now);
+    t.node.textContent = secs === null ? t.prefix + "unknown" + t.suffix
+      : t.prefix + duration(secs) + t.suffix;
+  }
 }
 
 function unknown(text) { return el("p", "unknown", text); }
@@ -237,10 +327,10 @@ function runningCard(card, now) {
   if (card.pipeline === "secops" && typeof card.issue_number !== "number") {
     top.appendChild(el("span", "title", "secops sweep"));
   } else {
-    top.appendChild(el("span", "title", issueText(card.repo, card.issue_number, card.title)));
+    top.appendChild(ghLink(card.url, issueText(card.repo, card.issue_number, card.title), "title"));
   }
   top.appendChild(el("span", "tag", card.pipeline));
-  top.appendChild(el("span", "muted", "running " + duration(card.elapsed_s)));
+  top.appendChild(ticking(card.elapsed_s, "running ", ""));
   if (card.looks_stuck) {
     top.appendChild(el("span", "tag stuck", "looks stuck"));
   }
@@ -260,7 +350,8 @@ function runningCard(card, now) {
   } else {
     last.appendChild(el("span", "unknown", "last command unknown"));
   }
-  last.appendChild(el("span", "muted", ago(card.last_step_ts, now)));
+  last.appendChild(ticking(typeof card.last_step_ts === "number" ? now - card.last_step_ts : null,
+    "", " ago"));
   box.appendChild(last);
   if (card.reason) { box.appendChild(el("div", "muted", card.reason)); }
   return box;
@@ -302,12 +393,13 @@ function renderNeeds(data, now) {
     var top = el("div", "row");
     top.appendChild(el("span", "repo", q.repo));
     if (typeof q.issue_number === "number") {
-      top.appendChild(el("span", "title", issueText(q.repo, q.issue_number, q.title)));
+      top.appendChild(ghLink(q.url, issueText(q.repo, q.issue_number, q.title), "title"));
     } else {
       top.appendChild(el("span", "title", q.pipeline === "secops" ? "secops sweep" : "no issue"));
     }
     top.appendChild(el("span", "tag", q.pipeline));
-    top.appendChild(el("span", "muted", "waiting " + duration(now - q.asked_ts)));
+    top.appendChild(ticking(typeof q.asked_ts === "number" ? now - q.asked_ts : null,
+      "waiting ", ""));
     box.appendChild(top);
     box.appendChild(el("p", "question", q.question));
     if (typeof q.held_until_ts === "number") {
@@ -345,7 +437,7 @@ function renderWaiting(data) {
       var li = el("li");
       var row = el("div", "row");
       row.appendChild(el("span", "repo", it.repo));
-      row.appendChild(el("span", "title", issueText(it.repo, it.issue_number, it.title)));
+      row.appendChild(ghLink(it.url, issueText(it.repo, it.issue_number, it.title), "title"));
       li.appendChild(row);
       li.appendChild(el("div", "muted", it.reason));
       list.appendChild(li);
@@ -353,6 +445,79 @@ function renderWaiting(data) {
     nodes.push(list);
   }
   put(target, nodes);
+}
+
+// Assigned open issues the poller will not take, with why. Collapsed by
+// default; the count in the summary says how many. Null until GitHub has
+// answered once, which is "unknown", never "none".
+function renderSkipped(data) {
+  var target = document.getElementById("skipped");
+  if (!Array.isArray(data.skipped)) {
+    setCount("skipped-count", null);
+    put(target, [unknown("unknown: no answer from GitHub yet")]);
+    return;
+  }
+  setCount("skipped-count", data.skipped.length);
+  var nodes = [];
+  var w = data.waiting || {};
+  if (w.status !== "ok" && typeof w.last_good_ts === "number") {
+    nodes.push(el("p", "muted", "from the last good answer, " + clock(w.last_good_ts)));
+  }
+  if (data.skipped.length === 0) {
+    nodes.push(empty("no assigned issue is being skipped"));
+    put(target, nodes);
+    return;
+  }
+  var list = el("ul", "plain");
+  data.skipped.forEach(function (it) {
+    var li = el("li");
+    var row = el("div", "row");
+    row.appendChild(el("span", "repo", it.repo));
+    row.appendChild(ghLink(it.url, issueText(it.repo, it.issue_number, it.title), "title"));
+    li.appendChild(row);
+    li.appendChild(el("div", "muted", it.reason));
+    list.appendChild(li);
+  });
+  nodes.push(list);
+  put(target, nodes);
+}
+
+function gigabytes(n) {
+  return typeof n === "number" ? (n / 1073741824).toFixed(1) + " GB" : "unknown";
+}
+
+function pct(n) { return typeof n === "number" ? n.toFixed(0) + "%" : "unknown"; }
+
+function load(n) { return typeof n === "number" ? n.toFixed(2) : "unknown"; }
+
+// Load, memory, disks and uptime. A line is marked "low" when the server
+// says less than 10% is free; a number it could not read says "unknown".
+function renderServer(data) {
+  var target = document.getElementById("server");
+  var s = data.server;
+  if (!s || typeof s !== "object") {
+    put(target, [unknown("unknown: server health could not be read")]);
+    return;
+  }
+  var lines = [];
+  var cores = typeof s.cpu_count === "number" ? " on " + s.cpu_count + " cores" : " (cores unknown)";
+  lines.push(el("div", "line", "load " + load(s.load_1m) + " / " + load(s.load_5m) + " / " +
+    load(s.load_15m) + cores));
+  var m = s.memory || {};
+  lines.push(el("div", "line" + (m.low === true ? " low" : ""),
+    "memory " + gigabytes(m.available_bytes) + " free of " + gigabytes(m.total_bytes) +
+    " (" + pct(m.available_pct) + ")"));
+  (Array.isArray(s.disks) ? s.disks : []).forEach(function (d) {
+    lines.push(el("div", "line" + (d.low === true ? " low" : ""),
+      "disk " + d.name + " " + gigabytes(d.free_bytes) + " free of " +
+      gigabytes(d.total_bytes) + " (" + pct(d.free_pct) + ")"));
+  });
+  lines.push(el("div", "line", typeof s.uptime_s === "number"
+    ? "up " + duration(s.uptime_s) : "uptime unknown"));
+  (Array.isArray(s.unavailable) ? s.unavailable : []).forEach(function (why) {
+    lines.push(el("div", "muted", why));
+  });
+  put(target, lines);
 }
 
 function renderToday(data) {
@@ -407,8 +572,8 @@ function renderFeed(data) {
     row.appendChild(el("span", "tag k-" + String(ev.kind).replace(/[^a-z_]/g, ""),
       KIND_LABEL[ev.kind] || ev.kind));
     if (ev.repo) {
-      row.appendChild(el("span", "repo",
-        ev.repo + (typeof ev.issue_number === "number" ? "#" + ev.issue_number : "")));
+      row.appendChild(ghLink(ev.url,
+        ev.repo + (typeof ev.issue_number === "number" ? "#" + ev.issue_number : ""), "repo"));
     }
     li.appendChild(row);
     var text = detailText(ev.detail);
@@ -422,7 +587,6 @@ function renderFeed(data) {
 function renderHeader(data) {
   document.getElementById("host").textContent = data.host || "unknown";
   document.getElementById("version").textContent = data.version || "unknown";
-  document.getElementById("updated").textContent = clock(data.generated_ts);
   var errs = Array.isArray(data.errors) ? data.errors : [];
   put(document.getElementById("errors"), errs.map(function (e) { return el("li", null, e); }));
   document.title = "ctrlrelay · " + (data.host || "unknown");
@@ -430,12 +594,15 @@ function renderHeader(data) {
 
 function render(data) {
   var now = nowOf(data);
+  TICKING = [];
   renderHeader(data);
   renderBusy(data);
   renderRunning(data, now);
   renderNeeds(data, now);
   renderWaiting(data);
+  renderSkipped(data);
   renderToday(data);
+  renderServer(data);
   renderFeed(data);
 }
 
@@ -459,6 +626,7 @@ function poll() {
       lastData = data;
       lastOkAt = Date.now();
       render(data);
+      tick();
       showBanner("");
     })
     .catch(function (err) {
@@ -472,6 +640,8 @@ function poll() {
 }
 
 poll();
+tick();
+setInterval(tick, 1000);
 </script>
 </body>
 </html>
