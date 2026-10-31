@@ -9,6 +9,11 @@ self-assignment check, and nothing the poller has already seen or is already
 running. Repos with ``include_labels`` are also asked per label, as the
 poller does, so an issue triggered by a label alone appears too.
 
+The same answer also gives the skipped list (#232): every assigned open
+issue the poller will not take and is not running, with why, sorted by the
+same rules (see :func:`classify_issues`). It costs no GitHub call beyond the
+search and the cached self-assignment checks the waiting line already makes.
+
 Read only. A failed GitHub call leaves the line ``unknown`` with the last good
 answer and its time, never an empty list that reads as "nothing waiting".
 """

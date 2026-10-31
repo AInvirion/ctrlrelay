@@ -243,10 +243,22 @@ function tickedSeconds(base, receivedAtMs, nowMs) {
   return base + Math.max(0, Math.floor((nowMs - receivedAtMs) / 1000));
 }
 
+// Like duration, with seconds kept below an hour so a ticking span is seen
+// to move ("10m 05s"). Unknown stays "unknown", with no "ago" after it.
+function tickText(seconds, prefix, suffix) {
+  if (typeof seconds !== "number" || !isFinite(seconds)) { return prefix + "unknown"; }
+  seconds = Math.max(0, Math.floor(seconds));
+  if (seconds >= 60 && seconds < 3600) {
+    var s = seconds % 60;
+    return prefix + Math.floor(seconds / 60) + "m " + (s < 10 ? "0" : "") + s + "s" + suffix;
+  }
+  return prefix + duration(seconds) + suffix;
+}
+
 function ticking(base, prefix, suffix, cls) {
   var node = el("span", cls || "muted");
   TICKING.push({ node: node, base: base, prefix: prefix, suffix: suffix });
-  node.textContent = prefix + duration(base) + suffix;
+  node.textContent = tickText(base, prefix, suffix);
   return node;
 }
 
@@ -261,8 +273,7 @@ function tick() {
   for (var i = 0; i < TICKING.length; i++) {
     var t = TICKING[i];
     var secs = lastOkAt === null ? null : tickedSeconds(t.base, lastOkAt, now);
-    t.node.textContent = secs === null ? t.prefix + "unknown" + t.suffix
-      : t.prefix + duration(secs) + t.suffix;
+    t.node.textContent = tickText(secs, t.prefix, t.suffix);
   }
 }
 

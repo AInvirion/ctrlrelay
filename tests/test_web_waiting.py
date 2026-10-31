@@ -1030,12 +1030,28 @@ def test_label_only_rows_are_never_skipped(tmp_path: Path) -> None:
     """A row from a per-label query that is not assigned to the operator is
     not "an assigned issue nobody will take": it was never assigned."""
     config = _config(tmp_path, [
-        {"name": GAMMA, "automation": {"include_labels": ["ctrlrelay:auto"]}},
+        {"name": GAMMA, "automation": {"include_labels": ["ctrlrelay:auto"],
+                                       "exclude_labels": ["epic"]}},
     ])
-    stray = {**_issue_list_row(2, ["bug"], assignees=["teammate"]),
-             "repo": GAMMA, VIA_LABEL: True}
 
-    waiting, skipped = _classify(config, [stray], username="octo")
+    def row(number: int, labels: list[str]) -> dict:
+        return {**_issue_list_row(number, labels, assignees=["teammate"]),
+                "repo": GAMMA, VIA_LABEL: True}
+
+    stray = row(2, ["bug"])
+    excluded = row(3, ["ctrlrelay:auto", "epic"])
+    handled = row(4, ["ctrlrelay:auto"])
+    # Present case: the same excluded and handled issues, assigned to the
+    # operator (assignee-search rows), are skipped for those reasons.
+    mine = [{**r, VIA_LABEL: False} for r in (excluded, handled)]
+    _, skipped = _classify(config, mine, seen={f"{GAMMA}#4"}, username="octo")
+    assert _skipped(skipped) == {
+        (GAMMA, 3): "excluded label epic", (GAMMA, 4): REASON_SEEN,
+    }
+
+    waiting, skipped = _classify(
+        config, [stray, excluded, handled], seen={f"{GAMMA}#4"}, username="octo",
+    )
 
     assert waiting == [] and skipped == []
 

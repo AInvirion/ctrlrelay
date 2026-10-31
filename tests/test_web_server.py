@@ -1031,6 +1031,18 @@ def test_elapsed_times_tick_from_the_server_value() -> None:
     assert "ticking(" in card
 
 
+@pytest.mark.parametrize(("secs", "expected"), [
+    (None, "running unknown"),
+    (45, "running 45s"),
+    (605, "running 10m 05s"),     # seconds shown below an hour, so it moves
+    (3_725, "running 1h 2m"),
+])
+def test_ticking_text_moves_every_second_below_an_hour(secs, expected) -> None:
+    got = _run_js(["tickText", "duration"],
+                  f'tickText({json.dumps(secs)}, "running ", "")')
+    assert got == expected
+
+
 def test_skipped_section_is_collapsed_with_a_count() -> None:
     html = _page_source()
     m = re.search(r"<details[^>]*id=\"skipped-box\"[^>]*>", html)

@@ -257,6 +257,19 @@ loopback or on the home network.
 | `/api/status` | Everything on the page, as JSON (the contract is in `src/ctrlrelay/web/status.py`). A section that could not be read is `null` and `errors` says why; `[]` means "read, and empty". The feed holds at most the newest `feed_limit` (200) events: `feed_total` is how many the history window holds (`null` if unreadable) and `feed_truncated` is `true` when some were left out, in which case the page says "showing newest N of M". |
 | `/api/events?since=<epoch seconds>` | The feed, newest first, at most `limit` (200) events. Without `since`, the last `web.history_days` days. Carries the same `feed_total` and `feed_truncated`, plus the `limit` used. |
 
+The page header shows how long ago it last heard from the server ("updated
+12s ago", ticking every second) and a dot that is green while the last good
+answer is at most two refresh intervals old and red otherwise. Elapsed times
+on cards tick between polls too.
+
+Fields added in #232 (all in `/api/status`):
+
+| Field | What |
+|---|---|
+| `url` | On every `running`, `needs_you`, `waiting.items`, `skipped` and `feed` item (and on `/api/events` events): a link to the GitHub issue, or for a feed event that names a PR by number, the PR. Built only as `https://github.com/<owner>/<repo>/issues/<n>` or `/pull/<n>`, from a repo matching `owner/name` and an integer; `null` otherwise (a secops run with no issue, a restart). A `pr_url` an agent reported is never used. |
+| `skipped` | Every open issue assigned to you that the poller will **not** pick up and is not running, from the same search as the waiting line (no extra GitHub calls): `repo`, `issue_number`, `title`, `url`, `updated`/`updated_ts` and `reason`, one of `repo not in config`, `excluded label <label>`, `already handled once (won't retry)`, `missing required label <label>` (several joined with "or": any one admits it), `assigned by someone else`. `null` until GitHub has answered once; `waiting.status` and `waiting.last_good_ts` say how current it is. The page shows it collapsed, with a count. |
+| `server` | This machine's health, read on each request: `load_1m`, `load_5m`, `load_15m`, `cpu_count`, `memory` (`total_bytes`, `available_bytes`, `available_pct`, `low`), `disks` (one each for `home` and `worktrees`: `name`, `path`, `total_bytes`, `free_bytes`, `free_pct`, `low`), `uptime_s`, and `unavailable` (why any number is `null`; memory and uptime are `null` off Linux). `low` is true below 10% free and the page marks it. The whole section is `null`, with a line in `errors`, only if reading it failed outright. |
+
 Try it on loopback first (the default `web.host` is `127.0.0.1`, port `8787`):
 
 ```bash
