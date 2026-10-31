@@ -1435,6 +1435,9 @@ def test_needs_you_links_each_number_its_question_names(tmp_path: Path) -> None:
         "Approve merging #8 and #7? Not &#9 or a/#5. Again #8, then (#12).",
     )
     db.add_pending_resume("s-none", "secops", BETA, "Nothing to approve here.")
+    # Same rule as the page, whose \w is ASCII: a non-ASCII letter before
+    # #N does not hide it, and a non-ASCII digit is not part of N.
+    db.add_pending_resume("s-uni", "secops", BETA, "é#3 and #4\u0663")
 
     out = _status(tmp_path, 2_000)
 
@@ -1444,6 +1447,7 @@ def test_needs_you_links_each_number_its_question_names(tmp_path: Path) -> None:
         {"number": 12, "url": f"https://github.com/{BETA}/issues/12"},
     ]
     assert _only(out["needs_you"], "s-none")["refs"] == []
+    assert [r["number"] for r in _only(out["needs_you"], "s-uni")["refs"]] == [3, 4]
 
 
 def test_needs_you_refs_are_empty_for_a_repo_that_cannot_be_linked(

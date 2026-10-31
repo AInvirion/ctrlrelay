@@ -214,9 +214,10 @@ function setCount(id, value) {
 var QUESTION_REF = /(?<![\w\/&])#(\d{1,7})\b/;
 
 // #241: a question as text parts, with each #N the server sent a ref for
-// carrying that ref's URL. Joined, the parts are the question unchanged.
+// carrying that ref's URL. Joined, the parts are the question unchanged;
+// anything that is not a string is shown as no text.
 function questionParts(text, refs) {
-  if (typeof text !== "string") { return [{ text: text, url: null }]; }
+  if (typeof text !== "string") { return [{ text: "", url: null }]; }
   var urls = {};
   if (Array.isArray(refs)) {
     refs.forEach(function (r) {
@@ -473,7 +474,7 @@ function renderNeeds(data, now) {
     var question = el("p", "question");
     questionParts(q.question, q.refs).forEach(function (part) {
       question.appendChild(part.url === null
-        ? document.createTextNode(part.text === null || part.text === undefined ? "" : String(part.text))
+        ? document.createTextNode(part.text)
         : ghLink(part.url, part.text, "ref"));
     });
     box.appendChild(question);

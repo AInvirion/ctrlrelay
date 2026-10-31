@@ -547,7 +547,8 @@ def _card(
 # A ``#N`` in a question's text: not after a word character, ``/`` or
 # ``&`` (an HTML entity or a path is not a reference). The page uses the
 # same pattern, QUESTION_REF, and links only the numbers listed here.
-_QUESTION_REF = re.compile(r"(?<![\w/&])#(\d{1,7})\b")
+# ASCII, because a JavaScript ``\w``, ``\d`` and ``\b`` are ASCII only.
+_QUESTION_REF = re.compile(r"(?<![\w/&])#(\d{1,7})\b", re.ASCII)
 _MAX_REFS = 20
 
 

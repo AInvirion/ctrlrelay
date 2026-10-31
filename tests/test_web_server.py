@@ -1138,3 +1138,21 @@ def test_question_with_no_usable_refs_is_one_text_part(refs: object) -> None:
     parts = _run_js(["questionParts"],
                     f"questionParts({json.dumps(text)}, {json.dumps(refs)})")
     assert parts == [{"text": text, "url": None}]
+
+
+def test_question_parts_agree_with_the_server_on_non_ascii() -> None:
+    """The server's pattern is ASCII (#241), like the page's: a non-ASCII
+    letter before #N does not hide it, and a non-ASCII digit ends N."""
+    refs = [{"number": 3, "url": "https://github.com/o/r/issues/3"},
+            {"number": 4, "url": "https://github.com/o/r/issues/4"}]
+    text = "\u00e9#3 and #4\u0663"
+    parts = _run_js(["questionParts"],
+                    f"questionParts({json.dumps(text)}, {json.dumps(refs)})")
+    assert [p["text"] for p in parts if p["url"]] == ["#3", "#4"]
+    assert "".join(p["text"] for p in parts) == text
+
+
+@pytest.mark.parametrize("question", [None, 5, {"toString": None}])
+def test_a_question_that_is_not_text_renders_as_no_text(question: object) -> None:
+    parts = _run_js(["questionParts"], f"questionParts({json.dumps(question)}, [])")
+    assert parts == [{"text": "", "url": None}]
