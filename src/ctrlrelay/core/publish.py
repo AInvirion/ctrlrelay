@@ -142,9 +142,12 @@ def build_pr_title(
     """One line, capped. Falls back to the issue's own title."""
     raw = agent_title if isinstance(agent_title, str) else ""
     line = raw.strip().splitlines()[0].strip() if raw.strip() else ""
-    line = sanitize_untrusted_text(line, max_chars=10_000)
     if not line:
         line = f"{issue_title.strip()} (#{issue_number})".strip()
+    # After choosing: the fallback is the issue's title, which anyone
+    # who can file an issue wrote, so it is no more trusted than the
+    # agent's.
+    line = sanitize_untrusted_text(line, max_chars=10_000)
     if len(line) > PR_TITLE_MAX_CHARS:
         line = line[: PR_TITLE_MAX_CHARS - 3].rstrip() + "..."
     return line

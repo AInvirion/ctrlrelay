@@ -287,25 +287,70 @@ class TestRealGitAndGhFindNothingUnderTheAgentEnv:
         assert not agent_got_a_token
 
     @pytest.mark.skipif(shutil.which("gh") is None, reason="gh not installed")
-    def test_gh_cannot_reach_the_desktop_keyring(self, tmp_path: Path) -> None:
-        """Measured on a laptop host, 2026-10-31: with GH_CONFIG_DIR empty,
-        `gh auth token` still returned the operator's token from the
-        Secret Service keyring, because the D-Bus client dials
-        /run/user/<uid>/bus on its own. Run against the REAL session
-        environment, so on a host with a keyring token this is the
-        incident; on a host without one it passes for that reason, which
-        the skip-free control in the test above already covers."""
+    def test_gh_cannot_reach_a_session_bus(self, tmp_path: Path) -> None:
+        """gh falls back to the desktop keyring over the D-Bus session bus
+        when its config has no token (measured on a laptop host,
+        2026-10-31: it printed the operator's token with GH_CONFIG_DIR
+        empty). gh has no switch to turn the keyring off, so the test
+        stands up a fake session bus - a unix socket that counts
+        connections - and points the operator env at it. Control: gh
+        dials it under the operator env. Claim: under the agent env
+        built from that same env, it never does. Deterministic: no real
+        keyring is involved either way."""
+        import socket
+        import threading
+
         from ctrlrelay.core.agent_env import build_agent_env
 
-        empty = tmp_path / "empty-gh"
-        empty.mkdir()
-        agent, _ = build_agent_env(dict(os.environ), gh_config_dir=empty)
-        run = subprocess.run(
-            ["gh", "auth", "token"], env=agent, capture_output=True,
-            text=True, timeout=30,
-        )
-        agent_got_a_token = run.returncode == 0 and bool(run.stdout.strip())
-        assert not agent_got_a_token
+        sock_path = tmp_path / "bus"
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(str(sock_path))
+        srv.listen(8)
+        srv.settimeout(0.1)
+        hits: list[int] = []
+        stop = threading.Event()
+
+        def serve() -> None:
+            while not stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    continue
+                hits.append(1)
+                conn.close()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            empty = tmp_path / "gh-empty"
+            empty.mkdir()
+            operator = {
+                "PATH": os.environ["PATH"],
+                "HOME": str(tmp_path),
+                "GH_CONFIG_DIR": str(empty),
+                "DBUS_SESSION_BUS_ADDRESS": f"unix:path={sock_path}",
+            }
+            subprocess.run(
+                ["gh", "auth", "token"], env=operator,
+                capture_output=True, timeout=30,
+            )
+            control_dialled = len(hits)
+            hits.clear()
+            agent, _ = build_agent_env(
+                operator, gh_config_dir=tmp_path / "gh-agent"
+            )
+            (tmp_path / "gh-agent").mkdir()
+            subprocess.run(
+                ["gh", "auth", "token"], env=agent,
+                capture_output=True, timeout=30,
+            )
+            agent_dialled = len(hits)
+        finally:
+            stop.set()
+            t.join(timeout=5)
+            srv.close()
+        assert control_dialled >= 1, "control: gh did not try the bus at all"
+        assert agent_dialled == 0
 
 
 # --- push guard -----------------------------------------------------------
@@ -429,7 +474,7 @@ class TestThePushGuard:
             await _manager(tmp_path).push_run_branch(
                 "owner/repo", target, run_branch=run_branch,
                 default_branch=default, expected_remote_sha=None,
-                session_id="s-1",
+                relay_pushed_shas=frozenset(), session_id="s-1",
             )
         assert _git("for-each-ref", cwd=origin) == before
         [rec] = [r for r in caplog.records if r.msg == "publish.push.refused"]
@@ -455,6 +500,7 @@ class TestThePushGuard:
         pushed = await _manager(tmp_path).push_run_branch(
             "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
             default_branch="main", expected_remote_sha=None,
+                relay_pushed_shas=frozenset(),
         )
         assert pushed == sha
         assert _git("rev-parse", "refs/heads/fix/issue-7", cwd=origin) == sha
@@ -501,6 +547,7 @@ class TestThePushGuard:
         pushed = await _manager(tmp_path).push_run_branch(
             "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
             default_branch="main", expected_remote_sha=None,
+                relay_pushed_shas=frozenset(),
         )
         assert pushed == sha
         assert _git("rev-parse", "refs/heads/fix/issue-7", cwd=origin) == sha
@@ -524,17 +571,19 @@ class TestThePushGuard:
             calls.append((args, dict(env or {})))
             if args[0] == "init":
                 (Path(args[-1]) / "objects" / "info").mkdir(parents=True)
-            if "rev-parse" in args:
-                return "a" * 40 if "fix/issue-7" in args[-1] else "b" * 40
             if "rev-list" in args:
                 return "1\n"
             return ""
 
         monkeypatch.setattr(WorktreeManager, "_run_git", fake_run_git)
-        (tmp_path / "repos").mkdir()
+        heads = tmp_path / "repos" / "owner-repo.git" / "refs" / "heads"
+        (heads / "fix").mkdir(parents=True)
+        (heads / "fix" / "issue-7").write_text("a" * 40 + "\n")
+        (heads / "main").write_text("b" * 40 + "\n")
         await _manager(tmp_path).push_run_branch(
             "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
             default_branch="main", expected_remote_sha=None,
+                relay_pushed_shas=frozenset(),
         )
         bare = str(tmp_path / "repos" / "owner-repo.git")
         flags = [
@@ -560,10 +609,55 @@ class TestThePushGuard:
                 tmp_path / "push"
             )
             assert "GIT_SSH_COMMAND" not in env
-        for args in network:
+        # No git process runs in the shared clone at all: its heads are
+        # read from the ref files, and every call uses the private dir.
+        for args, _ in calls:
+            if args[0] == "init":
+                continue
             gitdir = args[args.index("--git-dir") + 1]
             assert gitdir != bare and gitdir.startswith(str(tmp_path / "push"))
         assert not any((tmp_path / "push").iterdir()), "private dir left behind"
+
+    @pytest.mark.asyncio
+    async def test_a_remote_branch_ctrlrelay_did_not_push_is_not_overwritten(
+        self, tmp_path: Path, push_to_local_origin, caplog
+    ) -> None:
+        from ctrlrelay.core.publish import PushRefusedError
+
+        origin, bare, _ = _origin_and_bare(tmp_path)
+        push_to_local_origin(origin)
+        _commit_on(bare, "fix/issue-7", tmp_path)
+        # Somebody else's branch of the same name is already on GitHub.
+        other = _commit_on(bare, "someone", tmp_path)
+        _git("push", "-q", str(origin), f"{other}:refs/heads/fix/issue-7",
+             cwd=bare)
+        caplog.set_level(logging.ERROR, logger="ctrlrelay.core.worktree")
+        with pytest.raises(PushRefusedError, match="ctrlrelay did not push"):
+            await _manager(tmp_path).push_run_branch(
+                "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
+                default_branch="main", expected_remote_sha=None,
+                relay_pushed_shas=frozenset({"0" * 40}),
+            )
+        assert _git("rev-parse", "refs/heads/fix/issue-7", cwd=origin) == other
+        assert any(r.msg == "publish.push.refused" for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_remote_head_ctrlrelay_pushed_is_leased_and_replaced(
+        self, tmp_path: Path, push_to_local_origin
+    ) -> None:
+        origin, bare, _ = _origin_and_bare(tmp_path)
+        push_to_local_origin(origin)
+        old = _commit_on(bare, "older", tmp_path)
+        _git("push", "-q", str(origin), f"{old}:refs/heads/fix/issue-7",
+             cwd=bare)
+        new = _commit_on(bare, "fix/issue-7", tmp_path)
+        pushed = await _manager(tmp_path).push_run_branch(
+            "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
+            default_branch="main", expected_remote_sha=None,
+            relay_pushed_shas=frozenset({old}),
+        )
+        assert pushed == new
+        assert _git("rev-parse", "refs/heads/fix/issue-7", cwd=origin) == new
 
     @pytest.mark.asyncio
     async def test_a_branch_with_no_new_commits_is_not_pushed(
@@ -577,6 +671,7 @@ class TestThePushGuard:
             await _manager(tmp_path).push_run_branch(
                 "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
                 default_branch="main", expected_remote_sha=None,
+                relay_pushed_shas=frozenset(),
             )
         assert "fix/issue-7" not in _git("for-each-ref", cwd=origin)
 
@@ -627,6 +722,9 @@ class TestThePullRequestBodyIsTreatedAsUntrusted:
         assert build_pr_title(
             None, issue_number=7, issue_title="Login broken"
         ) == "Login broken (#7)"
+        assert build_pr_title(
+            "", issue_number=7, issue_title="Please investigate @octocat"
+        ) == "Please investigate @\u200boctocat (#7)"
         long = build_pr_title("y" * 500, issue_number=7, issue_title="t")
         assert len(long) == PR_TITLE_MAX_CHARS and long.endswith("...")
 
@@ -779,6 +877,95 @@ class TestADevRunEndsWithTheRelayPublishing:
         assert "pr_number" not in result.outputs
         github.create_pr.assert_not_awaited()
         worktree.delete_branch.assert_not_awaited()
+
+
+def _publisher(tmp_path: Path, github, worktree, state_db, session_id="s-1"):
+    from ctrlrelay.pipelines.dev import _Publisher
+
+    return _Publisher(
+        github=github, worktree=worktree, state_db=state_db,
+        repo="owner/repo", branch="fix/issue-7", issue_number=7,
+        issue_title="Login broken", session_id=session_id,
+    )
+
+
+def _done(**outputs):
+    from ctrlrelay.pipelines.base import PipelineResult
+
+    return PipelineResult(
+        success=True, session_id="s-1", summary="done", outputs=outputs,
+    )
+
+
+class TestThePublisher:
+    @pytest.mark.asyncio
+    async def test_a_resumed_session_leases_on_what_it_pushed_before(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        github = AsyncMock()
+        fake_relay_publish(github)
+        worktree = AsyncMock()
+        worktree.push_run_branch.side_effect = ["sha-1", "sha-2"]
+        try:
+            first = await _publisher(tmp_path, github, worktree, db).publish(
+                _done()
+            )
+            assert first.success
+            # A fresh publisher, as resume_dev_from_pending builds one.
+            again = await _publisher(tmp_path, github, worktree, db).publish(
+                _done()
+            )
+            assert again.success
+            kwargs = [c.kwargs for c in worktree.push_run_branch.await_args_list]
+            assert [k["expected_remote_sha"] for k in kwargs] == [None, "sha-1"]
+            assert kwargs[1]["relay_pushed_shas"] == frozenset({"sha-1"})
+            assert db.relay_pushed_shas(
+                repo="owner/repo", branch="fix/issue-7"
+            ) == frozenset({"sha-1", "sha-2"})
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("owner", "base", "reused"),
+        [
+            ("owner", "main", True),
+            ("forker", "main", False),
+            ("owner", "release", False),
+        ],
+        ids=["same-repo-default-base", "fork-head", "other-base"],
+    )
+    async def test_an_open_pr_is_reused_only_when_it_is_ours(
+        self, tmp_path: Path, owner, base, reused
+    ) -> None:
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        github = AsyncMock()
+        fake_relay_publish(github)
+        github.list_prs.return_value = [{
+            "number": 5, "headRefName": "fix/issue-7", "baseRefName": base,
+            "headRepositoryOwner": {"login": owner},
+            "headRepository": {"name": "repo"},
+        }]
+        worktree = AsyncMock()
+        worktree.push_run_branch.return_value = "sha-1"
+        try:
+            result = await _publisher(tmp_path, github, worktree, db).publish(
+                _done()
+            )
+        finally:
+            db.close()
+        github.create_pr.assert_not_awaited()
+        if reused:
+            assert result.success and result.outputs["pr_number"] == 5
+        else:
+            assert not result.success
+            assert "refusing to reuse PR #5" in (result.error or "")
+            assert "pr_number" not in result.outputs
 
 
 class TestAFixRoundIsPushedByTheRelay:

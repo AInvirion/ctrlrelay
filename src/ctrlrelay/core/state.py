@@ -195,6 +195,20 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, ts);
+
+-- Every branch head ctrlrelay itself pushed for an agent (#219). The
+-- push lease is taken from here, so a remote branch ctrlrelay did not
+-- put there is refused rather than force-pushed over.
+CREATE TABLE IF NOT EXISTS relay_pushes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    pushed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_relay_pushes_branch
+    ON relay_pushes(repo, branch, id);
 """
 
 
@@ -428,6 +442,36 @@ class StateDB:
         """
         rows = self._conn.execute("SELECT * FROM repo_locks").fetchall()
         return [dict(row) for row in rows]
+
+    # Relay pushes (#219)
+
+    def record_relay_push(
+        self, *, repo: str, branch: str, session_id: str, sha: str
+    ) -> None:
+        """Remember a branch head ctrlrelay pushed itself."""
+        self._conn.execute(
+            "INSERT INTO relay_pushes (repo, branch, session_id, sha, pushed_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (repo, branch, session_id, sha, int(time.time())),
+        )
+        self._conn.commit()
+
+    def last_relay_push(self, *, repo: str, branch: str, session_id: str) -> str | None:
+        """The last head this session pushed to ``branch``, or None."""
+        row = self._conn.execute(
+            "SELECT sha FROM relay_pushes WHERE repo = ? AND branch = ? "
+            "AND session_id = ? ORDER BY id DESC LIMIT 1",
+            (repo, branch, session_id),
+        ).fetchone()
+        return row["sha"] if row else None
+
+    def relay_pushed_shas(self, *, repo: str, branch: str) -> frozenset[str]:
+        """Every head ctrlrelay ever pushed to ``branch``, any session."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT sha FROM relay_pushes WHERE repo = ? AND branch = ?",
+            (repo, branch),
+        ).fetchall()
+        return frozenset(r["sha"] for r in rows)
 
     # Agent session ids
 

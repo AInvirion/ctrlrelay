@@ -165,7 +165,8 @@ class GitHubCLI:
             "--limit", str(limit),
             "--json", (
                 "number,title,author,labels,headRefName,mergeable,"
-                "reviewDecision,headRepositoryOwner,headRepository"
+                "reviewDecision,headRepositoryOwner,headRepository,"
+                "baseRefName,url"
             ),
         ]
         if head is not None:

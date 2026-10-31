@@ -931,6 +931,7 @@ class _Publisher:
 
     github: GitHubCLI
     worktree: WorktreeManager
+    state_db: StateDB
     repo: str
     branch: str
     issue_number: int
@@ -940,6 +941,27 @@ class _Publisher:
     last_pushed_sha: str | None = None
     pr_number: int | None = None
     pr_url: str | None = None
+
+    def _check_reusable(self, pr: dict[str, Any]) -> None:
+        """Refuse to adopt an open PR this run would not have opened.
+
+        ``gh pr list --head`` matches the branch NAME, so a PR from a
+        fork with the same branch name, or one aimed at another base,
+        comes back too. Pushing to our branch would then report someone
+        else's pull request as this run's.
+        """
+        from ctrlrelay.core.publish import PushRefusedError
+
+        owner = ((pr.get("headRepositoryOwner") or {}).get("login") or "")
+        name = ((pr.get("headRepository") or {}).get("name") or "")
+        head_repo = f"{owner}/{name}"
+        base = pr.get("baseRefName") or ""
+        if head_repo.lower() != self.repo.lower() or base != self.default_branch:
+            raise PushRefusedError(
+                f"refusing to reuse PR #{pr.get('number')}: head repo "
+                f"{head_repo!r}, base {base!r}; expected {self.repo!r} into "
+                f"{self.default_branch!r}"
+            )
 
     async def publish(self, result: PipelineResult) -> PipelineResult:
         """Push, then open (or find) the pull request.
@@ -964,20 +986,35 @@ class _Publisher:
                 self.default_branch = await self.github.get_default_branch(
                     self.repo
                 )
+            if self.last_pushed_sha is None:
+                # A resumed session pushed before it blocked; its last
+                # push is the lease, not whatever GitHub holds now.
+                self.last_pushed_sha = self.state_db.last_relay_push(
+                    repo=self.repo, branch=self.branch,
+                    session_id=self.session_id,
+                )
             sha = await self.worktree.push_run_branch(
                 self.repo,
                 self.branch,
                 run_branch=self.branch,
                 default_branch=self.default_branch,
                 expected_remote_sha=self.last_pushed_sha,
+                relay_pushed_shas=self.state_db.relay_pushed_shas(
+                    repo=self.repo, branch=self.branch,
+                ),
                 session_id=self.session_id,
             )
             self.last_pushed_sha = sha
+            self.state_db.record_relay_push(
+                repo=self.repo, branch=self.branch,
+                session_id=self.session_id, sha=sha,
+            )
             if self.pr_number is None:
                 existing = await self.github.list_prs(
                     self.repo, state="open", head=self.branch
                 )
                 if existing:
+                    self._check_reusable(existing[0])
                     self.pr_number = int(existing[0]["number"])
                     self.pr_url = (
                         f"https://github.com/{self.repo}/pull/{self.pr_number}"
@@ -1711,6 +1748,7 @@ async def run_dev_issue(
         publisher = _Publisher(
             github=github,
             worktree=worktree,
+            state_db=state_db,
             repo=repo,
             branch=branch_name,
             issue_number=issue_number,
@@ -2311,6 +2349,7 @@ async def resume_dev_from_pending(
         publisher = _Publisher(
             github=github,
             worktree=worktree,
+            state_db=state_db,
             repo=repo,
             branch=branch_name,
             issue_number=int(issue_number),

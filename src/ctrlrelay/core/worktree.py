@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -116,6 +117,42 @@ _RELAY_GIT_FLAGS: tuple[str, ...] = (
     "-c", "protocol.file.allow=never",
     "-c", "protocol.ext.allow=never",
 )
+
+
+_HEX_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def _read_branch_head(bare_path: Path, branch: str) -> str:
+    """Head of ``refs/heads/<branch>`` read from the ref files as data.
+
+    No git process runs in the bare clone, so none of its config (which
+    the agent can write) is read. A symbolic ref, an unreadable value or
+    a missing branch raises :class:`WorktreeError`.
+    """
+    from ctrlrelay.core.publish import PushRefusedError
+
+    ref = f"refs/heads/{branch}"
+    loose = bare_path / ref
+    value: str | None = None
+    if loose.is_file() and not loose.is_symlink():
+        value = loose.read_text().strip()
+    else:
+        packed = bare_path / "packed-refs"
+        if packed.is_file():
+            for line in packed.read_text().splitlines():
+                if line.startswith(("#", "^")):
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) == 2 and parts[1] == ref:
+                    value = parts[0]
+                    break
+    if value is None:
+        raise WorktreeError(f"branch {branch!r} not found in {bare_path}")
+    if not _HEX_SHA.match(value):
+        raise PushRefusedError(
+            f"push refused: {ref} does not hold a plain commit id"
+        )
+    return value
 
 
 def _relay_push_gitconfig() -> str:
@@ -884,37 +921,40 @@ class WorktreeManager:
         run_branch: str,
         default_branch: str,
         expected_remote_sha: str | None,
+        relay_pushed_shas: frozenset[str],
         session_id: str | None = None,
     ) -> str:
         """Push this run's branch to GitHub with the relay's credentials.
 
-        The only push the relay makes on an agent's behalf (#219), so
-        every rule is enforced here rather than in a prompt:
+        The only push the relay makes on an agent's behalf (#219):
 
         - :func:`check_push_target` refuses ``main``, ``master``, the
           default branch and anything that is not ``run_branch``.
         - The branch must carry at least one commit the default branch
           does not, or there is nothing to open a pull request for.
-        - The pushed object is the SHA read once here, not a ref name,
-          so an agent still running cannot move the ref under the push.
-        - **No credentialed git command reads config the agent can
-          write.** The bare clone's config is shared with every worktree
-          cut from it, so the agent can set ``core.sshCommand``,
-          ``credential.helper``, ``url.*.insteadOf``,
-          ``remote.origin.url``, ``include.path`` or hooks there, and a
-          push run in the bare clone would honour them under the
-          relay's login. So the push runs from a fresh git dir created
-          for this one push in a relay-only directory, borrowing the
-          bare clone's objects through ``objects/info/alternates``
-          (objects are content-addressed data: nothing in them is run).
-          Its config is written here; system config is off; the global
-          config is a file written here carrying only the credential
-          helper; hooks and fsmonitor are disabled on the command line;
-          and the remote is an explicit URL built from the validated
-          repo name, never ``origin``.
-        - ``--force-with-lease`` expects ``expected_remote_sha`` (what
-          this run last pushed). ``None`` means "read it now", which is
-          right for the first push of a run.
+        - The pushed object is the SHA read once here, not a ref name.
+        - The remote is an explicit URL built from the validated repo
+          name, never ``origin``, and the push runs from a fresh git dir
+          created for this one push in a relay directory. Its config is
+          written here, system config is off, the global config is a
+          file written here holding only the credential helper, no
+          ``GIT_*`` variable is inherited, and hooks and fsmonitor are
+          off on the command line.
+        - The bare clone's config is never read: its config is shared
+          with every worktree cut from it, so the agent can write it.
+          The two branch heads are read from its ref files as data, and
+          its objects are borrowed through ``objects/info/alternates``.
+        - Lease: ``expected_remote_sha`` is what this session pushed
+          last. When it is None, a branch that does not exist on GitHub
+          is created; one that does is pushed over only if its head is
+          a SHA in ``relay_pushed_shas`` (ctrlrelay put it there), and
+          refused otherwise rather than overwritten.
+
+        What this does NOT guarantee: the agent runs as the same OS user,
+        so a deliberately hostile agent can read credential files, and
+        can write to the relay's push directory, the bare clone's object
+        store and any alternates chain it adds there, racing this push.
+        That boundary needs a separate user or a read-only home (#236).
 
         Returns the SHA pushed.
         """
@@ -933,6 +973,8 @@ class WorktreeManager:
         )
         url = github_push_url(repo)
         bare_path = self._get_bare_repo_path(repo)
+        sha = _read_branch_head(bare_path, branch)
+        base_sha = _read_branch_head(bare_path, default_branch)
         push_root = self.bare_repos_dir.parent / "push"
         push_root.mkdir(parents=True, exist_ok=True)
         push_root.chmod(0o700)
@@ -950,25 +992,12 @@ class WorktreeManager:
             (gitdir / "objects" / "info" / "alternates").write_text(
                 str((bare_path / "objects").resolve()) + "\n"
             )
-            # Refs are read from the agent-writable clone as DATA (a
-            # rev-parse, under the relay env and flags), then everything
-            # else happens in the private dir.
-            sha = (
+            for value in (sha, base_sha):
                 await self._run_git(
-                    "--git-dir", str(bare_path), *_RELAY_GIT_FLAGS,
-                    "rev-parse", "--verify", "--end-of-options",
-                    f"refs/heads/{branch}^{{commit}}",
+                    *git("rev-parse", "--verify", "--quiet",
+                         "--end-of-options", f"{value}^{{commit}}"),
                     env=env,
                 )
-            ).strip()
-            base_sha = (
-                await self._run_git(
-                    "--git-dir", str(bare_path), *_RELAY_GIT_FLAGS,
-                    "rev-parse", "--verify", "--end-of-options",
-                    f"refs/heads/{default_branch}^{{commit}}",
-                    env=env,
-                )
-            ).strip()
             ahead = (
                 await self._run_git(
                     *git("rev-list", "--count", f"{base_sha}..{sha}"), env=env,
@@ -993,7 +1022,24 @@ class WorktreeManager:
                     env=env,
                     timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
                 )
-                expected_remote_sha = out.split()[0] if out.strip() else ""
+                remote = out.split()[0] if out.strip() else ""
+                if remote and remote not in relay_pushed_shas:
+                    _logger.error(
+                        "publish.push.refused",
+                        extra={
+                            "repo": repo,
+                            "session_id": session_id,
+                            "branch": branch,
+                            "remote_sha": remote,
+                            "reason": "remote branch not pushed by ctrlrelay",
+                        },
+                    )
+                    raise PushRefusedError(
+                        f"push refused: {branch!r} already exists on GitHub "
+                        f"at {remote[:12]}, which ctrlrelay did not push; "
+                        "not overwriting it"
+                    )
+                expected_remote_sha = remote
             await self._run_git(
                 *git(
                     "push", "--no-verify", "--porcelain",
