@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-31
+
+A read-only status page. `state.db` switches to WAL mode and gains an
+`events` table; both happen automatically. The page is off until you start
+it. **No config edit is required** to upgrade.
+
+### Added
+
+- `ctrlrelay web start|stop|status` and a `ctrlrelay-web` systemd unit: a
+  read-only page plus `/api/status` and `/api/events` JSON showing what each
+  agent is doing (phase and last command), the waiting line, questions that
+  need you, today's counts, and a feed of dispatches, PRs, CI, reviews,
+  merges, messages and alerts. New `web:` config block (defaults
+  `127.0.0.1:8787`, 7 days). Requests for other host names are refused; add
+  LAN names to `web.allowed_hosts` (#217, closes #209)
+- An `events` table, written best-effort by the daemon on a separate
+  connection with a 0.25s lock wait, so a slow or failed write never affects
+  the work it records (#217)
+
+### Changed
+
+- `state.db` uses WAL mode so the page can read while the daemon writes. If
+  the switch cannot get the lock at startup it is deferred to the next start
+  instead of failing (#217)
+
 ## [0.13.0] - 2026-10-30
 
 New database columns and one new config value. All of them are added
@@ -1771,7 +1796,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.4...v0.13.0
 [0.12.4]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.2...v0.12.4
 [0.12.3]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.2...v0.12.3
