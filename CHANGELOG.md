@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-31
+
+The dev and task agents no longer inherit the usual GitHub credentials;
+ctrlrelay does the pushing, PR opening and commenting itself
+after the agent exits. One new
+database table is added automatically and the new config values have
+defaults, so **no config edit is required** to upgrade.
+
+### Changed
+
+- Dev and task agents run with inherited `GH_*` and `GITHUB_*` variables
+  and gh's login removed from their environment, git credential helpers and
+  git's SSH disabled, and the D-Bus and runtime-dir variables pointed away
+  from the desktop keyring. After the agent exits the
+  relay pushes the run branch from a relay-private git dir to an explicit
+  GitHub URL, opens the PR from the DONE checkpoint (or reuses an open PR on the run
+  branch), pushes fix rounds,
+  fetches failed CI logs and posts task reports. It refuses to push the
+  default branch and only overwrites a remote branch whose head it recorded
+  pushing. secops keeps GitHub access (#235, closes #219)
+- Status page: the phase bar shows the furthest phase seen in the recent
+  transcript and pipeline events, CI waits are
+  shown as waiting rather than reading, and the PR is linked (#239, closes
+  #238)
+
+### Added
+
+- Optional `agent.sandbox: bwrap` with `agent.sandbox_hide_paths` to run the
+  dev and task agents under bubblewrap with credential paths hidden. Off by
+  default (#235)
+- A `relay_pushes` table recording the heads ctrlrelay pushed (#235)
+- Status page: a live counter and dot, server health, GitHub links, and the
+  list of skipped issues (#233, closes #232)
+
+### Known limits
+
+- The agent still runs as the same OS user. Without the bwrap sandbox it
+  can read credential files on disk; with it, only the paths in
+  `agent.sandbox_hide_paths` are hidden. It can still run ssh directly, reach
+  the Linux keyring by resetting the D-Bus address, or read a token kept
+  under some other variable name, and the macOS keychain is not covered. Running the agent as a separate user
+  is tracked in #236
+
 ## [0.14.0] - 2026-10-31
 
 A read-only status page. `state.db` switches to WAL mode and gains an
@@ -1796,7 +1839,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.4...v0.13.0
 [0.12.4]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.2...v0.12.4
