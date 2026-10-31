@@ -16,6 +16,7 @@ from ctrlrelay.web.transcript import (
     classify,
     read_activity,
     summarize_command,
+    summarize_path,
     transcript_dir_for,
 )
 
@@ -414,3 +415,53 @@ def test_a_symlink_out_of_the_worktree_is_outside(tmp_path: Path) -> None:
 
     (d / "t.jsonl").write_text(via_link + "\n")
     assert read_activity(str(worktree), home=tmp_path).last_command == "file outside repo"
+
+
+@pytest.mark.parametrize(
+    ("relative", "shown"),
+    [
+        ("src/app.py", "src/app.py"),
+        ("docs/tokenizer-notes.md", "docs/***"),
+        ("tokens/ghp_abc123DEF456ghi789", "***/***"),
+        ("fixtures/ghp_abc123DEF456ghi789.json", "fixtures/***"),
+        ("fixtures/gho_x", "fixtures/***"),
+        ("fixtures/ghs_x", "fixtures/***"),
+        ("fixtures/github_pat_11AB", "fixtures/***"),
+        ("keys/sk-live-abc", "keys/***"),
+        ("chat/xoxb-1-2", "chat/***"),
+        ("chat/xoxp-1-2", "chat/***"),
+        ("aws/AKIAIOSFODNN7EXAMPLE", "aws/***"),
+        ("cache/a1b2c3d4e5f6a7b8c9d0e1f2", "cache/***"),
+        (".env", "***"),
+        ("deploy/prod.env", "deploy/***"),
+        ("deploy/.env.local", "deploy/.env.local"),
+        ("home/id_rsa", "home/***"),
+        ("home/id_rsa.pub", "home/***"),
+        ("certs/server.pem", "certs/***"),
+        ("certs/server.key", "certs/***"),
+        ("config/Secrets.yaml", "config/***"),
+        ("config/db_password.txt", "config/***"),
+        ("config/passwd", "config/***"),
+        ("config/credentials.json", "config/***"),
+        # Ordinary names that only resemble a rule stay readable.
+        ("src/task-runner/main.py", "src/task-runner/main.py"),
+        ("src/desk-lamp.py", "src/desk-lamp.py"),
+        ("src/keyboard.py", "src/keyboard.py"),
+        ("src/environment.py", "src/environment.py"),
+        ("src/abcdefghijklmnopqrstuvwxyz.py", "src/abcdefghijklmnopqrstuvwxyz.py"),
+        ("src/12345678901234567890123.txt", "src/12345678901234567890123.txt"),
+    ],
+)
+def test_path_components_that_look_like_credentials_are_masked(
+    relative: str, shown: str
+) -> None:
+    assert summarize_path(f"{WORKTREE}/{relative}", WORKTREE) == shown
+
+
+def test_a_masked_path_never_shows_the_token_through_the_transcript(
+    tmp_path: Path,
+) -> None:
+    secret = "ghp_abc123DEF456ghi789jkl012"
+    shown = _shown_for(tmp_path, "Read", {"file_path": f"{WORKTREE}/tokens/{secret}"})
+    assert shown == "***/***"
+    assert "ghp_" not in shown

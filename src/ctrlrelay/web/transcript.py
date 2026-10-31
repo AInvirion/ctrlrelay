@@ -9,8 +9,9 @@ a reason.
 
 The page is open to the home network, so the last command is never shown as
 typed. It is built only from fixed lists: a known program name (anything else is
-"cmd"), one known subcommand for a few tools, a path inside the worktree, or the
-word "search". Everything else is left out and marked with "…".
+"cmd"), one known subcommand for a few tools, a path inside the worktree (any
+component of it that looks like a credential shown as "***"), or the word
+"search". Everything else is left out and marked with "…".
 """
 
 from __future__ import annotations
@@ -246,15 +247,42 @@ def summarize_command(command: str, limit: int = MAX_COMMAND_CHARS) -> str:
     return text[:limit]
 
 
+# A path component that looks like a credential, or names a file that
+# holds one, is shown as MASK. A token prefix counts only at the start of
+# the component or after a non-alphanumeric, so "task-runner" is not "sk-".
+_TOKEN_PREFIX = re.compile(
+    r"(?<![A-Za-z0-9])(?:ghp_|gho_|ghs_|github_pat_|sk-|xox[a-z]-|AKIA)"
+)
+_LONG_RUN = re.compile(r"[A-Za-z0-9]{20,}")
+_SECRET_NAME = re.compile(
+    r"(?i)(secret|token|password|passwd|credential|\.env$|id_rsa|\.pem$|\.key$)"
+)
+MASK = "***"
+
+
+def _looks_secret(component: str) -> bool:
+    if _TOKEN_PREFIX.search(component) or _SECRET_NAME.search(component):
+        return True
+    return any(
+        re.search(r"[A-Za-z]", run) and re.search(r"[0-9]", run)
+        for run in _LONG_RUN.findall(component)
+    )
+
+
 def summarize_path(file_path: str, worktree_path: str | None) -> str:
-    """The path relative to the worktree, or a fixed phrase when it is outside."""
+    """The path relative to the worktree, or a fixed phrase when it is outside.
+
+    Any component that looks like a credential (see ``_looks_secret``) is
+    replaced by ``***``; the rest of the path is shown as it is.
+    """
     if not worktree_path:
         return OUTSIDE_REPO
     path = os.path.realpath(file_path)
     root = os.path.realpath(worktree_path)
     if os.path.commonpath([path, root]) != root or path == root:
         return OUTSIDE_REPO
-    return os.path.relpath(path, root)
+    parts = os.path.relpath(path, root).split(os.sep)
+    return os.sep.join(MASK if _looks_secret(p) else p for p in parts)
 
 
 def _describe(tool_name: str, tool_input: dict, worktree_path: str | None) -> str | None:
