@@ -305,11 +305,12 @@ class TestRealGitAndGhFindNothingUnderTheAgentEnv:
 
         Two fake session buses (unix sockets that count connections):
         A at an explicit DBUS_SESSION_BUS_ADDRESS, B at
-        $XDG_RUNTIME_DIR/bus. Two clients: gh itself, and a reference
+        $XDG_RUNTIME_DIR/bus. Three clients: gh itself, a reference
         client that follows the D-Bus rule (address if set, else
-        $XDG_RUNTIME_DIR/bus). Controls: under operator envs the
-        reference client reaches A and B, and gh reaches A. Claim: under
-        the agent env built from each, neither client reaches either bus.
+        $XDG_RUNTIME_DIR/bus), and one that only looks under
+        $XDG_RUNTIME_DIR. Controls: under operator envs the python
+        clients reach A and B, and gh reaches A. Claim: under the agent
+        env built from each, no client reaches either bus.
 
         What this proves: the agent env routes both the address and the
         XDG lookup away from anything the operator env points at. What it
@@ -359,10 +360,21 @@ class TestRealGitAndGhFindNothingUnderTheAgentEnv:
             "try:\n    s.connect(p)\nexcept OSError:\n    pass\n"
         )
 
+        # Some clients (sd-bus's user bus, for one) look only at
+        # $XDG_RUNTIME_DIR/bus. This one does, so the XDG override is
+        # tested on its own and not only behind the address.
+        xdg_only_client = (
+            "import os, socket\n"
+            "p = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/nonexistent'), 'bus')\n"
+            "s = socket.socket(socket.AF_UNIX)\n"
+            "try:\n    s.connect(p)\nexcept OSError:\n    pass\n"
+        )
+
         def dial(env: dict) -> dict:
             before = dict(hits)
-            subprocess.run([sys.executable, "-c", ref_client], env=env,
-                           capture_output=True, timeout=30)
+            for client in (ref_client, xdg_only_client):
+                subprocess.run([sys.executable, "-c", client], env=env,
+                               capture_output=True, timeout=30)
             subprocess.run(["gh", "auth", "token"], env=env,
                            capture_output=True, timeout=30)
             import time as _t
@@ -394,9 +406,11 @@ class TestRealGitAndGhFindNothingUnderTheAgentEnv:
             stop.set()
             for srv in servers:
                 srv.close()
-        # ref client + gh both reach A; only the ref client reaches B.
-        assert control_a["A"] == 2
-        assert control_b["B"] == 1
+        # by address: the rule client and gh reach A, the XDG-only
+        # client reaches B. By XDG: both python clients reach B (gh goes
+        # to /run/user/<uid>/bus, see the docstring).
+        assert control_a == {"A": 2, "B": 1}
+        assert control_b == {"A": 0, "B": 2}
         assert agent_results == [{"A": 0, "B": 0}, {"A": 0, "B": 0}]
 
 
