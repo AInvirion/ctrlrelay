@@ -1588,10 +1588,12 @@ async def run_dev_issue(
     # that was never recorded would name a session nothing else knows.
     session_row_inserted = False
 
-    # Whether the agent was started. A failure before that (the issue
-    # read, the claim comment, the clone, the worktree) is reported as
-    # ``failed_before_dispatch`` so the poller can retry the issue
-    # instead of dropping it (#234).
+    # Whether the run was handed to the pipeline that starts the agent.
+    # A failure before that (the issue read, the claim comment, the
+    # clone, the worktree) is reported as ``failed_before_dispatch`` so
+    # the poller can retry the issue instead of dropping it (#234). A
+    # failure inside the pipeline is not, even before the agent spawns:
+    # retrying is only offered where nothing could have run.
     dispatched = False
 
     try:

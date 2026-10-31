@@ -1249,6 +1249,11 @@ class WorktreeManager:
         missing. If the fresh clone fails, the partial one is removed
         and the old clone put back, so the next run sees the same state
         and tries again.
+
+        The check and the move are not atomic on their own. They rely on
+        the per-repo lock: every caller of ``ensure_bare_repo`` (the dev,
+        task and secops runs, their resumes, and the dev fix round)
+        holds it, and so does everything that adds a worktree.
         """
         listing = await self._run_git(
             "worktree", "list", "--porcelain", cwd=bare_path,

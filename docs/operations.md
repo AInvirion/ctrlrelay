@@ -510,9 +510,9 @@ The poller's seen-issue state is a JSON file at
 re-process a specific issue, delete its number from `seen_issues[<repo>]` (or
 delete the file entirely to reseed from scratch on next start).
 
-A run that fails **before the agent starts** (reading the issue, posting
-the claim comment, cloning, cutting the worktree) does not use the issue
-up. The issue is un-marked and tried again on the next poll, up to 3 runs
+A run that fails **before it is handed to the agent pipeline** (reading
+the issue, posting the claim comment, cloning, cutting the worktree) does
+not use the issue up. The issue is un-marked and tried again on the next poll, up to 3 runs
 in all, with a chat message each time. After the third it stays in
 `seen_issues` and the message says so; fix the cause, then delete the
 number as above. The count is kept in `pre_dispatch_failures` in the same

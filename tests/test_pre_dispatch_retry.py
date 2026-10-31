@@ -109,6 +109,17 @@ class TestSettle:
         assert poller.seen_issues == {REPO: {1}}
         assert poller.pre_dispatch_failures == {"other/repo": {8: 2}}
 
+    @pytest.mark.parametrize("bad", ["[]", '{"seen_issues": []}', "5"])
+    def test_a_state_file_of_the_wrong_shape_starts_fresh(
+        self, tmp_path: Path, bad: str,
+    ) -> None:
+        state = tmp_path / "state.json"
+        state.write_text(bad)
+
+        poller = _poller(state)
+
+        assert poller.seen_issues == {} and poller.pre_dispatch_failures == {}
+
     def test_counts_that_are_not_an_object_are_dropped(self, tmp_path: Path) -> None:
         state = tmp_path / "state.json"
         state.write_text(json.dumps(
@@ -160,11 +171,11 @@ async def test_dev_marks_a_clone_failure_as_before_dispatch(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_dev_does_not_mark_a_failure_after_the_agent_started(
+async def test_dev_does_not_mark_a_failure_once_the_pipeline_runs(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """The run itself raising stands for any failure once the agent was
-    started; that one must not be retried by this path."""
+    """Once the run is handed to the pipeline that starts the agent, a
+    failure is not retried by this path, whatever stage it came from."""
     from ctrlrelay.core.state import StateDB
     from ctrlrelay.pipelines.dev import DevPipeline, run_dev_issue
 
@@ -207,7 +218,7 @@ async def test_task_marks_a_clone_failure_as_before_dispatch(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_task_does_not_mark_a_failure_after_the_agent_started(
+async def test_task_does_not_mark_a_failure_once_the_pipeline_runs(
     tmp_path: Path, monkeypatch,
 ) -> None:
     from ctrlrelay.core.state import StateDB
