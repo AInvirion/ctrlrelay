@@ -69,10 +69,10 @@ def test_transcript_dir_matches_measured_layout() -> None:
         ("Bash", {"command": "uv run pytest -q && git push"}, Phase.PR),
         ("Bash", {"command": "git push && pytest -q"}, Phase.TESTING),
         ("Bash", {"command": "uv run pytest -q 2>&1 | tail -20"}, Phase.TESTING),
-        ("Bash", {"command": "echo \"git push\""}, Phase.READING),
+        ("Bash", {"command": "echo \"git push\""}, None),
         ("Bash", {"command": "cat pytest.log"}, Phase.READING),
         ("Bash", {"command": "cd /w && FOO=1 python -m pytest tests"}, Phase.TESTING),
-        ("Bash", {"command": "git commit -F - <<'MSG'\ngit push later\nMSG\n"}, Phase.READING),
+        ("Bash", {"command": "git commit -F - <<'MSG'\ngit push later\nMSG\n"}, Phase.CODING),
         ("Bash", {"command": "npm run test:unit"}, Phase.TESTING),
         ("Bash", {"command": "go test ./..."}, Phase.TESTING),
         ("Bash", {"command": "sed -n '1,60p' f.py"}, Phase.READING),
@@ -86,7 +86,7 @@ def test_transcript_dir_matches_measured_layout() -> None:
         ("Bash", {"command": 'pytest ";" git push'}, Phase.TESTING),
         ("Bash", {"command": "echo '<<EOF'\ngit push"}, Phase.PR),
         ("Bash", {"command": "cat <<-EOF\ngit push\nEOF\npytest -q"}, Phase.TESTING),
-        ("Bash", {"command": "git commit -F - <<'M'\nit's done; git push\nM"}, Phase.READING),
+        ("Bash", {"command": "git commit -F - <<'M'\nit's done; git push\nM"}, Phase.CODING),
         ("TodoWrite", {}, None),
     ],
 )
@@ -465,3 +465,67 @@ def test_a_masked_path_never_shows_the_token_through_the_transcript(
     shown = _shown_for(tmp_path, "Read", {"file_path": f"{WORKTREE}/tokens/{secret}"})
     assert shown == "***/***"
     assert "ghp_" not in shown
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # Read-only programs and subcommands.
+        *[(c, Phase.READING) for c in (
+            "cat a", "head -5 a", "tail -f a", "less a", "ls -la", "grep -rn x .",
+            "rg x", "find . -name x", "wc -l a", "diff a b", "tree", "stat a",
+            "file a", "sed -n '1,5p' a", "sed 's/a/b/' f",
+            "git status", "git diff HEAD", "git log -3", "git show HEAD",
+            "git blame a", "git branch", "gh pr view 3", "gh pr list",
+            "gh issue view 3", "gh issue list", "/usr/bin/cat a",
+        )],
+        # Mutating ones.
+        *[(c, Phase.CODING) for c in (
+            "rm -rf build", "mv a b", "cp a b", "touch a", "mkdir -p d", "rmdir d",
+            "chmod +x a", "ln -s a b", "echo x | tee a", "patch -p1 < d",
+            "sed -i 's/a/b/' f", "sed -i.bak 's/a/b/' f", "sed -Ei 's/a/b/' f",
+            "sed --in-place 's/a/b/' f",
+            "git add a", "git commit -m x", "git checkout -b x", "git switch x",
+            "git restore a", "git stash", "git rebase main", "git merge x",
+            "git reset --hard", "git cherry-pick abc", "git apply d",
+            "npm install", "pnpm add x", "yarn add x", "yarn install",
+            "uv add x", "uv sync", "uv pip install x", "pip install x",
+        )],
+        # Anything else says nothing.
+        *[(c, None) for c in (
+            "echo hi", "curl https://example.invalid", "git branch -D x",
+            "git fetch", "gh api repos/x", "python script.py", "make build",
+            "jq . a", "npm run build", "uv pip list", "pip list", "cd /w",
+        )],
+        # A read never outranks what else the line did.
+        ("uv run pytest -q 2>&1 | tail -20", Phase.TESTING),
+        ("git push && git status", Phase.PR),
+        ("rm a && ls", Phase.CODING),
+        ("cat a && pytest", Phase.TESTING),
+        ("pytest && rm -rf .cache", Phase.CODING),
+        ("echo x && cat a", Phase.READING),
+    ],
+)
+def test_classify_shell_segments(command: str, expected: Phase | None) -> None:
+    assert classify("Bash", {"command": command}) is expected
+
+
+def test_a_shell_command_that_says_nothing_keeps_the_last_phase(
+    tmp_path: Path,
+) -> None:
+    d = _transcript_dir(tmp_path)
+    rows = [
+        _assistant_row("Edit", {"file_path": f"{WORKTREE}/src/app.py"},
+                       "2026-10-31T03:00:00.000Z"),
+        _assistant_row("Bash", {"command": "echo done"}, "2026-10-31T03:00:05.000Z"),
+    ]
+    (d / "t.jsonl").write_text("\n".join(rows) + "\n")
+    assert read_activity(WORKTREE, home=tmp_path).phase is Phase.CODING
+
+    rows.append(_assistant_row("Bash", {"command": "rm -rf build"},
+                               "2026-10-31T03:00:09.000Z"))
+    rows.insert(0, _assistant_row("Read", {"file_path": f"{WORKTREE}/a"},
+                                  "2026-10-31T02:59:00.000Z"))
+    rows[1] = _assistant_row("Bash", {"command": "cat a"}, "2026-10-31T03:00:00.000Z")
+    (d / "t.jsonl").write_text("\n".join(rows) + "\n")
+    assert read_activity(WORKTREE, home=tmp_path).phase is Phase.CODING

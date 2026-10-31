@@ -88,6 +88,28 @@ _CONTROL = frozenset(";&|\n()")
 _ENV_OPERAND_FLAGS = frozenset({"-u", "--unset", "-C", "--chdir"})
 _TEST_RUNNERS = frozenset({"pytest", "jest", "vitest"})
 _TEST_SUBCOMMANDS = {"go": "test", "cargo": "test", "playwright": "test"}
+# Shell commands known to only look (READING) or to change files (CODING).
+# Anything not listed says nothing about the phase.
+_READ_PROGRAMS = frozenset({
+    "cat", "head", "tail", "less", "ls", "grep", "rg", "find", "wc", "diff",
+    "tree", "stat", "file",
+})
+_WRITE_PROGRAMS = frozenset({
+    "rm", "mv", "cp", "touch", "mkdir", "rmdir", "chmod", "ln", "tee", "patch",
+})
+_GIT_READ = frozenset({"status", "diff", "log", "show", "blame"})
+_GIT_WRITE = frozenset({
+    "add", "commit", "checkout", "switch", "restore", "stash", "rebase", "merge",
+    "reset", "cherry-pick", "apply",
+})
+_GH_READ = frozenset({("pr", "view"), ("pr", "list"), ("issue", "view"), ("issue", "list")})
+_INSTALLERS = {
+    "npm": frozenset({"install", "add"}),
+    "pnpm": frozenset({"install", "add"}),
+    "yarn": frozenset({"install", "add"}),
+    "uv": frozenset({"add", "sync"}),
+    "pip": frozenset({"install"}),
+}
 
 
 def _shell_tokens(command: str):
@@ -191,6 +213,33 @@ def _classify_segment(words: list[str]) -> Phase | None:
         return Phase.PR
     if head == "gh" and rest[:2] == ["pr", "create"]:
         return Phase.PR
+    return _read_or_write(head, rest)
+
+
+def _read_or_write(head: str, rest: list[str]) -> Phase | None:
+    """READING for a known read-only command, CODING for a known mutating
+    one, None for anything else."""
+    if head == "sed":
+        in_place = any(
+            re.match(r"-[A-Za-z]*i", w) or w.startswith("--in-place") for w in rest
+        )
+        return Phase.CODING if in_place else Phase.READING
+    if head in _READ_PROGRAMS:
+        return Phase.READING
+    if head in _WRITE_PROGRAMS:
+        return Phase.CODING
+    if head == "git":
+        if (rest[:1] and rest[0] in _GIT_READ) or rest == ["branch"]:
+            return Phase.READING
+        if rest[:1] and rest[0] in _GIT_WRITE:
+            return Phase.CODING
+        return None
+    if head == "gh":
+        return Phase.READING if tuple(rest[:2]) in _GH_READ else None
+    if head == "uv" and rest[:2] == ["pip", "install"]:
+        return Phase.CODING
+    if rest[:1] and rest[0] in _INSTALLERS.get(head, ()):
+        return Phase.CODING
     return None
 
 
@@ -208,12 +257,21 @@ def classify(tool_name: str, tool_input: dict) -> Phase | None:
     if tool_name == "Bash":
         command = tool_input.get("command")
         if not isinstance(command, str):
-            return Phase.READING
-        phase = Phase.READING  # any other shell command only looks around
+            return None
+        # The last segment that says something decides, except that a read
+        # never outranks anything else the line did: `pytest | tail` is
+        # testing, `rm x && ls` is coding. A line made only of commands
+        # nobody listed says nothing (None), so the previous phase stands.
+        phase: Phase | None = None
+        reads = False
         for words in _segments(command):
             classified = _classify_segment(words)
-            if classified is not None:
+            if classified is Phase.READING:
+                reads = True
+            elif classified is not None:
                 phase = classified
+        if phase is None and reads:
+            return Phase.READING
         return phase
     return None
 
