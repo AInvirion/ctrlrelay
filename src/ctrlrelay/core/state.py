@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 import uuid
@@ -11,6 +12,10 @@ from typing import Any
 from ctrlrelay.core.obs import get_logger, log_event
 
 _logger = get_logger("core.state")
+
+# The longest a starting daemon waits to switch the file to WAL before it
+# gives up for this start (see StateDB._switch_to_wal).
+WAL_SWITCH_TIMEOUT_MS = 2000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -176,6 +181,20 @@ CREATE INDEX IF NOT EXISTS idx_pending_resumes_answered_unresumed
 -- The repeat lookup reads one repo's history on every posted question.
 CREATE INDEX IF NOT EXISTS idx_pending_resumes_repo_created
     ON pending_resumes(repo, created_at);
+
+-- Feed for the status page. Written best-effort by the daemon through
+-- ctrlrelay.core.events.emit_event; a failed write never affects the work.
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    repo TEXT,
+    issue_number INTEGER,
+    session_id TEXT,
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, ts);
 """
 
 
@@ -194,12 +213,56 @@ class StateDB:
         """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Opened on first use by record_event_nowait; see there.
+        self._event_conn: sqlite3.Connection | None = None
 
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
+        self._switch_to_wal()
+        # busy_timeout makes a briefly contended write wait instead of
+        # failing at once.
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        # An in-memory database reports an empty file name. A second
+        # connection to it would be a different, empty database, so event
+        # writes must stay on the main connection there.
+        self._in_memory = (
+            self._conn.execute("PRAGMA database_list").fetchone()[2] == ""
+        )
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._conn.commit()
+
+    def _switch_to_wal(self) -> None:
+        """Put the file in WAL mode if it is not already, never failing.
+
+        WAL lets the read-only status page read while the poller and
+        bridge write. The mode is stored in the file, so after the first
+        successful switch this is a no-op. The switch itself needs an
+        exclusive lock: on a database still in rollback-journal mode, the
+        other daemon process holding a read makes it fail with "database
+        is locked". So it waits at most ``WAL_SWITCH_TIMEOUT_MS`` and, if
+        still locked, logs ``state.wal_switch_deferred`` and carries on in
+        the current mode; the next start tries again. Every reader and
+        writer here works in either mode.
+        """
+        self._conn.execute(f"PRAGMA busy_timeout={WAL_SWITCH_TIMEOUT_MS}")
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as exc:
+            mode = self._conn.execute("PRAGMA journal_mode").fetchone()[0]
+            _logger.warning(
+                "state.wal_switch_deferred",
+                extra={
+                    "db_path": str(self.db_path),
+                    "journal_mode": mode,
+                    "error": str(exc),
+                    "detail": (
+                        "another process held the database while this one "
+                        "started; running in the current journal mode, the "
+                        "next start tries WAL again"
+                    ),
+                },
+            )
 
     def _migrate(self) -> None:
         """Apply in-place schema additions to databases written by older versions.
@@ -280,7 +343,10 @@ class StateDB:
         self._ensure_dispatch_health_row()
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Close the database connection (and the event side connection)."""
+        if self._event_conn is not None:
+            self._event_conn.close()
+            self._event_conn = None
         self._conn.close()
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
@@ -504,7 +570,17 @@ class StateDB:
         itself opens a transaction, so asking afterwards always answers
         "one is open" and the commit would never run — a guard that
         cannot fire, in the fix for a guard that fired too often.
+
+        When the row is already there nothing is written at all. An
+        ``INSERT OR IGNORE`` that ignores still takes a write lock and its
+        commit needs an exclusive one, so on a rollback-journal database
+        (one whose WAL switch was deferred) a daemon starting while the
+        other holds a read would fail here instead.
         """
+        if self._conn.execute(
+            "SELECT 1 FROM dispatch_health WHERE id = 1"
+        ).fetchone() is not None:
+            return
         joined = self._conn.in_transaction
         self._conn.execute(
             "INSERT OR IGNORE INTO dispatch_health "
@@ -1165,6 +1241,240 @@ class StateDB:
             "SELECT * FROM pr_watches ORDER BY started_at ASC"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # Events (status page feed)
+
+    # Seconds a best-effort event write may wait for a contended lock.
+    EVENT_WRITE_TIMEOUT = 0.25
+
+    @staticmethod
+    def _insert_event(
+        conn: sqlite3.Connection,
+        kind: str,
+        repo: str | None,
+        issue_number: int | None,
+        session_id: str | None,
+        detail: dict[str, Any] | None,
+        ts: int | None,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO events
+               (ts, kind, repo, issue_number, session_id, detail)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                int(time.time()) if ts is None else int(ts),
+                str(kind),
+                repo,
+                issue_number,
+                session_id,
+                None if detail is None else json.dumps(detail),
+            ),
+        )
+        conn.commit()
+
+    def record_event(
+        self,
+        kind: str,
+        *,
+        repo: str | None = None,
+        issue_number: int | None = None,
+        session_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+        ts: int | None = None,
+    ) -> None:
+        """Append one row to the events feed on the main connection and
+        commit. Raises on failure, and a contended write waits for the
+        main connection's busy timeout. The daemon uses
+        ``events.emit_event`` instead, which goes through
+        :meth:`record_event_nowait`."""
+        self._insert_event(
+            self._conn, kind, repo, issue_number, session_id, detail, ts
+        )
+
+    def record_event_nowait(
+        self,
+        kind: str,
+        *,
+        repo: str | None = None,
+        issue_number: int | None = None,
+        session_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+        ts: int | None = None,
+    ) -> None:
+        """Like :meth:`record_event`, but through a separate connection to
+        the same file that waits at most ``EVENT_WRITE_TIMEOUT`` seconds
+        for a lock. Using its own connection keeps a failed event write
+        from leaving the main connection mid-transaction. Raises on
+        failure; the side connection is rolled back first.
+
+        For an in-memory database there is no file to share, so this
+        falls back to the main connection (and its busy timeout) - but
+        only when no transaction is open there. Inserting would join that
+        transaction and the commit would publish somebody else's
+        half-finished write, so the event is skipped instead and
+        ``events.write_skipped`` logged."""
+        if self._in_memory:
+            if self._main_busy_for_events(kind):
+                return
+            self.record_event(
+                kind, repo=repo, issue_number=issue_number,
+                session_id=session_id, detail=detail, ts=ts,
+            )
+            return
+        conn = self._event_connection()
+        try:
+            self._insert_event(
+                conn, kind, repo, issue_number, session_id, detail, ts
+            )
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _main_busy_for_events(self, kind: str) -> bool:
+        """For an in-memory database: whether the main connection has a
+        transaction open, in which case an event write or prune must not
+        touch it. Logs ``events.write_skipped`` when it does."""
+        if not self._conn.in_transaction:
+            return False
+        log_event(
+            _logger,
+            "events.write_skipped",
+            kind=str(kind),
+            reason="main_connection_in_transaction",
+        )
+        return True
+
+    # The "once" lookup. Equality on session_id leads, so it is answered
+    # from idx_events_session (session_id, ts); kind, repo and the PR
+    # number are checked on that session's few rows.
+    _EVENT_ONCE_SQL = """INSERT INTO events
+           (ts, kind, repo, issue_number, session_id, detail)
+           SELECT ?, ?, ?, ?, ?, ?
+           WHERE NOT EXISTS (
+               SELECT 1 FROM events
+               WHERE session_id IS ? AND kind = ? AND repo IS ?
+                 AND json_extract(detail, '$.pr_number') = ?
+           )"""
+
+    def record_event_once_nowait(
+        self,
+        kind: str,
+        *,
+        pr_number: int,
+        repo: str | None = None,
+        issue_number: int | None = None,
+        session_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+        ts: int | None = None,
+    ) -> bool:
+        """Like :meth:`record_event_nowait`, but writes nothing when an
+        event of ``kind`` already names ``pr_number`` (in
+        ``detail.pr_number``) for this repo and session. Returns whether a
+        row was written.
+
+        The check and the insert are ONE statement and one commit on the
+        side connection, so the lock wait is bounded by
+        ``EVENT_WRITE_TIMEOUT`` once, not once per step, and two writers
+        cannot both pass the check. In-memory: the main connection, under
+        the same no-open-transaction rule as record_event_nowait."""
+        params = (
+            int(time.time()) if ts is None else int(ts),
+            str(kind),
+            repo,
+            issue_number,
+            session_id,
+            None if detail is None else json.dumps(detail),
+            session_id,
+            str(kind),
+            repo,
+            int(pr_number),
+        )
+        if self._in_memory:
+            if self._main_busy_for_events(kind):
+                return False
+            conn = self._conn
+        else:
+            conn = self._event_connection()
+        try:
+            cursor = conn.execute(self._EVENT_ONCE_SQL, params)
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        return cursor.rowcount == 1
+
+    def _event_connection(self) -> sqlite3.Connection:
+        """The short-timeout side connection for event writes, opened on
+        first use."""
+        if self._event_conn is None:
+            self._event_conn = sqlite3.connect(
+                str(self.db_path), timeout=self.EVENT_WRITE_TIMEOUT
+            )
+        return self._event_conn
+
+    def list_events(
+        self, *, since_ts: int = 0, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Return events with ``ts >= since_ts``, newest first, at most
+        ``limit`` rows. ``detail`` is decoded from JSON (None if absent)."""
+        rows = self._conn.execute(
+            """SELECT * FROM events WHERE ts >= ?
+               ORDER BY ts DESC, id DESC LIMIT ?""",
+            (int(since_ts), int(limit)),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw = item.get("detail")
+            item["detail"] = None if raw is None else json.loads(raw)
+            out.append(item)
+        return out
+
+    def prune_events(self, older_than_ts: int) -> int:
+        """Delete events with ``ts < older_than_ts``; return rows deleted."""
+        cursor = self._conn.execute(
+            "DELETE FROM events WHERE ts < ?", (int(older_than_ts),)
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+    def prune_events_nowait(self, older_than_ts: int) -> int:
+        """Like :meth:`prune_events`, but through the event side connection,
+        so it waits at most ``EVENT_WRITE_TIMEOUT`` seconds for a lock.
+
+        The daemon prunes with this one. A DELETE on the main connection
+        would join (and commit) any transaction another coroutine has open
+        there, and one that failed on a busy lock would leave the main
+        connection holding a stale read snapshot, so the next real write on
+        it could fail. Raises on failure; the side connection is rolled
+        back first. An in-memory database falls back to the main
+        connection, as for :meth:`record_event_nowait`."""
+        if self._in_memory:
+            # Same rule as record_event_nowait: never commit a transaction
+            # somebody else has open on the main connection. Skipped, so
+            # nothing was deleted.
+            if self._main_busy_for_events("prune"):
+                return 0
+            return self.prune_events(older_than_ts)
+        conn = self._event_connection()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM events WHERE ts < ?", (int(older_than_ts),)
+            )
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        return cursor.rowcount
 
     # Valid post-merge cleanup phases, in monotonic progression. Each
     # phase stamps *after* its side effect has succeeded, so if the

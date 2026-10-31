@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 
 import typer
@@ -12,6 +13,7 @@ from rich.table import Table
 
 from ctrlrelay import __version__
 from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
+from ctrlrelay.core.events import EventKind, emit_event
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier
@@ -1138,6 +1140,14 @@ async def deliver_relay_alert(config, state_db, alert) -> bool:
         return False
     try:
         state_db.mark_dispatch_alert_delivered(alert.claim_token)
+        emit_event(
+            state_db, EventKind.ALERT_SENT,
+            lambda: {
+                "detail": {
+                    "consecutive_failures": getattr(alert, "consecutive", None),
+                },
+            },
+        )
     except Exception as e:
         # The message HAS gone out. Failing to record that means the
         # next failure may send a second one, which is a duplicate —
@@ -3034,6 +3044,18 @@ def poller_start(
             # eventually deleted from the config it answers None, `not
             # ttl` returns early, and questions stop expiring with
             # nothing logged. Same fault as #181, third instance.
+            #
+            # The status page's event history is pruned first, in its own
+            # guard, so it is trimmed even with no chat transport.
+            try:
+                history_days = getattr(
+                    getattr(config, "web", None), "history_days", 7
+                )
+                state_db.prune_events_nowait(
+                    int(time.time()) - int(history_days) * 86400
+                )
+            except Exception as e:
+                _log_quietly("events.prune_failed", cause=e)
             chat = _active_chat_config(config)
             ttl = getattr(chat, "question_ttl_seconds", None)
             if not ttl:
@@ -3443,6 +3465,12 @@ def poller_start(
                     f"{config.schedules.personalization_cron}"
                 )
             scheduler.start()
+            emit_event(
+                state_db, EventKind.RESTART,
+                lambda: {
+                    "detail": {"process": "poller", "version": __version__},
+                },
+            )
             console.print(
                 f"[dim]Scheduler: secops cron={config.schedules.secops_cron} "
                 f"tz={config.timezone} | "
@@ -3637,6 +3665,259 @@ def poller_status(
             pass
 
     console.print("[dim]Poller not running[/dim]")
+    raise typer.Exit(1)
+
+
+web_app = typer.Typer(help="Read-only status page and JSON API (#209).")
+app.add_typer(web_app, name="web")
+
+
+def _get_web_pid_file(config_path: str | None) -> Path:
+    """PID file for the status page: ``web.pid`` next to ``state.db``."""
+    try:
+        config = load_config(resolve_config_path(config_path))
+        return config.paths.state_db.parent / "web.pid"
+    except ConfigError:
+        pass
+    return Path("~/.ctrlrelay/web.pid").expanduser().resolve()
+
+
+def _process_command_line(pid: int, proc_root: Path) -> list[str] | None:
+    """``pid``'s argv: from ``<proc_root>/<pid>/cmdline`` when that tree
+    exists (Linux), else from ``ps -o command=`` (split on whitespace, so a
+    path with a space is cut up; good enough to find the subcommand).
+    ``None`` when it cannot be read, which callers treat as "not ours"."""
+    import subprocess
+
+    if proc_root.is_dir():
+        try:
+            raw = (proc_root / str(pid) / "cmdline").read_bytes()
+        except OSError:
+            return None
+        return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.split()
+
+
+def _is_our_web_process(pid: int, *, proc_root: Path = Path("/proc")) -> bool:
+    """Whether ``pid`` is a running ``ctrlrelay web start``.
+
+    A PID file outlives its process, and the PID is then reused by
+    something else: signalling it would stop an unrelated program, and
+    ``pid <= 0`` would signal a whole process group. So the PID must be
+    above 1 and its command line must be ctrlrelay (the console script, or
+    ``python -m ctrlrelay.cli``) followed by ``web start``. A substring
+    test is not enough: a test run from a checkout named ctrlrelay, on a
+    file named test_web_server.py, contains both words."""
+    import os
+
+    if pid <= 1:
+        return False
+    args = _process_command_line(pid, proc_root)
+    if not args:
+        return False
+    for i, arg in enumerate(args):
+        entry = os.path.basename(arg) == "ctrlrelay" or (
+            arg == "ctrlrelay.cli" and i > 0 and args[i - 1] == "-m"
+        )
+        if entry and args[i + 1:i + 3] == ["web", "start"]:
+            return True
+    return False
+
+
+def _read_web_pid(pid_file: Path) -> int | None:
+    try:
+        return int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+@web_app.command("start")
+def web_start(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+    foreground: bool = typer.Option(
+        False,
+        "--foreground",
+        "-F",
+        help="Run in the foreground (for systemd/debugging). Default is to daemonize.",
+    ),
+) -> None:
+    """Serve the read-only status page on web.host:web.port.
+
+    Reads state.db read-only, the agents' transcripts, and GitHub through
+    `gh` (one search a minute). Never writes the database or GitHub;
+    writes only its PID file and its logs.
+    """
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    resolved_config = _resolve_config_or_exit(config_path)
+    try:
+        config = load_config(resolved_config)
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+    pid_file = _get_web_pid_file(str(resolved_config))
+    if pid_file.exists():
+        # The same ours-only check as `web stop` and `web status`: a PID
+        # that is alive but is not a status page (reused after a crash)
+        # leaves a stale file, which is removed so start can proceed.
+        # A file naming this process is the claim a daemonizing parent
+        # wrote for it, and is kept.
+        pid = _read_web_pid(pid_file)
+        if pid != os.getpid():
+            if pid is not None and _is_our_web_process(pid):
+                console.print(
+                    f"[yellow]Status page already running (PID {pid})[/yellow]"
+                )
+                raise typer.Exit(1)
+            pid_file.unlink(missing_ok=True)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if not foreground:
+        cmd = [
+            sys.executable, "-m", "ctrlrelay.cli", "web", "start",
+            "--config", str(resolved_config), "--foreground",
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        # Claimed before the liveness probe, as `poller start` does, so a
+        # second `start` in the same second sees it.
+        pid_file.write_text(str(proc.pid))
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            console.print(
+                f"[green]Status page started (PID {proc.pid}) on "
+                f"http://{config.web.host}:{config.web.port}/[/green]"
+            )
+            return
+        pid_file.unlink(missing_ok=True)
+        console.print(
+            f"[red]Status page failed to start[/red] (exit code {proc.returncode}); "
+            "run with --foreground to see why"
+        )
+        raise typer.Exit(1)
+
+    def _raise_systemexit_on_signal(sig: int, _frame: object) -> None:
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _raise_systemexit_on_signal)
+
+    pid_file.write_text(str(os.getpid()))
+    try:
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.web.server import WaitingRefresher, make_server
+        from ctrlrelay.web.status import make_sessions_reader
+        from ctrlrelay.web.waiting import WaitingTracker
+
+        tracker = WaitingTracker(
+            config,
+            GitHubCLI(),
+            sessions=make_sessions_reader(config.paths.state_db),
+        )
+        try:
+            httpd = make_server(config, waiting=tracker)
+        except OSError as e:
+            console.print(
+                f"[red]Cannot listen on {config.web.host}:{config.web.port}:[/red] {e}"
+            )
+            raise typer.Exit(1)
+        refresher = WaitingRefresher(
+            tracker, interval_s=config.web.github_check_seconds,
+        )
+        refresher.start()
+        try:
+            httpd.serve_forever()
+        finally:
+            refresher.stop()
+            httpd.server_close()
+    finally:
+        pid_file.unlink(missing_ok=True)
+
+
+@web_app.command("stop")
+def web_stop(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+) -> None:
+    """Stop the status page.
+
+    Signals only a process whose command line is `ctrlrelay web start`. A
+    PID file naming anything else is stale: it is removed, and nothing is
+    signalled."""
+    import os
+    import signal
+
+    pid_file = _get_web_pid_file(config_path)
+    if not pid_file.exists():
+        console.print("[yellow]Status page not running (no PID file)[/yellow]")
+        return
+    pid = _read_web_pid(pid_file)
+    if pid is None or not _is_our_web_process(pid):
+        console.print(
+            f"[yellow]Status page not running: stale PID file {pid_file} "
+            f"(PID {pid if pid is not None else 'unreadable'} is not "
+            "`ctrlrelay web start`); removed it, signalled nothing[/yellow]"
+        )
+        pid_file.unlink(missing_ok=True)
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        console.print(f"[green]Stopped status page (PID {pid})[/green]")
+    except ProcessLookupError:
+        console.print("[yellow]Status page process not found[/yellow]")
+    pid_file.unlink(missing_ok=True)
+
+
+@web_app.command("status")
+def web_status(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+) -> None:
+    """Check whether the status page is running."""
+    pid_file = _get_web_pid_file(config_path)
+    if pid_file.exists():
+        pid = _read_web_pid(pid_file)
+        if pid is not None and _is_our_web_process(pid):
+            console.print(f"[green]Status page running (PID {pid})[/green]")
+            return
+        console.print(
+            f"[yellow]Stale PID file {pid_file} "
+            f"(PID {pid if pid is not None else 'unreadable'} is not "
+            "`ctrlrelay web start`); removed it[/yellow]"
+        )
+        pid_file.unlink(missing_ok=True)
+    console.print("[dim]Status page not running[/dim]")
     raise typer.Exit(1)
 
 
@@ -4641,12 +4922,13 @@ def install_systemd(
         help="Print what would be written without touching the filesystem.",
     ),
 ) -> None:
-    """Render and install bridge + poller systemd user units (Linux).
+    """Render and install bridge, poller and status-page systemd user units (Linux).
 
     After running, enable with:
       systemctl --user daemon-reload
       systemctl --user enable --now ctrlrelay-bridge.service
       systemctl --user enable --now ctrlrelay-poller.service
+      systemctl --user enable --now ctrlrelay-web.service   # optional
     """
     from ctrlrelay.install import render_systemd, write_units
 

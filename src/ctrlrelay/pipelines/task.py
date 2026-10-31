@@ -31,6 +31,7 @@ from pathlib import Path
 
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
+from ctrlrelay.core.events import EventKind, emit_event, emit_outcome
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.state import StateDB
@@ -383,6 +384,15 @@ async def run_task_issue(
         )
         state_db.commit()
         session_row_inserted = True
+        emit_event(
+            state_db, EventKind.DISPATCHED,
+            lambda: {
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "detail": {"pipeline": "task"},
+            },
+        )
 
         pipeline = TaskPipeline(
             dispatcher=dispatcher,
@@ -453,6 +463,19 @@ async def run_task_issue(
                     error=str(e)[:200],
                 )
 
+        emit_outcome(
+            state_db,
+            lambda: {
+                "status": status,
+                "pipeline": "task",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "exit_code": result.exit_code,
+                "question": result.question,
+            },
+        )
+
         if dashboard and result.success:
             await dashboard.push_event(EventPayload(
                 level="info",
@@ -473,6 +496,16 @@ async def run_task_issue(
                 ("failed", f"Error: {e}", int(time.time()), session_id),
             )
             state_db.commit()
+            emit_outcome(
+                state_db,
+                lambda: {
+                    "status": "failed",
+                    "pipeline": "task",
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "session_id": session_id,
+                },
+            )
         return PipelineResult(
             success=False,
             session_id=session_id,
@@ -711,6 +744,18 @@ async def resume_task_from_pending(
                     error=str(e)[:200],
                 )
 
+        emit_outcome(
+            state_db,
+            lambda: {
+                "status": status,
+                "pipeline": "task",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "exit_code": result.exit_code,
+                "question": result.question,
+            },
+        )
         return result
 
     except Exception as e:
@@ -720,6 +765,16 @@ async def resume_task_from_pending(
             ("failed", f"Resume error: {e}", int(time.time()), session_id),
         )
         state_db.commit()
+        emit_outcome(
+            state_db,
+            lambda: {
+                "status": "failed",
+                "pipeline": "task",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+            },
+        )
         return PipelineResult(
             success=False,
             session_id=session_id,

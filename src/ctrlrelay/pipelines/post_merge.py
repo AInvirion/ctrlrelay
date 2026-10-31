@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Awaitable, Callable
 
+from ctrlrelay.core.events import EventKind, emit_event_once
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.pr_watcher import PRWatcher
@@ -358,6 +359,23 @@ async def pr_watch_task(
             session_id=session_id, repo=repo, issue_number=issue_number,
             pr_number=pr_number,
         )
+        # Recorded once per session and PR. A watcher resuming an
+        # interrupted cleanup, or one rehydrated after a restart, may be
+        # re-finding a merge an earlier run already recorded - or one that
+        # run never got to record (killed between detecting it and writing
+        # the row, or the write failed). So the events table is asked
+        # in the same statement that writes, and the merge recorded only
+        # if it is not there.
+        if merged:
+            def _merge_fields() -> dict[str, Any]:
+                return {
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "session_id": session_id,
+                    "detail": {"pr_number": pr_number, "pr_url": pr_url or None},
+                }
+
+            emit_event_once(state_db, EventKind.MERGED, _merge_fields)
         if merged:
             # Defer transport construction to inside the retry loop so
             # each attempt gets a fresh connection — a bridge restart

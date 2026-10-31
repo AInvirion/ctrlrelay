@@ -52,7 +52,7 @@ class RenderedUnit:
     """A rendered unit file ready to write to disk."""
 
     platform: str  # "launchd" | "systemd"
-    service: str  # "bridge" | "poller"
+    service: str  # "bridge" | "poller" | "web" (systemd only)
     content: str
     target_path: Path
     # Variables that were left unsubstituted (e.g. CTRLRELAY_TELEGRAM_TOKEN
@@ -134,12 +134,13 @@ def render_systemd(
     ctrlrelay_bin: str | None = None,
     target_dir: Path | None = None,
 ) -> list[RenderedUnit]:
-    """Render the bridge and poller systemd user unit files.
+    """Render the bridge, poller and status-page systemd user unit files.
 
     ``target_dir`` defaults to ``~/.config/systemd/user`` — the canonical
     location for user-scoped units (no root needed). systemd doesn't
     require label_prefix-style namespacing the way launchd does, so the
-    filenames are fixed: ``ctrlrelay-{bridge,poller}.service``.
+    filenames are fixed: ``ctrlrelay-{bridge,poller,web}.service``. The
+    web unit (#209) is rendered here only; launchd has no template for it.
     """
     values = _build_substitution_values(
         workdir=workdir,
@@ -151,7 +152,7 @@ def render_systemd(
     )
     target_dir = target_dir or Path.home() / ".config" / "systemd" / "user"
     units: list[RenderedUnit] = []
-    for service in ("bridge", "poller"):
+    for service in ("bridge", "poller", "web"):
         raw = _read_template("systemd", f"{service}.service.template")
         rendered = _substitute(raw, values)
         target = target_dir / f"ctrlrelay-{service}.service"

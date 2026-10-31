@@ -301,6 +301,45 @@ class GitHubCLI:
         output = await self._run_gh(*args)
         return json.loads(output) if output.strip() else []
 
+    async def search_assigned_issues(
+        self,
+        assignee: str,
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Open issues assigned to ``assignee`` across every repository,
+        in one ``gh search issues`` call (the status page's waiting line,
+        #209).
+
+        Each dict gets ``"repo"`` set from ``repository.nameWithOwner`` so
+        callers can treat it like a per-repo ``gh issue list`` row. 1000 is
+        the most GitHub's search returns; a result of exactly ``limit`` rows
+        may have been cut short, and the caller must treat it so. Read only;
+        raises ``GitHubError`` when ``gh`` fails.
+        """
+        output = await self._run_gh(
+            "search", "issues",
+            "--assignee", assignee,
+            "--state", "open",
+            "--limit", str(limit),
+            "--json", "repository,number,title,labels,assignees,updatedAt",
+        )
+        issues = json.loads(output) if output.strip() else []
+        for issue in issues:
+            issue["repo"] = (issue.get("repository") or {}).get("nameWithOwner", "")
+        return issues
+
+    async def current_login(self) -> str:
+        """The login ``gh`` is authenticated as (``gh api user``).
+
+        Raises ``GitHubError`` when ``gh`` fails or answers with nothing,
+        so an empty answer is never mistaken for a user.
+        """
+        login = (await self._run_gh("api", "user", "--jq", ".login")).strip()
+        if not login:
+            raise GitHubError("gh api user returned no login")
+        return login
+
     async def list_issues_by_label(
         self,
         repo: str,

@@ -1,0 +1,22 @@
+[Unit]
+Description=ctrlrelay status page (read-only)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${WORKDIR}
+# No chat token here: the status page only reads state.db, the agents'
+# transcripts and (through `gh`) GitHub. It sends nothing.
+Environment=PYTHONUNBUFFERED=1
+# Same PATH as the poller unit: the waiting line runs `gh`, and a
+# systemd user unit does not read ~/.bashrc. See poller.service for why
+# this is a superset of the user manager's value.
+Environment=PATH=${HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+ExecStart=${CTRLRELAY_BIN} web start --foreground
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/.ctrlrelay/logs/web.log
+StandardError=append:%h/.ctrlrelay/logs/web.error.log
+
+[Install]
+WantedBy=default.target

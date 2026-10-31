@@ -1,0 +1,162 @@
+[
+  {
+    "assignees": [
+      {
+        "id": "U_kgDOAAAAAQ",
+        "is_bot": false,
+        "login": "octo-user",
+        "type": "User",
+        "url": "https://github.com/octo-user"
+      }
+    ],
+    "labels": [
+      {
+        "color": "d73a4a",
+        "description": "Something isn't working",
+        "id": "LA_kwDOAAAAAc8AAAAAAAAA001",
+        "name": "bug"
+      },
+      {
+        "color": "0e8a16",
+        "description": "Assigned + labeled: ctrlrelay's dev pipeline will pick this up",
+        "id": "LA_kwDOAAAAAc8AAAAAAAAA002",
+        "name": "ctrlrelay:auto"
+      },
+      {
+        "color": "fbca04",
+        "description": "Wanted, schedulable",
+        "id": "LA_kwDOAAAAAc8AAAAAAAAA003",
+        "name": "P2"
+      },
+      {
+        "color": "0e8a16",
+        "description": "T-shirt size XS",
+        "id": "LA_kwDOAAAAAc8AAAAAAAAA004",
+        "name": "size:XS"
+      }
+    ],
+    "number": 304,
+    "repository": {
+      "name": "alpha",
+      "nameWithOwner": "example-org/alpha"
+    },
+    "title": "...",
+    "updatedAt": "2026-10-31T04:02:32Z"
+  },
+  {
+    "assignees": [
+      {
+        "id": "U_kgDOAAAAAQ",
+        "is_bot": false,
+        "login": "octo-user",
+        "type": "User",
+        "url": "https://github.com/octo-user"
+      }
+    ],
+    "labels": [
+      {
+        "color": "5319e7",
+        "description": "Mini-project epic",
+        "id": "LA_kwDOAAAAAc8AAAAAAAAA005",
+        "name": "epic"
+      }
+    ],
+    "number": 48,
+    "repository": {
+      "name": "beta",
+      "nameWithOwner": "example-org/beta"
+    },
+    "title": "...",
+    "updatedAt": "2026-10-29T17:28:46Z"
+  },
+  {
+    "assignees": [
+      {
+        "id": "U_kgDOAAAAAQ",
+        "is_bot": false,
+        "login": "octo-user",
+        "type": "User",
+        "url": "https://github.com/octo-user"
+      }
+    ],
+    "labels": [
+      {
+        "color": "5319e7",
+        "description": "Mini-project epic",
+        "id": "LA_kwDOAAAAAc8AAAAAAAAA005",
+        "name": "epic"
+      }
+    ],
+    "number": 47,
+    "repository": {
+      "name": "beta",
+      "nameWithOwner": "example-org/beta"
+    },
+    "title": "...",
+    "updatedAt": "2026-10-29T17:28:34Z"
+  },
+  {
+    "assignees": [
+      {
+        "id": "U_kgDOAAAAAQ",
+        "is_bot": false,
+        "login": "octo-user",
+        "type": "User",
+        "url": "https://github.com/octo-user"
+      }
+    ],
+    "labels": [
+      {
+        "color": "5319e7",
+        "description": "Mini-project epic",
+        "id": "LA_kwDOAAAAAc8AAAAAAAAA005",
+        "name": "epic"
+      }
+    ],
+    "number": 46,
+    "repository": {
+      "name": "beta",
+      "nameWithOwner": "example-org/beta"
+    },
+    "title": "...",
+    "updatedAt": "2026-10-29T17:28:22Z"
+  },
+  {
+    "assignees": [
+      {
+        "id": "U_kgDOAAAAAQ",
+        "is_bot": false,
+        "login": "octo-user",
+        "type": "User",
+        "url": "https://github.com/octo-user"
+      }
+    ],
+    "labels": [
+      {
+        "color": "d73a4a",
+        "description": "Something isn't working",
+        "id": "LA_kwDOAAAAAc8AAAAAAAAA006",
+        "name": "bug"
+      },
+      {
+        "color": "BFD4F2",
+        "description": "Half a day",
+        "id": "LA_kwDOAAAAAc8AAAAAAAAA007",
+        "name": "size/S"
+      },
+      {
+        "color": "FBCA04",
+        "description": "Scheduled",
+        "id": "LA_kwDOAAAAAc8AAAAAAAAA008",
+        "name": "priority/P2"
+      }
+    ],
+    "number": 366,
+    "repository": {
+      "name": "gamma",
+      "nameWithOwner": "other-org/gamma"
+    },
+    "title": "...",
+    "updatedAt": "2026-10-26T19:45:04Z"
+  }
+]

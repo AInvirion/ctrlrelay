@@ -26,6 +26,7 @@ paths:        { ... }
 claude:       { ... }
 transport:    { ... }
 dashboard:    { ... }
+web:          { ... }
 repos:        [ ... ]
 ```
 
@@ -38,6 +39,7 @@ repos:        [ ... ]
 | `claude` | object | no | (defaults) | See [claude](#claude). |
 | `transport` | object | **yes** | — | See [transport](#transport). |
 | `dashboard` | object | no | (defaults) | See [dashboard](#dashboard). |
+| `web` | object | no | (defaults) | The read-only status page. See [web](#web). |
 | `repos` | list | no | `[]` | See [repos](#repos). |
 | `schedules` | object | no | (defaults) | See [schedules](#schedules). |
 | `personalization` | object | no | unset | Cross-machine sync of Claude state. See [personalization](#personalization) and [Personalization sync]({{ '/personalization/' | relative_url }}). |
@@ -204,6 +206,36 @@ dashboard:
 
 The dashboard is optional. Leaving `url` empty (the default) is the supported
 no-op configuration.
+
+## web
+
+The read-only status page served by `ctrlrelay web start` (see
+[Operations: status page]({{ '/operations/' | relative_url }}#status-page)). Every key is optional;
+without a `web:` block the defaults below apply.
+
+```yaml
+web:
+  host: "127.0.0.1"
+  port: 8787
+  history_days: 7
+  refresh_seconds: 5
+  github_check_seconds: 60
+  stale_after_minutes: 15
+  allowed_hosts: []          # e.g. ["mybox", "mybox.lan"]
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `host` | string | `"127.0.0.1"` | Address to listen on, exactly. Loopback by default so a fresh install is never reachable from other machines. Set it to this machine's LAN address to open the page from the home network. `0.0.0.0` listens on every interface and is warned about at startup. |
+| `port` | int (1-65535) | `8787` | Port to listen on. |
+| `history_days` | int (>= 1) | `7` | Days of feed the page shows, and what `/api/events` returns without `?since=`. |
+| `refresh_seconds` | int (>= 1) | `5` | How often the page asks `/api/status` again. |
+| `github_check_seconds` | int (>= 15) | `60` | How often the waiting line asks GitHub (one search, plus one query per `include_labels` label). |
+| `stale_after_minutes` | int (>= 1) | `15` | A running card is marked "looks stuck" after this long with no new agent step, unless ctrlrelay itself has a CI wait or review open for it. |
+| `allowed_hosts` | list of strings | `[]` | Extra names the page may be opened by. A request is served only when its `Host` header is `localhost`, `127.0.0.1`, `[::1]`, `host` (unless it is `0.0.0.0`/`::`), this machine's hostname, the hostname plus `.local`, or one of these, alone or followed by `:port`. Anything else, or no `Host`, gets `421`. Matching ignores case and a trailing dot. This stops a web page on another site from pointing its own name at this server (DNS rebinding) and reading it. |
+
+The page has no login and shows repository names, issue titles and the
+questions agents asked. **Never expose it to the internet.**
 
 ## repos
 

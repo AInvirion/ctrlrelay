@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>ctrlrelay status</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #5c6577;
+  --line: #dde1e8; --accent: #2457d6; --accent-ink: #ffffff;
+  --done: #c9d6f5; --warn: #b45309; --warn-bg: #fff4e0; --bad: #b42318;
+  --bad-bg: #fde8e7; --unknown: #6b7280; --tag: #eef1f6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1b1f27; --ink: #e6e9ef; --muted: #9aa3b5;
+    --line: #2c323d; --accent: #6d95ff; --accent-ink: #0d1220;
+    --done: #2b3a5f; --warn: #f5b454; --warn-bg: #3a2c12; --bad: #ff8a80;
+    --bad-bg: #3d1c1a; --unknown: #9aa3b5; --tag: #262c37;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header {
+  display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: baseline;
+  padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+header h1 { font-size: 17px; margin: 0 8px 0 0; }
+header .meta { color: var(--muted); font-size: 13px; }
+#banner {
+  display: none; margin: 0; padding: 10px 20px; font-weight: 600;
+  background: var(--bad-bg); color: var(--bad); border-bottom: 1px solid var(--bad);
+}
+#banner.show { display: block; }
+#errors { margin: 0; padding: 0 20px; list-style: none; }
+#errors li {
+  margin: 8px 0 0; padding: 8px 12px; border-radius: 6px;
+  background: var(--warn-bg); color: var(--warn); font-size: 13px;
+}
+main {
+  display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 20px; padding: 16px 20px 28px; max-width: 1500px;
+}
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+section { margin-bottom: 22px; }
+h2 {
+  font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); margin: 0 0 8px;
+}
+h2 .count { font-weight: 400; margin-left: 6px; }
+.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 14px; margin-bottom: 10px;
+}
+.card.stuck { border-color: var(--warn); box-shadow: inset 4px 0 0 var(--warn); }
+.row { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.repo { font-weight: 600; }
+.title { overflow-wrap: anywhere; }
+.muted { color: var(--muted); font-size: 13px; }
+.tag {
+  display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px;
+  background: var(--tag); color: var(--ink); white-space: nowrap;
+}
+.tag.stuck { background: var(--warn-bg); color: var(--warn); font-weight: 600; }
+.tag.k-failed, .tag.k-alert_sent { background: var(--bad-bg); color: var(--bad); }
+.tag.k-blocked, .tag.k-question_posted, .tag.k-question_held { background: var(--warn-bg); color: var(--warn); }
+.phases { display: flex; gap: 3px; margin: 10px 0 6px; }
+.phase {
+  flex: 1; text-align: center; font-size: 12px; padding: 3px 0; border-radius: 4px;
+  background: var(--tag); color: var(--muted);
+}
+.phase.done { background: var(--done); color: var(--ink); }
+.phase.now { background: var(--accent); color: var(--accent-ink); font-weight: 700; }
+.phases.unknown .phase { opacity: .55; }
+code {
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--tag); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere;
+}
+.unknown { color: var(--unknown); font-style: italic; }
+.empty { color: var(--muted); }
+.question { margin: 6px 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+ul.plain { list-style: none; margin: 0; padding: 0; }
+ul.plain > li { padding: 7px 0; border-bottom: 1px solid var(--line); }
+ul.plain > li:last-child { border-bottom: 0; }
+.today { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.today .n { font-size: 22px; font-weight: 700; }
+.feed .when { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 4.5em; }
+.feed .detail { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+</style>
+</head>
+<body data-refresh-seconds="__REFRESH_SECONDS__">
+<header>
+  <h1>ctrlrelay</h1>
+  <span class="meta">host <strong id="host">…</strong></span>
+  <span class="meta">version <span id="version">…</span></span>
+  <span class="meta">updated <span id="updated">never</span></span>
+  <span class="meta">busy with <span id="busy">…</span></span>
+</header>
+<p id="banner" role="alert"></p>
+<ul id="errors" aria-live="polite"></ul>
+<main>
+  <div>
+    <section>
+      <h2>Running now<span class="count" id="running-count"></span></h2>
+      <div id="running"><p class="unknown">loading…</p></div>
+    </section>
+    <section>
+      <h2>Needs you<span class="count" id="needs-count"></span></h2>
+      <div id="needs"><p class="unknown">loading…</p></div>
+    </section>
+    <section>
+      <h2>Waiting<span class="count" id="waiting-count"></span></h2>
+      <div id="waiting"><p class="unknown">loading…</p></div>
+    </section>
+    <section>
+      <h2>Today</h2>
+      <div id="today"><p class="unknown">loading…</p></div>
+    </section>
+  </div>
+  <div>
+    <section class="feed">
+      <h2>Live feed</h2>
+      <div id="feed"><p class="unknown">loading…</p></div>
+    </section>
+  </div>
+</main>
+<script>
+"use strict";
+// Every value from the server reaches the page through textContent or
+// createElement. Nothing here parses a string as HTML: titles come from
+// GitHub, where anyone can file an issue on a public repository.
+
+var PHASES = [
+  ["reading", "reading"], ["coding", "coding"], ["testing", "testing"],
+  ["ci", "CI"], ["review", "review"], ["pr", "PR"]
+];
+var TODAY = [
+  ["dispatched", "dispatched"], ["pr_opened", "PRs opened"], ["merged", "merged"],
+  ["failed", "failed"], ["blocked", "blocked"], ["messages_sent", "messages sent"]
+];
+var KIND_LABEL = {
+  dispatched: "dispatched", done: "done", blocked: "blocked", failed: "failed",
+  pr_opened: "PR opened", merged: "merged", ci_started: "CI wait started",
+  ci_finished: "CI wait finished", review_started: "review started",
+  review_finished: "review finished", message_sent: "message sent",
+  question_posted: "question asked", question_held: "question held back",
+  alert_sent: "alert sent", restart: "restart"
+};
+
+var refreshSeconds = parseInt(document.body.getAttribute("data-refresh-seconds"), 10);
+if (!(refreshSeconds >= 1)) { refreshSeconds = 5; }
+var lastData = null;
+var lastOkAt = null;
+
+function el(tag, cls, text) {
+  var node = document.createElement(tag);
+  if (cls) { node.className = cls; }
+  if (text !== undefined && text !== null) { node.textContent = String(text); }
+  return node;
+}
+
+function put(parent, children) {
+  while (parent.firstChild) { parent.removeChild(parent.firstChild); }
+  for (var i = 0; i < children.length; i++) { parent.appendChild(children[i]); }
+}
+
+// A section count: a number, or "unknown" when the section is null (the
+// server could not read it). Never blank, which would read as "nothing".
+function setCount(id, value) {
+  document.getElementById(id).textContent = typeof value === "number" ? String(value) : "unknown";
+}
+
+function unknown(text) { return el("p", "unknown", text); }
+function empty(text) { return el("p", "empty", text); }
+
+function duration(seconds) {
+  if (typeof seconds !== "number" || !isFinite(seconds)) { return "unknown"; }
+  seconds = Math.max(0, Math.round(seconds));
+  if (seconds < 60) { return seconds + "s"; }
+  var m = Math.floor(seconds / 60);
+  if (m < 60) { return m + "m"; }
+  var h = Math.floor(m / 60);
+  if (h < 48) { return h + "h " + (m % 60) + "m"; }
+  return Math.floor(h / 24) + "d " + (h % 24) + "h";
+}
+
+function ago(ts, now) {
+  if (typeof ts !== "number") { return "unknown"; }
+  return duration(now - ts) + " ago";
+}
+
+function clock(ts) {
+  if (typeof ts !== "number") { return "unknown"; }
+  var d = new Date(ts * 1000);
+  var today = new Date();
+  var hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (d.toDateString() === today.toDateString()) { return hm; }
+  return d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + hm;
+}
+
+function issueText(repo, number, title) {
+  var parts = [];
+  if (typeof number === "number") { parts.push("#" + number); }
+  if (title) { parts.push(title); }
+  else if (typeof number === "number") { parts.push("(title not known yet)"); }
+  return parts.join(" ");
+}
+
+function nowOf(data) {
+  return typeof data.generated_ts === "number" ? data.generated_ts : Date.now() / 1000;
+}
+
+function phaseBar(phase) {
+  var bar = el("div", "phases");
+  var at = -1;
+  for (var i = 0; i < PHASES.length; i++) { if (PHASES[i][0] === phase) { at = i; } }
+  if (at < 0) { bar.className += " unknown"; }
+  for (var j = 0; j < PHASES.length; j++) {
+    var cls = "phase" + (j === at ? " now" : (at >= 0 && j < at ? " done" : ""));
+    var step = el("div", cls, PHASES[j][1]);
+    if (j === at) { step.setAttribute("aria-current", "step"); }
+    bar.appendChild(step);
+  }
+  return bar;
+}
+
+function runningCard(card, now) {
+  var box = el("div", "card" + (card.looks_stuck ? " stuck" : ""));
+  var top = el("div", "row");
+  top.appendChild(el("span", "repo", card.repo));
+  if (card.pipeline === "secops" && typeof card.issue_number !== "number") {
+    top.appendChild(el("span", "title", "secops sweep"));
+  } else {
+    top.appendChild(el("span", "title", issueText(card.repo, card.issue_number, card.title)));
+  }
+  top.appendChild(el("span", "tag", card.pipeline));
+  top.appendChild(el("span", "muted", "running " + duration(card.elapsed_s)));
+  if (card.looks_stuck) {
+    top.appendChild(el("span", "tag stuck", "looks stuck"));
+  }
+  box.appendChild(top);
+  box.appendChild(phaseBar(card.phase));
+
+  var last = el("div", "row");
+  if (card.phase === "unknown") {
+    last.appendChild(el("span", "unknown", "phase unknown"));
+  } else {
+    last.appendChild(el("span", "muted", card.phase_source === "pipeline"
+      ? "ctrlrelay is running this step" : "from the agent's transcript"));
+  }
+  if (card.last_command) {
+    last.appendChild(el("span", "muted", "last:"));
+    last.appendChild(el("code", null, card.last_command));
+  } else {
+    last.appendChild(el("span", "unknown", "last command unknown"));
+  }
+  last.appendChild(el("span", "muted", ago(card.last_step_ts, now)));
+  box.appendChild(last);
+  if (card.reason) { box.appendChild(el("div", "muted", card.reason)); }
+  return box;
+}
+
+function renderRunning(data, now) {
+  var target = document.getElementById("running");
+  if (!Array.isArray(data.running)) {
+    setCount("running-count", null);
+    put(target, [unknown("unknown: running sessions could not be read")]);
+    return;
+  }
+  setCount("running-count", data.running.length);
+  if (data.running.length === 0) { put(target, [empty("nothing running")]); return; }
+  put(target, data.running.map(function (c) { return runningCard(c, now); }));
+}
+
+function renderBusy(data) {
+  var busy = document.getElementById("busy");
+  if (!Array.isArray(data.running)) { busy.textContent = "unknown"; busy.className = "unknown"; return; }
+  busy.className = "";
+  if (data.running.length === 0) { busy.textContent = "nothing"; return; }
+  busy.textContent = data.running.map(function (c) {
+    return typeof c.issue_number === "number" ? c.repo + "#" + c.issue_number : c.repo + " (" + c.pipeline + ")";
+  }).join(", ");
+}
+
+function renderNeeds(data, now) {
+  var target = document.getElementById("needs");
+  if (!Array.isArray(data.needs_you)) {
+    setCount("needs-count", null);
+    put(target, [unknown("unknown: questions could not be read")]);
+    return;
+  }
+  setCount("needs-count", data.needs_you.length);
+  if (data.needs_you.length === 0) { put(target, [empty("no open questions")]); return; }
+  put(target, data.needs_you.map(function (q) {
+    var box = el("div", "card");
+    var top = el("div", "row");
+    top.appendChild(el("span", "repo", q.repo));
+    if (typeof q.issue_number === "number") {
+      top.appendChild(el("span", "title", issueText(q.repo, q.issue_number, q.title)));
+    } else {
+      top.appendChild(el("span", "title", q.pipeline === "secops" ? "secops sweep" : "no issue"));
+    }
+    top.appendChild(el("span", "tag", q.pipeline));
+    top.appendChild(el("span", "muted", "waiting " + duration(now - q.asked_ts)));
+    box.appendChild(top);
+    box.appendChild(el("p", "question", q.question));
+    if (typeof q.held_until_ts === "number") {
+      box.appendChild(el("div", "muted", "held back; asked again at " + clock(q.held_until_ts)));
+    }
+    return box;
+  }));
+}
+
+function renderWaiting(data) {
+  var target = document.getElementById("waiting");
+  var w = data.waiting;
+  var nodes = [];
+  if (!w || typeof w !== "object" || !Array.isArray(w.items)) {
+    setCount("waiting-count", null);
+    put(target, [unknown("unknown: the waiting line is not available")]);
+    return;
+  }
+  var ok = w.status === "ok";
+  if (!ok) {
+    var why = "unknown" + (w.error ? ": " + w.error : "");
+    nodes.push(unknown(why));
+    nodes.push(el("p", "muted", typeof w.last_good_ts === "number"
+      ? "last good answer " + clock(w.last_good_ts) + "; the list below is from then"
+      : "no good answer from GitHub yet"));
+  } else {
+    nodes.push(el("p", "muted", "checked " + clock(w.checked_ts)));
+  }
+  setCount("waiting-count", ok ? w.items.length : null);
+  if (w.items.length === 0) {
+    if (ok) { nodes.push(empty("nothing waiting")); }
+  } else {
+    var list = el("ul", "plain");
+    w.items.forEach(function (it) {
+      var li = el("li");
+      var row = el("div", "row");
+      row.appendChild(el("span", "repo", it.repo));
+      row.appendChild(el("span", "title", issueText(it.repo, it.issue_number, it.title)));
+      li.appendChild(row);
+      li.appendChild(el("div", "muted", it.reason));
+      list.appendChild(li);
+    });
+    nodes.push(list);
+  }
+  put(target, nodes);
+}
+
+function renderToday(data) {
+  var target = document.getElementById("today");
+  var t = data.today || {};
+  var grid = el("div", "today");
+  TODAY.forEach(function (pair) {
+    var v = t[pair[0]];
+    var cell = el("div", "card");
+    if (typeof v === "number") { cell.appendChild(el("div", "n", v)); }
+    else { cell.appendChild(el("div", "n unknown", "unknown")); }
+    cell.appendChild(el("div", "muted", pair[1]));
+    grid.appendChild(cell);
+  });
+  put(target, [grid]);
+}
+
+function detailText(detail) {
+  if (detail === null || detail === undefined) { return ""; }
+  if (typeof detail !== "object") { return String(detail); }
+  var parts = [];
+  Object.keys(detail).forEach(function (k) {
+    var v = detail[k];
+    if (v === null || v === undefined || v === "") { return; }
+    if (typeof v === "object") { v = JSON.stringify(v); }
+    parts.push(k.replace(/_/g, " ") + ": " + v);
+  });
+  var text = parts.join(" · ");
+  return text.length > 300 ? text.slice(0, 299) + "…" : text;
+}
+
+// The feed holds at most the server's limit. When the history window has
+// more, say so: a cut list must not read as everything that happened.
+function feedNote(data) {
+  if (!Array.isArray(data.feed) || data.feed_truncated !== true) { return null; }
+  var total = typeof data.feed_total === "number" ? String(data.feed_total) : "unknown";
+  return "showing newest " + data.feed.length + " of " + total;
+}
+
+function renderFeed(data) {
+  var target = document.getElementById("feed");
+  if (!Array.isArray(data.feed)) {
+    put(target, [unknown("unknown: the feed could not be read")]);
+    return;
+  }
+  if (data.feed.length === 0) { put(target, [empty("nothing happened in the history window")]); return; }
+  var list = el("ul", "plain");
+  data.feed.forEach(function (ev) {
+    var li = el("li");
+    var row = el("div", "row");
+    row.appendChild(el("span", "when", clock(ev.ts)));
+    row.appendChild(el("span", "tag k-" + String(ev.kind).replace(/[^a-z_]/g, ""),
+      KIND_LABEL[ev.kind] || ev.kind));
+    if (ev.repo) {
+      row.appendChild(el("span", "repo",
+        ev.repo + (typeof ev.issue_number === "number" ? "#" + ev.issue_number : "")));
+    }
+    li.appendChild(row);
+    var text = detailText(ev.detail);
+    if (text) { li.appendChild(el("div", "detail", text)); }
+    list.appendChild(li);
+  });
+  var note = feedNote(data);
+  put(target, note ? [el("p", "empty", note), list] : [list]);
+}
+
+function renderHeader(data) {
+  document.getElementById("host").textContent = data.host || "unknown";
+  document.getElementById("version").textContent = data.version || "unknown";
+  document.getElementById("updated").textContent = clock(data.generated_ts);
+  var errs = Array.isArray(data.errors) ? data.errors : [];
+  put(document.getElementById("errors"), errs.map(function (e) { return el("li", null, e); }));
+  document.title = "ctrlrelay · " + (data.host || "unknown");
+}
+
+function render(data) {
+  var now = nowOf(data);
+  renderHeader(data);
+  renderBusy(data);
+  renderRunning(data, now);
+  renderNeeds(data, now);
+  renderWaiting(data);
+  renderToday(data);
+  renderFeed(data);
+}
+
+function showBanner(message) {
+  var b = document.getElementById("banner");
+  b.textContent = message;
+  b.className = message ? "show" : "";
+}
+
+function poll() {
+  var done = false;
+  var controller = typeof AbortController === "function" ? new AbortController() : null;
+  var timer = setTimeout(function () { if (controller) { controller.abort(); } },
+    Math.max(4000, refreshSeconds * 1000));
+  fetch("/api/status", { cache: "no-store", signal: controller ? controller.signal : undefined })
+    .then(function (resp) {
+      if (!resp.ok) { throw new Error("HTTP " + resp.status); }
+      return resp.json();
+    })
+    .then(function (data) {
+      lastData = data;
+      lastOkAt = Date.now();
+      render(data);
+      showBanner("");
+    })
+    .catch(function (err) {
+      var since = lastOkAt ? new Date(lastOkAt).toLocaleTimeString() : "never";
+      showBanner("Can't reach the server (" + (err && err.message ? err.message : "error") +
+        "). Showing the last data received: " + since + ".");
+    })
+    .then(function () {
+      if (!done) { done = true; clearTimeout(timer); setTimeout(poll, refreshSeconds * 1000); }
+    });
+}
+
+poll();
+</script>
+</body>
+</html>

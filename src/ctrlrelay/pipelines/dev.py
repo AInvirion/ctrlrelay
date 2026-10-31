@@ -18,6 +18,12 @@ from ctrlrelay.core.code_review import (
     run_code_review,
 )
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
+from ctrlrelay.core.events import (
+    EventKind,
+    emit_event,
+    emit_event_once,
+    emit_outcome,
+)
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier, VerificationResult
@@ -910,6 +916,8 @@ async def _review_and_comment(
     worktree_path: Path,
     base_branch: str,
     config: Any = None,
+    state_db: StateDB | None = None,
+    issue_number: int | None = None,
 ) -> ReviewReport:
     """Run the configured review and post what it found.
 
@@ -930,16 +938,41 @@ async def _review_and_comment(
             deliberate=True,
         )
 
-    outcome = await run_code_review(
-        repo=repo,
-        worktree_path=worktree_path,
-        base_branch=base_branch,
-        cli_command=getattr(
-            config, "cli_command", 'codex review -c sandbox_mode="read-only"'
-        ),
-        timeout_seconds=getattr(config, "timeout_seconds", 900),
-        session_id=session_id,
+    # Status page: the review phase runs after the agent has exited, so
+    # nothing in its transcript shows it. ``state_db`` None records nothing.
+    emit_event(
+        state_db, EventKind.REVIEW_STARTED,
+        lambda: {
+            "repo": repo,
+            "issue_number": issue_number,
+            "session_id": session_id,
+            "detail": {"pr_number": pr_number},
+        },
     )
+    review_ok = False
+    try:
+        outcome = await run_code_review(
+            repo=repo,
+            worktree_path=worktree_path,
+            base_branch=base_branch,
+            cli_command=getattr(
+                config, "cli_command", 'codex review -c sandbox_mode="read-only"'
+            ),
+            timeout_seconds=getattr(config, "timeout_seconds", 900),
+            session_id=session_id,
+        )
+        review_ok = outcome.worth_posting
+    finally:
+        # Also on a raise, so the phase does not read as still open.
+        emit_event(
+            state_db, EventKind.REVIEW_FINISHED,
+            lambda: {
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "detail": {"pr_number": pr_number, "ok": review_ok},
+            },
+        )
 
     if not outcome.worth_posting:
         log_event(
@@ -1011,9 +1044,20 @@ async def _verify_and_fix_pr(
     result: PipelineResult,
     verifier: PRVerifier,
     max_attempts: int,
+    state_db: StateDB | None,
     lock_handle: _RepoLockHandle | None = None,
 ) -> PipelineResult:
     """Loop: verify CI+mergeability, ask Claude to fix, re-verify.
+
+    ``state_db`` is where the CI-wait start and end events and the
+    ``pr_opened`` event go (status page); required so a caller cannot
+    drop them by omission, and None records nothing.
+
+    ``pr_opened`` is recorded here, not where the agent first reports a
+    PR number, because this is the first point GitHub has answered about
+    that PR: ``verify`` returns only after at least one successful read of
+    its checks (``wait_for_checks`` raises when every read failed). Once
+    per session and PR, however many verify rounds or resumes reach here.
 
     Lock discipline (issue #29): the verify phase is pure `gh` polling
     and holds no git state, so callers pass a ``lock_handle`` whose
@@ -1033,6 +1077,21 @@ async def _verify_and_fix_pr(
     if pr_number_raw is None:
         return result
     pr_number = int(pr_number_raw)
+    # The agent's outputs that named this PR; `result` is replaced by fix
+    # rounds, whose outputs need not carry the URL.
+    reported_outputs = result.outputs
+
+    def _pr_confirmed() -> dict[str, Any]:
+        pr_url = reported_outputs.get("pr_url")
+        return {
+            "repo": ctx.repo,
+            "issue_number": ctx.issue_number,
+            "session_id": ctx.session_id,
+            "detail": {
+                "pr_number": pr_number,
+                "pr_url": pr_url if isinstance(pr_url, str) else None,
+            },
+        }
 
     async def _run_verify() -> VerificationResult:
         """Release the lock around the pure-gh polling window, then
@@ -1041,13 +1100,37 @@ async def _verify_and_fix_pr(
         widest possible window."""
         if lock_handle is not None:
             lock_handle.release()
+        emit_event(
+            state_db, EventKind.CI_STARTED,
+            lambda: {
+                "repo": ctx.repo,
+                "issue_number": ctx.issue_number,
+                "session_id": ctx.session_id,
+                "detail": {"pr_number": pr_number},
+            },
+        )
+        ci_ok = False
         try:
-            return await verifier.verify(ctx.repo, pr_number)
+            verification = await verifier.verify(ctx.repo, pr_number)
+            emit_event_once(state_db, EventKind.PR_OPENED, _pr_confirmed)
+            ci_ok = verification.ready
+            return verification
         except asyncio.CancelledError:
             # Intentionally leave held=False so the outer finally's
             # release_lock is a no-op; the row is already gone. Re-raise
             # to let the cancellation propagate.
             raise
+        finally:
+            # Also on a raise, so the CI wait does not read as still open.
+            emit_event(
+                state_db, EventKind.CI_FINISHED,
+                lambda: {
+                    "repo": ctx.repo,
+                    "issue_number": ctx.issue_number,
+                    "session_id": ctx.session_id,
+                    "detail": {"pr_number": pr_number, "ok": bool(ci_ok)},
+                },
+            )
 
     verification = await _run_verify()
     # If CI is simply slow (timed_out) we hand the PR off rather than asking
@@ -1208,6 +1291,10 @@ async def run_dev_issue(
     # number that was sitting in the result.
     last_exit_code: int | None = None
 
+    # Whether this run's `sessions` row exists. An event for a session
+    # that was never recorded would name a session nothing else knows.
+    session_row_inserted = False
+
     try:
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
@@ -1289,6 +1376,16 @@ async def run_dev_issue(
             ),
         )
         state_db.commit()
+        session_row_inserted = True
+        emit_event(
+            state_db, EventKind.DISPATCHED,
+            lambda: {
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "detail": {"pipeline": "dev"},
+            },
+        )
 
         # Run pipeline
         pipeline = DevPipeline(
@@ -1372,6 +1469,7 @@ async def run_dev_issue(
                 result=result,
                 verifier=verifier,
                 max_attempts=max_fix_attempts,
+                state_db=state_db,
                 lock_handle=lock,
             )
 
@@ -1413,6 +1511,8 @@ async def run_dev_issue(
                             worktree_path=worktree_path,
                             base_branch=review_base,
                             config=code_review,
+                            state_db=state_db,
+                            issue_number=issue_number,
                         )
                     except Exception as e:
                         review_report = ReviewReport(
@@ -1531,6 +1631,19 @@ async def run_dev_issue(
                     error=str(e)[:200],
                 )
 
+        emit_outcome(
+            state_db,
+            lambda: {
+                "status": status,
+                "pipeline": "dev",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "exit_code": result.exit_code,
+                "question": result.question,
+            },
+        )
+
         # Push event to dashboard
         if dashboard and result.success:
             await dashboard.push_event(EventPayload(
@@ -1607,6 +1720,18 @@ async def run_dev_issue(
             ("failed", f"Error: {e}", int(time.time()), session_id),
         )
         state_db.commit()
+        if session_row_inserted:
+            emit_outcome(
+                state_db,
+                lambda: {
+                    "status": "failed",
+                    "pipeline": "dev",
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "session_id": session_id,
+                    "exit_code": last_exit_code,
+                },
+            )
 
         # Best-effort cleanup so a retry isn't blocked by leftover state.
         # Only touch the branch if THIS session created it (issue #51 —
@@ -1915,6 +2040,7 @@ async def resume_dev_from_pending(
                 result=result,
                 verifier=verifier,
                 max_attempts=max_fix_attempts,
+                state_db=state_db,
                 lock_handle=lock,
             )
 
@@ -1947,6 +2073,18 @@ async def resume_dev_from_pending(
                     error=str(e)[:200],
                 )
 
+        emit_outcome(
+            state_db,
+            lambda: {
+                "status": status,
+                "pipeline": "dev",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+                "exit_code": result.exit_code,
+                "question": result.question,
+            },
+        )
         return result
 
     except Exception as e:
@@ -1956,6 +2094,16 @@ async def resume_dev_from_pending(
             ("failed", f"Resume error: {e}", int(time.time()), session_id),
         )
         state_db.commit()
+        emit_outcome(
+            state_db,
+            lambda: {
+                "status": "failed",
+                "pipeline": "dev",
+                "repo": repo,
+                "issue_number": issue_number,
+                "session_id": session_id,
+            },
+        )
         return PipelineResult(
             success=False,
             session_id=session_id,

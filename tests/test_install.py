@@ -147,7 +147,28 @@ class TestRenderSystemd:
     def test_target_filenames_are_fixed(self, workdir: Path, target_dir: Path) -> None:
         units = render_systemd(workdir=workdir, target_dir=target_dir)
         names = sorted(u.target_path.name for u in units)
-        assert names == ["ctrlrelay-bridge.service", "ctrlrelay-poller.service"]
+        assert names == [
+            "ctrlrelay-bridge.service",
+            "ctrlrelay-poller.service",
+            "ctrlrelay-web.service",
+        ]
+
+    def test_web_unit_runs_the_status_page(
+        self, workdir: Path, target_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The status page (#209) is its own unit so a slow page can never
+        # stall the poller or the bridge. It needs no chat token.
+        monkeypatch.setenv("CTRLRELAY_TELEGRAM_TOKEN", "abc:test-token-xyz")
+        units = render_systemd(
+            workdir=workdir, target_dir=target_dir, ctrlrelay_bin="/opt/bin/ctrlrelay"
+        )
+        [web] = [u for u in units if u.service == "web"]
+        lines = web.content.splitlines()
+        assert "ExecStart=/opt/bin/ctrlrelay web start --foreground" in lines
+        assert "StandardOutput=append:%h/.ctrlrelay/logs/web.log" in lines
+        assert "StandardError=append:%h/.ctrlrelay/logs/web.error.log" in lines
+        assert "abc:test-token-xyz" not in web.content
+        assert web.unresolved == []
 
     def test_pythonunbuffered_set_in_both_units(
         self, workdir: Path, target_dir: Path
