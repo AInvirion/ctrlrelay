@@ -79,6 +79,13 @@ def test_transcript_dir_matches_measured_layout() -> None:
         ("Bash", {"command": "git push;\npytest"}, Phase.TESTING),
         ("Bash", {"command": "env FOO=bar pytest"}, Phase.TESTING),
         ("Bash", {"command": "env -i FOO=bar git push"}, Phase.PR),
+        ("Bash", {"command": "env -u FOO pytest"}, Phase.TESTING),
+        ("Bash", {"command": "env --chdir /w -0 pytest"}, Phase.TESTING),
+        # Quoted text is a word, never an operator or a heredoc.
+        ("Bash", {"command": 'pytest ";" git push'}, Phase.TESTING),
+        ("Bash", {"command": "echo '<<EOF'\ngit push"}, Phase.PR),
+        ("Bash", {"command": "cat <<-EOF\ngit push\nEOF\npytest -q"}, Phase.TESTING),
+        ("Bash", {"command": "git commit -F - <<'M'\nit's done; git push\nM"}, Phase.READING),
         ("TodoWrite", {}, None),
     ],
 )
@@ -177,13 +184,30 @@ def test_a_tail_too_short_for_the_last_row_finds_no_step(tmp_path: Path) -> None
     assert activity.reason == "no step in transcript tail"
 
 
-def test_a_tail_starting_inside_the_previous_row_drops_only_that_part(tmp_path: Path) -> None:
-    last_row_bytes = _boundary_file(tmp_path)
+def test_a_tail_starting_inside_a_row_never_parses_that_fragment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The cut row is the only step in the file; the row after it is not a step.
+    d = _transcript_dir(tmp_path)
+    step = _assistant_row("Bash", {"command": "uv run pytest -q"}, "2026-10-31T03:30:00.000Z")
+    after = json.dumps({"type": "user", "timestamp": "2026-10-31T03:31:00.000Z"})
+    (d / "t.jsonl").write_text(step + "\n" + after + "\n")
+    tail_bytes = 1 + 6 + 1 + len(after) + 1  # probe, 6 bytes of the step, "\n", the row after
+    fragment = step[-6:]
 
-    activity = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes + 6)
+    parsed: list[str] = []
+    real_loads = json.loads
 
-    assert activity.phase is Phase.TESTING
-    assert activity.last_command == "pytest \u2026"
+    def spy(text, *args, **kwargs):
+        parsed.append(text)
+        return real_loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(transcript_module.json, "loads", spy)
+    activity = read_activity(WORKTREE, home=tmp_path, tail_bytes=tail_bytes)
+
+    assert after in parsed  # the read reached the rows it had
+    assert fragment not in parsed
+    assert activity.phase is Phase.UNKNOWN
 
 
 def test_no_transcript_is_unknown(tmp_path: Path) -> None:
@@ -269,9 +293,11 @@ def test_last_command_truncated_to_200(tmp_path: Path) -> None:
     activity = read_activity(WORKTREE, home=tmp_path)
 
     assert activity.last_command is not None
-    assert len(activity.last_command) == 200
-    assert "\n" not in activity.last_command
+    assert len(activity.last_command) <= 200
     assert activity.last_command.startswith("cmd \u2026 && cmd && cmd")
+    assert activity.last_command.endswith("cmd \u2026")
+    # Whole words only: nothing cut in half at the limit.
+    assert set(activity.last_command.split()) == {"cmd", "&&", "\u2026"}
 
 
 @pytest.mark.parametrize(

@@ -15,6 +15,7 @@ word "search". Everything else is left out and marked with "…".
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -78,45 +79,72 @@ _SUBCOMMANDS = {
 }
 UNKNOWN_PROGRAM = "cmd"
 OUTSIDE_REPO = "file outside repo"
-_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
-_FD_REDIRECT = re.compile(r"\d*>&\d+")
-
-# Characters of the shell control operators that start a new command. shlex
-# groups adjacent ones (";\n", "|&"), so a token made only of these separates.
-_CONTROL = frozenset(";&|\n")
+# Shell operator characters. shlex returns a run of them as one token (";\n",
+# "|&", ">&"); an unquoted run made only of _CONTROL characters ends a command.
+_PUNCTUATION = "();<>|&\n"
+_CONTROL = frozenset(";&|\n()")
+# `env` options that take an operand, and ones that do not.
+_ENV_OPERAND_FLAGS = frozenset({"-u", "--unset", "-C", "--chdir"})
 _TEST_RUNNERS = frozenset({"pytest", "jest", "vitest"})
 _TEST_SUBCOMMANDS = {"go": "test", "cargo": "test", "playwright": "test"}
 
 
-def _strip_heredoc_bodies(command: str) -> str:
-    lines = command.split("\n")
-    kept: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        kept.append(line)
-        i += 1
-        for m in _HEREDOC.finditer(line):
-            while i < len(lines) and lines[i].strip() != m.group(2):
-                i += 1
-            i += 1  # the terminator
-    return "\n".join(kept)
+def _shell_tokens(command: str):
+    """Yield (token, is_operator) with heredoc bodies left out.
+
+    Operators come out as tokens of their own; quoted or escaped text, even ";"
+    or "<<", is a word. A heredoc's body is read off the raw input and skipped,
+    so its text never reaches the lexer.
+    """
+    stream = io.StringIO(command)
+    lexer = shlex.shlex(stream, posix=True, punctuation_chars=_PUNCTUATION)
+    lexer.whitespace = " \t\r"  # newline is an operator, not a space
+    lexer.whitespace_split = True  # words such as `test:unit` stay whole
+
+    def offset() -> int:
+        # shlex holds back at most one character it has read but not used.
+        return stream.tell() - len(lexer._pushback_chars)
+
+    delimiters: list[str] = []
+    while True:
+        start = offset()
+        token = lexer.get_token()
+        if token is None:
+            return
+        raw = command[start:offset()].strip(" \t\r")
+        operator = bool(token) and raw == token and set(token) <= set(_PUNCTUATION)
+        if operator and token == "<<":
+            delimiter = lexer.get_token()
+            if delimiter is None:
+                return
+            delimiters.append(delimiter[1:] if delimiter.startswith("-") else delimiter)
+            continue
+        yield token, operator
+        if operator and "\n" in token and delimiters:
+            pending = token[token.rindex("\n") + 1 :] + "".join(reversed(lexer._pushback_chars))
+            lexer._pushback_chars.clear()
+            for delimiter in delimiters:
+                while True:
+                    line = pending + stream.readline()
+                    pending = ""
+                    if not line or line.strip() == delimiter:
+                        break
+            delimiters = []
 
 
 def _segments(command: str) -> list[list[str]]:
-    """The simple commands in a shell line, as word lists, quotes respected."""
-    command = _FD_REDIRECT.sub(" ", _strip_heredoc_bodies(command))
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
-    lexer.whitespace = " \t\r"
-    lexer.whitespace_split = True  # words such as `test:unit` stay whole
+    """The simple commands in a shell line, as word lists."""
     try:
-        tokens = list(lexer)
+        tokens = list(_shell_tokens(command))
     except ValueError:  # unbalanced quote: fall back to a plain split
-        tokens = re.split(r"[ \t\r]+|([;&|\n]+)", command)
-        tokens = [t for t in tokens if t]
+        tokens = [
+            (t, set(t) <= _CONTROL)
+            for t in re.split(r"[ \t\r]+|([;&|\n]+)", command)
+            if t
+        ]
     segments: list[list[str]] = [[]]
-    for token in tokens:
-        if set(token) <= _CONTROL:
+    for token, operator in tokens:
+        if operator and set(token) <= _CONTROL:
             segments.append([])
         else:
             segments[-1].append(token)
@@ -132,7 +160,8 @@ def _command_words(words: list[str]) -> list[str]:
         elif head == "env":
             words = words[1:]
             while words and words[0].startswith("-"):
-                words = words[1:]
+                flag = words[0]
+                words = words[2:] if flag in _ENV_OPERAND_FLAGS else words[1:]
         elif head in ("uv", "poetry") and words[1:2] == ["run"]:
             words = words[2:]
         elif head in ("npx", "bunx"):
@@ -188,8 +217,12 @@ def classify(tool_name: str, tool_input: dict) -> Phase | None:
     return None
 
 
-def summarize_command(command: str) -> str:
-    """Each shell segment as a known program and, for some, one known subcommand."""
+def summarize_command(command: str, limit: int = MAX_COMMAND_CHARS) -> str:
+    """Each shell segment as a known program and, for some, one known subcommand.
+
+    Over ``limit`` characters, whole trailing segments are dropped and "…" added,
+    so no word is ever cut in half.
+    """
     parts: list[str] = []
     for segment in _segments(command):
         words = _command_words(segment)
@@ -206,7 +239,11 @@ def summarize_command(command: str) -> str:
         if rest:
             shown.append(MORE)
         parts.append(" ".join(shown))
-    return " && ".join(parts) if parts else MORE
+    text = " && ".join(parts) if parts else MORE
+    while len(text) > limit and parts:
+        parts.pop()
+        text = " && ".join(parts) + " " + MORE if parts else MORE
+    return text[:limit]
 
 
 def summarize_path(file_path: str, worktree_path: str | None) -> str:
@@ -226,7 +263,7 @@ def _describe(tool_name: str, tool_input: dict, worktree_path: str | None) -> st
     if tool_name == "Bash":
         command = tool_input.get("command")
         if isinstance(command, str) and command.strip():
-            return summarize_command(command)[:MAX_COMMAND_CHARS]
+            return summarize_command(command)
         return None
     if tool_name in _FILE_TOOLS:
         path = tool_input.get("file_path") or tool_input.get("notebook_path")
