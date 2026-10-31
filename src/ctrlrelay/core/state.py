@@ -209,6 +209,8 @@ class StateDB:
         """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Opened on first use by record_event_nowait; see there.
+        self._event_conn: sqlite3.Connection | None = None
 
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
@@ -301,7 +303,10 @@ class StateDB:
         self._ensure_dispatch_health_row()
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Close the database connection (and the event side connection)."""
+        if self._event_conn is not None:
+            self._event_conn.close()
+            self._event_conn = None
         self._conn.close()
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
@@ -1189,22 +1194,20 @@ class StateDB:
 
     # Events (status page feed)
 
-    def record_event(
-        self,
-        kind: str,
-        *,
-        repo: str | None = None,
-        issue_number: int | None = None,
-        session_id: str | None = None,
-        detail: dict[str, Any] | None = None,
-        ts: int | None = None,
-    ) -> None:
-        """Append one row to the events feed and commit.
+    # Seconds a best-effort event write may wait for a contended lock.
+    EVENT_WRITE_TIMEOUT = 0.25
 
-        Callers in the daemon go through ``events.emit_event``, which
-        swallows any failure; this method itself raises.
-        """
-        self._conn.execute(
+    @staticmethod
+    def _insert_event(
+        conn: sqlite3.Connection,
+        kind: str,
+        repo: str | None,
+        issue_number: int | None,
+        session_id: str | None,
+        detail: dict[str, Any] | None,
+        ts: int | None,
+    ) -> None:
+        conn.execute(
             """INSERT INTO events
                (ts, kind, repo, issue_number, session_id, detail)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -1217,7 +1220,57 @@ class StateDB:
                 None if detail is None else json.dumps(detail),
             ),
         )
-        self._conn.commit()
+        conn.commit()
+
+    def record_event(
+        self,
+        kind: str,
+        *,
+        repo: str | None = None,
+        issue_number: int | None = None,
+        session_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+        ts: int | None = None,
+    ) -> None:
+        """Append one row to the events feed on the main connection and
+        commit. Raises on failure, and a contended write waits for the
+        main connection's busy timeout. The daemon uses
+        ``events.emit_event`` instead, which goes through
+        :meth:`record_event_nowait`."""
+        self._insert_event(
+            self._conn, kind, repo, issue_number, session_id, detail, ts
+        )
+
+    def record_event_nowait(
+        self,
+        kind: str,
+        *,
+        repo: str | None = None,
+        issue_number: int | None = None,
+        session_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+        ts: int | None = None,
+    ) -> None:
+        """Like :meth:`record_event`, but through a separate connection to
+        the same file that waits at most ``EVENT_WRITE_TIMEOUT`` seconds
+        for a lock. Using its own connection keeps a failed event write
+        from leaving the main connection mid-transaction. Raises on
+        failure; the side connection is rolled back first."""
+        if self._event_conn is None:
+            self._event_conn = sqlite3.connect(
+                str(self.db_path), timeout=self.EVENT_WRITE_TIMEOUT
+            )
+        conn = self._event_conn
+        try:
+            self._insert_event(
+                conn, kind, repo, issue_number, session_id, detail, ts
+            )
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
 
     def list_events(
         self, *, since_ts: int = 0, limit: int = 200

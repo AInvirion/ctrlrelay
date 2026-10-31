@@ -1,8 +1,10 @@
 """Best-effort event feed for the status page.
 
 The daemon calls :func:`emit_event` at points where something worth showing
-happens. A write must never change, delay or fail the work it describes, so
-every exception is logged and swallowed here.
+happens. A write must not fail the work it describes and may delay it by at
+most ``StateDB.EVENT_WRITE_TIMEOUT`` seconds (a contended lock): it goes
+through a separate short-timeout connection, and every exception, including
+one raised while logging the failure, is swallowed here.
 """
 
 from __future__ import annotations
@@ -37,19 +39,27 @@ class EventKind(StrEnum):
 
 
 def emit_event(state_db: StateDB | None, kind: EventKind, **fields: Any) -> None:
-    """Record ``kind`` with ``fields`` (passed to ``StateDB.record_event``).
+    """Record ``kind`` with ``fields`` (as for ``StateDB.record_event``).
 
-    No-op when ``state_db`` is None. Any exception is logged as
-    ``events.write_failed`` and swallowed.
+    No-op when ``state_db`` is None. Never raises: a failed write is logged
+    as ``events.write_failed`` and swallowed, and a failure while logging
+    is swallowed too.
     """
     if state_db is None:
         return
+    # Set before the try so the failure log never has to touch ``kind``
+    # again: if str() itself raises, the log names it as unprintable.
+    kind_value = "<unprintable>"
     try:
-        state_db.record_event(str(kind), **fields)
+        kind_value = str(kind)
+        state_db.record_event_nowait(kind_value, **fields)
     except Exception as e:  # noqa: BLE001 - best-effort by design
-        log_event(
-            _logger,
-            "events.write_failed",
-            kind=str(kind),
-            reason=type(e).__name__,
-        )
+        try:
+            log_event(
+                _logger,
+                "events.write_failed",
+                kind=kind_value,
+                reason=type(e).__name__,
+            )
+        except Exception:  # noqa: BLE001 - a broken log handler included
+            pass
