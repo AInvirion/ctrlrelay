@@ -104,6 +104,7 @@ def test_read_activity_from_real_fixture(tmp_path: Path) -> None:
     assert activity == AgentActivity(
         phase=Phase.PR,
         furthest=Phase.PR,
+        phase_ts=LAST_STEP_TS,
         last_command=LAST_COMMAND,
         last_step_ts=LAST_STEP_TS,
         transcript=str(d / "d9f6c0f2.jsonl"),

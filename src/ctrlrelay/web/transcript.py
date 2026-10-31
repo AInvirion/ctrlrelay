@@ -55,11 +55,13 @@ def furthest_of(*phases: Phase | None) -> Phase:
 
 @dataclass(frozen=True)
 class AgentActivity:
-    """``phase`` is the latest classified step (what the agent is doing now);
-    ``furthest`` is the furthest phase any step in the tail reached (#238)."""
+    """``phase`` is the latest classified step (what the agent is doing now),
+    taken at ``phase_ts``; ``furthest`` is the furthest phase any step in
+    the tail reached (#238)."""
 
     phase: Phase
     furthest: Phase
+    phase_ts: int | None
     last_command: str | None
     last_step_ts: int | None
     transcript: str | None
@@ -460,6 +462,7 @@ def _unknown(reason: str, transcript: str | None = None) -> AgentActivity:
     return AgentActivity(
         phase=Phase.UNKNOWN,
         furthest=Phase.UNKNOWN,
+        phase_ts=None,
         last_command=None,
         last_step_ts=None,
         transcript=transcript,
@@ -488,6 +491,7 @@ def read_activity(
 
     phase: Phase | None = None
     furthest = Phase.UNKNOWN
+    phase_ts: int | None = None
     last_command: str | None = None
     last_step_ts: int | None = None
     for name, tool_input, timestamp in _tool_uses(lines):
@@ -501,12 +505,14 @@ def read_activity(
             last_command = described
         if classified is not None:
             phase = classified
+            phase_ts = last_step_ts
             furthest = furthest_of(furthest, classified)
 
     if phase is None:
         return AgentActivity(
             phase=Phase.UNKNOWN,
             furthest=Phase.UNKNOWN,
+            phase_ts=None,
             last_command=last_command,
             last_step_ts=last_step_ts,
             transcript=str(newest),
@@ -515,6 +521,7 @@ def read_activity(
     return AgentActivity(
         phase=phase,
         furthest=furthest,
+        phase_ts=phase_ts,
         last_command=last_command,
         last_step_ts=last_step_ts,
         transcript=str(newest),

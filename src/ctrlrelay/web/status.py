@@ -66,14 +66,16 @@ reason in ``server.unavailable``.
 Phase (#238): ``phase`` is the furthest step reached, in the order
 reading < coding < testing < ci < review < pr, over the transcript tail and
 the session's pipeline events (``ci_*``, ``review_*``, ``pr_opened``); the
-bar never moves back. ``current_activity`` is what is happening now: while
-ctrlrelay itself has a CI wait or a review open for a session (a
-``ci_started``/``review_started`` event with no later matching
-``*_finished``, and no poller ``restart`` since), that is the current
-activity (``phase_source: "pipeline"``) and the card is never
-``looks_stuck``. Otherwise it is the latest classified step in the agent's
-transcript (``"transcript"``), and the card looks stuck when its last step
-is older than ``stale_after_s``. Both are ``"unknown"`` when nothing says.
+bar never moves back, and it can come from history (a CI wait that has
+finished). ``current_activity`` is the most recent step by time: an open
+CI wait or review run by ctrlrelay itself (a ``ci_started``/
+``review_started`` event with no later matching ``*_finished``, and no
+poller ``restart`` since) when it started after the transcript's latest
+classified step, else that transcript step. ``phase_source`` says where
+``current_activity`` came from: ``"pipeline"``, ``"transcript"``, or
+``"none"`` when it is ``"unknown"``. While such a wait or review is open the
+card is never ``looks_stuck``; otherwise it looks stuck when the agent's
+last step is older than ``stale_after_s``.
 ``pr_url`` is the session's pull request, built by ``github_url`` from the
 repo and the last int ``pr_number`` its pipeline events carry, else
 ``null``; a ``pr_url`` in an event's detail is never used.
@@ -391,9 +393,10 @@ def _local_day(now: int) -> tuple[int, int]:
     return int(start.timestamp()), int(end.timestamp())
 
 
-def _open_phases(events: list[dict[str, Any]]) -> dict[str, Phase]:
-    """Per session, the most recently started CI wait or review still open."""
-    open_: dict[str, dict[Phase, int]] = {}
+def _open_phases(events: list[dict[str, Any]]) -> dict[str, tuple[Phase, int]]:
+    """Per session, the most recently started CI wait or review still open,
+    and the ``ts`` of the event that started it."""
+    open_: dict[str, dict[Phase, tuple[int, int]]] = {}
     for order, ev in enumerate(events):
         kind = ev["kind"]
         if kind == "restart":
@@ -407,14 +410,15 @@ def _open_phases(events: list[dict[str, Any]]) -> dict[str, Phase]:
         if sid is None:
             continue
         if kind in _OPENS:
-            open_.setdefault(sid, {})[_OPENS[kind]] = order
+            open_.setdefault(sid, {})[_OPENS[kind]] = (order, int(ev["ts"]))
         elif kind in _CLOSES:
             open_.get(sid, {}).pop(_CLOSES[kind], None)
-    return {
-        sid: max(phases, key=phases.__getitem__)
-        for sid, phases in open_.items()
-        if phases
-    }
+    out: dict[str, tuple[Phase, int]] = {}
+    for sid, phases in open_.items():
+        if phases:
+            latest = max(phases, key=lambda p: phases[p][0])
+            out[sid] = (latest, phases[latest][1])
+    return out
 
 
 def _reached(
@@ -469,7 +473,7 @@ def _card(
     row: dict[str, Any],
     *,
     now: int,
-    pipeline_phases: dict[str, Phase] | None,
+    pipeline_phases: dict[str, tuple[Phase, int]] | None,
     reached: dict[str, tuple[Phase, int | None]] | None,
     titles: dict[tuple[str, int], str],
     stale_after_s: int,
@@ -481,22 +485,29 @@ def _card(
     reasons = [activity.reason] if activity.reason else []
 
     pipeline_phase = None
+    pipeline_ts: int | None = None
     if pipeline_phases is None:
         reasons.append(_EVENTS_UNKNOWN)
-    else:
-        pipeline_phase = pipeline_phases.get(sid)
+    elif sid in pipeline_phases:
+        pipeline_phase, pipeline_ts = pipeline_phases[sid]
 
     reached_phase, pr_number = (reached or {}).get(sid, (Phase.UNKNOWN, None))
     # The bar shows the furthest phase reached (#238); current_activity
     # shows what is happening now, which may legitimately be earlier (a
     # read after the PR, a fix round after review).
     phase = furthest_of(activity.furthest, pipeline_phase, reached_phase)
-    if pipeline_phase is not None:
+    # The most recent step is the current activity: an open CI wait or
+    # review only when it started after the transcript's latest step.
+    transcript_known = activity.phase != Phase.UNKNOWN
+    pipeline_newer = pipeline_phase is not None and (
+        not transcript_known
+        or activity.phase_ts is None
+        or (pipeline_ts is not None and pipeline_ts > activity.phase_ts)
+    )
+    if pipeline_newer:
         current, source = pipeline_phase, "pipeline"
-    elif activity.phase != Phase.UNKNOWN:
+    elif transcript_known:
         current, source = activity.phase, "transcript"
-    elif reached_phase != Phase.UNKNOWN:
-        current, source = Phase.UNKNOWN, "pipeline"
     else:
         current, source = Phase.UNKNOWN, "none"
 

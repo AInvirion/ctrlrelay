@@ -238,10 +238,18 @@ journalctl --user -u ctrlrelay-poller -f
 ## Status page
 
 `ctrlrelay web start` serves a read-only page and JSON API showing what each
-agent is doing (phase, last command), what is waiting and why, the questions
-that need an answer, and a feed of what ctrlrelay did and said. It is a third
-process next to the bridge and the poller, so a slow or broken page can never
-stall them.
+agent is doing (phase, current activity, last command), what is waiting and
+why, the questions that need an answer, and a feed of what ctrlrelay did and
+said. It is a third process next to the bridge and the poller, so a slow or
+broken page can never stall them.
+
+On a running card, **phase** (the bar) is the furthest step the session has
+reached, from the agent's transcript plus ctrlrelay's own CI, review and PR
+events, so it never moves back. **Current activity** is the most recent step:
+an open CI wait or review if it started after the agent's latest step, else
+that step. It can be earlier than the bar, for example a read after the PR
+or a fix round after review. The card links the PR once ctrlrelay has
+recorded its number.
 
 It is **read-only**: it opens `state.db` read-only, reads the tail of each
 agent's transcript, and asks GitHub (through the `gh` login ctrlrelay already

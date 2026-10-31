@@ -1229,7 +1229,6 @@ def test_reads_after_a_push_keep_the_bar_at_pr(tmp_path: Path) -> None:
     _rows_transcript(tmp_path, wt, [
         ("Edit", {"file_path": wt + "/src/app.py"}, 1_000),
         ("Bash", {"command": "git push -u origin fix/237"}, 1_010),
-        ("Bash", {"command": "gh pr create --fill"}, 1_020),
         ("Read", {"file_path": "/etc/hosts"}, 1_030),
     ])
     _session(db, "s1", worktree=wt, started_at=900)
@@ -1279,6 +1278,8 @@ def test_pipeline_events_move_the_bar_without_a_transcript(tmp_path: Path) -> No
     card = _only(_status(tmp_path, 1_200)["running"], "s1")
     assert card["phase"] == "pr"
     assert card["current_activity"] == "unknown"
+    # phase comes from history; nothing says what is happening now.
+    assert card["phase_source"] == "none"
 
 
 def test_the_card_links_the_pr_when_one_is_known(tmp_path: Path) -> None:
@@ -1366,3 +1367,59 @@ def test_a_later_event_without_a_good_number_keeps_the_known_pr(tmp_path: Path) 
 
     card = _only(_status(tmp_path, 1_200)["running"], "s1")
     assert card["pr_url"] == f"https://github.com/{ALPHA}/pull/239"
+
+
+def test_a_transcript_step_newer_than_an_open_ci_wait_is_the_current_activity(
+    tmp_path: Path,
+) -> None:
+    """The most recent step wins: ci_started at 10:00, then the agent reads at
+    10:01, so the agent is reading now."""
+    db = _db(tmp_path)
+    wt = _worktree(tmp_path, "w1")
+    t0 = int(datetime(2026, 10, 31, 10, 0, tzinfo=UTC).timestamp())
+    _rows_transcript(tmp_path, wt, [
+        ("Bash", {"command": "git push -u origin fix/x"}, t0 - 60),
+        ("Read", {"file_path": wt + "/src/app.py"}, t0 + 60),
+    ])
+    _session(db, "s1", worktree=wt, started_at=t0 - 600)
+    db.record_event("ci_started", session_id="s1", repo=ALPHA,
+                    detail={"pr_number": 7}, ts=t0)
+
+    card = _only(_status(tmp_path, t0 + 120)["running"], "s1")
+    assert card["current_activity"] == "reading"
+    assert card["phase_source"] == "transcript"
+    assert card["phase"] == "pr"
+
+
+def test_an_open_ci_wait_newer_than_the_transcript_is_the_current_activity(
+    tmp_path: Path,
+) -> None:
+    """Control for the test above: the same steps, the wait started last."""
+    db = _db(tmp_path)
+    wt = _worktree(tmp_path, "w1")
+    t0 = int(datetime(2026, 10, 31, 10, 0, tzinfo=UTC).timestamp())
+    _rows_transcript(tmp_path, wt, [
+        ("Bash", {"command": "git push -u origin fix/x"}, t0 - 60),
+        ("Read", {"file_path": wt + "/src/app.py"}, t0 - 30),
+    ])
+    _session(db, "s1", worktree=wt, started_at=t0 - 600)
+    db.record_event("ci_started", session_id="s1", repo=ALPHA,
+                    detail={"pr_number": 7}, ts=t0)
+
+    card = _only(_status(tmp_path, t0 + 120)["running"], "s1")
+    assert card["current_activity"] == "ci"
+    assert card["phase_source"] == "pipeline"
+
+
+def test_a_finished_ci_with_no_transcript_has_no_current_activity(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _session(db, "s1", worktree=None, started_at=900)
+    db.record_event("ci_started", session_id="s1", repo=ALPHA,
+                    detail={"pr_number": 239}, ts=1_000)
+    db.record_event("ci_finished", session_id="s1", repo=ALPHA,
+                    detail={"pr_number": 239, "ok": True}, ts=1_100)
+
+    card = _only(_status(tmp_path, 1_200)["running"], "s1")
+    assert card["phase"] == "ci"
+    assert card["current_activity"] == "unknown"
+    assert card["phase_source"] == "none"
