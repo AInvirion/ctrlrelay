@@ -1,3 +1,10 @@
+---
+title: Status page design
+layout: default
+nav_order: 100
+nav_exclude: true
+---
+
 # Status page: see what ctrlrelay is doing without reading the log
 
 Issue: #209. Date: 2026-10-30.
