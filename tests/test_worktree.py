@@ -1816,10 +1816,20 @@ class TestFetchSurvivesRewrittenBranches:
         wt, _origin, target, local = self._diverged_setup(tmp_path, monkeypatch)
         monkeypatch.setattr(wt, "_clone_url",
                             lambda repo: str(tmp_path / "nowhere"))
+        real_clone = wt._clone_bare
+        seen: list[bool] = []
 
-        with pytest.raises(WorktreeError):
+        async def clone(repo: str, bare_path: Path) -> None:
+            # The old clone has been moved aside by the time this runs.
+            seen.append(bare_path.exists())
+            await real_clone(repo, bare_path)
+
+        monkeypatch.setattr(wt, "_clone_bare", clone)
+
+        with pytest.raises(WorktreeError, match="nowhere"):
             await wt.ensure_bare_repo("owner/repo")
 
+        assert seen == [False]
         assert self._sha(target, "refs/heads/main") == local
         assert not list(target.parent.glob("owner-repo.git.replaced-*"))
 

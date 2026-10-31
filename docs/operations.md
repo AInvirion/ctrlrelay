@@ -526,8 +526,8 @@ If the local copy's default branch can no longer fast-forward to GitHub's
 (the repo was replaced by a new one with the same name, or its default
 branch was force-pushed), ctrlrelay moves the copy to
 `~/.ctrlrelay/repos/<owner>-<repo>.git.replaced-<UTC time>`, clones again,
-and says so in chat. Nothing is deleted: remove the old copy once you do
-not need it. This is refused while any worktree still uses the copy (a
+and says so in chat. The old copy is kept as it was after the failed
+fetch: remove it once you do not need it. This is refused while any worktree still uses the copy (a
 blocked session keeps its worktree for the resume); the run then fails
 with `default branch diverged ... not re-cloning while N worktree(s) still
 use it`, and you can finish or clean up that session first.

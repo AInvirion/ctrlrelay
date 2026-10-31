@@ -1237,9 +1237,10 @@ class WorktreeManager:
         """Move a clone whose default branch diverged from origin to
         ``<name>.git.replaced-<UTC time>`` and clone fresh (#234).
 
-        The old clone is never deleted: any local-only commits stay in
-        the set-aside copy, and the operator is told where it is so they
-        can delete it.
+        The old clone is never deleted here, and the operator is told
+        where it went so they can delete it. It holds what the failed
+        fetch left: that fetch's ``--prune`` may already have dropped
+        local branches origin does not have, as every fetch here does.
 
         Refused, re-raising ``cause``, while any worktree is registered
         in the clone: a BLOCKED session keeps its worktree for the
