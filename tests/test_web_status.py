@@ -304,8 +304,8 @@ def test_task_session_renders(tmp_path: Path) -> None:
 
 
 def test_titles_come_only_from_the_titles_map(tmp_path: Path) -> None:
-    """The waiting line's items are not a title source: only the tracker's
-    unfiltered map is, so the two can never disagree about a title."""
+    """Titles come only from the tracker's unfiltered map. A title in the
+    waiting line's items is never used, even when the map has none."""
     db = _db(tmp_path)
     _session(db, "s1", issue_number=215, worktree=None, started_at=1_000)
     _session(db, "s2", repo=BETA, issue_number=215, worktree=None, started_at=1_000)
@@ -594,7 +594,9 @@ def _exercise_all_readers(tmp_path: Path, now: int) -> dict:
     return out
 
 
-def test_never_writes_while_the_daemon_has_it_open(tmp_path: Path) -> None:
+def test_reading_while_the_daemon_has_it_open_changes_no_mtime_size_or_files(
+    tmp_path: Path,
+) -> None:
     db = _db(tmp_path)  # stays open, as the poller's does: -wal and -shm exist
     _session(db, "s1", worktree=None, started_at=1_000)
     db.add_pending_resume("s2", "dev", ALPHA, "Q?")
@@ -612,7 +614,9 @@ def test_never_writes_while_the_daemon_has_it_open(tmp_path: Path) -> None:
     db.close()
 
 
-def test_never_writes_when_nobody_has_it_open(tmp_path: Path) -> None:
+def test_reading_when_nobody_has_it_open_changes_no_mtime_size_or_files(
+    tmp_path: Path,
+) -> None:
     """With no daemon connection a WAL database has no -wal or -shm, and a
     plain read-only open would create both. Reading must not."""
     db = _db(tmp_path)
@@ -801,7 +805,7 @@ def _old_pending_resumes(tmp_path: Path, columns: str) -> None:
     db.close()
 
 
-def test_pending_resumes_without_held_until_says_so(tmp_path: Path) -> None:
+def test_pending_resumes_without_held_until_is_unknown(tmp_path: Path) -> None:
     _old_pending_resumes(
         tmp_path,
         "session_id TEXT PRIMARY KEY, pipeline TEXT, repo TEXT, question TEXT,"
@@ -817,9 +821,13 @@ def test_pending_resumes_without_held_until_says_so(tmp_path: Path) -> None:
 
     out = _status(tmp_path, 2_000)
 
-    assert [q["session_id"] for q in out["needs_you"]] == ["q1"]
-    assert out["needs_you"][0]["held_until_ts"] is None
-    assert any("held_until unavailable" in e for e in out["errors"])
+    # Unknown whether it is held back, so the section is unknown: never a
+    # list that reads as "not held".
+    assert out["needs_you"] is None
+    # Named by the column check, which names the table, not by the query
+    # tripping over its alias.
+    assert "pending_resumes: no such column: pending_resumes.held_until" in out["errors"]
+    assert out["running"] == []
 
 
 def test_pending_resumes_missing_a_required_column_is_unknown(tmp_path: Path) -> None:
@@ -858,14 +866,97 @@ def test_a_question_row_that_cannot_be_shaped_is_reported(
     real = status_module._read_needs
 
     def one_bad_row(conn):
-        rows, notes = real(conn)
+        rows = real(conn)
         for r in rows:
             if r["session_id"] == "bad":
                 del r["question"]
-        return rows, notes
+        return rows
 
     monkeypatch.setattr(status_module, "_read_needs", one_bad_row)
     out = _status(tmp_path, 2_000)
 
-    assert [q["session_id"] for q in out["needs_you"]] == ["good"]
-    assert any("bad" in e and "pending_resumes" in e for e in out["errors"])
+    # Never a shorter list that reads as complete.
+    assert out["needs_you"] is None
+    assert any("pending_resumes" in e for e in out["errors"])
+
+
+# --- review round 2: whole sections or null -----------------------------------
+
+
+def test_open_readonly_never_reads_without_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lock-free open is safe only inside _read, which checks the file
+    did not change. The public opener never uses it."""
+    _closed_db(tmp_path)  # nobody has it open: where _read goes lock-free
+    uris: list[str] = []
+    real = sqlite3.connect
+
+    def spy(database, *args, **kwargs):
+        uris.append(str(database))
+        return real(database, *args, **kwargs)
+
+    monkeypatch.setattr(status_module.sqlite3, "connect", spy)
+    conn = open_readonly(tmp_path / "state.db")
+    conn.close()
+
+    assert len(uris) == 1
+    assert "mode=ro" in uris[0]
+    assert "immutable" not in uris[0]
+
+
+def test_sessions_reader_goes_through_the_guarded_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _closed_db(tmp_path)
+    used: list[Path] = []
+    real = status_module._read
+
+    def spy(path, fn):
+        used.append(path)
+        return real(path, fn)
+
+    monkeypatch.setattr(status_module, "_read", spy)
+    running, _ = make_sessions_reader(tmp_path / "state.db")()
+    assert [r["session_id"] for r in running] == ["s1"]
+    assert used == [tmp_path / "state.db"]
+
+
+def test_a_running_row_with_a_corrupt_start_is_unknown_not_an_exception(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    _session(db, "s1", worktree=None, started_at=1_000)
+    db.execute(
+        """INSERT INTO sessions (id, pipeline, repo, status, started_at)
+           VALUES ('s2', 'dev', ?, 'running', 'not a number')""",
+        (ALPHA,),
+    )
+    db.record_event("dispatched", ts=1_500)
+    db.commit()
+
+    out = _status(tmp_path, 2_000)
+
+    assert out["running"] is None
+    assert any("sessions" in e for e in out["errors"])
+    # Other sections are still whole.
+    assert [e["kind"] for e in out["feed"]] == ["dispatched"]
+    assert out["today"] is not None
+
+
+def test_an_event_with_an_out_of_range_time_makes_the_feed_unknown(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    _session(db, "s1", worktree=None, started_at=1_000)
+    db.record_event("dispatched", ts=1_500)
+    db.record_event("merged", ts=10**15)  # no datetime can hold it
+
+    out = _status(tmp_path, 2_000)
+
+    assert out["feed"] is None
+    assert any("events" in e for e in out["errors"])
+    assert [c["session_id"] for c in out["running"]] == ["s1"]
+
+    alone = list_feed(db_path=tmp_path / "state.db", since_ts=0)
+    assert alone["events"] is None and alone["error"]

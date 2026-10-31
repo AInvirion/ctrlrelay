@@ -1,14 +1,17 @@
 """The status page's JSON, built from a read-only snapshot of ``state.db`` (#209).
 
-Read only. Every connection is opened by ``_open`` (``mode=ro``, and
-``immutable=1`` when nobody else has the database open), the same opener
-behind the public :func:`open_readonly`; nothing here opens the database any
-other way. It never modifies the database's content and never takes a write
+Read only. Every connection is opened by ``_open`` with ``mode=ro``.
+Only ``_read`` may also ask for ``immutable=1`` (when nobody else has the
+database open), because only it checks afterwards that the file did not
+change; the public :func:`open_readonly` never does. Nothing here opens the
+database any other way. It never modifies the database's content and never takes a write
 lock. One known limit: if the daemon closes the database between the
 sidecar check and the connect, SQLite may leave empty ``-wal``/``-shm``
 files, holding no data, which are what the daemon itself creates on open.
 
-Never a confident wrong answer. A section that could not be read is
+Never a confident wrong answer. A section is either complete or ``null``,
+never partial: one row that cannot be read or shaped makes its whole
+section ``null``. A section that could not be read is
 ``null`` (``today``: every count ``null``) and ``errors`` says why. An empty
 list means the database was read and holds nothing, and only that. A
 database that is missing, locked or unreadable gives ``200``-shaped output
@@ -113,7 +116,9 @@ def _sidecars(db_path: Path) -> tuple[bool, bool]:
     )
 
 
-def _open(db_path: Path) -> tuple[sqlite3.Connection, bool]:
+def _open(
+    db_path: Path, *, lock_free_ok: bool,
+) -> tuple[sqlite3.Connection, bool]:
     """A read-only connection, and whether it reads without locks.
 
     A read-only open of a WAL database creates ``-wal`` and ``-shm`` when
@@ -131,7 +136,7 @@ def _open(db_path: Path) -> tuple[sqlite3.Connection, bool]:
     if _is_wal(db_path):  # raises if the file is missing
         wal, shm = _sidecars(db_path)
         if not wal and not shm:
-            immutable = True
+            immutable = lock_free_ok
         elif not shm:
             raise sqlite3.OperationalError(
                 f"{db_path} has a -wal but no -shm; reading it would create one"
@@ -146,10 +151,10 @@ def _open(db_path: Path) -> tuple[sqlite3.Connection, bool]:
 def open_readonly(db_path: Path) -> sqlite3.Connection:
     """Open ``db_path`` read-only (``mode=ro``); never modifies its content.
 
-    Raises if the file is missing. When nobody else has a WAL database open
-    the connection reads it without locks; use it for one short read.
+    Raises if the file is missing. Always a plain ``mode=ro`` connection,
+    never a lock-free one: that is safe only inside ``_read``.
     """
-    conn, _ = _open(db_path)
+    conn, _ = _open(db_path, lock_free_ok=False)
     return conn
 
 
@@ -172,7 +177,7 @@ def _read(db_path: Path, fn: Callable[[sqlite3.Connection], T]) -> T:
     last_error: sqlite3.Error | None = None
     for _ in range(_ATTEMPTS):
         before = _fingerprint(db_path)
-        conn, immutable = _open(db_path)
+        conn, immutable = _open(db_path, lock_free_ok=True)
         try:
             conn.execute("BEGIN")
             result = fn(conn)
@@ -197,14 +202,20 @@ def _schema_missing(exc: sqlite3.OperationalError) -> bool:
 
 
 def _section(errors: list[str], name: str, fn: Callable[[], T]) -> T | _Missing:
-    """``fn()``, or ``_MISSING`` if this database lacks what it reads. Any
-    other failure (busy, locked, corrupt) propagates and voids the read."""
+    """``fn()``, or ``_MISSING`` with an error when this database lacks what
+    it reads or a row cannot be shaped. A database failure (busy, locked,
+    corrupt) propagates and voids the whole read."""
     try:
         return fn()
     except sqlite3.OperationalError as exc:
         if not _schema_missing(exc):
             raise
         errors.append(f"{name}: {exc}")
+        return _MISSING
+    except sqlite3.Error:
+        raise
+    except Exception as exc:  # a row that cannot be shaped
+        errors.append(f"{name}: unreadable row: {type(exc).__name__}: {exc}")
         return _MISSING
 
 
@@ -225,22 +236,17 @@ def _read_locks(conn: sqlite3.Connection) -> dict[str, str]:
     return {r["repo"]: r["session_id"] for r in rows}
 
 
+# ``held_until`` included: without it nobody can say whether a question is
+# held back, and listing it as "not held" would be a guess.
 _NEEDS_REQUIRED = (
     "session_id", "pipeline", "repo", "question", "created_at",
-    "answered_at", "expired_at",
-)
-HELD_UNTIL_UNAVAILABLE = (
-    "pending_resumes: held_until unavailable (database older than #214); "
-    "whether a question is held back is unknown"
+    "answered_at", "expired_at", "held_until",
 )
 
 
-def _read_needs(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list[str]]:
-    """Open, unanswered questions, and notes about what could not be read.
-
-    A missing required column raises (the section is unknown). A database
-    without ``held_until`` still lists its questions, with ``held_until``
-    null and a note saying it is unknown, not "not held"."""
+def _read_needs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Open, unanswered questions. A missing column raises, naming every
+    missing column, so the section is unknown."""
     columns = {r["name"] for r in conn.execute("PRAGMA table_info(pending_resumes)")}
     if not columns:
         raise sqlite3.OperationalError("no such table: pending_resumes")
@@ -249,21 +255,16 @@ def _read_needs(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list[st
         raise sqlite3.OperationalError(
             f"no such column: pending_resumes.{', '.join(missing)}"
         )
-    notes: list[str] = []
-    held = "pr.held_until"
-    if "held_until" not in columns:
-        held = "NULL"
-        notes.append(HELD_UNTIL_UNAVAILABLE)
     rows = conn.execute(
-        f"""SELECT pr.session_id, pr.pipeline, pr.repo, pr.question,
-                   pr.created_at, {held} AS held_until,
+        """SELECT pr.session_id, pr.pipeline, pr.repo, pr.question,
+                   pr.created_at, pr.held_until,
                    s.issue_number AS issue_number
             FROM pending_resumes pr
             LEFT JOIN sessions s ON s.id = pr.session_id
             WHERE pr.answered_at IS NULL AND pr.expired_at IS NULL
             ORDER BY pr.created_at ASC, pr.session_id ASC"""
     ).fetchall()
-    return [dict(r) for r in rows], notes
+    return [dict(r) for r in rows]
 
 
 def _read_phase_events(
@@ -486,8 +487,12 @@ def build_status(
     def read_all(conn: sqlite3.Connection) -> dict[str, Any]:
         section_errors: list[str] = []
         running = _section(section_errors, "sessions", lambda: _read_running(conn))
-        since = min((r["started_at"] for r in running), default=now) if isinstance(
-            running, list) else now
+        starts = (
+            [r["started_at"] for r in running] if isinstance(running, list) else []
+        )
+        # A corrupt start time is the sessions section's problem (it is
+        # reported there); it must not break the events read.
+        since = min((t for t in starts if type(t) is int), default=now)
         return {
             "running": running,
             "needs": _section(section_errors, "pending_resumes", lambda: _read_needs(conn)),
@@ -518,30 +523,27 @@ def build_status(
             if err not in errors:
                 errors.append(err)
         phase_events = snap["phase_events"]
-        pipeline_phases = (
-            None if isinstance(phase_events, _Missing) else _open_phases(phase_events)
-        )
+        pipeline_phases = None
+        if not isinstance(phase_events, _Missing):
+            phases = _section(errors, "events", lambda: _open_phases(phase_events))
+            pipeline_phases = None if isinstance(phases, _Missing) else phases
         title_map = _titles(titles)
+        # Shaping happens inside the section guard: one row that cannot be
+        # shaped makes the whole section unknown, never a shorter list.
         if not isinstance(snap["running"], _Missing):
-            running = [
+            cards = _section(errors, "sessions", lambda: [
                 _card(
                     row, now=now, pipeline_phases=pipeline_phases, titles=title_map,
                     stale_after_s=stale_after_s, home=home,
                 )
                 for row in snap["running"]
-            ]
+            ])
+            running = None if isinstance(cards, _Missing) else cards
         if not isinstance(snap["needs"], _Missing):
-            rows, notes = snap["needs"]
-            errors.extend(n for n in notes if n not in errors)
-            needs_you = []
-            for row in rows:
-                try:
-                    needs_you.append(_question(row, title_map))
-                except (KeyError, IndexError, TypeError) as exc:
-                    errors.append(
-                        f"pending_resumes: question {row.get('session_id')!r} "
-                        f"unreadable: {type(exc).__name__}: {exc}"
-                    )
+            shaped = _section(errors, "pending_resumes", lambda: [
+                _question(row, title_map) for row in snap["needs"]
+            ])
+            needs_you = None if isinstance(shaped, _Missing) else shaped
         if not isinstance(snap["today"], _Missing):
             today = dict(snap["today"])
         if not isinstance(snap["feed"], _Missing):
