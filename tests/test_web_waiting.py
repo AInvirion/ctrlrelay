@@ -21,9 +21,15 @@ from ctrlrelay.core.config import Config
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.poller import IssuePoller
 from ctrlrelay.web.waiting import (
+    REASON_CONFIRM,
+    REASON_FOREIGN,
+    REASON_NOT_CONFIGURED,
+    REASON_SEEN,
     VIA_LABEL,
+    SkippedItem,
     WaitingItem,
     WaitingTracker,
+    classify_issues,
     compute_waiting,
     load_seen,
 )
@@ -531,6 +537,7 @@ async def test_snapshot_items_carry_timestamp_pairs(tmp_path: Path) -> None:
         "issue_number": 48,
         "title": "...",
         "reason": "next poll",
+        "url": f"https://github.com/{BETA}/issues/48",
         "updated_ts": 1793294926,
         "updated": "2026-10-29T17:28:46+00:00",
     }
@@ -903,3 +910,262 @@ async def test_titles_from_a_refresh_that_failed_later_are_not_published(
     assert calls["n"] == 2  # the second refresh reached the sessions read
     assert tracker.snapshot()["status"] == "unknown"
     assert tracker.titles() == before
+
+
+# --- skipped (#232) ------------------------------------------------------------
+
+
+def _classify(config: Config, issues: list[dict], **kw):
+    kw.setdefault("seen", set())
+    kw.setdefault("running", [])
+    kw.setdefault("locks", {})
+    return classify_issues(config, issues, **kw)
+
+
+def _skipped(skipped: list[SkippedItem]) -> dict[tuple[str, int], str]:
+    return {(s.repo, s.issue_number): s.reason for s in skipped}
+
+
+def test_skipped_repo_not_in_config(tmp_path: Path) -> None:
+    config = _config(tmp_path, [_accepting(BETA)])
+
+    waiting, skipped = _classify(config, _issues())
+
+    assert _keys(waiting) == [(BETA, 48), (BETA, 47), (BETA, 46)]
+    assert _skipped(skipped) == {
+        (ALPHA, 304): REASON_NOT_CONFIGURED,
+        (GAMMA, 366): REASON_NOT_CONFIGURED,
+    }
+    assert REASON_NOT_CONFIGURED == "repo not in config"
+    gamma = next(s for s in skipped if s.repo == GAMMA)
+    assert gamma.title == "..."
+    assert gamma.updated_ts == 1793043904
+
+
+def test_skipped_missing_required_label_names_the_label(tmp_path: Path) -> None:
+    config = _config(tmp_path, [
+        _accepting(GAMMA, require_labels=["ready"]),
+        _accepting(BETA, require_labels=["ready", "go"]),
+    ])
+    issues = [i for i in _issues() if i["repo"] in (GAMMA, BETA)]
+
+    waiting, skipped = _classify(config, issues)
+
+    assert waiting == []
+    reasons = _skipped(skipped)
+    assert reasons[(GAMMA, 366)] == "missing required label ready"
+    # Either label admits it (the poller's check is any-of), so both are named.
+    assert reasons[(BETA, 48)] == "missing required label ready or go"
+
+    # Present case: with the label, the same issue waits instead.
+    issues[-1]["labels"].append({"name": "Ready"})
+    waiting, skipped = _classify(config, issues)
+    assert (GAMMA, 366) in _keys(waiting)
+    assert (GAMMA, 366) not in _skipped(skipped)
+
+
+def test_skipped_excluded_label_names_the_label_on_the_issue(tmp_path: Path) -> None:
+    config = _config(tmp_path, [_accepting(BETA, exclude_labels=["EPIC"])])
+    issues = [i for i in _issues() if i["repo"] == BETA]
+
+    waiting, skipped = _classify(config, issues)
+
+    assert waiting == []
+    assert set(_skipped(skipped).values()) == {"excluded label epic"}
+    assert len(skipped) == 3
+
+
+def test_skipped_excluded_wins_over_seen(tmp_path: Path) -> None:
+    """The poller marks an excluded issue seen, so nearly every excluded
+    issue is also seen. The label is the reason that holds it back; "handled
+    once" would send the operator looking at the wrong thing."""
+    config = _config(tmp_path, [_accepting(BETA, exclude_labels=["epic"])])
+    issues = [i for i in _issues() if i["number"] == 48]
+
+    _, skipped = _classify(config, issues, seen={f"{BETA}#48"})
+
+    assert _skipped(skipped) == {(BETA, 48): "excluded label epic"}
+
+
+def test_skipped_already_handled_once(tmp_path: Path) -> None:
+    config = _config(tmp_path, [_accepting(BETA)])
+
+    waiting, skipped = _classify(config, _issues(), seen={f"{BETA}#47"})
+
+    assert _keys(waiting) == [(BETA, 48), (BETA, 46)]
+    assert _skipped(skipped)[(BETA, 47)] == REASON_SEEN
+    assert REASON_SEEN == "already handled once (won't retry)"
+
+
+def test_skipped_assigned_by_someone_else(tmp_path: Path) -> None:
+    config = _config(tmp_path, [{"name": GAMMA}])
+    issues = [i for i in _issues() if i["repo"] == GAMMA]
+
+    unknown_w, unknown_s = _classify(config, issues, assignments={})
+    foreign_w, foreign_s = _classify(config, issues, assignments={f"{GAMMA}#366": False})
+    self_w, self_s = _classify(config, issues, assignments={f"{GAMMA}#366": True})
+
+    # Not checked yet: it waits on the check, it is not skipped.
+    assert [(i.issue_number, i.reason) for i in unknown_w] == [(366, REASON_CONFIRM)]
+    assert unknown_s == []
+    assert foreign_w == []
+    assert _skipped(foreign_s) == {(GAMMA, 366): REASON_FOREIGN}
+    assert REASON_FOREIGN == "assigned by someone else"
+    assert _keys(self_w) == [(GAMMA, 366)] and self_s == []
+
+
+def test_running_issues_are_neither_waiting_nor_skipped(tmp_path: Path) -> None:
+    config = _config(tmp_path, [_accepting(BETA)])
+    running = [{"session_id": "s1", "repo": BETA, "issue_number": 47}]
+
+    waiting, skipped = _classify(config, _issues(), running=running, seen={f"{BETA}#47"})
+
+    assert (BETA, 47) not in _keys(waiting)
+    assert (BETA, 47) not in _skipped(skipped)
+    # Present case: the other two from the same repo are still there.
+    assert _keys(waiting) == [(BETA, 48), (BETA, 46)]
+
+
+def test_label_only_rows_are_never_skipped(tmp_path: Path) -> None:
+    """A row from a per-label query that is not assigned to the operator is
+    not "an assigned issue nobody will take": it was never assigned."""
+    config = _config(tmp_path, [
+        {"name": GAMMA, "automation": {"include_labels": ["ctrlrelay:auto"],
+                                       "exclude_labels": ["epic"]}},
+    ])
+
+    def row(number: int, labels: list[str]) -> dict:
+        return {**_issue_list_row(number, labels, assignees=["teammate"]),
+                "repo": GAMMA, VIA_LABEL: True}
+
+    stray = row(2, ["bug"])
+    excluded = row(3, ["ctrlrelay:auto", "epic"])
+    handled = row(4, ["ctrlrelay:auto"])
+    # Present case: the same excluded and handled issues, assigned to the
+    # operator (assignee-search rows), are skipped for those reasons.
+    mine = [{**r, VIA_LABEL: False} for r in (excluded, handled)]
+    _, skipped = _classify(config, mine, seen={f"{GAMMA}#4"}, username="octo")
+    assert _skipped(skipped) == {
+        (GAMMA, 3): "excluded label epic", (GAMMA, 4): REASON_SEEN,
+    }
+
+    waiting, skipped = _classify(
+        config, [stray, excluded, handled], seen={f"{GAMMA}#4"}, username="octo",
+    )
+
+    assert waiting == [] and skipped == []
+
+
+@pytest.mark.parametrize("repos", [
+    [_accepting(BETA)],
+    [{"name": GAMMA}, _accepting(BETA, exclude_labels=["epic"])],
+    [_accepting(ALPHA, require_labels=["ready"]), _accepting(GAMMA, require_labels=["bug"])],
+    [{"name": ALPHA, "automation": {"include_labels": ["ctrlrelay:auto"],
+                                    "require_labels": ["ready"]}},
+     {"name": GAMMA}, {"name": BETA}],
+])
+@pytest.mark.parametrize("assigned", [None, True, False])
+def test_every_assigned_issue_is_waiting_skipped_or_running(
+    tmp_path: Path, repos: list[dict], assigned: bool | None,
+) -> None:
+    """The property the section exists for: no assigned open issue is
+    missing from the page. Each search row lands in exactly one of
+    waiting, skipped or running, whatever the config."""
+    config = _config(tmp_path, repos)
+    issues = _issues()
+    running = [{"session_id": "s1", "repo": BETA, "issue_number": 46}]
+    assignments = {} if assigned is None else {
+        f"{i['repo']}#{i['number']}": assigned for i in issues
+    }
+
+    waiting, skipped = _classify(
+        config, issues, running=running, seen={f"{BETA}#47"},
+        assignments=assignments,
+    )
+
+    w, s = set(_keys(waiting)), set(_skipped(skipped))
+    run = {(BETA, 46)}
+    assert not (w & s) and not (w & run) and not (s & run)
+    assert w | s | run == {(i["repo"], i["number"]) for i in issues}
+    assert len(waiting) == len(w) and len(skipped) == len(s)
+
+
+def test_compute_waiting_is_the_waiting_half_of_classify(tmp_path: Path) -> None:
+    config = _config(tmp_path, [{"name": GAMMA}, _accepting(BETA)])
+    kw = {"seen": {f"{BETA}#47"}, "running": [], "locks": {},
+          "assignments": {f"{GAMMA}#366": True}}
+
+    assert compute_waiting(config, _issues(), **kw) == classify_issues(
+        config, _issues(), **kw,
+    )[0]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_carries_skipped_with_links_and_no_extra_github_calls(
+    tmp_path: Path,
+) -> None:
+    gh = _FakeGitHub(
+        [_issues()], events={(GAMMA, 366): _assigned_by("teammate")},
+    )
+    tracker = _tracker(tmp_path, gh, [1_800_000_000], repos=[
+        _accepting(BETA, exclude_labels=["epic"]), {"name": GAMMA},
+    ])
+
+    await tracker.refresh()
+    snap = tracker.snapshot()
+
+    assert snap["status"] == "ok"
+    assert snap["items"] == []
+    assert [(s["repo"], s["issue_number"], s["reason"]) for s in snap["skipped"]] == [
+        (BETA, 48, "excluded label epic"),
+        (BETA, 47, "excluded label epic"),
+        (BETA, 46, "excluded label epic"),
+        (GAMMA, 366, REASON_FOREIGN),
+        (ALPHA, 304, REASON_NOT_CONFIGURED),
+    ]
+    first = snap["skipped"][0]
+    assert first == {
+        "repo": BETA, "issue_number": 48, "title": "...",
+        "reason": "excluded label epic",
+        "url": f"https://github.com/{BETA}/issues/48",
+        "updated_ts": 1793294926, "updated": "2026-10-29T17:28:46+00:00",
+    }
+    # One search, and the one self-assignment check the waiting line
+    # already made; skipped costs nothing more.
+    assert gh.searches == ["octo"]
+    assert gh.event_calls == [(GAMMA, 366)]
+    assert gh.label_calls == []
+
+
+@pytest.mark.asyncio
+async def test_waiting_items_carry_their_link(tmp_path: Path) -> None:
+    gh = _FakeGitHub([[i for i in _issues() if i["number"] == 48]])
+    tracker = _tracker(tmp_path, gh, [1_800_000_000])
+
+    await tracker.refresh()
+
+    (item,) = tracker.snapshot()["items"]
+    assert item["url"] == f"https://github.com/{BETA}/issues/48"
+
+
+@pytest.mark.asyncio
+async def test_skipped_keeps_last_good_when_a_refresh_fails(tmp_path: Path) -> None:
+    gh = _FakeGitHub([_issues(), GitHubError("gh failed: HTTP 502")])
+    clock = [1_800_000_000]
+    tracker = _tracker(tmp_path, gh, clock)
+
+    before = tracker.snapshot()
+    assert before["skipped"] == [] and before["last_good_ts"] is None
+
+    await tracker.refresh()
+    good = tracker.snapshot()
+    assert {(s["repo"], s["issue_number"]) for s in good["skipped"]} == {
+        (ALPHA, 304), (GAMMA, 366),
+    }
+    clock[0] += 60
+    await tracker.refresh()
+    snap = tracker.snapshot()
+
+    assert snap["status"] == "unknown"
+    assert snap["skipped"] == good["skipped"]
+    assert snap["last_good_ts"] == 1_800_000_000

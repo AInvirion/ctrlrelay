@@ -48,20 +48,28 @@ WAITING_OK = {
 
 TOP_KEYS = {
     "version", "host", "generated", "generated_ts", "running", "needs_you",
-    "waiting", "today", "feed", "feed_total", "feed_truncated", "feed_limit",
-    "errors",
+    "waiting", "skipped", "server", "today", "feed", "feed_total",
+    "feed_truncated", "feed_limit", "errors",
+}
+# What a server-health reader returns; build_status passes it through whole.
+SERVER_OK = {
+    "load_1m": 0.5, "load_5m": 0.25, "load_15m": 0.125, "cpu_count": 12,
+    "memory": {"total_bytes": 100, "available_bytes": 50, "available_pct": 50.0,
+               "low": False},
+    "disks": [], "uptime_s": 10, "unavailable": [],
 }
 RUNNING_KEYS = {
     "session_id", "pipeline", "repo", "issue_number", "title", "started",
     "started_ts", "elapsed_s", "phase", "phase_source", "last_command",
-    "last_step", "last_step_ts", "looks_stuck", "reason",
+    "last_step", "last_step_ts", "looks_stuck", "reason", "url",
 }
 NEEDS_KEYS = {
     "session_id", "pipeline", "repo", "issue_number", "title", "question",
-    "asked", "asked_ts", "held_until", "held_until_ts",
+    "asked", "asked_ts", "held_until", "held_until_ts", "url",
 }
 TODAY_KEYS = {"dispatched", "pr_opened", "merged", "failed", "blocked", "messages_sent"}
-FEED_KEYS = {"ts", "time", "kind", "repo", "issue_number", "session_id", "detail"}
+FEED_KEYS = {"ts", "time", "kind", "repo", "issue_number", "session_id", "detail",
+             "url"}
 
 
 # --- helpers ---------------------------------------------------------------
@@ -127,6 +135,7 @@ def _status(tmp_path: Path, now: int, **kw) -> dict:
         host="testhost",
         now=now,
         home=kw.pop("home", tmp_path),
+        server=kw.pop("server", lambda: SERVER_OK),
         **kw,
     )
 
@@ -515,7 +524,8 @@ def test_an_unreadable_feed_has_an_unknown_total(tmp_path: Path) -> None:
     assert out["feed_truncated"] is False
 
     missing = build_status(db_path=tmp_path / "nope.db", waiting=WAITING_OK,
-                           version="1", host="h", now=2_000, home=tmp_path)
+                           version="1", host="h", now=2_000, home=tmp_path,
+                           server=lambda: SERVER_OK)
     assert missing["feed_total"] is None and missing["feed_truncated"] is False
     assert missing["feed_limit"] == status_module.FEED_LIMIT
 
@@ -567,7 +577,7 @@ def test_contract_keys(tmp_path: Path) -> None:
 def test_missing_db_returns_unknown_sections(tmp_path: Path) -> None:
     path = tmp_path / "missing" / "state.db"
     out = build_status(db_path=path, waiting=WAITING_OK, version="1", host="h",
-                       now=2_000, home=tmp_path)
+                       now=2_000, home=tmp_path, server=lambda: SERVER_OK)
 
     assert out["errors"] and any(str(path) in e for e in out["errors"])
     # Unknown, not "nothing running": null, never an empty list or zero.
@@ -577,6 +587,8 @@ def test_missing_db_returns_unknown_sections(tmp_path: Path) -> None:
     assert out["today"] == dict.fromkeys(TODAY_KEYS)
     # The waiting line is the tracker's, whatever the DB did.
     assert out["waiting"] == WAITING_OK
+    # So is the server section: it does not come from the database.
+    assert out["server"] == SERVER_OK
     # Reading never created the file (or its directory).
     assert not path.parent.exists()
 
@@ -1063,3 +1075,119 @@ def test_reads_a_database_whose_wal_switch_was_deferred(tmp_path: Path) -> None:
     check = sqlite3.connect(str(path))
     assert check.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     check.close()
+
+
+# --- #232: server health, skipped, links ----------------------------------------
+
+
+def test_server_section_is_the_readers_answer(tmp_path: Path) -> None:
+    _db(tmp_path).close()
+    out = _status(tmp_path, 2_000)
+
+    assert out["server"] == SERVER_OK
+    assert out["errors"] == []
+
+
+def test_a_server_reader_that_raises_is_null_with_an_error(tmp_path: Path) -> None:
+    """Whole or null: a failed health read is never a half-filled section
+    or zeros that read as "no load, no memory"."""
+    _db(tmp_path).close()
+
+    def broken() -> dict:
+        raise RuntimeError("boom")
+
+    out = _status(tmp_path, 2_000, server=broken)
+
+    assert out["server"] is None
+    assert out["errors"] == ["server: RuntimeError: boom"]
+    # The rest of the page is unaffected.
+    assert out["running"] == []
+
+
+def test_skipped_is_lifted_out_of_the_waiting_snapshot(tmp_path: Path) -> None:
+    _db(tmp_path).close()
+    row = {"repo": ALPHA, "issue_number": 3, "title": "t", "reason": "repo not in config",
+           "url": f"https://github.com/{ALPHA}/issues/3", "updated_ts": 1, "updated": None}
+    waiting = {**WAITING_OK, "last_good_ts": 1_000, "skipped": [row]}
+
+    out = _status(tmp_path, 2_000, waiting=waiting)
+
+    assert out["skipped"] == [row]
+    assert "skipped" not in out["waiting"]
+    assert out["waiting"]["last_good_ts"] == 1_000
+    # The tracker's own dict is not modified.
+    assert waiting["skipped"] == [row]
+
+
+def test_skipped_is_null_until_github_has_answered_once(tmp_path: Path) -> None:
+    """Before any good answer the tracker holds an empty list, which would
+    read as "nothing skipped"."""
+    _db(tmp_path).close()
+    waiting = {**WAITING_OK, "status": "unknown", "last_good_ts": None, "skipped": []}
+
+    assert _status(tmp_path, 2_000, waiting=waiting)["skipped"] is None
+
+
+def test_running_and_needs_you_link_to_their_issue(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _session(db, "s1", issue_number=215, worktree=None, started_at=1_000)
+    db.execute(
+        """INSERT INTO sessions (id, pipeline, repo, worktree_path, status, started_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("s-sec", "secops", BETA, None, "running", 1_000),
+    )
+    db.commit()
+    _session(db, "s-q", issue_number=7, status="blocked", started_at=1_000)
+    db.add_pending_resume("s-q", "dev", ALPHA, "Q?")
+    db.add_pending_resume("s-sec2", "secops", BETA, "Q2?")
+
+    out = _status(tmp_path, 2_000)
+
+    assert _only(out["running"], "s1")["url"] == f"https://github.com/{ALPHA}/issues/215"
+    assert _only(out["running"], "s-sec")["url"] is None
+    assert _only(out["needs_you"], "s-q")["url"] == f"https://github.com/{ALPHA}/issues/7"
+    assert _only(out["needs_you"], "s-sec2")["url"] is None
+
+
+def test_a_repo_name_that_is_not_owner_slash_name_gets_no_link(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _session(db, "s1", repo="javascript:alert(1)//x", issue_number=1, worktree=None,
+             started_at=1_000)
+    out = _status(tmp_path, 2_000)
+    assert _only(out["running"], "s1")["url"] is None
+
+
+def test_feed_links_prefer_the_pr_built_from_its_number(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    now = 1_800_000_000
+    db.record_event("dispatched", repo=ALPHA, issue_number=2, ts=now - 50)
+    # The pr_url an agent reported is never used, even when it looks right.
+    db.record_event("pr_opened", repo=ALPHA, issue_number=2,
+                    detail={"pr_number": 9, "pr_url": "https://evil.example/x"},
+                    ts=now - 40)
+    db.record_event("merged", repo=ALPHA, issue_number=2,
+                    detail={"pr_number": "9"}, ts=now - 30)
+    db.record_event("restart", detail={"process": "poller"}, ts=now - 20)
+    db.record_event("message_sent", repo=ALPHA, ts=now - 10)
+
+    out = _status(tmp_path, now)
+    urls = {e["kind"]: e["url"] for e in out["feed"]}
+
+    assert urls == {
+        "dispatched": f"https://github.com/{ALPHA}/issues/2",
+        "pr_opened": f"https://github.com/{ALPHA}/pull/9",
+        # A pr_number that is not an int is not used; the issue still is.
+        "merged": f"https://github.com/{ALPHA}/issues/2",
+        "restart": None,
+        "message_sent": None,
+    }
+
+
+def test_list_feed_events_carry_links_too(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    db.record_event("pr_opened", repo=ALPHA, issue_number=2,
+                    detail={"pr_number": 9}, ts=1_000)
+
+    out = list_feed(db_path=tmp_path / "state.db", since_ts=0)
+
+    assert out["events"][0]["url"] == f"https://github.com/{ALPHA}/pull/9"
