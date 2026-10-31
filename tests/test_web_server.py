@@ -1142,13 +1142,15 @@ def test_question_with_no_usable_refs_is_one_text_part(refs: object) -> None:
 
 @pytest.mark.parametrize(("text", "linked"), [
     ("\u00e9#3 and #4\u0663", ["#3", "#4"]),     # non-ASCII letter before, digit after
-    ("x#3, &#4, a/#3, #3_ and (#4).", ["#4"]),  # word, entity, path, word char after
+    # Each refused form shares its number with an allowed one, so the server
+    # sends a ref for it and only the page's own pattern can refuse it.
+    ("x#3, &#4, a/#3, #3_ and (#4), #3.", ["#4", "#3"]),
 ])
 def test_page_links_exactly_the_numbers_the_server_lists(
     text: str, linked: list[str],
 ) -> None:
     """#241: the refs come from the server's own _question_refs and the
-    page runs on them, so either pattern drifting from the other fails."""
+    page runs on them, so a pattern that drifts on any of these forms fails."""
     from ctrlrelay.web.status import _question_refs
 
     refs = _question_refs("o/r", text)
