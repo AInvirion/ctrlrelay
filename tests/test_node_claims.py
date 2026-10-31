@@ -512,3 +512,63 @@ class TestClaimsConfig:
 
         with pytest.raises(ValidationError, match="three times"):
             ClaimsConfig(refresh_seconds=300, stale_after_seconds=600)
+
+
+class TestTheTaskRunClaimsToo:
+    async def _run(self, tmp_path: Path, thread: Thread, node: str, exit_code: int):
+        from unittest.mock import MagicMock
+
+        from ctrlrelay.core.dispatcher import SessionResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.pipelines.task import run_task_issue
+
+        dispatcher = AsyncMock()
+        dispatcher.spawn_session.side_effect = lambda **kw: SessionResult(
+            session_id=kw["session_id"], exit_code=exit_code,
+            stdout="", stderr="", state=None,
+        )
+        worktree = AsyncMock()
+        worktree.create_worktree.return_value = tmp_path / "wt"
+        worktree.symlink_context = MagicMock()
+        worktree.remove_context_symlink = MagicMock()
+        github = AsyncMock()
+        github.get_issue.return_value = {"number": 55, "title": "t", "body": "b"}
+        github.list_issue_comments.side_effect = thread.list_issue_comments
+        github.post_issue_comment.side_effect = thread.post_issue_comment
+        github.edit_issue_comment.side_effect = thread.edit_issue_comment
+
+        async def comment_on_issue(repo, issue_number, body):
+            thread.add(body)
+
+        github.comment_on_issue.side_effect = comment_on_issue
+        state_db = StateDB(tmp_path / f"{node}.db")
+        try:
+            result = await run_task_issue(
+                claims=settings(node, race_wait_seconds=0),
+                repo=REPO, issue_number=55, dispatcher=dispatcher,
+                github=github, worktree=worktree, dashboard=None,
+                state_db=state_db, transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+        finally:
+            state_db.close()
+        return result, dispatcher
+
+    @pytest.mark.asyncio
+    async def test_a_task_another_machine_holds_is_skipped(self, tmp_path: Path) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        thread.add(claim_body("node-a", "aaa", WORKING, clock()))
+        result, dispatcher = await self._run(tmp_path, thread, "node-b", 0)
+        assert result.outputs["claimed_by"] == "node-a"
+        assert dispatcher.spawn_session.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failed_task_releases_its_claim(self, tmp_path: Path) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        result, dispatcher = await self._run(tmp_path, thread, "node-a", 1)
+        assert not result.success
+        assert dispatcher.spawn_session.await_count == 1
+        assert "node=node-a" in thread.comments[0]["body"]
+        assert other_owner(thread.comments, settings("node-b"), clock()) is None
