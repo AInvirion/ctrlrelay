@@ -539,6 +539,31 @@ class TestKeeper:
         assert "state=working" in thread.comments[0]["body"]
 
     @pytest.mark.asyncio
+    async def test_releasing_a_taker_does_not_bring_back_what_it_took(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        clock.t += 1801
+        b = await acquire_claim(
+            thread, REPO, 1, settings("node-b"), clock=clock, sleep=no_sleep,
+        )
+        # node-a comes back and refreshes once (fresh, but replaced).
+        a_keeper = ClaimKeeper(thread, REPO, 1, a.claim, settings("node-a"), clock=clock)
+        assert await a_keeper._write(WORKING)
+        clock.t += 1801
+        # node-b goes stale; node-c takes over from it ...
+        c = await acquire_claim(
+            thread, REPO, 1, settings("node-c"), clock=clock, sleep=no_sleep,
+        )
+        assert c.won
+        # ... and node-b, coming back, fails and releases its claim.
+        thread.add(release_marker(b.claim.claim_id))
+        assert await a_keeper._write(WORKING)
+        assert other_owner(thread.comments, settings("node-d"), clock()).node == "node-c"
+
+    @pytest.mark.asyncio
     async def test_the_takeover_mark_survives_the_takers_refresh(self) -> None:
         clock = Clock()
         thread = Thread(clock)
@@ -722,7 +747,7 @@ class TestTwoMachinesThroughTheDevRun:
         assert (claim.node, claim.state) == (winner, HELD)
 
     @pytest.mark.asyncio
-    async def test_a_failed_run_releases_only_its_own_claim(self, tmp_path: Path) -> None:
+    async def test_a_failed_run_releases_its_claim_by_id(self, tmp_path: Path) -> None:
         clock = Clock()
         thread = Thread(clock)
         a = _machine(tmp_path / "a", thread, checkpoint=None, exit_code=1)

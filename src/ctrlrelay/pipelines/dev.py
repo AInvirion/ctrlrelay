@@ -1683,9 +1683,9 @@ async def run_dev_issue(
                 )
         else:
             # No retraction is possible until the claim's id is known: a
-            # failure comment without one would end every claim on the
-            # issue, another machine's included. A claim whose post lost
-            # its response is never refreshed, so it goes stale instead.
+            # failure comment without one releases no named claim, ours
+            # included. A claim whose post lost its response is never
+            # refreshed, so it goes stale instead.
             outcome = await acquire_claim(github, repo, issue_number, claims)
             if not outcome.won:
                 return claimed_elsewhere_result(

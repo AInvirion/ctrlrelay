@@ -247,11 +247,7 @@ def live_claims(
     id, back in first place while the taker is running.
     """
     claims = parse_claims(comments, settings.account)
-    replaced = {
-        cid
-        for c in claims if c.replaces
-        for cid in c.replaces.split(",")
-    }
+    replaced = _replaced_ids(claims)
     live = []
     for claim in claims:
         if claim.claim_id in replaced:
@@ -261,6 +257,14 @@ def live_claims(
             continue
         live.append(claim)
     return sorted(live, key=lambda c: c.comment_id)
+
+
+def _replaced_ids(claims: list[Claim]) -> set[str]:
+    return {
+        cid
+        for c in claims if c.replaces
+        for cid in c.replaces.split(",")
+    }
 
 
 def other_owner(
@@ -332,7 +336,12 @@ async def acquire_claim(
 
     claim_id = secrets.token_hex(6)
     stale = _stale_claims(comments, settings, now)
-    replaces = ",".join(c.claim_id for c in stale if c.claim_id) or None
+    # Everything already replaced is replaced again, so the history does
+    # not depend on the claim that first recorded it: if that claim is
+    # later released, what it had taken must not come back to life.
+    already = _replaced_ids(parse_claims(comments, settings.account))
+    ids = {c.claim_id for c in stale if c.claim_id} | already
+    replaces = ",".join(sorted(ids)) or None
     comment_id = await github.post_issue_comment(
         repo, issue_number,
         claim_body(
