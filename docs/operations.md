@@ -371,7 +371,9 @@ When the run ends:
 - **finished, or waiting for an answer**: the claim is marked `held`. A held
   claim never goes stale, so a long wait for an answer never hands the issue
   to another machine. If marking it held fails three times the machine logs
-  `claims.hold_failed`; the claim then goes stale like a working one.
+  `claims.hold_failed` and keeps trying every `claims.refresh_seconds` in the
+  background, until the stale time counted from its last good write. If that
+  also fails, or the machine stops, the claim goes stale like a working one.
 - **failed**: the failure comment releases that one claim
   (`<!-- ctrlrelay:released id=... -->`), and the issue is free again.
 

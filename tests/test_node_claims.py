@@ -730,6 +730,34 @@ class TestTwoMachinesThroughTheDevRun:
     @pytest.mark.asyncio
     async def test_exactly_one_machine_runs_the_issue(self, tmp_path: Path) -> None:
         thread = Thread(Clock())
+        # Both machines read an empty thread and both post before either
+        # reads back: the race the check exists for, not one machine
+        # simply seeing the other's claim first.
+        both_read, both_posted = asyncio.Event(), asyncio.Event()
+        counts = {"read": 0, "post": 0}
+        real_list, real_post = thread.list_issue_comments, thread.post_issue_comment
+
+        async def list_comments(repo, n):
+            out = await real_list(repo, n)
+            counts["read"] += 1
+            if counts["read"] == 2:
+                both_read.set()
+            if counts["read"] > 2:
+                return out
+            await both_read.wait()
+            return out
+
+        async def post(repo, n, body):
+            cid = await real_post(repo, n, body)
+            counts["post"] += 1
+            if counts["post"] == 2:
+                both_posted.set()
+            if "Backing off" not in body:
+                await both_posted.wait()
+            return cid
+
+        thread.list_issue_comments = list_comments
+        thread.post_issue_comment = post
         a = _machine(tmp_path / "a", thread, checkpoint=BLOCKED, exit_code=0)
         b = _machine(tmp_path / "b", thread, checkpoint=BLOCKED, exit_code=0)
         ra, rb = await asyncio.gather(
@@ -741,6 +769,8 @@ class TestTwoMachinesThroughTheDevRun:
         winner = "node-a" if ran is ra else "node-b"
         assert ran.blocked
         assert skipped.outputs["claimed_by"] == winner
+        assert counts["post"] == 3  # two claims and the loser's release
+        assert "Backing off" in thread.comments[2]["body"]
         # The run is waiting on a question: the claim is held, so it is
         # never taken over however long the answer takes.
         [claim] = live_claims(thread.comments, settings("node-c"), 10**10)
