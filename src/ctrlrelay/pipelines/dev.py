@@ -18,6 +18,7 @@ from ctrlrelay.core.code_review import (
     run_code_review,
 )
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
+from ctrlrelay.core.events import EventKind, emit_event, emit_outcome
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier, VerificationResult
@@ -910,6 +911,8 @@ async def _review_and_comment(
     worktree_path: Path,
     base_branch: str,
     config: Any = None,
+    state_db: StateDB | None = None,
+    issue_number: int | None = None,
 ) -> ReviewReport:
     """Run the configured review and post what it found.
 
@@ -930,16 +933,33 @@ async def _review_and_comment(
             deliberate=True,
         )
 
-    outcome = await run_code_review(
-        repo=repo,
-        worktree_path=worktree_path,
-        base_branch=base_branch,
-        cli_command=getattr(
-            config, "cli_command", 'codex review -c sandbox_mode="read-only"'
-        ),
-        timeout_seconds=getattr(config, "timeout_seconds", 900),
-        session_id=session_id,
+    # Status page: the review phase runs after the agent has exited, so
+    # nothing in its transcript shows it. ``state_db`` None records nothing.
+    emit_event(
+        state_db, EventKind.REVIEW_STARTED, repo=repo,
+        issue_number=issue_number, session_id=session_id,
+        detail={"pr_number": pr_number},
     )
+    review_ok = False
+    try:
+        outcome = await run_code_review(
+            repo=repo,
+            worktree_path=worktree_path,
+            base_branch=base_branch,
+            cli_command=getattr(
+                config, "cli_command", 'codex review -c sandbox_mode="read-only"'
+            ),
+            timeout_seconds=getattr(config, "timeout_seconds", 900),
+            session_id=session_id,
+        )
+        review_ok = outcome.worth_posting
+    finally:
+        # Also on a raise, so the phase does not read as still open.
+        emit_event(
+            state_db, EventKind.REVIEW_FINISHED, repo=repo,
+            issue_number=issue_number, session_id=session_id,
+            detail={"pr_number": pr_number, "ok": review_ok},
+        )
 
     if not outcome.worth_posting:
         log_event(
@@ -1011,9 +1031,14 @@ async def _verify_and_fix_pr(
     result: PipelineResult,
     verifier: PRVerifier,
     max_attempts: int,
+    state_db: StateDB | None,
     lock_handle: _RepoLockHandle | None = None,
 ) -> PipelineResult:
     """Loop: verify CI+mergeability, ask Claude to fix, re-verify.
+
+    ``state_db`` is where the CI-wait start and end events go (status
+    page); required so a caller cannot drop them by omission, and None
+    records nothing.
 
     Lock discipline (issue #29): the verify phase is pure `gh` polling
     and holds no git state, so callers pass a ``lock_handle`` whose
@@ -1041,13 +1066,28 @@ async def _verify_and_fix_pr(
         widest possible window."""
         if lock_handle is not None:
             lock_handle.release()
+        emit_event(
+            state_db, EventKind.CI_STARTED, repo=ctx.repo,
+            issue_number=ctx.issue_number, session_id=ctx.session_id,
+            detail={"pr_number": pr_number},
+        )
+        ci_ok = False
         try:
-            return await verifier.verify(ctx.repo, pr_number)
+            verification = await verifier.verify(ctx.repo, pr_number)
+            ci_ok = verification.ready
+            return verification
         except asyncio.CancelledError:
             # Intentionally leave held=False so the outer finally's
             # release_lock is a no-op; the row is already gone. Re-raise
             # to let the cancellation propagate.
             raise
+        finally:
+            # Also on a raise, so the CI wait does not read as still open.
+            emit_event(
+                state_db, EventKind.CI_FINISHED, repo=ctx.repo,
+                issue_number=ctx.issue_number, session_id=ctx.session_id,
+                detail={"pr_number": pr_number, "ok": bool(ci_ok)},
+            )
 
     verification = await _run_verify()
     # If CI is simply slow (timed_out) we hand the PR off rather than asking
@@ -1289,6 +1329,11 @@ async def run_dev_issue(
             ),
         )
         state_db.commit()
+        emit_event(
+            state_db, EventKind.DISPATCHED, repo=repo,
+            issue_number=issue_number, session_id=session_id,
+            detail={"pipeline": "dev"},
+        )
 
         # Run pipeline
         pipeline = DevPipeline(
@@ -1361,6 +1406,15 @@ async def run_dev_issue(
         # the same repo can now run their own git-op phases while we wait.
         if result.success and result.outputs.get("pr_number") is not None:
             pr_number_for_review = int(result.outputs["pr_number"])
+            pr_url_raw = result.outputs.get("pr_url")
+            emit_event(
+                state_db, EventKind.PR_OPENED, repo=repo,
+                issue_number=issue_number, session_id=session_id,
+                detail={
+                    "pr_number": pr_number_for_review,
+                    "pr_url": pr_url_raw if isinstance(pr_url_raw, str) else None,
+                },
+            )
             # Starts as a failure, not as "fine". Every branch below
             # overwrites it; this value is what survives if a new
             # branch is ever added that forgets to.
@@ -1372,6 +1426,7 @@ async def run_dev_issue(
                 result=result,
                 verifier=verifier,
                 max_attempts=max_fix_attempts,
+                state_db=state_db,
                 lock_handle=lock,
             )
 
@@ -1413,6 +1468,8 @@ async def run_dev_issue(
                             worktree_path=worktree_path,
                             base_branch=review_base,
                             config=code_review,
+                            state_db=state_db,
+                            issue_number=issue_number,
                         )
                     except Exception as e:
                         review_report = ReviewReport(
@@ -1531,6 +1588,12 @@ async def run_dev_issue(
                     error=str(e)[:200],
                 )
 
+        emit_outcome(
+            state_db, status, pipeline="dev", repo=repo,
+            issue_number=issue_number, session_id=session_id,
+            exit_code=result.exit_code, question=result.question,
+        )
+
         # Push event to dashboard
         if dashboard and result.success:
             await dashboard.push_event(EventPayload(
@@ -1607,6 +1670,11 @@ async def run_dev_issue(
             ("failed", f"Error: {e}", int(time.time()), session_id),
         )
         state_db.commit()
+        emit_outcome(
+            state_db, "failed", pipeline="dev", repo=repo,
+            issue_number=issue_number, session_id=session_id,
+            exit_code=last_exit_code,
+        )
 
         # Best-effort cleanup so a retry isn't blocked by leftover state.
         # Only touch the branch if THIS session created it (issue #51 —
@@ -1915,6 +1983,7 @@ async def resume_dev_from_pending(
                 result=result,
                 verifier=verifier,
                 max_attempts=max_fix_attempts,
+                state_db=state_db,
                 lock_handle=lock,
             )
 
@@ -1947,6 +2016,11 @@ async def resume_dev_from_pending(
                     error=str(e)[:200],
                 )
 
+        emit_outcome(
+            state_db, status, pipeline="dev", repo=repo,
+            issue_number=issue_number, session_id=session_id,
+            exit_code=result.exit_code, question=result.question,
+        )
         return result
 
     except Exception as e:
@@ -1956,6 +2030,10 @@ async def resume_dev_from_pending(
             ("failed", f"Resume error: {e}", int(time.time()), session_id),
         )
         state_db.commit()
+        emit_outcome(
+            state_db, "failed", pipeline="dev", repo=repo,
+            issue_number=issue_number, session_id=session_id,
+        )
         return PipelineResult(
             success=False,
             session_id=session_id,

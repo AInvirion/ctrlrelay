@@ -63,3 +63,69 @@ def emit_event(state_db: StateDB | None, kind: EventKind, **fields: Any) -> None
             )
         except Exception:  # noqa: BLE001 - a broken log handler included
             pass
+
+
+# Session status (as written to ``sessions.status``) -> the event for it.
+_OUTCOME_KINDS = {
+    "done": EventKind.DONE,
+    "blocked": EventKind.BLOCKED,
+    "failed": EventKind.FAILED,
+}
+
+# Longest question text an outcome event carries.
+QUESTION_DETAIL_CHARS = 300
+
+
+def emit_outcome(
+    state_db: StateDB | None,
+    status: str,
+    *,
+    pipeline: str,
+    repo: str | None,
+    issue_number: int | None,
+    session_id: str | None,
+    exit_code: Any = None,
+    question: Any = None,
+) -> None:
+    """Record how a pipeline session ended: ``status`` is the value just
+    written to ``sessions.status`` (``done``, ``blocked`` or ``failed``).
+
+    ``exit_code`` and ``question`` come from the agent's result, so they
+    are kept only when they have the expected type. Never raises, like
+    :func:`emit_event`; building the detail is inside the guard too."""
+    if state_db is None:
+        return
+    try:
+        kind = _OUTCOME_KINDS[status]
+        detail = {
+            "pipeline": pipeline,
+            "exit_code": (
+                exit_code
+                if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+                else None
+            ),
+            "question": (
+                question[:QUESTION_DETAIL_CHARS]
+                if isinstance(question, str) and question
+                else None
+            ),
+        }
+    except Exception as e:  # noqa: BLE001 - best-effort by design
+        try:
+            log_event(
+                _logger,
+                "events.write_failed",
+                kind=f"outcome:{status!r:.40}",
+                reason=type(e).__name__,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    emit_event(
+        state_db,
+        kind,
+        repo=repo,
+        issue_number=issue_number,
+        session_id=session_id,
+        detail=detail,
+    )

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ctrlrelay import __version__
 from ctrlrelay.bridge.protocol import (
     BridgeMessage,
     BridgeOp,
@@ -20,6 +21,7 @@ from ctrlrelay.bridge.protocol import (
     parse_message,
     serialize_message,
 )
+from ctrlrelay.core.events import EventKind, emit_event
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.question_expiry import (
     find_repeat_history,
@@ -371,6 +373,11 @@ class BridgeServer:
         os.chmod(self.socket_path, stat.S_IRUSR | stat.S_IWUSR)
 
         self._running = True
+        # Bound and accepting: this is the moment a restart took effect.
+        emit_event(
+            self.state_db, EventKind.RESTART,
+            detail={"process": "bridge", "version": __version__},
+        )
         async with self._server:
             await self._server.serve_forever()
 
@@ -476,6 +483,11 @@ class BridgeServer:
                             post_id, msg.session_id
                         )
                 _log.info("bridge: SEND delivered, request_id=%s", msg.request_id)
+                emit_event(
+                    self.state_db, EventKind.MESSAGE_SENT, repo=msg.repo,
+                    issue_number=msg.issue_number, session_id=msg.session_id,
+                    detail={"request_id": msg.request_id, "chars": len(text)},
+                )
                 return BridgeMessage(op=BridgeOp.ACK, request_id=msg.request_id, status="sent")
             except Exception as e:
                 _log.warning("bridge: SEND failed, request_id=%s err=%s", msg.request_id, e)
@@ -552,6 +564,11 @@ class BridgeServer:
                     "dev.question.posted",
                     **post_fields,
                     post_id=post_id,
+                )
+                emit_event(
+                    self.state_db, EventKind.QUESTION_POSTED, repo=msg.repo,
+                    issue_number=msg.issue_number, session_id=msg.session_id,
+                    detail={"request_id": msg.request_id},
                 )
                 return BridgeMessage(
                     op=BridgeOp.ACK, request_id=msg.request_id, status="pending",

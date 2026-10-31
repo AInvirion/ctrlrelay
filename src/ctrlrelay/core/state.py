@@ -1271,11 +1271,7 @@ class StateDB:
                 session_id=session_id, detail=detail, ts=ts,
             )
             return
-        if self._event_conn is None:
-            self._event_conn = sqlite3.connect(
-                str(self.db_path), timeout=self.EVENT_WRITE_TIMEOUT
-            )
-        conn = self._event_conn
+        conn = self._event_connection()
         try:
             self._insert_event(
                 conn, kind, repo, issue_number, session_id, detail, ts
@@ -1286,6 +1282,15 @@ class StateDB:
             except sqlite3.Error:
                 pass
             raise
+
+    def _event_connection(self) -> sqlite3.Connection:
+        """The short-timeout side connection for event writes, opened on
+        first use."""
+        if self._event_conn is None:
+            self._event_conn = sqlite3.connect(
+                str(self.db_path), timeout=self.EVENT_WRITE_TIMEOUT
+            )
+        return self._event_conn
 
     def list_events(
         self, *, since_ts: int = 0, limit: int = 200
@@ -1311,6 +1316,33 @@ class StateDB:
             "DELETE FROM events WHERE ts < ?", (int(older_than_ts),)
         )
         self._conn.commit()
+        return cursor.rowcount
+
+    def prune_events_nowait(self, older_than_ts: int) -> int:
+        """Like :meth:`prune_events`, but through the event side connection,
+        so it waits at most ``EVENT_WRITE_TIMEOUT`` seconds for a lock.
+
+        The daemon prunes with this one. A DELETE on the main connection
+        would join (and commit) any transaction another coroutine has open
+        there, and one that failed on a busy lock would leave the main
+        connection holding a stale read snapshot, so the next real write on
+        it could fail. Raises on failure; the side connection is rolled
+        back first. An in-memory database falls back to the main
+        connection, as for :meth:`record_event_nowait`."""
+        if self._in_memory:
+            return self.prune_events(older_than_ts)
+        conn = self._event_connection()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM events WHERE ts < ?", (int(older_than_ts),)
+            )
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         return cursor.rowcount
 
     # Valid post-merge cleanup phases, in monotonic progression. Each

@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 
 import typer
@@ -12,6 +13,7 @@ from rich.table import Table
 
 from ctrlrelay import __version__
 from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
+from ctrlrelay.core.events import EventKind, emit_event
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier
@@ -1138,6 +1140,12 @@ async def deliver_relay_alert(config, state_db, alert) -> bool:
         return False
     try:
         state_db.mark_dispatch_alert_delivered(alert.claim_token)
+        emit_event(
+            state_db, EventKind.ALERT_SENT,
+            detail={
+                "consecutive_failures": getattr(alert, "consecutive", None),
+            },
+        )
     except Exception as e:
         # The message HAS gone out. Failing to record that means the
         # next failure may send a second one, which is a duplicate —
@@ -3034,6 +3042,18 @@ def poller_start(
             # eventually deleted from the config it answers None, `not
             # ttl` returns early, and questions stop expiring with
             # nothing logged. Same fault as #181, third instance.
+            #
+            # The status page's event history is pruned first, in its own
+            # guard, so it is trimmed even with no chat transport.
+            try:
+                history_days = getattr(
+                    getattr(config, "web", None), "history_days", 7
+                )
+                state_db.prune_events_nowait(
+                    int(time.time()) - int(history_days) * 86400
+                )
+            except Exception as e:
+                _log_quietly("events.prune_failed", cause=e)
             chat = _active_chat_config(config)
             ttl = getattr(chat, "question_ttl_seconds", None)
             if not ttl:
@@ -3443,6 +3463,10 @@ def poller_start(
                     f"{config.schedules.personalization_cron}"
                 )
             scheduler.start()
+            emit_event(
+                state_db, EventKind.RESTART,
+                detail={"process": "poller", "version": __version__},
+            )
             console.print(
                 f"[dim]Scheduler: secops cron={config.schedules.secops_cron} "
                 f"tz={config.timezone} | "

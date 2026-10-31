@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Awaitable, Callable
 
+from ctrlrelay.core.events import EventKind, emit_event
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.pr_watcher import PRWatcher
@@ -358,6 +359,15 @@ async def pr_watch_task(
             session_id=session_id, repo=repo, issue_number=issue_number,
             pr_number=pr_number,
         )
+        # Not when resuming an interrupted cleanup: the run that found
+        # the merge was the one to record it, and a second row would
+        # show the PR merging twice.
+        if merged and not resuming_cleanup:
+            emit_event(
+                state_db, EventKind.MERGED, repo=repo,
+                issue_number=issue_number, session_id=session_id,
+                detail={"pr_number": pr_number, "pr_url": pr_url or None},
+            )
         if merged:
             # Defer transport construction to inside the retry loop so
             # each attempt gets a fresh connection — a bridge restart
