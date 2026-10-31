@@ -541,6 +541,58 @@ class GitHubCLI:
             "--body", body,
         )
 
+    async def list_issue_comments(
+        self, repo: str, issue_number: int,
+    ) -> list[dict[str, Any]]:
+        """Every comment on an issue, oldest first, from the REST API.
+
+        Not ``gh issue view --json comments``: that carries no numeric
+        id and no ``updated_at``, and the claim rules (#245) need both.
+        """
+        output = await self._run_gh(
+            "api", "--paginate",
+            f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
+            "--jq",
+            ".[] | {id, body, created_at, updated_at, user: {login: .user.login}}",
+        )
+        return [json.loads(line) for line in output.splitlines() if line.strip()]
+
+    async def post_issue_comment(
+        self, repo: str, issue_number: int, body: str,
+    ) -> int:
+        """Post a comment and return its id, which ``comment_on_issue``
+        cannot (``gh issue comment`` prints only a URL)."""
+        output = await self._run_gh(
+            "api", "-X", "POST",
+            f"repos/{repo}/issues/{issue_number}/comments",
+            "-f", f"body={body}",
+            "--jq", ".id",
+        )
+        try:
+            return int(output.strip())
+        except ValueError:
+            raise GitHubError(
+                f"posting a comment returned no id: {output.strip()[:200]!r}"
+            ) from None
+
+    async def edit_issue_comment(
+        self, repo: str, comment_id: int, body: str,
+    ) -> None:
+        """Replace the body of an issue comment."""
+        await self._run_gh(
+            "api", "-X", "PATCH",
+            f"repos/{repo}/issues/comments/{comment_id}",
+            "-f", f"body={body}",
+            "--jq", ".id",
+        )
+
+    async def get_login(self) -> str:
+        """The login ``gh`` is authenticated as."""
+        login = (await self._run_gh("api", "user", "--jq", ".login")).strip()
+        if not login:
+            raise GitHubError("could not read the GitHub login")
+        return login
+
     async def comment_on_pr(self, repo: str, pr_number: int, body: str) -> None:
         """Post a comment on a PR."""
         await self._run_gh(
