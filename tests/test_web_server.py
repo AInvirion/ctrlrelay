@@ -1080,3 +1080,32 @@ def test_server_panel_flags_low_memory_and_disk() -> None:
     assert re.search(r'd\.low === true \? " low"', body), body
     assert ".server .line.low" in _page_source()
     assert 'id="server"' in _page_source()
+
+
+def test_running_card_links_the_pr_and_shows_the_current_activity() -> None:
+    """#238: the PR link goes through ghLink like every other link, and the
+    card names what the agent is doing now beside the furthest-phase bar."""
+    card = _js_function(_script(), "runningCard")
+    assert re.search(r"ghLink\(\s*card\.pr_url\s*,", card), card
+    assert re.search(r"if\s*\(\s*card\.pr_url\s*\)", card), card
+    assert "card.current_activity" in card
+    assert re.search(r"phaseLabel\(\s*card\.current_activity\s*\)", card), card
+
+
+@pytest.mark.parametrize(("phase", "label"), [
+    ("ci", "CI"), ("reading", "reading"), ("pr", "PR"), ("unknown", None),
+    ("nope", None), (None, None),
+])
+def test_phase_label_names_only_known_phases(phase, label) -> None:
+    script = _script()
+    m = re.search(r"^var PHASES = \[.*?\];$", script, re.M | re.S)
+    assert m
+    node = shutil.which("node") or shutil.which("nodejs")
+    if node is None:
+        pytest.skip("node is not installed, so the page's script cannot run here")
+    fn = _js_function(script, "phaseLabel")
+    program = (m.group(0) + f"\nfunction phaseLabel(phase) {{{fn}}}\n"
+               f"process.stdout.write(JSON.stringify(phaseLabel({json.dumps(phase)})));")
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True,
+                          timeout=30, check=True)
+    assert json.loads(done.stdout) == label

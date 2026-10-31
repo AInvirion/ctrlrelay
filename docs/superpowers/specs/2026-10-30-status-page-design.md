@@ -117,7 +117,12 @@ pattern) and a timestamp. Phase is derived from the most recent tool uses:
 - `Read`, `Grep`, `Glob`, read-only shell (`cat`, `sed -n`, `grep`, `ls`, `git log/diff/show`) → **reading**
 - `Edit`, `Write`, `NotebookEdit` → **coding**
 - shell running a test runner (`pytest`, `npm test`, `npx playwright`, `go test`, `cargo test`, `uv run pytest`, ...) → **testing**
+- `ctrlrelay ci wait`, `gh pr checks`, `gh run watch`, `gh run view`, `gh pr view --json statusCheckRollup` → **CI**
 - `git push`, `gh pr create` → **PR**
+
+The bar shows the furthest phase reached (transcript tail plus pipeline events), so it
+never moves back; the card also names the current activity, which can be earlier (a
+read after the PR, a fix round after review) (#238).
 
 If no transcript is found, phase is **unknown**. The agents need no change for this.
 
