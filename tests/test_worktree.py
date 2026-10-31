@@ -1746,8 +1746,8 @@ class TestFetchSurvivesRewrittenBranches:
         self, tmp_path: Path, monkeypatch,
     ) -> None:
         """#234: a repo whose history was replaced used to fail every run
-        until the clone was moved by hand. Now the clone is moved aside,
-        nothing in it lost, and a fresh one matches origin."""
+        until the clone was moved by hand. Now the clone is moved aside
+        with its diverged main intact, and a fresh one matches origin."""
         wt, origin, target, local = self._diverged_setup(tmp_path, monkeypatch)
         told: list[tuple[str, Path]] = []
 
