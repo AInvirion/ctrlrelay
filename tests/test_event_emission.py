@@ -23,6 +23,7 @@ import pytest
 import yaml
 
 from ctrlrelay.core.state import StateDB
+from tests._publish_fakes import fake_relay_publish
 from tests.conftest import FakeChatHandler
 
 DAY = 86400
@@ -128,12 +129,15 @@ async def _dev_run(tmp_path: Path, db: StateDB, *, spawn, transport=None):
     dispatcher.spawn_session.side_effect = spawn
 
     worktree = AsyncMock()
+    worktree.push_run_branch.return_value = "c0ffee"
     worktree.create_worktree_with_new_branch.return_value = (tmp_path / "wt", True)
     worktree.get_default_branch.return_value = "main"
+    worktree.push_run_branch.return_value = "c0ffee"
     worktree.symlink_context = MagicMock()
     worktree.remove_context_symlink = MagicMock()
 
     github = AsyncMock()
+    fake_relay_publish(github, pr_number=7, repo="o/r")
     github.get_issue.return_value = {
         "number": 1, "title": "x", "body": "y", "comments": [],
     }
@@ -220,11 +224,13 @@ async def test_ci_and_review_that_did_not_pass_finish_with_ok_false(
     dispatcher = AsyncMock()
     dispatcher.spawn_session.side_effect = _done_state(9)
     worktree = AsyncMock()
+    worktree.push_run_branch.return_value = "c0ffee"
     worktree.create_worktree_with_new_branch.return_value = (tmp_path / "wt", True)
     worktree.get_default_branch.return_value = "main"
     worktree.symlink_context = MagicMock()
     worktree.remove_context_symlink = MagicMock()
     github = AsyncMock()
+    fake_relay_publish(github, pr_number=9, repo="o/r")
     github.get_issue.return_value = {"number": 1, "title": "x", "body": ""}
 
     result = await dev_mod.run_dev_issue(
@@ -268,10 +274,12 @@ async def test_dev_run_that_raises_records_failed(tmp_path: Path) -> None:
     dispatcher = AsyncMock()
     dispatcher.spawn_session.side_effect = RuntimeError("agent crashed")
     worktree = AsyncMock()
+    worktree.push_run_branch.return_value = "c0ffee"
     worktree.create_worktree_with_new_branch.return_value = (tmp_path / "wt", True)
     worktree.symlink_context = MagicMock()
     worktree.remove_context_symlink = MagicMock()
     github = AsyncMock()
+    fake_relay_publish(github, pr_number=7, repo="o/r")
     github.get_issue.return_value = {"number": 1, "title": "x", "body": ""}
 
     result = await run_dev_issue(
@@ -359,6 +367,8 @@ def _task_spawn(status: str, question: str | None = None):
                 timestamp="2026-10-30T12:00:00Z",
                 summary="ran it" if status == "DONE" else None,
                 question=question,
+                # #219: the relay posts the report from the outputs.
+                outputs={"report": "build is green"} if status == "DONE" else {},
             ),
         )
 
@@ -369,10 +379,12 @@ def _task_fakes(tmp_path: Path, spawn):
     dispatcher = AsyncMock()
     dispatcher.spawn_session.side_effect = spawn
     worktree = AsyncMock()
+    worktree.push_run_branch.return_value = "c0ffee"
     worktree.create_worktree.return_value = tmp_path / "wt"
     worktree.symlink_context = MagicMock()
     worktree.remove_context_symlink = MagicMock()
     github = AsyncMock()
+    fake_relay_publish(github, pr_number=7, repo="o/r")
     github.get_issue.return_value = {"number": 55, "title": "t", "body": ""}
     return dispatcher, worktree, github
 
@@ -418,6 +430,7 @@ async def test_task_and_secops_record_dispatched_and_outcome(
         session_id="agent", exit_code=3, state=state,
     )
     sec_worktree = AsyncMock()
+    sec_worktree.push_run_branch.return_value = "c0ffee"
     sec_worktree.create_worktree.return_value = tmp_path / "swt"
     sec_worktree.symlink_context = MagicMock()
     sec_worktree.remove_context_symlink = MagicMock()
@@ -882,8 +895,10 @@ async def test_a_run_that_fails_before_its_session_exists_records_nothing(
     db.record_event("dispatched", repo="o/r", ts=1)  # not an empty table
 
     github = AsyncMock()
+    fake_relay_publish(github, pr_number=7, repo="o/r")
     github.get_issue.side_effect = RuntimeError("gh down")
     worktree = AsyncMock()
+    worktree.push_run_branch.return_value = "c0ffee"
     worktree.symlink_context = MagicMock()
     worktree.remove_context_symlink = MagicMock()
 
@@ -899,6 +914,7 @@ async def test_a_run_that_fails_before_its_session_exists_records_nothing(
         contexts_dir=tmp_path / "contexts",
     )
     sec_worktree = AsyncMock()
+    sec_worktree.push_run_branch.return_value = "c0ffee"
     sec_worktree.ensure_bare_repo.side_effect = RuntimeError("clone failed")
     sec_worktree.remove_context_symlink = MagicMock()
     repo = MagicMock()
@@ -936,6 +952,7 @@ async def test_pr_opened_records_once_after_verify_returns(
         dispatcher = AsyncMock()
         dispatcher.spawn_session.side_effect = _done_state(7)
         worktree = AsyncMock()
+        worktree.push_run_branch.return_value = "c0ffee"
         worktree.create_worktree_with_new_branch.return_value = (
             tmp_path / "wt", True,
         )
@@ -943,6 +960,7 @@ async def test_pr_opened_records_once_after_verify_returns(
         worktree.symlink_context = MagicMock()
         worktree.remove_context_symlink = MagicMock()
         github = AsyncMock()
+        fake_relay_publish(github, pr_number=7, repo="o/r")
         github.get_issue.return_value = {"number": 1, "title": "x", "body": ""}
         return await run_dev_issue(
             repo="o/r", issue_number=1, branch_template="fix/issue-{n}",

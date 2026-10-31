@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests._publish_fakes import fake_relay_publish
+
 
 class TestDevPipeline:
     @pytest.mark.asyncio
@@ -24,75 +26,16 @@ class TestDevPipeline:
 
         assert pipeline.name == "dev"
 
-    def test_prompt_directs_claude_to_ci_wait_helper(self) -> None:
-        """Prompt must tell Claude to call `ctrlrelay ci wait` (or equivalent
-        approved command) rather than improvising a bash `until`/`while` loop.
-        Issue #85: hand-written loops were inverted-semantics and ate exit
-        codes, burning 30-min timeouts on PRs that had already gone green.
+    def test_prompt_asks_for_a_local_commit_and_no_github_writes(self) -> None:
+        """#219: the agent commits; the relay pushes and opens the PR.
+
+        This replaces three tests that pinned the old step 5 (`ctrlrelay
+        ci wait` inside the agent). The agent has no GitHub login now,
+        so a prompt still telling it to push, open a pull request or
+        wait on CI would send it at commands that fail and burn the
+        session on them. The workflow section is read whole, not
+        searched for a phrase list.
         """
-        from ctrlrelay.pipelines.dev import DevPipeline
-
-        pipeline = DevPipeline(
-            dispatcher=MagicMock(),
-            github=MagicMock(),
-            worktree=MagicMock(),
-            dashboard=None,
-            state_db=MagicMock(),
-            transport=None,
-        )
-
-        prompt = pipeline._build_prompt(
-            repo="owner/repo",
-            issue_number=42,
-            extra={
-                "issue_title": "t",
-                "issue_body": "b",
-                "branch_name": "fix/issue-42",
-            },
-            session_id="dev-42",
-            state_file=Path("/tmp/state.json"),
-        )
-
-        # Points Claude at the approved waiter.
-        assert "ctrlrelay ci wait" in prompt
-        # Explicitly forbids the pattern that broke in issue #85.
-        lower = prompt.lower()
-        assert "until" in lower and "while" in lower, (
-            "prompt should explicitly ban `until`/`while` bash CI-wait loops"
-        )
-
-    def test_prompt_uses_default_ci_wait_timeout_when_not_configured(self) -> None:
-        """No ci_wait_timeout_seconds in extra: falls back to 600, matching
-        AutomationConfig's default so an unconfigured repo behaves as before."""
-        from ctrlrelay.pipelines.dev import DevPipeline
-
-        pipeline = DevPipeline(
-            dispatcher=MagicMock(),
-            github=MagicMock(),
-            worktree=MagicMock(),
-            dashboard=None,
-            state_db=MagicMock(),
-            transport=None,
-        )
-
-        prompt = pipeline._build_prompt(
-            repo="owner/repo",
-            issue_number=42,
-            extra={
-                "issue_title": "t",
-                "issue_body": "b",
-                "branch_name": "fix/issue-42",
-            },
-            session_id="dev-42",
-            state_file=Path("/tmp/state.json"),
-        )
-
-        assert "ctrlrelay ci wait --pr <PR> --repo owner/repo --timeout 600" in prompt
-
-    def test_prompt_uses_configured_ci_wait_timeout(self) -> None:
-        """A repo with a slow (or fast) CI can override the 600s default so
-        the dev pipeline doesn't spend most of a session blocked in one
-        `ctrlrelay ci wait` call."""
         from ctrlrelay.pipelines.dev import DevPipeline
 
         pipeline = DevPipeline(
@@ -117,8 +60,27 @@ class TestDevPipeline:
             state_file=Path("/tmp/state.json"),
         )
 
-        assert "ctrlrelay ci wait --pr <PR> --repo owner/repo --timeout 300" in prompt
-        assert "--timeout 600" not in prompt
+        start = prompt.index("Execute the following workflow:")
+        end = prompt.index("## No GitHub access")
+        workflow = prompt[start:end]
+        assert workflow.strip().splitlines()[1:8] == [
+            "",
+            "1. Validate the issue still applies to the current codebase",
+            "2. If anything is unclear, signal BLOCKED (see below) to ask "
+            "for clarification",
+            "3. Plan and implement the fix using TDD, and run the project's "
+            "tests locally",
+            "4. Commit your work on `fix/issue-42` in this worktree. Do not "
+            "create or",
+            "   switch to any other branch: only `fix/issue-42` is published.",
+            "5. Signal DONE with a pull request title and description (see "
+            "below).",
+        ]
+        assert "ctrlrelay ci wait" not in prompt
+        assert "gh pr create --" not in prompt
+        contract = pipeline._checkpoint_contract("/tmp/state.json", "dev-42")
+        assert '"pr_title"' in contract and '"pr_body"' in contract
+        assert "pr_url" not in contract
 
     @pytest.mark.asyncio
     async def test_run_dispatches_claude_session(self, tmp_path: Path) -> None:
@@ -198,11 +160,13 @@ class TestDevPipeline:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 123,
             "title": "Fix bug",
@@ -459,11 +423,13 @@ class TestDevPipeline:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 123,
             "title": "Fix bug",
@@ -529,11 +495,13 @@ class TestDevPipeline:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 123,
             "title": "Fix bug",
@@ -659,11 +627,13 @@ class TestRunDevIssueVerification:
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {"number": 1, "title": "x", "body": "y"}
         mock_github.get_pr_checks.return_value = [
             {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
@@ -702,11 +672,13 @@ class TestRunDevIssueVerification:
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {"number": 1, "title": "x", "body": "y"}
         # First verification: CI fails. Second: CI passes.
         mock_github.get_pr_checks.side_effect = [
@@ -753,11 +725,13 @@ class TestRunDevIssueVerification:
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {"number": 1, "title": "x", "body": "y"}
         mock_github.get_pr_checks.return_value = [
             {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
@@ -840,11 +814,13 @@ class TestRunDevIssueVerification:
         mock_dispatcher.spawn_session.side_effect = [blocked, done]
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "wt", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 13,
             "title": "x",
@@ -918,11 +894,13 @@ class TestRunDevIssueVerification:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "wt", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 13, "title": "x", "body": "y", "comments": [],
         }
@@ -974,11 +952,13 @@ class TestRunDevIssueVerification:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "wt", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 13, "title": "x", "body": "y", "comments": [],
         }
@@ -1045,11 +1025,13 @@ class TestRunDevIssueVerification:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 123,
             "title": "Fix bug",
@@ -1099,11 +1081,13 @@ class TestRunDevIssueVerification:
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {"number": 1, "title": "x", "body": "y"}
         # Always failing
         mock_github.get_pr_checks.return_value = [
@@ -1178,6 +1162,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (
             tmp_path / "worktree", True,
         )
@@ -1185,6 +1170,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 1, "title": "x", "body": "y", "comments": [],
         }
@@ -1269,6 +1255,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         mock_dispatcher.spawn_session.return_value = done_state
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (
             tmp_path / "worktree", True,
         )
@@ -1276,6 +1263,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 1, "title": "x", "body": "y", "comments": [],
         }
@@ -1381,6 +1369,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (
             tmp_path / "worktree", True,
         )
@@ -1388,6 +1377,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 1, "title": "x", "body": "y", "comments": [],
         }
@@ -1492,6 +1482,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (
             tmp_path / "worktree", True,
         )
@@ -1499,6 +1490,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         mock_worktree.remove_context_symlink = MagicMock()
 
         mock_github = AsyncMock()
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 1, "title": "x", "body": "y", "comments": [],
         }

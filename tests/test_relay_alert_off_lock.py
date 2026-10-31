@@ -127,7 +127,8 @@ class TestAWedgedBridgeDoesNotHoldTheLock:
                 async def _under_lock() -> None:
                     async with repo_lock:
                         await dispatcher.spawn_session(
-                            session_id="s-0",
+                            github_access=False,
+session_id="s-0",
                             prompt="p",
                             working_dir=tmp_path,
                             state_file=tmp_path / "missing.json",

@@ -31,7 +31,8 @@ class TestClaudeDispatcher:
             }))
 
             await dispatcher.spawn_session(
-                session_id="test-123",
+                github_access=False,
+session_id="test-123",
                 prompt="Test prompt",
                 working_dir=tmp_path,
                 state_file=state_file,
@@ -56,7 +57,8 @@ class TestClaudeDispatcher:
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await dispatcher.spawn_session(
-                session_id="test-123",
+                github_access=False,
+session_id="test-123",
                 prompt="Test",
                 working_dir=tmp_path,
                 state_file=tmp_path / "state.json",
@@ -89,7 +91,8 @@ class TestClaudeDispatcher:
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             with pytest.raises(asyncio.CancelledError):
                 await dispatcher.spawn_session(
-                    session_id="test-cancel",
+                    github_access=False,
+session_id="test-cancel",
                     prompt="Test",
                     working_dir=tmp_path,
                     state_file=tmp_path / "state.json",
@@ -122,7 +125,8 @@ class TestClaudeDispatcher:
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await dispatcher.spawn_session(
-                session_id="test-123",
+                github_access=False,
+session_id="test-123",
                 prompt="Test",
                 working_dir=tmp_path,
                 state_file=state_file,
@@ -165,7 +169,8 @@ class TestClaudeDispatcher:
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await dispatcher.spawn_session(
-                session_id="dev-o-r-1-abc",
+                github_access=False,
+session_id="dev-o-r-1-abc",
                 prompt="x",
                 working_dir=tmp_path,
                 state_file=state_file,
@@ -190,7 +195,8 @@ class TestClaudeDispatcher:
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await dispatcher.spawn_session(
-                session_id="sid",
+                github_access=False,
+session_id="sid",
                 prompt="x",
                 working_dir=tmp_path,
                 state_file=tmp_path / "state.json",
@@ -218,7 +224,8 @@ class TestClaudeDispatcher:
             "asyncio.create_subprocess_exec", return_value=mock_proc
         ) as mock_exec:
             await dispatcher.spawn_session(
-                session_id="dev-o-r-1-abc",
+                github_access=False,
+session_id="dev-o-r-1-abc",
                 prompt="x",
                 working_dir=tmp_path,
                 state_file=tmp_path / "state.json",
@@ -248,7 +255,8 @@ class TestClaudeDispatcher:
             "asyncio.create_subprocess_exec", return_value=mock_proc
         ) as mock_exec:
             await dispatcher.spawn_session(
-                session_id="dev-o-r-1-abc",
+                github_access=False,
+session_id="dev-o-r-1-abc",
                 prompt="x",
                 working_dir=tmp_path,
                 state_file=tmp_path / "state.json",
@@ -280,7 +288,8 @@ class TestClaudeDispatcher:
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await dispatcher.spawn_session(
-                session_id="test-123",
+                github_access=False,
+session_id="test-123",
                 prompt="Test",
                 working_dir=tmp_path,
                 state_file=state_file,
@@ -325,7 +334,8 @@ class TestDispatcherLogging:
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
                 await dispatcher.spawn_session(
-                    session_id="dev-o-r-9-abc",
+                    github_access=False,
+session_id="dev-o-r-9-abc",
                     prompt="secret prompt text",
                     working_dir=tmp_path,
                     state_file=tmp_path / "state.json",
@@ -356,7 +366,8 @@ class TestDispatcherLogging:
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
                 await dispatcher.spawn_session(
-                    session_id="dev-o-r-9-abc",
+                    github_access=False,
+session_id="dev-o-r-9-abc",
                     prompt="x",
                     working_dir=tmp_path,
                     state_file=tmp_path / "state.json",
@@ -393,7 +404,8 @@ class TestDispatcherLogging:
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
                 await dispatcher.spawn_session(
-                    session_id="sid",
+                    github_access=False,
+session_id="sid",
                     prompt=prompt,
                     working_dir=tmp_path,
                     state_file=state_file,
@@ -437,7 +449,8 @@ class TestDispatcherLogging:
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
                 await dispatcher.spawn_session(
-                    session_id="sid",
+                    github_access=False,
+session_id="sid",
                     prompt="x",
                     working_dir=tmp_path,
                     state_file=state_file,
@@ -468,7 +481,8 @@ class TestDispatcherLogging:
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
                 await dispatcher.spawn_session(
-                    session_id="sid",
+                    github_access=False,
+session_id="sid",
                     prompt="x",
                     working_dir=tmp_path,
                     state_file=tmp_path / "missing.json",
@@ -497,7 +511,8 @@ class TestDispatcherLogging:
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
                 result = await dispatcher.spawn_session(
-                    session_id="sid",
+                    github_access=False,
+session_id="sid",
                     prompt="x",
                     working_dir=tmp_path,
                     state_file=state_file,
@@ -524,7 +539,8 @@ class TestDispatcherLogging:
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
                 await dispatcher.spawn_session(
-                    session_id="sid",
+                    github_access=False,
+session_id="sid",
                     prompt="x",
                     working_dir=tmp_path,
                     state_file=tmp_path / "state.json",
@@ -554,7 +570,8 @@ class TestDispatcherLogging:
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):
             with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
                 await dispatcher.spawn_session(
-                    session_id="sid",
+                    github_access=False,
+session_id="sid",
                     prompt="x",
                     working_dir=tmp_path,
                     state_file=tmp_path / "state.json",
@@ -585,7 +602,8 @@ class TestDispatcherLogging:
             with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
                 with pytest.raises(asyncio.CancelledError):
                     await dispatcher.spawn_session(
-                        session_id="sid",
+                        github_access=False,
+session_id="sid",
                         prompt="x",
                         working_dir=tmp_path,
                         state_file=tmp_path / "state.json",
@@ -613,7 +631,8 @@ class TestDispatcherLogging:
             ):
                 with pytest.raises(FileNotFoundError):
                     await dispatcher.spawn_session(
-                        session_id="sid",
+                        github_access=False,
+session_id="sid",
                         prompt="x",
                         working_dir=tmp_path,
                         state_file=tmp_path / "state.json",

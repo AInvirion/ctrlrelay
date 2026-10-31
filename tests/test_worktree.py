@@ -1313,29 +1313,6 @@ class TestWorktreeManager:
             assert "main" in second_call_args
 
     @pytest.mark.asyncio
-    async def test_push_branch(self, tmp_path: Path) -> None:
-        """Should push branch to origin with -u flag."""
-        from ctrlrelay.core.worktree import WorktreeManager
-
-        manager = WorktreeManager(
-            worktrees_dir=tmp_path / "worktrees",
-            bare_repos_dir=tmp_path / "repos",
-        )
-
-        worktree_path = tmp_path / "some-worktree"
-        worktree_path.mkdir()
-
-        with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            mock_git.return_value = ""
-
-            await manager.push_branch(worktree_path, "feature/my-branch")
-
-            mock_git.assert_called_once_with(
-                "push", "-u", "origin", "feature/my-branch",
-                cwd=worktree_path,
-            )
-
-    @pytest.mark.asyncio
     async def test_symlink_context(self, tmp_path: Path) -> None:
         """Should symlink CLAUDE.md into worktree."""
         from ctrlrelay.core.worktree import WorktreeManager

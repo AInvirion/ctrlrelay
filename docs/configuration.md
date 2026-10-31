@@ -88,7 +88,78 @@ claude:
 
 ctrlrelay always invokes claude with `--dangerously-skip-permissions` so the
 agent does not pause on tool-permission prompts in headless runs. This is
-intentional — the orchestrator runs unattended.
+intentional — the orchestrator runs unattended. The CLI's other unattended
+modes either need every shell command allow-listed or filter by command text,
+which a wrapper script walks past, so they are not used as a guard. The guard
+is the next section: the agent holds no GitHub credentials.
+
+### What the agent can reach (#219)
+
+The dev and task agents run **without GitHub access**. ctrlrelay starts them
+with:
+
+- every `GH_*` and `GITHUB_*` variable removed (`GH_TOKEN`, `GITHUB_TOKEN`,
+  `GH_ENTERPRISE_TOKEN`, ...), and every inherited `CTRLRELAY_*` variable
+  (the chat bot tokens) except the two the checkpoint needs;
+- `GH_CONFIG_DIR` pointed at a fresh empty directory, so `gh` finds no login;
+- `DBUS_SESSION_BUS_ADDRESS` pointed at nothing, so `gh` and other libsecret
+  clients cannot fall back to the desktop keyring;
+- `credential.helper` reset to empty (through `GIT_CONFIG_COUNT`),
+  `GIT_SSH_COMMAND=false` and `SSH_AUTH_SOCK` removed, so git cannot
+  authenticate over HTTPS or SSH, including through an `insteadOf` rewrite;
+- `GIT_TERMINAL_PROMPT=0`, so nothing waits on a prompt.
+
+Everything else is inherited unchanged, so the model CLI and the project's
+toolchain behave as before. ctrlrelay then does the GitHub side itself, with
+its own credentials, after the agent exits:
+
+- **dev:** the agent commits on the run's branch and writes a PR title and
+  description in its DONE checkpoint. ctrlrelay pushes the branch and opens
+  the pull request. After a CI or conflict fix round it pushes again, and it
+  fetches the failed-job logs the agent used to read with `gh run view`.
+- **task:** the agent writes its report in its DONE checkpoint and ctrlrelay
+  posts it as the issue comment.
+- **secops** still runs **with** the operator's GitHub access. Its agent
+  reads Dependabot alerts and pull requests and merges what the policy
+  allows during the run. Moving it would mean ctrlrelay doing those reads
+  up front and the merges afterwards from a decision the agent returns.
+
+Pushes are refused, and logged as `publish.push.refused`, for `main`,
+`master`, the repository's default branch (read from the GitHub API, not
+from the local clone) and any branch that is not the run's own. The push
+goes to `https://github.com/<owner>/<repo>.git` (never `origin`) from a
+private git dir with hooks off and only ctrlrelay's own git config, pushes the
+commit it checked rather than the ref name, and uses `--force-with-lease`
+against the head this session last pushed (recorded in the state DB). An
+open PR found for the branch is reused only if its head repo is this repo and
+its base is the default branch. Text the agent wrote is posted with `@`-mentions and
+issue-closing keywords disabled and its length capped (20,000 characters);
+the PR's own `Closes #N` is added by ctrlrelay.
+
+**What this guarantees.** No GitHub credential is handed to the agent through
+its environment. ctrlrelay chooses the push URL, the branch and the PR base.
+`main`, `master`, the default branch and any branch other than the run's own
+are refused, and a branch that already exists on GitHub is only pushed over if
+its head is one ctrlrelay recorded pushing. Agent-written text is sanitized.
+An agent that only uses its normal tooling (git, gh, ssh as configured) cannot
+push. The push itself runs from a fresh relay-owned git dir under
+`~/.ctrlrelay/push/`, reads the clone's branch heads from its ref files, and
+never reads the clone's config, which every worktree shares.
+
+**What it does not guarantee.** The agent still runs as your user. A
+deliberately hostile agent can read `~/.config/gh/hosts.yml`, `~/.ssh` and
+anything else in your home directory and use them by hand; it can write
+anywhere your user can, including your dotfiles and ctrlrelay's install; and
+it can write to `~/.ctrlrelay/push/`, the bare clone's object store and any
+`objects/info/alternates` chain it adds there, racing a push. On macOS the
+login keychain is reachable whatever the environment says. Closing that needs
+a separate user or a read-only home (#236). The next setting hides the
+credential paths; it does not stop the writes.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `sandbox` | `"none"` or `"bwrap"` | `"none"` | `"bwrap"` runs the dev and task agents under bubblewrap with `sandbox_hide_paths` replaced by empty mounts. Linux only; needs `bwrap` installed and unprivileged user namespaces allowed (on Ubuntu 24.04+ an AppArmor profile for `bwrap`). ctrlrelay refuses to start if it is set and `bwrap` is missing. |
+| `sandbox_hide_paths` | list of strings | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc`, `~/.local/share/keyrings`, `$XDG_RUNTIME_DIR/bus` | Paths hidden under `sandbox: bwrap`. A directory becomes an empty tmpfs, a file or socket becomes `/dev/null`, a missing path is skipped. |
 
 ## transport
 
@@ -285,7 +356,7 @@ and ask the operator), or `never` (skip).
 | `exclude_labels` | `["manual", "operator", "instruction"]` | Issue labels that tell the poller "this isn't for the agent". See [exclude_labels](#reposautomationexclude_labels) below. |
 | `include_labels` | `[]` | Issue labels that opt an issue **into** the dev pipeline regardless of who is (or isn't) assigned. See [include_labels](#reposautomationinclude_labels) below. |
 | `require_labels` | `[]` | Issue labels that gate the plain-assignment trigger: when set, assignment alone is no longer enough — the issue must also carry one of these labels. See [require_labels](#reposautomationrequire_labels) below. |
-| `ci_wait_timeout_seconds` | `600` | Hard cap, in seconds, on the single `ctrlrelay ci wait` call the dev pipeline prompt tells Claude to run before signaling DONE. See [ci_wait_timeout_seconds](#reposautomationci_wait_timeout_seconds) below. |
+| `ci_wait_timeout_seconds` | `600` | Unused since #219 (the agent no longer waits on CI; ctrlrelay does). Still accepted so existing configs load. See [ci_wait_timeout_seconds](#reposautomationci_wait_timeout_seconds) below. |
 
 The current secops and dev pipelines read these settings to bias their prompts
 to Claude — they're not enforced by hard-coded checks.
@@ -432,7 +503,12 @@ repos:
 
 ### repos[].automation.ci_wait_timeout_seconds
 
-The dev pipeline prompt tells Claude to run `ctrlrelay ci wait --pr <PR>
+**Not used by the dev pipeline since #219.** The agent no longer has GitHub
+access, so it no longer waits on CI: ctrlrelay pushes the branch after the
+agent exits and its own PR verifier waits on CI. The key is still accepted so
+existing configs load. What follows describes the earlier behaviour.
+
+The dev pipeline prompt told Claude to run `ctrlrelay ci wait --pr <PR>
 --repo <repo> --timeout <N>` before signaling DONE — a single blocking call
 that polls GitHub every 15s until CI finishes, fails, or the timeout hits.
 No tokens get generated while it's blocked; on a repo with a slow CI suite,

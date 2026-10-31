@@ -30,6 +30,10 @@ class TestTaskPipelineBasic:
                     session_id=kwargs["session_id"],
                     timestamp="2026-04-21T12:00:00Z",
                     summary="Build ran clean; no errors.",
+                    outputs={
+                        "report": "Build is clean. cc @someone",
+                        "pr_url": "https://github.com/owner/repo/pull/1",
+                    },
                 ),
             )
 
@@ -70,6 +74,12 @@ class TestTaskPipelineBasic:
         # it.
         assert "pr_url" not in result.outputs
         assert "pr_number" not in result.outputs
+
+        # #219: the relay posted the report, once, with the mention
+        # disabled; the agent's stray pr_url did not cross over.
+        mock_github.comment_on_issue.assert_awaited_once()
+        body = mock_github.comment_on_issue.await_args.kwargs["body"]
+        assert body.startswith("Build is clean. cc @\u200bsomeone\n\n---\n")
 
         # Session row marked done.
         row = state_db.get_session_row(result.session_id)

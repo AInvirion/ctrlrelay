@@ -190,10 +190,16 @@ def test_the_contract_is_one_source_shared_with_the_initial_prompt(
         "the initial prompt must render the same contract text the resume "
         "prompt does; if these diverge, one of them is a stale copy"
     )
+    # #219: dev's DONE carries the PR text the relay opens the pull
+    # request from; nobody's DONE carries a PR URL any more, because the
+    # agent no longer opens one.
+    assert "pr_url" not in contract
     if mod == "dev":
-        assert "pr_url" in contract, "dev's DONE carries the PR outputs"
+        assert '"pr_title"' in contract and '"pr_body"' in contract, (
+            "dev's DONE carries the PR title and description"
+        )
     else:
-        assert "pr_url" not in contract
+        assert "pr_title" not in contract
 
 
 @pytest.mark.parametrize("mod", PIPELINES)
@@ -247,9 +253,13 @@ def test_every_checkpoint_snippet_creates_its_own_directory(mod: str) -> None:
     )
 
     for i, block in enumerate(blocks):
-        assert "printf " in block, f"{mod}: block {i} writes nothing"
+        # The writer is `printf` for one-line states and `python3` for a
+        # DONE that carries multi-line text (#219: a PR description or
+        # a task report), which printf cannot JSON-encode.
+        writer = "printf " if "printf " in block else "python3 "
+        assert writer in block, f"{mod}: block {i} writes nothing"
         mk = block.find("mkdir -p -- ")
-        pf = block.find("printf ")
+        pf = block.find(writer)
         assert mk != -1, (
             f"{mod}: block {i} writes the checkpoint without creating its "
             "directory, so it depends on somebody else having made it"

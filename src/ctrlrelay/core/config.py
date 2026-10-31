@@ -7,10 +7,12 @@ import re
 import socket
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from ctrlrelay.core.agent_env import DEFAULT_SANDBOX_HIDE_PATHS
 
 CONFIG_FILENAME = "orchestrator.yaml"
 CONFIG_SUBDIR = "config"
@@ -83,6 +85,15 @@ class AgentConfig(BaseModel):
     binary: str = "claude"
     default_timeout_seconds: int = 1800
     output_format: str = "json"
+    # #219. "bwrap" runs the dev and task agents under bubblewrap with
+    # the paths below replaced by empty mounts, so the agent cannot
+    # read the SSH key or gh's stored login. Off by default because it
+    # needs bwrap installed and unprivileged user namespaces allowed.
+    # The credential stripping in core.agent_env applies either way.
+    sandbox: Literal["none", "bwrap"] = "none"
+    sandbox_hide_paths: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_SANDBOX_HIDE_PATHS)
+    )
 
 
 # Backwards-compat alias. Older code and docs reference ``ClaudeConfig``;

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -102,6 +105,141 @@ class StaleRecreatePartialFailureError(WorktreeError):
     WorktreeManager were racy under concurrent run_dev_issue calls)."""
 
 
+# Command-line config for every git call the relay makes with its own
+# credentials (#219). Command-line `-c` outranks every config file, so
+# these hold even if a file somewhere sets the opposite. (An empty
+# `include.path` cannot be passed here - git refuses relative includes
+# from the command line - and is not needed: the only files read are
+# the two this module writes.)
+_RELAY_GIT_FLAGS: tuple[str, ...] = (
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false",
+    "-c", "protocol.file.allow=never",
+    "-c", "protocol.ext.allow=never",
+)
+
+
+_HEX_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+_SAFE_BRANCH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*$")
+
+
+def _safe_repo_file(repo_real: str, rel: str) -> str | None:
+    """Path of ``rel`` inside ``repo_real`` if it is safe to read.
+
+    Returns None when nothing exists there. Raises
+    :class:`PushRefusedError` when something exists but is unsafe: any
+    symlink between the repository and the file (the file itself or a
+    parent directory), or a path that resolves outside the repository.
+    Present-but-unsafe is never reported as absent, so the caller cannot
+    fall through to an older value somewhere else.
+    """
+    from ctrlrelay.core.publish import PushRefusedError
+
+    path = os.path.join(repo_real, rel)
+    cur = repo_real
+    for part in rel.split("/"):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            raise PushRefusedError(
+                f"push refused: {rel} in the clone goes through a symlink"
+            )
+        if not os.path.lexists(cur):
+            return None
+    if (
+        os.path.realpath(path) != os.path.abspath(path)
+        or not os.path.realpath(path).startswith(repo_real + os.sep)
+        or not os.path.isfile(path)
+    ):
+        raise PushRefusedError(
+            f"push refused: {rel} in the clone is not a plain file inside it"
+        )
+    return path
+
+
+def _read_nofollow(path: str) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "r") as f:
+        return f.read()
+
+
+def _read_branch_head(bare_path: Path, branch: str) -> str:
+    """Head of ``refs/heads/<branch>`` read from the ref files as data.
+
+    No git process runs in the bare clone, so none of its config (which
+    the agent can write) is read. The agent can also write the ref files
+    themselves, so they are read only when no symlink is involved and
+    the file is inside the clone: a loose ref first, then
+    ``packed-refs``. A loose ref that exists but is unsafe is refused,
+    never treated as absent. A missing branch raises
+    :class:`WorktreeError`; anything unsafe raises
+    :class:`PushRefusedError`.
+    """
+    from ctrlrelay.core.publish import PushRefusedError
+
+    if (
+        not _SAFE_BRANCH.match(branch)
+        or ".." in branch
+        or "//" in branch
+        or any(part.startswith(".") or part.endswith(".lock")
+               for part in branch.split("/"))
+    ):
+        raise PushRefusedError(f"push refused: {branch!r} is not a safe ref name")
+    repo_real = os.path.realpath(bare_path)
+    ref = f"refs/heads/{branch}"
+    value: str | None = None
+    loose = _safe_repo_file(repo_real, ref)
+    if loose is not None:
+        value = _read_nofollow(loose).strip()
+    else:
+        packed = _safe_repo_file(repo_real, "packed-refs")
+        if packed is not None:
+            for line in _read_nofollow(packed).splitlines():
+                if line.startswith(("#", "^")):
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) == 2 and parts[1] == ref:
+                    value = parts[0]
+                    break
+    if value is None:
+        raise WorktreeError(f"branch {branch!r} not found in {bare_path}")
+    if not _HEX_SHA.match(value):
+        raise PushRefusedError(
+            f"push refused: {ref} does not hold a plain commit id"
+        )
+    return value
+
+
+def _relay_push_gitconfig() -> str:
+    """The whole global config a credentialed push sees: one helper.
+
+    ``gh auth git-credential`` hands git the relay's own gh login, the
+    same one every other GitHub call the relay makes uses.
+    """
+    from ctrlrelay.core.github import _find_gh
+
+    gh = _find_gh().replace("\\", "\\\\").replace('"', '\\"')
+    return (
+        '[credential "https://github.com"]\n'
+        f'\thelper = "!\\"{gh}\\" auth git-credential"\n'
+    )
+
+
+def _relay_git_env(global_config: Path) -> dict[str, str]:
+    """Environment for a credentialed git call: no inherited GIT_* at
+    all (GIT_DIR, GIT_CONFIG_*, GIT_SSH_COMMAND, ...), no system config,
+    and the global config replaced by ``global_config``."""
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith("GIT_")
+    }
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = str(global_config)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 @dataclass
 class WorktreeManager:
     """Manages git worktrees for session isolation."""
@@ -123,6 +261,7 @@ class WorktreeManager:
         timeout: int | None = None,
         tolerate_non_fast_forward: bool = False,
         protected_refs: frozenset[str] = frozenset(),
+        env: dict[str, str] | None = None,
     ) -> str:
         """Run git command and return stdout. `timeout` overrides self.timeout
         for one call — useful for cheap probes that shouldn't inherit the full
@@ -143,6 +282,7 @@ class WorktreeManager:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=cwd,
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -830,9 +970,155 @@ class WorktreeManager:
         # Each line starts with "+" (unique) or "-" (patch-equivalent in upstream).
         return all(line.startswith("-") for line in lines)
 
-    async def push_branch(self, worktree_path: Path, branch: str) -> None:
-        """Push a branch to origin."""
-        await self._run_git("push", "-u", "origin", branch, cwd=worktree_path)
+    async def push_run_branch(
+        self,
+        repo: str,
+        branch: str,
+        *,
+        run_branch: str,
+        default_branch: str,
+        expected_remote_sha: str | None,
+        relay_pushed_shas: frozenset[str],
+        session_id: str | None = None,
+    ) -> str:
+        """Push this run's branch to GitHub with the relay's credentials.
+
+        The only push the relay makes on an agent's behalf (#219):
+
+        - :func:`check_push_target` refuses ``main``, ``master``, the
+          default branch and anything that is not ``run_branch``.
+        - The branch must carry at least one commit the default branch
+          does not, or there is nothing to open a pull request for.
+        - The pushed object is the SHA read once here, not a ref name.
+        - The remote is an explicit URL built from the validated repo
+          name, never ``origin``, and the push runs from a fresh git dir
+          created for this one push in a relay directory. Its config is
+          written here, system config is off, the global config is a
+          file written here holding only the credential helper, no
+          ``GIT_*`` variable is inherited, and hooks and fsmonitor are
+          off on the command line.
+        - The bare clone's config is never read: its config is shared
+          with every worktree cut from it, so the agent can write it.
+          The two branch heads are read from its ref files as data, and
+          its objects are borrowed through ``objects/info/alternates``.
+        - Lease: ``expected_remote_sha`` is what this session pushed
+          last. When it is None, a branch that does not exist on GitHub
+          is created; one that does is pushed over only if its head is
+          a SHA in ``relay_pushed_shas`` (ctrlrelay put it there), and
+          refused otherwise rather than overwritten.
+
+        What this does NOT guarantee: the agent runs as the same OS user,
+        so a deliberately hostile agent can read credential files, and
+        can write to the relay's push directory, the bare clone's object
+        store and any alternates chain it adds there, racing this push.
+        That boundary needs a separate user or a read-only home (#236).
+
+        Returns the SHA pushed.
+        """
+        from ctrlrelay.core.publish import (
+            PushRefusedError,
+            check_push_target,
+            github_push_url,
+        )
+
+        check_push_target(
+            branch,
+            run_branch=run_branch,
+            default_branch=default_branch,
+            repo=repo,
+            session_id=session_id,
+        )
+        url = github_push_url(repo)
+        bare_path = self._get_bare_repo_path(repo)
+        sha = _read_branch_head(bare_path, branch)
+        base_sha = _read_branch_head(bare_path, default_branch)
+        push_root = self.bare_repos_dir.parent / "push"
+        push_root.mkdir(parents=True, exist_ok=True)
+        push_root.chmod(0o700)
+        workdir = Path(tempfile.mkdtemp(prefix="push-", dir=push_root))
+        try:
+            gitdir = workdir / "repo.git"
+            global_cfg = workdir / "gitconfig"
+            global_cfg.write_text(_relay_push_gitconfig())
+            env = _relay_git_env(global_cfg)
+
+            def git(*args: str) -> list[str]:
+                return ["--git-dir", str(gitdir), *_RELAY_GIT_FLAGS, *args]
+
+            await self._run_git("init", "-q", "--bare", str(gitdir), env=env)
+            (gitdir / "objects" / "info" / "alternates").write_text(
+                str((bare_path / "objects").resolve()) + "\n"
+            )
+            for value in (sha, base_sha):
+                await self._run_git(
+                    *git("rev-parse", "--verify", "--quiet",
+                         "--end-of-options", f"{value}^{{commit}}"),
+                    env=env,
+                )
+            ahead = (
+                await self._run_git(
+                    *git("rev-list", "--count", f"{base_sha}..{sha}"), env=env,
+                )
+            ).strip()
+            if ahead == "0":
+                log_event(
+                    _logger,
+                    "publish.push.nothing_to_push",
+                    repo=repo,
+                    session_id=session_id,
+                    branch=branch,
+                )
+                raise PushRefusedError(
+                    f"push refused: {branch!r} has no commits that "
+                    f"{default_branch!r} does not already have; the agent "
+                    f"must commit its work on {branch!r}"
+                )
+            if expected_remote_sha is None:
+                out = await self._run_git(
+                    *git("ls-remote", "--heads", url, f"refs/heads/{branch}"),
+                    env=env,
+                    timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+                )
+                remote = out.split()[0] if out.strip() else ""
+                if remote and remote not in relay_pushed_shas:
+                    _logger.error(
+                        "publish.push.refused",
+                        extra={
+                            "repo": repo,
+                            "session_id": session_id,
+                            "branch": branch,
+                            "remote_sha": remote,
+                            "reason": "remote branch not pushed by ctrlrelay",
+                        },
+                    )
+                    raise PushRefusedError(
+                        f"push refused: {branch!r} already exists on GitHub "
+                        f"at {remote[:12]}, which ctrlrelay did not push; "
+                        "not overwriting it"
+                    )
+                expected_remote_sha = remote
+            await self._run_git(
+                *git(
+                    "push", "--no-verify", "--porcelain",
+                    f"--force-with-lease=refs/heads/{branch}:"
+                    f"{expected_remote_sha}",
+                    url, f"{sha}:refs/heads/{branch}",
+                ),
+                env=env,
+                timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+            )
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        log_event(
+            _logger,
+            "publish.push.done",
+            repo=repo,
+            session_id=session_id,
+            branch=branch,
+            sha=sha,
+            commits_ahead=ahead,
+        )
+        return sha
 
     async def ensure_bare_repo(self, repo: str) -> Path:
         """Ensure bare repo exists, cloning if needed.
