@@ -187,6 +187,69 @@ def _digest(path: Path) -> dict[str, str | None]:
 # --- the page -----------------------------------------------------------------
 
 
+def _js_function(script: str, name: str) -> str:
+    """The body of ``function <name>(...) {...}``, braces matched past string
+    literals and comments. Raises when the function is missing, so a rename
+    fails loudly instead of handing back an empty body."""
+    m = re.search(r"\bfunction\s+" + re.escape(name) + r"\s*\([^)]*\)\s*\{", script)
+    if m is None:
+        raise AssertionError(f"function {name} not found in the page")
+    i, depth = m.end(), 1
+    while depth:
+        if i >= len(script):
+            raise AssertionError(f"function {name} never closes")
+        ch = script[i]
+        if ch in "\"'":
+            j = i + 1
+            while script[j] != ch:
+                j += 2 if script[j] == "\\" else 1
+            i = j + 1
+            continue
+        if script.startswith("//", i):
+            i = script.index("\n", i)
+            continue
+        if script.startswith("/*", i):
+            i = script.index("*/", i) + 2
+            continue
+        depth += {"{": 1, "}": -1}.get(ch, 0)
+        i += 1
+    return script[m.end(): i - 1]
+
+
+def _script() -> str:
+    return "\n".join(re.findall(r"<script>(.*?)</script>", _page_source(), re.S))
+
+
+def test_null_section_counts_read_unknown() -> None:
+    """A section the server could not read is null, and its count in the
+    heading must say "unknown", never blank and never 0. Every count is
+    written by setCount; setCount writes "unknown" for anything that is not
+    a number; each renderer passes null on its unreadable path."""
+    script = _script()
+    set_count = _js_function(script, "setCount")
+    assert re.fullmatch(
+        r'\s*document\.getElementById\(id\)\.textContent\s*=\s*'
+        r'typeof value === "number" \? String\(value\) : "unknown";\s*',
+        set_count,
+    ), set_count
+    for renderer, count_id in (("renderRunning", "running-count"),
+                               ("renderNeeds", "needs-count"),
+                               ("renderWaiting", "waiting-count")):
+        body = _js_function(script, renderer)
+        calls = re.findall(r'setCount\("' + count_id + r'",\s*([^;]*)\);', body)
+        assert calls, (renderer, "never sets its count")
+        assert any(c.strip() == "null" for c in calls), (renderer, calls)
+    # Nothing but setCount writes a count element: every mention of a
+    # count id in the script is the first argument of a setCount call.
+    for count_id in ("running-count", "needs-count", "waiting-count"):
+        mentions = script.count(f'"{count_id}"')
+        assert mentions >= 2, count_id
+        assert script.count(f'setCount("{count_id}",') == mentions, count_id
+    # Today: a count that is not a number is drawn as "unknown".
+    today = _js_function(script, "renderToday")
+    assert re.search(r'else\s*\{\s*cell\.appendChild\(el\("div", "n unknown", "unknown"\)\)', today)
+
+
 def _page_source() -> str:
     return (
         resources.files("ctrlrelay.web").joinpath("static/index.html")
@@ -239,10 +302,12 @@ def test_index_carries_refresh_seconds(tmp_path: Path, serve) -> None:
     assert re.search(r'data-refresh-seconds="7"', body.decode())
 
 
-def test_page_escapes_titles_and_commands() -> None:
-    """Titles come from GitHub, where anyone can file on a public repo, and
-    the last command can carry a file name. The page builds every node with
-    textContent/createElement; nothing in it parses a string as HTML."""
+def test_page_source_has_no_html_parsing_dom_sinks() -> None:
+    """A source scan, not a rendering test: the page file contains none of
+    the DOM APIs that parse a string as HTML. Titles come from GitHub, where
+    anyone can file on a public repo, so the page must build every node with
+    textContent/createElement. That the hostile values reach the JSON as
+    plain strings is test_api_status_contract."""
     html = _page_source()
     script = "\n".join(re.findall(r"<script>(.*?)</script>", html, re.S))
     # Present case: the page really does build its DOM in this script.
@@ -560,7 +625,47 @@ def test_web_start_refuses_when_already_running(tmp_path: Path) -> None:
     assert pid_file.read_text() == str(os.getppid())
 
 
-def test_web_status_reads_the_pid_file_next_to_state_db(tmp_path: Path) -> None:
+def _kills(monkeypatch) -> list[tuple[int, int]]:
+    """Record os.kill instead of sending anything, so a regression that
+    signals pid 0 or this process cannot take the test run down with it.
+    Every pid answers as alive."""
+    import os
+
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: calls.append((pid, sig)))
+    return calls
+
+
+@pytest.mark.parametrize("pid", ["0", "-5", "1", "self"])
+def test_web_stop_never_signals_a_process_that_is_not_ours(
+    tmp_path: Path, monkeypatch, pid: str,
+) -> None:
+    import os
+    import signal
+
+    from typer.testing import CliRunner
+
+    from ctrlrelay.cli import app
+
+    cfg = _write_config(tmp_path)
+    pid_file = tmp_path / "run" / "web.pid"
+    pid_file.parent.mkdir()
+    # "self" is this pytest process: its command line names this test
+    # file and this checkout, so a substring match would call it ours.
+    pid_file.write_text(str(os.getpid()) if pid == "self" else pid)
+    calls = _kills(monkeypatch)
+
+    result = CliRunner().invoke(app, ["web", "stop", "-c", str(cfg)])
+
+    assert [c for c in calls if c[1] == signal.SIGTERM] == []
+    assert not pid_file.exists()
+    assert "stale pid file" in result.output.lower()
+
+
+@pytest.mark.parametrize("pid", ["0", "-5", "self"])
+def test_web_status_does_not_report_a_process_that_is_not_ours(
+    tmp_path: Path, monkeypatch, pid: str,
+) -> None:
     import os
 
     from typer.testing import CliRunner
@@ -568,13 +673,80 @@ def test_web_status_reads_the_pid_file_next_to_state_db(tmp_path: Path) -> None:
     from ctrlrelay.cli import app
 
     cfg = _write_config(tmp_path)
+    pid_file = tmp_path / "run" / "web.pid"
+    pid_file.parent.mkdir()
+    pid_file.write_text(str(os.getpid()) if pid == "self" else pid)
+    _kills(monkeypatch)
+
+    result = CliRunner().invoke(app, ["web", "status", "-c", str(cfg)])
+
+    assert result.exit_code == 1
+    assert "running (PID" not in result.output
+    assert "stale pid file" in result.output.lower()
+    assert not pid_file.exists()
+
+
+@pytest.fixture
+def live_web(tmp_path: Path) -> Iterator[tuple[Path, object]]:
+    """A real `ctrlrelay web start -F`, with no `gh` on its PATH so it never
+    reaches GitHub (the waiting line is simply unknown)."""
+    import os
+    import subprocess
+    import sys
+
+    cfg = _write_config(tmp_path)
+    env = {**os.environ, "PATH": os.path.dirname(sys.executable)}
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "ctrlrelay.cli", "web", "start", "-F", "-c", str(cfg)],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    pid_file = tmp_path / "run" / "web.pid"
+    try:
+        assert _wait_for(
+            lambda: pid_file.exists() and pid_file.read_text().strip() == str(proc.pid),
+            timeout=20,
+        ), "web start never wrote its pid"
+        yield cfg, proc
+    finally:
+        if proc.poll() is None:
+            proc.kill()  # only the process this fixture started
+        proc.wait(timeout=10)
+
+
+def test_web_status_and_stop_act_on_a_live_web_process(live_web, tmp_path: Path) -> None:
+    import signal
+
+    from typer.testing import CliRunner
+
+    from ctrlrelay.cli import app
+
+    cfg, proc = live_web
     runner = CliRunner()
-    assert runner.invoke(app, ["web", "status", "-c", str(cfg)]).exit_code == 1
-    (tmp_path / "run").mkdir()
-    (tmp_path / "run" / "web.pid").write_text(str(os.getppid()))
-    result = runner.invoke(app, ["web", "status", "-c", str(cfg)])
-    assert result.exit_code == 0
-    assert str(os.getppid()) in result.output
+
+    status = runner.invoke(app, ["web", "status", "-c", str(cfg)])
+    assert status.exit_code == 0
+    assert f"running (PID {proc.pid})" in status.output
+
+    stop = runner.invoke(app, ["web", "stop", "-c", str(cfg)])
+    assert f"Stopped status page (PID {proc.pid})" in stop.output
+    assert proc.wait(timeout=10) in (0, -signal.SIGTERM)
+    assert not (tmp_path / "run" / "web.pid").exists()
+
+
+@pytest.mark.parametrize("proc_root", ["/proc", "missing"])
+def test_web_process_check_by_command_line(live_web, tmp_path: Path, proc_root: str) -> None:
+    """Both ways of reading a command line: /proc on Linux, `ps` elsewhere."""
+    import os
+
+    from ctrlrelay.cli import _is_our_web_process
+
+    _, proc = live_web
+    root = Path(proc_root) if proc_root == "/proc" else tmp_path / "no-proc"
+    assert _is_our_web_process(proc.pid, proc_root=root) is True
+    assert _is_our_web_process(os.getpid(), proc_root=root) is False
+    assert _is_our_web_process(os.getppid(), proc_root=root) is False
+    for pid in (0, -1, 1):
+        assert _is_our_web_process(pid, proc_root=root) is False
 
 
 # --- Host header (DNS rebinding) ------------------------------------------------------

@@ -3682,6 +3682,64 @@ def _get_web_pid_file(config_path: str | None) -> Path:
     return Path("~/.ctrlrelay/web.pid").expanduser().resolve()
 
 
+def _process_command_line(pid: int, proc_root: Path) -> list[str] | None:
+    """``pid``'s argv: from ``<proc_root>/<pid>/cmdline`` when that tree
+    exists (Linux), else from ``ps -o command=`` (split on whitespace, so a
+    path with a space is cut up; good enough to find the subcommand).
+    ``None`` when it cannot be read, which callers treat as "not ours"."""
+    import subprocess
+
+    if proc_root.is_dir():
+        try:
+            raw = (proc_root / str(pid) / "cmdline").read_bytes()
+        except OSError:
+            return None
+        return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.split()
+
+
+def _is_our_web_process(pid: int, *, proc_root: Path = Path("/proc")) -> bool:
+    """Whether ``pid`` is a running ``ctrlrelay web start``.
+
+    A PID file outlives its process, and the PID is then reused by
+    something else: signalling it would stop an unrelated program, and
+    ``pid <= 0`` would signal a whole process group. So the PID must be
+    above 1 and its command line must be ctrlrelay (the console script, or
+    ``python -m ctrlrelay.cli``) followed by ``web start``. A substring
+    test is not enough: a test run from a checkout named ctrlrelay, on a
+    file named test_web_server.py, contains both words."""
+    import os
+
+    if pid <= 1:
+        return False
+    args = _process_command_line(pid, proc_root)
+    if not args:
+        return False
+    for i, arg in enumerate(args):
+        entry = os.path.basename(arg) == "ctrlrelay" or (
+            arg == "ctrlrelay.cli" and i > 0 and args[i - 1] == "-m"
+        )
+        if entry and args[i + 1:i + 3] == ["web", "start"]:
+            return True
+    return False
+
+
+def _read_web_pid(pid_file: Path) -> int | None:
+    try:
+        return int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 @web_app.command("start")
 def web_start(
     config_path: str | None = typer.Option(
@@ -3700,7 +3758,8 @@ def web_start(
     """Serve the read-only status page on web.host:web.port.
 
     Reads state.db read-only, the agents' transcripts, and GitHub through
-    `gh` (one search a minute). Never writes anything but its PID file.
+    `gh` (one search a minute). Never writes the database or GitHub;
+    writes only its PID file and its logs.
     """
     import os
     import signal
@@ -3802,7 +3861,11 @@ def web_stop(
         help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
 ) -> None:
-    """Stop the status page."""
+    """Stop the status page.
+
+    Signals only a process whose command line is `ctrlrelay web start`. A
+    PID file naming anything else is stale: it is removed, and nothing is
+    signalled."""
     import os
     import signal
 
@@ -3810,14 +3873,20 @@ def web_stop(
     if not pid_file.exists():
         console.print("[yellow]Status page not running (no PID file)[/yellow]")
         return
+    pid = _read_web_pid(pid_file)
+    if pid is None or not _is_our_web_process(pid):
+        console.print(
+            f"[yellow]Status page not running: stale PID file {pid_file} "
+            f"(PID {pid if pid is not None else 'unreadable'} is not "
+            "`ctrlrelay web start`); removed it, signalled nothing[/yellow]"
+        )
+        pid_file.unlink(missing_ok=True)
+        return
     try:
-        pid = int(pid_file.read_text().strip())
         os.kill(pid, signal.SIGTERM)
         console.print(f"[green]Stopped status page (PID {pid})[/green]")
     except ProcessLookupError:
         console.print("[yellow]Status page process not found[/yellow]")
-    except ValueError:
-        console.print("[red]Invalid PID file[/red]")
     pid_file.unlink(missing_ok=True)
 
 
@@ -3831,17 +3900,18 @@ def web_status(
     ),
 ) -> None:
     """Check whether the status page is running."""
-    import os
-
     pid_file = _get_web_pid_file(config_path)
     if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
+        pid = _read_web_pid(pid_file)
+        if pid is not None and _is_our_web_process(pid):
             console.print(f"[green]Status page running (PID {pid})[/green]")
             return
-        except (ProcessLookupError, ValueError):
-            pass
+        console.print(
+            f"[yellow]Stale PID file {pid_file} "
+            f"(PID {pid if pid is not None else 'unreadable'} is not "
+            "`ctrlrelay web start`); removed it[/yellow]"
+        )
+        pid_file.unlink(missing_ok=True)
     console.print("[dim]Status page not running[/dim]")
     raise typer.Exit(1)
 

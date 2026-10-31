@@ -170,6 +170,12 @@ function put(parent, children) {
   for (var i = 0; i < children.length; i++) { parent.appendChild(children[i]); }
 }
 
+// A section count: a number, or "unknown" when the section is null (the
+// server could not read it). Never blank, which would read as "nothing".
+function setCount(id, value) {
+  document.getElementById(id).textContent = typeof value === "number" ? String(value) : "unknown";
+}
+
 function unknown(text) { return el("p", "unknown", text); }
 function empty(text) { return el("p", "empty", text); }
 
@@ -262,13 +268,12 @@ function runningCard(card, now) {
 
 function renderRunning(data, now) {
   var target = document.getElementById("running");
-  var count = document.getElementById("running-count");
   if (!Array.isArray(data.running)) {
-    count.textContent = "";
+    setCount("running-count", null);
     put(target, [unknown("unknown: running sessions could not be read")]);
     return;
   }
-  count.textContent = String(data.running.length);
+  setCount("running-count", data.running.length);
   if (data.running.length === 0) { put(target, [empty("nothing running")]); return; }
   put(target, data.running.map(function (c) { return runningCard(c, now); }));
 }
@@ -285,13 +290,12 @@ function renderBusy(data) {
 
 function renderNeeds(data, now) {
   var target = document.getElementById("needs");
-  var count = document.getElementById("needs-count");
   if (!Array.isArray(data.needs_you)) {
-    count.textContent = "";
+    setCount("needs-count", null);
     put(target, [unknown("unknown: questions could not be read")]);
     return;
   }
-  count.textContent = String(data.needs_you.length);
+  setCount("needs-count", data.needs_you.length);
   if (data.needs_you.length === 0) { put(target, [empty("no open questions")]); return; }
   put(target, data.needs_you.map(function (q) {
     var box = el("div", "card");
@@ -315,11 +319,10 @@ function renderNeeds(data, now) {
 
 function renderWaiting(data) {
   var target = document.getElementById("waiting");
-  var count = document.getElementById("waiting-count");
   var w = data.waiting;
   var nodes = [];
   if (!w || typeof w !== "object" || !Array.isArray(w.items)) {
-    count.textContent = "";
+    setCount("waiting-count", null);
     put(target, [unknown("unknown: the waiting line is not available")]);
     return;
   }
@@ -333,7 +336,7 @@ function renderWaiting(data) {
   } else {
     nodes.push(el("p", "muted", "checked " + clock(w.checked_ts)));
   }
-  count.textContent = ok ? String(w.items.length) : "";
+  setCount("waiting-count", ok ? w.items.length : null);
   if (w.items.length === 0) {
     if (ok) { nodes.push(empty("nothing waiting")); }
   } else {
