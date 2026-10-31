@@ -977,6 +977,7 @@ def test_every_href_goes_through_one_helper() -> None:
     for renderer in ("runningCard", "renderNeeds", "renderWaiting", "renderSkipped",
                      "renderFeed"):
         assert "ghLink(" in _js_function(script, renderer), renderer
+    assert "questionParts(" in _js_function(script, "renderNeeds")
 
 
 def test_no_server_value_reaches_html_parsing() -> None:
@@ -1109,3 +1110,31 @@ def test_phase_label_names_only_known_phases(phase, label) -> None:
     done = subprocess.run([node, "-e", program], capture_output=True, text=True,
                           timeout=30, check=True)
     assert json.loads(done.stdout) == label
+
+
+def test_question_numbers_become_links_only_when_the_server_sent_one() -> None:
+    """#241: the page links a #N in a question only to the URL the server
+    built for that N. A number with no ref, an entity and a path stay text."""
+    refs = [{"number": 8, "url": "https://github.com/o/r/issues/8"},
+            {"number": 7, "url": "https://github.com/o/r/issues/7"}]
+    text = "Approve #8 and #7? Not #3, &#8 or a/#7. Again #8."
+    parts = _run_js(["questionParts"],
+                    f"questionParts({json.dumps(text)}, {json.dumps(refs)})")
+    assert parts == [
+        {"text": "Approve ", "url": None},
+        {"text": "#8", "url": "https://github.com/o/r/issues/8"},
+        {"text": " and ", "url": None},
+        {"text": "#7", "url": "https://github.com/o/r/issues/7"},
+        {"text": "? Not #3, &#8 or a/#7. Again ", "url": None},
+        {"text": "#8", "url": "https://github.com/o/r/issues/8"},
+        {"text": ".", "url": None},
+    ]
+    assert "".join(p["text"] for p in parts) == text
+
+
+@pytest.mark.parametrize("refs", [None, [], "x", [{"number": "8", "url": "u"}]])
+def test_question_with_no_usable_refs_is_one_text_part(refs: object) -> None:
+    text = "Approve #8?"
+    parts = _run_js(["questionParts"],
+                    f"questionParts({json.dumps(text)}, {json.dumps(refs)})")
+    assert parts == [{"text": text, "url": None}]

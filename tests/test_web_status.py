@@ -66,7 +66,7 @@ RUNNING_KEYS = {
 }
 NEEDS_KEYS = {
     "session_id", "pipeline", "repo", "issue_number", "title", "question",
-    "asked", "asked_ts", "held_until", "held_until_ts", "url",
+    "asked", "asked_ts", "held_until", "held_until_ts", "url", "refs",
 }
 TODAY_KEYS = {"dispatched", "pr_opened", "merged", "failed", "blocked", "messages_sent"}
 FEED_KEYS = {"ts", "time", "kind", "repo", "issue_number", "session_id", "detail",
@@ -1423,3 +1423,35 @@ def test_a_finished_ci_with_no_transcript_has_no_current_activity(tmp_path: Path
     assert card["phase"] == "ci"
     assert card["current_activity"] == "unknown"
     assert card["phase_source"] == "none"
+
+
+def test_needs_you_links_each_number_its_question_names(tmp_path: Path) -> None:
+    """#241: a secops question has no issue, so the PRs it asks about are
+    only named in its text. Each #N gets a link built from the repo and N,
+    once, in order; an HTML entity or a path fragment is not a reference."""
+    db = _db(tmp_path)
+    db.add_pending_resume(
+        "s-sec", "secops", BETA,
+        "Approve merging #8 and #7? Not &#9 or a/#5. Again #8, then (#12).",
+    )
+    db.add_pending_resume("s-none", "secops", BETA, "Nothing to approve here.")
+
+    out = _status(tmp_path, 2_000)
+
+    assert _only(out["needs_you"], "s-sec")["refs"] == [
+        {"number": 8, "url": f"https://github.com/{BETA}/issues/8"},
+        {"number": 7, "url": f"https://github.com/{BETA}/issues/7"},
+        {"number": 12, "url": f"https://github.com/{BETA}/issues/12"},
+    ]
+    assert _only(out["needs_you"], "s-none")["refs"] == []
+
+
+def test_needs_you_refs_are_empty_for_a_repo_that_cannot_be_linked(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    db.add_pending_resume("s-bad", "secops", "not-a-repo", "Approve #4?")
+
+    out = _status(tmp_path, 2_000)
+
+    assert _only(out["needs_you"], "s-bad")["refs"] == []
