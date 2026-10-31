@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 import uuid
@@ -176,6 +177,20 @@ CREATE INDEX IF NOT EXISTS idx_pending_resumes_answered_unresumed
 -- The repeat lookup reads one repo's history on every posted question.
 CREATE INDEX IF NOT EXISTS idx_pending_resumes_repo_created
     ON pending_resumes(repo, created_at);
+
+-- Feed for the status page. Written best-effort by the daemon through
+-- ctrlrelay.core.events.emit_event; a failed write never affects the work.
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    repo TEXT,
+    issue_number INTEGER,
+    session_id TEXT,
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, ts);
 """
 
 
@@ -197,6 +212,12 @@ class StateDB:
 
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
+        # WAL lets the read-only status page read while the poller and
+        # bridge write. The mode is stored in the file, so this is a no-op
+        # after the first open. busy_timeout makes a briefly contended
+        # write wait instead of failing at once.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._conn.commit()
@@ -1165,6 +1186,64 @@ class StateDB:
             "SELECT * FROM pr_watches ORDER BY started_at ASC"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # Events (status page feed)
+
+    def record_event(
+        self,
+        kind: str,
+        *,
+        repo: str | None = None,
+        issue_number: int | None = None,
+        session_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+        ts: int | None = None,
+    ) -> None:
+        """Append one row to the events feed and commit.
+
+        Callers in the daemon go through ``events.emit_event``, which
+        swallows any failure; this method itself raises.
+        """
+        self._conn.execute(
+            """INSERT INTO events
+               (ts, kind, repo, issue_number, session_id, detail)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                int(time.time()) if ts is None else int(ts),
+                str(kind),
+                repo,
+                issue_number,
+                session_id,
+                None if detail is None else json.dumps(detail),
+            ),
+        )
+        self._conn.commit()
+
+    def list_events(
+        self, *, since_ts: int = 0, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Return events with ``ts >= since_ts``, newest first, at most
+        ``limit`` rows. ``detail`` is decoded from JSON (None if absent)."""
+        rows = self._conn.execute(
+            """SELECT * FROM events WHERE ts >= ?
+               ORDER BY ts DESC, id DESC LIMIT ?""",
+            (int(since_ts), int(limit)),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw = item.get("detail")
+            item["detail"] = None if raw is None else json.loads(raw)
+            out.append(item)
+        return out
+
+    def prune_events(self, older_than_ts: int) -> int:
+        """Delete events with ``ts < older_than_ts``; return rows deleted."""
+        cursor = self._conn.execute(
+            "DELETE FROM events WHERE ts < ?", (int(older_than_ts),)
+        )
+        self._conn.commit()
+        return cursor.rowcount
 
     # Valid post-merge cleanup phases, in monotonic progression. Each
     # phase stamps *after* its side effect has succeeded, so if the
