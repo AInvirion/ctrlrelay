@@ -7,14 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-30
+
+New database columns and one new config value. All of them are added
+automatically and have defaults, so **no config edit is required**.
+
+### Added
+
+- A re-asked question says so: "Repeat: asked N times before, last on
+  <date> UTC, no answer yet" (#213, closes #200)
+- Finished questions older than 90 days are pruned from `pending_resumes`.
+  Open ones are always kept. New config value `question_retention_days`,
+  default 90 (#213, closes #200)
+
 ### Changed
 
-- The scheduled secops sweep holds back a question nobody answered, posting it again after 1, 2, 4, then 7 days (#214)
-- A reply to an earlier post of a question whose session expired unanswered goes to the newest open session asking the same thing in that repo, instead of being refused (#214)
+- The scheduled secops sweep holds back a question nobody answered, posting it again after 1, 2, 4, then 7 days (#215, closes #214)
+- A reply to an earlier post of a question whose session expired unanswered goes to the newest open session asking the same thing in that repo, instead of being refused (#215, closes #214)
+- The relay-health alert is sent in the background instead of while the per-repository lock is held, so a stuck chat bridge no longer slows down every repo in a sweep (#212, closes #208)
 
 ### Fixed
 
-- A secops repo that failed after its result was recorded no longer adds a second result, which paired every later repo's notification with its neighbour's result (#214)
+- A state file path with an apostrophe, a trailing newline in a folder name, or a leading dash broke every checkpoint snippet, so the agent looked crashed (#211, closes #191)
+- A secops repo that failed after its result was recorded no longer adds a second result, which paired every later repo's notification with its neighbour's result (#215)
 
 ## [0.12.4] - 2026-10-18
 
@@ -1756,7 +1771,9 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.3...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.4...v0.13.0
+[0.12.4]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.2...v0.12.4
 [0.12.3]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.0...v0.12.1
