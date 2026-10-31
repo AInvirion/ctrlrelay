@@ -182,6 +182,20 @@ CREATE INDEX IF NOT EXISTS idx_pending_resumes_answered_unresumed
 CREATE INDEX IF NOT EXISTS idx_pending_resumes_repo_created
     ON pending_resumes(repo, created_at);
 
+-- Every branch head ctrlrelay itself pushed for an agent (#219). The
+-- push lease is taken from here, so a remote branch ctrlrelay did not
+-- put there is refused rather than force-pushed over.
+CREATE TABLE IF NOT EXISTS relay_pushes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    pushed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_relay_pushes_branch
+    ON relay_pushes(repo, branch, id);
+
 -- Feed for the status page. Written best-effort by the daemon through
 -- ctrlrelay.core.events.emit_event; a failed write never affects the work.
 CREATE TABLE IF NOT EXISTS events (
@@ -196,19 +210,6 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, ts);
 
--- Every branch head ctrlrelay itself pushed for an agent (#219). The
--- push lease is taken from here, so a remote branch ctrlrelay did not
--- put there is refused rather than force-pushed over.
-CREATE TABLE IF NOT EXISTS relay_pushes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo TEXT NOT NULL,
-    branch TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    sha TEXT NOT NULL,
-    pushed_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_relay_pushes_branch
-    ON relay_pushes(repo, branch, id);
 """
 
 

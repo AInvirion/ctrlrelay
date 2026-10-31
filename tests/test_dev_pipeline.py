@@ -160,6 +160,7 @@ class TestDevPipeline:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -422,6 +423,7 @@ class TestDevPipeline:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -493,6 +495,7 @@ class TestDevPipeline:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -624,6 +627,7 @@ class TestRunDevIssueVerification:
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -668,6 +672,7 @@ class TestRunDevIssueVerification:
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -720,6 +725,7 @@ class TestRunDevIssueVerification:
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -808,6 +814,7 @@ class TestRunDevIssueVerification:
         mock_dispatcher.spawn_session.side_effect = [blocked, done]
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "wt", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -887,6 +894,7 @@ class TestRunDevIssueVerification:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "wt", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -944,6 +952,7 @@ class TestRunDevIssueVerification:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "wt", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -1016,6 +1025,7 @@ class TestRunDevIssueVerification:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -1071,6 +1081,7 @@ class TestRunDevIssueVerification:
         mock_dispatcher.spawn_session.return_value = self._make_done_state(pr_number=42)
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (tmp_path / "worktree", True)
         mock_worktree.symlink_context = MagicMock()
         mock_worktree.remove_context_symlink = MagicMock()
@@ -1151,6 +1162,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (
             tmp_path / "worktree", True,
         )
@@ -1243,6 +1255,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         mock_dispatcher.spawn_session.return_value = done_state
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (
             tmp_path / "worktree", True,
         )
@@ -1356,6 +1369,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (
             tmp_path / "worktree", True,
         )
@@ -1468,6 +1482,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         )
 
         mock_worktree = AsyncMock()
+        mock_worktree.push_run_branch.return_value = "c0ffee"
         mock_worktree.create_worktree_with_new_branch.return_value = (
             tmp_path / "worktree", True,
         )
