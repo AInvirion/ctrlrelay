@@ -9,16 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.15.0] - 2026-10-31
 
-The dev and task agents no longer get GitHub credentials in their
-environment; ctrlrelay does the pushing, PR opening and commenting itself
+The dev and task agents no longer inherit the usual GitHub credentials;
+ctrlrelay does the pushing, PR opening and commenting itself
 after the agent exits. One new
 database table is added automatically and the new config values have
 defaults, so **no config edit is required** to upgrade.
 
 ### Changed
 
-- Dev and task agents run with the `GH_*` and `GITHUB_*` variables and
-  gh's login removed from their environment, git credential helpers and
+- Dev and task agents run with inherited `GH_*` and `GITHUB_*` variables
+  and gh's login removed from their environment, git credential helpers and
   git's SSH disabled, and the D-Bus and runtime-dir variables pointed away
   from the desktop keyring. After the agent exits the
   relay pushes the run branch from a relay-private git dir to an explicit
