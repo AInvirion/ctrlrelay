@@ -638,25 +638,6 @@ def _write_config(tmp_path: Path) -> Path:
     return path
 
 
-def test_web_start_refuses_when_already_running(tmp_path: Path) -> None:
-    import os
-
-    from typer.testing import CliRunner
-
-    from ctrlrelay.cli import app
-
-    cfg = _write_config(tmp_path)
-    pid_file = tmp_path / "run" / "web.pid"
-    pid_file.parent.mkdir()
-    pid_file.write_text(str(os.getppid()))  # alive, and not this process
-
-    result = CliRunner().invoke(app, ["web", "start", "-F", "-c", str(cfg)])
-
-    assert result.exit_code == 1
-    assert "already running" in result.output
-    assert pid_file.read_text() == str(os.getppid())
-
-
 def _kills(monkeypatch) -> list[tuple[int, int]]:
     """Record os.kill instead of sending anything, so a regression that
     signals pid 0 or this process cannot take the test run down with it.
@@ -743,6 +724,60 @@ def live_web(tmp_path: Path) -> Iterator[tuple[Path, object]]:
         if proc.poll() is None:
             proc.kill()  # only the process this fixture started
         proc.wait(timeout=10)
+
+
+def test_web_start_refuses_when_already_running(live_web, tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    from ctrlrelay.cli import app
+
+    cfg, proc = live_web
+    pid_file = tmp_path / "run" / "web.pid"
+
+    result = CliRunner().invoke(app, ["web", "start", "-F", "-c", str(cfg)])
+
+    assert result.exit_code == 1
+    assert f"already running (PID {proc.pid})" in result.output
+    assert pid_file.read_text() == str(proc.pid)
+    assert proc.poll() is None
+
+
+def test_web_start_replaces_a_pid_file_naming_an_unrelated_process(
+    tmp_path: Path,
+) -> None:
+    """The PID in the file is alive but is not a status page (the PID was
+    reused): the file is stale, and start proceeds."""
+    import os
+    import subprocess
+    import sys
+
+    cfg = _write_config(tmp_path)
+    pid_file = tmp_path / "run" / "web.pid"
+    pid_file.parent.mkdir()
+    unrelated = os.getppid()
+    os.kill(unrelated, 0)  # alive
+    pid_file.write_text(str(unrelated))
+
+    env = {**os.environ, "PATH": os.path.dirname(sys.executable)}
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "ctrlrelay.cli", "web", "start", "-F", "-c", str(cfg)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    try:
+        started = _wait_for(
+            lambda: proc.poll() is not None or (
+                pid_file.exists() and pid_file.read_text().strip() == str(proc.pid)
+            ),
+            timeout=20,
+        )
+        assert started and proc.poll() is None, (
+            proc.stdout.read() if proc.poll() is not None else "never wrote its pid"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()  # only the process this test started
+        proc.wait(timeout=10)
+        proc.stdout.close()
 
 
 def test_web_status_and_stop_act_on_a_live_web_process(live_web, tmp_path: Path) -> None:

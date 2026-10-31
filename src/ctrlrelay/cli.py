@@ -3775,13 +3775,18 @@ def web_start(
 
     pid_file = _get_web_pid_file(str(resolved_config))
     if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if pid != os.getpid():
-                os.kill(pid, 0)
-                console.print(f"[yellow]Status page already running (PID {pid})[/yellow]")
+        # The same ours-only check as `web stop` and `web status`: a PID
+        # that is alive but is not a status page (reused after a crash)
+        # leaves a stale file, which is removed so start can proceed.
+        # A file naming this process is the claim a daemonizing parent
+        # wrote for it, and is kept.
+        pid = _read_web_pid(pid_file)
+        if pid != os.getpid():
+            if pid is not None and _is_our_web_process(pid):
+                console.print(
+                    f"[yellow]Status page already running (PID {pid})[/yellow]"
+                )
                 raise typer.Exit(1)
-        except (ProcessLookupError, ValueError):
             pid_file.unlink(missing_ok=True)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
 
