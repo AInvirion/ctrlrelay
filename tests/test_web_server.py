@@ -1140,15 +1140,22 @@ def test_question_with_no_usable_refs_is_one_text_part(refs: object) -> None:
     assert parts == [{"text": text, "url": None}]
 
 
-def test_question_parts_agree_with_the_server_on_non_ascii() -> None:
-    """The server's pattern is ASCII (#241), like the page's: a non-ASCII
-    letter before #N does not hide it, and a non-ASCII digit ends N."""
-    refs = [{"number": 3, "url": "https://github.com/o/r/issues/3"},
-            {"number": 4, "url": "https://github.com/o/r/issues/4"}]
-    text = "\u00e9#3 and #4\u0663"
+@pytest.mark.parametrize(("text", "linked"), [
+    ("\u00e9#3 and #4\u0663", ["#3", "#4"]),     # non-ASCII letter before, digit after
+    ("x#3, &#4, a/#3, #3_ and (#4).", ["#4"]),  # word, entity, path, word char after
+])
+def test_page_links_exactly_the_numbers_the_server_lists(
+    text: str, linked: list[str],
+) -> None:
+    """#241: the refs come from the server's own _question_refs and the
+    page runs on them, so either pattern drifting from the other fails."""
+    from ctrlrelay.web.status import _question_refs
+
+    refs = _question_refs("o/r", text)
+    assert [f"#{r['number']}" for r in refs] == list(dict.fromkeys(linked))
     parts = _run_js(["questionParts"],
                     f"questionParts({json.dumps(text)}, {json.dumps(refs)})")
-    assert [p["text"] for p in parts if p["url"]] == ["#3", "#4"]
+    assert [p["text"] for p in parts if p["url"]] == linked
     assert "".join(p["text"] for p in parts) == text
 
 
