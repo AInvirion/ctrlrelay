@@ -18,14 +18,20 @@ Contract (keys exactly; every timestamp is ``<name>_ts`` epoch seconds plus
                   "started", "started_ts", "elapsed_s", "phase",
                   "phase_source", "last_command", "last_step", "last_step_ts",
                   "looks_stuck", "reason"}] | null,
-     "needs_you": [{"session_id", "pipeline", "repo", "question", "asked",
-                    "asked_ts", "held_until", "held_until_ts"}] | null,
+     "needs_you": [{"session_id", "pipeline", "repo", "issue_number",
+                    "title", "question", "asked", "asked_ts", "held_until",
+                    "held_until_ts"}] | null,
      "waiting": <WaitingTracker.snapshot()>,
      "today": {"dispatched", "pr_opened", "merged", "failed", "blocked",
                "messages_sent"},   # ints, or all null if unreadable
      "feed": [{"ts", "time", "kind", "repo", "issue_number", "session_id",
                "detail"}] | null,
      "errors": [str]}
+
+``issue_number`` in ``needs_you`` comes from the question's session row
+(``null`` for secops, or when the row is gone). ``title`` (running and
+needs_you) comes from the ``titles`` map, ``WaitingTracker.titles()``, keyed
+``"owner/repo#N"`` and matched case-insensitively; ``null`` when absent.
 
 Phase: while ctrlrelay itself has a CI wait or a review open for a session
 (a ``ci_started``/``review_started`` event with no later matching
@@ -41,7 +47,7 @@ import json
 import os
 import sqlite3
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
@@ -199,9 +205,11 @@ def _read_locks(conn: sqlite3.Connection) -> dict[str, str]:
 
 def _read_needs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """SELECT * FROM pending_resumes
-           WHERE answered_at IS NULL AND expired_at IS NULL
-           ORDER BY created_at ASC, session_id ASC"""
+        """SELECT pr.*, s.issue_number AS issue_number
+           FROM pending_resumes pr
+           LEFT JOIN sessions s ON s.id = pr.session_id
+           WHERE pr.answered_at IS NULL AND pr.expired_at IS NULL
+           ORDER BY pr.created_at ASC, pr.session_id ASC"""
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -303,7 +311,11 @@ def _open_phases(events: list[dict[str, Any]]) -> dict[str, Phase]:
     }
 
 
-def _titles(waiting: dict[str, Any]) -> dict[tuple[str, int], str]:
+def _titles(
+    waiting: dict[str, Any], titles: Mapping[str, str] | None,
+) -> dict[tuple[str, int], str]:
+    """(lower-cased repo, number) -> title: the waiting line's items, then
+    the tracker's unfiltered ``titles`` map over them."""
     out: dict[tuple[str, int], str] = {}
     items = waiting.get("items") if isinstance(waiting, dict) else None
     for item in items or []:
@@ -311,7 +323,26 @@ def _titles(waiting: dict[str, Any]) -> dict[tuple[str, int], str]:
             out[(str(item["repo"]).lower(), int(item["issue_number"]))] = str(item["title"])
         except (KeyError, TypeError, ValueError):
             continue
+    for key, title in (titles or {}).items():
+        repo, sep, number = str(key).rpartition("#")
+        if not sep or not isinstance(title, str) or not title:
+            continue
+        try:
+            out[(repo.lower(), int(number))] = title
+        except ValueError:
+            continue
     return out
+
+
+def _title_for(
+    titles: dict[tuple[str, int], str], repo: Any, issue: Any,
+) -> str | None:
+    if issue is None:
+        return None
+    try:
+        return titles.get((str(repo).lower(), int(issue)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _card(
@@ -348,9 +379,7 @@ def _card(
         and now - activity.last_step_ts > stale_after_s
     )
     issue = row.get("issue_number")
-    title = None
-    if issue is not None:
-        title = titles.get((str(row["repo"]).lower(), int(issue)))
+    title = _title_for(titles, row["repo"], issue)
     return {
         "session_id": sid,
         "pipeline": row["pipeline"],
@@ -370,13 +399,18 @@ def _card(
     }
 
 
-def _question(row: dict[str, Any]) -> dict[str, Any]:
+def _question(
+    row: dict[str, Any], titles: dict[tuple[str, int], str],
+) -> dict[str, Any]:
     asked = row.get("created_at")
     held = row.get("held_until")
+    issue = row.get("issue_number")
     return {
         "session_id": row["session_id"],
         "pipeline": row["pipeline"],
         "repo": row["repo"],
+        "issue_number": issue,
+        "title": _title_for(titles, row["repo"], issue),
         "question": row["question"],
         "asked": _iso(asked),
         "asked_ts": asked,
@@ -395,6 +429,7 @@ def build_status(
     stale_after_s: int = 900,
     history_days: int = 7,
     home: Path | None = None,
+    titles: Mapping[str, str] | None = None,
 ) -> dict:
     """Everything the page shows, as the documented JSON contract. Never
     raises for a database problem; see the module docstring."""
@@ -442,17 +477,17 @@ def build_status(
         pipeline_phases = (
             None if isinstance(phase_events, _Missing) else _open_phases(phase_events)
         )
+        title_map = _titles(waiting, titles)
         if not isinstance(snap["running"], _Missing):
-            titles = _titles(waiting)
             running = [
                 _card(
-                    row, now=now, pipeline_phases=pipeline_phases, titles=titles,
+                    row, now=now, pipeline_phases=pipeline_phases, titles=title_map,
                     stale_after_s=stale_after_s, home=home,
                 )
                 for row in snap["running"]
             ]
         if not isinstance(snap["needs"], _Missing):
-            needs_you = [_question(r) for r in snap["needs"]]
+            needs_you = [_question(r, title_map) for r in snap["needs"]]
         if not isinstance(snap["today"], _Missing):
             today = dict(snap["today"])
         if not isinstance(snap["feed"], _Missing):

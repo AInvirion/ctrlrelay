@@ -833,3 +833,38 @@ async def test_changed_issue_is_checked_again(tmp_path: Path) -> None:
 
     assert gh.event_calls == [(GAMMA, 366), (GAMMA, 366)]
     assert tracker.snapshot()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_titles_include_running_issues_and_survive_a_failed_refresh(
+    tmp_path: Path,
+) -> None:
+    """Titles come from the search before any filtering, so an issue that is
+    running (and so never in the waiting line) still has its title."""
+    issues = _issues()
+    running_one = next(i for i in issues if i["repo"] == BETA)
+    gh = _FakeGitHub([issues, GitHubError("gh failed: API rate limit exceeded")])
+    clock = [1_800_000_000]
+    config = _config(tmp_path, [_accepting(BETA)])
+    running = [{"session_id": "s1", "repo": BETA,
+                "issue_number": running_one["number"], "pipeline": "dev"}]
+    tracker = WaitingTracker(
+        config, gh,  # type: ignore[arg-type]
+        sessions=lambda: (running, {BETA: "s1"}),
+        clock=lambda: clock[0],
+    )
+    assert tracker.titles() == {}
+
+    await tracker.refresh()
+    key = f"{BETA}#{running_one['number']}"
+    assert key not in {
+        f"{i['repo']}#{i['issue_number']}" for i in tracker.snapshot()["items"]
+    }
+    titles = tracker.titles()
+    assert titles[key] == running_one["title"]
+    assert titles == {f"{i['repo']}#{i['number']}": i["title"] for i in issues}
+
+    clock[0] += 60
+    await tracker.refresh()
+    assert tracker.snapshot()["status"] == "unknown"
+    assert tracker.titles() == titles

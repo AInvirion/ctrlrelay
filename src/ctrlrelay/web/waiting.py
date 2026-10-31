@@ -222,6 +222,19 @@ def compute_waiting(
     return items
 
 
+def _titles_of(issues: list[dict[str, Any]]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for issue in issues:
+        try:
+            key = seen_key(str(issue["repo"]), int(issue["number"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        title = issue.get("title")
+        if isinstance(title, str) and title:
+            out[key] = title
+    return out
+
+
 def _item_dict(item: WaitingItem) -> dict[str, Any]:
     out = asdict(item)
     out["updated"] = _iso(item.updated_ts)
@@ -262,6 +275,9 @@ class WaitingTracker:
         self._assignment_cache: dict[str, tuple[bool, int, int]] = {}
         self._last_good: list[dict[str, Any]] = []
         self._last_good_ts: int | None = None
+        # "owner/repo#N" -> title, from the last search that succeeded,
+        # before any filtering: running issues are in it too.
+        self._titles: dict[str, str] = {}
         self._snapshot: dict[str, Any] = self._build(
             status="unknown", checked_ts=None, error="not checked yet",
         )
@@ -286,6 +302,7 @@ class WaitingTracker:
                 self._username = await self._github.current_login()
             username = self._username
             issues = await self._fetch(username)
+            self._titles = _titles_of(issues)
             running, locks = self._sessions()
             seen = load_seen(self._poller_state_file)
             # First pass: which items wait only on the self-assignment
@@ -395,6 +412,12 @@ class WaitingTracker:
         value = await self._poller._is_self_assigned(repo, number)
         self._assignment_cache[key] = (value, now, updated_ts)
         return value
+
+    def titles(self) -> dict[str, str]:
+        """Issue titles keyed ``"owner/repo#N"``, from the last successful
+        search (unfiltered). Empty until a search has succeeded; a failed
+        refresh keeps the previous titles."""
+        return dict(self._titles)
 
     def snapshot(self) -> dict[str, Any]:
         snap = self._snapshot

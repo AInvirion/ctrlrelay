@@ -56,8 +56,8 @@ RUNNING_KEYS = {
     "last_step", "last_step_ts", "looks_stuck", "reason",
 }
 NEEDS_KEYS = {
-    "session_id", "pipeline", "repo", "question", "asked", "asked_ts",
-    "held_until", "held_until_ts",
+    "session_id", "pipeline", "repo", "issue_number", "title", "question",
+    "asked", "asked_ts", "held_until", "held_until_ts",
 }
 TODAY_KEYS = {"dispatched", "pr_opened", "merged", "failed", "blocked", "messages_sent"}
 FEED_KEYS = {"ts", "time", "kind", "repo", "issue_number", "session_id", "detail"}
@@ -317,11 +317,30 @@ def test_title_comes_from_the_waiting_line_when_github_gave_it(tmp_path: Path) -
     assert _only(out["running"], "s2")["title"] is None
 
 
+def test_titles_map_fills_running_titles(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _session(db, "s1", issue_number=215, worktree=None, started_at=1_000)
+    _session(db, "s2", issue_number=216, worktree=None, started_at=1_000)
+    titles = {f"{ALPHA.upper()}#215": "From the last search", f"{BETA}#216": "Other repo"}
+    out = _status(tmp_path, 2_000, titles=titles)
+    # Repo names compare as GitHub does, case-insensitively.
+    assert _only(out["running"], "s1")["title"] == "From the last search"
+    # Absent from the map (only another repo's #216 is there): null.
+    assert _only(out["running"], "s2")["title"] is None
+
+
 # --- needs you ---------------------------------------------------------------
 
 
 def test_needs_you_lists_open_unanswered_questions(tmp_path: Path) -> None:
     db = _db(tmp_path)
+    _session(db, "s-open", issue_number=215, status="blocked", started_at=1_000)
+    db.execute(
+        """INSERT INTO sessions (id, pipeline, repo, worktree_path, status, started_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("s-held", "secops", BETA, None, "blocked", 1_000),
+    )
+    db.commit()
     db.add_pending_resume("s-open", "dev", ALPHA, "Which branch?")
     db.add_pending_resume("s-held", "secops", BETA, "Bump the major?",
                           held_until=1_900_000_000, posted=False)
@@ -331,18 +350,22 @@ def test_needs_you_lists_open_unanswered_questions(tmp_path: Path) -> None:
     db.expire_pending_resume("s-expired", "ttl")
     created = db.get_pending_resume("s-open")["created_at"]
 
-    out = _status(tmp_path, int(time.time()))
+    out = _status(tmp_path, int(time.time()), titles={f"{ALPHA}#215": "Pick a branch"})
 
     assert out["errors"] == []
     assert sorted(q["session_id"] for q in out["needs_you"]) == ["s-held", "s-open"]
     open_q = _only(out["needs_you"], "s-open")
     assert set(open_q) == NEEDS_KEYS
     assert open_q["question"] == "Which branch?"
+    assert open_q["issue_number"] == 215
+    assert open_q["title"] == "Pick a branch"
     assert open_q["pipeline"] == "dev" and open_q["repo"] == ALPHA
     assert open_q["asked_ts"] == created
     assert open_q["asked"] == datetime.fromtimestamp(created, UTC).isoformat()
     assert open_q["held_until_ts"] is None and open_q["held_until"] is None
     held = _only(out["needs_you"], "s-held")
+    # A secops question has no issue, so no title either.
+    assert held["issue_number"] is None and held["title"] is None
     assert held["held_until_ts"] == 1_900_000_000
     assert held["held_until"] == datetime.fromtimestamp(1_900_000_000, UTC).isoformat()
 
@@ -523,6 +546,8 @@ def test_db_older_than_the_events_table(tmp_path: Path) -> None:
 
     assert [c["session_id"] for c in out["running"]] == ["s1"]
     assert [q["session_id"] for q in out["needs_you"]] == ["s2"]
+    # No session row for the question: no issue to show, not a guess.
+    assert out["needs_you"][0]["issue_number"] is None
     assert out["feed"] is None
     assert out["today"] == dict.fromkeys(TODAY_KEYS)
     assert any("events" in e for e in out["errors"])
