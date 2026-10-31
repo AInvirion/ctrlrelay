@@ -438,6 +438,8 @@ async def run_task_issue(
 
     worktree_path: Path | None = None
     session_row_inserted = False
+    # See run_dev_issue: a failure before the agent starts is retried.
+    dispatched = False
 
     try:
         issue = await github.get_issue(repo, issue_number)
@@ -499,6 +501,7 @@ async def run_task_issue(
             state_db=state_db,
             transport=transport,
         )
+        dispatched = True
         result = await pipeline.run(ctx)
 
         rounds = 0
@@ -608,6 +611,7 @@ async def run_task_issue(
             session_id=session_id,
             summary=f"Error processing task issue #{issue_number}",
             error=str(e),
+            outputs={"failed_before_dispatch": True} if not dispatched else {},
         )
 
     finally:

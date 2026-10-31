@@ -52,6 +52,31 @@ def _is_issues_disabled_error(exc: Exception) -> bool:
     return "has disabled issues" in str(exc).lower()
 
 
+def _read_pre_dispatch_failures(raw: object) -> dict[str, dict[int, int]]:
+    """``pre_dispatch_failures`` from the state file, keeping only
+    entries that are an issue number and a positive whole count (#234).
+    Anything else is dropped rather than trusted: a negative count would
+    lift the retry limit, and a value that cannot convert would stop the
+    poller from loading at all."""
+    out: dict[str, dict[int, int]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for repo, counts in raw.items():
+        if not isinstance(repo, str) or not isinstance(counts, dict):
+            continue
+        kept: dict[int, int] = {}
+        for number, count in counts.items():
+            if not (isinstance(number, str) and number.isascii()
+                    and number.isdigit() and len(number) <= 18):
+                continue
+            if type(count) is not int or count < 1:
+                continue
+            kept[int(number)] = count
+        if kept:
+            out[repo] = kept
+    return out
+
+
 @dataclass
 class IssuePoller:
     """Polls GitHub repos for newly assigned issues.
@@ -106,6 +131,10 @@ class IssuePoller:
     repos: list[str]
     state_file: Path
     seen_issues: dict[str, set[int]] = field(default_factory=dict)
+    # Runs that failed before the agent started, per repo and issue
+    # (#234). Persisted with seen_issues so a restart does not reset
+    # the limit on a permanent problem.
+    pre_dispatch_failures: dict[str, dict[int, int]] = field(default_factory=dict)
     accept_foreign_assignments: set[str] = field(default_factory=set)
     exclude_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
     include_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
@@ -152,15 +181,27 @@ class IssuePoller:
             data = json.loads(self.state_file.read_text())
             raw = data.get("seen_issues", {})
             self.seen_issues = {repo: set(numbers) for repo, numbers in raw.items()}
-        except (json.JSONDecodeError, OSError):
-            # Corrupt or unreadable state — start fresh
+            self.pre_dispatch_failures = _read_pre_dispatch_failures(
+                data.get("pre_dispatch_failures"),
+            )
+        except (ValueError, OSError, AttributeError, TypeError):
+            # Corrupt or unreadable state — start fresh. ValueError
+            # covers JSONDecodeError and an integer too long to convert;
+            # AttributeError and TypeError are valid JSON of the wrong
+            # shape, e.g. a list at the top level or for seen_issues.
             self.seen_issues = {}
+            self.pre_dispatch_failures = {}
 
     def _save_state(self) -> None:
         """Persist seen issues and a ``last_poll`` timestamp to the state file."""
         data = {
             "seen_issues": {
                 repo: sorted(numbers) for repo, numbers in self.seen_issues.items()
+            },
+            "pre_dispatch_failures": {
+                repo: {str(n): c for n, c in sorted(counts.items())}
+                for repo, counts in self.pre_dispatch_failures.items()
+                if counts
             },
             "last_poll": datetime.now(timezone.utc).isoformat(),
         }
@@ -707,6 +748,22 @@ class IssuePoller:
         seen = self.seen_issues.get(repo)
         if seen and issue_number in seen:
             seen.discard(issue_number)
+            self._save_state_best_effort()
+
+    def record_pre_dispatch_failure(self, repo: str, issue_number: int) -> int:
+        """Count one run of ``issue_number`` that failed before the agent
+        started, and return how many there have been (#234). Saved
+        best-effort, like ``unmark_seen``."""
+        counts = self.pre_dispatch_failures.setdefault(repo, {})
+        counts[issue_number] = counts.get(issue_number, 0) + 1
+        self._save_state_best_effort()
+        return counts[issue_number]
+
+    def clear_pre_dispatch_failures(self, repo: str, issue_number: int) -> None:
+        """Forget the count once a run reaches the agent or is given up."""
+        counts = self.pre_dispatch_failures.get(repo)
+        if counts and issue_number in counts:
+            del counts[issue_number]
             self._save_state_best_effort()
 
     async def seed_current(self) -> None:

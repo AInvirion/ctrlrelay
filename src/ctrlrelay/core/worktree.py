@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import tempfile
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -89,6 +91,16 @@ def _rejections_are_only_non_fast_forward(stderr: str) -> list[str]:
 
 class WorktreeError(Exception):
     """Raised when worktree operations fail."""
+
+
+class DefaultBranchDivergedError(WorktreeError):
+    """The bare clone's default branch cannot fast-forward to origin's.
+
+    Usually the repository on GitHub was replaced or its default branch
+    force-pushed. ``ensure_bare_repo`` answers it by setting the clone
+    aside and cloning again (#234); it reaches a caller only when that
+    is refused or fails.
+    """
 
 
 class StaleRecreatePartialFailureError(WorktreeError):
@@ -247,6 +259,10 @@ class WorktreeManager:
     worktrees_dir: Path
     bare_repos_dir: Path
     timeout: int = 120
+    # Told when a clone is set aside and cloned again (#234), with the
+    # repo and where the old clone went. Best-effort: a failure is
+    # logged and never fails the run.
+    on_reclone: Callable[[str, Path], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         self.worktrees_dir = Path(self.worktrees_dir)
@@ -334,7 +350,7 @@ class WorktreeManager:
                 raise WorktreeError(f"git failed: {err}")
             stuck = sorted(set(declined) & protected_refs)
             if stuck:
-                raise WorktreeError(
+                raise DefaultBranchDivergedError(
                     f"git failed: default branch diverged from origin "
                     f"({', '.join(stuck)}); refusing to use a stale tree: "
                     f"{err}"
@@ -1164,10 +1180,14 @@ class WorktreeManager:
           applied, and that exit code was aborting the whole session
           for a branch it had correctly protected.
 
-        The default branch is the exception: a rejection there still
-        raises. Sessions are cut from it, so tolerating that one would
-        swap a loud failure for work done quietly on a stale tree —
-        e.g. after a force-push to ``main`` on GitHub.
+        The default branch is the exception: tolerating a rejection
+        there would swap a loud failure for work done quietly on a stale
+        tree, since sessions are cut from it. So the clone is set aside
+        and cloned again instead (#234): the usual cause is the repo on
+        GitHub being replaced or its default branch force-pushed, and
+        before this every run on the repo failed until somebody moved
+        the clone by hand. See :meth:`_set_aside_and_reclone` for when
+        that is refused.
         """
         bare_path = self._get_bare_repo_path(repo)
 
@@ -1179,27 +1199,102 @@ class WorktreeManager:
                 # branch to protect. create_worktree fails on the same
                 # lookup, so the stale-tree risk never reaches a session.
                 default_branch = ""
-            await self._run_git(
-                "fetch", "--prune", "origin",
-                _BOT_BRANCH_REFSPEC,
-                "refs/heads/*:refs/heads/*",
-                cwd=bare_path,
-                timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
-                tolerate_non_fast_forward=True,
-                protected_refs=(
-                    frozenset({default_branch}) if default_branch
-                    else frozenset()
-                ),
-            )
+            try:
+                await self._run_git(
+                    "fetch", "--prune", "origin",
+                    _BOT_BRANCH_REFSPEC,
+                    "refs/heads/*:refs/heads/*",
+                    cwd=bare_path,
+                    timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+                    tolerate_non_fast_forward=True,
+                    protected_refs=(
+                        frozenset({default_branch}) if default_branch
+                        else frozenset()
+                    ),
+                )
+            except DefaultBranchDivergedError as e:
+                await self._set_aside_and_reclone(repo, bare_path, e)
         else:
-            await self._run_git(
-                "clone", "--bare",
-                f"https://github.com/{repo}.git",
-                str(bare_path),
-                timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
-            )
+            await self._clone_bare(repo, bare_path)
 
         return bare_path
+
+    def _clone_url(self, repo: str) -> str:
+        """Where a bare clone comes from. Never the old clone's
+        ``remote.origin.url``: that config is shared with every worktree
+        cut from the clone, so an agent can rewrite it."""
+        return f"https://github.com/{repo}.git"
+
+    async def _clone_bare(self, repo: str, bare_path: Path) -> None:
+        await self._run_git(
+            "clone", "--bare", self._clone_url(repo), str(bare_path),
+            timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+        )
+
+    async def _set_aside_and_reclone(
+        self, repo: str, bare_path: Path, cause: DefaultBranchDivergedError,
+    ) -> None:
+        """Move a clone whose default branch diverged from origin to
+        ``<name>.git.replaced-<UTC time>`` and clone fresh (#234).
+
+        The old clone is never deleted here, and the operator is told
+        where it went so they can delete it. It holds what the failed
+        fetch left: that fetch's ``--prune`` may already have dropped
+        local branches origin does not have, as every fetch here does.
+
+        Refused, re-raising ``cause``, while any worktree is registered
+        in the clone: a BLOCKED session keeps its worktree for the
+        resume, and moving the clone would cut that worktree off from
+        its repository. No prune first, because a prune also drops the
+        registration of a worktree whose directory is only briefly
+        missing. If the fresh clone fails, the partial one is removed
+        and the old clone put back, so the next run sees the same state
+        and tries again.
+
+        The check and the move are not atomic on their own. They rely on
+        the per-repo lock: every caller of ``ensure_bare_repo`` (the dev,
+        task and secops runs, their resumes, and the dev fix round)
+        holds it, and so does everything that adds a worktree.
+        """
+        listing = await self._run_git(
+            "worktree", "list", "--porcelain", cwd=bare_path,
+        )
+        linked = [
+            line[len("worktree "):]
+            for line in listing.splitlines()[1:]
+            if line.startswith("worktree ")
+        ]
+        if linked:
+            log_event(
+                _logger, "worktree.bare.reclone_refused",
+                repo=repo, worktrees=len(linked),
+            )
+            raise DefaultBranchDivergedError(
+                f"{cause}; not re-cloning while {len(linked)} worktree(s) "
+                f"still use it: {', '.join(linked)}"
+            ) from cause
+
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        aside = bare_path.with_name(f"{bare_path.name}.replaced-{stamp}")
+        bare_path.rename(aside)
+        try:
+            await self._clone_bare(repo, bare_path)
+        except BaseException:
+            shutil.rmtree(bare_path, ignore_errors=True)
+            aside.rename(bare_path)
+            raise
+        log_event(
+            _logger, "worktree.bare.recloned",
+            repo=repo, set_aside=str(aside),
+        )
+        if self.on_reclone is not None:
+            try:
+                await self.on_reclone(repo, aside)
+            except Exception as e:
+                log_event(
+                    _logger, "worktree.bare.reclone_notice_failed",
+                    repo=repo, reason=type(e).__name__,
+                )
 
     async def remove_worktree(self, repo: str, session_id: str) -> None:
         """Remove a worktree and clean up."""

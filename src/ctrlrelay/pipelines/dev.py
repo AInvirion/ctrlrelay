@@ -1588,6 +1588,14 @@ async def run_dev_issue(
     # that was never recorded would name a session nothing else knows.
     session_row_inserted = False
 
+    # Whether the run was handed to the pipeline that starts the agent.
+    # A failure before that (the issue read, the claim comment, the
+    # clone, the worktree) is reported as ``failed_before_dispatch`` so
+    # the poller can retry the issue instead of dropping it (#234). A
+    # failure inside the pipeline is not, even before the agent spawns:
+    # retrying is only offered where nothing could have run.
+    dispatched = False
+
     try:
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
@@ -1689,6 +1697,7 @@ async def run_dev_issue(
             state_db=state_db,
             transport=transport,
         )
+        dispatched = True
         result = await pipeline.run(ctx)
         last_exit_code = result.exit_code
 
@@ -2146,6 +2155,7 @@ async def run_dev_issue(
             session_id=session_id,
             summary=f"Error processing issue #{issue_number}",
             error=str(e),
+            outputs={"failed_before_dispatch": True} if not dispatched else {},
         )
 
     finally:
