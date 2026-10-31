@@ -13,12 +13,19 @@ import asyncio
 import json
 import os
 import shutil
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from ctrlrelay.core.agent_env import (
+    DEFAULT_SANDBOX_HIDE_PATHS,
+    build_agent_env,
+    bwrap_prefix,
+    resolve_bwrap,
+)
 from ctrlrelay.core.binaries import resolve_binary
 from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
@@ -147,6 +154,13 @@ class ClaudeDispatcher:
     # construction site has to say which of those it is, rather than
     # inheriting the pre-#204 silence by omission.
     outcome_hook: DispatchOutcomeHook | None = None
+    # "none" or "bwrap" (#219). With "bwrap", a spawn WITHOUT GitHub
+    # access runs under bubblewrap with ``sandbox_hide_paths`` replaced
+    # by empty mounts, so the agent cannot read the SSH key or gh's
+    # stored login either. Off by default: it needs bwrap installed and
+    # unprivileged user namespaces allowed, which not every host has.
+    sandbox: str = "none"
+    sandbox_hide_paths: tuple[str, ...] = DEFAULT_SANDBOX_HIDE_PATHS
 
     def __post_init__(self) -> None:
         # Only auto-resolve the bare default. Absolute paths, relative paths
@@ -155,6 +169,16 @@ class ClaudeDispatcher:
         if self.claude_binary == "claude":
             resolved = shutil.which("claude")
             self.claude_binary = resolved or _find_claude()
+        if self.sandbox not in ("none", "bwrap"):
+            raise ValueError(
+                f"agent.sandbox must be 'none' or 'bwrap', got {self.sandbox!r}"
+            )
+        # Resolved at construction so a missing bwrap fails the daemon
+        # at startup, not every dispatch later with a spawn error that
+        # names a path nobody configured.
+        self._bwrap: str | None = (
+            resolve_bwrap() if self.sandbox == "bwrap" else None
+        )
 
     async def _report_outcome(
         self,
@@ -211,12 +235,21 @@ class ClaudeDispatcher:
         resume_session_id: str | None = None,
         repo: str | None = None,
         issue_number: int | None = None,
+        *,
+        github_access: bool,
     ) -> SessionResult:
         """Spawn a Claude session and wait for completion.
 
         ``repo``/``issue_number`` are observability-only: they let the
         dispatcher's events be correlated with the pipeline's without
         re-parsing the composite session id.
+
+        ``github_access`` is REQUIRED and has no default (#219). False
+        strips every GitHub credential from the child (see
+        :mod:`ctrlrelay.core.agent_env`); True hands it the operator's
+        environment as before, which only secops still needs. A default
+        would let a new lane inherit whichever answer was written here
+        first without anybody deciding it.
         """
         timeout = timeout or self.default_timeout
 
@@ -228,12 +261,46 @@ class ClaudeDispatcher:
             "issue_number": issue_number,
         }
 
-        env = os.environ.copy()
-        env.update(self.extra_env)
+        base_env = os.environ.copy()
+        base_env.update(self.extra_env)
+
+        gh_config_dir: Path | None = None
+        prefix: list[str] = []
+        if github_access:
+            env = base_env
+            stripped: list[str] = []
+        else:
+            gh_config_dir = Path(
+                tempfile.mkdtemp(prefix="ctrlrelay-agent-gh-")
+            )
+            env, stripped = build_agent_env(
+                base_env, gh_config_dir=gh_config_dir
+            )
+            if self._bwrap is not None:
+                prefix = bwrap_prefix(self._bwrap, self.sandbox_hide_paths)
         env["CTRLRELAY_SESSION_ID"] = session_id
         env["CTRLRELAY_STATE_FILE"] = str(state_file)
 
+        # Names only, never values: this is the record that a given
+        # session ran without the operator's GitHub login.
+        log_event(
+            _logger,
+            "dispatcher.session.credentials",
+            **ident,
+            github_access=github_access,
+            stripped_env=stripped,
+            sandbox="bwrap" if prefix else "none",
+        )
+
+        # `--dangerously-skip-permissions` stays (#219). The CLI's other
+        # unattended modes either still need every Bash command
+        # allow-listed (`dontAsk`) or filter by command TEXT
+        # (`--disallowedTools "Bash(git push:*)"`), which `bash -c` or
+        # an alias walks straight past. The guard is that the process
+        # holds no credential to push with, not what it is allowed to
+        # type.
         cmd = [
+            *prefix,
             self.claude_binary,
             "-p", prompt,
             "--output-format", "json",
@@ -241,6 +308,41 @@ class ClaudeDispatcher:
         ]
         if resume_session_id:
             cmd.extend(["--resume", resume_session_id])
+
+        try:
+            return await self._run_session(
+                cmd=cmd,
+                env=env,
+                ident=ident,
+                session_id=session_id,
+                prompt=prompt,
+                working_dir=working_dir,
+                state_file=state_file,
+                timeout=timeout,
+                resume_session_id=resume_session_id,
+                repo=repo,
+                issue_number=issue_number,
+            )
+        finally:
+            if gh_config_dir is not None:
+                shutil.rmtree(gh_config_dir, ignore_errors=True)
+
+    async def _run_session(
+        self,
+        *,
+        cmd: list[str],
+        env: dict[str, str],
+        ident: dict[str, Any],
+        session_id: str,
+        prompt: str,
+        working_dir: Path,
+        state_file: Path,
+        timeout: int,
+        resume_session_id: str | None,
+        repo: str | None,
+        issue_number: int | None,
+    ) -> SessionResult:
+        """Run the child built by :meth:`spawn_session` to completion."""
 
         # The prompt can carry issue bodies and operator answers, so only its
         # hash and length are ever logged (#41).
@@ -528,6 +630,8 @@ class AgentAdapter(Protocol):
         resume_session_id: str | None = None,
         repo: str | None = None,
         issue_number: int | None = None,
+        *,
+        github_access: bool,
     ) -> SessionResult:
         ...
 
@@ -557,6 +661,8 @@ def make_agent_dispatcher(
             claude_binary=agent_config.binary,
             default_timeout=agent_config.default_timeout_seconds,
             outcome_hook=outcome_hook,
+            sandbox=agent_config.sandbox,
+            sandbox_hide_paths=tuple(agent_config.sandbox_hide_paths),
         )
     raise NotImplementedError(
         f"agent.type={t!r} has no adapter yet. Implement one that "

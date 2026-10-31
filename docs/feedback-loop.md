@@ -151,9 +151,12 @@ Step-by-step:
 15–17. **Loop until terminal.** If the resumed session blocks again, steps
     8–14 repeat (capped at `DEFAULT_MAX_BLOCKED_ROUNDS`, currently 5). On
     `DONE`/`FAILED`, the loop exits.
-18. **PR verification.** If the dev pipeline got `DONE` with a `pr_url`, it
-    verifies the PR is mergeable and CI is green. If not, it asks Claude to
-    fix and re-verifies (up to `DEFAULT_MAX_FIX_ATTEMPTS`, currently 3).
+18. **Publish and verify.** On `DONE` the agent has only committed; it has
+    no GitHub access (#219). ctrlrelay pushes the run's branch, opens the PR
+    from the title and description in the checkpoint, then verifies the PR
+    is mergeable and CI is green. If not, it resumes the agent with the
+    failed-job logs, pushes the fix itself and re-verifies (up to
+    `DEFAULT_MAX_FIX_ATTEMPTS`, currently 3).
 19. **Operator notified.** The poller pushes a final `✅ PR ready: <url>` (or
     `❌ Failed: …`) message via the bridge.
 

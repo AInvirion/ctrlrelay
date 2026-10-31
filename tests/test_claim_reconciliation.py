@@ -217,6 +217,12 @@ def _dev_issue_harness(tmp_path: Path, *, checkpoint: dict | None, exit_code: in
         "body": "...",
         "comments": [],
     }
+    # #219: the relay pushes and opens the pull request itself.
+    github.get_default_branch.return_value = "main"
+    github.list_prs.return_value = []
+    github.create_pr.return_value = {
+        "number": 42, "url": "https://github.com/owner/repo/pull/42",
+    }
 
     dispatcher = AsyncMock(spec=ClaudeDispatcher)
 
@@ -295,6 +301,10 @@ class TestRunDevIssueReconcilesTheClaim:
             ) as default_branch,
             patch.object(worktree, "symlink_context"),
             patch.object(worktree, "remove_context_symlink"),
+            patch.object(
+                worktree, "push_run_branch", new_callable=AsyncMock,
+                return_value="c0ffee",
+            ),
         ):
             wt = tmp_path / "worktrees" / "wt"
             wt.mkdir(parents=True)
@@ -563,6 +573,10 @@ class TestTheExceptionPathNamesTheExitCodeItHas:
             patch.object(worktree, "delete_branch", new_callable=AsyncMock),
             patch.object(worktree, "symlink_context"),
             patch.object(worktree, "remove_context_symlink"),
+            patch.object(
+                worktree, "push_run_branch", new_callable=AsyncMock,
+                return_value="c0ffee",
+            ),
         ):
             wt = tmp_path / "worktrees" / "wt"
             wt.mkdir(parents=True)
@@ -712,6 +726,10 @@ class TestTheRealPipelineRecordsTheExitCode:
             patch.object(worktree, "delete_branch", new_callable=AsyncMock),
             patch.object(worktree, "symlink_context"),
             patch.object(worktree, "remove_context_symlink"),
+            patch.object(
+                worktree, "push_run_branch", new_callable=AsyncMock,
+                return_value="c0ffee",
+            ),
         ):
             wt = tmp_path / "worktrees" / "wt"
             wt.mkdir(parents=True)
@@ -850,6 +868,10 @@ class TestARetractionCancelsTheClaim:
             patch.object(worktree, "delete_branch", new_callable=AsyncMock),
             patch.object(worktree, "symlink_context"),
             patch.object(worktree, "remove_context_symlink"),
+            patch.object(
+                worktree, "push_run_branch", new_callable=AsyncMock,
+                return_value="c0ffee",
+            ),
         ):
             wt = tmp_path / "worktrees" / "wt"
             wt.mkdir(parents=True)
@@ -967,6 +989,10 @@ class TestAResumedWorkersExitCodeIsTheOneReported:
             patch.object(worktree, "delete_branch", new_callable=AsyncMock),
             patch.object(worktree, "symlink_context"),
             patch.object(worktree, "remove_context_symlink"),
+            patch.object(
+                worktree, "push_run_branch", new_callable=AsyncMock,
+                return_value="c0ffee",
+            ),
         ):
             wt = tmp_path / "worktrees" / "wt"
             wt.mkdir(parents=True)

@@ -63,7 +63,8 @@ class TestEverySpawnReportsItsOutcome:
             "asyncio.create_subprocess_exec", return_value=_proc(returncode=0)
         ):
             await d.spawn_session(
-                session_id="s",
+                github_access=False,
+session_id="s",
                 prompt="p",
                 working_dir=tmp_path,
                 state_file=state_file,
@@ -94,7 +95,8 @@ class TestEverySpawnReportsItsOutcome:
             ),
         ):
             await d.spawn_session(
-                session_id="s",
+                github_access=False,
+session_id="s",
                 prompt="p",
                 working_dir=tmp_path,
                 state_file=tmp_path / "missing.json",
@@ -125,7 +127,8 @@ class TestEverySpawnReportsItsOutcome:
             "asyncio.create_subprocess_exec", return_value=_proc(returncode=0)
         ):
             await d.spawn_session(
-                session_id="s",
+                github_access=False,
+session_id="s",
                 prompt="p",
                 working_dir=tmp_path,
                 state_file=tmp_path / "missing.json",
@@ -148,7 +151,8 @@ class TestEverySpawnReportsItsOutcome:
         proc.wait = AsyncMock()
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             await d.spawn_session(
-                session_id="s",
+                github_access=False,
+session_id="s",
                 prompt="p",
                 working_dir=tmp_path,
                 state_file=tmp_path / "missing.json",
@@ -179,7 +183,8 @@ class TestEverySpawnReportsItsOutcome:
         ):
             with pytest.raises(FileNotFoundError):
                 await d.spawn_session(
-                    session_id="s",
+                    github_access=False,
+session_id="s",
                     prompt="p",
                     working_dir=tmp_path,
                     state_file=tmp_path / "missing.json",
@@ -204,7 +209,8 @@ class TestTheHookCannotBreakADispatch:
             "asyncio.create_subprocess_exec", return_value=_proc(returncode=0)
         ):
             result = await d.spawn_session(
-                session_id="s",
+                github_access=False,
+session_id="s",
                 prompt="p",
                 working_dir=tmp_path,
                 state_file=tmp_path / "missing.json",
@@ -224,7 +230,8 @@ class TestTheHookCannotBreakADispatch:
         ):
             with pytest.raises(asyncio.CancelledError):
                 await d.spawn_session(
-                    session_id="s",
+                    github_access=False,
+session_id="s",
                     prompt="p",
                     working_dir=tmp_path,
                     state_file=tmp_path / "missing.json",
@@ -237,7 +244,8 @@ class TestTheHookCannotBreakADispatch:
             "asyncio.create_subprocess_exec", return_value=_proc(returncode=0)
         ):
             result = await d.spawn_session(
-                session_id="s",
+                github_access=False,
+session_id="s",
                 prompt="p",
                 working_dir=tmp_path,
                 state_file=tmp_path / "missing.json",
@@ -878,7 +886,8 @@ class TestCommunicateFailuresAreReported:
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(OSError):
                 await d.spawn_session(
-                    session_id="s",
+                    github_access=False,
+session_id="s",
                     prompt="p",
                     working_dir=tmp_path,
                     state_file=tmp_path / "missing.json",
@@ -911,7 +920,8 @@ class TestCommunicateFailuresAreReported:
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(asyncio.CancelledError):
                 await d.spawn_session(
-                    session_id="s",
+                    github_access=False,
+session_id="s",
                     prompt="p",
                     working_dir=tmp_path,
                     state_file=tmp_path / "missing.json",
@@ -1287,7 +1297,8 @@ class TestTheChildIsReapedWithoutLosingTheCause:
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(OSError) as excinfo:
                 await d.spawn_session(
-                    session_id="s",
+                    github_access=False,
+session_id="s",
                     prompt="p",
                     working_dir=tmp_path,
                     state_file=tmp_path / "missing.json",
@@ -1317,7 +1328,8 @@ class TestInvalidUtf8FromAChildIsNotLost:
         d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             result = await d.spawn_session(
-                session_id="s",
+                github_access=False,
+session_id="s",
                 prompt="p",
                 working_dir=tmp_path,
                 state_file=tmp_path / "missing.json",
@@ -1472,7 +1484,8 @@ class TestAnUnreadExitStatusIsNotReportedAsHealthy:
         d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             await d.spawn_session(
-                session_id="s",
+                github_access=False,
+session_id="s",
                 prompt="p",
                 working_dir=tmp_path,
                 state_file=tmp_path / "missing.json",
@@ -1499,7 +1512,8 @@ class TestAnUnreadExitStatusIsNotReportedAsHealthy:
         d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             await d.spawn_session(
-                session_id="s",
+                github_access=False,
+session_id="s",
                 prompt="p",
                 working_dir=tmp_path,
                 state_file=tmp_path / "missing.json",

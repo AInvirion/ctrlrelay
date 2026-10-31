@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests._publish_fakes import fake_relay_publish
+
 
 class TestDevIntegration:
     @pytest.mark.asyncio
@@ -34,6 +36,7 @@ class TestDevIntegration:
 
         # Mock GitHub
         mock_github = AsyncMock(spec=GitHubCLI)
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 123,
             "title": "Fix the login bug",
@@ -88,6 +91,10 @@ class TestDevIntegration:
             ) as mock_create,
             patch.object(worktree, "remove_worktree", new_callable=AsyncMock),
             patch.object(worktree, "symlink_context"),
+            patch.object(
+                worktree, "push_run_branch", new_callable=AsyncMock,
+                return_value="c0ffee",
+            ),
             patch.object(worktree, "remove_context_symlink"),
         ):
 
@@ -175,6 +182,7 @@ class TestDevPipelineCleanup:
         )
 
         mock_github = AsyncMock(spec=GitHubCLI)
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 13,
             "title": "Remove roadmap section from README",
@@ -202,6 +210,10 @@ class TestDevPipelineCleanup:
                 worktree, "branch_exists_locally", new_callable=AsyncMock
             ) as mock_local,
             patch.object(worktree, "symlink_context"),
+            patch.object(
+                worktree, "push_run_branch", new_callable=AsyncMock,
+                return_value="c0ffee",
+            ),
             patch.object(worktree, "remove_context_symlink"),
         ):
 
@@ -370,6 +382,7 @@ class TestDevPipelineCleanup:
             bare_repos_dir=tmp_path / "repos",
         )
         mock_github = AsyncMock(spec=GitHubCLI)
+        fake_relay_publish(mock_github)
         mock_github.get_issue.return_value = {
             "number": 42, "title": "t", "body": "b",
         }
@@ -391,6 +404,10 @@ class TestDevPipelineCleanup:
                 worktree, "branch_exists_locally", new_callable=AsyncMock
             ) as mock_local,
             patch.object(worktree, "symlink_context"),
+            patch.object(
+                worktree, "push_run_branch", new_callable=AsyncMock,
+                return_value="c0ffee",
+            ),
             patch.object(worktree, "remove_context_symlink"),
         ):
             mock_remote.return_value = False
@@ -737,6 +754,7 @@ class TestLabelTriggeredDevPipelineE2E:
             "updatedAt": "2026-04-22T00:00:00Z",
         }
         mock_github = MagicMock(spec=GitHubCLI)
+        fake_relay_publish(mock_github, pr_number=88)
         # Targeted queries: assignee path returns nothing (issue has no
         # assignee), label path returns the labeled issue. The poller
         # merges them by number so the label path is the sole trigger.
@@ -825,6 +843,10 @@ class TestLabelTriggeredDevPipelineE2E:
                 ) as mock_create,
                 patch.object(worktree, "remove_worktree", new_callable=AsyncMock),
                 patch.object(worktree, "symlink_context"),
+                patch.object(
+                    worktree, "push_run_branch", new_callable=AsyncMock,
+                    return_value="c0ffee",
+                ),
                 patch.object(worktree, "remove_context_symlink"),
             ):
                 worktree_path = tmp_path / "worktrees" / f"wt-{issue['number']}"
@@ -913,6 +935,7 @@ class TestLabelTriggeredDevPipelineE2E:
             "updatedAt": "2026-04-22T00:00:00Z",
         }
         mock_github = MagicMock(spec=GitHubCLI)
+        fake_relay_publish(mock_github)
         mock_github.list_assigned_issues = AsyncMock(return_value=[])
         mock_github.list_issues_by_label = AsyncMock(return_value=[labeled_issue])
         mock_github.list_assignment_events = AsyncMock(return_value=[])

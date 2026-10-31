@@ -830,9 +830,103 @@ class WorktreeManager:
         # Each line starts with "+" (unique) or "-" (patch-equivalent in upstream).
         return all(line.startswith("-") for line in lines)
 
-    async def push_branch(self, worktree_path: Path, branch: str) -> None:
-        """Push a branch to origin."""
-        await self._run_git("push", "-u", "origin", branch, cwd=worktree_path)
+    async def push_run_branch(
+        self,
+        repo: str,
+        branch: str,
+        *,
+        run_branch: str,
+        default_branch: str,
+        expected_remote_sha: str | None,
+        session_id: str | None = None,
+    ) -> str:
+        """Push this run's branch to origin with the relay's credentials.
+
+        The only push the relay makes on an agent's behalf (#219), so
+        every rule is enforced here rather than in a prompt:
+
+        - :func:`check_push_target` refuses ``main``, ``master``, the
+          default branch and anything that is not ``run_branch``.
+        - The branch must carry at least one commit the default branch
+          does not, or there is nothing to open a pull request for.
+        - The pushed object is the SHA read here, not the ref name, so
+          an agent process still running cannot move the ref between
+          the check and the push.
+        - It runs from the bare repository with hooks disabled
+          (``core.hooksPath=/dev/null`` and ``--no-verify``): the agent
+          can write hooks into the bare repo, and those must not run
+          under the relay's credentials.
+        - ``--force-with-lease`` expects ``expected_remote_sha`` (what
+          this run last pushed). ``None`` means "read it now", which is
+          right for the first push of a run. A branch somebody else
+          moved since is refused by git rather than overwritten.
+
+        Replaces the old unguarded ``push_branch``, which nothing called
+        and which would have pushed any branch name it was given.
+
+        Returns the SHA pushed.
+        """
+        from ctrlrelay.core.publish import PushRefusedError, check_push_target
+
+        check_push_target(
+            branch,
+            run_branch=run_branch,
+            default_branch=default_branch,
+            repo=repo,
+            session_id=session_id,
+        )
+        bare_path = self._get_bare_repo_path(repo)
+        sha = (
+            await self._run_git(
+                "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}",
+                cwd=bare_path,
+            )
+        ).strip()
+        ahead = (
+            await self._run_git(
+                "rev-list", "--count",
+                f"refs/heads/{default_branch}..{sha}",
+                cwd=bare_path,
+            )
+        ).strip()
+        if ahead == "0":
+            log_event(
+                _logger,
+                "publish.push.nothing_to_push",
+                repo=repo,
+                session_id=session_id,
+                branch=branch,
+            )
+            raise PushRefusedError(
+                f"push refused: {branch!r} has no commits that "
+                f"{default_branch!r} does not already have; the agent must "
+                f"commit its work on {branch!r}"
+            )
+        if expected_remote_sha is None:
+            out = await self._run_git(
+                "ls-remote", "--heads", "origin", f"refs/heads/{branch}",
+                cwd=bare_path,
+                timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+            )
+            expected_remote_sha = out.split()[0] if out.strip() else ""
+        await self._run_git(
+            "-c", "core.hooksPath=/dev/null",
+            "push", "--no-verify", "--porcelain",
+            f"--force-with-lease=refs/heads/{branch}:{expected_remote_sha}",
+            "origin", f"{sha}:refs/heads/{branch}",
+            cwd=bare_path,
+            timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+        )
+        log_event(
+            _logger,
+            "publish.push.done",
+            repo=repo,
+            session_id=session_id,
+            branch=branch,
+            sha=sha,
+            commits_ahead=ahead,
+        )
+        return sha
 
     async def ensure_bare_repo(self, repo: str) -> Path:
         """Ensure bare repo exists, cloning if needed.

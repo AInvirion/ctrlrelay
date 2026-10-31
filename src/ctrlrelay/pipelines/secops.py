@@ -241,6 +241,15 @@ class SecopsPipeline:
             resume_session_id=resume_uuid,
             repo=ctx.repo,
             issue_number=ctx.issue_number,
+            # Deliberately True, and the one lane that still is (#219).
+            # The secops agent reads Dependabot alerts and pull requests
+            # through `gh` and merges the ones policy allows, so it
+            # needs the operator's login during the run. Moving it to
+            # the dev/task model means the relay doing those reads up
+            # front and the merges afterwards from a decision the agent
+            # returns; until then this lane keeps the pre-#219
+            # behaviour, on purpose and in one visible place.
+            github_access=True,
         )
 
         if result.agent_session_id:

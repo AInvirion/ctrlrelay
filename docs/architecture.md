@@ -70,6 +70,14 @@ is the only place ctrlrelay calls out to Claude Code.
 - **Environment additions:** `CTRLRELAY_SESSION_ID` and `CTRLRELAY_STATE_FILE`
   are the only contract between dispatcher and child. Anything else the agent
   needs (issue body, PR rules, etc.) goes into the prompt.
+- **Credentials (#219):** every spawn says whether it gets GitHub access
+  (`spawn_session(..., github_access=...)`, no default). dev and task spawn
+  without it: GitHub tokens, `gh`'s login, git credential helpers, SSH and
+  the desktop keyring are cut off (`core/agent_env.py`), and ctrlrelay
+  pushes the branch, opens the PR or posts the report itself afterwards
+  (`core/publish.py`, `WorktreeManager.push_run_branch`). secops still
+  spawns with access. See
+  [What the agent can reach](configuration.md#what-the-agent-can-reach-219).
 - **Result:** `SessionResult(session_id, exit_code, state, stdout, stderr,
   agent_session_id)`. `session_id` is our composite orchestrator id;
   `agent_session_id` is Claude's own UUID, parsed from the JSON stdout and

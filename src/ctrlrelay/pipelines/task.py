@@ -2,9 +2,9 @@
 
 A ``task``-labeled issue routes here instead of the dev pipeline. The
 agent is told to do the work described (run a build, investigate a
-failure, check a config, etc.) and report its findings as an issue
-comment. No branch, no PR. Useful when the outcome is information
-rather than code changes.
+failure, check a config, etc.) and hand back its findings, which the
+relay posts as an issue comment. No branch, no PR. Useful when the
+outcome is information rather than code changes.
 
 Shared pieces with the dev pipeline:
 - Per-repo state_db lock so secops / dev / task runs on the same repo
@@ -16,13 +16,15 @@ Shared pieces with the dev pipeline:
 
 Intentionally NOT shared with dev:
 - No branch creation or PR handoff.
-- No claim comment (the agent writes its own report-comment on exit,
-  which serves as the equivalent "agent touched this" signal).
+- No claim comment (the report-comment posted on exit serves as the
+  equivalent "agent touched this" signal). Since #219 the relay posts
+  it from the agent's DONE outputs; the agent has no GitHub access.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import shlex
 import time
 import uuid
@@ -79,7 +81,7 @@ class TaskPipeline:
             state_file=ctx.state_file,
         )
         result = await self._spawn(ctx, prompt, resume=False)
-        return self._session_to_result(result)
+        return await self._post_report(ctx, self._session_to_result(result))
 
     async def resume(self, ctx: PipelineContext, answer: str) -> PipelineResult:
         # The checkpoint contract is restated here, not just in the
@@ -109,7 +111,75 @@ class TaskPipeline:
             answer_hash=hash_text(answer),
         )
         result = await self._spawn(ctx, prompt, resume=True)
-        return self._session_to_result(result)
+        return await self._post_report(ctx, self._session_to_result(result))
+
+    async def _post_report(
+        self, ctx: PipelineContext, result: PipelineResult
+    ) -> PipelineResult:
+        """Post the agent's report on the issue, as the relay (#219).
+
+        The agent used to post it with ``gh issue comment`` under the
+        operator's login. It has no GitHub access now, so it hands the
+        report over in its DONE outputs and the relay posts it, with
+        mentions disabled and the length capped.
+
+        A DONE without a report is a failure, not a quiet success: the
+        report is the task lane's whole output, and "done" with nothing
+        on the issue is exactly what an operator cannot tell from a
+        crash.
+        """
+        if not result.success:
+            return result
+        from ctrlrelay.core.publish import (
+            COMMENT_MAX_CHARS,
+            sanitize_untrusted_text,
+        )
+
+        raw = result.outputs.get("report")
+        report = raw.strip() if isinstance(raw, str) else ""
+        if not report or ctx.issue_number is None:
+            return dataclasses.replace(
+                result,
+                success=False,
+                summary="Task agent signalled DONE without a report",
+                error="no report in the DONE checkpoint outputs",
+            )
+        body = sanitize_untrusted_text(report, max_chars=COMMENT_MAX_CHARS)
+        body += (
+            "\n\n---\nPosted by ctrlrelay (session "
+            f"`{ctx.session_id}`) from the task agent's report."
+        )
+        try:
+            await self.github.comment_on_issue(
+                repo=ctx.repo, issue_number=ctx.issue_number, body=body,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event(
+                _logger,
+                "task.report.post_failed",
+                session_id=ctx.session_id,
+                repo=ctx.repo,
+                issue_number=ctx.issue_number,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
+            return dataclasses.replace(
+                result,
+                success=False,
+                summary="Task finished but ctrlrelay could not post the report",
+                error=f"{type(e).__name__}: {str(e)[:200]}",
+            )
+        log_event(
+            _logger,
+            "task.report.posted",
+            session_id=ctx.session_id,
+            repo=ctx.repo,
+            issue_number=ctx.issue_number,
+            report_len=len(report),
+        )
+        return result
 
     async def _spawn(
         self,
@@ -130,6 +200,9 @@ class TaskPipeline:
             resume_session_id=resume_uuid,
             repo=ctx.repo,
             issue_number=ctx.issue_number,
+            # #219: the relay posts the report; the agent has no GitHub
+            # credentials.
+            github_access=False,
         )
 
         if result.agent_session_id:
@@ -174,21 +247,21 @@ check a config, summarize state of something.
 
 1. Read the issue above. You have a clean worktree of {repo}'s
    default branch at the current directory — files are real; tools
-   like `gh`, `git`, `npm`, `uv`, `cargo`, etc. are on PATH.
-2. Do the work. Run commands, read files, query APIs. You can write
-   files in the worktree if it helps your investigation, but those
-   changes will be discarded at the end — do not rely on them
-   persisting.
-3. When you have your findings, post them as a comment on the issue
-   using:
-   ```bash
-   gh issue comment {issue_number} --repo {repo} --body "<your findings>"
-   ```
-   The comment is your primary output. Keep it concise but concrete:
-   what you found, what commands you ran, any snippets the operator
-   should see. No unnecessary throat-clearing.
-4. Signal DONE with a short summary (the Telegram notification the
-   operator sees is based on this summary, so make it useful).
+   like `git`, `npm`, `uv`, `cargo`, etc. are on PATH.
+2. Do the work. Run commands, read files. You can write files in the
+   worktree if it helps your investigation, but those changes will
+   be discarded at the end — do not rely on them persisting.
+3. Write your findings as the `report` in the DONE checkpoint below.
+   The orchestrator posts it as a comment on issue #{issue_number}
+   after you exit. Keep it concise but concrete: what you found, what
+   commands you ran, any snippets the operator should see. No
+   unnecessary throat-clearing.
+4. Signal DONE with a short summary as well (the Telegram
+   notification the operator sees is based on it, so make it useful).
+
+This session has no GitHub credentials: `gh` and any `git` command
+that talks to GitHub will fail. Do not try to post the comment
+yourself and do not look for credentials.
 
 If you hit genuine ambiguity that needs the operator's input,
 signal BLOCKED with a specific question — same pattern as the dev
@@ -241,12 +314,28 @@ pipeline. Don't BLOCK on things you can figure out yourself.
 STATE_FILE: {state_file_path}
 SESSION_ID: {session_id}
 
-**DONE** (task complete, comment posted):
+**DONE** (task complete). The report is markdown and may span lines;
+it goes inside a Python raw triple-quoted string, so it must not contain
+three single quotes in a row:
 ```bash
 mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\\
-'"timestamp":"%s","summary":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ONE-LINE SUMMARY>" > {quoted_path}
+python3 - {quoted_path} <<'CTRLRELAY_DONE'
+import datetime, json, sys
+state = {{
+    "version": "1",
+    "status":"DONE",
+    "session_id": "{session_id}",
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    ),
+    "summary": "<ONE-LINE SUMMARY>",
+    "outputs": {{
+        "report": r'''<REPORT>''',
+    }},
+}}
+with open(sys.argv[1], "w") as f:
+    json.dump(state, f)
+CTRLRELAY_DONE
 ```
 
 **BLOCKED** (need operator input):
@@ -280,6 +369,14 @@ printf '{{"version":"1","status":"FAILED",'\\
                 success=True,
                 session_id=result.session_id,
                 summary=state.summary or "Task complete",
+                # Only the report crosses over (#219). Anything else the
+                # agent wrote stays out: a stray `pr_url` here is how the
+                # cli decides to announce "PR ready".
+                outputs=(
+                    {"report": state.outputs["report"]}
+                    if "report" in state.outputs
+                    else {}
+                ),
             )
         if state.status == CheckpointStatus.BLOCKED_NEEDS_INPUT:
             return PipelineResult(

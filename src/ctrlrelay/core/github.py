@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 from dataclasses import dataclass, field
 from typing import Any
@@ -421,9 +422,18 @@ class GitHubCLI:
         title: str,
         body: str,
         head: str,
-        base: str = "main",
+        base: str,
     ) -> dict[str, Any]:
-        """Create a pull request."""
+        """Create a pull request; return ``{"number", "url"}``.
+
+        ``gh pr create`` has no ``--json`` flag (it prints the new
+        pull request's URL), so the number is read from that URL. The
+        old version passed ``--json`` and could never have succeeded;
+        nothing called it until #219 moved PR creation into the relay.
+
+        ``base`` is required: a default of ``"main"`` would quietly
+        target the wrong branch on a repository whose default differs.
+        """
         output = await self._run_gh(
             "pr", "create",
             "--repo", repo,
@@ -431,9 +441,50 @@ class GitHubCLI:
             "--body", body,
             "--head", head,
             "--base", base,
-            "--json", "number,title,url,state",
         )
-        return json.loads(output)
+        url = ""
+        for line in output.splitlines():
+            line = line.strip()
+            if "/pull/" in line:
+                url = line
+        match = re.search(r"/pull/(\d+)\b", url)
+        if not match:
+            raise GitHubError(
+                f"gh pr create returned no pull request URL: {output.strip()[:200]!r}"
+            )
+        return {"number": int(match.group(1)), "url": url}
+
+    async def get_default_branch(self, repo: str) -> str:
+        """The repository's default branch, as GitHub reports it.
+
+        Read from the API rather than from the bare clone's HEAD,
+        because the agent can write to the bare clone and must not be
+        able to change which branch the push guard protects (#219).
+        """
+        output = await self._run_gh(
+            "repo", "view", repo,
+            "--json", "defaultBranchRef",
+            "--jq", ".defaultBranchRef.name",
+        )
+        name = output.strip()
+        if not name:
+            raise GitHubError(f"could not read the default branch of {repo}")
+        return name
+
+    async def get_failed_job_log(
+        self, repo: str, job_id: str, *, timeout: int | None = None,
+    ) -> str:
+        """``gh run view --job <id> --log-failed`` for one Actions job.
+
+        The dev agent used to fetch these itself. It has no GitHub
+        login now (#219), so the relay fetches them and puts an
+        excerpt in the fix prompt.
+        """
+        return await self._run_gh(
+            "run", "view", "--repo", repo, "--job", str(job_id),
+            "--log-failed",
+            timeout=timeout,
+        )
 
     async def get_pr_state(
         self,
