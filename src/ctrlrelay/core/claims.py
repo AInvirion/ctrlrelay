@@ -237,9 +237,25 @@ def live_claims(
     settings: ClaimSettings,
     now: float,
 ) -> list[Claim]:
-    """Unreleased, unexpired claims, lowest comment id first."""
+    """Unreleased, unexpired claims, lowest comment id first.
+
+    A claim that another unreleased claim names in ``replaces`` is out,
+    whatever its comment id and however fresh. Editing a comment is not
+    a compare-and-swap, so a machine that comes back after its claim was
+    taken can always refresh it once more before it notices. Without
+    this rule that one refresh would put the old claim, with its lower
+    id, back in first place while the taker is running.
+    """
+    claims = parse_claims(comments, settings.account)
+    replaced = {
+        cid
+        for c in claims if c.replaces
+        for cid in c.replaces.split(",")
+    }
     live = []
-    for claim in parse_claims(comments, settings.account):
+    for claim in claims:
+        if claim.claim_id in replaced:
+            continue
         stale_at = claim.stale_at(settings.stale_after_seconds)
         if stale_at is not None and now >= stale_at:
             continue
@@ -297,6 +313,15 @@ async def acquire_claim(
     live = live_claims(comments, settings, now)
     if live and live[0].claim_id is not None:
         mine = live[0]
+        # An earlier run's background hold must not mark this new run's
+        # claim held after it starts working.
+        pending = _BACKGROUND_HOLDS.pop(mine.claim_id, None)
+        if pending is not None:
+            pending.cancel()
+            try:
+                await pending
+            except asyncio.CancelledError:
+                pass
         await github.edit_issue_comment(
             repo, mine.comment_id,
             claim_body(
@@ -417,6 +442,11 @@ class ClaimKeeper:
         # still working: the claim went stale (GitHub unreachable for the
         # whole stale time) and is no longer this machine's.
         self.taken_over_by: str | None = None
+        # When GitHub last confirmed a write of this claim: the stale time
+        # runs from here, in every other machine's eyes.
+        self._confirmed_at: float = (
+            claim.updated_at if claim.updated_at is not None else clock()
+        )
 
     async def _write(self, state: str) -> bool:
         try:
@@ -436,6 +466,7 @@ class ClaimKeeper:
                 error=str(e)[:200],
             )
             return False
+        self._confirmed_at = self._clock()
         return True
 
     async def _taken_over(self) -> tuple[bool, str | None]:
@@ -506,9 +537,11 @@ class ClaimKeeper:
         then take an issue whose run already opened a pull request or
         asked a question. So it is tried ``attempts`` times here, and if
         GitHub is still refusing, again in the background every
-        ``refresh_seconds`` until the claim would have gone stale. That
-        background retry lives only as long as this process. Returns
-        whether it was written here; a claim taken over is not reclaimed.
+        ``refresh_seconds`` until the stale time counted from the last
+        write GitHub confirmed. That retry lives only as long as this
+        process, and a new run adopting the claim cancels it. Returns
+        whether it was written here; a claim taken over is not reclaimed
+        (and could not be: the taker's claim names it as replaced).
         """
         await self.stop()
         if self.taken_over_by is not None:
@@ -525,15 +558,22 @@ class ClaimKeeper:
                 "comment_id": self.claim.comment_id,
             },
         )
-        task = asyncio.create_task(self._hold_later(self._clock()))
-        _BACKGROUND_HOLDS.add(task)
-        task.add_done_callback(_BACKGROUND_HOLDS.discard)
+        task = asyncio.create_task(self._hold_later())
+        _BACKGROUND_HOLDS[self.claim_id] = task
+
+        def _forget(t: asyncio.Task[None], cid: str = self.claim_id) -> None:
+            if _BACKGROUND_HOLDS.get(cid) is t:
+                del _BACKGROUND_HOLDS[cid]
+
+        task.add_done_callback(_forget)
         return False
 
-    async def _hold_later(self, started: float) -> None:
-        deadline = started + self.settings.stale_after_seconds
-        while self._clock() < deadline:
+    async def _hold_later(self) -> None:
+        deadline = self._confirmed_at + self.settings.stale_after_seconds
+        while True:
             await self._sleep(self.settings.refresh_seconds)
+            if self._clock() >= deadline:
+                return
             checked, taker = await self._taken_over()
             if taker is not None:
                 return
@@ -545,5 +585,6 @@ class ClaimKeeper:
                 return
 
 
-# Background hold retries, referenced so they are not collected mid-run.
-_BACKGROUND_HOLDS: set[asyncio.Task[None]] = set()
+# Background hold retries by claim id: referenced so they are not
+# collected mid-run, and found by id so a new run can cancel one.
+_BACKGROUND_HOLDS: dict[str, asyncio.Task[None]] = {}

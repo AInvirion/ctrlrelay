@@ -360,7 +360,8 @@ start the run and does not announce the issue in chat. It logs
 `claims.refresh_seconds`, which moves the comment's `updated_at`. A
 `working` claim not refreshed for `claims.stale_after_seconds` is stale:
 that machine is treated as stopped, and another machine may take the issue
-(its claim says whose claim it replaced). A skipping machine looks again at
+(its claim names the claim it replaced, and a replaced claim never counts
+again, however it is edited later). A skipping machine looks again at
 exactly the time the claim could go stale, not on every poll. If a machine
 whose claim was taken over is in fact still running, it stops refreshing
 its claim and logs `claims.taken_over`; its run is not stopped.

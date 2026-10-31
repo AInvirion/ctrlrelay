@@ -375,7 +375,7 @@ class TestKeeper:
         )
         assert await keeper.hold() is False  # logged, not raised
         from ctrlrelay.core.claims import _BACKGROUND_HOLDS
-        await asyncio.gather(*list(_BACKGROUND_HOLDS))  # gives up at the stale time
+        await asyncio.gather(*list(_BACKGROUND_HOLDS.values()))  # gives up at the stale time
 
     @pytest.mark.asyncio
     async def test_a_hold_that_failed_is_written_later_in_the_background(self) -> None:
@@ -404,7 +404,7 @@ class TestKeeper:
         )
         assert await keeper.hold() is False
         from ctrlrelay.core.claims import _BACKGROUND_HOLDS
-        await asyncio.gather(*list(_BACKGROUND_HOLDS))
+        await asyncio.gather(*list(_BACKGROUND_HOLDS.values()))
         assert "state=held" in thread.comments[0]["body"]
         clock.t += 86400
         assert other_owner(thread.comments, settings("node-b"), clock()).node == "node-a"
@@ -481,6 +481,62 @@ class TestKeeper:
         with pytest.raises(asyncio.CancelledError):
             await keeper._task
         assert edits == []
+
+    @pytest.mark.asyncio
+    async def test_a_late_write_cannot_put_a_taken_claim_back_in_first_place(
+        self,
+    ) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        clock.t += 1801
+        b = await acquire_claim(
+            thread, REPO, 1, settings("node-b"), clock=clock, sleep=no_sleep,
+        )
+        assert b.won
+        # node-a's refresh read the comments just before node-b's claim
+        # landed, and writes anyway: both a refresh and a hold.
+        a_keeper = ClaimKeeper(thread, REPO, 1, a.claim, settings("node-a"), clock=clock)
+        assert await a_keeper._write(WORKING)
+        assert other_owner(thread.comments, settings("node-c"), clock()).node == "node-b"
+        assert await a_keeper._write(HELD)
+        assert other_owner(thread.comments, settings("node-c"), clock()).node == "node-b"
+        out = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        assert not out.won and out.owner.node == "node-b"
+
+    @pytest.mark.asyncio
+    async def test_a_new_run_cancels_the_old_runs_background_hold(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        real_edit = thread.edit_issue_comment
+        down = [True]
+
+        async def edit(repo, cid, body):
+            if down[0]:
+                raise RuntimeError("503")
+            await real_edit(repo, cid, body)
+
+        thread.edit_issue_comment = edit
+        keeper = ClaimKeeper(
+            thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        assert await keeper.hold() is False
+        from ctrlrelay.core.claims import _BACKGROUND_HOLDS
+        task = _BACKGROUND_HOLDS[a.claim.claim_id]
+        down[0] = False
+        again = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        assert again.won and again.claim.claim_id == a.claim.claim_id
+        assert task.cancelled()
+        assert "state=working" in thread.comments[0]["body"]
 
     @pytest.mark.asyncio
     async def test_the_takeover_mark_survives_the_takers_refresh(self) -> None:
@@ -823,5 +879,8 @@ class TestTheTaskRunClaimsToo:
         result, dispatcher = await self._run(tmp_path, thread, "node-a", 1)
         assert not result.success
         assert dispatcher.spawn_session.await_count == 1
-        assert "node=node-a" in thread.comments[0]["body"]
-        assert other_owner(thread.comments, settings("node-b"), clock()) is None
+        [posted] = parse_claims(thread.comments[:1], ACCOUNT)
+        assert posted.node == "node-a"
+        # Released by its own id, not merely gone stale.
+        assert release_marker(posted.claim_id) in thread.comments[-1]["body"]
+        assert parse_claims(thread.comments, ACCOUNT) == []
