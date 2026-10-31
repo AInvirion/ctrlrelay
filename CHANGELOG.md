@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.15.0] - 2026-10-31
 
-The dev and task agents now run without GitHub credentials; ctrlrelay does
-the pushing, PR opening and commenting itself after the agent exits. One new
+The dev and task agents no longer get GitHub credentials in their
+environment; ctrlrelay does the pushing, PR opening and commenting itself
+after the agent exits. One new
 database table is added automatically and the new config values have
 defaults, so **no config edit is required** to upgrade.
 
@@ -40,9 +41,10 @@ defaults, so **no config edit is required** to upgrade.
 
 ### Known limits
 
-- An agent running as the same OS user can still read credential files on
-  disk or run ssh directly unless the bwrap sandbox is on, and the macOS
-  keychain is not covered. Running the agent as a separate user
+- The agent still runs as the same OS user. Without the bwrap sandbox it
+  can read credential files on disk; with it, only the paths in
+  `agent.sandbox_hide_paths` are hidden. It can still run ssh directly, and
+  the macOS keychain is not covered. Running the agent as a separate user
   is tracked in #236
 
 ## [0.14.0] - 2026-10-31
