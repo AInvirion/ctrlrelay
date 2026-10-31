@@ -23,7 +23,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "transcript_sample.jsonl"
 WORKTREE = "/home/u/.ctrlrelay/worktrees/example-org-alpha-dev-215-49a5"
 
 # The fixture's last tool use, read off the file by hand: the agent opening its PR.
-LAST_COMMAND = "gh pr create \u2026 && tail \u2026"
+LAST_COMMAND = "gh pr \u2026 && tail \u2026"
 LAST_STEP_TS = int(datetime(2026, 10, 31, 3, 59, 16, 739000, tzinfo=UTC).timestamp())
 
 
@@ -75,6 +75,10 @@ def test_transcript_dir_matches_measured_layout() -> None:
         ("Bash", {"command": "npm run test:unit"}, Phase.TESTING),
         ("Bash", {"command": "go test ./..."}, Phase.TESTING),
         ("Bash", {"command": "sed -n '1,60p' f.py"}, Phase.READING),
+        # shlex hands ";\n" over as one token; it still ends the first command.
+        ("Bash", {"command": "git push;\npytest"}, Phase.TESTING),
+        ("Bash", {"command": "env FOO=bar pytest"}, Phase.TESTING),
+        ("Bash", {"command": "env -i FOO=bar git push"}, Phase.PR),
         ("TodoWrite", {}, None),
     ],
 )
@@ -154,17 +158,32 @@ def _boundary_file(tmp_path: Path) -> int:
     return len(last.encode()) + 1
 
 
-def test_a_tail_starting_exactly_on_a_row_keeps_that_row(tmp_path: Path) -> None:
+def test_a_probe_byte_that_is_a_newline_keeps_the_row_after_it(tmp_path: Path) -> None:
     last_row_bytes = _boundary_file(tmp_path)
 
-    # The first byte of the tail is the newline before the row: the row is whole.
-    on_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes + 1)
-    inside_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes)
-    before_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes + 6)
+    # One probe byte (the newline before the row) plus the row and its newline.
+    activity = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes + 1)
 
-    assert on_row.phase is Phase.TESTING
-    assert inside_row.phase is Phase.UNKNOWN  # only part of the row is in the tail
-    assert before_row.phase is Phase.TESTING
+    assert activity.phase is Phase.TESTING
+
+
+def test_a_tail_too_short_for_the_last_row_finds_no_step(tmp_path: Path) -> None:
+    last_row_bytes = _boundary_file(tmp_path)
+
+    # The probe is the row's own first byte, so what follows is only part of it.
+    activity = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes)
+
+    assert activity.phase is Phase.UNKNOWN
+    assert activity.reason == "no step in transcript tail"
+
+
+def test_a_tail_starting_inside_the_previous_row_drops_only_that_part(tmp_path: Path) -> None:
+    last_row_bytes = _boundary_file(tmp_path)
+
+    activity = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes + 6)
+
+    assert activity.phase is Phase.TESTING
+    assert activity.last_command == "pytest \u2026"
 
 
 def test_no_transcript_is_unknown(tmp_path: Path) -> None:
@@ -252,7 +271,7 @@ def test_last_command_truncated_to_200(tmp_path: Path) -> None:
     assert activity.last_command is not None
     assert len(activity.last_command) == 200
     assert "\n" not in activity.last_command
-    assert activity.last_command.startswith("echo start && true && true")
+    assert activity.last_command.startswith("cmd \u2026 && cmd && cmd")
 
 
 @pytest.mark.parametrize(
@@ -260,24 +279,26 @@ def test_last_command_truncated_to_200(tmp_path: Path) -> None:
     [
         ("git status", "git status"),
         ("git push", "git push"),
-        ("npm test", "npm test"),
-        ("python3 manage.py check", "python3 manage.py check"),
-        ("tool login 0123abcd0123abcd0123abcd0123ab", "tool login \u2026"),
-        ("tool login abcdef0123abcdef0123abcdef0123", "tool login \u2026"),
         ("git push -u origin x", "git push \u2026"),
+        ("git clone https://h/r", "git \u2026"),
+        ("npm test", "npm test"),
+        ("npm run test:unit", "npm run \u2026"),
+        ("cd /w && npm run test:unit", "npm run \u2026"),
+        ("gh pr create --fill", "gh pr \u2026"),
+        ("uv sync", "uv sync"),
         ("uv run pytest -q tests/a.py", "pytest \u2026"),
         ("poetry run pytest", "pytest"),
-        ("bunx vitest run", "vitest run"),
+        ("bunx vitest run", "vitest \u2026"),
         ("python -m pytest -p xdist", "pytest \u2026"),
-        (
-            'export API_KEY=abc && curl -H "Bearer x" https://h',
-            "export \u2026 && curl \u2026",
-        ),
-        ("cd /w && npm run test:unit", "npm run test:unit"),
+        ("env FOO=bar pytest -q", "pytest \u2026"),
+        ("python3 manage.py check", "python3 \u2026"),
+        ("make test", "make \u2026"),
+        ("docker compose up", "docker compose \u2026"),
+        ("export API_KEY=abc && curl -H \"Bearer x\" https://h", "cmd \u2026 && curl \u2026"),
         ("uv run pytest -q 2>&1 | tail -20", "pytest \u2026 && tail \u2026"),
-        ("gh pr create --fill", "gh pr create \u2026"),
-        ("./scripts/rotate-token.sh now", "*** now"),
+        ("git push;\npytest", "git push && pytest"),
         ("git commit -F - <<'MSG'\nprivate words\nMSG", "git commit \u2026"),
+        ("swordfishctl", "cmd"),
     ],
 )
 def test_summarize_command(command: str, shown: str) -> None:
@@ -291,16 +312,16 @@ def _shown_for(tmp_path: Path, name: str, tool_input: dict) -> str | None:
     return read_activity(WORKTREE, home=tmp_path).last_command
 
 
-# Every leak found by the two review rounds, through the path the page reads.
+# Every leak found by the three review rounds, through the path the page reads.
 @pytest.mark.parametrize(
     ("command", "secrets"),
     [
-        ("tool --verbose --password hunter2", ["hunter2"]),
+        ("tool --verbose --password hunter2", ["hunter2", "tool"]),
         ("echo xoxs-123-456-abc", ["xoxs", "123-456"]),
         ("echo AbCdEfGh/IjKlMnOp+QrStUvWx/YzAbCdEf+GhIjKlMn==", ["AbCd", "IjKl"]),
-        ('llm --prompt "Private customer details"', ["Private", "customer"]),
+        ('llm --prompt "Private customer details"', ["Private", "customer", "llm"]),
         ("export API_KEY=secret", ["API_KEY", "secret"]),
-        ("mysql -psecret", ["secret"]),
+        ("mysql -psecret", ["secret", "mysql"]),
         ("mysql -u x -p secret", ["secret"]),
         ("sshpass -p secret ssh h", ["secret"]),
         ("GH_TOKEN=abc gh pr create --fill", ["GH_TOKEN", "abc"]),
@@ -308,8 +329,16 @@ def _shown_for(tmp_path: Path, name: str, tool_input: dict) -> str | None:
         ('curl -H "Authorization: Bearer abc.def" h', ["abc.def", "Bearer"]),
         ("echo sk-proj-abc123", ["sk-proj"]),
         ("echo " + "a1b2" * 10, ["a1b2"]),
-        ("tool login deploy-key-1234", ["deploy-key"]),
+        ("tool login deploy-key-1234", ["deploy-key", "login"]),
         ("tool login abcdef0123abcdef0123abcdef0123", ["abcdef", "0123"]),
+        ("echo swordfish", ["swordfish"]),
+        ("grep confidential notes.txt", ["confidential", "notes"]),
+        ("acme-internal-deployer --target prod", ["acme", "prod"]),
+        ("git commit -m swordfish", ["swordfish"]),
+        ("gh pr create --title swordfish", ["swordfish", "create"]),
+        ("npm run swordfish", ["swordfish"]),
+        ("cat /tmp/swordfish", ["swordfish"]),
+        ("env SECRET=swordfish pytest", ["SECRET", "swordfish"]),
     ],
 )
 def test_no_secret_reaches_last_command(
@@ -327,15 +356,35 @@ def test_no_secret_reaches_last_command(
     [
         ("Read", {"file_path": f"{WORKTREE}/src/app.py"}, "src/app.py"),
         ("Edit", {"file_path": f"{WORKTREE}/src/app.py", "old_string": "x"}, "src/app.py"),
-        ("Write", {"file_path": "/etc/ssl/site.conf", "content": "x"}, "site.conf"),
         ("NotebookEdit", {"notebook_path": f"{WORKTREE}/nb/a.ipynb"}, "nb/a.ipynb"),
-        ("Read", {"file_path": f"{WORKTREE}/secrets/prod.env"}, "***/prod.env"),
-        ("Read", {"file_path": "/home/u/.config/tokens.json"}, "***"),
+        ("Write", {"file_path": "/etc/ssl/site.conf", "content": "x"}, "file outside repo"),
+        ("Read", {"file_path": "/tmp/swordfish"}, "file outside repo"),
+        ("Read", {"file_path": f"{WORKTREE}/../../../tmp/swordfish"}, "file outside repo"),
+        ("Read", {"file_path": f"{WORKTREE}-other/app.py"}, "file outside repo"),
+        ("Read", {"file_path": WORKTREE}, "file outside repo"),
         ("Grep", {"pattern": "ghp_abcdef123", "path": "/x"}, "search"),
-        ("Glob", {"pattern": "**/password*.txt"}, "search"),
+        ("Glob", {"pattern": "**/swordfish*.txt"}, "search"),
     ],
 )
 def test_file_and_search_tools_show_a_safe_string(
     tmp_path: Path, name: str, tool_input: dict, shown: str
 ) -> None:
     assert _shown_for(tmp_path, name, tool_input) == shown
+
+
+def test_a_symlink_out_of_the_worktree_is_outside(tmp_path: Path) -> None:
+    worktree = tmp_path / "wt"
+    (worktree / "src").mkdir(parents=True)
+    (tmp_path / "private").mkdir()
+    (worktree / "src" / "link").symlink_to(tmp_path / "private")
+    d = transcript_dir_for(str(worktree), tmp_path)
+    d.mkdir(parents=True)
+    ts = "2026-10-31T03:00:00.000Z"
+    via_link = _assistant_row("Read", {"file_path": f"{worktree}/src/link/swordfish"}, ts)
+    inside = _assistant_row("Read", {"file_path": f"{worktree}/src/app.py"}, ts)
+
+    (d / "t.jsonl").write_text(inside + "\n")
+    assert read_activity(str(worktree), home=tmp_path).last_command == "src/app.py"
+
+    (d / "t.jsonl").write_text(via_link + "\n")
+    assert read_activity(str(worktree), home=tmp_path).last_command == "file outside repo"

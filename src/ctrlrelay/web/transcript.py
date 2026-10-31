@@ -8,8 +8,8 @@ and never raises: anything it cannot read comes back as ``Phase.UNKNOWN`` with
 a reason.
 
 The page is open to the home network, so the last command is never shown as
-typed. It is a summary built only from words known to be safe to show: program
-names and short lowercase subcommands, a path relative to the worktree, or the
+typed. It is built only from fixed lists: a known program name (anything else is
+"cmd"), one known subcommand for a few tools, a path inside the worktree, or the
 word "search". Everything else is left out and marked with "…".
 """
 
@@ -22,11 +22,10 @@ import shlex
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 MAX_COMMAND_CHARS = 200
-HIDDEN = "***"
 MORE = "…"
 
 
@@ -54,16 +53,37 @@ _CODE_TOOLS = frozenset({"Edit", "Write", "NotebookEdit", "MultiEdit"})
 _SEARCH_TOOLS = frozenset({"Grep", "Glob"})
 _FILE_TOOLS = frozenset({"Read", "Edit", "Write", "NotebookEdit", "MultiEdit"})
 
-_SECRET_WORD = re.compile(r"(?i)key|token|secret|pass|pwd|auth|credential|cookie")
-_PROGRAM_WORD = re.compile(r"[a-z][a-z0-9._:-]{0,30}")  # python3 keeps its digit
-_SHOWN_WORD = re.compile(r"[a-z][a-z._:-]{0,30}")  # no digits: hex and ids stay hidden
-# Words that fit the shape above and are still credentials (`xoxs-abc`, `sk-abc`).
-_TOKEN_PREFIX = re.compile(r"(?i)(?:sk|xox[a-z]|gh[a-z]|github_pat|akia)[-_]")
+# The only words a shell summary is built from.
+_PROGRAMS = frozenset({
+    "git", "gh", "pytest", "python", "python3", "uv", "pip", "npm", "npx", "node",
+    "yarn", "pnpm", "bun", "ruff", "mypy", "make", "cargo", "go", "rustc", "docker",
+    "ls", "cat", "head", "tail", "sed", "grep", "rg", "find", "wc", "diff", "mkdir",
+    "cp", "mv", "rm", "touch", "curl", "jq", "playwright", "jest", "vitest", "tsc",
+    "eslint", "prettier", "ctrlrelay",
+})
+_PACKAGE_SUBCOMMANDS = frozenset({"test", "run", "install", "ci"})
+_SUBCOMMANDS = {
+    "git": frozenset({
+        "status", "diff", "log", "show", "add", "commit", "push", "pull", "fetch",
+        "checkout", "switch", "rebase", "merge", "branch", "stash", "restore",
+    }),
+    "gh": frozenset({"pr", "issue", "run", "api", "repo"}),
+    "npm": _PACKAGE_SUBCOMMANDS,
+    "pnpm": _PACKAGE_SUBCOMMANDS,
+    "yarn": _PACKAGE_SUBCOMMANDS,
+    "uv": frozenset({"run", "sync", "pip", "add"}),
+    "cargo": frozenset({"test", "build", "run", "check"}),
+    "go": frozenset({"test", "build", "run", "vet"}),
+    "docker": frozenset({"build", "run", "compose", "ps", "logs"}),
+}
+UNKNOWN_PROGRAM = "cmd"
+OUTSIDE_REPO = "file outside repo"
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
 _FD_REDIRECT = re.compile(r"\d*>&\d+")
 
-# Shell separators that start a new command, and words that only wrap one.
-_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "\n"})
+# Characters of the shell control operators that start a new command. shlex
+# groups adjacent ones (";\n", "|&"), so a token made only of these separates.
+_CONTROL = frozenset(";&|\n")
 _TEST_RUNNERS = frozenset({"pytest", "jest", "vitest"})
 _TEST_SUBCOMMANDS = {"go": "test", "cargo": "test", "playwright": "test"}
 
@@ -92,11 +112,11 @@ def _segments(command: str) -> list[list[str]]:
     try:
         tokens = list(lexer)
     except ValueError:  # unbalanced quote: fall back to a plain split
-        tokens = re.split(r"\s+|(&&|\|\||[;|&\n])", command)
+        tokens = re.split(r"[ \t\r]+|([;&|\n]+)", command)
         tokens = [t for t in tokens if t]
     segments: list[list[str]] = [[]]
     for token in tokens:
-        if token in _SEPARATORS:
+        if set(token) <= _CONTROL:
             segments.append([])
         else:
             segments[-1].append(token)
@@ -104,11 +124,15 @@ def _segments(command: str) -> list[list[str]]:
 
 
 def _command_words(words: list[str]) -> list[str]:
-    """Drop env assignments and wrappers (`uv run`, `poetry run`, `npx`, `python -m`)."""
+    """Drop env assignments and wrappers (`env`, `uv run`, `poetry run`, `npx`, `python -m`)."""
     while words:
         head = os.path.basename(words[0])
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
             words = words[1:]
+        elif head == "env":
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                words = words[1:]
         elif head in ("uv", "poetry") and words[1:2] == ["run"]:
             words = words[2:]
         elif head in ("npx", "bunx"):
@@ -164,26 +188,21 @@ def classify(tool_name: str, tool_input: dict) -> Phase | None:
     return None
 
 
-def _is_shown(word: str, shape: re.Pattern = _SHOWN_WORD) -> bool:
-    return (
-        shape.fullmatch(word) is not None
-        and not _SECRET_WORD.search(word)
-        and not _TOKEN_PREFIX.match(word)
-    )
-
-
 def summarize_command(command: str) -> str:
-    """Program names and up to two safe subcommand words per shell segment."""
+    """Each shell segment as a known program and, for some, one known subcommand."""
     parts: list[str] = []
     for segment in _segments(command):
         words = _command_words(segment)
         if not words or os.path.basename(words[0]) == "cd":
             continue
         program = os.path.basename(words[0])
-        shown = [program if _is_shown(program, _PROGRAM_WORD) else HIDDEN]
         rest = words[1:]
-        while rest and len(shown) < 3 and _is_shown(rest[0]):
-            shown.append(rest.pop(0))
+        if program not in _PROGRAMS:
+            shown = [UNKNOWN_PROGRAM]
+        else:
+            shown = [program]
+            if rest and rest[0] in _SUBCOMMANDS.get(program, ()):
+                shown.append(rest.pop(0))
         if rest:
             shown.append(MORE)
         parts.append(" ".join(shown))
@@ -191,13 +210,14 @@ def summarize_command(command: str) -> str:
 
 
 def summarize_path(file_path: str, worktree_path: str | None) -> str:
-    """The path inside the worktree, or only the file name when outside it."""
-    path = PurePosixPath(file_path)
-    if worktree_path and path.is_relative_to(worktree_path):
-        parts = path.relative_to(worktree_path).parts
-    else:
-        parts = (path.name,)
-    return "/".join(HIDDEN if _SECRET_WORD.search(p) else p for p in parts) or MORE
+    """The path relative to the worktree, or a fixed phrase when it is outside."""
+    if not worktree_path:
+        return OUTSIDE_REPO
+    path = os.path.realpath(file_path)
+    root = os.path.realpath(worktree_path)
+    if os.path.commonpath([path, root]) != root or path == root:
+        return OUTSIDE_REPO
+    return os.path.relpath(path, root)
 
 
 def _describe(tool_name: str, tool_input: dict, worktree_path: str | None) -> str | None:
@@ -225,16 +245,22 @@ def _epoch(timestamp: Any) -> int | None:
 
 
 def _tail_lines(path: Path, tail_bytes: int) -> list[str]:
-    """The complete lines in the last ``tail_bytes`` bytes, reading no more than that."""
+    """The lines at the end of the file, reading at most ``tail_bytes`` bytes in all.
+
+    When the file is longer than that, the first byte read is a probe: the byte
+    just before the tail. The tail's first line is a whole row only if the probe
+    is a newline; otherwise it is the end of a row and is dropped.
+    """
     size = path.stat().st_size
     count = max(0, min(tail_bytes, size))
     with open(path, "rb") as fh:
         fh.seek(size - count)
         data = fh.read(count)
-    lines = data.decode("utf-8", errors="replace").split("\n")
+    probe = b"\n"
     if count < size:
-        # The first byte read is only there to show where a row begins: a cut
-        # landing just after a newline keeps the row that follows it.
+        probe, data = data[:1], data[1:]
+    lines = data.decode("utf-8", errors="replace").split("\n")
+    if probe != b"\n":
         lines = lines[1:]
     return lines
 
