@@ -21,8 +21,8 @@ from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.events import (
     EventKind,
     emit_event,
+    emit_event_once,
     emit_outcome,
-    not_yet_recorded,
 )
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
@@ -1081,12 +1081,7 @@ async def _verify_and_fix_pr(
     # rounds, whose outputs need not carry the URL.
     reported_outputs = result.outputs
 
-    def _pr_confirmed() -> dict[str, Any] | None:
-        if not not_yet_recorded(
-            state_db, EventKind.PR_OPENED, repo=ctx.repo,
-            session_id=ctx.session_id, pr_number=pr_number,
-        ):
-            return None
+    def _pr_confirmed() -> dict[str, Any]:
         pr_url = reported_outputs.get("pr_url")
         return {
             "repo": ctx.repo,
@@ -1117,7 +1112,7 @@ async def _verify_and_fix_pr(
         ci_ok = False
         try:
             verification = await verifier.verify(ctx.repo, pr_number)
-            emit_event(state_db, EventKind.PR_OPENED, _pr_confirmed)
+            emit_event_once(state_db, EventKind.PR_OPENED, _pr_confirmed)
             ci_ok = verification.ready
             return verification
         except asyncio.CancelledError:

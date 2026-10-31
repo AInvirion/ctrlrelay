@@ -1303,27 +1303,67 @@ class StateDB:
         )
         return True
 
-    def has_pr_event_nowait(
+    # The "once" lookup. Equality on session_id leads, so it is answered
+    # from idx_events_session (session_id, ts); kind, repo and the PR
+    # number are checked on that session's few rows.
+    _EVENT_ONCE_SQL = """INSERT INTO events
+           (ts, kind, repo, issue_number, session_id, detail)
+           SELECT ?, ?, ?, ?, ?, ?
+           WHERE NOT EXISTS (
+               SELECT 1 FROM events
+               WHERE session_id IS ? AND kind = ? AND repo IS ?
+                 AND json_extract(detail, '$.pr_number') = ?
+           )"""
+
+    def record_event_once_nowait(
         self,
         kind: str,
         *,
-        repo: str | None,
-        session_id: str | None,
         pr_number: int,
+        repo: str | None = None,
+        issue_number: int | None = None,
+        session_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+        ts: int | None = None,
     ) -> bool:
-        """Whether an event of ``kind`` exists for this repo, session and
-        ``detail.pr_number``. Read on the event side connection (a plain
-        SELECT on the main connection for an in-memory database, which
-        opens no transaction). Raises on failure."""
-        conn = self._conn if self._in_memory else self._event_connection()
-        row = conn.execute(
-            """SELECT 1 FROM events
-               WHERE kind = ? AND repo IS ? AND session_id IS ?
-                 AND json_extract(detail, '$.pr_number') = ?
-               LIMIT 1""",
-            (str(kind), repo, session_id, int(pr_number)),
-        ).fetchone()
-        return row is not None
+        """Like :meth:`record_event_nowait`, but writes nothing when an
+        event of ``kind`` already names ``pr_number`` (in
+        ``detail.pr_number``) for this repo and session. Returns whether a
+        row was written.
+
+        The check and the insert are ONE statement and one commit on the
+        side connection, so the lock wait is bounded by
+        ``EVENT_WRITE_TIMEOUT`` once, not once per step, and two writers
+        cannot both pass the check. In-memory: the main connection, under
+        the same no-open-transaction rule as record_event_nowait."""
+        params = (
+            int(time.time()) if ts is None else int(ts),
+            str(kind),
+            repo,
+            issue_number,
+            session_id,
+            None if detail is None else json.dumps(detail),
+            session_id,
+            str(kind),
+            repo,
+            int(pr_number),
+        )
+        if self._in_memory:
+            if self._main_busy_for_events(kind):
+                return False
+            conn = self._conn
+        else:
+            conn = self._event_connection()
+        try:
+            cursor = conn.execute(self._EVENT_ONCE_SQL, params)
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        return cursor.rowcount == 1
 
     def _event_connection(self) -> sqlite3.Connection:
         """The short-timeout side connection for event writes, opened on

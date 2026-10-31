@@ -324,7 +324,9 @@ async def test_event_write_failure_does_not_change_the_run(
         calls.append(kind)
         raise sqlite3.OperationalError("database is locked")
 
+    # Both event write paths: the plain one and the record-once one.
     monkeypatch.setattr(StateDB, "record_event_nowait", broken)
+    monkeypatch.setattr(StateDB, "record_event_once_nowait", broken)
     broken_db = StateDB(tmp_path / "b" / "state.db")
     run = await _dev_run(tmp_path / "b", broken_db, spawn=_done_state())
 
@@ -789,7 +791,7 @@ def _emit_calls() -> list[tuple[str, int, ast.Call]]:
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id in ("emit_event", "emit_outcome")
+                and node.func.id in ("emit_event", "emit_event_once", "emit_outcome")
             ):
                 calls.append((str(path.relative_to(root)), node.lineno, node))
     return calls
@@ -914,12 +916,15 @@ async def test_a_run_that_fails_before_its_session_exists_records_nothing(
 
 
 @pytest.mark.asyncio
-async def test_pr_opened_waits_for_github_and_is_recorded_once(
+async def test_pr_opened_records_once_after_verify_returns(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """The agent's word that it opened PR 7 is not enough: a verify that
-    never got an answer from GitHub records no pr_opened. Once one does,
-    the PR is recorded once, however many verify rounds follow."""
+    """pr_opened is written after ``verify`` returns, not on the agent's
+    word: a verify that raises records none, and one that returns records
+    the PR once, however many verify rounds follow. The verifier is a
+    mock here; that a returning verify means GitHub answered about the PR
+    is ``PRVerifier.verify``'s own contract (``wait_for_checks`` raises
+    when no read succeeded), tested with the verifier."""
     from ctrlrelay.core.pr_verifier import VerificationResult
     from ctrlrelay.pipelines.dev import run_dev_issue
 
@@ -964,3 +969,79 @@ async def test_pr_opened_waits_for_github_and_is_recorded_once(
     assert opened["detail"] == {
         "pr_number": 7, "pr_url": "https://github.com/o/r/pull/7",
     }
+
+
+def test_record_once_is_one_bounded_statement(tmp_path: Path, caplog) -> None:
+    """The "once" check and the write are one statement: under a lock held
+    by another connection the whole emit gives up within one write
+    timeout (not one per step), and once the lock is gone a second emit
+    for the same session and PR writes no row."""
+    import logging
+
+    from ctrlrelay.core.events import EventKind, emit_event_once
+
+    path = tmp_path / "state.db"
+    db = StateDB(path)
+
+    def fields(pr: int, session: str = "s-1"):
+        return lambda: {
+            "repo": "o/r", "session_id": session,
+            "detail": {"pr_number": pr, "pr_url": None},
+        }
+
+    try:
+        db.record_event("merged", repo="o/r", session_id="s-1", detail={
+            "pr_number": 6, "pr_url": None,
+        }, ts=1)
+        holder = sqlite3.connect(str(path), isolation_level=None)
+        try:
+            holder.execute("BEGIN IMMEDIATE")
+            holder.execute("INSERT INTO events (ts, kind) VALUES (2, 'held')")
+            with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+                start = time.monotonic()
+                emit_event_once(db, EventKind.MERGED, fields(7))
+                elapsed = time.monotonic() - start
+            assert elapsed < 0.6, elapsed
+            assert [
+                r.kind for r in caplog.records
+                if r.getMessage() == "events.write_failed"
+            ] == ["merged"]
+            assert db._event_conn is not None
+            assert not db._event_conn.in_transaction
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+
+        emit_event_once(db, EventKind.MERGED, fields(7))
+        emit_event_once(db, EventKind.MERGED, fields(7))  # same session+PR
+        emit_event_once(db, EventKind.MERGED, fields(6))  # already there
+        emit_event_once(db, EventKind.MERGED, fields(7, "s-2"))  # other session
+        emit_event_once(db, EventKind.PR_OPENED, fields(7))  # other kind
+        rows = [
+            (e["kind"], e["session_id"], e["detail"]["pr_number"])
+            for e in _in_order(db)
+        ]
+        assert rows == [
+            ("merged", "s-1", 6),
+            ("merged", "s-1", 7),
+            ("merged", "s-2", 7),
+            ("pr_opened", "s-1", 7),
+        ]
+    finally:
+        db.close()
+
+
+def test_the_once_lookup_is_answered_from_the_session_index(
+    tmp_path: Path,
+) -> None:
+    db = StateDB(tmp_path / "state.db")
+    try:
+        plan = db.execute(
+            "EXPLAIN QUERY PLAN " + StateDB._EVENT_ONCE_SQL,
+            (1, "merged", "o/r", None, "s-1", None, "s-1", "merged", "o/r", 7),
+        ).fetchall()
+        details = [row[-1] for row in plan]
+        assert any("idx_events_session" in d for d in details), details
+        assert not any(d.startswith("SCAN events") for d in details), details
+    finally:
+        db.close()

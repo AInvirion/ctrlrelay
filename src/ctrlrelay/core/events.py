@@ -2,9 +2,12 @@
 
 The daemon calls :func:`emit_event` at points where something worth showing
 happens. A write must not fail the work it describes and may delay it by at
-most ``StateDB.EVENT_WRITE_TIMEOUT`` seconds (a contended lock): it goes
-through a separate short-timeout connection, and every exception, including
-one raised while logging the failure, is swallowed here.
+most ``StateDB.EVENT_WRITE_TIMEOUT`` seconds of lock wait: each event is one
+statement and one commit (the "once" check included, see
+:func:`emit_event_once`) on a separate connection whose busy timeout is that
+bound, and every exception, including one raised while logging the failure,
+is swallowed here. An in-memory database has no second connection to wait
+on, so its fallback to the main connection does not wait at all.
 
 Everything an event carries is built INSIDE that guard: callers pass a
 zero-argument callable, never values. An argument is evaluated before
@@ -92,34 +95,27 @@ def emit_event(
         _log_failure(kind_value, e)
 
 
-def not_yet_recorded(
-    state_db: StateDB,
+def emit_event_once(
+    state_db: StateDB | None,
     kind: EventKind,
-    *,
-    repo: str | None,
-    session_id: str | None,
-    pr_number: int,
-) -> bool:
-    """Whether no ``kind`` event names this PR for this session yet.
-
-    For use inside a builder. A lookup that fails answers True: the
-    choice is between a duplicate row and a missing one, and a feed that
-    shows a PR twice is less wrong than one that never shows it."""
+    build: Callable[[], dict[str, Any]],
+) -> None:
+    """Like :func:`emit_event`, but records ``kind`` at most once per repo,
+    session and PR: ``build()`` must return a ``detail`` carrying
+    ``pr_number``. The check and the write are one statement (see
+    ``StateDB.record_event_once_nowait``), so this waits no longer than
+    an ordinary event write. Never raises."""
+    if state_db is None:
+        return
+    kind_value = "<unprintable>"
     try:
-        return not state_db.has_pr_event_nowait(
-            str(kind), repo=repo, session_id=session_id, pr_number=pr_number,
+        kind_value = str(kind)
+        fields = build()
+        state_db.record_event_once_nowait(
+            kind_value, pr_number=fields["detail"]["pr_number"], **fields,
         )
     except Exception as e:  # noqa: BLE001 - best-effort by design
-        try:
-            log_event(
-                _logger,
-                "events.lookup_failed",
-                kind=str(kind),
-                reason=type(e).__name__,
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return True
+        _log_failure(kind_value, e)
 
 
 # Session status (as written to ``sessions.status``) -> the event for it.
