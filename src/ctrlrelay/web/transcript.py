@@ -6,6 +6,11 @@ Each ``assistant`` row carries ``tool_use`` entries (tool name and input) and a
 timestamp. This module reads only the tail of the newest transcript, read-only,
 and never raises: anything it cannot read comes back as ``Phase.UNKNOWN`` with
 a reason.
+
+The page is open to the home network, so the last command is never shown as
+typed. It is a summary built only from words known to be safe to show: program
+names and short lowercase subcommands, a path relative to the worktree, or the
+word "search". Everything else is left out and marked with "…".
 """
 
 from __future__ import annotations
@@ -17,10 +22,12 @@ import shlex
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 MAX_COMMAND_CHARS = 200
+HIDDEN = "***"
+MORE = "…"
 
 
 class Phase(StrEnum):
@@ -44,86 +51,20 @@ class AgentActivity:
 
 _READ_TOOLS = frozenset({"Read", "Grep", "Glob"})
 _CODE_TOOLS = frozenset({"Edit", "Write", "NotebookEdit", "MultiEdit"})
+_SEARCH_TOOLS = frozenset({"Grep", "Glob"})
+_FILE_TOOLS = frozenset({"Read", "Edit", "Write", "NotebookEdit", "MultiEdit"})
 
-MASK = "***"
-_SECRET_NAME = re.compile(r"(?i)key|token|secret|pass|pwd|auth|credential|cookie")
-_VALUE = r"(\"[^\"]*\"|'[^']*'|[^\s;&|]+)"
-_ASSIGNMENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=" + _VALUE)
-_FLAG = re.compile(r"(?<![\w-])(--?[A-Za-z][\w-]*)(=|\s+)" + _VALUE)
-_TOKEN_SHAPES = [
-    re.compile(r"\bBearer\s+[^\s\"']+"),
-    re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]+"),
-    re.compile(r"\bxox[abp]-[A-Za-z0-9-]+"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-]
-# Long runs that may be a token. A run right after "/" or "." is a path
-# segment (a worktree folder is long and hyphenated) and passes, unless it holds
-# an unbroken 20+ stretch mixing letters and digits, which words never do.
-_RUN = re.compile(r"(?<![A-Za-z0-9+=_-])[A-Za-z0-9+=_-]{20,}")
-_UNBROKEN = re.compile(r"[A-Za-z0-9]{20,}")
-# Standard base64 carries "/" too; a run starting at, or after, "/" or "." is a path.
-_BASE64 = re.compile(r"(?<![\w/.])(?!/)[A-Za-z0-9+/]{32,}={0,2}(?![\w/])")
-# A password glued to its flag: `mysql -pSECRET`, `pg_dump -pSECRET`, `sshpass -pSECRET`.
-_GLUED_PASSWORD = re.compile(
-    r"(\b(?:mysql\w*|mariadb\w*|psql|pg_\w+|sshpass)\b[^;&|\n]*?\s-p)(?=[^\s;&|])[^\s;&|]+"
-)
-# Commands whose `-p` takes a plugin name, not a password.
-_SAFE_DASH_P = frozenset({"pytest", "py.test"})
+_SECRET_WORD = re.compile(r"(?i)key|token|secret|pass|pwd|auth|credential|cookie")
+_SHOWN_WORD = re.compile(r"[a-z][a-z0-9._:-]{0,30}")
+# Words that fit the shape above and are still credentials (`xoxs-abc`, `sk-abc`).
+_TOKEN_PREFIX = re.compile(r"(?i)(?:sk|xox[a-z]|gh[a-z]|github_pat|akia)[-_]")
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
+_FD_REDIRECT = re.compile(r"\d*>&\d+")
 
 # Shell separators that start a new command, and words that only wrap one.
 _SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "\n"})
 _TEST_RUNNERS = frozenset({"pytest", "jest", "vitest"})
 _TEST_SUBCOMMANDS = {"go": "test", "cargo": "test", "playwright": "test"}
-
-
-def redact(text: str) -> str:
-    """Mask anything in a command or pattern that may be a secret."""
-    text = re.sub(r"<<.*", "<<\u2026", text, flags=re.S)
-
-    def assignment(m: re.Match) -> str:
-        return f"{m.group(1)}={MASK}" if _SECRET_NAME.search(m.group(1)) else m.group(0)
-
-    def flag(m: re.Match) -> str:
-        name, sep, value = m.groups()
-        if value.startswith("-"):
-            return m.group(0)
-        if name == "-p" and not _dash_p_is_safe(m.string[: m.start()]):
-            return f"{name}{sep}{MASK}"
-        if _SECRET_NAME.search(name.lstrip("-")):
-            return f"{name}{sep}{MASK}"
-        return m.group(0)
-
-    text = _TOKEN_SHAPES[0].sub(f"Bearer {MASK}", text)
-    for shape in _TOKEN_SHAPES[1:]:
-        text = shape.sub(MASK, text)
-    text = _BASE64.sub(MASK, text)
-    text = _RUN.sub(_long_run, text)
-    text = _GLUED_PASSWORD.sub(lambda m: m.group(1) + MASK, text)
-    text = _ASSIGNMENT.sub(assignment, text)
-    return _FLAG.sub(flag, text)
-
-
-def _mixes_letters_and_digits(text: str) -> bool:
-    return any(c.isdigit() for c in text) and any(c.isalpha() for c in text)
-
-
-def _long_run(m: re.Match) -> str:
-    run = m.group(0)
-    if any(_mixes_letters_and_digits(s) for s in _UNBROKEN.findall(run)):
-        return MASK
-    in_path = m.start() > 0 and m.string[m.start() - 1] in "/."
-    if not in_path and (_mixes_letters_and_digits(run) or len(run) >= 32):
-        return MASK
-    return run
-
-
-def _dash_p_is_safe(before: str) -> bool:
-    """True when this `-p` belongs to a pytest run, where it names a plugin."""
-    segment = re.split(r"&&|\|\||[;|&\n]", before)[-1].split()
-    words = _command_words(segment)
-    return bool(words) and os.path.basename(words[0]) in _SAFE_DASH_P
 
 
 def _strip_heredoc_bodies(command: str) -> str:
@@ -143,9 +84,10 @@ def _strip_heredoc_bodies(command: str) -> str:
 
 def _segments(command: str) -> list[list[str]]:
     """The simple commands in a shell line, as word lists, quotes respected."""
-    command = _strip_heredoc_bodies(command)
+    command = _FD_REDIRECT.sub(" ", _strip_heredoc_bodies(command))
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
     lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True  # words such as `test:unit` stay whole
     try:
         tokens = list(lexer)
     except ValueError:  # unbalanced quote: fall back to a plain split
@@ -161,14 +103,14 @@ def _segments(command: str) -> list[list[str]]:
 
 
 def _command_words(words: list[str]) -> list[str]:
-    """Drop env assignments and wrappers (`uv run`, `npx`, `python -m`)."""
+    """Drop env assignments and wrappers (`uv run`, `poetry run`, `npx`, `python -m`)."""
     while words:
         head = os.path.basename(words[0])
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
             words = words[1:]
-        elif head == "uv" and words[1:2] == ["run"]:
+        elif head in ("uv", "poetry") and words[1:2] == ["run"]:
             words = words[2:]
-        elif head == "npx":
+        elif head in ("npx", "bunx"):
             words = words[1:]
         elif re.fullmatch(r"python[0-9.]*", head) and words[1:2] == ["-m"]:
             words = words[2:]
@@ -221,13 +163,54 @@ def classify(tool_name: str, tool_input: dict) -> Phase | None:
     return None
 
 
-def _describe(tool_input: Any) -> str | None:
-    if not isinstance(tool_input, dict):
+def _is_shown(word: str) -> bool:
+    return (
+        _SHOWN_WORD.fullmatch(word) is not None
+        and not _SECRET_WORD.search(word)
+        and not _TOKEN_PREFIX.match(word)
+    )
+
+
+def summarize_command(command: str) -> str:
+    """Program names and up to two safe subcommand words per shell segment."""
+    parts: list[str] = []
+    for segment in _segments(command):
+        words = _command_words(segment)
+        if not words or os.path.basename(words[0]) == "cd":
+            continue
+        program = os.path.basename(words[0])
+        shown = [program if _is_shown(program) else HIDDEN]
+        rest = words[1:]
+        while rest and len(shown) < 3 and _is_shown(rest[0]):
+            shown.append(rest.pop(0))
+        if rest:
+            shown.append(MORE)
+        parts.append(" ".join(shown))
+    return " && ".join(parts) if parts else MORE
+
+
+def summarize_path(file_path: str, worktree_path: str | None) -> str:
+    """The path inside the worktree, or only the file name when outside it."""
+    path = PurePosixPath(file_path)
+    if worktree_path and path.is_relative_to(worktree_path):
+        parts = path.relative_to(worktree_path).parts
+    else:
+        parts = (path.name,)
+    return "/".join(HIDDEN if _SECRET_WORD.search(p) else p for p in parts) or MORE
+
+
+def _describe(tool_name: str, tool_input: dict, worktree_path: str | None) -> str | None:
+    if tool_name in _SEARCH_TOOLS:
+        return "search"
+    if tool_name == "Bash":
+        command = tool_input.get("command")
+        if isinstance(command, str) and command.strip():
+            return summarize_command(command)[:MAX_COMMAND_CHARS]
         return None
-    for key in ("command", "file_path", "pattern"):
-        value = tool_input.get(key)
-        if isinstance(value, str) and value.strip():
-            return " ".join(redact(value).split())[:MAX_COMMAND_CHARS]
+    if tool_name in _FILE_TOOLS:
+        path = tool_input.get("file_path") or tool_input.get("notebook_path")
+        if isinstance(path, str) and path.strip():
+            return summarize_path(path, worktree_path)[:MAX_COMMAND_CHARS]
     return None
 
 
@@ -241,18 +224,17 @@ def _epoch(timestamp: Any) -> int | None:
 
 
 def _tail_lines(path: Path, tail_bytes: int) -> list[str]:
+    """The complete lines in the last ``tail_bytes`` bytes, reading no more than that."""
     size = path.stat().st_size
-    start = max(0, size - tail_bytes)
-    mid_line = False
+    count = max(0, min(tail_bytes, size))
     with open(path, "rb") as fh:
-        if start > 0:
-            fh.seek(start - 1)
-            mid_line = fh.read(1) != b"\n"
-        fh.seek(start)
-        data = fh.read(tail_bytes)
+        fh.seek(size - count)
+        data = fh.read(count)
     lines = data.decode("utf-8", errors="replace").split("\n")
-    if mid_line:
-        lines = lines[1:]  # the cut landed inside a row
+    if count < size:
+        # The first byte read is only there to show where a row begins: a cut
+        # landing just after a newline keeps the row that follows it.
+        lines = lines[1:]
     return lines
 
 
@@ -298,14 +280,14 @@ def read_activity(
     """What the agent working in ``worktree_path`` did last, from its transcript."""
     if not worktree_path:
         return _unknown("no worktree")
-    folder = transcript_dir_for(worktree_path, home if home is not None else Path.home())
     try:
+        folder = transcript_dir_for(worktree_path, home if home is not None else Path.home())
         candidates = [p for p in folder.glob("*.jsonl") if p.is_file()]
         if not candidates:
             return _unknown("no transcript")
         newest = max(candidates, key=lambda p: p.stat().st_mtime)
         lines = _tail_lines(newest, tail_bytes)
-    except OSError as exc:
+    except Exception as exc:
         return _unknown(f"transcript unreadable: {exc.__class__.__name__}")
 
     phase: Phase | None = None
@@ -313,10 +295,13 @@ def read_activity(
     last_step_ts: int | None = None
     for name, tool_input, timestamp in _tool_uses(lines):
         last_step_ts = _epoch(timestamp)
-        described = _describe(tool_input)
+        try:
+            described = _describe(name, tool_input, worktree_path)
+            classified = classify(name, tool_input)
+        except Exception:
+            described, classified = MORE, None
         if described is not None:
             last_command = described
-        classified = classify(name, tool_input)
         if classified is not None:
             phase = classified
 

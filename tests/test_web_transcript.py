@@ -15,7 +15,7 @@ from ctrlrelay.web.transcript import (
     Phase,
     classify,
     read_activity,
-    redact,
+    summarize_command,
     transcript_dir_for,
 )
 
@@ -23,10 +23,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "transcript_sample.jsonl"
 WORKTREE = "/home/u/.ctrlrelay/worktrees/example-org-alpha-dev-215-49a5"
 
 # The fixture's last tool use, read off the file by hand: the agent opening its PR.
-LAST_COMMAND = (
-    "gh pr create --repo example-org/alpha --base main"
-    " --head fix/issue-1 --title \"...\" --body \"$(cat <<\u2026"
-)
+LAST_COMMAND = "gh pr create \u2026 && tail \u2026"
 LAST_STEP_TS = int(datetime(2026, 10, 31, 3, 59, 16, 739000, tzinfo=UTC).timestamp())
 
 
@@ -160,9 +157,10 @@ def _boundary_file(tmp_path: Path) -> int:
 def test_a_tail_starting_exactly_on_a_row_keeps_that_row(tmp_path: Path) -> None:
     last_row_bytes = _boundary_file(tmp_path)
 
-    on_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes)
-    inside_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes - 1)
-    before_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes + 5)
+    # The first byte of the tail is the newline before the row: the row is whole.
+    on_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes + 1)
+    inside_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes)
+    before_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes + 6)
 
     assert on_row.phase is Phase.TESTING
     assert inside_row.phase is Phase.UNKNOWN  # only part of the row is in the tail
@@ -229,13 +227,22 @@ def test_reads_only_the_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert activity.phase is Phase.TESTING
     assert asked, "the reader did not go through open().read"
     assert None not in asked
-    assert max(asked) <= tail_bytes
-    assert sum(asked) <= tail_bytes + 1  # plus the one byte before the cut
+    assert sum(asked) <= tail_bytes
+
+
+def test_a_huge_tail_bytes_reads_the_whole_file(tmp_path: Path) -> None:
+    d = _transcript_dir(tmp_path)
+    shutil.copy(FIXTURE, d / "d9f6c0f2.jsonl")
+
+    activity = read_activity(WORKTREE, home=tmp_path, tail_bytes=10**100)
+
+    assert activity == read_activity(WORKTREE, home=tmp_path)
+    assert activity.phase is Phase.PR
 
 
 def test_last_command_truncated_to_200(tmp_path: Path) -> None:
     d = _transcript_dir(tmp_path)
-    long_command = "echo start\n" + "x " * 300 + "\necho end"
+    long_command = "echo start\n" + "true && " * 100 + "echo end"
     (d / "t.jsonl").write_text(
         _assistant_row("Bash", {"command": long_command}, "2026-10-31T03:00:00.000Z") + "\n"
     )
@@ -245,77 +252,84 @@ def test_last_command_truncated_to_200(tmp_path: Path) -> None:
     assert activity.last_command is not None
     assert len(activity.last_command) == 200
     assert "\n" not in activity.last_command
-    assert activity.last_command.startswith("echo start x")
+    assert activity.last_command.startswith("echo start && true && true")
 
 
 @pytest.mark.parametrize(
-    ("raw", "shown"),
+    ("command", "shown"),
     [
-        ("git status --short", "git status --short"),
-        ("uv run pytest -q tests/test_x.py", "uv run pytest -q tests/test_x.py"),
+        ("git status", "git status"),
+        ("git push -u origin x", "git push \u2026"),
+        ("uv run pytest -q tests/a.py", "pytest \u2026"),
+        ("poetry run pytest", "pytest"),
+        ("bunx vitest run", "vitest run"),
+        ("python -m pytest -p xdist", "pytest \u2026"),
         (
-            'export OPENAI_API_KEY=abc SECRET_KEY="a b" LEVEL=3 && make',
-            "export OPENAI_API_KEY=*** SECRET_KEY=*** LEVEL=3 && make",
+            'export API_KEY=abc && curl -H "Bearer x" https://h',
+            "export \u2026 && curl \u2026",
         ),
-        ("curl --token abc123 https://x", "curl --token *** https://x"),
-        ("tool --auth-token=xyz run", "tool --auth-token=*** run"),
-        ("mysql -u app -pHunter2 db", "mysql -u app -p*** db"),
-        ("psql -pHunter2 db", "psql -p*** db"),
-        ("tool --password hunter2 run", "tool --password *** run"),
-        ("pytest -p no:warnings -q", "pytest -p no:warnings -q"),
-        ("uv run pytest -p no:cacheprovider", "uv run pytest -p no:cacheprovider"),
-        ("python -m pytest -p xdist", "python -m pytest -p xdist"),
-        ("mysql -u x -p secret", "mysql -u x -p ***"),
-        ("sshpass -p secret ssh h", "sshpass -p *** ssh h"),
-        ("somecmd -p secret", "somecmd -p ***"),
-        ("pytest -q && somecmd -p secret", "pytest -q && somecmd -p ***"),
-        ("mariadb -pHunter2 db", "mariadb -p*** db"),
-        ("pg_dump -pHunter2 db", "pg_dump -p*** db"),
-        ("sshpass -pHunter2 ssh h", "sshpass -p*** ssh h"),
-        ("echo configuration_management_module", "echo configuration_management_module"),
-        ("echo deadbeef12deadbeef34", "echo ***"),
-        ("echo Ab12-Cd34_Ef56-Gh78-Ij90", "echo ***"),
-        ("echo AbC1+dEf2/GhI3+jKl4/MnO5+pQr6/StU7+vWx8/Yz0=", "echo ***"),
-        (
-            "cat /home/u/.ctrlrelay/worktrees/example-org-alpha-service-dev-example-org"
-            "-alpha-service-304-c1446f76/src/app.py",
-            "cat /home/u/.ctrlrelay/worktrees/example-org-alpha-service-dev-example-org"
-            "-alpha-service-304-c1446f76/src/app.py",
-        ),
-        (
-            "ls /home/u/.ctrlrelay/worktrees/example-org-tools-secops-example-org-tools-6cbd20da",
-            "ls /home/u/.ctrlrelay/worktrees/example-org-tools-secops-example-org-tools-6cbd20da",
-        ),
-        ("git show 5bf7858dbe7a3e679e17b9176ae099f225b76c77", "git show ***"),
-        ("curl https://x/r/" + "a1B2" * 10 + "/raw", "curl https://x/r/***/raw"),
-        ("git clone https://ghp_abcdef123@x/r", "git clone https://***@x/r"),
-        ("echo gho_abc ghs_def github_pat_11ABC_def", "echo *** *** ***"),
-        ("echo sk-proj-abc123", "echo ***"),
-        ("echo xoxb-123-456-abc", "echo ***"),
-        ('curl -H "Authorization: Bearer abc.def"', 'curl -H "Authorization: Bearer ***"'),
-        ("aws s3 ls # AKIAABCDEFGHIJKLMNOP", "aws s3 ls # ***"),
-        ("echo " + "a1B2" * 8, "echo ***"),
-        ("git commit -F - <<'MSG'\nprivate words\nMSG", "git commit -F - <<\u2026"),
+        ("cd /w && npm run test:unit", "npm run test:unit"),
+        ("uv run pytest -q 2>&1 | tail -20", "pytest \u2026 && tail \u2026"),
+        ("gh pr create --fill", "gh pr create \u2026"),
+        ("./scripts/rotate-token.sh now", "*** now"),
+        ("git commit -F - <<'MSG'\nprivate words\nMSG", "git commit \u2026"),
     ],
 )
-def test_redact(raw: str, shown: str) -> None:
-    assert redact(raw) == shown
+def test_summarize_command(command: str, shown: str) -> None:
+    assert summarize_command(command) == shown
 
 
-def test_last_command_is_redacted_on_the_way_out(tmp_path: Path) -> None:
-    d = _transcript_dir(tmp_path)
-    push = _assistant_row(
-        "Bash", {"command": "GH_TOKEN=abc gh pr create --fill"}, "2026-10-31T03:00:00.000Z"
-    )
-    (d / "t.jsonl").write_text(push + "\n")
+def _shown_for(tmp_path: Path, name: str, tool_input: dict) -> str | None:
+    d = transcript_dir_for(WORKTREE, tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "t.jsonl").write_text(_assistant_row(name, tool_input, "2026-10-31T03:00:00.000Z") + "\n")
+    return read_activity(WORKTREE, home=tmp_path).last_command
 
-    assert read_activity(WORKTREE, home=tmp_path).last_command == (
-        "GH_TOKEN=*** gh pr create --fill"
-    )
 
-    grep = _assistant_row("Grep", {"pattern": "ghp_abcdef123"}, "2026-10-31T03:01:00.000Z")
-    (d / "t.jsonl").write_text(push + "\n" + grep + "\n")
+# Every leak found by the two review rounds, through the path the page reads.
+@pytest.mark.parametrize(
+    ("command", "secrets"),
+    [
+        ("tool --verbose --password hunter2", ["hunter2"]),
+        ("echo xoxs-123-456-abc", ["xoxs", "123-456"]),
+        ("echo AbCdEfGh/IjKlMnOp+QrStUvWx/YzAbCdEf+GhIjKlMn==", ["AbCd", "IjKl"]),
+        ('llm --prompt "Private customer details"', ["Private", "customer"]),
+        ("export API_KEY=secret", ["API_KEY", "secret"]),
+        ("mysql -psecret", ["secret"]),
+        ("mysql -u x -p secret", ["secret"]),
+        ("sshpass -p secret ssh h", ["secret"]),
+        ("GH_TOKEN=abc gh pr create --fill", ["GH_TOKEN", "abc"]),
+        ("git clone https://ghp_abcdef123@x/r", ["ghp_", "abcdef123"]),
+        ('curl -H "Authorization: Bearer abc.def" h', ["abc.def", "Bearer"]),
+        ("echo sk-proj-abc123", ["sk-proj"]),
+        ("echo " + "a1b2" * 10, ["a1b2"]),
+        ("tool login deploy-key-1234", ["deploy-key"]),
+    ],
+)
+def test_no_secret_reaches_last_command(
+    tmp_path: Path, command: str, secrets: list[str]
+) -> None:
+    shown = _shown_for(tmp_path, "Bash", {"command": command})
 
-    activity = read_activity(WORKTREE, home=tmp_path)
-    assert activity.last_command == "***"
-    assert activity.phase is Phase.READING
+    assert shown
+    for secret in secrets:
+        assert secret not in shown
+
+
+@pytest.mark.parametrize(
+    ("name", "tool_input", "shown"),
+    [
+        ("Read", {"file_path": f"{WORKTREE}/src/app.py"}, "src/app.py"),
+        ("Edit", {"file_path": f"{WORKTREE}/src/app.py", "old_string": "x"}, "src/app.py"),
+        ("Write", {"file_path": "/etc/ssl/site.conf", "content": "x"}, "site.conf"),
+        ("NotebookEdit", {"notebook_path": f"{WORKTREE}/nb/a.ipynb"}, "nb/a.ipynb"),
+        ("Read", {"file_path": f"{WORKTREE}/secrets/prod.env"}, "***/prod.env"),
+        ("Read", {"file_path": "/home/u/.config/tokens.json"}, "***"),
+        ("Grep", {"pattern": "ghp_abcdef123", "path": "/x"}, "search"),
+        ("Glob", {"pattern": "**/password*.txt"}, "search"),
+    ],
+)
+def test_file_and_search_tools_show_a_safe_string(
+    tmp_path: Path, name: str, tool_input: dict, shown: str
+) -> None:
+    assert _shown_for(tmp_path, name, tool_input) == shown
