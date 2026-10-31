@@ -300,6 +300,34 @@ class DashboardConfig(BaseModel):
     sync_config_on_heartbeat: bool = False
 
 
+class WebConfig(BaseModel):
+    """The read-only status page served by ``ctrlrelay web`` (#209).
+
+    The default host is loopback so a fresh install never exposes the page;
+    a host that should be reachable from the home network sets ``host`` to
+    its LAN address. Never expose it to the internet: some repositories are
+    private, and the page has no login.
+    """
+
+    host: str = "127.0.0.1"
+    port: int = Field(default=8787, ge=1, le=65535)
+    # Days of feed the page and /api/events (without ?since=) show.
+    history_days: int = Field(default=7, ge=1)
+    # How often the page asks /api/status again.
+    refresh_seconds: int = Field(default=5, ge=1)
+    # How often the waiting line asks GitHub. One search per check, plus
+    # one query per include label; below 15 s that spends the rate limit.
+    github_check_seconds: int = Field(default=60, ge=15)
+    # A running card with no new agent step for this long, and no CI wait
+    # or review open, is marked "looks stuck".
+    stale_after_minutes: int = Field(default=15, ge=1)
+    # Extra names the page may be reached by, e.g. "alkaturbo.local". A
+    # request whose Host header is not this machine's own name, loopback,
+    # ``host`` or one of these is refused (421), so a web page elsewhere
+    # cannot rebind its own hostname to this server and read it.
+    allowed_hosts: list[str] = Field(default_factory=list)
+
+
 class DeployConfig(BaseModel):
     """Deployment configuration for a repo."""
 
@@ -696,6 +724,7 @@ class Config(BaseModel):
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
     personalization: Personalization | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
 

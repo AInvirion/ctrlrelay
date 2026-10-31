@@ -21,6 +21,7 @@ ctrlrelay generates platform-appropriate service unit files for you with
 |---|---|---|
 | Bridge | `ctrlrelay bridge start` | Delivers BLOCKED questions to Telegram and routes answers back. |
 | Poller | `ctrlrelay poller start --interval 300` | Watches GitHub for newly assigned issues and runs the dev pipeline. |
+| Status page (optional) | `ctrlrelay web start` | Read-only page and JSON API of what ctrlrelay is doing. See [Status page](#status-page). |
 
 Both should restart on failure and on login.
 
@@ -234,6 +235,76 @@ systemctl --user status ctrlrelay-poller
 journalctl --user -u ctrlrelay-poller -f
 ```
 
+## Status page
+
+`ctrlrelay web start` serves a read-only page and JSON API showing what each
+agent is doing (phase, last command), what is waiting and why, the questions
+that need an answer, and a feed of what ctrlrelay did and said. It is a third
+process next to the bridge and the poller, so a slow or broken page can never
+stall them.
+
+It is **read-only**: it opens `state.db` read-only, reads the tail of each
+agent's transcript, and asks GitHub (through the `gh` login ctrlrelay already
+uses) for the waiting line once a minute. It writes nothing but its PID file
+(`web.pid`, next to `state.db`), and serves `GET` only; any other method is
+`405`. It has **no login** and shows repository names, issue titles and the
+questions agents asked, so **never expose it to the internet**. Keep it on
+loopback or on the home network.
+
+| Path | What |
+|---|---|
+| `/` | The page. Refreshes itself every `web.refresh_seconds`. |
+| `/api/status` | Everything on the page, as JSON (the contract is in `src/ctrlrelay/web/status.py`). A section that could not be read is `null` and `errors` says why; `[]` means "read, and empty". |
+| `/api/events?since=<epoch seconds>` | The feed, newest first. Without `since`, the last `web.history_days` days. |
+
+Try it on loopback first (the default `web.host` is `127.0.0.1`, port `8787`):
+
+```bash
+ctrlrelay web start
+ctrlrelay web status
+curl -s http://127.0.0.1:8787/api/status | python3 -m json.tool | head -40
+curl -s "http://127.0.0.1:8787/api/events?since=$(( $(date +%s) - 3600 ))"
+ctrlrelay web stop
+```
+
+To open it from another machine on the home network, set `web.host` in
+`orchestrator.yaml` to this machine's LAN address (see
+[web]({{ '/configuration/' | relative_url }}#web)), then run it under
+systemd. `ctrlrelay install systemd` renders `ctrlrelay-web.service` with the
+other two units. It refuses to overwrite units that already exist, so on a
+host where the bridge and poller are installed, render into a scratch
+directory and copy only the web unit:
+
+```bash
+ctrlrelay install systemd --workdir ~/Projects/ctrlrelay --target-dir ~/ctrlrelay-units
+cp ~/ctrlrelay-units/ctrlrelay-web.service ~/.config/systemd/user/
+rm -r ~/ctrlrelay-units   # the other two carry the chat token
+systemctl --user daemon-reload
+systemctl --user enable --now ctrlrelay-web.service
+journalctl --user -u ctrlrelay-web -n 20
+tail -n 20 ~/.ctrlrelay/logs/web.log
+```
+
+The first line in `web.log` is a `web.started` event naming the address it
+bound. If `web.host` is `0.0.0.0` it also logs a warning: that listens on
+every interface, which is rarely what you want.
+
+The page answers only to names it knows: `localhost`, `127.0.0.1`, `[::1]`,
+`web.host`, and this machine's own hostname (plus `.local`). A request whose
+`Host` header carries any other name gets `421 misdirected request`, and the
+refused name is logged once as `web.misdirected_host`. So if you open it from
+another machine by a name that is none of those, for example a DNS name your
+router hands out, add that name to `web.allowed_hosts` and restart the unit:
+
+```yaml
+web:
+  host: "192.168.1.20"
+  allowed_hosts: ["mybox.lan"]
+```
+
+`grep misdirected_host ~/.ctrlrelay/logs/web.log` shows any name that was
+refused, which is the quickest way to find the one to add.
+
 ## Scheduled jobs
 
 The poller daemon also hosts an in-process cron (APScheduler). The jobs run
@@ -300,6 +371,7 @@ Tail them:
 tail -f ~/.ctrlrelay/logs/poller.log
 tail -f ~/.ctrlrelay/logs/bridge.log
 tail -f ~/.ctrlrelay/logs/poller.error.log
+tail -f ~/.ctrlrelay/logs/web.log      # if the status page is installed
 ```
 
 The poller prints one line per detected issue and one line per pipeline outcome.

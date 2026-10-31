@@ -88,6 +88,20 @@ dashboard:
   url: "https://ctrlrelay-dashboard.example.com"
   auth_token_env: "CTRLRELAY_DASHBOARD_TOKEN"
 
+# Read-only status page: `ctrlrelay web start`. Loopback by default; set
+# host to this machine's LAN address to open it from the home network.
+# It has no login: never expose it to the internet.
+web:
+  host: "127.0.0.1"
+  port: 8787
+  history_days: 7
+  refresh_seconds: 5
+  github_check_seconds: 60
+  stale_after_minutes: 15
+  # Extra names you open the page by from another machine (the Host
+  # header); loopback, web.host and this machine's hostname are allowed.
+  allowed_hosts: []
+
 # Scheduled jobs run in-process by the poller daemon. Cron expressions are
 # standard 5-field (minute hour dom month dow) and evaluate in the `timezone`
 # set above. Change `secops_cron` to e.g. "0 6 * * 1" for weekly (Mondays).

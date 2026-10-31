@@ -3668,6 +3668,184 @@ def poller_status(
     raise typer.Exit(1)
 
 
+web_app = typer.Typer(help="Read-only status page and JSON API (#209).")
+app.add_typer(web_app, name="web")
+
+
+def _get_web_pid_file(config_path: str | None) -> Path:
+    """PID file for the status page: ``web.pid`` next to ``state.db``."""
+    try:
+        config = load_config(resolve_config_path(config_path))
+        return config.paths.state_db.parent / "web.pid"
+    except ConfigError:
+        pass
+    return Path("~/.ctrlrelay/web.pid").expanduser().resolve()
+
+
+@web_app.command("start")
+def web_start(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+    foreground: bool = typer.Option(
+        False,
+        "--foreground",
+        "-F",
+        help="Run in the foreground (for systemd/debugging). Default is to daemonize.",
+    ),
+) -> None:
+    """Serve the read-only status page on web.host:web.port.
+
+    Reads state.db read-only, the agents' transcripts, and GitHub through
+    `gh` (one search a minute). Never writes anything but its PID file.
+    """
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    resolved_config = _resolve_config_or_exit(config_path)
+    try:
+        config = load_config(resolved_config)
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+    pid_file = _get_web_pid_file(str(resolved_config))
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if pid != os.getpid():
+                os.kill(pid, 0)
+                console.print(f"[yellow]Status page already running (PID {pid})[/yellow]")
+                raise typer.Exit(1)
+        except (ProcessLookupError, ValueError):
+            pid_file.unlink(missing_ok=True)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if not foreground:
+        cmd = [
+            sys.executable, "-m", "ctrlrelay.cli", "web", "start",
+            "--config", str(resolved_config), "--foreground",
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        # Claimed before the liveness probe, as `poller start` does, so a
+        # second `start` in the same second sees it.
+        pid_file.write_text(str(proc.pid))
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            console.print(
+                f"[green]Status page started (PID {proc.pid}) on "
+                f"http://{config.web.host}:{config.web.port}/[/green]"
+            )
+            return
+        pid_file.unlink(missing_ok=True)
+        console.print(
+            f"[red]Status page failed to start[/red] (exit code {proc.returncode}); "
+            "run with --foreground to see why"
+        )
+        raise typer.Exit(1)
+
+    def _raise_systemexit_on_signal(sig: int, _frame: object) -> None:
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _raise_systemexit_on_signal)
+
+    pid_file.write_text(str(os.getpid()))
+    try:
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.web.server import WaitingRefresher, make_server
+        from ctrlrelay.web.status import make_sessions_reader
+        from ctrlrelay.web.waiting import WaitingTracker
+
+        tracker = WaitingTracker(
+            config,
+            GitHubCLI(),
+            sessions=make_sessions_reader(config.paths.state_db),
+        )
+        try:
+            httpd = make_server(config, waiting=tracker)
+        except OSError as e:
+            console.print(
+                f"[red]Cannot listen on {config.web.host}:{config.web.port}:[/red] {e}"
+            )
+            raise typer.Exit(1)
+        refresher = WaitingRefresher(
+            tracker, interval_s=config.web.github_check_seconds,
+        )
+        refresher.start()
+        try:
+            httpd.serve_forever()
+        finally:
+            refresher.stop()
+            httpd.server_close()
+    finally:
+        pid_file.unlink(missing_ok=True)
+
+
+@web_app.command("stop")
+def web_stop(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+) -> None:
+    """Stop the status page."""
+    import os
+    import signal
+
+    pid_file = _get_web_pid_file(config_path)
+    if not pid_file.exists():
+        console.print("[yellow]Status page not running (no PID file)[/yellow]")
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        console.print(f"[green]Stopped status page (PID {pid})[/green]")
+    except ProcessLookupError:
+        console.print("[yellow]Status page process not found[/yellow]")
+    except ValueError:
+        console.print("[red]Invalid PID file[/red]")
+    pid_file.unlink(missing_ok=True)
+
+
+@web_app.command("status")
+def web_status(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+) -> None:
+    """Check whether the status page is running."""
+    import os
+
+    pid_file = _get_web_pid_file(config_path)
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            console.print(f"[green]Status page running (PID {pid})[/green]")
+            return
+        except (ProcessLookupError, ValueError):
+            pass
+    console.print("[dim]Status page not running[/dim]")
+    raise typer.Exit(1)
+
+
 personalization_app = typer.Typer(help="Personalization sync (cross-machine operator state).")
 app.add_typer(personalization_app, name="personalization")
 
@@ -4669,12 +4847,13 @@ def install_systemd(
         help="Print what would be written without touching the filesystem.",
     ),
 ) -> None:
-    """Render and install bridge + poller systemd user units (Linux).
+    """Render and install bridge, poller and status-page systemd user units (Linux).
 
     After running, enable with:
       systemctl --user daemon-reload
       systemctl --user enable --now ctrlrelay-bridge.service
       systemctl --user enable --now ctrlrelay-poller.service
+      systemctl --user enable --now ctrlrelay-web.service   # optional
     """
     from ctrlrelay.install import render_systemd, write_units
 

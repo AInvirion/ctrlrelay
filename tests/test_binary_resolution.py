@@ -815,10 +815,11 @@ class TestTheUnitsCarryTheUserBinDir:
             ]["PATH"]
             assert "${" not in value, (unit.service, value)
             examined += 1
-        # Four units, four PATHs. Without this the whole test passes if
+        # Five units (systemd bridge, poller, web; launchd bridge,
+        # poller), five PATHs. Without this the whole test passes if
         # a renderer returns nothing, or stops emitting a PATH at all —
         # an absence assertion over an empty set.
-        assert examined == 4, examined
+        assert examined == 5, examined
 
     def test_the_systemd_path_loses_nothing_the_live_unit_carried(
         self, tmp_path: Path
