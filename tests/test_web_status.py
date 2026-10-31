@@ -960,3 +960,39 @@ def test_an_event_with_an_out_of_range_time_makes_the_feed_unknown(
 
     alone = list_feed(db_path=tmp_path / "state.db", since_ts=0)
     assert alone["events"] is None and alone["error"]
+
+
+def test_reads_a_database_whose_wal_switch_was_deferred(tmp_path: Path) -> None:
+    """A daemon may run on a rollback-journal file (its WAL switch was
+    deferred at startup). The page reads it like any other, alongside
+    another reader."""
+    db = _db(tmp_path)
+    _session(db, "s1", worktree=None, started_at=1_000)
+    db.record_event("dispatched", session_id="s1", ts=1_500)
+    db.close()
+    path = tmp_path / "state.db"
+    conv = sqlite3.connect(str(path))
+    assert conv.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    conv.close()
+
+    other = sqlite3.connect(str(path), isolation_level=None)
+    other.execute("BEGIN")
+    other.execute("SELECT count(*) FROM sessions").fetchone()
+    try:
+        out = _status(tmp_path, 2_000)
+        feed = list_feed(db_path=path, since_ts=0)
+        running, _locks = make_sessions_reader(path)()
+    finally:
+        other.execute("COMMIT")
+        other.close()
+
+    assert out["errors"] == []
+    assert [c["session_id"] for c in out["running"]] == ["s1"]
+    assert [e["kind"] for e in out["feed"]] == ["dispatched"]
+    assert [e["kind"] for e in feed["events"]] == ["dispatched"]
+    assert [r["session_id"] for r in running] == ["s1"]
+    # Reading did not switch the file or leave sidecars behind.
+    assert not os.path.exists(f"{path}-wal")
+    check = sqlite3.connect(str(path))
+    assert check.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    check.close()

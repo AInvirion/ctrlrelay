@@ -351,3 +351,75 @@ def test_record_event_accepts_str_or_kind(tmp_path: Path, kind) -> None:
         assert db.list_events()[0]["kind"] == "done"
     finally:
         db.close()
+
+
+def _rollback_journal_db(path: Path) -> None:
+    """A database with the full current schema, in the old journal mode."""
+    StateDB(path).close()
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    finally:
+        conn.close()
+
+
+def test_wal_switch_never_stops_startup_when_another_process_reads(
+    tmp_path: Path, caplog
+) -> None:
+    """Switching to WAL needs an exclusive lock. A daemon starting while
+    the other one holds a read must still start, in the old mode, and say
+    so; the next start switches."""
+    path = tmp_path / "s.db"
+    _rollback_journal_db(path)
+
+    reader = sqlite3.connect(str(path), isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM sessions").fetchone()  # SHARED lock
+    try:
+        started = time.monotonic()
+        with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+            db = StateDB(path)
+        elapsed = time.monotonic() - started
+    finally:
+        reader.execute("COMMIT")
+        reader.close()
+    try:
+        assert db.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        # Still a working database in the old mode once the read ends.
+        emit_event(db, EventKind.DISPATCHED, lambda: {"repo": "example-org/alpha"})
+    finally:
+        db.close()
+
+    deferred = [
+        r for r in caplog.records if r.getMessage() == "state.wal_switch_deferred"
+    ]
+    assert len(deferred) == 1
+    assert deferred[0].levelno == logging.WARNING
+    assert elapsed < 4.0, elapsed  # bounded, well under the 5 s busy timeout
+
+    rows = sqlite3.connect(str(path)).execute(
+        "SELECT kind FROM events"
+    ).fetchall()
+    assert rows == [("dispatched",)]
+
+    db = StateDB(path)
+    try:
+        assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        db.close()
+
+
+def test_no_deferred_warning_when_the_switch_succeeds(
+    tmp_path: Path, caplog
+) -> None:
+    path = tmp_path / "s.db"
+    _rollback_journal_db(path)
+    with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+        db = StateDB(path)
+    try:
+        assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        db.close()
+    assert not [
+        r for r in caplog.records if r.getMessage() == "state.wal_switch_deferred"
+    ]

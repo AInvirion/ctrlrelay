@@ -13,6 +13,10 @@ from ctrlrelay.core.obs import get_logger, log_event
 
 _logger = get_logger("core.state")
 
+# The longest a starting daemon waits to switch the file to WAL before it
+# gives up for this start (see StateDB._switch_to_wal).
+WAL_SWITCH_TIMEOUT_MS = 2000
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -214,11 +218,9 @@ class StateDB:
 
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
-        # WAL lets the read-only status page read while the poller and
-        # bridge write. The mode is stored in the file, so this is a no-op
-        # after the first open. busy_timeout makes a briefly contended
-        # write wait instead of failing at once.
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._switch_to_wal()
+        # busy_timeout makes a briefly contended write wait instead of
+        # failing at once.
         self._conn.execute("PRAGMA busy_timeout=5000")
         # An in-memory database reports an empty file name. A second
         # connection to it would be a different, empty database, so event
@@ -229,6 +231,38 @@ class StateDB:
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._conn.commit()
+
+    def _switch_to_wal(self) -> None:
+        """Put the file in WAL mode if it is not already, never failing.
+
+        WAL lets the read-only status page read while the poller and
+        bridge write. The mode is stored in the file, so after the first
+        successful switch this is a no-op. The switch itself needs an
+        exclusive lock: on a database still in rollback-journal mode, the
+        other daemon process holding a read makes it fail with "database
+        is locked". So it waits at most ``WAL_SWITCH_TIMEOUT_MS`` and, if
+        still locked, logs ``state.wal_switch_deferred`` and carries on in
+        the current mode; the next start tries again. Every reader and
+        writer here works in either mode.
+        """
+        self._conn.execute(f"PRAGMA busy_timeout={WAL_SWITCH_TIMEOUT_MS}")
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as exc:
+            mode = self._conn.execute("PRAGMA journal_mode").fetchone()[0]
+            _logger.warning(
+                "state.wal_switch_deferred",
+                extra={
+                    "db_path": str(self.db_path),
+                    "journal_mode": mode,
+                    "error": str(exc),
+                    "detail": (
+                        "another process held the database while this one "
+                        "started; running in the current journal mode, the "
+                        "next start tries WAL again"
+                    ),
+                },
+            )
 
     def _migrate(self) -> None:
         """Apply in-place schema additions to databases written by older versions.
@@ -536,7 +570,17 @@ class StateDB:
         itself opens a transaction, so asking afterwards always answers
         "one is open" and the commit would never run — a guard that
         cannot fire, in the fix for a guard that fired too often.
+
+        When the row is already there nothing is written at all. An
+        ``INSERT OR IGNORE`` that ignores still takes a write lock and its
+        commit needs an exclusive one, so on a rollback-journal database
+        (one whose WAL switch was deferred) a daemon starting while the
+        other holds a read would fail here instead.
         """
+        if self._conn.execute(
+            "SELECT 1 FROM dispatch_health WHERE id = 1"
+        ).fetchone() is not None:
+            return
         joined = self._conn.in_transaction
         self._conn.execute(
             "INSERT OR IGNORE INTO dispatch_health "
