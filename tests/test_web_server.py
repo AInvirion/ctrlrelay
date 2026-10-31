@@ -44,7 +44,8 @@ HOSTILE_TITLE = "<img src=x onerror=alert(1)>"
 HOSTILE_FILE = '"><script>alert(1)<'
 TOP_KEYS = {
     "version", "host", "generated", "generated_ts", "running", "needs_you",
-    "waiting", "today", "feed", "feed_total", "feed_truncated", "errors",
+    "waiting", "today", "feed", "feed_total", "feed_truncated", "feed_limit",
+    "errors",
 }
 
 

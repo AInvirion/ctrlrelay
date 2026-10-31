@@ -36,9 +36,10 @@ Contract (keys exactly; every timestamp is ``<name>_ts`` epoch seconds plus
                "detail"}] | null,   # newest first, at most FEED_LIMIT
      "feed_total": int | null,       # events in the history window
      "feed_truncated": bool,         # feed_total > len(feed)
+     "feed_limit": int,              # the most events feed can hold
      "errors": [str]}
 
-``feed`` holds at most ``FEED_LIMIT`` events. ``feed_total`` counts every
+``feed`` holds at most ``feed_limit`` (``FEED_LIMIT``) events. ``feed_total`` counts every
 event in the history window, read in the same transaction; it is ``null``
 whenever ``feed`` is, and ``feed_truncated`` is then ``false``.
 
@@ -496,6 +497,7 @@ def build_status(
     errors: list[str] = []
     day_start, day_end = _local_day(now)
     feed_since = now - history_days * 86_400
+    feed_limit = FEED_LIMIT
 
     def read_all(conn: sqlite3.Connection) -> dict[str, Any]:
         section_errors: list[str] = []
@@ -516,7 +518,7 @@ def build_status(
                 section_errors, "events", lambda: _read_today(conn, day_start, day_end)
             ),
             "feed": _section(
-                section_errors, "events", lambda: _read_feed(conn, feed_since, FEED_LIMIT)
+                section_errors, "events", lambda: _read_feed(conn, feed_since, feed_limit)
             ),
             "errors": section_errors,
         }
@@ -576,6 +578,7 @@ def build_status(
         "feed_total": feed_total,
         "feed_truncated": feed is not None and feed_total is not None
         and feed_total > len(feed),
+        "feed_limit": feed_limit,
         "errors": errors,
     }
 

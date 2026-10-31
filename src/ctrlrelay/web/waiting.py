@@ -337,7 +337,8 @@ class WaitingTracker:
             return
         # Published only now, with the line: a refresh that fails at any
         # step (the sessions read, a self-assignment check) keeps the
-        # previous titles as well as the previous line.
+        # previous titles and the previous items, and marks the line
+        # unknown.
         self._titles = titles
         self._last_good = [_item_dict(i) for i in items]
         self._last_good_ts = now

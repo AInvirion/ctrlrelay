@@ -48,7 +48,8 @@ WAITING_OK = {
 
 TOP_KEYS = {
     "version", "host", "generated", "generated_ts", "running", "needs_you",
-    "waiting", "today", "feed", "feed_total", "feed_truncated", "errors",
+    "waiting", "today", "feed", "feed_total", "feed_truncated", "feed_limit",
+    "errors",
 }
 RUNNING_KEYS = {
     "session_id", "pipeline", "repo", "issue_number", "title", "started",
@@ -488,6 +489,7 @@ def test_a_feed_over_the_limit_says_it_was_cut_and_by_how_much(
     assert [e["issue_number"] for e in out["feed"]] == [2, 1]
     assert out["feed_total"] == 3
     assert out["feed_truncated"] is True
+    assert out["feed_limit"] == 2
 
 
 def test_a_feed_within_the_limit_is_not_truncated(tmp_path: Path) -> None:
@@ -501,6 +503,7 @@ def test_a_feed_within_the_limit_is_not_truncated(tmp_path: Path) -> None:
     assert len(out["feed"]) == 2
     assert out["feed_total"] == 2
     assert out["feed_truncated"] is False
+    assert out["feed_limit"] == status_module.FEED_LIMIT
 
 
 def test_an_unreadable_feed_has_an_unknown_total(tmp_path: Path) -> None:
@@ -514,6 +517,7 @@ def test_an_unreadable_feed_has_an_unknown_total(tmp_path: Path) -> None:
     missing = build_status(db_path=tmp_path / "nope.db", waiting=WAITING_OK,
                            version="1", host="h", now=2_000, home=tmp_path)
     assert missing["feed_total"] is None and missing["feed_truncated"] is False
+    assert missing["feed_limit"] == status_module.FEED_LIMIT
 
 
 def test_list_feed_reports_its_limit_total_and_truncation(tmp_path: Path) -> None:
