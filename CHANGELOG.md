@@ -22,7 +22,8 @@ defaults, so **no config edit is required** to upgrade.
   git's SSH disabled, and the D-Bus and runtime-dir variables pointed away
   from the desktop keyring. After the agent exits the
   relay pushes the run branch from a relay-private git dir to an explicit
-  GitHub URL, opens the PR from the DONE checkpoint, pushes fix rounds,
+  GitHub URL, opens the PR from the DONE checkpoint (or reuses an open PR on the run
+  branch), pushes fix rounds,
   fetches failed CI logs and posts task reports. It refuses to push the
   default branch and only overwrites a remote branch whose head it recorded
   pushing. secops keeps GitHub access (#235, closes #219)
