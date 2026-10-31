@@ -56,8 +56,14 @@ _TOKEN_SHAPES = [
     re.compile(r"\bsk-[A-Za-z0-9_-]+"),
     re.compile(r"\bxox[abp]-[A-Za-z0-9-]+"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"[A-Za-z0-9+/=_-]{32,}"),
 ]
+# A long run with no "/" (so paths keep their shape). Hyphenated names such as
+# a worktree folder are long too, so only a run holding an unbroken 20+ stretch
+# of token characters counts: hex digests and base64 do, words do not.
+_LONG_RUN = re.compile(r"[A-Za-z0-9+=_-]{32,}")
+_UNBROKEN = re.compile(r"[A-Za-z0-9+=]{20,}")
+# `mysql -pSECRET`, `psql -pSECRET`: the password glued to the flag.
+_GLUED_PASSWORD = re.compile(r"(\b(?:mysql|psql)\b[^;&|\n]*?\s-p)(?=[^\s;&|])[^\s;&|]+")
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
 
 # Shell separators that start a new command, and words that only wrap one.
@@ -77,13 +83,15 @@ def redact(text: str) -> str:
         name, sep, value = m.groups()
         if value.startswith("-"):
             return m.group(0)
-        if name == "-p" or _SECRET_NAME.search(name.lstrip("-")):
+        if _SECRET_NAME.search(name.lstrip("-")):
             return f"{name}{sep}{MASK}"
         return m.group(0)
 
     text = _TOKEN_SHAPES[0].sub(f"Bearer {MASK}", text)
     for shape in _TOKEN_SHAPES[1:]:
         text = shape.sub(MASK, text)
+    text = _LONG_RUN.sub(lambda m: MASK if _UNBROKEN.search(m.group(0)) else m.group(0), text)
+    text = _GLUED_PASSWORD.sub(lambda m: m.group(1) + MASK, text)
     text = _ASSIGNMENT.sub(assignment, text)
     return _FLAG.sub(flag, text)
 

@@ -259,7 +259,18 @@ def test_last_command_truncated_to_200(tmp_path: Path) -> None:
         ),
         ("curl --token abc123 https://x", "curl --token *** https://x"),
         ("tool --auth-token=xyz run", "tool --auth-token=*** run"),
-        ("mysql -p hunter2 db", "mysql -p *** db"),
+        ("mysql -u app -pHunter2 db", "mysql -u app -p*** db"),
+        ("psql -pHunter2 db", "psql -p*** db"),
+        ("tool --password hunter2 run", "tool --password *** run"),
+        ("pytest -p no:warnings -q", "pytest -p no:warnings -q"),
+        (
+            "cat /home/u/.ctrlrelay/worktrees/example-org-alpha-service-dev-example-org"
+            "-alpha-service-304-c1446f76/src/app.py",
+            "cat /home/u/.ctrlrelay/worktrees/example-org-alpha-service-dev-example-org"
+            "-alpha-service-304-c1446f76/src/app.py",
+        ),
+        ("git show 5bf7858dbe7a3e679e17b9176ae099f225b76c77", "git show ***"),
+        ("curl https://x/r/" + "a1B2" * 10 + "/raw", "curl https://x/r/***/raw"),
         ("git clone https://ghp_abcdef123@x/r", "git clone https://***@x/r"),
         ("echo gho_abc ghs_def github_pat_11ABC_def", "echo *** *** ***"),
         ("echo sk-proj-abc123", "echo ***"),
