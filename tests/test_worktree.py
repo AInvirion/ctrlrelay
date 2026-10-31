@@ -1708,21 +1708,15 @@ class TestFetchSurvivesRewrittenBranches:
             await wt.ensure_bare_repo("owner/repo")
 
 
-    @pytest.mark.asyncio
-    async def test_force_pushed_default_branch_still_raises(
-        self, tmp_path: Path
-    ) -> None:
-        """Sessions are cut from the default branch. If origin rewrote it,
-        tolerating the rejection would run every session on a tree origin
-        no longer has — quietly, instead of loudly."""
+    def _diverged_setup(self, tmp_path: Path, monkeypatch):
+        """A managed bare clone whose main diverged from origin's: origin
+        rewrote main and the clone holds its own commit on it. Clones
+        come from the local origin instead of github.com."""
         import subprocess
 
-        from ctrlrelay.core.worktree import WorktreeError, WorktreeManager
+        from ctrlrelay.core.worktree import WorktreeManager
 
         origin, bare = self._build_repos(tmp_path)
-
-        # Rewrite main on origin, and give the bare clone its own commit
-        # on main so the two have diverged.
         self._git("checkout", "-q", "main", cwd=origin)
         (origin / "f").write_text("rewritten\n")
         self._git("commit", "-qam", "x", cwd=origin)
@@ -1730,13 +1724,14 @@ class TestFetchSurvivesRewrittenBranches:
                   cwd=origin)
         tree = self._git("rev-parse", "refs/heads/main^{tree}",
                          cwd=bare).strip()
-        sha = self._git("commit-tree", tree, "-p", "refs/heads/main",
-                        "-m", "local main", cwd=bare).strip()
-        self._git("update-ref", "refs/heads/main", sha, cwd=bare)
+        local = self._git("commit-tree", tree, "-p", "refs/heads/main",
+                          "-m", "local main", cwd=bare).strip()
+        self._git("update-ref", "refs/heads/main", local, cwd=bare)
 
         wt = WorktreeManager(
             worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos",
         )
+        monkeypatch.setattr(wt, "_clone_url", lambda repo: str(origin))
         target = wt._get_bare_repo_path("owner/repo")
         target.parent.mkdir(parents=True, exist_ok=True)
         bare.rename(target)
@@ -1744,9 +1739,80 @@ class TestFetchSurvivesRewrittenBranches:
             ["git", "remote", "set-url", "origin", str(origin)],
             cwd=target, check=True,
         )
+        return wt, origin, target, local
 
-        with pytest.raises(WorktreeError, match="default branch diverged"):
+    @pytest.mark.asyncio
+    async def test_diverged_default_branch_is_set_aside_and_recloned(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """#234: a repo whose history was replaced used to fail every run
+        until the clone was moved by hand. Now the clone is moved aside,
+        nothing in it lost, and a fresh one matches origin."""
+        wt, origin, target, local = self._diverged_setup(tmp_path, monkeypatch)
+        told: list[tuple[str, Path]] = []
+
+        async def on_reclone(repo: str, aside: Path) -> None:
+            told.append((repo, aside))
+
+        wt.on_reclone = on_reclone
+
+        assert await wt.ensure_bare_repo("owner/repo") == target
+
+        assert self._sha(target, "refs/heads/main") == self._git(
+            "rev-parse", "refs/heads/main", cwd=origin).strip()
+        asides = sorted(target.parent.glob("owner-repo.git.replaced-*"))
+        assert len(asides) == 1
+        assert self._sha(asides[0], "refs/heads/main") == local
+        assert told == [("owner/repo", asides[0])]
+
+    @pytest.mark.asyncio
+    async def test_reclone_is_refused_while_a_worktree_uses_the_clone(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A BLOCKED session keeps its worktree for the resume. Moving the
+        clone would cut it off, so the old loud failure stands."""
+        from ctrlrelay.core.worktree import DefaultBranchDivergedError
+
+        wt, _origin, target, local = self._diverged_setup(tmp_path, monkeypatch)
+        held = tmp_path / "wt" / "held"
+        self._git("worktree", "add", "-q", "-b", "held", str(held), "main",
+                  cwd=target)
+
+        with pytest.raises(DefaultBranchDivergedError,
+                           match="(?s)default branch diverged.*worktree"):
             await wt.ensure_bare_repo("owner/repo")
+
+        assert self._sha(target, "refs/heads/main") == local
+        assert not list(target.parent.glob("owner-repo.git.replaced-*"))
+
+    @pytest.mark.asyncio
+    async def test_a_failed_reclone_puts_the_old_clone_back(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from ctrlrelay.core.worktree import WorktreeError
+
+        wt, _origin, target, local = self._diverged_setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(wt, "_clone_url",
+                            lambda repo: str(tmp_path / "nowhere"))
+
+        with pytest.raises(WorktreeError):
+            await wt.ensure_bare_repo("owner/repo")
+
+        assert self._sha(target, "refs/heads/main") == local
+        assert not list(target.parent.glob("owner-repo.git.replaced-*"))
+
+    @pytest.mark.asyncio
+    async def test_a_failing_reclone_notice_does_not_fail_the_run(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        wt, _origin, target, _local = self._diverged_setup(tmp_path, monkeypatch)
+
+        async def broken(repo: str, aside: Path) -> None:
+            raise RuntimeError("chat is down")
+
+        wt.on_reclone = broken
+
+        assert await wt.ensure_bare_repo("owner/repo") == target
 
 
 class TestNonFastForwardClassifier:

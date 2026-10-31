@@ -509,3 +509,25 @@ The poller's seen-issue state is a JSON file at
 `<state_db_dir>/poller_state.json`. If you want to force the poller to
 re-process a specific issue, delete its number from `seen_issues[<repo>]` (or
 delete the file entirely to reseed from scratch on next start).
+
+A run that fails **before the agent starts** (reading the issue, posting
+the claim comment, cloning, cutting the worktree) does not use the issue
+up. The issue is un-marked and tried again on the next poll, up to 3 runs
+in all, with a chat message each time. After the third it stays in
+`seen_issues` and the message says so; fix the cause, then delete the
+number as above. The count is kept in `pre_dispatch_failures` in the same
+file, so a restart does not reset it. Each retry posts a fresh claim
+comment and, when it fails, a fresh "nothing is working on this" comment
+on the issue.
+
+### A repo whose history was replaced
+
+If the local copy's default branch can no longer fast-forward to GitHub's
+(the repo was replaced by a new one with the same name, or its default
+branch was force-pushed), ctrlrelay moves the copy to
+`~/.ctrlrelay/repos/<owner>-<repo>.git.replaced-<UTC time>`, clones again,
+and says so in chat. Nothing is deleted: remove the old copy once you do
+not need it. This is refused while any worktree still uses the copy (a
+blocked session keeps its worktree for the resume); the run then fails
+with `default branch diverged ... not re-cloning while N worktree(s) still
+use it`, and you can finish or clean up that session first.

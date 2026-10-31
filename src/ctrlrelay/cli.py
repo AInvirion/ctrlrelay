@@ -1029,6 +1029,93 @@ def persist_dispatch_outcome(state_db, outcome) -> bool:
     return wrote
 
 
+# Runs of one issue that may fail before the agent starts before the
+# poller stops retrying it (#234).
+PRE_DISPATCH_ATTEMPTS = 3
+
+
+def pre_dispatch_failure_message(
+    repo: str, issue_number: int, error: str, *, attempts: int, retrying: bool,
+) -> str:
+    """The chat line for a run that failed before the agent started."""
+    why = (error.strip().splitlines() or ["no error recorded"])[0][:200]
+    if retrying:
+        return (
+            f"\u23f3 #{issue_number} in {repo} failed before the agent "
+            f"started (try {attempts} of {PRE_DISPATCH_ATTEMPTS}): {why}. "
+            "Will retry on the next poll."
+        )
+    return (
+        f"\u274c #{issue_number} in {repo} failed before the agent started "
+        f"{attempts} times; not retrying. Last error: {why}. Fix the cause, "
+        "then remove the issue number from seen_issues in "
+        "poller_state.json to try again."
+    )
+
+
+def settle_pre_dispatch_failure(poller, repo: str, issue_number: int, result):
+    """Decide what a finished run means for retrying its issue (#234).
+
+    A run that failed before the agent started is counted; below
+    ``PRE_DISPATCH_ATTEMPTS`` the issue is un-marked so the next poll
+    runs it again, and at the limit it stays seen and the count is
+    dropped. Returns the chat line for that case. Any other result
+    (the agent ran, or the run succeeded) clears the count and returns
+    ``None`` so the caller carries on as before.
+    """
+    if (
+        result.success
+        or result.blocked
+        or not result.outputs.get("failed_before_dispatch")
+    ):
+        poller.clear_pre_dispatch_failures(repo, issue_number)
+        return None
+    attempts = poller.record_pre_dispatch_failure(repo, issue_number)
+    retrying = attempts < PRE_DISPATCH_ATTEMPTS
+    if retrying:
+        poller.unmark_seen(repo, issue_number)
+    else:
+        poller.clear_pre_dispatch_failures(repo, issue_number)
+    return pre_dispatch_failure_message(
+        repo, issue_number, result.error or "",
+        attempts=attempts, retrying=retrying,
+    )
+
+
+def reclone_message(repo: str, set_aside: Path) -> str:
+    """The chat line for a clone that was set aside and cloned again
+    (#234). Names where the old copy went, because nothing deletes it."""
+    return (
+        f"\u267b\ufe0f {repo}: the local copy no longer matched GitHub "
+        "(history replaced or the default branch force-pushed), so it was "
+        f"cloned again. The old copy is at {set_aside}; delete it once you "
+        "do not need it."
+    )
+
+
+def make_reclone_notice(config):
+    """``WorktreeManager.on_reclone`` for the daemon: one bounded chat
+    message per re-clone, resolved at use like every other notice."""
+
+    async def notice(repo: str, set_aside: Path) -> None:
+        transport = await connect_notify_transport(config)
+        if transport is None:
+            _log_quietly(
+                "worktree.reclone_notice_undelivered", repo=repo,
+                detail="no channel to say the clone was set aside",
+            )
+            return
+        try:
+            await asyncio.wait_for(
+                transport.send(reclone_message(repo, set_aside)),
+                timeout=_NOTIFY_SEND_TIMEOUT_SECONDS,
+            )
+        finally:
+            _close_notify_transport(transport)
+
+    return notice
+
+
 async def send_relay_alert(config, alert) -> bool:
     """Post one relay-health alert on the chat transport.
 
@@ -2470,6 +2557,7 @@ def poller_start(
         worktree = WorktreeManager(
             worktrees_dir=config.paths.worktrees,
             bare_repos_dir=config.paths.bare_repos,
+            on_reclone=make_reclone_notice(config),
         )
 
         # Report the notification channel at startup; do not DECIDE it
@@ -2777,6 +2865,24 @@ def poller_start(
                                 f"⏳ #{issue_number} in {repo} "
                                 "deferred (repo busy); will retry."
                             )
+                        except Exception:
+                            pass
+                    return
+
+                # Failed before the agent started (#234): the clone, the
+                # worktree, the issue read. Nothing ran, so retrying is
+                # safe, and the cause is often fixed by the next poll (a
+                # network blip) or by an operator. Bounded so a permanent
+                # cause does not loop: after the last attempt the issue
+                # stays seen and the operator is told why.
+                message = settle_pre_dispatch_failure(
+                    poller, repo, issue_number, result,
+                )
+                if message is not None:
+                    console.print(f"[yellow]{message}[/yellow]")
+                    if connected_transport is not None:
+                        try:
+                            await connected_transport.send(message)
                         except Exception:
                             pass
                     return
