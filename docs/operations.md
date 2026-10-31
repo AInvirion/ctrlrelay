@@ -327,6 +327,72 @@ web:
 `grep misdirected_host ~/.ctrlrelay/logs/web.log` shows any name that was
 refused, which is the quickest way to find the one to add.
 
+## Several machines on one account
+
+Two or more machines can run ctrlrelay against the same repositories under
+the same GitHub account. Each machine's seen-list and run lock are its own,
+so the claim comment on the issue is what keeps two machines off one issue.
+
+**The claim.** Before a dev or task run starts, the machine posts a comment
+naming itself:
+
+```
+Taken by ctrlrelay on **node-a**. It is working on this issue; ...
+
+<!-- ctrlrelay:claimed node=node-a id=3f9c0a1b2c4d state=working seen=... -->
+```
+
+`node` is the config's `node_id` (the hostname by default). Give every
+machine a different one. Only comments by the account the relay runs as
+count; a marker pasted by anyone else is ignored.
+
+**The race check.** Two machines can see a new issue in the same poll. Each
+posts its claim, waits `claims.race_wait_seconds`, and reads the comments
+again. The live claim with the lowest comment id wins: GitHub numbers the
+comments, so no machine's clock decides. The loser posts "Backing off:
+ctrlrelay on node-a has this issue" and drops it.
+
+**Skipping.** A machine that finds another machine's live claim does not
+start the run and does not announce the issue in chat. It logs
+`claims.skipped` with the owner.
+
+**The stale rule.** While a run works, its machine edits the claim every
+`claims.refresh_seconds`, which moves the comment's `updated_at`. A
+`working` claim not refreshed for `claims.stale_after_seconds` is stale:
+that machine is treated as stopped, and another machine may take the issue
+(its claim says whose claim it replaced). A skipping machine looks again at
+exactly the time the claim could go stale, not on every poll.
+
+When the run ends:
+
+- **finished, or waiting for an answer**: the claim is marked `held`. A held
+  claim never goes stale, so a long wait for an answer never hands the issue
+  to another machine.
+- **failed**: the failure comment releases that one claim
+  (`<!-- ctrlrelay:released id=... -->`), and the issue is free again.
+
+A claim from a version before this (`<!-- ctrlrelay:claimed -->` with no
+machine name) counts as taken by `unknown` and never goes stale.
+
+To free an issue by hand, delete the claim comment.
+
+| setting | default | |
+|---|---|---|
+| `claims.race_wait_seconds` | `5` | wait between posting a claim and reading it back |
+| `claims.refresh_seconds` | `300` | how often a working machine refreshes its claim |
+| `claims.stale_after_seconds` | `1800` | a working claim older than this is stale; must be at least three refreshes |
+
+Limits to know:
+
+- The stale time compares GitHub's `updated_at` with this machine's clock.
+  Keep clocks in sync (NTP); half an hour is far above normal drift.
+- A machine that loses GitHub for longer than the stale time while its run
+  keeps working can have the issue taken over. Raise
+  `claims.stale_after_seconds` if that is likely.
+- Mixed versions: a machine on a version before this one reads every
+  failure comment as ending every claim, including another machine's.
+  Upgrade all machines together.
+
 ## Scheduled jobs
 
 The poller daemon also hosts an in-process cron (APScheduler). The jobs run

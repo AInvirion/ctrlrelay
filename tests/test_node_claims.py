@@ -324,3 +324,191 @@ class TestKeeper:
         thread.comments.clear()  # the comment was deleted
         keeper = ClaimKeeper(thread, REPO, a.claim, settings("node-a"), clock=clock)
         await keeper.hold()  # logged, not raised
+
+
+# --- Through run_dev_issue: two machines, one account, one issue -----------
+
+from contextlib import ExitStack  # noqa: E402
+from pathlib import Path  # noqa: E402
+from unittest.mock import AsyncMock, patch  # noqa: E402
+
+from tests.test_claim_reconciliation import _dev_issue_harness  # noqa: E402
+
+
+def _machine(tmp_path: Path, thread: Thread, *, checkpoint, exit_code):
+    """One machine: its own clone dir, state DB and mocks, sharing the
+    issue thread with every other machine in the test."""
+    from ctrlrelay.core.state import StateDB
+
+    tmp_path.mkdir(parents=True)
+    worktree, github, dispatcher = _dev_issue_harness(
+        tmp_path, checkpoint=checkpoint, exit_code=exit_code,
+    )
+    github.list_issue_comments.side_effect = thread.list_issue_comments
+    github.post_issue_comment.side_effect = thread.post_issue_comment
+    github.edit_issue_comment.side_effect = thread.edit_issue_comment
+
+    async def comment_on_issue(repo, issue_number, body):
+        thread.add(body)
+
+    github.comment_on_issue.side_effect = comment_on_issue
+    stack = ExitStack()
+    for name in (
+        "ensure_bare_repo", "remove_worktree", "delete_branch",
+        "branch_exists_locally", "branch_exists_on_remote",
+    ):
+        stack.enter_context(
+            patch.object(worktree, name, new_callable=AsyncMock, return_value=False)
+        )
+    stack.enter_context(patch.object(worktree, "symlink_context"))
+    stack.enter_context(patch.object(worktree, "remove_context_symlink"))
+    stack.enter_context(patch.object(
+        worktree, "push_run_branch", new_callable=AsyncMock, return_value="c0ffee",
+    ))
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    stack.enter_context(patch.object(
+        worktree, "create_worktree_with_new_branch",
+        new_callable=AsyncMock, return_value=(wt, True),
+    ))
+    return stack, worktree, github, dispatcher, StateDB(tmp_path / "state.db")
+
+
+async def _run(machine, node: str, tmp_path: Path):
+    from ctrlrelay.pipelines.dev import run_dev_issue
+
+    stack, worktree, github, dispatcher, state_db = machine
+    with stack:
+        try:
+            return await run_dev_issue(
+                claims=settings(node, race_wait_seconds=0),
+                repo=REPO,
+                issue_number=853,
+                branch_template="fix/issue-{n}",
+                dispatcher=dispatcher,
+                github=github,
+                worktree=worktree,
+                dashboard=None,
+                state_db=state_db,
+                transport=None,
+                contexts_dir=tmp_path / "contexts",
+            )
+        finally:
+            state_db.close()
+
+
+BLOCKED = {"status": "BLOCKED_NEEDS_INPUT", "question": "which one?"}
+
+
+class TestTwoMachinesThroughTheDevRun:
+    @pytest.mark.asyncio
+    async def test_exactly_one_machine_runs_the_issue(self, tmp_path: Path) -> None:
+        thread = Thread(Clock())
+        a = _machine(tmp_path / "a", thread, checkpoint=BLOCKED, exit_code=0)
+        b = _machine(tmp_path / "b", thread, checkpoint=BLOCKED, exit_code=0)
+        ra, rb = await asyncio.gather(
+            _run(a, "node-a", tmp_path / "a"), _run(b, "node-b", tmp_path / "b"),
+        )
+        spawns = a[3].spawn_session.await_count + b[3].spawn_session.await_count
+        assert spawns == 1
+        ran, skipped = (ra, rb) if a[3].spawn_session.await_count else (rb, ra)
+        winner = "node-a" if ran is ra else "node-b"
+        assert ran.blocked
+        assert skipped.outputs["claimed_by"] == winner
+        # The run is waiting on a question: the claim is held, so it is
+        # never taken over however long the answer takes.
+        [claim] = live_claims(thread.comments, settings("node-c"), 10**10)
+        assert (claim.node, claim.state) == (winner, HELD)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_run_releases_only_its_own_claim(self, tmp_path: Path) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = _machine(tmp_path / "a", thread, checkpoint=None, exit_code=1)
+        result = await _run(a, "node-a", tmp_path / "a")
+        assert not result.success
+        assert other_owner(thread.comments, settings("node-b"), clock()) is None
+        claim_id = parse_claims(thread.comments[:1], ACCOUNT)[0].claim_id
+        assert release_marker(claim_id) in thread.comments[-1]["body"]
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_issue_is_looked_at_again_when_the_claim_could_go_stale(
+        self, tmp_path: Path,
+    ) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        thread.add(claim_body("node-a", "aaa", WORKING, clock()))
+        b = _machine(tmp_path / "b", thread, checkpoint=None, exit_code=0)
+        result = await _run(b, "node-b", tmp_path / "b")
+        assert result.outputs["claimed_by"] == "node-a"
+        assert result.outputs["recheck_at"] == clock() + 1800
+        assert b[3].spawn_session.await_count == 0
+        assert len(thread.comments) == 1
+
+
+class TestThePollerLooksAgainWhenTheClaimCouldGoStale:
+    def _poller(self, tmp_path: Path):
+        from unittest.mock import MagicMock
+
+        from ctrlrelay.core.poller import IssuePoller
+
+        gh = MagicMock()
+        gh.list_assigned_issues = AsyncMock(return_value=[{"number": 7, "title": "t"}])
+        gh.list_issues_by_label = AsyncMock(return_value=[])
+        gh.list_assignment_events = AsyncMock(return_value=[{
+            "event": "assigned", "actor": {"login": "alice"},
+            "assignee": {"login": "alice"},
+        }])
+        return IssuePoller(
+            github=gh, username="alice", repos=["o/r"],
+            state_file=tmp_path / "poller_state.json",
+        )
+
+    @pytest.mark.asyncio
+    async def test_not_before_the_recheck_time_and_again_after_it(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        import ctrlrelay.core.poller as poller_mod
+        from ctrlrelay.cli import settle_claimed_elsewhere
+
+        now = [1000.0]
+        monkeypatch.setattr(poller_mod.time, "time", lambda: now[0])
+        poller = self._poller(tmp_path)
+        assert [i["issue"]["number"] for i in await poller.poll()] == [7]
+
+        line = settle_claimed_elsewhere(poller, "o/r", 7, "node-a", 2800.0)
+        assert "node-a" in line
+        now[0] = 2799.0
+        assert await poller.poll() == []
+        now[0] = 2800.0
+        assert [i["issue"]["number"] for i in await poller.poll()] == [7]
+
+    @pytest.mark.asyncio
+    async def test_a_claim_that_never_goes_stale_keeps_the_issue_seen(
+        self, tmp_path: Path,
+    ) -> None:
+        from ctrlrelay.cli import settle_claimed_elsewhere
+
+        poller = self._poller(tmp_path)
+        await poller.poll()
+        settle_claimed_elsewhere(poller, "o/r", 7, "node-a", None)
+        assert await poller.poll() == []
+        assert 7 in poller.seen_issues["o/r"]
+
+
+class TestClaimsConfig:
+    def test_defaults(self) -> None:
+        from ctrlrelay.core.config import ClaimsConfig
+
+        c = ClaimsConfig()
+        assert (c.race_wait_seconds, c.refresh_seconds, c.stale_after_seconds) == (
+            5.0, 300.0, 1800.0,
+        )
+
+    def test_one_missed_refresh_cannot_make_a_live_run_look_stopped(self) -> None:
+        from pydantic import ValidationError
+
+        from ctrlrelay.core.config import ClaimsConfig
+
+        with pytest.raises(ValidationError, match="three times"):
+            ClaimsConfig(refresh_seconds=300, stale_after_seconds=600)

@@ -13,6 +13,16 @@ from pathlib import Path
 from typing import Any
 
 from ctrlrelay.core.checkpoint import CheckpointStatus
+from ctrlrelay.core.claims import (
+    CLAIM_MARKER_PREFIX,
+    DISPATCH_FAILED_MARKER,
+    RELEASE_MARKER_PREFIX,
+    ClaimKeeper,
+    ClaimOutcome,
+    ClaimSettings,
+    acquire_claim,
+    release_marker,
+)
 from ctrlrelay.core.code_review import (
     extract_verdict,
     format_review_comment,
@@ -245,13 +255,18 @@ AGENT_CLAIM_COMMENT = (
 # comment is NOT deleted: deleting it would lose the record that the
 # issue was taken, and `format_issue_comments` already drops both
 # markers from the prompt so neither becomes agent input.
-AGENT_OUTCOME_MARKER = "<!-- ctrlrelay:dispatch-failed -->"
+AGENT_OUTCOME_MARKER = DISPATCH_FAILED_MARKER
 
 # Every marker that identifies a comment the relay wrote itself. Read by
 # `format_issue_comments` so none of our own prose is ever fed back to an
 # agent as though an operator had written it. One tuple, so adding a
 # marker is one edit rather than one edit plus remembering this filter.
-OUR_COMMENT_MARKERS = (AGENT_CLAIM_MARKER, AGENT_OUTCOME_MARKER)
+OUR_COMMENT_MARKERS = (
+    AGENT_CLAIM_MARKER,
+    AGENT_OUTCOME_MARKER,
+    CLAIM_MARKER_PREFIX,
+    RELEASE_MARKER_PREFIX,
+)
 
 
 def claim_is_live(comments: list[dict[str, Any]] | None) -> bool:
@@ -290,6 +305,7 @@ def claim_failure_comment(
     reason: str,
     exit_code: int | None,
     pr_number: int | None = None,
+    claim_id: str | None = None,
 ) -> str:
     """The comment that reconciles the claim with a failed outcome.
 
@@ -337,6 +353,45 @@ def claim_failure_comment(
         f"- Reason: {reason}\n\n"
         f"{next_step}\n\n"
         f"{AGENT_OUTCOME_MARKER}"
+        # With a claim id it releases that one claim only (#245). Without
+        # one it ends every claim above it, which on a shared account
+        # would free another machine's claim too.
+        + (f"\n{release_marker(claim_id)}" if claim_id else "")
+    )
+
+
+def claimed_elsewhere_result(
+    session_id: str,
+    repo: str,
+    issue_number: int,
+    outcome: ClaimOutcome,
+    settings: ClaimSettings,
+) -> PipelineResult:
+    """The result for an issue another machine holds (#245).
+
+    ``recheck_at`` is when that claim could go stale, so the poller looks
+    again then; ``None`` means it never will (held, or from before
+    #245).
+    """
+    owner = outcome.owner
+    assert owner is not None
+    log_event(
+        _logger,
+        "claims.skipped",
+        repo=repo,
+        issue_number=issue_number,
+        node=settings.node,
+        owner=owner.node,
+    )
+    return PipelineResult(
+        success=False,
+        session_id=session_id,
+        summary=f"#{issue_number} in {repo} is claimed by {owner.node}",
+        error=f"claimed by {owner.node}",
+        outputs={
+            "claimed_by": owner.node,
+            "recheck_at": owner.stale_at(settings.stale_after_seconds),
+        },
     )
 
 
@@ -350,6 +405,7 @@ async def reconcile_claim_on_failure(
     exit_code: int | None,
     pr_number: int | None = None,
     claim_posted: bool = True,
+    claim_id: str | None = None,
 ) -> bool:
     """Post the retraction. Returns whether a comment was written.
 
@@ -376,6 +432,7 @@ async def reconcile_claim_on_failure(
                 reason=reason,
                 exit_code=exit_code,
                 pr_number=pr_number,
+                claim_id=claim_id,
             ),
         )
     except asyncio.CancelledError:
@@ -1514,8 +1571,15 @@ async def run_dev_issue(
     pr_verifier: PRVerifier | None = None,
     ci_wait_timeout_seconds: int = 600,
     code_review: Any = None,
+    *,
+    claims: ClaimSettings | None,
 ) -> PipelineResult:
-    """Run dev pipeline for a single issue."""
+    """Run dev pipeline for a single issue.
+
+    ``claims`` is required so no caller drops the shared-account claim
+    by omission (#245). ``None`` is the single-machine behaviour: the
+    unnamed claim, with no race check.
+    """
     session_id = f"dev-{repo.replace('/', '-')}-{issue_number}-{uuid.uuid4().hex[:8]}"
     branch_name = branch_template.replace("{n}", str(issue_number))
 
@@ -1574,6 +1638,10 @@ async def run_dev_issue(
     # stale claim from an earlier run is just as wrong, and the reader
     # of the issue cannot tell them apart.
     claim_may_stand = False
+    # Set once this machine has won the claim (#245). Refreshed while the
+    # run works, held when it stops, released by id when it fails.
+    keeper: ClaimKeeper | None = None
+    claim_id: str | None = None
 
     # The last exit code a worker actually reported, for the exception
     # path's reconciliation comment. The exception path used to pass
@@ -1603,15 +1671,31 @@ async def run_dev_issue(
         # Post claim comment so collaborators can see the agent picked it up.
         # Skip if a previous attempt already left the marker — keeps it idempotent
         # across retries / resumed sessions.
-        existing_comments = issue.get("comments") or []
-        already_claimed = claim_is_live(existing_comments)
-        claim_may_stand = True
-        if not already_claimed:
-            await github.comment_on_issue(
-                repo=repo,
-                issue_number=issue_number,
-                body=AGENT_CLAIM_COMMENT,
-            )
+        if claims is None:
+            existing_comments = issue.get("comments") or []
+            already_claimed = claim_is_live(existing_comments)
+            claim_may_stand = True
+            if not already_claimed:
+                await github.comment_on_issue(
+                    repo=repo,
+                    issue_number=issue_number,
+                    body=AGENT_CLAIM_COMMENT,
+                )
+        else:
+            # No retraction is possible until the claim's id is known: a
+            # failure comment without one would end every claim on the
+            # issue, another machine's included. A claim whose post lost
+            # its response is never refreshed, so it goes stale instead.
+            outcome = await acquire_claim(github, repo, issue_number, claims)
+            if not outcome.won:
+                return claimed_elsewhere_result(
+                    session_id, repo, issue_number, outcome, claims,
+                )
+            assert outcome.claim is not None
+            claim_id = outcome.claim.claim_id
+            claim_may_stand = True
+            keeper = ClaimKeeper(github, repo, outcome.claim, claims)
+            keeper.start()
 
         # Issue #51: ownership is signaled by ``created_fresh`` returned
         # from create_worktree_with_new_branch. True when this call
@@ -2014,6 +2098,11 @@ async def run_dev_issue(
         # is still true — and success speaks for itself through the
         # announcement. Only a run that ended without finishing leaves
         # the claim saying something false.
+        if keeper is not None:
+            if result.success or result.blocked:
+                await keeper.hold()
+            else:
+                await keeper.stop()
         if not result.success and not result.blocked:
             pr_raw = result.outputs.get("pr_number")
             try:
@@ -2033,11 +2122,14 @@ async def run_dev_issue(
                 exit_code=result.exit_code,
                 pr_number=pr_for_comment,
                 claim_posted=claim_may_stand,
+                claim_id=claim_id,
             )
 
         return result
 
     except Exception as e:
+        if keeper is not None:
+            await keeper.stop()
         state_db.execute(
             "UPDATE sessions SET status = ?, summary = ?, ended_at = ? WHERE id = ?",
             ("failed", f"Error: {e}", int(time.time()), session_id),
@@ -2148,6 +2240,7 @@ async def run_dev_issue(
             reason=f"{type(e).__name__}: {str(e)[:200]}",
             exit_code=last_exit_code,
             claim_posted=claim_may_stand,
+            claim_id=claim_id,
         )
 
         return PipelineResult(
@@ -2166,6 +2259,11 @@ async def run_dev_issue(
         # CancelledError: if cancellation arrives during the unlocked
         # verify window, held is already False, so no stray DELETE runs.
         lock.release()
+        # A cancelled run must not leave the refresher behind: a claim
+        # that keeps being refreshed with nothing working never goes
+        # stale, so no other machine could ever take the issue.
+        if keeper is not None:
+            await keeper.stop()
 
 
 async def resume_dev_from_pending(

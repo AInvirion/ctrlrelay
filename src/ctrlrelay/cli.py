@@ -1053,6 +1053,54 @@ def pre_dispatch_failure_message(
     )
 
 
+def claim_settings(config, account: str):
+    """This machine's claim settings (#245): its ``node_id``, the account
+    the relay posts as, and the configured timings."""
+    from ctrlrelay.core.claims import ClaimSettings
+    return ClaimSettings(
+        node=config.node_id,
+        account=account,
+        race_wait_seconds=config.claims.race_wait_seconds,
+        refresh_seconds=config.claims.refresh_seconds,
+        stale_after_seconds=config.claims.stale_after_seconds,
+    )
+
+
+async def peek_claim_owner(github, repo: str, issue_number: int, settings):
+    """Another machine's live claim on the issue, or ``None``.
+
+    A cheap look before the "new issue" chat line, so a machine does not
+    announce issues it is about to skip. It is not the decision: the run
+    takes the claim with the race check either way, so a failed look
+    only costs the early exit.
+    """
+    import time as _time
+
+    from ctrlrelay.core.claims import other_owner
+    try:
+        comments = await github.list_issue_comments(repo, issue_number)
+    except Exception:
+        return None
+    return other_owner(comments, settings, _time.time())
+
+
+def settle_claimed_elsewhere(
+    poller, repo: str, issue_number: int, owner: str, recheck_at,
+) -> str:
+    """What to do with an issue another machine holds (#245).
+
+    A claim that can go stale is looked at again when it could; one that
+    cannot (held, or from before #245) stays seen. Returns the log line.
+    """
+    if recheck_at is not None:
+        poller.recheck_at(repo, issue_number, float(recheck_at))
+        return (
+            f"#{issue_number} in {repo} is claimed by {owner}; "
+            "looking again if that claim stops being refreshed."
+        )
+    return f"#{issue_number} in {repo} is claimed by {owner}; skipping."
+
+
 def settle_pre_dispatch_failure(poller, repo: str, issue_number: int, result):
     """Decide what a finished run means for retrying its issue (#234).
 
@@ -2182,7 +2230,9 @@ def run_dev(
     console.print(f"Running dev pipeline for issue #{issue} on {repo_config.name}...")
 
     async def _run():
+        account = await github.get_login()
         return await run_dev_issue(
+            claims=claim_settings(config, account),
             repo=repo_config.name,
             issue_number=issue,
             branch_template=branch_template,
@@ -2539,6 +2589,7 @@ def poller_start(
             include_labels_by_repo=include_labels_by_repo,
             require_labels_by_repo=require_labels_by_repo,
         )
+        claims = claim_settings(config, username)
 
         # NOTE: first-run seeding moved into `_main()` so the APScheduler
         # cron is registered + running BEFORE the slow seed_current() pass
@@ -2758,6 +2809,16 @@ def poller_start(
         async def handle_issue(repo: str, issue: dict) -> None:
             issue_number = issue["number"]
             title = issue.get("title", "")
+
+            owner = await peek_claim_owner(github, repo, issue_number, claims)
+            if owner is not None:
+                skipped = settle_claimed_elsewhere(
+                    poller, repo, issue_number, owner.node,
+                    owner.stale_at(claims.stale_after_seconds),
+                )
+                console.print(f"[dim]{skipped}[/dim]")
+                return
+
             console.print(
                 f"[green]New issue detected:[/green] #{issue_number} in {repo} — {title}"
             )
@@ -2823,6 +2884,7 @@ def poller_start(
                         state_db=state_db,
                         transport=connected_transport,
                         contexts_dir=config.paths.contexts,
+                        claims=claims,
                     )
                 else:
                     result = await run_dev_issue(
@@ -2838,7 +2900,19 @@ def poller_start(
                         contexts_dir=config.paths.contexts,
                         ci_wait_timeout_seconds=repo_config.automation.ci_wait_timeout_seconds,
                         code_review=repo_config.code_review,
+                        claims=claims,
                     )
+
+                # Lost the race check to another machine (#245): not a
+                # failure, and nothing to announce or retry here.
+                if result.outputs.get("claimed_by"):
+                    skipped = settle_claimed_elsewhere(
+                        poller, repo, issue_number,
+                        result.outputs["claimed_by"],
+                        result.outputs.get("recheck_at"),
+                    )
+                    console.print(f"[dim]{skipped}[/dim]")
+                    return
 
                 # Lock-conflict retry hook. The poller marks issues seen
                 # BEFORE handle_issue runs, so a failed attempt would

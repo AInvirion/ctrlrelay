@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ctrlrelay.core.checkpoint import CheckpointStatus
+from ctrlrelay.core.claims import ClaimKeeper, ClaimSettings, acquire_claim
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.events import EventKind, emit_event, emit_outcome
 from ctrlrelay.core.github import GitHubCLI
@@ -39,7 +40,7 @@ from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.state import StateDB
 from ctrlrelay.core.worktree import WorktreeManager
 from ctrlrelay.dashboard.client import DashboardClient, EventPayload
-from ctrlrelay.pipelines.base import PipelineContext, PipelineResult
+from ctrlrelay.pipelines.base import PipelineContext, PipelineResult, failure_text
 from ctrlrelay.transports.base import Transport
 
 DEFAULT_MAX_BLOCKED_ROUNDS = 5
@@ -420,9 +421,15 @@ async def run_task_issue(
     transport: Transport | None,
     contexts_dir: Path,
     max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
+    *,
+    claims: ClaimSettings | None,
 ) -> PipelineResult:
     """Run the task pipeline for a single issue. Mirrors run_dev_issue's
-    lock/worktree/BLOCKED-loop pattern minus the branch-and-PR work."""
+    lock/worktree/BLOCKED-loop pattern minus the branch-and-PR work.
+
+    ``claims`` as in ``run_dev_issue``: required, and ``None`` keeps the
+    single-machine behaviour, which for a task run is no claim at all.
+    """
     session_id = (
         f"task-{repo.replace('/', '-')}-{issue_number}-"
         f"{uuid.uuid4().hex[:8]}"
@@ -440,9 +447,24 @@ async def run_task_issue(
     session_row_inserted = False
     # See run_dev_issue: a failure before the agent starts is retried.
     dispatched = False
+    # See run_dev_issue (#245): set once this machine holds the claim.
+    keeper: ClaimKeeper | None = None
+    claim_id: str | None = None
 
     try:
         issue = await github.get_issue(repo, issue_number)
+
+        if claims is not None:
+            from ctrlrelay.pipelines.dev import claimed_elsewhere_result
+            outcome = await acquire_claim(github, repo, issue_number, claims)
+            if not outcome.won:
+                return claimed_elsewhere_result(
+                    session_id, repo, issue_number, outcome, claims,
+                )
+            assert outcome.claim is not None
+            claim_id = outcome.claim.claim_id
+            keeper = ClaimKeeper(github, repo, outcome.claim, claims)
+            keeper.start()
 
         await worktree.ensure_bare_repo(repo)
         # Default branch, session-scoped name so cleanup is keyed to
@@ -586,9 +608,29 @@ async def run_task_issue(
                 details={"issue_number": issue_number},
             ))
 
+        if keeper is not None:
+            if result.success or result.blocked:
+                await keeper.hold()
+            else:
+                await keeper.stop()
+                await _release_task_claim(
+                    github, repo, issue_number, session_id,
+                    reason=failure_text(result),
+                    exit_code=result.exit_code,
+                    claim_id=claim_id,
+                )
+
         return result
 
     except Exception as e:
+        if keeper is not None:
+            await keeper.stop()
+            await _release_task_claim(
+                github, repo, issue_number, session_id,
+                reason=f"{type(e).__name__}: {str(e)[:200]}",
+                exit_code=None,
+                claim_id=claim_id,
+            )
         if session_row_inserted:
             state_db.execute(
                 "UPDATE sessions SET status = ?, summary = ?, "
@@ -615,6 +657,9 @@ async def run_task_issue(
         )
 
     finally:
+        # A refresher left running would keep the claim fresh forever.
+        if keeper is not None:
+            await keeper.stop()
         # Task workflow: worktree is ephemeral (no PR depends on it).
         # Tear down on every outcome — even BLOCKED, because a task
         # resume will re-create the worktree from scratch anyway
@@ -688,6 +733,30 @@ async def run_task_issue(
                 error_type=type(lock_exc).__name__,
                 error=str(lock_exc)[:200],
             )
+
+
+async def _release_task_claim(
+    github: GitHubCLI,
+    repo: str,
+    issue_number: int,
+    session_id: str,
+    *,
+    reason: str,
+    exit_code: int | None,
+    claim_id: str | None,
+) -> None:
+    """Release a failed task run's claim with the dev lane's retraction,
+    so another machine, or a retry, can take the issue (#245)."""
+    from ctrlrelay.pipelines.dev import reconcile_claim_on_failure
+    await reconcile_claim_on_failure(
+        github,
+        repo=repo,
+        issue_number=issue_number,
+        session_id=session_id,
+        reason=reason,
+        exit_code=exit_code,
+        claim_id=claim_id,
+    )
 
 
 async def resume_task_from_pending(

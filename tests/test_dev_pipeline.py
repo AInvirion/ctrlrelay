@@ -183,6 +183,7 @@ class TestDevPipeline:
         state_db = StateDB(tmp_path / "state.db")
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=123,
             branch_template="fix/issue-{n}",
@@ -443,6 +444,7 @@ class TestDevPipeline:
         mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
 
         await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=123,
             branch_template="fix/issue-{n}",
@@ -522,6 +524,7 @@ class TestDevPipeline:
         mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
 
         await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=123,
             branch_template="fix/issue-{n}",
@@ -646,6 +649,7 @@ class TestRunDevIssueVerification:
         state_db = StateDB(tmp_path / "state.db")
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=1,
             branch_template="fix/issue-{n}",
@@ -693,6 +697,7 @@ class TestRunDevIssueVerification:
         state_db = StateDB(tmp_path / "state.db")
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=1,
             branch_template="fix/issue-{n}",
@@ -744,6 +749,7 @@ class TestRunDevIssueVerification:
         state_db = StateDB(tmp_path / "state.db")
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=1,
             branch_template="fix/issue-{n}",
@@ -836,6 +842,7 @@ class TestRunDevIssueVerification:
         mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=13,
             branch_template="fix/issue-{n}",
@@ -908,6 +915,7 @@ class TestRunDevIssueVerification:
         state_db = StateDB(tmp_path / "state.db")
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=13,
             branch_template="fix/issue-{n}",
@@ -969,6 +977,7 @@ class TestRunDevIssueVerification:
         mock_transport.ask.side_effect = RuntimeError("bridge down")
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=13,
             branch_template="fix/issue-{n}",
@@ -1052,6 +1061,7 @@ class TestRunDevIssueVerification:
         )
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=123,
             branch_template="fix/issue-{n}",
@@ -1101,6 +1111,7 @@ class TestRunDevIssueVerification:
         state_db = StateDB(tmp_path / "state.db")
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=1,
             branch_template="fix/issue-{n}",
@@ -1197,6 +1208,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         mock_pr_verifier.verify.side_effect = verify_checks_peer_can_acquire
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=1,
             branch_template="fix/issue-{n}",
@@ -1309,6 +1321,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
         mock_pr_verifier.verify.side_effect = verify
 
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=1,
             branch_template="fix/issue-{n}",
@@ -1411,6 +1424,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
 
         try:
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=1,
                 branch_template="fix/issue-{n}",
@@ -1507,6 +1521,7 @@ class TestRunDevIssueLockReleaseDuringVerify:
 
         with pytest.raises(asyncio.CancelledError):
             await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=1,
                 branch_template="fix/issue-{n}",

@@ -103,6 +103,7 @@ class TestDevIntegration:
             mock_create.return_value = (worktree_path, True)
 
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=123,
                 branch_template="fix/issue-{n}",
@@ -242,6 +243,7 @@ class TestDevPipelineCleanup:
             mock_pr_verifier.verify.return_value = VerificationResult(ready=True)
 
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=13,
                 branch_template="fix/issue-{n}",
@@ -417,6 +419,7 @@ class TestDevPipelineCleanup:
             mock_create.return_value = (worktree_path, True)
 
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=42,
                 branch_template="fix/issue-{n}",
@@ -854,6 +857,7 @@ class TestLabelTriggeredDevPipelineE2E:
                 mock_create.return_value = (worktree_path, True)
 
                 result = await run_dev_issue(
+                    claims=None,
                     repo=repo,
                     issue_number=issue["number"],
                     branch_template="fix/issue-{n}",

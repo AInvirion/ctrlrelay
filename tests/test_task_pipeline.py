@@ -55,6 +55,7 @@ class TestTaskPipelineBasic:
         state_db = StateDB(tmp_path / "state.db")
 
         result = await run_task_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=55,
             dispatcher=mock_dispatcher,
@@ -144,6 +145,7 @@ class TestTaskPipelineBasic:
         state_db = StateDB(tmp_path / "state.db")
 
         result = await run_task_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=77,
             dispatcher=mock_dispatcher,
