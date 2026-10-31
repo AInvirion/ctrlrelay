@@ -117,11 +117,14 @@ def build_agent_env(
     base: Mapping[str, str],
     *,
     gh_config_dir: Path,
+    runtime_dir: Path,
 ) -> tuple[dict[str, str], list[str]]:
     """Return ``(env, stripped_names)`` for an agent with no GitHub access.
 
-    ``gh_config_dir`` must be an empty directory the agent did not
-    choose; the caller creates and removes it. ``stripped_names`` is
+    ``gh_config_dir`` and ``runtime_dir`` must be empty directories the
+    agent did not choose; the caller creates and removes them.
+    ``runtime_dir`` becomes ``XDG_RUNTIME_DIR``, so a client that looks
+    for the session bus under it finds nothing there. ``stripped_names`` is
     the sorted list of variable NAMES removed, for the log. Values
     are never returned or logged.
     """
@@ -144,6 +147,12 @@ def build_agent_env(
     # login keychain outside anything an environment variable reaches;
     # see the configuration docs.
     env["DBUS_SESSION_BUS_ADDRESS"] = _NO_SESSION_BUS
+    # Also replaced, so a client that derives the bus from it finds an
+    # empty private directory. Measured: gh's D-Bus client falls back to
+    # /run/user/<uid>/bus by uid when no address is set, ignoring this
+    # variable, so it is the address above that blocks that fallback;
+    # this closes the XDG-based one.
+    env["XDG_RUNTIME_DIR"] = str(runtime_dir)
     env["GH_PROMPT_DISABLED"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "never"

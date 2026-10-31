@@ -54,7 +54,7 @@ def _git(*args: str, cwd: Path | None = None, env=None) -> str:
 
 async def _spawn_and_capture_env(
     tmp_path: Path, monkeypatch, *, github_access: bool
-) -> tuple[dict[str, str], bool, list[str]]:
+) -> tuple[dict[str, str], bool, list[str], bool]:
     """Run a real ClaudeDispatcher spawn with the exec faked.
 
     Returns ``(env, gh_dir_was_empty_dir, argv)`` as seen at exec time,
@@ -75,6 +75,10 @@ async def _spawn_and_capture_env(
         seen["gh_dir_empty"] = bool(
             d and Path(d).is_dir() and not any(Path(d).iterdir())
         )
+        r = env.get("XDG_RUNTIME_DIR")
+        seen["run_empty"] = bool(
+            r and Path(r).is_dir() and not any(Path(r).iterdir())
+        )
         proc = AsyncMock()
         proc.communicate.return_value = (b"", b"")
         proc.returncode = 0
@@ -89,7 +93,7 @@ async def _spawn_and_capture_env(
             state_file=tmp_path / "state.json",
             github_access=github_access,
         )
-    return seen["env"], seen["gh_dir_empty"], seen["argv"]
+    return seen["env"], seen["gh_dir_empty"], seen["argv"], seen["run_empty"]
 
 
 class TestTheAgentEnvironmentCarriesNoGitHubCredentials:
@@ -97,7 +101,7 @@ class TestTheAgentEnvironmentCarriesNoGitHubCredentials:
     async def test_token_vars_ssh_and_relay_secrets_are_gone(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        env, gh_dir_empty, argv = await _spawn_and_capture_env(
+        env, gh_dir_empty, argv, seen_runtime_empty = await _spawn_and_capture_env(
             tmp_path, monkeypatch, github_access=False
         )
         leaked = sorted(set(_SECRET_ENV) & set(env))
@@ -109,6 +113,8 @@ class TestTheAgentEnvironmentCarriesNoGitHubCredentials:
         )
         assert env["GIT_SSH_COMMAND"] == "false"
         assert env["DBUS_SESSION_BUS_ADDRESS"].startswith("unix:path=/nonexistent/")
+        assert seen_runtime_empty, "XDG_RUNTIME_DIR must be an existing EMPTY dir"
+        assert not Path(env["XDG_RUNTIME_DIR"]).exists()
         assert env["GIT_TERMINAL_PROMPT"] == "0"
         count = int(env["GIT_CONFIG_COUNT"])
         pairs = {
@@ -134,7 +140,7 @@ class TestTheAgentEnvironmentCarriesNoGitHubCredentials:
         """Negative control: the seeded secrets DO reach a child spawned
         with access, so the test above is not passing because they were
         never there."""
-        env, _, _ = await _spawn_and_capture_env(
+        env, _, _, _ = await _spawn_and_capture_env(
             tmp_path, monkeypatch, github_access=True
         )
         assert set(_SECRET_ENV) <= set(env)
@@ -228,7 +234,9 @@ class TestRealGitAndGhFindNothingUnderTheAgentEnv:
         }
         empty = tmp_path / "empty-gh"
         empty.mkdir()
-        agent, _ = build_agent_env(operator, gh_config_dir=empty)
+        run = tmp_path / "empty-run"
+        run.mkdir()
+        agent, _ = build_agent_env(operator, gh_config_dir=empty, runtime_dir=run)
         return operator, agent
 
     def test_git_credential_helpers_are_not_consulted(
@@ -287,70 +295,109 @@ class TestRealGitAndGhFindNothingUnderTheAgentEnv:
         assert not agent_got_a_token
 
     @pytest.mark.skipif(shutil.which("gh") is None, reason="gh not installed")
-    def test_gh_cannot_reach_a_session_bus(self, tmp_path: Path) -> None:
+    def test_no_session_bus_is_reachable_by_address_or_by_xdg(
+        self, tmp_path: Path
+    ) -> None:
         """gh falls back to the desktop keyring over the D-Bus session bus
         when its config has no token (measured on a laptop host,
         2026-10-31: it printed the operator's token with GH_CONFIG_DIR
-        empty). gh has no switch to turn the keyring off, so the test
-        stands up a fake session bus - a unix socket that counts
-        connections - and points the operator env at it. Control: gh
-        dials it under the operator env. Claim: under the agent env
-        built from that same env, it never does. Deterministic: no real
-        keyring is involved either way."""
+        empty). gh has no switch to turn the keyring off.
+
+        Two fake session buses (unix sockets that count connections):
+        A at an explicit DBUS_SESSION_BUS_ADDRESS, B at
+        $XDG_RUNTIME_DIR/bus. Two clients: gh itself, and a reference
+        client that follows the D-Bus rule (address if set, else
+        $XDG_RUNTIME_DIR/bus). Controls: under operator envs the
+        reference client reaches A and B, and gh reaches A. Claim: under
+        the agent env built from each, neither client reaches either bus.
+
+        What this proves: the agent env routes both the address and the
+        XDG lookup away from anything the operator env points at. What it
+        cannot show: gh's client, when no address is set, dials
+        /run/user/<uid>/bus by uid and ignores XDG_RUNTIME_DIR (measured;
+        that is why gh never reaches B even under the operator env). That
+        path is closed only because the agent env always sets an
+        unconnectable address, which the env test above pins. No real
+        keyring is involved in this test either way.
+        """
         import socket
+        import sys
         import threading
 
         from ctrlrelay.core.agent_env import build_agent_env
 
-        sock_path = tmp_path / "bus"
-        srv = socket.socket(socket.AF_UNIX)
-        srv.bind(str(sock_path))
-        srv.listen(8)
-        srv.settimeout(0.1)
-        hits: list[int] = []
+        xdg = tmp_path / "xdg"
+        xdg.mkdir()
+        buses = {"A": tmp_path / "bus-a", "B": xdg / "bus"}
+        hits = {"A": 0, "B": 0}
+        servers = []
         stop = threading.Event()
 
-        def serve() -> None:
+        def serve(name: str, srv: socket.socket) -> None:
             while not stop.is_set():
                 try:
                     conn, _ = srv.accept()
                 except OSError:
                     continue
-                hits.append(1)
+                hits[name] += 1
                 conn.close()
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
+        for name, path in buses.items():
+            srv = socket.socket(socket.AF_UNIX)
+            srv.bind(str(path))
+            srv.listen(8)
+            srv.settimeout(0.1)
+            servers.append(srv)
+            threading.Thread(target=serve, args=(name, srv), daemon=True).start()
+
+        ref_client = (
+            "import os, socket\n"
+            "a = os.environ.get('DBUS_SESSION_BUS_ADDRESS', '')\n"
+            "p = a[len('unix:path='):] if a.startswith('unix:path=') else "
+            "os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/nonexistent'), 'bus')\n"
+            "s = socket.socket(socket.AF_UNIX)\n"
+            "try:\n    s.connect(p)\nexcept OSError:\n    pass\n"
+        )
+
+        def dial(env: dict) -> dict:
+            before = dict(hits)
+            subprocess.run([sys.executable, "-c", ref_client], env=env,
+                           capture_output=True, timeout=30)
+            subprocess.run(["gh", "auth", "token"], env=env,
+                           capture_output=True, timeout=30)
+            import time as _t
+            _t.sleep(0.3)
+            return {k: hits[k] - before[k] for k in hits}
+
         try:
             empty = tmp_path / "gh-empty"
             empty.mkdir()
-            operator = {
-                "PATH": os.environ["PATH"],
-                "HOME": str(tmp_path),
-                "GH_CONFIG_DIR": str(empty),
-                "DBUS_SESSION_BUS_ADDRESS": f"unix:path={sock_path}",
-            }
-            subprocess.run(
-                ["gh", "auth", "token"], env=operator,
-                capture_output=True, timeout=30,
-            )
-            control_dialled = len(hits)
-            hits.clear()
-            agent, _ = build_agent_env(
-                operator, gh_config_dir=tmp_path / "gh-agent"
-            )
-            (tmp_path / "gh-agent").mkdir()
-            subprocess.run(
-                ["gh", "auth", "token"], env=agent,
-                capture_output=True, timeout=30,
-            )
-            agent_dialled = len(hits)
+            base = {"PATH": os.environ["PATH"], "HOME": str(tmp_path),
+                    "GH_CONFIG_DIR": str(empty)}
+            by_address = {**base,
+                          "DBUS_SESSION_BUS_ADDRESS": f"unix:path={buses['A']}",
+                          "XDG_RUNTIME_DIR": str(xdg)}
+            by_xdg = {**base, "XDG_RUNTIME_DIR": str(xdg)}
+            control_a = dial(by_address)
+            control_b = dial(by_xdg)
+            agent_results = []
+            for i, operator in enumerate((by_address, by_xdg)):
+                gh_dir = tmp_path / f"gh-agent-{i}"
+                run_dir = tmp_path / f"run-agent-{i}"
+                gh_dir.mkdir()
+                run_dir.mkdir()
+                agent, _ = build_agent_env(
+                    operator, gh_config_dir=gh_dir, runtime_dir=run_dir
+                )
+                agent_results.append(dial(agent))
         finally:
             stop.set()
-            t.join(timeout=5)
-            srv.close()
-        assert control_dialled >= 1, "control: gh did not try the bus at all"
-        assert agent_dialled == 0
+            for srv in servers:
+                srv.close()
+        # ref client + gh both reach A; only the ref client reaches B.
+        assert control_a["A"] == 2
+        assert control_b["B"] == 1
+        assert agent_results == [{"A": 0, "B": 0}, {"A": 0, "B": 0}]
 
 
 # --- push guard -----------------------------------------------------------
@@ -674,6 +721,85 @@ class TestThePushGuard:
                 relay_pushed_shas=frozenset(),
             )
         assert "fix/issue-7" not in _git("for-each-ref", cwd=origin)
+
+
+class TestRefFilesAreReadOnlyWhenSafe:
+    """The push reads the clone's branch heads from its ref files. The
+    agent can write those files, so a symlink anywhere on the way, or a
+    name that walks out of refs/, must be refused, not followed."""
+
+    A = "a" * 40
+    B = "b" * 40
+
+    def _repo(self, tmp_path: Path) -> Path:
+        repo = tmp_path / "owner-repo.git"
+        (repo / "refs" / "heads").mkdir(parents=True)
+        return repo
+
+    def test_control_plain_loose_and_packed_refs_are_read(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.worktree import _read_branch_head
+
+        repo = self._repo(tmp_path)
+        (repo / "refs" / "heads" / "fix").mkdir()
+        (repo / "refs" / "heads" / "fix" / "issue-7").write_text(self.A + "\n")
+        (repo / "packed-refs").write_text(
+            f"# pack-refs with: peeled\n{self.B} refs/heads/main\n"
+        )
+        assert _read_branch_head(repo, "fix/issue-7") == self.A
+        assert _read_branch_head(repo, "main") == self.B
+
+    def test_a_symlinked_parent_dir_is_refused(self, tmp_path: Path) -> None:
+        from ctrlrelay.core.publish import PushRefusedError
+        from ctrlrelay.core.worktree import _read_branch_head
+
+        repo = self._repo(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "issue-7").write_text(self.A + "\n")
+        (repo / "refs" / "heads" / "fix").symlink_to(outside)
+        with pytest.raises(PushRefusedError, match="symlink"):
+            _read_branch_head(repo, "fix/issue-7")
+
+    def test_a_symlinked_packed_refs_is_refused(self, tmp_path: Path) -> None:
+        from ctrlrelay.core.publish import PushRefusedError
+        from ctrlrelay.core.worktree import _read_branch_head
+
+        repo = self._repo(tmp_path)
+        outside = tmp_path / "packed"
+        outside.write_text(f"{self.A} refs/heads/fix/issue-7\n")
+        (repo / "packed-refs").symlink_to(outside)
+        with pytest.raises(PushRefusedError, match="symlink"):
+            _read_branch_head(repo, "fix/issue-7")
+
+    @pytest.mark.parametrize(
+        "name", ["fix/../../../outside", "../x", "fix/.hidden", "a//b"],
+    )
+    def test_a_name_that_walks_out_is_refused(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        from ctrlrelay.core.publish import PushRefusedError
+        from ctrlrelay.core.worktree import _read_branch_head
+
+        repo = self._repo(tmp_path)
+        (tmp_path / "outside").write_text(self.A + "\n")
+        with pytest.raises(PushRefusedError, match="not a safe ref name"):
+            _read_branch_head(repo, name)
+
+    def test_an_unsafe_loose_ref_does_not_fall_back_to_packed(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.publish import PushRefusedError
+        from ctrlrelay.core.worktree import _read_branch_head
+
+        repo = self._repo(tmp_path)
+        outside = tmp_path / "elsewhere"
+        outside.write_text(self.A + "\n")
+        (repo / "refs" / "heads" / "issue-7").symlink_to(outside)
+        (repo / "packed-refs").write_text(f"{self.B} refs/heads/issue-7\n")
+        with pytest.raises(PushRefusedError, match="symlink"):
+            _read_branch_head(repo, "issue-7")
 
 
 # --- untrusted PR text -----------------------------------------------------

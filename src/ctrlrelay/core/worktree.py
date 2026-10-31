@@ -122,24 +122,81 @@ _RELAY_GIT_FLAGS: tuple[str, ...] = (
 _HEX_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
+_SAFE_BRANCH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*$")
+
+
+def _safe_repo_file(repo_real: str, rel: str) -> str | None:
+    """Path of ``rel`` inside ``repo_real`` if it is safe to read.
+
+    Returns None when nothing exists there. Raises
+    :class:`PushRefusedError` when something exists but is unsafe: any
+    symlink between the repository and the file (the file itself or a
+    parent directory), or a path that resolves outside the repository.
+    Present-but-unsafe is never reported as absent, so the caller cannot
+    fall through to an older value somewhere else.
+    """
+    from ctrlrelay.core.publish import PushRefusedError
+
+    path = os.path.join(repo_real, rel)
+    cur = repo_real
+    for part in rel.split("/"):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            raise PushRefusedError(
+                f"push refused: {rel} in the clone goes through a symlink"
+            )
+        if not os.path.lexists(cur):
+            return None
+    if (
+        os.path.realpath(path) != os.path.abspath(path)
+        or not os.path.realpath(path).startswith(repo_real + os.sep)
+        or not os.path.isfile(path)
+    ):
+        raise PushRefusedError(
+            f"push refused: {rel} in the clone is not a plain file inside it"
+        )
+    return path
+
+
+def _read_nofollow(path: str) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "r") as f:
+        return f.read()
+
+
 def _read_branch_head(bare_path: Path, branch: str) -> str:
     """Head of ``refs/heads/<branch>`` read from the ref files as data.
 
     No git process runs in the bare clone, so none of its config (which
-    the agent can write) is read. A symbolic ref, an unreadable value or
-    a missing branch raises :class:`WorktreeError`.
+    the agent can write) is read. The agent can also write the ref files
+    themselves, so they are read only when no symlink is involved and
+    the file is inside the clone: a loose ref first, then
+    ``packed-refs``. A loose ref that exists but is unsafe is refused,
+    never treated as absent. A missing branch raises
+    :class:`WorktreeError`; anything unsafe raises
+    :class:`PushRefusedError`.
     """
     from ctrlrelay.core.publish import PushRefusedError
 
+    if (
+        not _SAFE_BRANCH.match(branch)
+        or ".." in branch
+        or "//" in branch
+        or any(part.startswith(".") or part.endswith(".lock")
+               for part in branch.split("/"))
+    ):
+        raise PushRefusedError(f"push refused: {branch!r} is not a safe ref name")
+    repo_real = os.path.realpath(bare_path)
     ref = f"refs/heads/{branch}"
-    loose = bare_path / ref
     value: str | None = None
-    if loose.is_file() and not loose.is_symlink():
-        value = loose.read_text().strip()
+    loose = _safe_repo_file(repo_real, ref)
+    if loose is not None:
+        value = _read_nofollow(loose).strip()
     else:
-        packed = bare_path / "packed-refs"
-        if packed.is_file():
-            for line in packed.read_text().splitlines():
+        packed = _safe_repo_file(repo_real, "packed-refs")
+        if packed is not None:
+            for line in _read_nofollow(packed).splitlines():
                 if line.startswith(("#", "^")):
                     continue
                 parts = line.split(" ", 1)

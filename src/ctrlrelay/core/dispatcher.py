@@ -264,17 +264,19 @@ class ClaudeDispatcher:
         base_env = os.environ.copy()
         base_env.update(self.extra_env)
 
-        gh_config_dir: Path | None = None
+        private_root: Path | None = None
         prefix: list[str] = []
         if github_access:
             env = base_env
             stripped: list[str] = []
         else:
-            gh_config_dir = Path(
-                tempfile.mkdtemp(prefix="ctrlrelay-agent-gh-")
-            )
+            private_root = Path(tempfile.mkdtemp(prefix="ctrlrelay-agent-"))
+            gh_config_dir = private_root / "gh"
+            runtime_dir = private_root / "run"
+            gh_config_dir.mkdir()
+            runtime_dir.mkdir(mode=0o700)
             env, stripped = build_agent_env(
-                base_env, gh_config_dir=gh_config_dir
+                base_env, gh_config_dir=gh_config_dir, runtime_dir=runtime_dir,
             )
             if self._bwrap is not None:
                 prefix = bwrap_prefix(self._bwrap, self.sandbox_hide_paths)
@@ -326,8 +328,8 @@ class ClaudeDispatcher:
                 issue_number=issue_number,
             )
         finally:
-            if gh_config_dir is not None:
-                shutil.rmtree(gh_config_dir, ignore_errors=True)
+            if private_root is not None:
+                shutil.rmtree(private_root, ignore_errors=True)
 
     async def _run_session(
         self,
