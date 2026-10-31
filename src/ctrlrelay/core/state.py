@@ -220,6 +220,12 @@ class StateDB:
         # write wait instead of failing at once.
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # An in-memory database reports an empty file name. A second
+        # connection to it would be a different, empty database, so event
+        # writes must stay on the main connection there.
+        self._in_memory = (
+            self._conn.execute("PRAGMA database_list").fetchone()[2] == ""
+        )
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._conn.commit()
@@ -1255,7 +1261,16 @@ class StateDB:
         the same file that waits at most ``EVENT_WRITE_TIMEOUT`` seconds
         for a lock. Using its own connection keeps a failed event write
         from leaving the main connection mid-transaction. Raises on
-        failure; the side connection is rolled back first."""
+        failure; the side connection is rolled back first.
+
+        For an in-memory database there is no file to share, so this
+        falls back to the main connection (and its busy timeout)."""
+        if self._in_memory:
+            self.record_event(
+                kind, repo=repo, issue_number=issue_number,
+                session_id=session_id, detail=detail, ts=ts,
+            )
+            return
         if self._event_conn is None:
             self._event_conn = sqlite3.connect(
                 str(self.db_path), timeout=self.EVENT_WRITE_TIMEOUT

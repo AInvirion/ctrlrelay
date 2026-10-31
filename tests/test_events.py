@@ -83,7 +83,8 @@ def test_record_and_list_events_newest_first(tmp_path: Path) -> None:
 
 
 def test_record_event_is_committed(tmp_path: Path) -> None:
-    """A row is visible to another connection without the writer committing."""
+    """record_event commits itself: a separate connection sees the row
+    without the caller ever calling commit()."""
     path = tmp_path / "s.db"
     db = StateDB(path)
     try:
@@ -256,7 +257,14 @@ def test_emit_event_under_a_held_write_lock_is_bounded(
                 start = time.monotonic()
                 assert emit_event(db, EventKind.DONE, ts=200) is None
                 elapsed = time.monotonic() - start
-            assert elapsed < 1.0
+            assert elapsed < 0.6
+            # The bound comes from the side connection's own timeout, not
+            # from luck: sqlite3 maps timeout= onto busy_timeout (ms).
+            assert db._event_conn is not None
+            assert StateDB.EVENT_WRITE_TIMEOUT == 0.25
+            assert db._event_conn.execute(
+                "PRAGMA busy_timeout"
+            ).fetchone()[0] == int(StateDB.EVENT_WRITE_TIMEOUT * 1000)
             failures = [
                 r for r in caplog.records
                 if r.getMessage() == "events.write_failed"
@@ -278,6 +286,31 @@ def test_emit_event_under_a_held_write_lock_is_bounded(
         db.record_event("merged", ts=300)
         emit_event(db, EventKind.DONE, ts=400)
         assert [e["ts"] for e in db.list_events()] == [400, 300, 100]
+    finally:
+        db.close()
+
+
+def test_in_memory_db_keeps_emitted_events() -> None:
+    """A second connection to ":memory:" is a different, empty database, so
+    for an in-memory StateDB the best-effort write must use the main
+    connection or the event is lost."""
+    db = StateDB(":memory:")
+    try:
+        emit_event(db, EventKind.DONE, repo="a/b", ts=10)
+        db.record_event_nowait("merged", ts=20)
+        assert [e["kind"] for e in db.list_events()] == ["merged", "done"]
+        assert db._event_conn is None
+    finally:
+        db.close()
+
+
+def test_file_db_uses_a_side_connection(tmp_path: Path) -> None:
+    """The in-memory fallback must not swallow the normal case."""
+    db = StateDB(tmp_path / "s.db")
+    try:
+        emit_event(db, EventKind.DONE, ts=10)
+        assert db._event_conn is not None
+        assert db._event_conn is not db._conn
     finally:
         db.close()
 
