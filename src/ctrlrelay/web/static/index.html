@@ -210,6 +210,39 @@ function setCount(id, value) {
   document.getElementById(id).textContent = typeof value === "number" ? String(value) : "unknown";
 }
 
+// A #N in a question's text; the same pattern as status._QUESTION_REF.
+var QUESTION_REF = /(?<![\w\/&])#(\d{1,7})\b/;
+
+// #241: a question as text parts, with each #N the server sent a ref for
+// carrying that ref's URL. Joined, the parts are the question unchanged;
+// anything that is not a string is shown as no text.
+function questionParts(text, refs) {
+  if (typeof text !== "string") { return [{ text: "", url: null }]; }
+  var urls = {};
+  if (Array.isArray(refs)) {
+    refs.forEach(function (r) {
+      if (r && typeof r.number === "number" && typeof r.url === "string") {
+        urls[String(r.number)] = r.url;
+      }
+    });
+  }
+  var parts = [];
+  var re = new RegExp(QUESTION_REF.source, "g");
+  var last = 0;
+  var m;
+  while ((m = re.exec(text)) !== null) {
+    var key = String(parseInt(m[1], 10));
+    if (!Object.prototype.hasOwnProperty.call(urls, key)) { continue; }
+    if (m.index > last) { parts.push({ text: text.slice(last, m.index), url: null }); }
+    parts.push({ text: m[0], url: urls[key] });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length || parts.length === 0) {
+    parts.push({ text: text.slice(last), url: null });
+  }
+  return parts;
+}
+
 function safeGithubUrl(url) {
   return typeof url === "string" && GITHUB_URL.test(url) ? url : null;
 }
@@ -438,7 +471,13 @@ function renderNeeds(data, now) {
     top.appendChild(ticking(typeof q.asked_ts === "number" ? now - q.asked_ts : null,
       "waiting ", ""));
     box.appendChild(top);
-    box.appendChild(el("p", "question", q.question));
+    var question = el("p", "question");
+    questionParts(q.question, q.refs).forEach(function (part) {
+      question.appendChild(part.url === null
+        ? document.createTextNode(part.text)
+        : ghLink(part.url, part.text, "ref"));
+    });
+    box.appendChild(question);
     if (typeof q.held_until_ts === "number") {
       box.appendChild(el("div", "muted", "held back; asked again at " + clock(q.held_until_ts)));
     }

@@ -29,7 +29,7 @@ Contract (keys exactly; every timestamp is ``<name>_ts`` epoch seconds plus
                   "pr_url"}] | null,
      "needs_you": [{"session_id", "pipeline", "repo", "issue_number",
                     "title", "question", "asked", "asked_ts", "held_until",
-                    "held_until_ts", "url"}] | null,
+                    "held_until_ts", "url", "refs"}] | null,
      "waiting": <WaitingTracker.snapshot() without "skipped">,
      "skipped": [{"repo", "issue_number", "title", "reason", "url",
                   "updated", "updated_ts"}] | null,
@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import urllib.parse
 from collections.abc import Callable, Mapping
@@ -543,6 +544,35 @@ def _card(
     }
 
 
+# A ``#N`` in a question's text: not after a word character, ``/`` or
+# ``&`` (an HTML entity or a path is not a reference). The page uses the
+# same pattern, QUESTION_REF, and links only the numbers listed here.
+# ASCII, because a JavaScript ``\w``, ``\d`` and ``\b`` are ASCII only.
+_QUESTION_REF = re.compile(r"(?<![\w/&])#(\d{1,7})\b", re.ASCII)
+_MAX_REFS = 20
+
+
+def _question_refs(repo: Any, question: Any) -> list[dict[str, Any]]:
+    """#241: one ``{"number", "url"}`` per distinct ``#N`` in ``question``,
+    in order and at most ``_MAX_REFS`` of them, with the link built by
+    ``github_url`` from ``repo`` and N. A secops question has no issue, so
+    these are its only links. Numbers that cannot be linked are left out."""
+    if not isinstance(question, str):
+        return []
+    refs: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for m in _QUESTION_REF.finditer(question):
+        number = int(m.group(1))
+        url = github_url(repo, number)
+        if number in seen or url is None:
+            continue
+        seen.add(number)
+        refs.append({"number": number, "url": url})
+        if len(refs) == _MAX_REFS:
+            break
+    return refs
+
+
 def _question(
     row: dict[str, Any], titles: dict[tuple[str, int], str],
 ) -> dict[str, Any]:
@@ -561,6 +591,7 @@ def _question(
         "held_until": _iso(held),
         "held_until_ts": held,
         "url": github_url(row["repo"], issue),
+        "refs": _question_refs(row["repo"], row["question"]),
     }
 
 

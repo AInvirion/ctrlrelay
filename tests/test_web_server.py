@@ -977,6 +977,7 @@ def test_every_href_goes_through_one_helper() -> None:
     for renderer in ("runningCard", "renderNeeds", "renderWaiting", "renderSkipped",
                      "renderFeed"):
         assert "ghLink(" in _js_function(script, renderer), renderer
+    assert "questionParts(" in _js_function(script, "renderNeeds")
 
 
 def test_no_server_value_reaches_html_parsing() -> None:
@@ -1109,3 +1110,58 @@ def test_phase_label_names_only_known_phases(phase, label) -> None:
     done = subprocess.run([node, "-e", program], capture_output=True, text=True,
                           timeout=30, check=True)
     assert json.loads(done.stdout) == label
+
+
+def test_question_numbers_become_links_only_when_the_server_sent_one() -> None:
+    """#241: the page links a #N in a question only to the URL the server
+    built for that N. A number with no ref, an entity and a path stay text."""
+    refs = [{"number": 8, "url": "https://github.com/o/r/issues/8"},
+            {"number": 7, "url": "https://github.com/o/r/issues/7"}]
+    text = "Approve #8 and #7? Not #3, &#8 or a/#7. Again #8."
+    parts = _run_js(["questionParts"],
+                    f"questionParts({json.dumps(text)}, {json.dumps(refs)})")
+    assert parts == [
+        {"text": "Approve ", "url": None},
+        {"text": "#8", "url": "https://github.com/o/r/issues/8"},
+        {"text": " and ", "url": None},
+        {"text": "#7", "url": "https://github.com/o/r/issues/7"},
+        {"text": "? Not #3, &#8 or a/#7. Again ", "url": None},
+        {"text": "#8", "url": "https://github.com/o/r/issues/8"},
+        {"text": ".", "url": None},
+    ]
+    assert "".join(p["text"] for p in parts) == text
+
+
+@pytest.mark.parametrize("refs", [None, [], "x", [{"number": "8", "url": "u"}]])
+def test_question_with_no_usable_refs_is_one_text_part(refs: object) -> None:
+    text = "Approve #8?"
+    parts = _run_js(["questionParts"],
+                    f"questionParts({json.dumps(text)}, {json.dumps(refs)})")
+    assert parts == [{"text": text, "url": None}]
+
+
+@pytest.mark.parametrize(("text", "linked"), [
+    ("\u00e9#3 and #4\u0663", ["#3", "#4"]),     # non-ASCII letter before, digit after
+    # Each refused form shares its number with an allowed one, so the server
+    # sends a ref for it and only the page's own pattern can refuse it.
+    ("x#3, &#4, a/#3, #3_ and (#4), #3.", ["#4", "#3"]),
+])
+def test_page_links_exactly_the_numbers_the_server_lists(
+    text: str, linked: list[str],
+) -> None:
+    """#241: the refs come from the server's own _question_refs and the
+    page runs on them, so a pattern that drifts on any of these forms fails."""
+    from ctrlrelay.web.status import _question_refs
+
+    refs = _question_refs("o/r", text)
+    assert [f"#{r['number']}" for r in refs] == list(dict.fromkeys(linked))
+    parts = _run_js(["questionParts"],
+                    f"questionParts({json.dumps(text)}, {json.dumps(refs)})")
+    assert [p["text"] for p in parts if p["url"]] == linked
+    assert "".join(p["text"] for p in parts) == text
+
+
+@pytest.mark.parametrize("question", [None, 5, {"toString": None}])
+def test_a_question_that_is_not_text_renders_as_no_text(question: object) -> None:
+    parts = _run_js(["questionParts"], f"questionParts({json.dumps(question)}, [])")
+    assert parts == [{"text": "", "url": None}]
