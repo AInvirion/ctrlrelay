@@ -17,9 +17,10 @@ defaults, so **no config edit is required** to upgrade.
 
 ### Changed
 
-- Dev and task agents run with GitHub tokens and gh's login removed from
-  their environment, git credential helpers and git's SSH disabled, and the
-  Linux desktop keyring unreachable. After the agent exits the
+- Dev and task agents run with the `GH_*` and `GITHUB_*` variables and
+  gh's login removed from their environment, git credential helpers and
+  git's SSH disabled, and the D-Bus and runtime-dir variables pointed away
+  from the desktop keyring. After the agent exits the
   relay pushes the run branch from a relay-private git dir to an explicit
   GitHub URL, opens the PR from the DONE checkpoint, pushes fix rounds,
   fetches failed CI logs and posts task reports. It refuses to push the
@@ -43,8 +44,9 @@ defaults, so **no config edit is required** to upgrade.
 
 - The agent still runs as the same OS user. Without the bwrap sandbox it
   can read credential files on disk; with it, only the paths in
-  `agent.sandbox_hide_paths` are hidden. It can still run ssh directly, and
-  the macOS keychain is not covered. Running the agent as a separate user
+  `agent.sandbox_hide_paths` are hidden. It can still run ssh directly, reach
+  the Linux keyring by resetting the D-Bus address, or read a token kept
+  under some other variable name, and the macOS keychain is not covered. Running the agent as a separate user
   is tracked in #236
 
 ## [0.14.0] - 2026-10-31
