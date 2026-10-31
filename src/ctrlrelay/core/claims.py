@@ -312,7 +312,7 @@ async def acquire_claim(
         # whether an older one is hiding from it too. Not a win: release
         # ours and let the run fail before it starts, to be retried.
         await _post_release(github, repo, issue_number, settings, claim_id, None)
-        raise ClaimNotVisible(
+        raise ClaimNotVisibleError(
             f"the claim posted on {repo}#{issue_number} was not in the "
             "comments read back, so the race check could not be decided"
         )
@@ -335,7 +335,7 @@ async def acquire_claim(
     return ClaimOutcome(won=False, owner=winner)
 
 
-class ClaimNotVisible(Exception):
+class ClaimNotVisibleError(Exception):
     """The race check could not see the claim it had just posted."""
 
 

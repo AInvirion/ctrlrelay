@@ -321,7 +321,7 @@ class TestAcquire:
 class TestTheRaceCheckFailsClosed:
     @pytest.mark.asyncio
     async def test_a_read_back_that_does_not_show_our_claim_is_not_a_win(self) -> None:
-        from ctrlrelay.core.claims import ClaimNotVisible
+        from ctrlrelay.core.claims import ClaimNotVisibleError
 
         clock = Clock()
         thread = Thread(clock)
@@ -334,7 +334,7 @@ class TestTheRaceCheckFailsClosed:
             return [] if reads == 2 else await real_list(repo, n)
 
         thread.list_issue_comments = list_comments
-        with pytest.raises(ClaimNotVisible):
+        with pytest.raises(ClaimNotVisibleError):
             await acquire_claim(
                 thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
             )
