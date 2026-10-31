@@ -554,9 +554,9 @@ _MAX_REFS = 20
 
 def _question_refs(repo: Any, question: Any) -> list[dict[str, Any]]:
     """#241: one ``{"number", "url"}`` per distinct ``#N`` in ``question``,
-    in order and at most ``_MAX_REFS`` of them, with the link built by ``github_url`` from ``repo`` and N.
-    A secops question has no issue, so these are its only links. Numbers
-    that cannot be linked are left out."""
+    in order and at most ``_MAX_REFS`` of them, with the link built by
+    ``github_url`` from ``repo`` and N. A secops question has no issue, so
+    these are its only links. Numbers that cannot be linked are left out."""
     if not isinstance(question, str):
         return []
     refs: list[dict[str, Any]] = []
