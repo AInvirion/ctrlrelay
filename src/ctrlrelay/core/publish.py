@@ -79,6 +79,22 @@ def check_push_target(
     raise PushRefusedError(f"push refused: {reason}")
 
 
+_REPO_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+$")
+
+
+def github_push_url(repo: str) -> str:
+    """The explicit URL the relay pushes to, from a validated name.
+
+    Never ``origin``: the remote's URL lives in config the agent can
+    write. Raises :class:`PushRefusedError` for anything that is not a
+    plain ``owner/name``.
+    """
+    name = repo.removesuffix(".git")
+    if not _REPO_NAME.match(name) or ".." in name:
+        raise PushRefusedError(f"push refused: {repo!r} is not owner/name")
+    return f"https://github.com/{name}.git"
+
+
 # --- untrusted text -------------------------------------------------------
 
 PR_TITLE_MAX_CHARS = 200

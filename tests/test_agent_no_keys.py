@@ -356,6 +356,47 @@ def _manager(tmp_path: Path):
     )
 
 
+@pytest.fixture
+def push_to_local_origin(monkeypatch):
+    """Let the relay's push reach a local origin instead of GitHub.
+
+    The ONLY relaxations, both test-side: the relay-written global
+    config maps the explicit GitHub URL to the local origin, and
+    ``protocol.file.allow=never`` is dropped from the command line so a
+    local path is reachable at all. Everything else (fresh private git
+    dir, hooks and fsmonitor off, no system config, no inherited GIT_*)
+    is the production path.
+    """
+    import ctrlrelay.core.worktree as wt
+
+    def install(origin: Path) -> None:
+        monkeypatch.setattr(
+            wt, "_relay_push_gitconfig",
+            lambda: (
+                f'[url "{origin}"]\n'
+                "\tinsteadOf = https://github.com/owner/repo.git\n"
+            ),
+        )
+        monkeypatch.setattr(
+            wt, "_RELAY_GIT_FLAGS",
+            _drop_flag(wt._RELAY_GIT_FLAGS, "protocol.file.allow=never"),
+        )
+
+    return install
+
+
+def _drop_flag(flags: tuple[str, ...], value: str) -> tuple[str, ...]:
+    out: list[str] = []
+    i = 0
+    while i < len(flags):
+        if flags[i] == "-c" and flags[i + 1] == value:
+            i += 2
+            continue
+        out.append(flags[i])
+        i += 1
+    return tuple(out)
+
+
 class TestThePushGuard:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -396,9 +437,10 @@ class TestThePushGuard:
 
     @pytest.mark.asyncio
     async def test_the_run_branch_is_pushed_and_hooks_do_not_run(
-        self, tmp_path: Path
+        self, tmp_path: Path, push_to_local_origin
     ) -> None:
         origin, bare, _ = _origin_and_bare(tmp_path)
+        push_to_local_origin(origin)
         sha = _commit_on(bare, "fix/issue-7", tmp_path)
         marker = tmp_path / "hook-ran"
         hook = bare / "hooks" / "pre-push"
@@ -417,6 +459,111 @@ class TestThePushGuard:
         assert pushed == sha
         assert _git("rev-parse", "refs/heads/fix/issue-7", cwd=origin) == sha
         assert not marker.exists(), "an agent-written hook ran as the relay"
+
+    @pytest.mark.asyncio
+    async def test_agent_written_config_in_the_shared_clone_has_no_effect(
+        self, tmp_path: Path, push_to_local_origin
+    ) -> None:
+        """The agent can write the bare clone's config from its worktree.
+        Plant every redirect we know of there, each one pointing at an
+        attacker origin or a marker-writing command, and check the push
+        honoured none: the commit lands in the real origin, the attacker
+        origin is untouched, no marker exists."""
+        origin, bare, _ = _origin_and_bare(tmp_path)
+        push_to_local_origin(origin)
+        sha = _commit_on(bare, "fix/issue-7", tmp_path)
+        evil = tmp_path / "evil.git"
+        _git("init", "-q", "--bare", str(evil))
+        marker = tmp_path / "honoured"
+        cmd = tmp_path / "evil.sh"
+        cmd.write_text(f"#!/bin/sh\necho \"$0 $*\" >> {marker}\nexit 1\n")
+        cmd.chmod(0o755)
+        included = tmp_path / "included.cfg"
+        included.write_text(f"[credential]\n\thelper = {cmd}\n")
+        for key, value in [
+            ("core.sshCommand", str(cmd)),
+            ("credential.helper", str(cmd)),
+            ("core.askPass", str(cmd)),
+            ("core.fsmonitor", str(cmd)),
+            ("core.hooksPath", str(tmp_path)),
+            ("remote.origin.url", str(evil)),
+            ("remote.origin.pushurl", str(evil)),
+            (f"url.{evil}.insteadOf", "https://github.com/"),
+            (f"url.{evil}.pushInsteadOf", "https://github.com/"),
+            ("include.path", str(included)),
+        ]:
+            _git("config", "--add", key, value, cwd=bare)
+        for hook in ("pre-push", "reference-transaction", "post-checkout"):
+            h = bare / "hooks" / hook
+            h.write_text(f"#!/bin/sh\ntouch {marker}\n")
+            h.chmod(0o755)
+
+        pushed = await _manager(tmp_path).push_run_branch(
+            "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
+            default_branch="main", expected_remote_sha=None,
+        )
+        assert pushed == sha
+        assert _git("rev-parse", "refs/heads/fix/issue-7", cwd=origin) == sha
+        assert _git("for-each-ref", cwd=evil) == ""
+        assert not marker.exists()
+
+    @pytest.mark.asyncio
+    async def test_every_credentialed_call_uses_relay_config_and_an_explicit_url(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """argv and env of each git call the push makes. None may name
+        `origin`, read the shared clone's config for a network operation,
+        or inherit a GIT_* variable from the relay's own environment."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        monkeypatch.setenv("GIT_SSH_COMMAND", "/tmp/should-not-be-inherited")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/tmp/operator-gitconfig")
+        calls: list[tuple[tuple[str, ...], dict]] = []
+
+        async def fake_run_git(self, *args, cwd=None, timeout=None, env=None, **kw):
+            calls.append((args, dict(env or {})))
+            if args[0] == "init":
+                (Path(args[-1]) / "objects" / "info").mkdir(parents=True)
+            if "rev-parse" in args:
+                return "a" * 40 if "fix/issue-7" in args[-1] else "b" * 40
+            if "rev-list" in args:
+                return "1\n"
+            return ""
+
+        monkeypatch.setattr(WorktreeManager, "_run_git", fake_run_git)
+        (tmp_path / "repos").mkdir()
+        await _manager(tmp_path).push_run_branch(
+            "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
+            default_branch="main", expected_remote_sha=None,
+        )
+        bare = str(tmp_path / "repos" / "owner-repo.git")
+        flags = [
+            "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+            "-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never",
+        ]
+        network = [a for a, _ in calls if "ls-remote" in a or "push" in a]
+        assert [a[a.index("ls-remote") if "ls-remote" in a else a.index("push"):]
+                for a in network] == [
+            ("ls-remote", "--heads", "https://github.com/owner/repo.git",
+             "refs/heads/fix/issue-7"),
+            ("push", "--no-verify", "--porcelain",
+             "--force-with-lease=refs/heads/fix/issue-7:",
+             "https://github.com/owner/repo.git",
+             "a" * 40 + ":refs/heads/fix/issue-7"),
+        ]
+        for args, env in calls:
+            assert "origin" not in args
+            if args[0] != "init":
+                assert list(args[2:2 + len(flags)]) == flags, args
+            assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+            assert Path(env["GIT_CONFIG_GLOBAL"]).parent.parent == (
+                tmp_path / "push"
+            )
+            assert "GIT_SSH_COMMAND" not in env
+        for args in network:
+            gitdir = args[args.index("--git-dir") + 1]
+            assert gitdir != bare and gitdir.startswith(str(tmp_path / "push"))
+        assert not any((tmp_path / "push").iterdir()), "private dir left behind"
 
     @pytest.mark.asyncio
     async def test_a_branch_with_no_new_commits_is_not_pushed(
@@ -490,7 +637,7 @@ class TestThePullRequestBodyIsTreatedAsUntrusted:
 class TestADevRunEndsWithTheRelayPublishing:
     @pytest.mark.asyncio
     async def test_relay_pushes_the_branch_and_opens_the_pr(
-        self, tmp_path: Path
+        self, tmp_path: Path, push_to_local_origin
     ) -> None:
         """Real git for the clone, worktree and push; fake GitHub for the
         API. The agent commits and reports PR #999, which does not exist:
@@ -504,6 +651,7 @@ class TestADevRunEndsWithTheRelayPublishing:
         from ctrlrelay.pipelines.dev import run_dev_issue
 
         origin, bare, main_sha = _origin_and_bare(tmp_path)
+        push_to_local_origin(origin)
         github = AsyncMock(spec=GitHubCLI)
         fake_relay_publish(github, pr_number=77)
         github.get_issue.return_value = {
