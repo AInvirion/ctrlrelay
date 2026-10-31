@@ -513,7 +513,7 @@ delete the file entirely to reseed from scratch on next start).
 A run that fails **before it is handed to the agent pipeline** (reading
 the issue, posting the claim comment, cloning, cutting the worktree) does
 not use the issue up. The issue is un-marked and tried again on the next poll, up to 3 runs
-in all, with a chat message each time. After the third it stays in
+in all, with a chat message each time when a chat channel is connected. After the third it stays in
 `seen_issues` and the message says so; fix the cause, then delete the
 number as above. The count is kept in `pre_dispatch_failures` in the same
 file, so a restart does not reset it. Each retry posts a fresh claim

@@ -52,7 +52,7 @@ class TestSettle:
         assert "not retrying" in messages[-1]
         assert "git failed: boom" in messages[-1]
 
-    def test_a_run_that_reached_the_agent_clears_the_count(
+    def test_a_failure_not_flagged_before_dispatch_clears_the_count(
         self, tmp_path: Path,
     ) -> None:
         poller = _poller(tmp_path / "state.json")
@@ -109,7 +109,7 @@ class TestSettle:
         assert poller.seen_issues == {REPO: {1}}
         assert poller.pre_dispatch_failures == {"other/repo": {8: 2}}
 
-    @pytest.mark.parametrize("bad", ["[]", '{"seen_issues": []}', "5"])
+    @pytest.mark.parametrize("bad", ["[]", '{"seen_issues": []}', "5", "9" * 5000])
     def test_a_state_file_of_the_wrong_shape_starts_fresh(
         self, tmp_path: Path, bad: str,
     ) -> None:
@@ -240,3 +240,14 @@ async def test_task_does_not_mark_a_failure_once_the_pipeline_runs(
     assert not result.success
     run.assert_awaited_once()
     assert "failed_before_dispatch" not in result.outputs
+
+
+def test_a_ten_digit_issue_number_keeps_its_count_across_a_restart(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state.json"
+    poller = _poller(state)
+    poller.mark_seen(REPO, 1_000_000_000)
+    settle_pre_dispatch_failure(poller, REPO, 1_000_000_000, _failed(True))
+
+    assert _poller(state).pre_dispatch_failures == {REPO: {1_000_000_000: 1}}

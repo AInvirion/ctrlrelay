@@ -67,7 +67,7 @@ def _read_pre_dispatch_failures(raw: object) -> dict[str, dict[int, int]]:
         kept: dict[int, int] = {}
         for number, count in counts.items():
             if not (isinstance(number, str) and number.isascii()
-                    and number.isdigit() and len(number) <= 9):
+                    and number.isdigit() and len(number) <= 18):
                 continue
             if type(count) is not int or count < 1:
                 continue
@@ -184,10 +184,11 @@ class IssuePoller:
             self.pre_dispatch_failures = _read_pre_dispatch_failures(
                 data.get("pre_dispatch_failures"),
             )
-        except (json.JSONDecodeError, OSError, AttributeError, TypeError):
-            # Corrupt or unreadable state — start fresh. AttributeError
-            # and TypeError are valid JSON of the wrong shape, e.g. a
-            # list at the top level or for seen_issues.
+        except (ValueError, OSError, AttributeError, TypeError):
+            # Corrupt or unreadable state — start fresh. ValueError
+            # covers JSONDecodeError and an integer too long to convert;
+            # AttributeError and TypeError are valid JSON of the wrong
+            # shape, e.g. a list at the top level or for seen_issues.
             self.seen_issues = {}
             self.pre_dispatch_failures = {}
 
