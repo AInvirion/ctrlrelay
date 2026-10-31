@@ -211,8 +211,10 @@ class TestRealGitAndGhFindNothingUnderTheAgentEnv:
             f"[credential]\n\thelper = {helper}\n"
             f"[core]\n\tsshCommand = {ssh}\n"
         )
-        ghdir = tmp_path / "gh"
-        ghdir.mkdir()
+        # gh's default location under HOME, which is where the agent's
+        # real HOME would lead it.
+        ghdir = tmp_path / ".config" / "gh"
+        ghdir.mkdir(parents=True)
         (ghdir / "hosts.yml").write_text(
             "github.com:\n    oauth_token: planted-gh-token\n"
             "    user: someone\n    git_protocol: https\n"
@@ -222,7 +224,6 @@ class TestRealGitAndGhFindNothingUnderTheAgentEnv:
             "HOME": str(tmp_path),
             "GIT_CONFIG_GLOBAL": str(gitconfig),
             "GIT_CONFIG_NOSYSTEM": "1",
-            "GH_CONFIG_DIR": str(ghdir),
             "GIT_TERMINAL_PROMPT": "0",
         }
         empty = tmp_path / "empty-gh"
@@ -608,7 +609,7 @@ class TestADevRunEndsWithTheRelayPublishing:
             session_id="x", exit_code=0,
             state=CheckpointState(
                 status=CheckpointStatus.DONE, session_id="x",
-                outputs={"pr_title": "t"},
+                outputs={"pr_title": "t", "pr_number": 999},
             ),
         )
         state_db = StateDB(tmp_path / "state.db")
@@ -625,6 +626,9 @@ class TestADevRunEndsWithTheRelayPublishing:
 
         assert not result.success
         assert "push refused" in (result.error or "")
+        # The agent's claimed PR is not carried into the failure, where
+        # the claim-retraction comment would cite it as real.
+        assert "pr_number" not in result.outputs
         github.create_pr.assert_not_awaited()
         worktree.delete_branch.assert_not_awaited()
 
