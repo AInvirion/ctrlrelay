@@ -55,7 +55,8 @@ _SEARCH_TOOLS = frozenset({"Grep", "Glob"})
 _FILE_TOOLS = frozenset({"Read", "Edit", "Write", "NotebookEdit", "MultiEdit"})
 
 _SECRET_WORD = re.compile(r"(?i)key|token|secret|pass|pwd|auth|credential|cookie")
-_SHOWN_WORD = re.compile(r"[a-z][a-z0-9._:-]{0,30}")
+_PROGRAM_WORD = re.compile(r"[a-z][a-z0-9._:-]{0,30}")  # python3 keeps its digit
+_SHOWN_WORD = re.compile(r"[a-z][a-z._:-]{0,30}")  # no digits: hex and ids stay hidden
 # Words that fit the shape above and are still credentials (`xoxs-abc`, `sk-abc`).
 _TOKEN_PREFIX = re.compile(r"(?i)(?:sk|xox[a-z]|gh[a-z]|github_pat|akia)[-_]")
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
@@ -163,9 +164,9 @@ def classify(tool_name: str, tool_input: dict) -> Phase | None:
     return None
 
 
-def _is_shown(word: str) -> bool:
+def _is_shown(word: str, shape: re.Pattern = _SHOWN_WORD) -> bool:
     return (
-        _SHOWN_WORD.fullmatch(word) is not None
+        shape.fullmatch(word) is not None
         and not _SECRET_WORD.search(word)
         and not _TOKEN_PREFIX.match(word)
     )
@@ -179,7 +180,7 @@ def summarize_command(command: str) -> str:
         if not words or os.path.basename(words[0]) == "cd":
             continue
         program = os.path.basename(words[0])
-        shown = [program if _is_shown(program) else HIDDEN]
+        shown = [program if _is_shown(program, _PROGRAM_WORD) else HIDDEN]
         rest = words[1:]
         while rest and len(shown) < 3 and _is_shown(rest[0]):
             shown.append(rest.pop(0))

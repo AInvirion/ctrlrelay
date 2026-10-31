@@ -259,6 +259,11 @@ def test_last_command_truncated_to_200(tmp_path: Path) -> None:
     ("command", "shown"),
     [
         ("git status", "git status"),
+        ("git push", "git push"),
+        ("npm test", "npm test"),
+        ("python3 manage.py check", "python3 manage.py check"),
+        ("tool login 0123abcd0123abcd0123abcd0123ab", "tool login \u2026"),
+        ("tool login abcdef0123abcdef0123abcdef0123", "tool login \u2026"),
         ("git push -u origin x", "git push \u2026"),
         ("uv run pytest -q tests/a.py", "pytest \u2026"),
         ("poetry run pytest", "pytest"),
@@ -304,6 +309,7 @@ def _shown_for(tmp_path: Path, name: str, tool_input: dict) -> str | None:
         ("echo sk-proj-abc123", ["sk-proj"]),
         ("echo " + "a1b2" * 10, ["a1b2"]),
         ("tool login deploy-key-1234", ["deploy-key"]),
+        ("tool login abcdef0123abcdef0123abcdef0123", ["abcdef", "0123"]),
     ],
 )
 def test_no_secret_reaches_last_command(
