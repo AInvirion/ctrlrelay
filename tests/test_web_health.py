@@ -155,6 +155,67 @@ def test_no_load_average_and_no_cpu_count_are_unknown(tmp_path: Path) -> None:
     assert "load" in joined and "cpu count" in joined
 
 
+def test_a_system_without_getloadavg_imports_and_reports_load_unknown(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """os.getloadavg does not exist everywhere. Its absence must not break
+    the import or the read: load is null, with a reason."""
+    import importlib
+
+    import ctrlrelay.web.health as health
+
+    monkeypatch.delattr(os, "getloadavg")
+    reloaded = importlib.reload(health)
+    try:
+        out = reloaded.read_server_health(
+            disks=[], proc=_proc(tmp_path), cpu_count=lambda: 4,
+        )
+    finally:
+        monkeypatch.undo()
+        importlib.reload(health)
+
+    assert (out["load_1m"], out["load_5m"], out["load_15m"]) == (None, None, None)
+    assert any(r.startswith("load average") for r in out["unavailable"])
+    # Present case: the rest is still read.
+    assert out["cpu_count"] == 4 and out["memory"]["total_bytes"] == 16_000_000 * 1024
+
+
+def _boom(*_a, **_kw):
+    raise RuntimeError("boom")
+
+
+@pytest.mark.parametrize("broken", ["loadavg", "cpu_count", "disk_usage"])
+def test_one_failing_reading_nulls_only_itself_and_never_raises(
+    tmp_path: Path, broken: str,
+) -> None:
+    """Any exception from one reading, not just the expected OSError,
+    nulls that value with a reason; the other readings are still made."""
+    out = _health(tmp_path, **{broken: _boom})
+
+    joined = " | ".join(out["unavailable"])
+    assert "RuntimeError: boom" in joined
+    assert len(out["unavailable"]) == 1
+    if broken == "loadavg":
+        assert out["load_1m"] is None and out["cpu_count"] == 12
+    elif broken == "cpu_count":
+        assert out["cpu_count"] is None and out["load_1m"] == 0.5
+    else:
+        assert out["disks"][0]["free_bytes"] is None and out["load_1m"] == 0.5
+    assert out["memory"]["total_bytes"] == 16_000_000 * 1024
+    assert out["uptime_s"] == 350000
+
+
+def test_unreadable_proc_files_never_raise(tmp_path: Path) -> None:
+    proc = _proc(tmp_path, meminfo="\xff not text", uptime="")
+    (proc / "meminfo").write_bytes(b"\xff\xfe")  # not UTF-8
+
+    out = _health(tmp_path, proc=proc)
+
+    assert out["memory"] == dict.fromkeys(MEMORY_KEYS)
+    assert out["uptime_s"] is None
+    assert out["load_1m"] == 0.5
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads the real /proc")
 def test_reads_this_machines_real_proc(tmp_path: Path) -> None:
     """The real files, with the real readers: nothing unavailable on Linux."""

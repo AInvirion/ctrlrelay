@@ -1014,11 +1014,22 @@ def test_live_dot_is_green_only_within_two_refresh_intervals(
     (None, 50_000, "updated never"),
     (50_000, 50_400, "updated 0s ago"),
     (40_000, 52_999, "updated 12s ago"),
-    (0, 125_000, "updated 2m ago"),
+    (0, 125_000, "updated 2m 05s ago"),
+    (0, 3_725_000, "updated 1h 02m 05s ago"),
 ])
 def test_updated_ago_counts_seconds(ok_at, now, expected) -> None:
-    got = _run_js(["updatedAgo", "duration"], f"updatedAgo({json.dumps(ok_at)}, {now})")
+    got = _run_js(["updatedAgo", "clockText"], f"updatedAgo({json.dumps(ok_at)}, {now})")
     assert got == expected
+
+
+@pytest.mark.parametrize("start_s", [125, 3_725, 90_000])
+def test_updated_ago_changes_every_second_past_a_minute_and_an_hour(start_s: int) -> None:
+    """One second later, the text is different: past 2m, past 1h, past 1d."""
+    texts = _run_js(
+        ["updatedAgo", "clockText"],
+        f"[updatedAgo(0, {start_s * 1000}), updatedAgo(0, {(start_s + 1) * 1000})]",
+    )
+    assert texts[0] != texts[1], texts
 
 
 def test_elapsed_times_tick_from_the_server_value() -> None:
@@ -1034,13 +1045,23 @@ def test_elapsed_times_tick_from_the_server_value() -> None:
 @pytest.mark.parametrize(("secs", "expected"), [
     (None, "running unknown"),
     (45, "running 45s"),
-    (605, "running 10m 05s"),     # seconds shown below an hour, so it moves
-    (3_725, "running 1h 2m"),
+    (605, "running 10m 05s"),
+    (3_725, "running 1h 02m 05s"),
+    (90_061, "running 1d 01h 01m 01s"),
 ])
-def test_ticking_text_moves_every_second_below_an_hour(secs, expected) -> None:
-    got = _run_js(["tickText", "duration"],
+def test_ticking_text_always_shows_seconds(secs, expected) -> None:
+    got = _run_js(["tickText", "clockText"],
                   f'tickText({json.dumps(secs)}, "running ", "")')
     assert got == expected
+
+
+@pytest.mark.parametrize("start_s", [65, 3_725, 90_000])
+def test_ticking_text_changes_every_second(start_s: int) -> None:
+    texts = _run_js(
+        ["tickText", "clockText"],
+        f'[tickText({start_s}, "", ""), tickText({start_s + 1}, "", "")]',
+    )
+    assert texts[0] != texts[1], texts
 
 
 def test_skipped_section_is_collapsed_with_a_count() -> None:

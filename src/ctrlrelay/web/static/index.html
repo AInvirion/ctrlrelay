@@ -234,7 +234,7 @@ function liveness(okAtMs, nowMs, seconds) {
 
 function updatedAgo(okAtMs, nowMs) {
   if (typeof okAtMs !== "number") { return "updated never"; }
-  return "updated " + duration(Math.floor((nowMs - okAtMs) / 1000)) + " ago";
+  return "updated " + clockText(Math.floor((nowMs - okAtMs) / 1000)) + " ago";
 }
 
 // A server count of seconds, moved on by the whole seconds since it arrived.
@@ -243,16 +243,23 @@ function tickedSeconds(base, receivedAtMs, nowMs) {
   return base + Math.max(0, Math.floor((nowMs - receivedAtMs) / 1000));
 }
 
-// Like duration, with seconds kept below an hour so a ticking span is seen
-// to move ("10m 05s"). Unknown stays "unknown", with no "ago" after it.
+// A count of seconds that always shows its seconds, so a ticking span is
+// seen to move at any age: "45s", "2m 05s", "1h 02m 05s", "1d 01h 01m 01s".
+function clockText(seconds) {
+  seconds = Math.max(0, Math.floor(seconds));
+  function two(n) { return (n < 10 ? "0" : "") + n; }
+  var s = seconds % 60, m = Math.floor(seconds / 60) % 60;
+  var h = Math.floor(seconds / 3600) % 24, d = Math.floor(seconds / 86400);
+  if (d > 0) { return d + "d " + two(h) + "h " + two(m) + "m " + two(s) + "s"; }
+  if (h > 0) { return h + "h " + two(m) + "m " + two(s) + "s"; }
+  if (m > 0) { return m + "m " + two(s) + "s"; }
+  return s + "s";
+}
+
+// Unknown stays "unknown", with no "ago" after it.
 function tickText(seconds, prefix, suffix) {
   if (typeof seconds !== "number" || !isFinite(seconds)) { return prefix + "unknown"; }
-  seconds = Math.max(0, Math.floor(seconds));
-  if (seconds >= 60 && seconds < 3600) {
-    var s = seconds % 60;
-    return prefix + Math.floor(seconds / 60) + "m " + (s < 10 ? "0" : "") + s + "s" + suffix;
-  }
-  return prefix + duration(seconds) + suffix;
+  return prefix + clockText(seconds) + suffix;
 }
 
 function ticking(base, prefix, suffix, cls) {

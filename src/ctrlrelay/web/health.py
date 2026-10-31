@@ -66,7 +66,7 @@ def _memory(proc: Path, unavailable: list[str]) -> dict[str, Any]:
         available = _meminfo_kb(text, "MemAvailable") * 1024
         if total <= 0:
             raise ValueError("MemTotal is 0")
-    except (OSError, ValueError) as exc:
+    except Exception as exc:
         unavailable.append(f"memory ({proc / 'meminfo'}): {_why(exc)}")
         return dict.fromkeys(_MEMORY_KEYS)
     return {
@@ -81,7 +81,7 @@ def _uptime(proc: Path, unavailable: list[str]) -> int | None:
     try:
         first = (proc / "uptime").read_text().split()[0]
         return int(float(first))
-    except (OSError, ValueError, IndexError) as exc:
+    except Exception as exc:
         unavailable.append(f"uptime ({proc / 'uptime'}): {_why(exc)}")
         return None
 
@@ -98,7 +98,7 @@ def _disk(
         total, free = int(usage.total), int(usage.free)
         if total <= 0:
             raise ValueError("total size is 0")
-    except (OSError, ValueError) as exc:
+    except Exception as exc:
         unavailable.append(f"disk {name} ({path}): {_why(exc)}")
         return out
     out.update(
@@ -108,28 +108,53 @@ def _disk(
     return out
 
 
+def _load(
+    loadavg: Callable[[], Any] | None, unavailable: list[str],
+) -> tuple[float | None, float | None, float | None]:
+    if loadavg is None:
+        unavailable.append("load average: os.getloadavg is not available here")
+        return None, None, None
+    try:
+        one, five, fifteen = (float(x) for x in loadavg())
+    except Exception as exc:
+        unavailable.append(f"load average: {_why(exc)}")
+        return None, None, None
+    return one, five, fifteen
+
+
+def _cores(cpu_count: Callable[[], Any], unavailable: list[str]) -> int | None:
+    try:
+        cores = cpu_count()
+    except Exception as exc:
+        unavailable.append(f"cpu count: {_why(exc)}")
+        return None
+    if type(cores) is not int or cores < 1:
+        unavailable.append("cpu count: not reported by this system")
+        return None
+    return cores
+
+
 def read_server_health(
     *,
     disks: Sequence[tuple[str, Path]],
     proc: Path = Path("/proc"),
-    loadavg: Callable[[], tuple[float, float, float]] = os.getloadavg,
-    cpu_count: Callable[[], int | None] = os.cpu_count,
+    loadavg: Callable[[], Any] | None = None,
+    cpu_count: Callable[[], Any] = os.cpu_count,
     disk_usage: Callable[[Path], Any] = shutil.disk_usage,
 ) -> dict[str, Any]:
     """This machine's health, read now. ``disks`` is ``(name, path)`` pairs
-    to measure, in the order shown. Raises only on a fault in this code;
-    anything the machine cannot tell is ``null`` with a line in
-    ``unavailable``."""
+    to measure, in the order shown. ``loadavg`` defaults to
+    ``os.getloadavg``, looked up here rather than at import because it
+    does not exist on every system.
+
+    Never raises for anything a reading does: each reading is guarded on
+    its own, so one that fails is ``null`` with a line in ``unavailable``
+    and the others are still made."""
     unavailable: list[str] = []
-    try:
-        one, five, fifteen = (float(x) for x in loadavg())
-    except (OSError, ValueError, TypeError) as exc:
-        unavailable.append(f"load average: {_why(exc)}")
-        one = five = fifteen = None  # type: ignore[assignment]
-    cores = cpu_count()
-    if not isinstance(cores, int) or cores < 1:
-        unavailable.append("cpu count: not reported by this system")
-        cores = None
+    if loadavg is None:
+        loadavg = getattr(os, "getloadavg", None)
+    one, five, fifteen = _load(loadavg, unavailable)
+    cores = _cores(cpu_count, unavailable)
     return {
         "load_1m": one,
         "load_5m": five,

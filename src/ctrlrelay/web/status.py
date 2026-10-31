@@ -534,7 +534,8 @@ def build_status(
     waiting = dict(waiting)
     skipped = waiting.pop("skipped", None)
     if waiting.get("last_good_ts") is None or not isinstance(skipped, list):
-        # Before GitHub has answered once the list is empty, not "none".
+        # Before GitHub has answered once the tracker's list is empty, which
+        # would read as "nothing skipped", so it is published as null.
         skipped = None
     try:
         server_health: dict | None = server()
