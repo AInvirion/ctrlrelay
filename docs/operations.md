@@ -254,8 +254,8 @@ loopback or on the home network.
 | Path | What |
 |---|---|
 | `/` | The page. Refreshes itself every `web.refresh_seconds`. |
-| `/api/status` | Everything on the page, as JSON (the contract is in `src/ctrlrelay/web/status.py`). A section that could not be read is `null` and `errors` says why; `[]` means "read, and empty". |
-| `/api/events?since=<epoch seconds>` | The feed, newest first. Without `since`, the last `web.history_days` days. |
+| `/api/status` | Everything on the page, as JSON (the contract is in `src/ctrlrelay/web/status.py`). A section that could not be read is `null` and `errors` says why; `[]` means "read, and empty". The feed holds at most the newest 200 events: `feed_total` is how many the history window holds (`null` if unreadable) and `feed_truncated` is `true` when some were left out, in which case the page says "showing newest N of M". |
+| `/api/events?since=<epoch seconds>` | The feed, newest first, at most `limit` (200) events. Without `since`, the last `web.history_days` days. Carries the same `feed_total` and `feed_truncated`, plus the `limit` used. |
 
 Try it on loopback first (the default `web.host` is `127.0.0.1`, port `8787`):
 

@@ -14,7 +14,9 @@ import http.client
 import json
 import logging
 import re
+import shutil
 import socket
+import subprocess
 import threading
 import time
 from collections.abc import Iterator
@@ -33,7 +35,7 @@ from ctrlrelay.web.server import (
     bind_warning,
     make_server,
 )
-from ctrlrelay.web.status import make_sessions_reader
+from ctrlrelay.web.status import FEED_LIMIT, make_sessions_reader
 from ctrlrelay.web.transcript import transcript_dir_for
 from ctrlrelay.web.waiting import WaitingTracker
 
@@ -42,7 +44,7 @@ HOSTILE_TITLE = "<img src=x onerror=alert(1)>"
 HOSTILE_FILE = '"><script>alert(1)<'
 TOP_KEYS = {
     "version", "host", "generated", "generated_ts", "running", "needs_you",
-    "waiting", "today", "feed", "errors",
+    "waiting", "today", "feed", "feed_total", "feed_truncated", "errors",
 }
 
 
@@ -410,6 +412,36 @@ def test_api_events_without_since_is_the_history_window(tmp_path: Path, serve) -
     assert status == 200
     # The 30-day-old row is outside the window; the three recent ones are in.
     assert [e["kind"] for e in out["events"]] == ["merged", "pr_opened", "dispatched"]
+    assert out["feed_total"] == 3
+    assert out["feed_truncated"] is False
+    assert out["limit"] == FEED_LIMIT
+
+
+def _feed_note(data: dict) -> object:
+    """Run the page's own feedNote on ``data`` in node."""
+    node = shutil.which("node") or shutil.which("nodejs")
+    if node is None:
+        pytest.skip("node is not installed, so the page's script cannot run here")
+    body = _js_function(_script(), "feedNote")
+    program = (
+        "function feedNote(data) {" + body + "}\n"
+        "process.stdout.write(JSON.stringify(feedNote(" + json.dumps(data) + ")));"
+    )
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True,
+                          timeout=30, check=True)
+    return json.loads(done.stdout)
+
+
+def test_page_says_when_the_feed_was_cut() -> None:
+    feed = [{"ts": 1, "kind": "merged"}] * 3
+    assert _feed_note({"feed": feed, "feed_total": 250, "feed_truncated": True}) == (
+        "showing newest 3 of 250"
+    )
+    assert _feed_note({"feed": feed, "feed_total": 3, "feed_truncated": False}) is None
+    assert _feed_note({"feed": None, "feed_total": None, "feed_truncated": False}) is None
+    # The renderer shows it.
+    render = _js_function(_script(), "renderFeed")
+    assert "feedNote(data)" in render
 
 
 @pytest.mark.parametrize("query", ["since=abc", "since=", "since=1.5", "since=1&since=2"])

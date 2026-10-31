@@ -384,6 +384,14 @@ function detailText(detail) {
   return text.length > 300 ? text.slice(0, 299) + "…" : text;
 }
 
+// The feed holds at most the server's limit. When the history window has
+// more, say so: a cut list must not read as everything that happened.
+function feedNote(data) {
+  if (!Array.isArray(data.feed) || data.feed_truncated !== true) { return null; }
+  var total = typeof data.feed_total === "number" ? String(data.feed_total) : "unknown";
+  return "showing newest " + data.feed.length + " of " + total;
+}
+
 function renderFeed(data) {
   var target = document.getElementById("feed");
   if (!Array.isArray(data.feed)) {
@@ -407,7 +415,8 @@ function renderFeed(data) {
     if (text) { li.appendChild(el("div", "detail", text)); }
     list.appendChild(li);
   });
-  put(target, [list]);
+  var note = feedNote(data);
+  put(target, note ? [el("p", "empty", note), list] : [list]);
 }
 
 function renderHeader(data) {

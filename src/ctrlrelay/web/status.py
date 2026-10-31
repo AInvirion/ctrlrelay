@@ -33,8 +33,14 @@ Contract (keys exactly; every timestamp is ``<name>_ts`` epoch seconds plus
      "today": {"dispatched", "pr_opened", "merged", "failed", "blocked",
                "messages_sent"},   # ints, or all null if unreadable
      "feed": [{"ts", "time", "kind", "repo", "issue_number", "session_id",
-               "detail"}] | null,
+               "detail"}] | null,   # newest first, at most FEED_LIMIT
+     "feed_total": int | null,       # events in the history window
+     "feed_truncated": bool,         # feed_total > len(feed)
      "errors": [str]}
+
+``feed`` holds at most ``FEED_LIMIT`` events. ``feed_total`` counts every
+event in the history window, read in the same transaction; it is ``null``
+whenever ``feed`` is, and ``feed_truncated`` is then ``false``.
 
 ``issue_number`` in ``needs_you`` comes from the question's session row
 (``null`` for secops, or when the row is gone). ``title`` (running and
@@ -296,13 +302,20 @@ def _read_today(conn: sqlite3.Connection, start: int, end: int) -> dict[str, int
     return counts
 
 
-def _read_feed(conn: sqlite3.Connection, since_ts: int, limit: int) -> list[dict[str, Any]]:
+def _read_feed(
+    conn: sqlite3.Connection, since_ts: int, limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """The newest ``limit`` events with ``ts >= since_ts``, and how many
+    events that window holds in all (read in the same transaction)."""
     rows = conn.execute(
         """SELECT ts, kind, repo, issue_number, session_id, detail FROM events
            WHERE ts >= ? ORDER BY ts DESC, id DESC LIMIT ?""",
         (int(since_ts), int(limit)),
     ).fetchall()
-    return [_event(dict(r)) for r in rows]
+    (total,) = conn.execute(
+        "SELECT count(*) FROM events WHERE ts >= ?", (int(since_ts),)
+    ).fetchone()
+    return [_event(dict(r)) for r in rows], int(total)
 
 
 def _detail(raw: Any) -> Any:
@@ -517,6 +530,7 @@ def build_status(
     running: list[dict[str, Any]] | None = None
     needs_you: list[dict[str, Any]] | None = None
     feed: list[dict[str, Any]] | None = None
+    feed_total: int | None = None
     today: dict[str, int | None] = dict.fromkeys(_TODAY.values())
     if snap is not None:
         for err in snap["errors"]:
@@ -547,7 +561,7 @@ def build_status(
         if not isinstance(snap["today"], _Missing):
             today = dict(snap["today"])
         if not isinstance(snap["feed"], _Missing):
-            feed = snap["feed"]
+            feed, feed_total = snap["feed"]
 
     return {
         "version": version,
@@ -559,21 +573,42 @@ def build_status(
         "waiting": waiting,
         "today": today,
         "feed": feed,
+        "feed_total": feed_total,
+        "feed_truncated": feed is not None and feed_total is not None
+        and feed_total > len(feed),
         "errors": errors,
     }
 
 
-def list_feed(*, db_path: Path, since_ts: int, limit: int = FEED_LIMIT) -> dict:
-    """Events with ``ts >= since_ts``, newest first: ``{"events", "error"}``.
-    ``events`` is ``null`` when they could not be read."""
+def list_feed(*, db_path: Path, since_ts: int, limit: int | None = None) -> dict:
+    """The newest ``limit`` (default ``FEED_LIMIT``) events with
+    ``ts >= since_ts``, newest first:
+    ``{"events", "feed_total", "feed_truncated", "limit", "error"}``.
+    ``feed_total`` counts every event in the window; ``feed_truncated`` is
+    true when that is more than ``events`` holds. ``events`` and
+    ``feed_total`` are ``null`` (and ``feed_truncated`` false) when they
+    could not be read."""
+    if limit is None:
+        limit = FEED_LIMIT
     try:
-        events = _read(Path(db_path), lambda conn: _read_feed(conn, since_ts, limit))
+        events, total = _read(
+            Path(db_path), lambda conn: _read_feed(conn, since_ts, limit)
+        )
     except Exception as exc:
         return {
             "events": None,
+            "feed_total": None,
+            "feed_truncated": False,
+            "limit": limit,
             "error": f"events could not be read ({db_path}): {type(exc).__name__}: {exc}",
         }
-    return {"events": events, "error": None}
+    return {
+        "events": events,
+        "feed_total": total,
+        "feed_truncated": total > len(events),
+        "limit": limit,
+        "error": None,
+    }
 
 
 def make_sessions_reader(db_path: Path) -> SessionsReader:

@@ -48,7 +48,7 @@ WAITING_OK = {
 
 TOP_KEYS = {
     "version", "host", "generated", "generated_ts", "running", "needs_you",
-    "waiting", "today", "feed", "errors",
+    "waiting", "today", "feed", "feed_total", "feed_truncated", "errors",
 }
 RUNNING_KEYS = {
     "session_id", "pipeline", "repo", "issue_number", "title", "started",
@@ -471,6 +471,69 @@ def test_feed_on_a_missing_db_is_unknown_not_empty(tmp_path: Path) -> None:
     out = list_feed(db_path=tmp_path / "nope.db", since_ts=0)
     assert out["events"] is None
     assert out["error"] and "nope.db" in out["error"]
+
+
+def test_a_feed_over_the_limit_says_it_was_cut_and_by_how_much(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(status_module, "FEED_LIMIT", 2)
+    db = _db(tmp_path)
+    now = 1_800_000_000
+    db.record_event("dispatched", ts=now - 30 * 86_400)  # outside the window
+    for i in range(3):
+        db.record_event("dispatched", issue_number=i, ts=now - 300 + i)
+
+    out = _status(tmp_path, now, history_days=7)
+
+    assert [e["issue_number"] for e in out["feed"]] == [2, 1]
+    assert out["feed_total"] == 3
+    assert out["feed_truncated"] is True
+
+
+def test_a_feed_within_the_limit_is_not_truncated(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    now = 1_800_000_000
+    db.record_event("dispatched", ts=now - 60)
+    db.record_event("merged", ts=now - 30)
+
+    out = _status(tmp_path, now)
+
+    assert len(out["feed"]) == 2
+    assert out["feed_total"] == 2
+    assert out["feed_truncated"] is False
+
+
+def test_an_unreadable_feed_has_an_unknown_total(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    db.record_event("merged", ts=10**15)  # makes the feed section unknown
+    out = _status(tmp_path, 2_000)
+    assert out["feed"] is None
+    assert out["feed_total"] is None
+    assert out["feed_truncated"] is False
+
+    missing = build_status(db_path=tmp_path / "nope.db", waiting=WAITING_OK,
+                           version="1", host="h", now=2_000, home=tmp_path)
+    assert missing["feed_total"] is None and missing["feed_truncated"] is False
+
+
+def test_list_feed_reports_its_limit_total_and_truncation(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    for ts in (100, 200, 300):
+        db.record_event("dispatched", ts=ts)
+
+    cut = list_feed(db_path=tmp_path / "state.db", since_ts=150, limit=1)
+    assert [e["ts"] for e in cut["events"]] == [300]
+    assert cut["feed_total"] == 2 and cut["feed_truncated"] is True
+    assert cut["limit"] == 1
+
+    whole = list_feed(db_path=tmp_path / "state.db", since_ts=0)
+    assert len(whole["events"]) == 3
+    assert whole["feed_total"] == 3 and whole["feed_truncated"] is False
+    assert whole["limit"] == status_module.FEED_LIMIT
+
+    gone = list_feed(db_path=tmp_path / "nope.db", since_ts=0, limit=5)
+    assert gone["events"] is None and gone["feed_total"] is None
+    assert gone["feed_truncated"] is False and gone["limit"] == 5
 
 
 # --- contract ----------------------------------------------------------------
