@@ -11,7 +11,9 @@ a reason.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -42,11 +44,119 @@ class AgentActivity:
 
 _READ_TOOLS = frozenset({"Read", "Grep", "Glob"})
 _CODE_TOOLS = frozenset({"Edit", "Write", "NotebookEdit", "MultiEdit"})
-_PR_COMMAND = re.compile(r"\bgit\s+push\b|\bgh\s+pr\s+create\b")
-_TEST_COMMAND = re.compile(
-    r"\bpytest\b|\bnpm\s+(?:run\s+)?test\b|\bnpx\s+playwright\b|\bgo\s+test\b"
-    r"|\bcargo\s+test\b|\bjest\b|\bvitest\b"
-)
+
+MASK = "***"
+_SECRET_NAME = re.compile(r"(?i)key|token|secret|pass|pwd|auth|credential|cookie")
+_VALUE = r"(\"[^\"]*\"|'[^']*'|[^\s;&|]+)"
+_ASSIGNMENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=" + _VALUE)
+_FLAG = re.compile(r"(?<![\w-])(--?[A-Za-z][\w-]*)(=|\s+)" + _VALUE)
+_TOKEN_SHAPES = [
+    re.compile(r"\bBearer\s+[^\s\"']+"),
+    re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]+"),
+    re.compile(r"\bxox[abp]-[A-Za-z0-9-]+"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"[A-Za-z0-9+/=_-]{32,}"),
+]
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
+
+# Shell separators that start a new command, and words that only wrap one.
+_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "\n"})
+_TEST_RUNNERS = frozenset({"pytest", "jest", "vitest"})
+_TEST_SUBCOMMANDS = {"go": "test", "cargo": "test", "playwright": "test"}
+
+
+def redact(text: str) -> str:
+    """Mask anything in a command or pattern that may be a secret."""
+    text = re.sub(r"<<.*", "<<\u2026", text, flags=re.S)
+
+    def assignment(m: re.Match) -> str:
+        return f"{m.group(1)}={MASK}" if _SECRET_NAME.search(m.group(1)) else m.group(0)
+
+    def flag(m: re.Match) -> str:
+        name, sep, value = m.groups()
+        if value.startswith("-"):
+            return m.group(0)
+        if name == "-p" or _SECRET_NAME.search(name.lstrip("-")):
+            return f"{name}{sep}{MASK}"
+        return m.group(0)
+
+    text = _TOKEN_SHAPES[0].sub(f"Bearer {MASK}", text)
+    for shape in _TOKEN_SHAPES[1:]:
+        text = shape.sub(MASK, text)
+    text = _ASSIGNMENT.sub(assignment, text)
+    return _FLAG.sub(flag, text)
+
+
+def _strip_heredoc_bodies(command: str) -> str:
+    lines = command.split("\n")
+    kept: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        kept.append(line)
+        i += 1
+        for m in _HEREDOC.finditer(line):
+            while i < len(lines) and lines[i].strip() != m.group(2):
+                i += 1
+            i += 1  # the terminator
+    return "\n".join(kept)
+
+
+def _segments(command: str) -> list[list[str]]:
+    """The simple commands in a shell line, as word lists, quotes respected."""
+    command = _strip_heredoc_bodies(command)
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
+    lexer.whitespace = " \t\r"
+    try:
+        tokens = list(lexer)
+    except ValueError:  # unbalanced quote: fall back to a plain split
+        tokens = re.split(r"\s+|(&&|\|\||[;|&\n])", command)
+        tokens = [t for t in tokens if t]
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token in _SEPARATORS:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return [s for s in segments if s]
+
+
+def _command_words(words: list[str]) -> list[str]:
+    """Drop env assignments and wrappers (`uv run`, `npx`, `python -m`)."""
+    while words:
+        head = os.path.basename(words[0])
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+            words = words[1:]
+        elif head == "uv" and words[1:2] == ["run"]:
+            words = words[2:]
+        elif head == "npx":
+            words = words[1:]
+        elif re.fullmatch(r"python[0-9.]*", head) and words[1:2] == ["-m"]:
+            words = words[2:]
+        else:
+            break
+    return words
+
+
+def _classify_segment(words: list[str]) -> Phase | None:
+    words = _command_words(words)
+    if not words:
+        return None
+    head = os.path.basename(words[0])
+    rest = words[1:]
+    if head in _TEST_RUNNERS:
+        return Phase.TESTING
+    if head in _TEST_SUBCOMMANDS and rest[:1] == [_TEST_SUBCOMMANDS[head]]:
+        return Phase.TESTING
+    if head == "npm" and (rest[:1] == ["test"] or (rest[:1] == ["run"] and rest[1:2]
+                                                  and rest[1].startswith("test"))):
+        return Phase.TESTING
+    if head == "git" and rest[:1] == ["push"]:
+        return Phase.PR
+    if head == "gh" and rest[:2] == ["pr", "create"]:
+        return Phase.PR
+    return None
 
 
 def transcript_dir_for(worktree_path: str, home: Path) -> Path:
@@ -64,11 +174,12 @@ def classify(tool_name: str, tool_input: dict) -> Phase | None:
         command = tool_input.get("command")
         if not isinstance(command, str):
             return Phase.READING
-        if _PR_COMMAND.search(command):
-            return Phase.PR
-        if _TEST_COMMAND.search(command):
-            return Phase.TESTING
-        return Phase.READING
+        phase = Phase.READING  # any other shell command only looks around
+        for words in _segments(command):
+            classified = _classify_segment(words)
+            if classified is not None:
+                phase = classified
+        return phase
     return None
 
 
@@ -78,7 +189,7 @@ def _describe(tool_input: Any) -> str | None:
     for key in ("command", "file_path", "pattern"):
         value = tool_input.get(key)
         if isinstance(value, str) and value.strip():
-            return " ".join(value.split())[:MAX_COMMAND_CHARS]
+            return " ".join(redact(value).split())[:MAX_COMMAND_CHARS]
     return None
 
 
@@ -94,12 +205,16 @@ def _epoch(timestamp: Any) -> int | None:
 def _tail_lines(path: Path, tail_bytes: int) -> list[str]:
     size = path.stat().st_size
     start = max(0, size - tail_bytes)
+    mid_line = False
     with open(path, "rb") as fh:
+        if start > 0:
+            fh.seek(start - 1)
+            mid_line = fh.read(1) != b"\n"
         fh.seek(start)
         data = fh.read(tail_bytes)
     lines = data.decode("utf-8", errors="replace").split("\n")
-    if start > 0:
-        lines = lines[1:]  # began mid-line
+    if mid_line:
+        lines = lines[1:]  # the cut landed inside a row
     return lines
 
 
@@ -108,8 +223,8 @@ def _tool_uses(lines: list[str]):
     for line in lines:
         try:
             row = json.loads(line)
-        except ValueError:
-            continue  # blank, or a row the CLI is still writing
+        except Exception:
+            continue  # blank, half-written, or too deep to parse
         if not isinstance(row, dict) or row.get("type") != "assistant":
             continue
         message = row.get("message")

@@ -15,6 +15,7 @@ from ctrlrelay.web.transcript import (
     Phase,
     classify,
     read_activity,
+    redact,
     transcript_dir_for,
 )
 
@@ -24,8 +25,7 @@ WORKTREE = "/home/u/.ctrlrelay/worktrees/example-org-alpha-dev-215-49a5"
 # The fixture's last tool use, read off the file by hand: the agent opening its PR.
 LAST_COMMAND = (
     "gh pr create --repo example-org/alpha --base main"
-    " --head fix/issue-1 --title \"...\" --body \"$(cat <<'BODY' ... BODY )\""
-    " 2>&1 | tail -3"
+    " --head fix/issue-1 --title \"...\" --body \"$(cat <<\u2026"
 )
 LAST_STEP_TS = int(datetime(2026, 10, 31, 3, 59, 16, 739000, tzinfo=UTC).timestamp())
 
@@ -52,7 +52,8 @@ def _assistant_row(name: str, tool_input: dict, ts: str) -> str:
 
 
 def test_transcript_dir_matches_measured_layout() -> None:
-    assert transcript_dir_for(WORKTREE, Path("/home/u")) == Path(
+    worktree = "/home/u/.ctrlrelay/worktrees/example_org-alpha-dev-215-49a5"
+    assert transcript_dir_for(worktree, Path("/home/u")) == Path(
         "/home/u/.claude/projects/-home-u--ctrlrelay-worktrees-example-org-alpha-dev-215-49a5"
     )
 
@@ -66,8 +67,16 @@ def test_transcript_dir_matches_measured_layout() -> None:
         ("Bash", {"command": "npx playwright test"}, Phase.TESTING),
         ("Bash", {"command": "git push -u origin x"}, Phase.PR),
         ("Bash", {"command": "gh pr create --fill"}, Phase.PR),
-        # The push is the step the command ends on, so it wins over the run before it.
+        # The phase is the last simple command that says something, not any word in the line.
         ("Bash", {"command": "uv run pytest -q && git push"}, Phase.PR),
+        ("Bash", {"command": "git push && pytest -q"}, Phase.TESTING),
+        ("Bash", {"command": "uv run pytest -q 2>&1 | tail -20"}, Phase.TESTING),
+        ("Bash", {"command": "echo \"git push\""}, Phase.READING),
+        ("Bash", {"command": "cat pytest.log"}, Phase.READING),
+        ("Bash", {"command": "cd /w && FOO=1 python -m pytest tests"}, Phase.TESTING),
+        ("Bash", {"command": "git commit -F - <<'MSG'\ngit push later\nMSG\n"}, Phase.READING),
+        ("Bash", {"command": "npm run test:unit"}, Phase.TESTING),
+        ("Bash", {"command": "go test ./..."}, Phase.TESTING),
         ("Bash", {"command": "sed -n '1,60p' f.py"}, Phase.READING),
         ("TodoWrite", {}, None),
     ],
@@ -121,6 +130,43 @@ def test_a_tool_use_outside_an_assistant_row_is_not_a_step(tmp_path: Path) -> No
 
     assert activity.phase is Phase.PR
     assert activity.last_command == LAST_COMMAND
+
+
+def test_a_line_too_deep_to_parse_is_skipped(tmp_path: Path) -> None:
+    d = _transcript_dir(tmp_path)
+    path = d / "d9f6c0f2.jsonl"
+    shutil.copy(FIXTURE, path)
+    whole = read_activity(WORKTREE, home=tmp_path)
+    with pytest.raises(RecursionError):
+        json.loads("[" * 100_000)
+    with path.open("a") as fh:
+        fh.write("[" * 100_000 + "\n")
+
+    assert read_activity(WORKTREE, home=tmp_path) == whole
+
+
+def _boundary_file(tmp_path: Path) -> int:
+    d = _transcript_dir(tmp_path)
+    last = _assistant_row("Bash", {"command": "uv run pytest -q"}, "2026-10-31T03:30:00.000Z")
+    (d / "t.jsonl").write_text(
+        _assistant_row("Edit", {"file_path": "/a.py"}, "2026-10-31T03:00:00.000Z")
+        + "\n"
+        + last
+        + "\n"
+    )
+    return len(last.encode()) + 1
+
+
+def test_a_tail_starting_exactly_on_a_row_keeps_that_row(tmp_path: Path) -> None:
+    last_row_bytes = _boundary_file(tmp_path)
+
+    on_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes)
+    inside_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes - 1)
+    before_row = read_activity(WORKTREE, home=tmp_path, tail_bytes=last_row_bytes + 5)
+
+    assert on_row.phase is Phase.TESTING
+    assert inside_row.phase is Phase.UNKNOWN  # only part of the row is in the tail
+    assert before_row.phase is Phase.TESTING
 
 
 def test_no_transcript_is_unknown(tmp_path: Path) -> None:
@@ -183,12 +229,13 @@ def test_reads_only_the_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert activity.phase is Phase.TESTING
     assert asked, "the reader did not go through open().read"
     assert None not in asked
-    assert sum(asked) <= tail_bytes
+    assert max(asked) <= tail_bytes
+    assert sum(asked) <= tail_bytes + 1  # plus the one byte before the cut
 
 
 def test_last_command_truncated_to_200(tmp_path: Path) -> None:
     d = _transcript_dir(tmp_path)
-    long_command = "echo start\n" + "x" * 500 + "\necho end"
+    long_command = "echo start\n" + "x " * 300 + "\necho end"
     (d / "t.jsonl").write_text(
         _assistant_row("Bash", {"command": long_command}, "2026-10-31T03:00:00.000Z") + "\n"
     )
@@ -199,3 +246,48 @@ def test_last_command_truncated_to_200(tmp_path: Path) -> None:
     assert len(activity.last_command) == 200
     assert "\n" not in activity.last_command
     assert activity.last_command.startswith("echo start x")
+
+
+@pytest.mark.parametrize(
+    ("raw", "shown"),
+    [
+        ("git status --short", "git status --short"),
+        ("uv run pytest -q tests/test_x.py", "uv run pytest -q tests/test_x.py"),
+        (
+            'export OPENAI_API_KEY=abc SECRET_KEY="a b" LEVEL=3 && make',
+            "export OPENAI_API_KEY=*** SECRET_KEY=*** LEVEL=3 && make",
+        ),
+        ("curl --token abc123 https://x", "curl --token *** https://x"),
+        ("tool --auth-token=xyz run", "tool --auth-token=*** run"),
+        ("mysql -p hunter2 db", "mysql -p *** db"),
+        ("git clone https://ghp_abcdef123@x/r", "git clone https://***@x/r"),
+        ("echo gho_abc ghs_def github_pat_11ABC_def", "echo *** *** ***"),
+        ("echo sk-proj-abc123", "echo ***"),
+        ("echo xoxb-123-456-abc", "echo ***"),
+        ('curl -H "Authorization: Bearer abc.def"', 'curl -H "Authorization: Bearer ***"'),
+        ("aws s3 ls # AKIAABCDEFGHIJKLMNOP", "aws s3 ls # ***"),
+        ("echo " + "a1B2" * 8, "echo ***"),
+        ("git commit -F - <<'MSG'\nprivate words\nMSG", "git commit -F - <<\u2026"),
+    ],
+)
+def test_redact(raw: str, shown: str) -> None:
+    assert redact(raw) == shown
+
+
+def test_last_command_is_redacted_on_the_way_out(tmp_path: Path) -> None:
+    d = _transcript_dir(tmp_path)
+    push = _assistant_row(
+        "Bash", {"command": "GH_TOKEN=abc gh pr create --fill"}, "2026-10-31T03:00:00.000Z"
+    )
+    (d / "t.jsonl").write_text(push + "\n")
+
+    assert read_activity(WORKTREE, home=tmp_path).last_command == (
+        "GH_TOKEN=*** gh pr create --fill"
+    )
+
+    grep = _assistant_row("Grep", {"pattern": "ghp_abcdef123"}, "2026-10-31T03:01:00.000Z")
+    (d / "t.jsonl").write_text(push + "\n" + grep + "\n")
+
+    activity = read_activity(WORKTREE, home=tmp_path)
+    assert activity.last_command == "***"
+    assert activity.phase is Phase.READING
