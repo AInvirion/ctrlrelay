@@ -1459,3 +1459,13 @@ def test_needs_you_refs_are_empty_for_a_repo_that_cannot_be_linked(
     out = _status(tmp_path, 2_000)
 
     assert _only(out["needs_you"], "s-bad")["refs"] == []
+
+
+def test_needs_you_refs_stop_at_twenty(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    db.add_pending_resume("s-many", "secops", BETA,
+                          " ".join(f"#{n}" for n in range(1, 30)))
+
+    refs = _only(_status(tmp_path, 2_000)["needs_you"], "s-many")["refs"]
+
+    assert [r["number"] for r in refs] == list(range(1, 21))
