@@ -297,8 +297,10 @@ class ClaudeDispatcher:
         # allow-listed (`dontAsk`) or filter by command TEXT
         # (`--disallowedTools "Bash(git push:*)"`), which `bash -c` or
         # an alias walks straight past. The guard is that the process
-        # holds no credential to push with, not what it is allowed to
-        # type.
+        # is handed no credential to push with, not what it is allowed
+        # to type. That stops an agent using normal tooling; one that
+        # deliberately reads credential files as the same OS user is
+        # not stopped until #236 (separate user / read-only home).
         cmd = [
             *prefix,
             self.claude_binary,

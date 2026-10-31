@@ -127,18 +127,34 @@ its own credentials, after the agent exits:
 Pushes are refused, and logged as `publish.push.refused`, for `main`,
 `master`, the repository's default branch (read from the GitHub API, not
 from the local clone) and any branch that is not the run's own. The push
-runs from the bare clone with hooks disabled, pushes the commit it checked
-rather than the ref name, and uses `--force-with-lease` against what the run
-pushed last. Text the agent wrote is posted with `@`-mentions and
+goes to `https://github.com/<owner>/<repo>.git` (never `origin`) from a
+private git dir with hooks off and only ctrlrelay's own git config, pushes the
+commit it checked rather than the ref name, and uses `--force-with-lease`
+against the head this session last pushed (recorded in the state DB). An
+open PR found for the branch is reused only if its head repo is this repo and
+its base is the default branch. Text the agent wrote is posted with `@`-mentions and
 issue-closing keywords disabled and its length capped (20,000 characters);
 the PR's own `Closes #N` is added by ctrlrelay.
 
-**What this does not stop.** The agent still runs as your user, so it can
-read `~/.ssh`, `~/.config/gh` and anything else in your home directory, and
-use a key it finds there by hand. It can also write anywhere your user can,
-including the bare clone's config and your dotfiles. On macOS the login
-keychain is reachable whatever the environment says. The next setting hides
-the credential paths; it does not make the home directory read-only.
+**What this guarantees.** No GitHub credential is handed to the agent through
+its environment. ctrlrelay chooses the push URL, the branch and the PR base.
+`main`, `master`, the default branch and any branch other than the run's own
+are refused, and a branch that already exists on GitHub is only pushed over if
+its head is one ctrlrelay recorded pushing. Agent-written text is sanitized.
+An agent that only uses its normal tooling (git, gh, ssh as configured) cannot
+push. The push itself runs from a fresh relay-owned git dir under
+`~/.ctrlrelay/push/`, reads the clone's branch heads from its ref files, and
+never reads the clone's config, which every worktree shares.
+
+**What it does not guarantee.** The agent still runs as your user. A
+deliberately hostile agent can read `~/.config/gh/hosts.yml`, `~/.ssh` and
+anything else in your home directory and use them by hand; it can write
+anywhere your user can, including your dotfiles and ctrlrelay's install; and
+it can write to `~/.ctrlrelay/push/`, the bare clone's object store and any
+`objects/info/alternates` chain it adds there, racing a push. On macOS the
+login keychain is reachable whatever the environment says. Closing that needs
+a separate user or a read-only home (#236). The next setting hides the
+credential paths; it does not stop the writes.
 
 | Key | Type | Default | Description |
 |---|---|---|---|

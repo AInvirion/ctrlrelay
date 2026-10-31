@@ -11,6 +11,21 @@ credentials. This module holds the two rules that make that safe:
   holds however the agent behaves.
 - :func:`sanitize_untrusted_text` and friends shape text the agent
   wrote before the relay posts it under the operator's name.
+
+What #219 guarantees: no GitHub credential is handed to the agent
+through its environment; ctrlrelay chooses the push URL, the branch and
+the base; main, master, the default branch and any other branch are
+refused; a remote branch ctrlrelay did not push is not overwritten;
+agent-written PR and comment text is sanitized; and an agent that only
+uses its normal tooling (git, gh, ssh as configured) cannot push.
+
+What it does NOT guarantee: the agent runs as the same OS user, so a
+deliberately hostile agent can still read credential files
+(``~/.config/gh/hosts.yml``, ``~/.ssh``), use them by hand, and write
+to the relay's push directory, the bare clone's object store and any
+``objects/info/alternates`` chain it adds there, racing a push. Closing
+that needs a separate user or a read-only home (#236). ``agent.sandbox:
+bwrap`` hides the credential paths; it does not stop the writes.
 """
 
 from __future__ import annotations

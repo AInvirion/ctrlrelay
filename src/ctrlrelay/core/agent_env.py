@@ -32,10 +32,20 @@ run the model CLI (which authenticates from its own files under
 ``~/.claude`` or from ``ANTHROPIC_*`` variables) and build and test
 the project with whatever toolchain the operator installed.
 
-**What this does not do.** The agent still runs as the same user, so
-it can still *read* ``~/.ssh`` and ``~/.config/gh`` and use what it
-finds there by hand. Hiding those paths needs an OS sandbox; see
-:func:`bwrap_prefix` and ``agent.sandbox`` in the configuration docs.
+What #219 guarantees: no GitHub credential is handed to the agent
+through its environment; ctrlrelay chooses the push URL, the branch and
+the base; main, master, the default branch and any other branch are
+refused; a remote branch ctrlrelay did not push is not overwritten;
+agent-written PR and comment text is sanitized; and an agent that only
+uses its normal tooling (git, gh, ssh as configured) cannot push.
+
+What it does NOT guarantee: the agent runs as the same OS user, so a
+deliberately hostile agent can still read credential files
+(``~/.config/gh/hosts.yml``, ``~/.ssh``), use them by hand, and write
+to the relay's push directory, the bare clone's object store and any
+``objects/info/alternates`` chain it adds there, racing a push. Closing
+that needs a separate user or a read-only home (#236). ``agent.sandbox:
+bwrap`` hides the credential paths; it does not stop the writes.
 """
 
 from __future__ import annotations
