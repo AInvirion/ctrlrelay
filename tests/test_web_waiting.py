@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -868,3 +869,37 @@ async def test_titles_include_running_issues_and_survive_a_failed_refresh(
     await tracker.refresh()
     assert tracker.snapshot()["status"] == "unknown"
     assert tracker.titles() == titles
+
+
+@pytest.mark.asyncio
+async def test_titles_from_a_refresh_that_failed_later_are_not_published(
+    tmp_path: Path,
+) -> None:
+    """The GitHub fetch succeeds but reading sessions fails: the refresh
+    failed, so neither its line nor its titles are published."""
+    first = [i for i in _issues() if i["number"] in (48, 47)]
+    second = [dict(i, title="renamed: " + i["title"]) for i in first]
+    gh = _FakeGitHub([first, second])
+    clock = [1_800_000_000]
+    calls = {"n": 0}
+
+    def sessions() -> tuple[list, dict]:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise sqlite3.OperationalError("database is locked")
+        return [], {}
+
+    tracker = WaitingTracker(
+        _config(tmp_path, [_accepting(BETA)]), gh,  # type: ignore[arg-type]
+        sessions=sessions, clock=lambda: clock[0],
+    )
+    await tracker.refresh()
+    before = tracker.titles()
+    assert before == {f"{i['repo']}#{i['number']}": i["title"] for i in first}
+
+    clock[0] += 60
+    await tracker.refresh()
+
+    assert calls["n"] == 2  # the second refresh reached the sessions read
+    assert tracker.snapshot()["status"] == "unknown"
+    assert tracker.titles() == before

@@ -275,8 +275,8 @@ class WaitingTracker:
         self._assignment_cache: dict[str, tuple[bool, int, int]] = {}
         self._last_good: list[dict[str, Any]] = []
         self._last_good_ts: int | None = None
-        # "owner/repo#N" -> title, from the last search that succeeded,
-        # before any filtering: running issues are in it too.
+        # "owner/repo#N" -> title, from the search of the last refresh
+        # that succeeded, before any filtering: running issues are in it too.
         self._titles: dict[str, str] = {}
         self._snapshot: dict[str, Any] = self._build(
             status="unknown", checked_ts=None, error="not checked yet",
@@ -302,7 +302,7 @@ class WaitingTracker:
                 self._username = await self._github.current_login()
             username = self._username
             issues = await self._fetch(username)
-            self._titles = _titles_of(issues)
+            titles = _titles_of(issues)
             running, locks = self._sessions()
             seen = load_seen(self._poller_state_file)
             # First pass: which items wait only on the self-assignment
@@ -335,6 +335,10 @@ class WaitingTracker:
                 status="unknown", checked_ts=now, error=error,
             )
             return
+        # Published only now, with the line: a refresh that fails at any
+        # step (the sessions read, a self-assignment check) keeps the
+        # previous titles as well as the previous line.
+        self._titles = titles
         self._last_good = [_item_dict(i) for i in items]
         self._last_good_ts = now
         self._snapshot = self._build(status="ok", checked_ts=now, error=None)
@@ -414,9 +418,10 @@ class WaitingTracker:
         return value
 
     def titles(self) -> dict[str, str]:
-        """Issue titles keyed ``"owner/repo#N"``, from the last successful
-        search (unfiltered). Empty until a search has succeeded; a failed
-        refresh keeps the previous titles."""
+        """Issue titles keyed ``"owner/repo#N"``, from the search of the
+        last refresh that succeeded as a whole (unfiltered, so running
+        issues are included). Empty until a refresh has succeeded; a
+        refresh that fails at any step keeps the previous titles."""
         return dict(self._titles)
 
     def snapshot(self) -> dict[str, Any]:
