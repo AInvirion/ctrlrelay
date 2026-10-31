@@ -434,7 +434,21 @@ def test_a_symlink_out_of_the_worktree_is_outside(tmp_path: Path) -> None:
         ("cache/a1b2c3d4e5f6a7b8c9d0e1f2", "cache/***"),
         (".env", "***"),
         ("deploy/prod.env", "deploy/***"),
-        ("deploy/.env.local", "deploy/.env.local"),
+        ("deploy/.env.local", "deploy/***"),
+        ("deploy/.env", "deploy/***"),
+        ("deploy/.envrc", "deploy/***"),
+        ("config/api_key.txt", "config/***"),
+        ("config/api-key", "config/***"),
+        ("config/APIKEY", "config/***"),
+        ("config/apikey.json", "config/***"),
+        ("config/private.json", "config/***"),
+        ("config/passw.txt", "config/***"),
+        ("certs/client.p12", "certs/***"),
+        ("certs/client.pfx", "certs/***"),
+        ("home/id_ed25519", "home/***"),
+        ("home/.netrc", "home/***"),
+        ("home/.npmrc", "home/***"),
+        ("home/.pypirc", "home/***"),
         ("home/id_rsa", "home/***"),
         ("home/id_rsa.pub", "home/***"),
         ("certs/server.pem", "certs/***"),
@@ -522,10 +536,14 @@ def test_a_shell_command_that_says_nothing_keeps_the_last_phase(
     (d / "t.jsonl").write_text("\n".join(rows) + "\n")
     assert read_activity(WORKTREE, home=tmp_path).phase is Phase.CODING
 
-    rows.append(_assistant_row("Bash", {"command": "rm -rf build"},
-                               "2026-10-31T03:00:09.000Z"))
-    rows.insert(0, _assistant_row("Read", {"file_path": f"{WORKTREE}/a"},
-                                  "2026-10-31T02:59:00.000Z"))
-    rows[1] = _assistant_row("Bash", {"command": "cat a"}, "2026-10-31T03:00:00.000Z")
+    # A test run, then only commands nobody listed: still testing. Nothing
+    # after the run changes files, so only the keep-phase rule gives this.
+    rows = [
+        _assistant_row("Bash", {"command": "uv run pytest -q"},
+                       "2026-10-31T03:01:00.000Z"),
+        _assistant_row("Bash", {"command": "curl -s http://127.0.0.1:8787/"},
+                       "2026-10-31T03:01:05.000Z"),
+        _assistant_row("Bash", {"command": "make build"}, "2026-10-31T03:01:09.000Z"),
+    ]
     (d / "t.jsonl").write_text("\n".join(rows) + "\n")
-    assert read_activity(WORKTREE, home=tmp_path).phase is Phase.CODING
+    assert read_activity(WORKTREE, home=tmp_path).phase is Phase.TESTING

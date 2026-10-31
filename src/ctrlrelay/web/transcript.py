@@ -249,7 +249,12 @@ def transcript_dir_for(worktree_path: str, home: Path) -> Path:
 
 
 def classify(tool_name: str, tool_input: dict) -> Phase | None:
-    """Phase a single tool use belongs to, or None if it says nothing."""
+    """Phase a single tool use belongs to, or None if it says nothing.
+
+    For a shell command the phase is a best guess from the program and its
+    subcommand; the arguments are not inspected, so ``find -delete`` reads
+    as reading and ``git branch -D`` says nothing.
+    """
     if tool_name in _READ_TOOLS:
         return Phase.READING
     if tool_name in _CODE_TOOLS:
@@ -313,12 +318,15 @@ _TOKEN_PREFIX = re.compile(
 )
 _LONG_RUN = re.compile(r"[A-Za-z0-9]{20,}")
 _SECRET_NAME = re.compile(
-    r"(?i)(secret|token|password|passwd|credential|\.env$|id_rsa|\.pem$|\.key$)"
+    r"(?i)(secret|token|passw|credential|api[_-]?key|apikey|private|\.env$"
+    r"|\.pem$|\.key$|\.p12$|\.pfx$|id_rsa|id_ed25519|\.netrc|\.npmrc|\.pypirc)"
 )
 MASK = "***"
 
 
 def _looks_secret(component: str) -> bool:
+    if component.startswith(".env"):
+        return True
     if _TOKEN_PREFIX.search(component) or _SECRET_NAME.search(component):
         return True
     return any(
