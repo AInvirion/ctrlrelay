@@ -1,7 +1,12 @@
 """The status page's JSON, built from a read-only snapshot of ``state.db`` (#209).
 
-Never writes. Every read goes through :func:`open_readonly`; nothing here
-opens the database any other way.
+Read only. Every connection is opened by ``_open`` (``mode=ro``, and
+``immutable=1`` when nobody else has the database open), the same opener
+behind the public :func:`open_readonly`; nothing here opens the database any
+other way. It never modifies the database's content and never takes a write
+lock. One known limit: if the daemon closes the database between the
+sidecar check and the connect, SQLite may leave empty ``-wal``/``-shm``
+files, holding no data, which are what the daemon itself creates on open.
 
 Never a confident wrong answer. A section that could not be read is
 ``null`` (``today``: every count ``null``) and ``errors`` says why. An empty
@@ -116,6 +121,10 @@ def _open(db_path: Path) -> tuple[sqlite3.Connection, bool]:
     open. Then nothing can be in the WAL, so the main file is the whole
     database and is read as immutable, creating nothing. The caller must
     check the file did not change during such a read (see :func:`_read`).
+
+    The check and the connect are not atomic: if a daemon closes the
+    database in between, the plain read-only open may leave empty sidecars
+    behind (see the module docstring). Content is never modified.
     """
     db_path = Path(db_path)
     immutable = False
@@ -135,7 +144,7 @@ def _open(db_path: Path) -> tuple[sqlite3.Connection, bool]:
 
 
 def open_readonly(db_path: Path) -> sqlite3.Connection:
-    """Open ``db_path`` read-only (``mode=ro``) without creating any file.
+    """Open ``db_path`` read-only (``mode=ro``); never modifies its content.
 
     Raises if the file is missing. When nobody else has a WAL database open
     the connection reads it without locks; use it for one short read.
@@ -154,18 +163,31 @@ def _read(db_path: Path, fn: Callable[[sqlite3.Connection], T]) -> T:
 
     A lock-free read (nobody had the database open) is kept only if the file
     and its sidecars are unchanged afterwards; otherwise someone opened or
-    wrote it meanwhile and the read is taken again. Raises on any failure.
+    wrote it meanwhile and the read is taken again. A lock-free read that
+    fails with a database error may have met a write in progress, so it is
+    retried too, up to ``_ATTEMPTS`` in all. A read under locks is not
+    retried (a busy database would only multiply the wait). Raises on
+    failure.
     """
+    last_error: sqlite3.Error | None = None
     for _ in range(_ATTEMPTS):
         before = _fingerprint(db_path)
         conn, immutable = _open(db_path)
         try:
             conn.execute("BEGIN")
             result = fn(conn)
+        except sqlite3.Error as exc:
+            if not immutable:
+                raise
+            last_error = exc
+            continue
         finally:
             conn.close()
         if not immutable or _fingerprint(db_path) == before:
             return result
+        last_error = None
+    if last_error is not None:
+        raise last_error
     raise sqlite3.OperationalError(f"{db_path} kept changing while being read")
 
 
@@ -203,15 +225,45 @@ def _read_locks(conn: sqlite3.Connection) -> dict[str, str]:
     return {r["repo"]: r["session_id"] for r in rows}
 
 
-def _read_needs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+_NEEDS_REQUIRED = (
+    "session_id", "pipeline", "repo", "question", "created_at",
+    "answered_at", "expired_at",
+)
+HELD_UNTIL_UNAVAILABLE = (
+    "pending_resumes: held_until unavailable (database older than #214); "
+    "whether a question is held back is unknown"
+)
+
+
+def _read_needs(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list[str]]:
+    """Open, unanswered questions, and notes about what could not be read.
+
+    A missing required column raises (the section is unknown). A database
+    without ``held_until`` still lists its questions, with ``held_until``
+    null and a note saying it is unknown, not "not held"."""
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(pending_resumes)")}
+    if not columns:
+        raise sqlite3.OperationalError("no such table: pending_resumes")
+    missing = [c for c in _NEEDS_REQUIRED if c not in columns]
+    if missing:
+        raise sqlite3.OperationalError(
+            f"no such column: pending_resumes.{', '.join(missing)}"
+        )
+    notes: list[str] = []
+    held = "pr.held_until"
+    if "held_until" not in columns:
+        held = "NULL"
+        notes.append(HELD_UNTIL_UNAVAILABLE)
     rows = conn.execute(
-        """SELECT pr.*, s.issue_number AS issue_number
-           FROM pending_resumes pr
-           LEFT JOIN sessions s ON s.id = pr.session_id
-           WHERE pr.answered_at IS NULL AND pr.expired_at IS NULL
-           ORDER BY pr.created_at ASC, pr.session_id ASC"""
+        f"""SELECT pr.session_id, pr.pipeline, pr.repo, pr.question,
+                   pr.created_at, {held} AS held_until,
+                   s.issue_number AS issue_number
+            FROM pending_resumes pr
+            LEFT JOIN sessions s ON s.id = pr.session_id
+            WHERE pr.answered_at IS NULL AND pr.expired_at IS NULL
+            ORDER BY pr.created_at ASC, pr.session_id ASC"""
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in rows], notes
 
 
 def _read_phase_events(
@@ -311,18 +363,10 @@ def _open_phases(events: list[dict[str, Any]]) -> dict[str, Phase]:
     }
 
 
-def _titles(
-    waiting: dict[str, Any], titles: Mapping[str, str] | None,
-) -> dict[tuple[str, int], str]:
-    """(lower-cased repo, number) -> title: the waiting line's items, then
-    the tracker's unfiltered ``titles`` map over them."""
+def _titles(titles: Mapping[str, str] | None) -> dict[tuple[str, int], str]:
+    """(lower-cased repo, number) -> title, from the tracker's unfiltered
+    ``titles`` map only."""
     out: dict[tuple[str, int], str] = {}
-    items = waiting.get("items") if isinstance(waiting, dict) else None
-    for item in items or []:
-        try:
-            out[(str(item["repo"]).lower(), int(item["issue_number"]))] = str(item["title"])
-        except (KeyError, TypeError, ValueError):
-            continue
     for key, title in (titles or {}).items():
         repo, sep, number = str(key).rpartition("#")
         if not sep or not isinstance(title, str) or not title:
@@ -477,7 +521,7 @@ def build_status(
         pipeline_phases = (
             None if isinstance(phase_events, _Missing) else _open_phases(phase_events)
         )
-        title_map = _titles(waiting, titles)
+        title_map = _titles(titles)
         if not isinstance(snap["running"], _Missing):
             running = [
                 _card(
@@ -487,7 +531,17 @@ def build_status(
                 for row in snap["running"]
             ]
         if not isinstance(snap["needs"], _Missing):
-            needs_you = [_question(r, title_map) for r in snap["needs"]]
+            rows, notes = snap["needs"]
+            errors.extend(n for n in notes if n not in errors)
+            needs_you = []
+            for row in rows:
+                try:
+                    needs_you.append(_question(row, title_map))
+                except (KeyError, IndexError, TypeError) as exc:
+                    errors.append(
+                        f"pending_resumes: question {row.get('session_id')!r} "
+                        f"unreadable: {type(exc).__name__}: {exc}"
+                    )
         if not isinstance(snap["today"], _Missing):
             today = dict(snap["today"])
         if not isinstance(snap["feed"], _Missing):

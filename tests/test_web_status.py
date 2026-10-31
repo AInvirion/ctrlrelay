@@ -303,18 +303,25 @@ def test_task_session_renders(tmp_path: Path) -> None:
     assert card["reason"] == "no worktree"
 
 
-def test_title_comes_from_the_waiting_line_when_github_gave_it(tmp_path: Path) -> None:
+def test_titles_come_only_from_the_titles_map(tmp_path: Path) -> None:
+    """The waiting line's items are not a title source: only the tracker's
+    unfiltered map is, so the two can never disagree about a title."""
     db = _db(tmp_path)
     _session(db, "s1", issue_number=215, worktree=None, started_at=1_000)
     _session(db, "s2", repo=BETA, issue_number=215, worktree=None, started_at=1_000)
     waiting = {**WAITING_OK, "items": [
-        {"repo": ALPHA, "issue_number": 215, "title": "Fix the thing",
+        {"repo": ALPHA, "issue_number": 215, "title": "Stale waiting title",
+         "reason": "next poll", "updated_ts": 1, "updated": None},
+        {"repo": BETA, "issue_number": 215, "title": "Only in waiting",
          "reason": "next poll", "updated_ts": 1, "updated": None},
     ]}
-    out = _status(tmp_path, 2_000, waiting=waiting)
-    assert _only(out["running"], "s1")["title"] == "Fix the thing"
-    # Same number, different repo: not that title.
+    out = _status(tmp_path, 2_000, waiting=waiting,
+                  titles={f"{ALPHA}#215": "From the map"})
+    assert _only(out["running"], "s1")["title"] == "From the map"
     assert _only(out["running"], "s2")["title"] is None
+    # No map at all: no titles, whatever the waiting line holds.
+    out = _status(tmp_path, 2_000, waiting=waiting)
+    assert {c["title"] for c in out["running"]} == {None}
 
 
 def test_titles_map_fills_running_titles(tmp_path: Path) -> None:
@@ -456,9 +463,8 @@ def test_feed_since(tmp_path: Path) -> None:
     assert out["error"] is None
     assert [e["kind"] for e in out["events"]] == ["message_sent", "merged"]
     assert out["events"][1]["detail"] == {"pr_number": 3, "pr_url": None}
-    assert list_feed(db_path=tmp_path / "state.db", since_ts=200, limit=1)["events"][0][
-        "kind"
-    ] == "message_sent"
+    one = list_feed(db_path=tmp_path / "state.db", since_ts=200, limit=1)["events"]
+    assert [e["kind"] for e in one] == ["message_sent"]
 
 
 def test_feed_on_a_missing_db_is_unknown_not_empty(tmp_path: Path) -> None:
@@ -731,3 +737,135 @@ def test_build_status_is_safe_to_call_from_threads(tmp_path: Path) -> None:
     assert len(results) == 4
     assert all(r["errors"] == [] and len(r["running"]) == 1 for r in results)
     db.close()
+
+
+# --- review round: retries and old question tables ----------------------------
+
+
+def _closed_db(tmp_path: Path) -> Path:
+    db = _db(tmp_path)
+    _session(db, "s1", worktree=None, started_at=1_000)
+    db.close()
+    return tmp_path / "state.db"
+
+
+def test_a_lock_free_read_that_raises_once_is_retried(tmp_path: Path) -> None:
+    path = _closed_db(tmp_path)  # nobody has it open: the lock-free path
+    calls: list[int] = []
+
+    def flaky(conn):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return status_module._read_running(conn)
+
+    rows = status_module._read(path, flaky)
+
+    assert [r["id"] for r in rows] == ["s1"]
+    assert len(calls) == 2
+
+
+def test_a_lock_free_read_that_keeps_raising_gives_up(tmp_path: Path) -> None:
+    path = _closed_db(tmp_path)
+    calls: list[int] = []
+
+    def broken(conn):
+        calls.append(1)
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    with pytest.raises(sqlite3.DatabaseError):
+        status_module._read(path, broken)
+    assert len(calls) == status_module._ATTEMPTS
+
+
+def test_a_locked_read_is_not_retried(tmp_path: Path) -> None:
+    """Retrying a busy database would multiply the lock wait."""
+    db = _db(tmp_path)  # held open: the locked (normal) path
+    calls: list[int] = []
+
+    def busy(conn):
+        calls.append(1)
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError):
+        status_module._read(tmp_path / "state.db", busy)
+    assert len(calls) == 1
+    db.close()
+
+
+def _old_pending_resumes(tmp_path: Path, columns: str) -> None:
+    db = _db(tmp_path)
+    db.execute("DROP TABLE pending_resumes")
+    db.execute(f"CREATE TABLE pending_resumes ({columns})")
+    db.commit()
+    db.close()
+
+
+def test_pending_resumes_without_held_until_says_so(tmp_path: Path) -> None:
+    _old_pending_resumes(
+        tmp_path,
+        "session_id TEXT PRIMARY KEY, pipeline TEXT, repo TEXT, question TEXT,"
+        " created_at INTEGER, answered_at INTEGER, expired_at INTEGER",
+    )
+    conn = sqlite3.connect(str(tmp_path / "state.db"))
+    conn.execute(
+        "INSERT INTO pending_resumes VALUES ('q1', 'dev', ?, 'Which?', 100, NULL, NULL)",
+        (ALPHA,),
+    )
+    conn.commit()
+    conn.close()
+
+    out = _status(tmp_path, 2_000)
+
+    assert [q["session_id"] for q in out["needs_you"]] == ["q1"]
+    assert out["needs_you"][0]["held_until_ts"] is None
+    assert any("held_until unavailable" in e for e in out["errors"])
+
+
+def test_pending_resumes_missing_a_required_column_is_unknown(tmp_path: Path) -> None:
+    _old_pending_resumes(
+        tmp_path,
+        "session_id TEXT PRIMARY KEY, pipeline TEXT, repo TEXT, question TEXT,"
+        " created_at INTEGER",  # no answered_at, no expired_at
+    )
+    conn = sqlite3.connect(str(tmp_path / "state.db"))
+    conn.execute(
+        "INSERT INTO pending_resumes VALUES ('q1', 'dev', ?, 'Which?', 100)",
+        (ALPHA,),
+    )
+    conn.commit()
+    conn.close()
+
+    out = _status(tmp_path, 2_000)
+
+    assert out["needs_you"] is None
+    # Every missing column is named, not just the first the query trips on.
+    assert any(
+        "pending_resumes" in e and "answered_at" in e and "expired_at" in e
+        for e in out["errors"]
+    )
+    # The rest of the database still reads.
+    assert out["running"] == []
+
+
+def test_a_question_row_that_cannot_be_shaped_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _db(tmp_path)
+    db.add_pending_resume("good", "dev", ALPHA, "Fine?")
+    db.add_pending_resume("bad", "dev", ALPHA, "Broken?")
+    db.close()
+    real = status_module._read_needs
+
+    def one_bad_row(conn):
+        rows, notes = real(conn)
+        for r in rows:
+            if r["session_id"] == "bad":
+                del r["question"]
+        return rows, notes
+
+    monkeypatch.setattr(status_module, "_read_needs", one_bad_row)
+    out = _status(tmp_path, 2_000)
+
+    assert [q["session_id"] for q in out["needs_you"]] == ["good"]
+    assert any("bad" in e and "pending_resumes" in e for e in out["errors"])
