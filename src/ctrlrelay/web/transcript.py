@@ -57,13 +57,19 @@ _TOKEN_SHAPES = [
     re.compile(r"\bxox[abp]-[A-Za-z0-9-]+"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 ]
-# A long run with no "/" (so paths keep their shape). Hyphenated names such as
-# a worktree folder are long too, so only a run holding an unbroken 20+ stretch
-# of token characters counts: hex digests and base64 do, words do not.
-_LONG_RUN = re.compile(r"[A-Za-z0-9+=_-]{32,}")
-_UNBROKEN = re.compile(r"[A-Za-z0-9+=]{20,}")
-# `mysql -pSECRET`, `psql -pSECRET`: the password glued to the flag.
-_GLUED_PASSWORD = re.compile(r"(\b(?:mysql|psql)\b[^;&|\n]*?\s-p)(?=[^\s;&|])[^\s;&|]+")
+# Long runs that may be a token. A run right after "/" or "." is a path
+# segment (a worktree folder is long and hyphenated) and passes, unless it holds
+# an unbroken 20+ stretch mixing letters and digits, which words never do.
+_RUN = re.compile(r"(?<![A-Za-z0-9+=_-])[A-Za-z0-9+=_-]{20,}")
+_UNBROKEN = re.compile(r"[A-Za-z0-9]{20,}")
+# Standard base64 carries "/" too; a run starting at, or after, "/" or "." is a path.
+_BASE64 = re.compile(r"(?<![\w/.])(?!/)[A-Za-z0-9+/]{32,}={0,2}(?![\w/])")
+# A password glued to its flag: `mysql -pSECRET`, `pg_dump -pSECRET`, `sshpass -pSECRET`.
+_GLUED_PASSWORD = re.compile(
+    r"(\b(?:mysql\w*|mariadb\w*|psql|pg_\w+|sshpass)\b[^;&|\n]*?\s-p)(?=[^\s;&|])[^\s;&|]+"
+)
+# Commands whose `-p` takes a plugin name, not a password.
+_SAFE_DASH_P = frozenset({"pytest", "py.test"})
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
 
 # Shell separators that start a new command, and words that only wrap one.
@@ -83,6 +89,8 @@ def redact(text: str) -> str:
         name, sep, value = m.groups()
         if value.startswith("-"):
             return m.group(0)
+        if name == "-p" and not _dash_p_is_safe(m.string[: m.start()]):
+            return f"{name}{sep}{MASK}"
         if _SECRET_NAME.search(name.lstrip("-")):
             return f"{name}{sep}{MASK}"
         return m.group(0)
@@ -90,10 +98,32 @@ def redact(text: str) -> str:
     text = _TOKEN_SHAPES[0].sub(f"Bearer {MASK}", text)
     for shape in _TOKEN_SHAPES[1:]:
         text = shape.sub(MASK, text)
-    text = _LONG_RUN.sub(lambda m: MASK if _UNBROKEN.search(m.group(0)) else m.group(0), text)
+    text = _BASE64.sub(MASK, text)
+    text = _RUN.sub(_long_run, text)
     text = _GLUED_PASSWORD.sub(lambda m: m.group(1) + MASK, text)
     text = _ASSIGNMENT.sub(assignment, text)
     return _FLAG.sub(flag, text)
+
+
+def _mixes_letters_and_digits(text: str) -> bool:
+    return any(c.isdigit() for c in text) and any(c.isalpha() for c in text)
+
+
+def _long_run(m: re.Match) -> str:
+    run = m.group(0)
+    if any(_mixes_letters_and_digits(s) for s in _UNBROKEN.findall(run)):
+        return MASK
+    in_path = m.start() > 0 and m.string[m.start() - 1] in "/."
+    if not in_path and (_mixes_letters_and_digits(run) or len(run) >= 32):
+        return MASK
+    return run
+
+
+def _dash_p_is_safe(before: str) -> bool:
+    """True when this `-p` belongs to a pytest run, where it names a plugin."""
+    segment = re.split(r"&&|\|\||[;|&\n]", before)[-1].split()
+    words = _command_words(segment)
+    return bool(words) and os.path.basename(words[0]) in _SAFE_DASH_P
 
 
 def _strip_heredoc_bodies(command: str) -> str:

@@ -263,11 +263,28 @@ def test_last_command_truncated_to_200(tmp_path: Path) -> None:
         ("psql -pHunter2 db", "psql -p*** db"),
         ("tool --password hunter2 run", "tool --password *** run"),
         ("pytest -p no:warnings -q", "pytest -p no:warnings -q"),
+        ("uv run pytest -p no:cacheprovider", "uv run pytest -p no:cacheprovider"),
+        ("python -m pytest -p xdist", "python -m pytest -p xdist"),
+        ("mysql -u x -p secret", "mysql -u x -p ***"),
+        ("sshpass -p secret ssh h", "sshpass -p *** ssh h"),
+        ("somecmd -p secret", "somecmd -p ***"),
+        ("pytest -q && somecmd -p secret", "pytest -q && somecmd -p ***"),
+        ("mariadb -pHunter2 db", "mariadb -p*** db"),
+        ("pg_dump -pHunter2 db", "pg_dump -p*** db"),
+        ("sshpass -pHunter2 ssh h", "sshpass -p*** ssh h"),
+        ("echo configuration_management_module", "echo configuration_management_module"),
+        ("echo deadbeef12deadbeef34", "echo ***"),
+        ("echo Ab12-Cd34_Ef56-Gh78-Ij90", "echo ***"),
+        ("echo AbC1+dEf2/GhI3+jKl4/MnO5+pQr6/StU7+vWx8/Yz0=", "echo ***"),
         (
             "cat /home/u/.ctrlrelay/worktrees/example-org-alpha-service-dev-example-org"
             "-alpha-service-304-c1446f76/src/app.py",
             "cat /home/u/.ctrlrelay/worktrees/example-org-alpha-service-dev-example-org"
             "-alpha-service-304-c1446f76/src/app.py",
+        ),
+        (
+            "ls /home/u/.ctrlrelay/worktrees/example-org-tools-secops-example-org-tools-6cbd20da",
+            "ls /home/u/.ctrlrelay/worktrees/example-org-tools-secops-example-org-tools-6cbd20da",
         ),
         ("git show 5bf7858dbe7a3e679e17b9176ae099f225b76c77", "git show ***"),
         ("curl https://x/r/" + "a1B2" * 10 + "/raw", "curl https://x/r/***/raw"),
