@@ -52,6 +52,31 @@ def _is_issues_disabled_error(exc: Exception) -> bool:
     return "has disabled issues" in str(exc).lower()
 
 
+def _read_pre_dispatch_failures(raw: object) -> dict[str, dict[int, int]]:
+    """``pre_dispatch_failures`` from the state file, keeping only
+    entries that are an issue number and a positive whole count (#234).
+    Anything else is dropped rather than trusted: a negative count would
+    lift the retry limit, and a value that cannot convert would stop the
+    poller from loading at all."""
+    out: dict[str, dict[int, int]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for repo, counts in raw.items():
+        if not isinstance(repo, str) or not isinstance(counts, dict):
+            continue
+        kept: dict[int, int] = {}
+        for number, count in counts.items():
+            if not (isinstance(number, str) and number.isascii()
+                    and number.isdigit() and len(number) <= 9):
+                continue
+            if type(count) is not int or count < 1:
+                continue
+            kept[int(number)] = count
+        if kept:
+            out[repo] = kept
+    return out
+
+
 @dataclass
 class IssuePoller:
     """Polls GitHub repos for newly assigned issues.
@@ -156,13 +181,10 @@ class IssuePoller:
             data = json.loads(self.state_file.read_text())
             raw = data.get("seen_issues", {})
             self.seen_issues = {repo: set(numbers) for repo, numbers in raw.items()}
-            failures = data.get("pre_dispatch_failures", {})
-            self.pre_dispatch_failures = {
-                repo: {int(n): int(c) for n, c in counts.items()}
-                for repo, counts in failures.items()
-            }
-        except (json.JSONDecodeError, OSError, AttributeError, TypeError,
-                ValueError):
+            self.pre_dispatch_failures = _read_pre_dispatch_failures(
+                data.get("pre_dispatch_failures"),
+            )
+        except (json.JSONDecodeError, OSError):
             # Corrupt or unreadable state — start fresh
             self.seen_issues = {}
             self.pre_dispatch_failures = {}

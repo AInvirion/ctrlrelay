@@ -1786,6 +1786,28 @@ class TestFetchSurvivesRewrittenBranches:
         assert not list(target.parent.glob("owner-repo.git.replaced-*"))
 
     @pytest.mark.asyncio
+    async def test_reclone_is_refused_even_when_the_worktree_dir_is_missing(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """No prune before the check: a worktree whose directory is only
+        briefly gone (an unmounted disk) is still a registered worktree."""
+        import shutil as _shutil
+
+        from ctrlrelay.core.worktree import DefaultBranchDivergedError
+
+        wt, _origin, target, local = self._diverged_setup(tmp_path, monkeypatch)
+        held = tmp_path / "wt" / "held"
+        self._git("worktree", "add", "-q", "-b", "held", str(held), "main",
+                  cwd=target)
+        _shutil.rmtree(held)
+
+        with pytest.raises(DefaultBranchDivergedError, match="(?s)worktree"):
+            await wt.ensure_bare_repo("owner/repo")
+
+        assert self._sha(target, "refs/heads/main") == local
+        assert str(held) in self._git("worktree", "list", cwd=target)
+
+    @pytest.mark.asyncio
     async def test_a_failed_reclone_puts_the_old_clone_back(
         self, tmp_path: Path, monkeypatch,
     ) -> None:

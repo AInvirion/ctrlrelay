@@ -89,17 +89,33 @@ class TestSettle:
         assert _poller(state).pre_dispatch_failures == {REPO: {7: 1}}
 
     @pytest.mark.parametrize("bad", [
-        {"pre_dispatch_failures": {REPO: {"x": 1}}},
-        {"pre_dispatch_failures": {REPO: [1]}},
-        {"pre_dispatch_failures": "nope"},
+        '{"x": 1}', "[1]", '"nope"', '{"7": 1e999}', '{"7": -100}',
+        '{"7": 0}', '{"7": true}', '{"7": 1.5}', '{"7": "2"}',
+        '{"' + "9" * 5000 + '": 1}', '{"\\u0663": 1}',
     ])
-    def test_unreadable_counts_start_fresh(self, tmp_path: Path, bad) -> None:
+    def test_counts_that_are_not_a_positive_whole_number_are_dropped(
+        self, tmp_path: Path, bad: str,
+    ) -> None:
+        """A bad count must neither stop the poller loading (1e999 is
+        infinity to the JSON reader) nor lift the limit (a negative)."""
         state = tmp_path / "state.json"
-        state.write_text(json.dumps({"seen_issues": {REPO: [1]}, **bad}))
+        state.write_text(
+            '{"seen_issues": {"%s": [1]}, "pre_dispatch_failures": '
+            '{"%s": %s, "other/repo": {"8": 2}}}' % (REPO, REPO, bad)
+        )
 
         poller = _poller(state)
 
-        assert poller.pre_dispatch_failures == {}
+        assert poller.seen_issues == {REPO: {1}}
+        assert poller.pre_dispatch_failures == {"other/repo": {8: 2}}
+
+    def test_counts_that_are_not_an_object_are_dropped(self, tmp_path: Path) -> None:
+        state = tmp_path / "state.json"
+        state.write_text(json.dumps(
+            {"seen_issues": {REPO: [1]}, "pre_dispatch_failures": "nope"}
+        ))
+
+        assert _poller(state).pre_dispatch_failures == {}
 
 
 def test_reclone_message_names_where_the_old_copy_went() -> None:
@@ -145,14 +161,17 @@ async def test_dev_marks_a_clone_failure_as_before_dispatch(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_dev_does_not_mark_a_failure_after_the_agent_started(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
+    """The run itself raising stands for any failure once the agent was
+    started; that one must not be retried by this path."""
     from ctrlrelay.core.state import StateDB
-    from ctrlrelay.pipelines.dev import run_dev_issue
+    from ctrlrelay.pipelines.dev import DevPipeline, run_dev_issue
 
     worktree, github = _dev_mocks(tmp_path)
     dispatcher = AsyncMock()
-    dispatcher.spawn_session.side_effect = RuntimeError("agent crashed")
+    run = AsyncMock(side_effect=RuntimeError("agent crashed"))
+    monkeypatch.setattr(DevPipeline, "run", run)
 
     result = await run_dev_issue(
         repo=REPO, issue_number=7, branch_template="fix/issue-{n}",
@@ -162,7 +181,7 @@ async def test_dev_does_not_mark_a_failure_after_the_agent_started(
     )
 
     assert not result.success
-    dispatcher.spawn_session.assert_called()
+    run.assert_awaited_once()
     assert "failed_before_dispatch" not in result.outputs
 
 
@@ -189,15 +208,16 @@ async def test_task_marks_a_clone_failure_as_before_dispatch(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_task_does_not_mark_a_failure_after_the_agent_started(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
     from ctrlrelay.core.state import StateDB
-    from ctrlrelay.pipelines.task import run_task_issue
+    from ctrlrelay.pipelines.task import TaskPipeline, run_task_issue
 
     worktree, github = _dev_mocks(tmp_path)
     worktree.create_worktree.return_value = tmp_path / "wt"
     dispatcher = AsyncMock()
-    dispatcher.spawn_session.side_effect = RuntimeError("agent crashed")
+    run = AsyncMock(side_effect=RuntimeError("agent crashed"))
+    monkeypatch.setattr(TaskPipeline, "run", run)
 
     result = await run_task_issue(
         repo=REPO, issue_number=7, dispatcher=dispatcher, github=github,
@@ -207,5 +227,5 @@ async def test_task_does_not_mark_a_failure_after_the_agent_started(
     )
 
     assert not result.success
-    dispatcher.spawn_session.assert_called()
+    run.assert_awaited_once()
     assert "failed_before_dispatch" not in result.outputs

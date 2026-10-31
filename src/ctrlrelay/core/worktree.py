@@ -1237,17 +1237,19 @@ class WorktreeManager:
         """Move a clone whose default branch diverged from origin to
         ``<name>.git.replaced-<UTC time>`` and clone fresh (#234).
 
-        Nothing is deleted: any local-only commits stay in the set-aside
-        copy, and the operator is told where it is so they can delete it.
+        The old clone is never deleted: any local-only commits stay in
+        the set-aside copy, and the operator is told where it is so they
+        can delete it.
 
-        Refused, re-raising ``cause``, while a worktree is still
-        registered in the clone after a prune: a BLOCKED session keeps
-        its worktree for the resume, and moving the clone would cut that
-        worktree off from its repository. If the fresh clone fails, the
-        partial one is removed and the old clone put back, so the next
-        run sees the same state and tries again.
+        Refused, re-raising ``cause``, while any worktree is registered
+        in the clone: a BLOCKED session keeps its worktree for the
+        resume, and moving the clone would cut that worktree off from
+        its repository. No prune first, because a prune also drops the
+        registration of a worktree whose directory is only briefly
+        missing. If the fresh clone fails, the partial one is removed
+        and the old clone put back, so the next run sees the same state
+        and tries again.
         """
-        await self._run_git("worktree", "prune", cwd=bare_path)
         listing = await self._run_git(
             "worktree", "list", "--porcelain", cwd=bare_path,
         )
