@@ -133,7 +133,18 @@ private git dir with hooks off and only ctrlrelay's own git config, pushes the
 commit it checked rather than the ref name, and uses `--force-with-lease`
 against the head this session last pushed (recorded in the state DB). An
 open PR found for the branch is reused only if its head repo is this repo and
-its base is the default branch. Text the agent wrote is posted with `@`-mentions and
+its base is the default branch.
+
+A push the **remote** refuses is a different thing, logged as
+`publish.push.rejected` with the per-ref reason git gave — a stale lease, a
+non-fast-forward, a branch-protection or repository-rule refusal. That reason
+comes from the `!` line of `git push --porcelain`, which git writes to
+**stdout**; stderr carries only `error: failed to push some refs to '<url>'`.
+Both streams of any failing git command now reach the error it raises, and the
+reason reaches `dev.publish.failed` as its own `push_rejection` field, so a
+rejection is not reported as a URL and nothing else.
+
+Text the agent wrote is posted with `@`-mentions and
 issue-closing keywords disabled and its length capped (20,000 characters);
 the PR's own `Closes #N` is added by ctrlrelay.
 

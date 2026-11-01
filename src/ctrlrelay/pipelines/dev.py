@@ -1106,6 +1106,8 @@ class _Publisher:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            from ctrlrelay.core.worktree import PushRejectedError
+
             refused = isinstance(e, PushRefusedError)
             _logger.error(
                 "dev.publish.failed",
@@ -1117,6 +1119,13 @@ class _Publisher:
                     "refused": refused,
                     "error_type": type(e).__name__,
                     "error": str(e)[:300],
+                    # The remote's per-ref reason when it refused the
+                    # push, as its own field so it survives the 300-char
+                    # cut on the message (#269). None for every other
+                    # publish failure.
+                    "push_rejection": (
+                        e.reason if isinstance(e, PushRejectedError) else None
+                    ),
                 },
             )
             outputs["publish_failed"] = True

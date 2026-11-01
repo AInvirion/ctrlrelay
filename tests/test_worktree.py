@@ -2162,3 +2162,165 @@ class TestFetchWithTheSessionsBranchCheckedOut:
         )
         with pytest.raises(WorktreeError, match="refusing to fetch"):
             await wt.ensure_bare_repo("owner/repo")
+
+
+class TestAFailedGitCommandNamesTheReason:
+    """#269: `_run_git` raised with stderr only, and the push runs with
+    `--porcelain`, which puts the per-ref rejection reason on stdout.
+    So every failed push was reported as
+
+        git failed: error: failed to push some refs to '<url>'
+
+    — git's summary line, and nothing else. The line naming the ref and
+    why the remote refused it was produced, captured and discarded in
+    the same call. Worse than terse: the one line that survived names
+    the URL, which sends the reader after the transport or the
+    credential when neither was at fault.
+    """
+
+    # A git command that writes to BOTH streams and exits non-zero. An
+    # alias is the only portable way to get stdout out of a failing
+    # git; what matters to the test is the two streams and the exit
+    # code, not which subcommand produced them.
+    _ALIAS = (
+        '!printf "on-stdout\\n"; printf "on-stderr\\n" >&2; exit 3'
+    )
+
+    @staticmethod
+    def _manager(tmp_path: Path):
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        return WorktreeManager(
+            worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos",
+        )
+
+    @pytest.mark.asyncio
+    async def test_both_streams_reach_the_message_and_the_exception(
+        self, tmp_path: Path
+    ) -> None:
+        from ctrlrelay.core.worktree import GitCommandError
+
+        with pytest.raises(GitCommandError) as caught:
+            await self._manager(tmp_path)._run_git(
+                "-c", f"alias.boom={self._ALIAS}", "boom", cwd=tmp_path,
+            )
+        message = str(caught.value)
+        assert "on-stderr" in message, "stderr dropped"
+        assert "on-stdout" in message, "stdout dropped — the #269 defect"
+        # stderr leads: it holds git's own fatal:/error: lines and is
+        # what existing callers match on.
+        assert message.index("on-stderr") < message.index("on-stdout")
+        assert caught.value.stdout == "on-stdout"
+        assert caught.value.stderr == "on-stderr"
+
+    @pytest.mark.asyncio
+    async def test_it_is_still_a_worktree_error(self, tmp_path: Path) -> None:
+        """Every existing handler filters on WorktreeError."""
+        from ctrlrelay.core.worktree import WorktreeError
+
+        with pytest.raises(WorktreeError):
+            await self._manager(tmp_path)._run_git(
+                "-c", f"alias.boom={self._ALIAS}", "boom", cwd=tmp_path,
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_silent_failure_names_its_exit_code(
+        self, tmp_path: Path
+    ) -> None:
+        """With nothing on either stream the exit code is all there is,
+        so it is named rather than rendered as `git failed: `."""
+        from ctrlrelay.core.worktree import GitCommandError
+
+        with pytest.raises(GitCommandError) as caught:
+            await self._manager(tmp_path)._run_git(
+                "-c", "alias.quiet=!exit 7", "quiet", cwd=tmp_path,
+            )
+        assert "exited 7" in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_a_credential_in_the_output_is_still_redacted(
+        self, tmp_path: Path
+    ) -> None:
+        """Keeping stdout must not start writing tokens to the log."""
+        from ctrlrelay.core.worktree import GitCommandError
+
+        alias = (
+            '!printf "Authorization: Bearer ghp_'
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n"; exit 1'
+        )
+        with pytest.raises(GitCommandError) as caught:
+            await self._manager(tmp_path)._run_git(
+                "-c", f"alias.leak={alias}", "leak", cwd=tmp_path,
+            )
+        assert "ghp_" not in str(caught.value)
+        assert "[redacted]" in str(caught.value)
+
+
+class TestParsePushRejection:
+    """The `!` line of `git push --porcelain` is the only place the
+    remote's reason exists: stderr gets `error: failed to push some
+    refs to '<url>'` and nothing more.
+    """
+
+    # Real `git push --porcelain` output, tabs and all.
+    _STALE = (
+        "To https://github.com/owner/repo.git\n"
+        "!\trefs/heads/fix/issue-7:refs/heads/fix/issue-7\t"
+        "[rejected] (stale info)\n"
+        "Done\n"
+    )
+    _HOOK = (
+        "To https://github.com/owner/repo.git\n"
+        "!\tfix/issue-7:refs/heads/fix/issue-7\t"
+        "[remote rejected] (push declined due to repository rule "
+        "violations)\n"
+        "Done\n"
+    )
+    _OK = (
+        "To https://github.com/owner/repo.git\n"
+        "\trefs/heads/fix/issue-7:refs/heads/fix/issue-7\tabc123..def456\n"
+        "Done\n"
+    )
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            (_STALE, "refs/heads/fix/issue-7:refs/heads/fix/issue-7 "
+                     "[rejected] (stale info)"),
+            (_HOOK, "fix/issue-7:refs/heads/fix/issue-7 [remote rejected] "
+                    "(push declined due to repository rule violations)"),
+            # The non-porcelain form carries the flag and reason too.
+            (" ! [rejected]        fix/issue-7 -> fix/issue-7 "
+             "(non-fast-forward)",
+             "[rejected]        fix/issue-7 -> fix/issue-7 "
+             "(non-fast-forward)"),
+        ],
+        ids=["stale-lease", "remote-rule", "non-porcelain"],
+    )
+    def test_the_reason_is_read_out(self, text: str, expected: str) -> None:
+        from ctrlrelay.core.worktree import parse_push_rejection
+
+        assert parse_push_rejection(text) == expected
+
+    @pytest.mark.parametrize(
+        "text", [_OK, "", "fatal: could not read Username for 'https://x'"],
+        ids=["every-ref-updated", "empty", "died-before-any-ref"],
+    )
+    def test_no_rejected_ref_is_none_not_a_guess(self, text: str) -> None:
+        """A push that died before it got a per-ref answer is a
+        different failure; stderr is the whole story and must not be
+        dressed up as a rejection."""
+        from ctrlrelay.core.worktree import parse_push_rejection
+
+        assert parse_push_rejection(text) is None
+
+    def test_a_long_reason_is_capped(self) -> None:
+        from ctrlrelay.core.worktree import (
+            _PUSH_REASON_MAX_CHARS,
+            parse_push_rejection,
+        )
+
+        text = "!\tr:r\t[remote rejected] (" + "x" * 5000 + ")"
+        reason = parse_push_rejection(text)
+        assert reason is not None
+        assert len(reason) == _PUSH_REASON_MAX_CHARS
