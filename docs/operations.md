@@ -389,11 +389,13 @@ naming itself:
 ```
 Taken by ctrlrelay on **node-a**. It is working on this issue; ...
 
-<!-- ctrlrelay:claimed node=node-a id=3f9c0a1b2c4d state=working seen=... -->
+<!-- ctrlrelay:claimed node=node-a id=3f9c0a1b2c4d state=working run=5e1d02aa seen=... -->
 ```
 
 `node` is the config's `node_id` (the hostname by default). Give every
-machine a different one. Only comments by the account the relay runs as
+machine a different one. `run` names the process that last wrote the claim
+and `seen` when, by its clock: a machine warns when a claim under its own
+name is refreshed by another process (two machines sharing a `node_id`). Only comments by the account the relay runs as
 count; a marker pasted by anyone else is ignored.
 
 **The race check.** Two machines can see a new issue in the same poll. Each
