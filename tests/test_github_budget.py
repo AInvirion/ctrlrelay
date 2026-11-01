@@ -61,8 +61,10 @@ class TestState:
         assert Bucket(999, 5000, NOW + 60).state(0.2, NOW) == LOW
         assert Bucket(0, 5000, NOW + 60).state(0.2, NOW) == OUT
 
-    def test_after_the_reset_an_old_reading_is_not_out(self) -> None:
-        assert Bucket(0, 5000, NOW + 60).state(0.2, NOW + 60) == OK
+    def test_after_the_reset_an_old_reading_is_unknown(self) -> None:
+        from ctrlrelay.core.github_budget import UNKNOWN
+
+        assert Bucket(0, 5000, NOW + 60).state(0.2, NOW + 60) == UNKNOWN
 
 
 class TestWhichBucket:
@@ -75,6 +77,10 @@ class TestWhichBucket:
         (("search", "issues", "x"), "search"),
         (("issue", "view", "1", "--repo", "o/r"), "graphql"),
         (("pr", "list", "--repo", "o/r"), "graphql"),
+        (("api", "-X", "GET", "search/issues", "-f", "q=x"), "search"),
+        (("api", "--method", "POST", "graphql", "-f", "query=x"), "graphql"),
+        (("api", "-H", "Accept: x", "repos/o/r"), "core"),
+        (("run", "view", "--job", "1", "--log-failed"), "core"),
     ])
     def test_bucket(self, args, bucket) -> None:
         assert bucket_for(args) == bucket
@@ -117,12 +123,14 @@ class TestBudget:
         assert budget.blocked_until("core") is None
 
     @pytest.mark.asyncio
-    async def test_a_failed_read_keeps_the_last_reading(self, tmp_path: Path) -> None:
+    async def test_a_failed_read_is_unknown_and_stops_blocking(self, tmp_path: Path) -> None:
         said: list[str] = []
         budget, _ = self._budget(tmp_path, [rate_limit(core=0), "garbage"], said)
         await budget.refresh()
-        assert await budget.refresh() is None
         assert budget.blocked_until("core") == NOW + 3000
+        assert await budget.refresh() is None
+        assert budget.blocked_until("core") is None
+        assert BudgetStore(tmp_path / "b.json").read() is None
 
     @pytest.mark.asyncio
     async def test_the_reading_is_stored_for_the_page(self, tmp_path: Path) -> None:
@@ -178,22 +186,43 @@ class TestTheGhGate:
         assert spawn.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_a_rate_limit_answer_marks_the_bucket_out(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("stderr,reads", [
+        (b"HTTP 403: API rate limit exceeded for user", 1),
+        (b"You have exceeded a secondary rate limit", 0),
+        (b"HTTP 502: bad gateway", 0),
+    ])
+    async def test_only_a_primary_rate_limit_answer_triggers_a_read(
+        self, tmp_path: Path, stderr: bytes, reads: int,
+    ) -> None:
+        import asyncio
+
         from ctrlrelay.core.github import GitHubCLI, GitHubError
+
+        fetch = AsyncMock(return_value=rate_limit(core=0))
+        said: list[str] = []
+
+        async def notify(t: str) -> None:
+            said.append(t)
 
         budget = GitHubBudget(
             BudgetStore(tmp_path / "b.json"), low_at=0.2,
-            fetch=AsyncMock(), clock=lambda: NOW,
+            fetch=fetch, notify=notify, clock=lambda: NOW,
         )
-        budget.reading = parse_rate_limit(rate_limit(core=3000), now=NOW)
         gh = GitHubCLI(gh_binary="gh", budget=budget)
         proc = AsyncMock()
-        proc.communicate.return_value = (b"", b"HTTP 403: API rate limit exceeded for user")
+        proc.communicate.return_value = (b"", stderr)
         proc.returncode = 1
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(GitHubError):
                 await gh._run_gh("api", "repos/o/r")
-        assert budget.blocked_until("core") == NOW + 3000
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert fetch.await_count == reads
+        if reads:
+            # Recorded for the page and announced at once, not at the next tick.
+            assert budget.blocked_until("core") == NOW + 3000
+            assert BudgetStore(tmp_path / "b.json").read().buckets["core"].remaining == 0
+            assert any("used up" in t for t in said)
 
 
 class TestSlowingDown:
@@ -287,3 +316,55 @@ class TestTheStatusBlock:
         block = server.node()["github_api"]
         assert block["core"]["remaining"] == 100
         assert block["core"]["state"] == LOW
+
+
+
+class TestRoundOneFixes:
+    @pytest.mark.parametrize("reset", [10**30, -5, 12])
+    def test_a_reset_that_is_not_a_time_is_unknown(self, reset: int) -> None:
+        text = json.dumps({"resources": {
+            "core": {"limit": 5000, "remaining": 1, "reset": reset},
+        }})
+        assert parse_rate_limit(text, now=NOW) is None
+
+    @pytest.mark.asyncio
+    async def test_back_from_empty_but_still_low_is_announced(self, tmp_path: Path) -> None:
+        said: list[str] = []
+        budget, _ = TestBudget()._budget(
+            tmp_path, [rate_limit(core=0), rate_limit(core=100)], said,
+        )
+        await budget.refresh()
+        await budget.refresh()
+        assert len(said) == 2 and "back, but low" in said[1]
+
+    @pytest.mark.asyncio
+    async def test_an_infinite_scale_does_not_stop_the_poller(self, monkeypatch) -> None:
+        from unittest.mock import MagicMock
+
+        import ctrlrelay.core.poller as poller_mod
+
+        slept: list[float] = []
+
+        async def fake_sleep(s: float) -> None:
+            slept.append(s)
+
+        monkeypatch.setattr(poller_mod.asyncio, "sleep", fake_sleep)
+        poller = MagicMock()
+        poller.poll = AsyncMock(return_value=[])
+        await poller_mod.run_poll_loop(
+            poller=poller, handler=AsyncMock(), interval=100, max_iterations=3,
+            interval_scale=iter([float("inf"), float("nan")]).__next__,
+        )
+        assert slept == [100, 100]
+
+    @pytest.mark.parametrize("minutes,ok", [(5, True), (15, True), (7, False), (40, False)])
+    def test_the_check_interval_divides_the_hour(self, minutes: int, ok: bool) -> None:
+        from pydantic import ValidationError
+
+        from ctrlrelay.core.config import GitHubApiConfig
+
+        if ok:
+            GitHubApiConfig(check_minutes=minutes)
+        else:
+            with pytest.raises(ValidationError):
+                GitHubApiConfig(check_minutes=minutes)

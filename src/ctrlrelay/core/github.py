@@ -159,7 +159,14 @@ class GitHubCLI:
 
         if proc.returncode != 0:
             message = stderr.decode().strip()
-            if self.budget is not None and "rate limit" in message.lower():
+            lowered = message.lower()
+            if (
+                self.budget is not None
+                and tuple(args) != ("api", "rate_limit")
+                and "api rate limit exceeded" in lowered
+                and "secondary" not in lowered
+            ):
+                # The primary hourly quota, not a short secondary limit.
                 self.budget.mark_out(bucket)
             raise GitHubError(f"gh failed: {message}")
 

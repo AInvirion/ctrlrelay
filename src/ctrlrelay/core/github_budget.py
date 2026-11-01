@@ -23,6 +23,7 @@ A reading that could not be taken is ``None``, published as
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -38,7 +39,9 @@ from ctrlrelay.core.obs import get_logger, log_event
 _logger = get_logger("core.github_budget")
 
 BUCKETS = ("core", "search", "graphql")
-OK, LOW, OUT = "ok", "low", "out"
+OK, LOW, OUT, UNKNOWN = "ok", "low", "out", "unknown"
+# Epoch seconds between 2001 and 2286; outside that a reset is not a time.
+_MIN_TS, _MAX_TS = 1_000_000_000, 10_000_000_000
 
 
 @dataclass(frozen=True)
@@ -50,7 +53,8 @@ class Bucket:
     def state(self, low_at: float, now: float) -> str:
         if now >= self.resets_at:
             # The reset has passed: this reading says nothing about now.
-            return OK
+            # Unknown, which blocks nothing and announces nothing.
+            return UNKNOWN
         if self.remaining <= 0:
             return OUT
         if self.limit > 0 and self.remaining / self.limit < low_at:
@@ -81,6 +85,8 @@ class BudgetReading:
             b = _bucket(data.get(name), reset_key="resets_at")
             if b is not None:
                 buckets[name] = b
+        if not _MIN_TS <= data["read_at"] < _MAX_TS:
+            return None
         return cls(buckets=buckets, read_at=data["read_at"]) if buckets else None
 
 
@@ -97,6 +103,8 @@ def _bucket(raw: Any, *, reset_key: str) -> Bucket | None:
         _int(raw.get("remaining")), _int(raw.get("limit")), _int(raw.get(reset_key)),
     )
     if remaining is None or limit is None or reset is None:
+        return None
+    if not _MIN_TS <= reset < _MAX_TS or limit < 0:
         return None
     return Bucket(remaining=remaining, limit=limit, resets_at=reset)
 
@@ -121,26 +129,52 @@ def parse_rate_limit(text: str, *, now: float | None = None) -> BudgetReading | 
 
 
 def bucket_for(args: Sequence[str]) -> str:
-    """Which bucket a ``gh`` command spends.
+    """Which bucket a ``gh`` command spends, as far as the command says.
 
-    ``gh api`` calls are REST (``core``) unless they name ``graphql`` or
-    a ``search/`` path. ``gh search`` is ``search``. The other commands
-    (``gh issue``, ``gh pr``, ``gh repo``, ``gh run``) mostly go through
-    GraphQL, so they are counted there.
+    ``gh api``: the endpoint argument (skipping options and their values)
+    is ``graphql``, a ``search/`` path, or REST (``core``). ``gh search``
+    is ``search``. ``gh run`` and ``gh release`` are REST. The rest of the
+    commands this relay uses (``issue``, ``pr``, ``repo``) go through
+    GraphQL. A best effort: the exact endpoints of a ``gh`` command are
+    not part of its interface.
     """
     if not args:
         return "core"
     if args[0] == "search":
         return "search"
     if args[0] == "api":
-        paths = [a for a in args[1:] if not a.startswith("-")]
-        path = paths[0].lstrip("/") if paths else ""
+        path = _api_endpoint(args[1:]).lstrip("/")
         if path.startswith("graphql"):
             return "graphql"
         if path.startswith("search/"):
             return "search"
         return "core"
+    if args[0] in ("run", "release"):
+        return "core"
     return "graphql"
+
+
+# `gh api` options that take a value as the next argument.
+_API_OPTS_WITH_VALUE = frozenset({
+    "-X", "--method", "-H", "--header", "-f", "--raw-field", "-F", "--field",
+    "-q", "--jq", "-t", "--template", "--input", "--hostname", "-p",
+    "--preview", "--cache",
+})
+
+
+def _api_endpoint(rest: Sequence[str]) -> str:
+    skip = False
+    for arg in rest:
+        if skip:
+            skip = False
+            continue
+        if arg in _API_OPTS_WITH_VALUE:
+            skip = True
+            continue
+        if arg.startswith("-"):
+            continue
+        return arg
+    return ""
 
 
 def _iso(ts: int | None) -> str | None:
@@ -187,10 +221,22 @@ class BudgetStore:
         except Exception as e:
             log_event(_logger, "github_budget.write_failed", error=str(e)[:200])
 
+    def mark_unknown(self, now: float) -> None:
+        """The latest read failed: the page says unknown, not the older
+        numbers as if current."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".github-budget-")
+            with os.fdopen(fd, "w") as f:
+                json.dump({"unknown": True, "read_at": int(now)}, f)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            log_event(_logger, "github_budget.write_failed", error=str(e)[:200])
+
     def read(self) -> BudgetReading | None:
         try:
             return BudgetReading.from_json(json.loads(self.path.read_text()))
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return None
 
 
@@ -219,6 +265,7 @@ class GitHubBudget:
         self._clock = clock
         self.reading: BudgetReading | None = store.read()
         self._said: dict[str, str] = {}
+        self._marking: asyncio.Task[BudgetReading | None] | None = None
 
     def blocked_until(self, bucket: str) -> int | None:
         """The reset time, while ``bucket`` is out; otherwise ``None``."""
@@ -234,29 +281,35 @@ class GitHubBudget:
         if self.reading is None:
             return False
         now = self._clock()
-        return any(b.state(self.low_at, now) != OK for b in self.reading.buckets.values())
+        return any(
+            b.state(self.low_at, now) in (LOW, OUT)
+            for b in self.reading.buckets.values()
+        )
 
     def mark_out(self, bucket: str) -> None:
-        """A call was refused as rate limited before the next scheduled
-        read saw it: treat the bucket as out until a read says otherwise."""
-        if self.reading is None:
+        """GitHub answered a call with its primary rate limit before the
+        next scheduled read saw it. Read the budget now, rather than guess:
+        the read records it, the page shows it, and the chat line goes out."""
+        if self._marking is not None and not self._marking.done():
             return
-        b = self.reading.buckets.get(bucket)
-        if b is None or b.remaining <= 0:
-            return
-        buckets = dict(self.reading.buckets)
-        buckets[bucket] = Bucket(0, b.limit, b.resets_at)
-        self.reading = BudgetReading(buckets=buckets, read_at=self.reading.read_at)
+        try:
+            self._marking = asyncio.get_running_loop().create_task(self.refresh())
+        except RuntimeError:
+            pass
 
     async def refresh(self) -> BudgetReading | None:
         try:
             text = await self._fetch()
+            reading = parse_rate_limit(text, now=self._clock())
+            if reading is None:
+                raise ValueError("unparseable")
         except Exception as e:
+            # Could not read: unknown, which blocks nothing. Keeping an
+            # older "used up" reading would go on refusing calls on the
+            # strength of something no longer known.
             log_event(_logger, "github_budget.read_failed", error=str(e)[:200])
-            return None
-        reading = parse_rate_limit(text, now=self._clock())
-        if reading is None:
-            log_event(_logger, "github_budget.read_failed", error="unparseable")
+            self.reading = None
+            self.store.mark_unknown(self._clock())
             return None
         self.reading = reading
         self.store.write(reading)
@@ -267,6 +320,8 @@ class GitHubBudget:
         now = self._clock()
         for name, b in reading.buckets.items():
             state = b.state(self.low_at, now)
+            if state == UNKNOWN:
+                continue  # an expired reading says nothing to announce
             before = self._said.get(name, OK)
             if state == before:
                 continue
@@ -278,9 +333,12 @@ class GitHubBudget:
                     f"shared by every machine on the account). GitHub calls are "
                     f"paused until it resets at {resets}."
                 )
+            elif state == LOW and before == OUT:
+                text = (
+                    f"\u2705 GitHub {name} API budget is back, but low: "
+                    f"{b.remaining} of {b.limit} left until {resets}."
+                )
             elif state == LOW:
-                if before == OUT:
-                    continue  # coming back from empty is announced as ok
                 text = (
                     f"⚠️ GitHub {name} API budget low: {b.remaining} of "
                     f"{b.limit} left until {resets}. Slowing down."

@@ -768,8 +768,19 @@ class GitHubApiConfig(BaseModel):
     # A bucket below this share of its hourly limit is "low": non-urgent
     # work slows down and one chat line goes out.
     low_at: float = Field(default=0.2, gt=0, lt=1)
-    # How often the daemon reads /rate_limit (a free call).
+    # How often the daemon reads /rate_limit (a free call). A divisor of
+    # 60, since it runs as a `*/N` cron: other values give uneven gaps.
     check_minutes: int = Field(default=5, ge=1, le=60)
+
+    @field_validator("check_minutes")
+    @classmethod
+    def divides_the_hour(cls, v: int) -> int:
+        if 60 % v:
+            raise ValueError(
+                "github_api.check_minutes must divide 60 (1, 2, 3, 4, 5, 6, "
+                "10, 12, 15, 20, 30 or 60)"
+            )
+        return v
     # While any bucket is low, the poll interval is multiplied by this.
     slow_factor: float = Field(default=3.0, ge=1, le=20)
 

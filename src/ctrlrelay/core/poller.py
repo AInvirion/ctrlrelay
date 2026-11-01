@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1036,7 +1037,10 @@ async def run_poll_loop(
             scale = 1.0
             if interval_scale is not None:
                 try:
-                    scale = max(1.0, float(interval_scale()))
+                    scale = float(interval_scale())
                 except Exception:
+                    scale = 1.0
+                # Never shorter, never forever.
+                if not math.isfinite(scale) or scale < 1.0:
                     scale = 1.0
             await asyncio.sleep(interval * scale)
