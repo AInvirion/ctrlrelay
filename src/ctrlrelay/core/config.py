@@ -12,7 +12,12 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from ctrlrelay.core.agent_env import DEFAULT_SANDBOX_HIDE_PATHS
+from ctrlrelay.core.agent_env import (
+    DEFAULT_SANDBOX_CACHE_DIR,
+    DEFAULT_SANDBOX_HIDE_PATHS,
+    DEFAULT_SANDBOX_READONLY_PATHS,
+    DEFAULT_SANDBOX_WRITABLE_PATHS,
+)
 
 CONFIG_FILENAME = "orchestrator.yaml"
 CONFIG_SUBDIR = "config"
@@ -88,15 +93,24 @@ class AgentConfig(BaseModel):
     # output that carries the subscription usage (#247). Kept so existing
     # configs still load.
     output_format: str = "json"
-    # #219. "bwrap" runs the dev and task agents under bubblewrap with
-    # the paths below replaced by empty mounts, so the agent cannot
-    # read the SSH key or gh's stored login. Off by default because it
-    # needs bwrap installed and unprivileged user namespaces allowed.
-    # The credential stripping in core.agent_env applies either way.
+    # #219, #236. "bwrap" runs the dev and task agents under bubblewrap
+    # in a read-only copy of the machine: the hide paths empty, and only
+    # the run's worktree, its git directory, a private /tmp, the writable
+    # paths (minus the read-only ones) and the cache dir writable. Off by
+    # default because it needs bwrap installed and unprivileged user
+    # namespaces allowed. The credential stripping in core.agent_env
+    # applies either way.
     sandbox: Literal["none", "bwrap"] = "none"
     sandbox_hide_paths: list[str] = Field(
         default_factory=lambda: list(DEFAULT_SANDBOX_HIDE_PATHS)
     )
+    sandbox_writable_paths: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_SANDBOX_WRITABLE_PATHS)
+    )
+    sandbox_readonly_paths: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_SANDBOX_READONLY_PATHS)
+    )
+    sandbox_cache_dir: str = DEFAULT_SANDBOX_CACHE_DIR
 
 
 # Backwards-compat alias. Older code and docs reference ``ClaudeConfig``;

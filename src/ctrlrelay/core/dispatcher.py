@@ -20,9 +20,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ctrlrelay.core.agent_env import (
+    DEFAULT_SANDBOX_CACHE_DIR,
     DEFAULT_SANDBOX_HIDE_PATHS,
+    DEFAULT_SANDBOX_READONLY_PATHS,
+    DEFAULT_SANDBOX_WRITABLE_PATHS,
+    SandboxUnavailableError,
+    agent_cache_env,
     build_agent_env,
     bwrap_prefix,
+    git_dirs,
     resolve_bwrap,
 )
 from ctrlrelay.core.binaries import resolve_binary
@@ -158,13 +164,18 @@ class ClaudeDispatcher:
     # construction site has to say which of those it is, rather than
     # inheriting the pre-#204 silence by omission.
     outcome_hook: DispatchOutcomeHook | None = None
-    # "none" or "bwrap" (#219). With "bwrap", a spawn WITHOUT GitHub
-    # access runs under bubblewrap with ``sandbox_hide_paths`` replaced
-    # by empty mounts, so the agent cannot read the SSH key or gh's
-    # stored login either. Off by default: it needs bwrap installed and
-    # unprivileged user namespaces allowed, which not every host has.
+    # "none" or "bwrap" (#219, #236). With "bwrap", a spawn WITHOUT GitHub
+    # access runs under bubblewrap in a read-only copy of the machine:
+    # ``sandbox_hide_paths`` empty, and only the worktree, its git
+    # directory, a private /tmp, ``sandbox_writable_paths`` (minus
+    # ``sandbox_readonly_paths``) and ``sandbox_cache_dir`` writable. Off
+    # by default: it needs bwrap installed and unprivileged user
+    # namespaces allowed, which not every host has.
     sandbox: str = "none"
     sandbox_hide_paths: tuple[str, ...] = DEFAULT_SANDBOX_HIDE_PATHS
+    sandbox_writable_paths: tuple[str, ...] = DEFAULT_SANDBOX_WRITABLE_PATHS
+    sandbox_readonly_paths: tuple[str, ...] = DEFAULT_SANDBOX_READONLY_PATHS
+    sandbox_cache_dir: str = DEFAULT_SANDBOX_CACHE_DIR
     # Where each run's subscription usage reading is kept (#247). Required,
     # here and in `make_agent_dispatcher`: ``None`` keeps no reading, and
     # a construction has to say so rather than get it by omission.
@@ -192,6 +203,117 @@ class ClaudeDispatcher:
         # names a path nobody configured.
         self._bwrap: str | None = (
             resolve_bwrap() if self.sandbox == "bwrap" else None
+        )
+
+    def _sandbox_prefix(
+        self,
+        env: dict[str, str],
+        working_dir: Path,
+        state_file: Path,
+        private_root: Path,
+    ) -> list[str]:
+        """The bwrap argv for one run (#236), and the agent's cache
+        variables set in ``env``. Raises :class:`SandboxUnavailableError`
+        rather than start a run it cannot confine as configured."""
+        if env.get("CLAUDE_CONFIG_DIR"):
+            raise SandboxUnavailableError(
+                "CLAUDE_CONFIG_DIR is set, and the sandbox only knows the "
+                "agent CLI's default state (~/.claude, ~/.claude.json); "
+                "unset it for the relay to run with agent.sandbox: bwrap"
+            )
+        cache_raw = os.path.expandvars(os.path.expanduser(self.sandbox_cache_dir))
+        if "$" in cache_raw:
+            raise SandboxUnavailableError(
+                f"agent.sandbox_cache_dir {self.sandbox_cache_dir!r} names an "
+                "unset variable"
+            )
+        cache_dir = Path(cache_raw)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise SandboxUnavailableError(
+                f"agent.sandbox_cache_dir {cache_dir}: {type(e).__name__}: {e}"
+            ) from e
+        # It is bound writable as a whole: one that is, or links to, the
+        # home directory or above would open all of it.
+        if Path.home().resolve().is_relative_to(cache_dir.resolve()):
+            raise SandboxUnavailableError(
+                f"agent.sandbox_cache_dir {cache_dir} resolves to "
+                f"{cache_dir.resolve()}, which contains the home directory; "
+                "point it at a directory of its own"
+            )
+        # The checkpoint is written inside the worktree; a state file
+        # elsewhere would need its directory opened, which could be home.
+        if not state_file.parent.resolve().is_relative_to(working_dir.resolve()):
+            raise SandboxUnavailableError(
+                f"the state file {state_file} is outside the worktree "
+                f"{working_dir}, so the sandbox cannot let the agent write it"
+            )
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        env.update(agent_cache_env(cache_dir))
+        dot_git = working_dir / ".git"
+        repo_dirs = git_dirs(working_dir)
+        if not repo_dirs:
+            # Every sandboxed run is in a git worktree. Without its git
+            # directory the agent could not commit, and a writable
+            # worktree with no ``.git`` lets it plant one, hooks and all,
+            # for the relay's later git commands there.
+            raise SandboxUnavailableError(
+                f"could not find the git directories of {working_dir} (it "
+                "must be a git worktree's top, and git 2.31 or later is "
+                "needed); not starting the agent"
+            )
+        # What every later git command in this clone runs, the relay's
+        # included: its config (core.hooksPath, core.fsmonitor, filters),
+        # per-worktree config, hooks, and the worktree's pointer to its
+        # git directory. The agent may not write them.
+        git_protected: list[Path] = []
+        for i, d in enumerate(repo_dirs):
+            # Files, made here when missing: the sandbox would otherwise
+            # make a missing name without a suffix a directory.
+            for name in ("config", "config.worktree"):
+                (d / name).touch(exist_ok=True)
+                git_protected.append(d / name)
+            # Submodules' git dirs, whose config git reads in each
+            # submodule when run in this one.
+            if (d / "modules").exists():
+                git_protected.append(d / "modules")
+            if i == 0:
+                git_protected.append(d / "hooks")
+                # Every worktree's git dir is in here: the others belong to
+                # other runs, so the folder is read-only and only this
+                # run's own (bound later, deeper) is writable.
+                if (d / "worktrees").exists():
+                    git_protected.append(d / "worktrees")
+            else:
+                # A linked worktree's pointers back to the shared clone:
+                # rewritten, they would send git to a config of the agent's.
+                git_protected += [
+                    d / n for n in ("commondir", "gitdir") if (d / n).exists()
+                ]
+        if dot_git.is_file():
+            git_protected.append(dot_git)
+
+        # The agent CLI rewrites its main config file on every start, and it
+        # also holds the operator's MCP server commands: the run gets its
+        # own copy, thrown away with the private dir.
+        copies: list[tuple[Path, Path]] = []
+        main_config = Path.home() / ".claude.json"
+        if main_config.is_file():
+            copy = private_root / "claude.json"
+            shutil.copyfile(main_config, copy)
+            copy.chmod(0o600)
+            # At the real path: a bind on a link lands where it leads.
+            copies.append((copy, Path(os.path.realpath(main_config))))
+        return bwrap_prefix(
+            self._bwrap,
+            self.sandbox_hide_paths,
+            writable=[
+                working_dir, *repo_dirs, private_root, cache_dir,
+                *self.sandbox_writable_paths,
+            ],
+            readonly=[*self.sandbox_readonly_paths, *git_protected],
+            copies=copies,
         )
 
     async def _report_outcome(
@@ -293,7 +415,13 @@ class ClaudeDispatcher:
                 base_env, gh_config_dir=gh_config_dir, runtime_dir=runtime_dir,
             )
             if self._bwrap is not None:
-                prefix = bwrap_prefix(self._bwrap, self.sandbox_hide_paths)
+                try:
+                    prefix = self._sandbox_prefix(
+                        env, working_dir, state_file, private_root,
+                    )
+                except Exception:
+                    shutil.rmtree(private_root, ignore_errors=True)
+                    raise
         env["CTRLRELAY_SESSION_ID"] = session_id
         env["CTRLRELAY_STATE_FILE"] = str(state_file)
 
@@ -316,7 +444,7 @@ class ClaudeDispatcher:
         # is handed no credential to push with, not what it is allowed
         # to type. That stops an agent using normal tooling; one that
         # deliberately reads credential files as the same OS user is
-        # not stopped until #236 (separate user / read-only home).
+        # stopped only by ``agent.sandbox: bwrap`` (#236).
         cmd = [
             *prefix,
             self.claude_binary,
@@ -707,6 +835,9 @@ def make_agent_dispatcher(
             outcome_hook=outcome_hook,
             sandbox=agent_config.sandbox,
             sandbox_hide_paths=tuple(agent_config.sandbox_hide_paths),
+            sandbox_writable_paths=tuple(agent_config.sandbox_writable_paths),
+            sandbox_readonly_paths=tuple(agent_config.sandbox_readonly_paths),
+            sandbox_cache_dir=agent_config.sandbox_cache_dir,
             usage_store=usage_store,
         )
     raise NotImplementedError(

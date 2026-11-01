@@ -39,13 +39,16 @@ refused; a remote branch ctrlrelay did not push is not overwritten;
 agent-written PR and comment text is sanitized; and an agent that only
 uses its normal tooling (git, gh, ssh as configured) cannot push.
 
-What it does NOT guarantee: the agent runs as the same OS user, so a
-deliberately hostile agent can still read credential files
-(``~/.config/gh/hosts.yml``, ``~/.ssh``), use them by hand, and write
-to the relay's push directory, the bare clone's object store and any
-``objects/info/alternates`` chain it adds there, racing a push. Closing
-that needs a separate user or a read-only home (#236). ``agent.sandbox:
-bwrap`` hides the credential paths; it does not stop the writes.
+What it does NOT guarantee: the agent runs as the same OS user, so
+without a sandbox a deliberately hostile agent can still read credential
+files (``~/.config/gh/hosts.yml``, ``~/.ssh``), use them by hand, and
+write anywhere the operator can: dotfiles, shell startup files, the
+relay's own install. ``agent.sandbox: bwrap`` (#236) closes that: the
+whole filesystem is read-only, the credential paths are empty, and only
+the run's worktree, its repository's git directory, a private ``/tmp``,
+the agent CLI's own state and an agent-only cache are writable. Within
+the git directory it can still write objects and refs, which the relay's
+push already treats as untrusted (#219).
 """
 
 from __future__ import annotations
@@ -178,7 +181,77 @@ DEFAULT_SANDBOX_HIDE_PATHS: tuple[str, ...] = (
     # reach it either.
     "~/.local/share/keyrings",
     "$XDG_RUNTIME_DIR/bus",
+    # Other credentials an operator's home commonly holds (#236).
+    "~/.gnupg",
+    "~/.aws",
+    "~/.azure",
+    "~/.config/gcloud",
+    "~/.kube",
+    "~/.docker/config.json",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.cargo/credentials",
+    "~/.cargo/credentials.toml",
+    "~/.config/doctl",
+    "~/.password-store",
+    "~/.1password",
+    "~/.docker/run",
+    "~/.docker/desktop",
+    # The relay's own config, which can hold chat tokens.
+    "~/.config/ctrlrelay",
+    # Sockets: a read-only mount does not stop a connect. The session's
+    # runtime dir holds the keyring, gpg-agent, ssh-agent and podman
+    # sockets (the agent gets its own, empty, in its environment); the
+    # Docker socket can mount any of the paths above into a container.
+    "$XDG_RUNTIME_DIR",
+    # The same, by uid, for a relay started where the variable is unset.
+    f"/run/user/{os.getuid()}",
+    "/run/docker.sock",
+    "/var/run/docker.sock",
+    # What the operator's own agent sessions run: shell snapshots sourced
+    # before each command, environment files sourced the same way, and the
+    # IDE connection locks. Empty and writable for the sandboxed run.
+    "~/.claude/shell-snapshots",
+    "~/.claude/session-env",
+    "~/.claude/ide",
+    # Snapshots that a rewind writes back into the operator's files.
+    "~/.claude/file-history",
 )
+
+# Writable inside the sandbox besides the run's own paths (#236): the
+# agent CLI keeps its login, session logs and history here. ``/*`` opens
+# what is in the directory now, one level, and not the directory itself:
+# the agent cannot add, remove or replace entries there, so a link such as
+# ``settings.json -> elsewhere`` cannot be swapped for a file of its own.
+DEFAULT_SANDBOX_WRITABLE_PATHS: tuple[str, ...] = ("~/.claude/*",)
+
+# Read-only again inside a writable path: what the operator's own agent
+# sessions load and run (settings with hooks, plugins, skills, agents),
+# so a run cannot plant something that runs later as the operator.
+DEFAULT_SANDBOX_READONLY_PATHS: tuple[str, ...] = (
+    "~/.claude/settings.json",
+    "~/.claude/settings.local.json",
+    "~/.claude/CLAUDE.md",
+    "~/.claude/agents",
+    "~/.claude/commands",
+    "~/.claude/skills",
+    "~/.claude/hooks",
+    "~/.claude/plugins",
+    "~/.claude/output-styles",
+    "~/.claude/scripts",
+    "~/.claude/rules",
+    # What the browser extension's native host runs.
+    "~/.claude/chrome",
+    # The agent CLI itself, when installed under its state directory.
+    "~/.claude/local",
+    # Each project's memory, which the operator's sessions in that project
+    # load. One ``*`` part is expanded to the directories there now.
+    "~/.claude/projects/*/memory",
+)
+
+# The agent's package caches: its own, never the operator's, so a run
+# cannot poison a cache the operator builds from later.
+DEFAULT_SANDBOX_CACHE_DIR = "~/.ctrlrelay/agent-cache"
 
 
 class SandboxUnavailableError(RuntimeError):
@@ -200,29 +273,256 @@ def resolve_bwrap() -> str:
     )
 
 
-def bwrap_prefix(bwrap: str, hide_paths: Sequence[str]) -> list[str]:
-    """Argv prefix that runs a command with ``hide_paths`` made empty.
+def _existing(raw: str | Path) -> Path | None:
+    """``raw`` with ``~`` and variables expanded and a symlink followed,
+    or ``None`` when it names nothing. An unset variable names nothing:
+    a literal "$XDG_RUNTIME_DIR" is not a path."""
+    expanded = os.path.expandvars(os.path.expanduser(str(raw)))
+    if "$" in expanded:
+        return None
+    # Every link on the way resolved, so the bind names the real place.
+    p = Path(os.path.realpath(expanded))
+    return p if p.exists() else None
 
-    The rest of the filesystem is bound through unchanged and writable,
-    so the agent's toolchain, caches and the model CLI's own state
-    behave exactly as without the sandbox. Only the named paths change:
-    a directory becomes an empty tmpfs and a file becomes /dev/null.
-    A path that does not exist is skipped (bwrap would otherwise have
-    to create a mount point for it).
+
+def bwrap_prefix(
+    bwrap: str,
+    hide_paths: Sequence[str],
+    *,
+    writable: Sequence[str | Path] = (),
+    readonly: Sequence[str | Path] = (),
+    copies: Sequence[tuple[Path, Path]] = (),
+) -> list[str]:
+    """Argv prefix that runs a command in a read-only copy of this machine.
+
+    In order, so each step wins over the one before: the whole
+    filesystem read-only, a fresh ``/dev``, ``/proc`` and private
+    ``/tmp``; ``writable`` bound back writable, and every directory
+    between one of those and a mount inside it made a mount point, so it
+    cannot be renamed away; each ``(copy, path)`` in ``copies`` shown
+    writable at ``path``; ``readonly`` bound read-only again; and
+    ``hide_paths`` made empty (a directory becomes an empty tmpfs, a file
+    or socket ``/dev/null``) wherever they are. Bind sources are
+    read from the host, so a path under ``/tmp`` binds normally. A
+    hidden or writable path that does not exist is skipped (bwrap would
+    otherwise have to create a mount point for it). A missing read-only
+    path inside a writable one is created first (see
+    :func:`_create_readonly`); elsewhere it stays absent, since nothing
+    can create it. The child gets its own process namespace and dies with
+    the relay.
     """
-    argv = [bwrap, "--dev-bind", "/", "/", "--die-with-parent"]
-    for raw in hide_paths:
-        expanded = os.path.expandvars(os.path.expanduser(raw))
-        if "$" in expanded:
-            # An unset variable: there is nothing at a path we cannot
-            # name, and a literal "$XDG_RUNTIME_DIR" is not a path.
+    argv = [
+        bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+        "--tmpfs", "/tmp", "--unshare-pid", "--die-with-parent",
+    ]
+    opened: list[Path] = []
+    for raw in _expand_globs(writable, dirs_only=False):
+        p = _existing(raw)
+        if p is not None and p not in opened:
+            opened.append(p)
+    open_dirs = [p for p in opened if p.is_dir()]
+
+    locked: list[Path] = []
+    links: list[Path] = []
+    for raw in _expand_globs(readonly, links=links):
+        link = _expand(raw)
+        if link is not None and link.is_symlink():
+            links.append(link)
+        p = _existing(raw)
+        if p is None:
+            target = _expand(raw)
+            if target is None:
+                continue
+            # Spelled through the same links as the writable paths, which
+            # were resolved: ``~/.claude`` may itself be a symlink. The last
+            # part is not followed, so a dangling link is judged where it
+            # sits.
+            target = Path(os.path.realpath(target.parent)) / target.name
+            if not any(target.is_relative_to(d) for d in open_dirs):
+                continue  # nothing writable reaches it: it stays absent
+            p = _create_readonly(target)
+        if p not in locked:
+            locked.append(p)
+
+    # A read-only bind protects a link's target, not the link: where the
+    # link sits writable, the agent could replace it with a file of its
+    # own under the name that is loaded. Refused, like a dangling one.
+    for link in links:
+        if _writable_at(Path(os.path.realpath(link.parent)), opened, locked):
+            raise SandboxUnavailableError(
+                f"agent.sandbox: {link} is a link in a directory the agent "
+                "can write, so it could be replaced; replace the link with "
+                "what it points to, or take the path out of "
+                "agent.sandbox_readonly_paths"
+            )
+
+    # A mount point cannot be renamed, but a plain directory above one
+    # can, and the mount moves with it: the agent could then make a new
+    # directory under the old name, which is the one later loaded. So
+    # every directory between a writable path and a mount inside it is
+    # made a mount point too.
+    pins: list[Path] = []
+    for m in [*opened, *locked]:
+        holders = [d for d in open_dirs if m != d and m.is_relative_to(d)]
+        if not holders:
             continue
-        p = Path(expanded)
-        if p.is_symlink():
-            p = p.resolve()
+        holder = max(holders, key=lambda d: len(d.parts))
+        a = m.parent
+        while a != holder:
+            if a not in pins and a not in opened and a not in locked:
+                pins.append(a)
+            a = a.parent
+
+    def depth(p: Path) -> int:
+        return len(p.parts)
+
+    mounts = [(p, "--bind") for p in [*opened, *pins] if p not in locked]
+    mounts += [(p, "--ro-bind") for p in locked]
+    # By depth, so a mount inside another always comes after it, whichever
+    # kind each is: a read-only directory can hold a writable one (the
+    # shared clone's ``worktrees`` and this run's own in it).
+    for p, kind in sorted(mounts, key=lambda m: (depth(m[0]), m[1] == "--ro-bind")):
+        argv += [kind, str(p), str(p)]
+    for src, dest in copies:
+        argv += ["--bind", str(src), str(dest)]
+    # Last, so neither a writable nor a read-only path that contains or
+    # names a hidden one brings it back.
+    for raw in hide_paths:
+        p = _existing(raw)
+        if p is None:
+            continue
         if p.is_dir():
             argv += ["--tmpfs", str(p)]
-        elif p.exists():
+        else:
             argv += ["--ro-bind", "/dev/null", str(p)]
     argv.append("--")
     return argv
+
+
+def _writable_at(where: Path, opened: list[Path], locked: list[Path]) -> bool:
+    """Whether ``where`` is writable in the sandbox: the nearest mount at
+    or above it decides."""
+    holders = [p for p in [*opened, *locked] if where.is_relative_to(p)]
+    if not holders:
+        return False
+    nearest = max(holders, key=lambda p: (len(p.parts), p in locked))
+    return nearest not in locked and nearest.is_dir()
+
+
+def _expand_globs(
+    paths: Sequence[str | Path],
+    *,
+    dirs_only: bool = True,
+    links: list[Path] | None = None,
+) -> list[str | Path]:
+    """Each path with a ``*`` part replaced by one path per entry that part
+    matches now, the rest of the path kept after it. Hidden names match.
+    With ``dirs_only`` (read-only paths), directories, a linked one by
+    where it leads; otherwise every entry but links (writable paths)."""
+    out: list[str | Path] = []
+    for raw in paths:
+        text = os.path.expanduser(str(raw))
+        parts = Path(text).parts
+        star = next((i for i, part in enumerate(parts) if "*" in part), None)
+        if star is None:
+            out.append(raw)
+            continue
+        head = Path(*parts[: star + 1])
+        rest = parts[star + 1:]
+        for match in sorted(head.parent.glob(head.name)):
+            if dirs_only:
+                # A linked directory counts where it leads, so what it
+                # holds is protected too.
+                if not match.is_dir():
+                    continue
+                if match.is_symlink() and links is not None:
+                    links.append(match)  # judged by the caller
+                match = match.resolve()
+            elif match.is_symlink():
+                continue
+            out.append(match.joinpath(*rest))
+    return out
+
+
+def _expand(raw: str | Path) -> Path | None:
+    expanded = os.path.expandvars(os.path.expanduser(str(raw)))
+    return None if "$" in expanded else Path(expanded)
+
+
+# What a missing read-only path is made as: these a file, anything else
+# a directory.
+_FILE_SUFFIXES = frozenset({".json", ".md", ".worktree"})
+_FILE_NAMES = frozenset({"config", "commondir", "gitdir"})
+
+
+def _create_readonly(p: Path) -> Path:
+    """Create a missing read-only path inside a writable one, so it can be
+    bound read-only.
+
+    Skipping it would leave the agent free to create it: a
+    ``settings.local.json`` with a hook in it, or a git hook, which then
+    runs later as the operator. A JSON file is made ``{}`` (so the agent
+    CLI still parses it); a Markdown file and git's ``config``,
+    ``config.worktree``, ``commondir`` and ``gitdir`` are made empty files;
+    anything else an empty directory. Raises :class:`SandboxUnavailableError` when it cannot be
+    made, a dangling symlink included (the agent could replace the link):
+    the run does not start rather than start with the path open.
+    """
+    if p.is_symlink():
+        raise SandboxUnavailableError(
+            f"agent.sandbox: {p} is a link to something missing, which the "
+            "agent could replace; remove the link, or take the path out of "
+            "agent.sandbox_readonly_paths"
+        )
+    try:
+        if p.suffix in _FILE_SUFFIXES or p.name in _FILE_NAMES:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("{}\n" if p.suffix == ".json" else "")
+        else:
+            p.mkdir(parents=True)
+    except OSError as e:
+        raise SandboxUnavailableError(
+            f"agent.sandbox: cannot create {p} to keep it read-only "
+            f"({type(e).__name__}: {e}); fix or remove it, or take it out "
+            "of agent.sandbox_readonly_paths"
+        ) from e
+    return p.resolve()
+
+
+def git_dirs(working_dir: Path) -> list[Path]:
+    """The worktree's git directories (its own and the shared one), which
+    a commit writes to; empty when ``working_dir`` is not in a repository."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--show-toplevel",
+             "--git-common-dir", "--git-dir"],
+            cwd=working_dir, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    lines = [line for line in out.stdout.splitlines() if line.strip()]
+    if out.returncode != 0 or len(lines) != 3:
+        return []
+    # A directory that is not a repository itself but sits inside one (a
+    # home kept in git) would otherwise name that repository's.
+    if Path(lines[0]).resolve() != working_dir.resolve():
+        return []
+    return [Path(line) for line in lines[1:]]
+
+
+def agent_cache_env(cache_dir: Path) -> dict[str, str]:
+    """Point the usual package caches at the agent's own ``cache_dir``."""
+    return {
+        "XDG_CACHE_HOME": str(cache_dir),
+        # Set as well, so an operator's own setting does not win.
+        "PIP_CACHE_DIR": str(cache_dir / "pip"),
+        "UV_CACHE_DIR": str(cache_dir / "uv"),
+        "npm_config_cache": str(cache_dir / "npm"),
+        "GOMODCACHE": str(cache_dir / "go-mod"),
+        "GRADLE_USER_HOME": str(cache_dir / "gradle"),
+        # Cargo keeps its registry under CARGO_HOME; the toolchain itself
+        # is found through PATH and RUSTUP_HOME, which stay as they are.
+        "CARGO_HOME": str(cache_dir / "cargo"),
+    }

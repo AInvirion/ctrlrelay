@@ -147,20 +147,118 @@ push. The push itself runs from a fresh relay-owned git dir under
 `~/.ctrlrelay/push/`, reads the clone's branch heads from its ref files, and
 never reads the clone's config, which every worktree shares.
 
-**What it does not guarantee.** The agent still runs as your user. A
-deliberately hostile agent can read `~/.config/gh/hosts.yml`, `~/.ssh` and
-anything else in your home directory and use them by hand; it can write
-anywhere your user can, including your dotfiles and ctrlrelay's install; and
-it can write to `~/.ctrlrelay/push/`, the bare clone's object store and any
-`objects/info/alternates` chain it adds there, racing a push. On macOS the
-login keychain is reachable whatever the environment says. Closing that needs
-a separate user or a read-only home (#236). The next setting hides the
-credential paths; it does not stop the writes.
+**What it does not guarantee without a sandbox.** The agent still runs as
+your user. With `sandbox: "none"` a deliberately hostile agent can read
+`~/.config/gh/hosts.yml`, `~/.ssh` and anything else in your home directory
+and use them by hand, and it can write anywhere your user can, including your
+dotfiles and ctrlrelay's install. On macOS the login keychain is reachable
+whatever the environment says. `sandbox: "bwrap"` closes this on Linux.
+
+**`sandbox: "bwrap"` (#236).** The dev and task agents run under bubblewrap
+in a read-only copy of the machine (the secops agent, which needs your GitHub
+login, does not):
+
+- everything is read-only, so the toolchain you installed (in `/usr`, in
+  `~/.local`, `~/.cargo`, ...) still runs;
+- writable: the run's worktree, its repository's git directories (so it can
+  commit), a private `/tmp`, the run's own empty `gh` and runtime
+  directories, `sandbox_writable_paths` and `sandbox_cache_dir`. The agent
+  CLI's state directory is opened entry by entry (`~/.claude/*`): what is in
+  it can be written, but nothing can be added to it, removed or replaced, so
+  a `settings.json` that is a link elsewhere cannot be swapped for a file of
+  the agent's. Log the agent CLI in on the machine before turning the
+  sandbox on, so its files exist. The CLI's main config, `~/.claude.json`,
+  which also holds your MCP server commands, is a private copy for each run
+  (the agent can read it, so keep secrets out of `mcpServers[].env`). The
+  sandbox refuses to start when `CLAUDE_CONFIG_DIR` is set, since it knows
+  only the default state paths;
+- `sandbox_hide_paths` are empty, also inside a writable path: your SSH keys,
+  `gh`'s login, the other credentials listed below, the sockets in your
+  session's runtime directory and Docker's (a read-only mount does not stop
+  a connection to a socket, so add any other socket here), and the agent
+  CLI's shell snapshots, session environment files, IDE locks and rewind
+  snapshots, which your own sessions run or write back (the sandboxed run
+  gets an empty, writable one of each);
+- read-only again, over those: `sandbox_readonly_paths` (the agent CLI's
+  settings, rules, hooks, plugins, skills, browser host and install, and each
+  project's memory under `~/.claude/projects/*/memory`, which your own
+  sessions load) and, in the repository, `config`, `config.worktree`,
+  `hooks`, `modules`, the other runs' worktree directories, a linked
+  worktree's `commondir` and `gitdir`, and the worktree's `.git` pointer,
+  which every later git command there reads. So the agent cannot change git
+  config (`git config`, `git remote add`, a branch with `--track`), and a
+  global `commit.gpgsign = true` makes its commits fail, since your GPG
+  agent is hidden. Submodules cannot be updated or committed in from a
+  sandboxed run. One that does not exist yet inside a
+  writable path is created first so the agent cannot create it (`{}` for a
+  JSON file; an empty file for a Markdown file or git's `config`,
+  `config.worktree`, `commondir` and `gitdir`; otherwise an empty directory); if it cannot be created, the run does
+  not start. Every directory between a writable path and one of these is
+  pinned too, so it cannot be renamed away and recreated.
+
+Package caches (`XDG_CACHE_HOME`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`,
+`npm_config_cache`, `GOMODCACHE`, `GRADLE_USER_HOME` and `CARGO_HOME`) point at
+`sandbox_cache_dir`: the agent's own, never yours, so a run cannot poison a
+cache you build from. It must not contain your home directory. The first run
+of each project downloads its packages again. `CARGO_HOME` and `GRADLE_USER_HOME` also
+move those tools' own config, so `~/.cargo/config.toml` and
+`~/.gradle/gradle.properties` do not apply there. A tool that writes
+elsewhere in your home fails there; point it at a directory of its own
+rather than opening one of yours, which your own builds would then run.
+
+What it still allows: the agent reads the agent CLI's login (it needs it to
+run) and anything readable that is not hidden. The login file is opened as a
+file, so a refresh that replaces it by renaming fails inside the sandbox; a
+long-lived token from `claude setup-token`, in the environment, avoids
+refreshes there. It writes objects and refs in its repository's git
+directory, which the relay's push already treats as untrusted, and session
+transcripts under `~/.claude/projects`, which a later `--resume` of that
+session reads. A read-only path that is a link, in a directory the agent
+can write, could be swapped for a file of the agent's, so a run with one
+does not start; the error names it.
+`~/.claude/*` opens every entry not listed as read-only or hidden, so an
+entry a later agent CLI version adds that your own sessions run needs adding
+to one of those lists. The run's checkpoint file must be inside its worktree (it
+always is for dev and task runs). It does not account for your own setup
+giving another way in: a hidden file with a second hard link elsewhere, your
+home mounted at a second path, or an `include.path` in a clone's git config
+pointing at a file the agent can write. ctrlrelay's own clones have none of
+these.
+
+**Setting it up.** Linux only. Install bubblewrap (`sudo apt install
+bubblewrap`), then check it runs as your user:
+
+```bash
+bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true && echo works
+```
+
+If that prints `works`, set `agent.sandbox: "bwrap"` and restart the daemons.
+ctrlrelay refuses to start if it is set and `bwrap` is missing. If it fails
+with `setting up uid map: Permission denied` (Ubuntu 24.04 and later restrict
+unprivileged user namespaces through AppArmor), allow it for `bwrap` only:
+
+```bash
+sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+PROFILE
+sudo apparmor_parser -r /etc/apparmor.d/bwrap
+```
+
+then run the check again. On a single-user laptop this is the whole setup.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `sandbox` | `"none"` or `"bwrap"` | `"none"` | `"bwrap"` runs the dev and task agents under bubblewrap with `sandbox_hide_paths` replaced by empty mounts. Linux only; needs `bwrap` installed and unprivileged user namespaces allowed (on Ubuntu 24.04+ an AppArmor profile for `bwrap`). ctrlrelay refuses to start if it is set and `bwrap` is missing. |
-| `sandbox_hide_paths` | list of strings | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc`, `~/.local/share/keyrings`, `$XDG_RUNTIME_DIR/bus` | Paths hidden under `sandbox: bwrap`. A directory becomes an empty tmpfs, a file or socket becomes `/dev/null`, a missing path is skipped. |
+| `sandbox` | `"none"` or `"bwrap"` | `"none"` | `"bwrap"` runs the dev and task agents in the read-only sandbox above. |
+| `sandbox_hide_paths` | list of strings | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc`, `~/.local/share/keyrings`, `$XDG_RUNTIME_DIR/bus`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.config/doctl`, `~/.password-store`, `~/.1password`, `~/.docker/run`, `~/.docker/desktop`, `~/.config/ctrlrelay`, `$XDG_RUNTIME_DIR`, `/run/user/<uid>`, `/run/docker.sock`, `/var/run/docker.sock`, `~/.claude/shell-snapshots`, `~/.claude/session-env`, `~/.claude/ide`, `~/.claude/file-history` | Made empty under `sandbox: bwrap`. A directory becomes an empty tmpfs, a file or socket becomes `/dev/null`, a missing path is skipped. |
+| `sandbox_writable_paths` | list of strings | `~/.claude/*` | Writable under `sandbox: bwrap`, besides the run's own paths. A last part of `*` opens each entry in the directory now (not links), not the directory itself. |
+| `sandbox_readonly_paths` | list of strings | `~/.claude/settings.json`, `settings.local.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `hooks`, `plugins`, `output-styles`, `scripts`, `rules`, `chrome`, `local`, `projects/*/memory` (all under `~/.claude`) | Read-only again inside a writable path. One `*` part matches the directories there at the start of each run; a missing path under a writable one is created first (an empty `memory` directory in each project, for one). |
+| `sandbox_cache_dir` | string | `~/.ctrlrelay/agent-cache` | The agent's own package cache under `sandbox: bwrap`. |
 
 ## transport
 
