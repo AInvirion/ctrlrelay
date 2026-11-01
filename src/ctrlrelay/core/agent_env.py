@@ -214,6 +214,9 @@ DEFAULT_SANDBOX_READONLY_PATHS: tuple[str, ...] = (
     "~/.claude/plugins",
     "~/.claude/output-styles",
     "~/.claude/scripts",
+    # Each project's memory, which the operator's sessions in that project
+    # load. One ``*`` part is expanded to the directories there now.
+    "~/.claude/projects/*/memory",
 )
 
 # The agent's package caches: its own, never the operator's, so a run
@@ -284,7 +287,7 @@ def bwrap_prefix(
         if p is not None:
             argv += ["--bind", str(p), str(p)]
             open_dirs.append(p)
-    for raw in readonly:
+    for raw in _expand_globs(readonly):
         p = _existing(raw)
         if p is None:
             target = _expand(raw)
@@ -311,6 +314,25 @@ def bwrap_prefix(
             argv += ["--ro-bind", "/dev/null", str(p)]
     argv.append("--")
     return argv
+
+
+def _expand_globs(paths: Sequence[str | Path]) -> list[str | Path]:
+    """Each path with a ``*`` part replaced by one path per directory
+    that part matches now, the rest of the path kept after it."""
+    out: list[str | Path] = []
+    for raw in paths:
+        text = os.path.expanduser(str(raw))
+        parts = Path(text).parts
+        star = next((i for i, part in enumerate(parts) if "*" in part), None)
+        if star is None:
+            out.append(raw)
+            continue
+        head = Path(*parts[: star + 1])
+        rest = parts[star + 1:]
+        for match in sorted(head.parent.glob(head.name)):
+            if match.is_dir() and not match.is_symlink():
+                out.append(match.joinpath(*rest))
+    return out
 
 
 def _expand(raw: str | Path) -> Path | None:
@@ -373,6 +395,9 @@ def agent_cache_env(cache_dir: Path) -> dict[str, str]:
     """Point the usual package caches at the agent's own ``cache_dir``."""
     return {
         "XDG_CACHE_HOME": str(cache_dir),
+        # Set as well, so an operator's own setting does not win.
+        "PIP_CACHE_DIR": str(cache_dir / "pip"),
+        "UV_CACHE_DIR": str(cache_dir / "uv"),
         "npm_config_cache": str(cache_dir / "npm"),
         "GOMODCACHE": str(cache_dir / "go-mod"),
         # Cargo keeps its registry under CARGO_HOME; the toolchain itself

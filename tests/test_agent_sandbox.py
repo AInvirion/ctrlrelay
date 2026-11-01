@@ -71,8 +71,11 @@ try write_local_bin "touch $HOME/.local/bin/planted"
 try write_settings "echo planted >> $HOME/.claude/settings.json"
 try create_local_settings "echo planted > $HOME/.claude/settings.local.json"
 try create_git_hook "mkdir -p $GITCOMMON/hooks && touch $GITCOMMON/hooks/post-checkout"
-try hardlink_settings "ln $HOME/.claude/settings.json ./hl && echo planted >> ./hl"
-try hardlink_git_config "ln $GITCOMMON/config ./hl2 && echo planted >> ./hl2"
+try hardlink_settings "ln $HOME/.claude/settings.json ./hl"
+try hardlink_git_config "ln $GITCOMMON/config ./hl2"
+try write_project_memory "echo planted >> $HOME/.claude/projects/-other/memory/MEMORY.md"
+M="$HOME/.claude/projects/-bare/memory"
+try create_project_memory "mkdir -p $M && touch $M/MEMORY.md"
 try repoint_dot_git "echo 'gitdir: /elsewhere' > .git"
 try worktree_config "echo planted >> $GITDIR/config.worktree"
 try read_hidden_in_writable "cat $HOME/.claude/secret-token"
@@ -88,6 +91,8 @@ try commit "echo change > file.txt && git add file.txt && $G commit -qm change"
 
 @pytest.fixture
 def home(monkeypatch):
+    if Path.cwd().resolve().is_relative_to("/tmp"):
+        pytest.skip("the fake home must be outside /tmp, which the sandbox replaces")
     base = Path(tempfile.mkdtemp(prefix=".sandbox-test-", dir=Path.cwd()))
     h = base / "home"
     (h / ".ssh").mkdir(parents=True)
@@ -96,7 +101,9 @@ def home(monkeypatch):
     (h / ".config" / "gh" / "hosts.yml").write_text("oauth_token: secret")
     (h / ".bashrc").write_text("# mine\n")
     (h / ".local" / "bin").mkdir(parents=True)
-    (h / ".claude" / "projects").mkdir(parents=True)
+    (h / ".claude" / "projects" / "-other" / "memory").mkdir(parents=True)
+    (h / ".claude" / "projects" / "-other" / "memory" / "MEMORY.md").write_text("mine\n")
+    (h / ".claude" / "projects" / "-bare").mkdir()
     (h / ".claude" / "settings.json").write_text("{}")
     monkeypatch.setenv("HOME", str(h))
     yield base
@@ -157,6 +164,8 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         "create_git_hook": "no",
         "hardlink_settings": "no",
         "hardlink_git_config": "no",
+        "write_project_memory": "no",
+        "create_project_memory": "no",
         "repoint_dot_git": "no",
         "worktree_config": "no",
         "read_hidden_in_writable": "no",
@@ -350,3 +359,23 @@ def test_a_missing_agent_state_dir_is_made_writable(tmp_path, monkeypatch) -> No
     argv = d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)
     state = str(tmp_path / "home" / ".claude")
     assert ["--bind", state, state] == argv[argv.index(state) - 1: argv.index(state) + 2]
+
+
+def test_a_cache_dir_that_contains_home_is_refused(tmp_path, monkeypatch) -> None:
+    if BWRAP is None:
+        pytest.skip("bwrap not installed")
+    from ctrlrelay.core.agent_env import SandboxUnavailableError
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    (tmp_path / "cache-link").symlink_to(home)
+    wt = tmp_path / "wt"
+    _git("init", "-q", str(wt), cwd=tmp_path)
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
+        sandbox_cache_dir=str(tmp_path / "cache-link"),
+    )
+    with pytest.raises(SandboxUnavailableError, match="contains the home directory"):
+        d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)

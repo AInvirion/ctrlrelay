@@ -228,6 +228,14 @@ class ClaudeDispatcher:
             raise SandboxUnavailableError(
                 f"agent.sandbox_cache_dir {cache_dir}: {type(e).__name__}: {e}"
             ) from e
+        # It is bound writable as a whole: one that is, or links to, the
+        # home directory or above would open all of it.
+        if Path.home().resolve().is_relative_to(cache_dir.resolve()):
+            raise SandboxUnavailableError(
+                f"agent.sandbox_cache_dir {cache_dir} resolves to "
+                f"{cache_dir.resolve()}, which contains the home directory; "
+                "point it at a directory of its own"
+            )
         # The checkpoint is written inside the worktree; a state file
         # elsewhere would need its directory opened, which could be home.
         if not state_file.parent.resolve().is_relative_to(working_dir.resolve()):
