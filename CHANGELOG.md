@@ -7,6 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-01
+
+Several machines can now run ctrlrelay on one GitHub account, each claiming
+an issue before it works it, and the dev and task agents can run in a
+read-only sandbox. Every new config value has a default and nothing is added
+to the database, so for most installs **no config edit is required**. Check
+three things before upgrading:
+
+- **A placeholder `node_id` is refused at startup**: `localhost`,
+  `localhost.localdomain`, `unknown`, `my-laptop`, `studio-mac` (both were
+  examples in earlier docs), `changeme`, `example`, `node`, `hostname`. Set a
+  name no other machine on the account uses. A missing `node_id` still
+  defaults to the hostname.
+- **If you already run `agent.sandbox: bwrap`**, it is now much stricter:
+  by default the agent can write its worktree, its git dirs, a private
+  `/tmp`, its own empty `gh` and runtime dirs, the entries of `~/.claude`,
+  its own cache and any `sandbox_writable_paths`, minus the read-only and
+  hidden paths inside those. Anything else a run wrote
+  (a cache in your home, `git config`, submodules, commit signing) fails
+  there. It also refuses to start with `CLAUDE_CONFIG_DIR` set or with a
+  read-only path that is a replaceable link. Read the sandbox section of the
+  configuration docs before upgrading such a machine.
+- **Upgrade every machine on an account to the same version.** Claims now
+  name the machine and the process that wrote them, and an older version
+  reads them differently. A claim comment left by an older version counts
+  as taken by `unknown` and never goes stale: once nothing is working that
+  issue, delete the comment to free it. With a shared Mattermost bot, a
+  question asked before the upgrade carries no machine tag: answer it with
+  `node-a: ...`.
+
+### Added
+
+- Several machines on one account: before a dev or task run, the machine
+  claims the issue with a comment naming itself, waits
+  `claims.race_wait_seconds` and backs off if another machine's claim came
+  first; claims are refreshed while the run lasts and taken over once stale
+  (`claims.refresh_seconds`, `claims.stale_after_seconds`). A run whose
+  machine cannot refresh its claim for longer than the stale time (a long
+  GitHub outage) can be taken over while it still runs, so keep the
+  machines' clocks synchronised and the stale time well above any outage
+  you expect. A run that fails after being resumed from a question leaves
+  its claim held; delete the claim comment to free that issue (#252,
+  closes #245)
+- The scheduled security sweep runs at most once per repository and
+  scheduled time across machines: the first to create the ref
+  `refs/ctrlrelay/claims/secops/<window>` in the repository runs it. A
+  machine that dies holding a window, or a ref that cannot be created,
+  leaves that repository unswept for that window; the next window is new.
+  Keep `repos`, `schedules` and `timezone` the same on every machine, or
+  they name different windows (#259, closes #246)
+- Chat with several machines: questions are tagged with the machine's name
+  and a machine ignores replies to another's. Mattermost machines can share
+  one bot and channel with `transport.mattermost.shared: true` (a message
+  that is not a reply must start with `node-b: ...`); Telegram needs one bot
+  per machine. When a second process starts reading the same bot, Telegram
+  cuts off the one already running, which now says so once, in its log and
+  in the chat, and stops reading (#260, closes #248)
+- Subscription usage: read from each agent run and shown on the status
+  page. New issues wait while the 5-hour or 7-day window is at or above
+  `usage.pause_at` (default 90%), or the status is anything but `allowed`,
+  until the window's reset (or an hour, when the reset time cannot be read,
+  and then the next reading decides); runs already going finish, and a usage that
+  could not be read never pauses. An idle probe every `usage.probe_minutes`
+  keeps the reading fresh (#254, closes #247)
+- GitHub API budget: watched every `github_api.check_minutes`; polling slows
+  by `github_api.slow_factor` while the `core` or `graphql` bucket is below
+  `github_api.low_at` (not `search`, which resets every minute), with one
+  chat line. When a bucket is used up, calls known to spend it
+  (`gh api`, `gh search`) fail at once as rate limited until its reset, and
+  the poller resumes after it; other `gh` commands are not held back (#256,
+  closes #237)
+- Status page: a Machines strip and who-has-what for every machine listed in
+  `fleet.peers` (each machine's `web.allowed_hosts` must hold the name the
+  others use for it), plus this machine's usage and API budget (#258,
+  closes #249)
+- `ctrlrelay node check [--no-agent]`: node id, GitHub login, agent login
+  and peers, exit 1 on any failure; the poller warns at startup and while
+  running if another process uses this machine's `node_id`; new guide
+  `docs/adding-a-machine.md` (#261, closes #250)
+- `agent.sandbox: bwrap` is now a read-only copy of the machine: by default
+  only the run's worktree, its git dirs, a private `/tmp`, the entries of
+  `~/.claude` and an agent-only cache (`agent.sandbox_cache_dir`) are
+  writable; the
+  agent CLI's settings, hooks, plugins, skills and project memory, and the
+  repository's git config and hooks, stay read-only; more credentials and
+  the session's sockets are hidden; `~/.claude.json` is a private copy per
+  run. New `agent.sandbox_writable_paths` and `agent.sandbox_readonly_paths`.
+  Still off by default. The configuration docs list what it costs a run
+  (no git config changes, no commit signing, no submodule updates) and how
+  to set it up (#262, closes #236)
+- Status page: PR and issue numbers in Needs you questions are links (#242,
+  closes #241)
+
+### Changed
+
+- The agent runs with `--output-format stream-json` (the only output that
+  carries the usage reading); `agent.output_format` is read and ignored
+  (#254)
+- A repository whose history was replaced upstream is re-cloned, unless a
+  worktree still uses the clone (finish or clean up the run first); an issue
+  that failed before the agent started is retried on the next polls, up to
+  three tries, then left as seen like any other failed run, with a chat
+  line saying so (#244, closes #234)
+
+### Fixed
+
+- A dev run whose PR went BEHIND mid-run no longer dies fetching its own
+  checked-out branch, and a late failure names the PR it opened (#255,
+  closes #253)
+
+### Known limits
+
+- With several machines, chat and status-page names are only as unique as
+  each machine's `node_id`; the duplicate-name warning does not catch every
+  case
+- The relay's own git calls in a worktree after the agent exits still read
+  that repository's config; only the push ignores it (#263)
+
 ## [0.15.0] - 2026-10-31
 
 The dev and task agents no longer inherit the usual GitHub credentials;
@@ -1839,7 +1957,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.12.4...v0.13.0
