@@ -291,7 +291,9 @@ class TestRoundOneFixes:
 
 class TestTheSchedulerSaysWhichRun:
     @pytest.mark.asyncio
-    async def test_a_run_started_late_names_the_fire_the_scheduler_planned(self) -> None:
+    async def test_the_window_is_the_fire_before_the_planned_next_one_not_the_clock(
+        self,
+    ) -> None:
         from datetime import timedelta
 
         from ctrlrelay.core.scheduler import current_due_time, make_scheduler
@@ -309,9 +311,36 @@ class TestTheSchedulerSaysWhichRun:
             this_fire = planned.next_run_time
             # The scheduler submits this fire and moves on to the next ...
             planned.modify(next_run_time=this_fire + timedelta(minutes=1))
-            # ... and the run itself starts 59 seconds late.
+            # ... and the run itself starts whenever it starts: the clock is
+            # not read at all, so how late does not matter.
             await planned.func()
         finally:
             await sched.shutdown()
         assert seen == [this_fire]
         assert current_due_time() is None  # nothing leaks out of the run
+
+
+    @pytest.mark.asyncio
+    async def test_a_repeated_daylight_saving_hour_names_the_right_fire(self) -> None:
+        from zoneinfo import ZoneInfo
+
+        from ctrlrelay.core.scheduler import current_due_time, make_scheduler
+
+        tz = ZoneInfo("America/New_York")
+        seen = []
+
+        async def job() -> None:
+            seen.append(current_due_time())
+
+        sched = make_scheduler("America/New_York")
+        sched.add_cron_job(name="every-minute", cron_expr="* * * * *", func=job)
+        sched.start()
+        try:
+            planned = sched._impl.get_job("every-minute")
+            # 01:00 happens twice there on 2026-11-01. The next fire is the
+            # second 01:00 (EST); the run before it is the first 01:59 (EDT).
+            planned.modify(next_run_time=datetime(2026, 11, 1, 1, 0, tzinfo=tz, fold=1))
+            await planned.func()
+        finally:
+            await sched.shutdown()
+        assert seen[0].astimezone(UTC) == datetime(2026, 11, 1, 5, 59, tzinfo=UTC)

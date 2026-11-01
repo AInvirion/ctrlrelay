@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.combining import OrTrigger
@@ -251,9 +251,11 @@ class Scheduler:
             try:
                 job = self._impl.get_job(name)
                 if job is not None and job.next_run_time is not None:
+                    # In UTC: a second before a local time can land in the
+                    # wrong half of a repeated daylight-saving hour.
                     _due = last_fire_time(
                         cron_expr, self._impl.timezone,
-                        job.next_run_time - timedelta(seconds=1),
+                        job.next_run_time.astimezone(UTC) - timedelta(seconds=1),
                     )
             except Exception:
                 _due = None

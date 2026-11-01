@@ -37,9 +37,9 @@ from ctrlrelay.core.obs import get_logger, log_event
 _logger = get_logger("core.job_claims")
 
 REF_PREFIX = "refs/ctrlrelay/claims"
-# Claims older than this are deleted. A sweep that is still running a week
-# after it was due would lose its claim to the prune; sweeps take minutes
-# to hours, so 30 days leaves a wide margin.
+# Claims older than this are deleted. A sweep still running 30 days after
+# it was due would lose its claim to the prune; sweeps take minutes to
+# hours, so that is far outside any real run.
 KEEP_DAYS = 30
 _WINDOW_FORMAT = "%Y%m%dT%H%MZ"
 
