@@ -197,8 +197,11 @@ DEFAULT_SANDBOX_HIDE_PATHS: tuple[str, ...] = (
 )
 
 # Writable inside the sandbox besides the run's own paths (#236): the
-# agent CLI keeps its login, session logs and history here.
-DEFAULT_SANDBOX_WRITABLE_PATHS: tuple[str, ...] = ("~/.claude",)
+# agent CLI keeps its login, session logs and history here. ``/*`` opens
+# what is in the directory now, one level, and not the directory itself:
+# the agent cannot add, remove or replace entries there, so a link such as
+# ``settings.json -> elsewhere`` cannot be swapped for a file of its own.
+DEFAULT_SANDBOX_WRITABLE_PATHS: tuple[str, ...] = ("~/.claude/*",)
 
 # Read-only again inside a writable path: what the operator's own agent
 # sessions load and run (settings with hooks, plugins, skills, agents),
@@ -282,11 +285,12 @@ def bwrap_prefix(
         "--tmpfs", "/tmp", "--unshare-pid", "--die-with-parent",
     ]
     open_dirs: list[Path] = []
-    for raw in writable:
+    for raw in _expand_globs(writable, dirs_only=False):
         p = _existing(raw)
         if p is not None:
             argv += ["--bind", str(p), str(p)]
-            open_dirs.append(p)
+            if p.is_dir():
+                open_dirs.append(p)
     for raw in _expand_globs(readonly):
         p = _existing(raw)
         if p is None:
@@ -316,9 +320,12 @@ def bwrap_prefix(
     return argv
 
 
-def _expand_globs(paths: Sequence[str | Path]) -> list[str | Path]:
-    """Each path with a ``*`` part replaced by one path per directory
-    that part matches now, the rest of the path kept after it."""
+def _expand_globs(
+    paths: Sequence[str | Path], *, dirs_only: bool = True,
+) -> list[str | Path]:
+    """Each path with a ``*`` part replaced by one path per entry that part
+    matches now (directories only, unless ``dirs_only`` is false; never a
+    symlink), the rest of the path kept after it. Hidden names match."""
     out: list[str | Path] = []
     for raw in paths:
         text = os.path.expanduser(str(raw))
@@ -330,8 +337,9 @@ def _expand_globs(paths: Sequence[str | Path]) -> list[str | Path]:
         head = Path(*parts[: star + 1])
         rest = parts[star + 1:]
         for match in sorted(head.parent.glob(head.name)):
-            if match.is_dir() and not match.is_symlink():
-                out.append(match.joinpath(*rest))
+            if match.is_symlink() or (dirs_only and not match.is_dir()):
+                continue
+            out.append(match.joinpath(*rest))
     return out
 
 

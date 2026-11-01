@@ -245,16 +245,6 @@ class ClaudeDispatcher:
             )
         state_file.parent.mkdir(parents=True, exist_ok=True)
         env.update(agent_cache_env(cache_dir))
-        # A writable directory that does not exist yet would stay on the
-        # read-only root, and the agent CLI could not create its state.
-        for raw in self.sandbox_writable_paths:
-            p = Path(os.path.expanduser(raw))
-            if not p.exists() and not p.is_symlink() and not p.suffix:
-                try:
-                    p.mkdir(parents=True)
-                except OSError:
-                    pass  # left read-only; the agent CLI says what it lacks
-
         dot_git = working_dir / ".git"
         repo_dirs = git_dirs(working_dir)
         if not repo_dirs:

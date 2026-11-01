@@ -70,6 +70,8 @@ try write_bashrc "echo planted >> $HOME/.bashrc"
 try write_local_bin "touch $HOME/.local/bin/planted"
 try write_settings "echo planted >> $HOME/.claude/settings.json"
 try create_local_settings "echo planted > $HOME/.claude/settings.local.json"
+try swap_linked_entry "rm $HOME/.claude/CLAUDE.md; echo planted > $HOME/.claude/CLAUDE.md"
+try new_top_level_file "touch $HOME/.claude/hooks.json"
 try create_git_hook "mkdir -p $GITCOMMON/hooks && touch $GITCOMMON/hooks/post-checkout"
 try hardlink_settings "ln $HOME/.claude/settings.json ./hl"
 try hardlink_git_config "ln $GITCOMMON/config ./hl2"
@@ -105,6 +107,9 @@ def home(monkeypatch):
     (h / ".claude" / "projects" / "-other" / "memory" / "MEMORY.md").write_text("mine\n")
     (h / ".claude" / "projects" / "-bare").mkdir()
     (h / ".claude" / "settings.json").write_text("{}")
+    (base / "shared").mkdir()
+    (base / "shared" / "CLAUDE.md").write_text("shared\n")
+    (h / ".claude" / "CLAUDE.md").symlink_to(base / "shared" / "CLAUDE.md")
     monkeypatch.setenv("HOME", str(h))
     yield base
     shutil.rmtree(base, ignore_errors=True)
@@ -161,6 +166,8 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         "write_local_bin": "no",
         "write_settings": "no",
         "create_local_settings": "no",
+        "swap_linked_entry": "no",
+        "new_top_level_file": "no",
         "create_git_hook": "no",
         "hardlink_settings": "no",
         "hardlink_git_config": "no",
@@ -180,7 +187,9 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
     assert (h / ".claude" / "settings.json").read_text() == "{}"
     assert not (h / ".local" / "bin" / "planted").exists()
     assert not (bare / "hooks" / "pre-push").exists()
-    assert (h / ".claude" / "settings.local.json").read_text() == "{}\n"
+    assert not (h / ".claude" / "settings.local.json").exists()
+    assert (h / ".claude" / "CLAUDE.md").is_symlink()
+    assert (home / "shared" / "CLAUDE.md").read_text() == "shared\n"
     assert (home / "agent-cache" / "uv" / "x").exists()
     assert _git("log", "-1", "--format=%s", "run", cwd=bare) == "change"
     assert (wt / ".git").read_text().startswith("gitdir: ")
@@ -342,23 +351,6 @@ def test_a_worktree_whose_git_directory_cannot_be_found_is_refused(
     )
     with pytest.raises(SandboxUnavailableError, match="git directories"):
         d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)
-
-
-def test_a_missing_agent_state_dir_is_made_writable(tmp_path, monkeypatch) -> None:
-    if BWRAP is None:
-        pytest.skip("bwrap not installed")
-    from ctrlrelay.core.dispatcher import ClaudeDispatcher
-
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    wt = tmp_path / "wt"
-    _git("init", "-q", str(wt), cwd=tmp_path)
-    d = ClaudeDispatcher(
-        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
-        sandbox_cache_dir=str(tmp_path / "c"), sandbox_readonly_paths=(),
-    )
-    argv = d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)
-    state = str(tmp_path / "home" / ".claude")
-    assert ["--bind", state, state] == argv[argv.index(state) - 1: argv.index(state) + 2]
 
 
 def test_a_cache_dir_that_contains_home_is_refused(tmp_path, monkeypatch) -> None:
