@@ -414,6 +414,29 @@ class TestRoundTwoFixes:
 
 
 class TestRoundThreeFixes:
+    def test_the_answer_and_the_end_of_its_read_are_one_step(self) -> None:
+        reader = PeerReader(["http://b"], interval_s=60, timeout_s=1, silent_after=300,
+                            fetch=lambda url, *, timeout: _status("node-b", beat=time.time()))
+        token = object()
+        reader._in_flight["http://b"] = (time.time(), token)
+        seen = []
+        real = reader._lock
+
+        class Spy:
+            def __enter__(self):
+                real.acquire()
+
+            def __exit__(self, *a):
+                # After every locked step: an answer is never visible
+                # while its read still counts as running.
+                if reader._entries.get("http://b", {}).get("reachable"):
+                    seen.append("http://b" in reader._in_flight)
+                real.release()
+
+        reader._lock = Spy()
+        reader._read("http://b", token)
+        assert seen and not any(seen)
+
     def test_a_timeout_never_lands_on_an_answer_that_arrived(self) -> None:
         reader = PeerReader(["http://b"], interval_s=60, timeout_s=1, silent_after=300,
                             fetch=lambda url, *, timeout: _status("node-b", beat=time.time()))

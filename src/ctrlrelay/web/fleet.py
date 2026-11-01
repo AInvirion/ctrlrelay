@@ -354,6 +354,7 @@ class PeerReader:
         error: str | None,
         *,
         only_if_running: object | None = None,
+        finishing: object | None = None,
     ) -> None:
         """Record one peer's entry. With ``only_if_running``, only while
         that read is still unfinished: a "timeout" must never land on top
@@ -372,21 +373,22 @@ class PeerReader:
                 silent_after=self._silent_after,
             )
         with self._lock:
+            running = self._in_flight.get(url)
             if only_if_running is not None:
-                running = self._in_flight.get(url)
                 if running is None or running[1] is not only_if_running:
                     return
             self._entries[url] = entry
+            # The answer and "this read is done" in one step, so a deadline
+            # can never see an answered read as still running.
+            if finishing is not None and running is not None and running[1] is finishing:
+                del self._in_flight[url]
 
     def _read(self, url: str, token: object) -> None:
         try:
             data, error = self._fetch(url, timeout=self._timeout), None
         except Exception as exc:
             data, error = None, _peer_error(exc)
-        self._publish(url, data, error)
-        with self._lock:
-            if self._in_flight.get(url, (0, None))[1] is token:
-                del self._in_flight[url]
+        self._publish(url, data, error, finishing=token)
 
     def read_once(self, wait: bool = True) -> None:
         """Start a read of every peer not already being read, and report

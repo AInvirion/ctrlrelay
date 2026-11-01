@@ -394,7 +394,7 @@ fleet:
 | `peers` | list of URLs | `[]` | Each peer's status page. The web server reads each one's `/api/status` itself, so the browser needs no access to them. **Each peer must accept the name this machine uses for it**: add that name to the peer's `web.allowed_hosts`, or it answers HTTP 421 and shows here as "not reachable from here: bad host header". Its `web.host` must also listen on an address this machine can reach. |
 | `check_seconds` | int (>= 10) | `60` | How often each peer is read. |
 | `timeout_seconds` | number (0-60] | `5` | How long one read may take. |
-| `silent_after_seconds` | int (>= 60) | `300` | A machine whose daemon heartbeat is older than this is shown as **silent**: its web server answers, its poller is not working. |
+| `silent_after_seconds` | int (>= 60) | `300` | A machine whose daemon heartbeat is older than this is shown as **silent**: its web server answers, but the daemon's heartbeat is missing or old, so its poller cannot be confirmed to be working. |
 | `account_label` | string | unset | A name for this machine's agent subscription, shown on its card, such as `max-2`. Never an email address (refused). |
 
 ## repos
