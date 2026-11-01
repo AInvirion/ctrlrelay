@@ -26,6 +26,10 @@ from ctrlrelay.core.usage import UsageGate, UsageStore, probe_usage
 from ctrlrelay.transports.base import Transport
 
 _logger = get_logger("cli")
+# When this process started: a claim under this machine's name written
+# after it, on an issue this process is not running, is another process's
+# (#250).
+PROCESS_STARTED_AT = time.time()
 
 # Startup probe cap. `GitHubCLI` uses 60s for ordinary calls; this one
 # gates daemon startup, so a hung gh must not wedge it indefinitely.
@@ -1068,22 +1072,34 @@ def claim_settings(config, account: str):
     )
 
 
-async def peek_claim_owner(github, repo: str, issue_number: int, settings):
+async def peek_claim_owner(
+    github, repo: str, issue_number: int, settings, on_duplicate=None,
+):
     """Another machine's live claim on the issue, or ``None``.
 
     A cheap look before the "new issue" chat line, so a machine does not
     announce issues it is about to skip. It is not the decision: the run
     takes the claim with the race check either way, so a failed look
     only costs the early exit.
+
+    The same read shows whether another process is refreshing claims
+    under this machine's name (#250); ``on_duplicate(repo, issue_number)``
+    is called when it is.
     """
     import time as _time
 
     from ctrlrelay.core.claims import other_owner
+    from ctrlrelay.core.node_check import claim_refreshed_by_another
     try:
         comments = await github.list_issue_comments(repo, issue_number)
     except Exception:
         return None
-    return other_owner(comments, settings, _time.time())
+    now = _time.time()
+    if on_duplicate is not None and claim_refreshed_by_another(
+        comments, settings, started_at=PROCESS_STARTED_AT,
+    ):
+        on_duplicate(repo, issue_number)
+    return other_owner(comments, settings, now)
 
 
 def settle_claimed_elsewhere(
@@ -2033,7 +2049,53 @@ def bridge_test(
         raise typer.Exit(1)
 
 
-# Run subcommand group
+node_app = typer.Typer(help="This machine's setup (#250).")
+app.add_typer(node_app, name="node")
+
+
+@node_app.command("check")
+def node_check(
+    config_path: str | None = typer.Option(
+        None, "--config", "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+    no_agent: bool = typer.Option(
+        False, "--no-agent",
+        help="Skip the agent login check (it makes one tiny call on the subscription).",
+    ),
+) -> None:
+    """Check this machine's setup: node id, GitHub login, agent login, peers."""
+    from ctrlrelay.core.dispatcher import _find_claude
+    from ctrlrelay.core.github import GitHubCLI
+    from ctrlrelay.core.node_check import run_checks
+    from ctrlrelay.core.usage import UsageStore, probe_usage
+    from ctrlrelay.web.fleet import fetch_peer
+
+    path = _resolve_config_or_exit(config_path)
+    try:
+        config = load_config(path)
+    except ConfigError as e:
+        console.print(f"[red]✗ config:[/red] {e}")
+        raise typer.Exit(1)
+
+    github = GitHubCLI()
+
+    async def probe():
+        # Found only when the check runs: --no-agent must not depend on it.
+        binary = config.agent.binary if config.agent.binary != "claude" else _find_claude()
+        return await probe_usage(binary, UsageStore.beside(config.paths.state_db))
+
+    checks = asyncio.run(run_checks(
+        config, github_login=github.get_login,
+        agent_probe=None if no_agent else probe, fetch=fetch_peer,
+    ))
+    for c in checks:
+        mark = "[green]✓[/green]" if c.ok else ("[dim]–[/dim]" if c.ok is None else "[red]✗[/red]")
+        console.print(f"{mark} {c.name}: {c.detail}")
+    if any(c.ok is False for c in checks):
+        raise typer.Exit(1)
+
+
 run_app = typer.Typer(help="Pipeline execution commands.")
 app.add_typer(run_app, name="run")
 
@@ -2895,6 +2957,43 @@ def poller_start(
             await watch_transport.connect()
             return watch_transport
 
+        # #250: another process using this machine's node_id. Logged each
+        # time it is seen; said in chat and on the console once per run.
+        duplicate_warned: list[bool] = []
+        # Held so the one chat notice is not dropped by the loop's weak
+        # reference to it before it is sent.
+        _notice_tasks: set[asyncio.Task] = set()
+
+        def _duplicate_name(where: str, number: int | None = None) -> None:
+            text = (
+                f"⚠️ Another ctrlrelay process is using this machine's "
+                f"node_id {config.node_id!r} ("
+                + (f"it is refreshing a claim on {where}#{number}" if number
+                   else f"{where} answers with this name")
+                + "). Claims, chat and the status page will mix the two up. "
+                "If it is another machine, give each machine its own node_id "
+                "(docs/adding-a-machine.md); if it is a second process on "
+                "this machine, such as a `ctrlrelay run` by hand, this is "
+                "expected while it runs."
+            )
+            log_event(_logger, "node.duplicate_name", node=config.node_id,
+                      where=where, issue_number=number)
+            if duplicate_warned:
+                return
+            duplicate_warned.append(True)
+            console.print(f"[red]{text}[/red]")
+
+            async def send() -> None:
+                try:
+                    await _chat_notice(text)
+                except Exception as e:
+                    log_event(_logger, "node.duplicate_notice_failed",
+                              error=f"{type(e).__name__}: {str(e)[:200]}")
+
+            task = asyncio.get_running_loop().create_task(send())
+            _notice_tasks.add(task)
+            task.add_done_callback(_notice_tasks.discard)
+
         async def handle_issue(repo: str, issue: dict) -> None:
             issue_number = issue["number"]
             title = issue.get("title", "")
@@ -2912,7 +3011,9 @@ def poller_start(
                 console.print(f"[yellow]{deferred}[/yellow]")
                 return
 
-            owner = await peek_claim_owner(github, repo, issue_number, claims)
+            owner = await peek_claim_owner(
+                github, repo, issue_number, claims, on_duplicate=_duplicate_name,
+            )
             if owner is not None:
                 skipped = settle_claimed_elsewhere(
                     poller, repo, issue_number, owner.node,
@@ -3812,6 +3913,22 @@ def poller_start(
             heartbeat = Heartbeat.beside(config.paths.state_db)
             heartbeat_task = asyncio.create_task(heartbeat.run())
 
+            # #250: a peer that answers with this machine's name. Checked
+            # once, in the background, so a slow peer cannot hold startup.
+            async def _check_peers_for_my_name() -> None:
+                from ctrlrelay.core.node_check import peers_with_my_name
+                from ctrlrelay.web.fleet import fetch_peer
+                try:
+                    for url in await peers_with_my_name(
+                        config.node_id, list(config.fleet.peers),
+                        fetch=fetch_peer, timeout=config.fleet.timeout_seconds,
+                    ):
+                        _duplicate_name(url)
+                except Exception as e:
+                    log_event(_logger, "node.peer_check_failed", error=str(e)[:200])
+
+            peer_check_task = asyncio.create_task(_check_peers_for_my_name())
+
             # Now the slow startup: first-run seeding (one gh call per
             # repo). Done inside _main so the scheduler is already up.
             if first_run:
@@ -3908,6 +4025,7 @@ def poller_start(
                 )
             finally:
                 heartbeat_task.cancel()
+                peer_check_task.cancel()
                 # Scheduler shutdown is async so it can cancel + await any
                 # in-flight job tasks (e.g. a scheduled secops sweep that was
                 # running when SIGTERM arrived). Without awaiting here the

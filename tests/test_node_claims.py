@@ -319,6 +319,31 @@ class TestAcquire:
         assert not out.won and out.owner.node == "unknown"
 
 
+class TestClaimsThisProcessMade:
+    @pytest.mark.asyncio
+    async def test_a_posted_claim_and_an_adopted_one_carry_this_processes_run(
+        self,
+    ) -> None:
+        from ctrlrelay.core.claims import PROCESS_RUN, parse_claims
+
+        clock = Clock()
+        thread = Thread(clock)
+        thread.add(claim_body("node-a", "before-restart", WORKING, clock(), run="earlier"))
+        out = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        assert out.claim.claim_id == "before-restart"
+        [adopted] = parse_claims(thread.comments, ACCOUNT)
+        assert adopted.run == PROCESS_RUN
+
+        fresh = Thread(clock)
+        out = await acquire_claim(
+            fresh, REPO, 2, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        assert out.won
+        assert parse_claims(fresh.comments, ACCOUNT)[0].run == PROCESS_RUN
+
+
 class TestTheRaceCheckFailsClosed:
     @pytest.mark.asyncio
     async def test_a_read_back_that_does_not_show_our_claim_is_not_a_win(self) -> None:

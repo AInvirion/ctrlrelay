@@ -825,6 +825,15 @@ class FleetConfig(BaseModel):
         return v
 
 
+# node_id values that cannot tell machines apart (#250): placeholder and
+# container hostnames, examples from earlier docs, and the owner name of
+# claims from before #245.
+PLACEHOLDER_NODE_IDS = frozenset({
+    "unknown", "localhost", "localhost.localdomain", "my-laptop",
+    "studio-mac", "changeme", "example", "node", "hostname",
+})
+
+
 class Config(BaseModel):
     """Root configuration model for ctrlrelay orchestrator."""
 
@@ -844,6 +853,26 @@ class Config(BaseModel):
     fleet: FleetConfig = Field(default_factory=FleetConfig)
     personalization: Personalization | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
+
+    @field_validator("node_id")
+    @classmethod
+    def node_id_names_this_machine(cls, v: str) -> str:
+        """Refuse a ``node_id`` that cannot tell machines apart (#250).
+
+        Claims, chat tags and the status page name the machine by it, so
+        two machines with the same one look like one. The hostname default
+        is fine (it differs per machine); a copied example, ``localhost``
+        (a container's hostname), or ``unknown`` (reserved for claims from
+        older versions) is not.
+        """
+        name = v.strip()
+        if name.lower() in PLACEHOLDER_NODE_IDS:
+            raise ValueError(
+                f"node_id {v!r} does not name this machine: set node_id in "
+                "orchestrator.yaml to a name no other ctrlrelay machine on "
+                "this account uses (see docs/adding-a-machine.md)"
+            )
+        return name
 
     @model_validator(mode="before")
     @classmethod
