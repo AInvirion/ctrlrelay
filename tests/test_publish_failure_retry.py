@@ -383,16 +383,38 @@ class TestReviewFixes:
         assert "could not be posted on the issue" in message
 
     @pytest.mark.asyncio
-    async def test_the_issue_is_unmarked_before_the_count_is_saved(
+    async def test_the_count_and_the_unmark_are_one_state_write(
         self, tmp_path: Path,
     ) -> None:
-        """A stop between the two saves costs one extra try, never a
-        stranded issue."""
+        """No stop can leave the count saved and the issue still seen, or
+        the reverse."""
         poller = _poller(tmp_path / "state.json")
-        order: list[str] = []
-        real_unmark, real_record = poller.unmark_seen, poller.record_publish_failure
-        poller.unmark_seen = lambda r, n: (order.append("unmark"), real_unmark(r, n))[1]
-        poller.record_publish_failure = lambda r, n: (order.append("count"), real_record(r, n))[1]
         poller.mark_seen(REPO, 7)
+        saves: list[tuple[int, bool]] = []
+        real_save = poller._save_state_best_effort
+
+        def save() -> None:
+            saves.append((
+                poller.publish_failures.get(REPO, {}).get(7, 0),
+                7 in poller.seen_issues.get(REPO, set()),
+            ))
+            real_save()
+
+        poller._save_state_best_effort = save
         await settle_publish_failure(AsyncMock(), poller, REPO, 7, _publish_failed())
-        assert order == ["unmark", "count"]
+        assert saves == [(1, False)]
+
+
+    @pytest.mark.parametrize("pr_number", [None, 12])
+    def test_the_retraction_promises_only_what_a_running_poller_does(
+        self, pr_number,
+    ) -> None:
+        from ctrlrelay.pipelines.dev import claim_failure_comment
+
+        body = claim_failure_comment(
+            "s", reason="publish failed", exit_code=0, pr_number=pr_number,
+            will_retry=True,
+        )
+        assert "When the relay's poller is running" in body
+        assert "says here if it stops" in body
+        assert "Nothing is needed from you" not in body

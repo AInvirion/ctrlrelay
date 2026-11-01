@@ -838,6 +838,21 @@ class IssuePoller:
         """How many publish failures are counted for ``issue_number``."""
         return self.publish_failures.get(repo, {}).get(issue_number, 0)
 
+    def count_publish_failure(
+        self, repo: str, issue_number: int, *, unmark: bool,
+    ) -> int:
+        """Count one publish failure and, when ``unmark``, take the issue
+        out of the seen-set, in ONE state write, so a stop between the two
+        cannot leave them disagreeing (#268). Returns the new count."""
+        counts = self.publish_failures.setdefault(repo, {})
+        counts[issue_number] = counts.get(issue_number, 0) + 1
+        if unmark:
+            seen = self.seen_issues.get(repo)
+            if seen:
+                seen.discard(issue_number)
+        self._save_state_best_effort()
+        return counts[issue_number]
+
     def record_publish_failure(self, repo: str, issue_number: int) -> int:
         """Count one run of ``issue_number`` whose agent finished but
         whose branch the relay could not publish, and return how many

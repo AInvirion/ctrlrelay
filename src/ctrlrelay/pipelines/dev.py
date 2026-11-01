@@ -352,8 +352,9 @@ def claim_failure_comment(
             "This supersedes any claim above."
         )
         next_step = (
-            f"The relay will try this issue again on its next poll and "
-            f"push to PR #{pr_number} then. Nothing is needed from you."
+            f"When the relay's poller is running, it tries this issue "
+            f"again on its next poll and pushes to PR #{pr_number} then, "
+            "a limited number of times, and says here if it stops."
             if will_retry else
             f"Review PR #{pr_number} on its own merits — it is not "
             "waiting on anything from this relay."
@@ -365,8 +366,9 @@ def claim_failure_comment(
             "working on this issue."
         )
         next_step = (
-            "The relay will pick this issue up again on its next poll and "
-            "start a fresh run. Nothing is needed from you."
+            "When the relay's poller is running, it picks this issue up "
+            "again on its next poll and starts a fresh run, a limited "
+            "number of times, and says here if it stops."
             if will_retry else
             f"This issue is free to pick up. {MANUAL_RETRY_ROUTE}"
         )

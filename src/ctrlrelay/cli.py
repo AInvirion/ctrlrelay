@@ -1258,13 +1258,10 @@ async def settle_publish_failure(
             f"the branch, so it is not retrying. {result.error or ''}".strip()
         )
 
-    # Un-marked before the count is saved: a stop between the two saves
-    # then costs one extra try rather than a stranded issue.
+    # The count and the un-mark are saved together, in one write.
     attempts = poller.publish_failure_count(repo, issue_number) + 1
     retrying = attempts < PUBLISH_ATTEMPTS
-    if retrying:
-        poller.unmark_seen(repo, issue_number)
-    poller.record_publish_failure(repo, issue_number)
+    poller.count_publish_failure(repo, issue_number, unmark=retrying)
     notice_failed = False
     if not retrying:
         poller.clear_publish_failures(repo, issue_number)
