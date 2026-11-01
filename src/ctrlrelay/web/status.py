@@ -828,8 +828,8 @@ def _read_day_events(
 
 def _reason(row: dict[str, Any], detail: Any) -> dict[str, Any]:
     """Why a run failed or stopped, from what the relay stored: the exit
-    code, its summary and output tail (both scrubbed again here), and the
-    question asked. ``session`` says when the run's row is gone."""
+    code, its summary and output tail, and the question asked, each
+    scrubbed of credential shapes again here. ``session`` says when the run's row is gone."""
     from ctrlrelay.core.redact import redact_secrets, tail
 
     detail = detail if isinstance(detail, dict) else {}
@@ -849,7 +849,10 @@ def _reason(row: dict[str, Any], detail: Any) -> dict[str, Any]:
             tail(redact_secrets(output), REASON_TAIL_CHARS)
             if isinstance(output, str) and output else None
         ),
-        "question": question if isinstance(question, str) and question else None,
+        "question": (
+            redact_secrets(question)[:REASON_SUMMARY_CHARS]
+            if isinstance(question, str) and question else None
+        ),
     }
     if row.get("s_id") is None:
         reason["session"] = "not found"

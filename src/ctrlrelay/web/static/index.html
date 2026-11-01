@@ -851,6 +851,9 @@ function renderUsage(data, now) {
 // differs only for messages.
 var TODAY_KIND = { messages_sent: "message_sent" };
 var todayOpen = null;
+// Each list request is numbered; only the newest one may draw, so a slow
+// answer for an earlier refresh or another counter never replaces a newer one.
+var todaySeq = 0;
 
 function renderToday(data) {
   var target = document.getElementById("today");
@@ -869,6 +872,7 @@ function renderToday(data) {
     cell.addEventListener("click", function () {
       todayOpen = todayOpen === kind ? null : kind;
       renderToday(lastData || data);
+      if (todayOpen) { put(document.getElementById("today-list"), [empty("loading…")]); }
       loadTodayList();
     });
     grid.appendChild(cell);
@@ -881,12 +885,13 @@ function renderToday(data) {
 function loadTodayList() {
   var target = document.getElementById("today-list");
   var kind = todayOpen;
+  var seq = ++todaySeq;
   if (!kind) { put(target, []); return; }
   fetch("/api/events?kind=" + encodeURIComponent(kind) + "&day=today", { cache: "no-store" })
     .then(function (resp) { return resp.json(); })
-    .then(function (data) { if (todayOpen === kind) { renderTodayList(data); } })
+    .then(function (data) { if (seq === todaySeq) { renderTodayList(data); } })
     .catch(function (err) {
-      if (todayOpen === kind) {
+      if (seq === todaySeq) {
         put(target, [unknown("unknown: the list could not be read (" +
           (err && err.message ? err.message : "error") + ")")]);
       }

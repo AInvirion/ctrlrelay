@@ -1178,24 +1178,31 @@ def test_a_question_that_is_not_text_renders_as_no_text(question: object) -> Non
 def _today_db(tmp_path: Path) -> Path:
     import sqlite3
 
+    from ctrlrelay.web.status import _local_day
+
     now = int(time.time())
+    # Placed by the local day, not by "now minus a minute", so a run just
+    # after midnight does not put them in yesterday.
+    start, _end = _local_day(now)
+    at = start + 3_600
     db = StateDB(tmp_path / "state.db")
     db.record_event("failed", repo=ALPHA, issue_number=215, session_id="s-fail",
-                    detail={"pipeline": "dev", "exit_code": 1, "question": None}, ts=now - 60)
+                    detail={"pipeline": "dev", "exit_code": 1, "question": None}, ts=at)
     db.record_event("failed", repo=ALPHA, issue_number=216, session_id="s-gone",
-                    detail={"pipeline": "dev", "exit_code": None, "question": None}, ts=now - 30)
+                    detail={"pipeline": "dev", "exit_code": None, "question": None}, ts=at + 30)
     db.record_event("blocked", repo=ALPHA, issue_number=217, session_id="s-q",
-                    detail={"pipeline": "dev", "exit_code": None, "question": "Merge or leave?"},
-                    ts=now - 20)
-    db.record_event("merged", repo=ALPHA, issue_number=218, detail={"pr_number": 9}, ts=now - 10)
-    # Yesterday's failure is not today's.
-    db.record_event("failed", repo=ALPHA, issue_number=1, ts=now - 3 * 86_400)
+                    detail={"pipeline": "dev", "exit_code": None,
+                            "question": "Merge or leave? token=ghp_" + "b" * 36},
+                    ts=at + 40)
+    db.record_event("merged", repo=ALPHA, issue_number=218, detail={"pr_number": 9}, ts=at + 50)
+    # A failure on the day before is not today's.
+    db.record_event("failed", repo=ALPHA, issue_number=1, ts=start - 3_600)
     db.close()
     conn = sqlite3.connect(tmp_path / "state.db")
     conn.execute(
         "INSERT INTO sessions (id, pipeline, repo, issue_number, status, started_at, "
         "claude_exit_code, summary, output_tail) VALUES (?,?,?,?,?,?,?,?,?)",
-        ("s-fail", "dev", ALPHA, 215, "failed", now - 120, 1,
+        ("s-fail", "dev", ALPHA, 215, "failed", at - 60, 1,
          "Error: push refused token=ghp_" + "a" * 36, "x" * 3000 + "\nTraceback: boom"),
     )
     conn.commit()
@@ -1235,7 +1242,8 @@ def test_api_events_kind_blocked_carries_the_question_and_merged_the_pr(
     srv = serve(config, _tracker(config, tmp_path))
 
     _, blocked = srv.json("/api/events?kind=blocked&day=today")
-    assert blocked["events"][0]["reason"]["question"] == "Merge or leave?"
+    question = blocked["events"][0]["reason"]["question"]
+    assert question.startswith("Merge or leave?") and "ghp_" not in question
     _, merged = srv.json("/api/events?kind=merged&day=today")
     assert merged["events"][0]["url"].endswith(f"/{ALPHA}/pull/9")
 
@@ -1279,3 +1287,6 @@ def test_every_today_counter_asks_for_a_kind_the_server_lists() -> None:
     # The cards are buttons that open the list.
     render = _js_function(script, "renderToday")
     assert 'el("button", "card")' in render and "loadTodayList()" in render
+    # Only the newest list request may draw.
+    load = _js_function(script, "loadTodayList")
+    assert load.count("seq === todaySeq") == 2 and "++todaySeq" in load
