@@ -26,8 +26,8 @@ isolated git worktree, opens a PR, and asks you on Telegram when it gets stuck.
   write your first config, run the dev pipeline against an issue.
 - **[Configuration]({{ '/configuration/' | relative_url }})** — every key in
   `orchestrator.yaml`, with defaults and what they actually do.
-- **[Telegram bridge]({{ '/bridge/' | relative_url }})** — BotFather walkthrough,
-  starting the bridge, troubleshooting Telegram delivery.
+- **[Chat bridge]({{ '/bridge/' | relative_url }})** — setting up Telegram or
+  Mattermost, starting the bridge, troubleshooting delivery.
 - **[Feedback loop]({{ '/feedback-loop/' | relative_url }})** — how
   `BLOCKED_NEEDS_INPUT` checkpoints reach you and how your reply resumes the
   paused Claude session.

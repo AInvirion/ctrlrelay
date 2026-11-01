@@ -27,7 +27,7 @@ ctrlrelay [--version] <command> ...
 | `ctrlrelay status` | Show active locks and the 5 most-recent sessions. |
 | `ctrlrelay config ...` | Configuration helpers. |
 | `ctrlrelay skills ...` | Skill discovery / audit. |
-| `ctrlrelay bridge ...` | Manage the Telegram bridge daemon. |
+| `ctrlrelay bridge ...` | Manage the chat bridge daemon (Telegram or Mattermost). |
 | `ctrlrelay run ...` | Run a pipeline interactively. |
 | `ctrlrelay ci ...` | CI helpers used by the dev pipeline prompt. |
 | `ctrlrelay poller ...` | Manage the issue-poller daemon. |
@@ -128,7 +128,7 @@ Lists discovered skills as a table (name, path).
 
 ## `ctrlrelay bridge`
 
-See [Telegram bridge]({{ '/bridge/' | relative_url }}) for the full setup walkthrough.
+See [Chat bridge]({{ '/bridge/' | relative_url }}) for the full setup walkthrough.
 
 ### `bridge start`
 

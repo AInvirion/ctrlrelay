@@ -302,7 +302,7 @@ transport:
 | Key | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `type` | enum | no | `"file_mock"` | One of `"telegram"`, `"mattermost"`, `"file_mock"`. |
-| `telegram` | object | required when `type=telegram` | — | Telegram bridge settings — see below. |
+| `telegram` | object | required when `type=telegram` | — | Telegram settings — see below. |
 | `mattermost` | object | required when `type=mattermost` | — | Mattermost bridge settings — see below. |
 | `file_mock` | object | required when `type=file_mock` | — | Local-file fake transport, used for tests/dev. |
 
@@ -321,7 +321,7 @@ reach anybody.
 | `question_ttl_seconds` | int | `172800` (48h) | How long an **unanswered** question stays routable before it is retired. Minimum `3600`. Without a ceiling those rows never die — a question whose PR was merged by hand weeks ago stays a live target for an orphan reply. The hourly `question_expiry_sweeper` also retires a question early once every issue/PR it cites is closed or merged. |
 | `question_retention_days` | int | `90` | How long a **finished** question (expired, or answered and resumed) is kept before the hourly sweeper deletes it. Minimum `1`. Open questions are never deleted. The kept history is what lets a re-asked question be marked as a repeat. |
 
-See [Telegram bridge]({{ '/bridge/' | relative_url }}) for the full setup walkthrough.
+See [Chat bridge]({{ '/bridge/' | relative_url }}) for the full setup walkthrough.
 
 ### transport.mattermost
 
