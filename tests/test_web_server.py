@@ -976,10 +976,13 @@ def test_every_href_goes_through_one_helper() -> None:
     assert not re.search(r"""setAttribute\(\s*["'](href|src|action|formaction)""", script)
     assert not re.search(r"""\[\s*["']href["']\s*\]""", script)
     # And the links are used: one call per section that links.
-    for renderer in ("runningCard", "renderNeeds", "renderWaiting", "renderSkipped",
-                     "renderFeed"):
+    # needCard builds every question card, this machine's and its peers'
+    # (#249); renderWho links the claimed issues.
+    for renderer in ("runningCard", "needCard", "renderWaiting", "renderSkipped",
+                     "renderFeed", "renderWho"):
         assert "ghLink(" in _js_function(script, renderer), renderer
-    assert "questionParts(" in _js_function(script, "renderNeeds")
+    assert "needCard(" in _js_function(script, "renderNeeds")
+    assert "questionParts(" in _js_function(script, "needCard")
 
 
 def test_no_server_value_reaches_html_parsing() -> None:

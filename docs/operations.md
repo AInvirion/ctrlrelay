@@ -299,6 +299,27 @@ search paths and `gh search` are `search`. The other `gh` commands (`issue`,
 held back; if GitHub refuses one as rate limited, the budget is read again at
 once.
 
+Added in #249:
+
+| Field | What |
+|---|---|
+| `node.version`, `node.account_label`, `node.chat` | This machine's version, its `fleet.account_label`, and its chat: `{transport, connected}` (`connected` is whether the bridge socket exists), or `null` with no chat configured. |
+| `node.state` | `working`, `idle`, `paused-limit` (paused for usage), `silent` (the daemon's heartbeat is missing or older than `fleet.silent_after_seconds`), or `unknown` (the state database could not be read). |
+| `node.slots` | `{total, busy}`. The daemon works one issue at a time, so `total` is 1. |
+| `node.claims` | What this machine holds: every running issue and every issue waiting for an answer, each `{repo, issue_number, kind, phase, since, url}`. `null` when the state database could not be read. |
+| `node.heartbeat_at`, `node.last_poll_at` | When the daemon last wrote its heartbeat (every 30 seconds, from its own task, so it moves while a run is going) and last polled GitHub. From `heartbeat.json` beside the state database. |
+| `node.open_questions` | How many questions are waiting for an answer. |
+| `fleet` | `{peers: [...]}` with one item per `fleet.peers` URL: `url`, `name`, `reachable`, `checked_at`, `error`, `state`, `node` (that peer's `node` block), `last_known` (its last block while it does not answer) and `needs_you`. `null` when no peers are configured. |
+
+**The page with peers.** A **Machines** strip shows one card per machine,
+this one first: state, slots, 5-hour and 7-day usage, heartbeat age. A card is
+red when the machine is paused, silent or not reachable. A peer that does not
+answer is shown as **not reachable from here**, with the reason (`timeout`,
+`refused`, `name not found`, `bad host header`, an HTTP status) and its last
+known numbers greyed out, never as idle. **Who has what** lists every claimed
+issue across the machines, and **Needs you** shows every machine's questions,
+each tagged with its machine. The rest of the page is this machine's own.
+
 **Pausing for usage.** Every agent run reports the subscription's usage, and
 an idle machine refreshes it with one tiny call every `usage.probe_minutes`.
 When the 5-hour or 7-day window reaches `usage.pause_at`, or the status is not
