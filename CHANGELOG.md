@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-01
+
+Fixes the chat bridge, which did not start on 0.16.0. **No config edit is
+required.** If you upgraded to 0.16.0, upgrade to this.
+
+### Fixed
+
+- `ctrlrelay bridge start` (what the bridge service runs) exited at startup
+  on 0.16.0 with `BridgeServer.__init__() missing 1 required keyword-only
+  argument: 'node'`, for Telegram and Mattermost alike, so chat questions
+  and answers stopped. It now passes the machine's name and the shared
+  setting, like `python -m ctrlrelay.bridge` (#265)
+
+### Changed
+
+- The bridge's systemd unit is described as "ctrlrelay chat bridge
+  (Telegram or Mattermost)", and the docs call it the chat bridge. An
+  installed unit keeps its old description until it is re-rendered (#266)
+
 ## [0.16.0] - 2026-11-01
 
 Several machines can now run ctrlrelay on one GitHub account, each claiming
@@ -1957,7 +1976,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.13.0...v0.14.0
