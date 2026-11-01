@@ -245,3 +245,29 @@ def test_a_missing_read_only_path_nothing_writable_reaches_is_left_alone(
 
     bwrap_prefix("/usr/bin/bwrap", [], writable=[], readonly=[tmp_path / "hooks"])
     assert not (tmp_path / "hooks").exists()
+
+
+def test_a_missing_read_only_path_under_a_symlinked_writable_dir_is_created(
+    tmp_path,
+) -> None:
+    from ctrlrelay.core.agent_env import bwrap_prefix
+
+    real = tmp_path / "real-claude"
+    real.mkdir()
+    link = tmp_path / "claude"
+    link.symlink_to(real)
+    argv = bwrap_prefix(
+        "/usr/bin/bwrap", [], writable=[link],
+        readonly=[link / "settings.local.json"],
+    )
+    made = real / "settings.local.json"
+    assert made.read_text() == "{}\n"
+    assert argv[-4:] == ["--ro-bind", str(made), str(made), "--"]
+
+
+def test_the_agent_caches_are_its_own(tmp_path) -> None:
+    from ctrlrelay.core.agent_env import agent_cache_env
+
+    env = agent_cache_env(tmp_path)
+    assert all(Path(v).is_relative_to(tmp_path) for v in env.values())
+    assert {"XDG_CACHE_HOME", "npm_config_cache", "GOMODCACHE", "CARGO_HOME"} <= set(env)

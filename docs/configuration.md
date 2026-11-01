@@ -174,10 +174,12 @@ login, does not):
   JSON file) so the agent cannot create it; if it cannot be created, the run
   does not start.
 
-Package caches (`XDG_CACHE_HOME`, `npm_config_cache`, `GOMODCACHE`) point at
-`sandbox_cache_dir`, the agent's own, never yours, so a run cannot poison a
-cache you build from. The first run of each project downloads its packages
-again.
+Package caches (`XDG_CACHE_HOME`, which covers pip and uv, `npm_config_cache`,
+`GOMODCACHE`, and `CARGO_HOME`) point at `sandbox_cache_dir`, the agent's own,
+never yours, so a run cannot poison a cache you build from. The first run of
+each project downloads its packages again. A tool that writes elsewhere in
+your home (Gradle's `~/.gradle`, for one) fails there until you add a
+directory for it to `sandbox_writable_paths`.
 
 What it still allows: the agent reads the agent CLI's login (it needs it to
 run) and anything readable that is not hidden; it writes objects and refs in
@@ -186,7 +188,11 @@ untrusted. A read-only path that is a symlink protects its target, not the
 link: the agent can replace the link. The dispatcher logs
 `dispatcher.sandbox.readonly_symlink` naming any; replace such a link with
 the file itself to protect it. The run's checkpoint file must be inside its
-worktree (it always is for dev and task runs).
+worktree (it always is for dev and task runs). It does not account for your
+own setup giving another way in: a hidden file with a second hard link
+elsewhere, your home mounted at a second path, or an `include.path` in a
+clone's git config pointing at a file the agent can write. ctrlrelay's own
+clones have none of these.
 
 **Setting it up.** Linux only. Install bubblewrap (`sudo apt install
 bubblewrap`), then check it runs as your user:

@@ -298,9 +298,12 @@ def bwrap_prefix(
         p = _existing(raw)
         if p is None:
             target = _expand(raw)
-            if target is None or not any(
-                target.is_relative_to(d) for d in open_dirs
-            ):
+            if target is None:
+                continue
+            # Spelled through the same links as the writable paths, which
+            # were resolved: ``~/.claude`` may itself be a symlink.
+            target = Path(os.path.realpath(target))
+            if not any(target.is_relative_to(d) for d in open_dirs):
                 continue  # nothing writable reaches it: it stays absent
             p = _create_readonly(target)
         argv += ["--ro-bind", str(p), str(p)]
@@ -364,4 +367,7 @@ def agent_cache_env(cache_dir: Path) -> dict[str, str]:
         "XDG_CACHE_HOME": str(cache_dir),
         "npm_config_cache": str(cache_dir / "npm"),
         "GOMODCACHE": str(cache_dir / "go-mod"),
+        # Cargo keeps its registry under CARGO_HOME; the toolchain itself
+        # is found through PATH and RUSTUP_HOME, which stay as they are.
+        "CARGO_HOME": str(cache_dir / "cargo"),
     }
