@@ -76,8 +76,9 @@ class TestWindow:
             now = datetime.strptime(at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
             return last_fire_time(cron, UTC, now).strftime("%m-%d %H:%M")
 
-        # A start a moment before the minute (clock skew) is that minute.
-        assert due("0 6 * * *", "2026-11-01 05:59:50") == "11-01 06:00"
+        # Fired on the minute, or seconds after it: that minute.
+        assert due("0 6 * * *", "2026-11-01 06:00:00") == "11-01 06:00"
+        assert due("* * * * *", "2026-11-01 06:00:35") == "11-01 06:00"
         # Hourly, asleep through 06:00 and 07:00: the scheduler coalesces
         # them into one run for 07:00, and that is the window named.
         assert due("0 * * * *", "2026-11-01 07:20:00") == "11-01 07:00"
@@ -213,7 +214,7 @@ class TestTheSweep:
 
 
 class TestALateRunKeepsItsWindow:
-    def test_a_run_an_hour_late_names_the_window_it_was_due_in(self, monkeypatch) -> None:
+    def test_a_run_55_minutes_late_names_the_window_it_was_due_in(self, monkeypatch) -> None:
         from datetime import datetime
 
         import ctrlrelay.cli as cli_mod

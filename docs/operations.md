@@ -511,8 +511,10 @@ was due, and names that window. A machine that dies holding a window loses only
 that window: the next one is a new ref. Refs older than 7 days are deleted by
 the next machine that claims.
 
-A machine claims a repo only once it holds that repo's local lock, so a
-claim is never won and then left unused. If a machine cannot create the ref
+A machine claims a repo only once it holds that repo's local lock, so it
+never wins a claim and then finds the repo busy on its own side. (A machine
+that dies right after claiming still leaves that window unswept; the next
+window runs.) If a machine cannot create the ref
 (GitHub down, no write access), it skips
 the repo for that window rather than risk a second sweep, and says so in the
 sweep results; the next window tries again. A sweep started by hand

@@ -338,22 +338,22 @@ def make_scheduler(timezone: str) -> Scheduler:
     return Scheduler(impl)
 
 
-def last_fire_time(
-    cron_expr: str, timezone, now: datetime, *, slack: timedelta = timedelta(seconds=30),
-) -> datetime | None:
-    """The latest time ``cron_expr`` was due at or before ``now + slack``;
-    ``None`` if it was not due in the last 40 days.
+def last_fire_time(cron_expr: str, timezone, now: datetime) -> datetime | None:
+    """The latest time ``cron_expr`` was due at or before ``now``; ``None``
+    if it was not due in the last 40 days.
 
-    This is the run the scheduler is executing (#246). It coalesces missed
-    runs into one, for the latest of them, and drops a run more than an
-    hour late; so a late start belongs to the latest due time, and every
-    machine works out the same one from the same rule. ``slack`` covers a
-    scheduler that fires a moment before the minute by this machine's
-    clock. Searched in growing spans, so an every-minute rule does not
-    walk 40 days of minutes.
+    This is the run the scheduler is executing (#246), read from this
+    machine's own clock, which is the clock the scheduler fired by (it
+    never fires before the due time). It coalesces missed runs into one,
+    for the latest of them, so a late start belongs to the latest due
+    time, and every machine works out the same one from the same rule.
+    It assumes a run starts before the rule is next due, which holds for
+    any schedule less frequent than the run takes to start. Searched in
+    growing spans, so an every-minute rule does not walk 40 days of
+    minutes.
     """
     trigger = _build_vixie_trigger(cron_expr, timezone)
-    limit = now + slack
+    limit = now
     for span in (timedelta(hours=2), timedelta(days=2), timedelta(days=40)):
         previous = None
         fire = trigger.get_next_fire_time(None, now - span)
