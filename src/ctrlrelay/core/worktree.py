@@ -166,7 +166,8 @@ def parse_push_rejection(porcelain_stdout: str) -> str | None:
         if not line.startswith("!"):
             continue
         if "\t" in raw:
-            fields = [f.strip() for f in raw.split("\t")]
+            # At most two splits: the summary keeps any tab inside it.
+            fields = [f.strip() for f in raw.split("\t", 2)]
             ref = fields[1] if len(fields) > 1 else ""
             summary = fields[2] if len(fields) > 2 else ""
             # Scrubbed before anything is cut (what the remote says can
@@ -205,11 +206,12 @@ class GitCommandError(WorktreeError):
 
 
 class PushRejectedError(WorktreeError):
-    """The remote refused the push, named with the reason it gave.
+    """Git rejected the push for a ref, named with the reason it gave.
 
-    Distinct from :class:`ctrlrelay.core.publish.PushRefusedError`,
-    which is the relay declining to push at all. This one is the
-    remote's answer, and ``reason`` is the ``!`` line from
+    Decided by git itself before the remote is asked (a stale lease, a
+    non-fast-forward) or by the remote (a protection rule). Distinct from
+    :class:`ctrlrelay.core.publish.PushRefusedError`, which is the relay
+    declining to push at all. ``reason`` is the ``!`` line from
     ``push --porcelain`` so a caller can log it as its own field
     instead of parsing it back out of the message.
     """
@@ -1287,9 +1289,11 @@ class WorktreeManager:
                 # The reason leads; git's own failure text follows, as the
                 # message carried it before, for anything matching on it.
                 raise PushRejectedError(
-                    f"push rejected by {url}: {reason}"
+                    f"git failed: push rejected by {url}: {reason}"
                     + (f"; {said}" if said else "")
-                    + f"; {exc}",
+                    # Already scrubbed where it was built; again here, so
+                    # this line does not depend on that.
+                    + f"; {redact_secrets(str(exc))}",
                     reason=reason,
                 ) from exc
         finally:

@@ -2361,3 +2361,10 @@ def test_a_token_across_the_cap_is_scrubbed_whole() -> None:
     pad = "x" * (_PUSH_REASON_MAX_CHARS - 10)
     reason = parse_push_rejection(f"!\tr:r\t[remote rejected] ({pad}{token})\n")
     assert "ghp_" not in reason and "eeeeee" not in reason
+
+
+def test_a_tab_inside_the_reason_is_kept() -> None:
+    from ctrlrelay.core.worktree import parse_push_rejection
+
+    reason = parse_push_rejection("!\tr:r\t[remote rejected] (rule failed:\tcheck required)\n")
+    assert reason.endswith("check required)")

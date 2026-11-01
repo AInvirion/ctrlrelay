@@ -1270,7 +1270,7 @@ class TestThePublisher:
         fake_relay_publish(github)
         worktree = AsyncMock()
         worktree.push_run_branch.side_effect = PushRejectedError(
-            f"push rejected by https://github.com/owner/repo.git: {reason}",
+            f"git failed: push rejected by https://github.com/owner/repo.git: {reason}",
             reason=reason,
         )
         caplog.set_level(logging.ERROR, logger="ctrlrelay.pipelines.dev")
