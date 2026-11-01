@@ -395,7 +395,8 @@ async def probe_usage(
     Run with no tools (so it cannot read a file or run a command), no MCP
     servers, no user or project settings (so no hooks), one turn, in an
     empty temporary directory. Returns the reading and stores it; a call
-    that carries no reading returns ``None`` and leaves the store alone.
+    that runs and carries no reading records unknown and returns ``None``;
+    one that cannot start or times out leaves the store alone.
     A call that exits non-zero is logged, and its reading kept if it has
     one (a refused call can still report the usage that refused it).
     Raises nothing but cancellation: it runs on a schedule, and its
@@ -423,11 +424,14 @@ async def probe_usage(
         if proc.returncode != 0:
             log_event(_logger, "usage.probe_failed", exit_code=proc.returncode)
         reading = parse_rate_limit_event(stdout.decode(errors="replace"))
-        if reading is None:
-            log_event(_logger, "usage.probe_failed", error="no usage in the output")
-            return None
         if still_idle is not None and not still_idle():
             log_event(_logger, "usage.probe_dropped", reason="a run started meanwhile")
+            return None
+        if reading is None:
+            # Same rule as a run: the call went through and carried no
+            # usage, so an older number stops standing as current.
+            log_event(_logger, "usage.probe_failed", error="no usage in the output")
+            store.mark_unknown()
             return None
         store.write(reading)
         return reading

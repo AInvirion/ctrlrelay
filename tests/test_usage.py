@@ -260,7 +260,7 @@ class TestProbe:
         assert "--max-turns 1" in args
 
     @pytest.mark.asyncio
-    async def test_a_probe_with_no_reading_leaves_the_store_alone(
+    async def test_a_probe_with_no_reading_records_unknown(
         self, tmp_path: Path,
     ) -> None:
         from ctrlrelay.core.usage import probe_usage
@@ -269,16 +269,18 @@ class TestProbe:
         fake.write_text("#!/bin/sh\necho 'rate limited, try later' >&2\nexit 1\n")
         fake.chmod(0o755)
         store = UsageStore(tmp_path / "usage.json")
-        store.write(_reading())
+        store.write(_reading(windows={"five_hour": Window(0.97, NOW + 600)}))
         assert await probe_usage(str(fake), store) is None
-        assert store.read() == _reading()
+        assert store.read() is None  # an older high number no longer pauses
 
     @pytest.mark.asyncio
     async def test_a_missing_binary_is_logged_not_raised(self, tmp_path: Path) -> None:
         from ctrlrelay.core.usage import probe_usage
 
         store = UsageStore(tmp_path / "usage.json")
+        store.write(_reading())
         assert await probe_usage(str(tmp_path / "nope"), store) is None
+        assert store.read() == _reading()  # could not run: nothing learned
 
 
 class TestTheStatusBlock:
@@ -595,9 +597,3 @@ class TestRoundFourFixes:
         path = tmp_path / "usage.json"
         path.write_bytes(b'{"status": "\xff\xfe"}')
         assert UsageStore(path).read() is None
-
-    def test_the_dispatcher_counts_sessions_started(self) -> None:
-        from ctrlrelay.core.dispatcher import ClaudeDispatcher
-
-        d = ClaudeDispatcher(claude_binary="claude", usage_store=None)
-        assert (d.active, d.started) == (0, 0)

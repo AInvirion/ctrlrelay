@@ -2864,6 +2864,10 @@ def poller_start(
             if pause is not None:
                 deferred = defer_for_usage(poller, repo, issue_number, pause)
                 usage_deferred.add((repo, issue_number))
+                # The pause may have ended while this check was still
+                # sending its chat line; then nothing would wake it.
+                if usage_gate.paused is None:
+                    _wake_usage_deferred()
                 console.print(f"[yellow]{deferred}[/yellow]")
                 return
 
