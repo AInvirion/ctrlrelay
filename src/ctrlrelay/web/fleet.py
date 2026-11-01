@@ -17,14 +17,13 @@ an old heartbeat is "silent": its web server is up, its poller is not.
 from __future__ import annotations
 
 import json
+import math
 import socket
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import UTC, datetime
 from typing import Any
 
@@ -165,7 +164,9 @@ def fetch_peer(url: str, *, timeout: float) -> dict[str, Any]:
 
 # A peer's answer is untrusted: only these shapes are passed on, so a bad
 # or hostile peer can neither break this server nor the page.
-_MAX_ITEMS = 200
+# More than this many claims or questions from one peer is not believable;
+# the list is then unknown rather than cut short.
+_MAX_ITEMS = 1000
 
 
 def _text(value: Any, limit: int = 300) -> str | None:
@@ -173,16 +174,19 @@ def _text(value: Any, limit: int = 300) -> str | None:
 
 
 def _clean_claims(raw: Any) -> list[dict[str, Any]] | None:
-    if not isinstance(raw, list):
+    """The peer's claims, or ``None`` (unknown) when the list is missing,
+    too long, or holds any entry that is not a claim: a list with a bad
+    entry dropped would read as fewer claims than the peer has."""
+    if not isinstance(raw, list) or len(raw) > _MAX_ITEMS:
         return None
     out = []
-    for c in raw[:_MAX_ITEMS]:
+    for c in raw:
         if not isinstance(c, dict):
-            continue
+            return None
         number = c.get("issue_number")
         repo = _text(c.get("repo"))
         if type(number) is not int or repo is None:
-            continue
+            return None
         out.append({
             "repo": repo, "issue_number": number, "kind": _text(c.get("kind"), 40),
             "phase": _text(c.get("phase"), 80), "since": _text(c.get("since"), 40),
@@ -192,12 +196,14 @@ def _clean_claims(raw: Any) -> list[dict[str, Any]] | None:
 
 
 def _clean_questions(raw: Any) -> list[dict[str, Any]] | None:
-    if not isinstance(raw, list):
+    """The peer's open questions, or ``None`` (unknown) on the same terms
+    as :func:`_clean_claims`."""
+    if not isinstance(raw, list) or len(raw) > _MAX_ITEMS:
         return None
     out = []
-    for q in raw[:_MAX_ITEMS]:
+    for q in raw:
         if not isinstance(q, dict) or _text(q.get("repo")) is None:
-            continue
+            return None
         refs = q.get("refs")
         out.append({
             "session_id": _text(q.get("session_id")),
@@ -226,6 +232,8 @@ def _clean_window(raw: Any) -> Any:
         return "unknown"
     used = raw.get("used")
     if isinstance(used, bool) or not isinstance(used, (int, float)):
+        return "unknown"
+    if not math.isfinite(float(used)):  # NaN would break the page's JSON
         return "unknown"
     return {"used": float(used), "resets_at": _text(raw.get("resets_at"), 40)}
 
@@ -304,15 +312,15 @@ def peer_entry(
 
 
 class PeerReader:
-    """Reads every peer on a timer in a daemon thread; ``snapshot()``
-    returns the latest ``fleet`` block and never waits on the network.
+    """Reads every peer on a timer; ``snapshot()`` returns the latest
+    ``fleet`` block and never waits on the network.
 
-    Peers are read in parallel, each with a deadline for the whole read
-    (name lookup and body included): one slow or stuck peer is reported
-    as "timeout" and cannot hold up the others.
+    Each peer is read in its own thread, at most one read in flight per
+    peer, and each read's result is published the moment it arrives. A
+    read still going ``timeout_s * 2`` after it started is reported as
+    "timeout"; it is left to finish, and its peer is not read again until
+    it has. So a stuck peer costs one thread and holds up no other peer.
     """
-
-    thread_name = "ctrlrelay-web-fleet"
 
     def __init__(
         self,
@@ -332,22 +340,13 @@ class PeerReader:
         self._clock = clock
         self._lock = threading.Lock()
         self._entries: dict[str, dict[str, Any]] = {}
+        self._in_flight: dict[str, float] = {}
         self._stop = threading.Event()
-        self._pool = ThreadPoolExecutor(
-            max_workers=max(1, min(len(self.peers), 8)),
-            thread_name_prefix="ctrlrelay-web-peer",
-        )
         self._thread = threading.Thread(
-            target=self._run, name=self.thread_name, daemon=True,
+            target=self._run, name="ctrlrelay-web-fleet", daemon=True,
         )
 
-    def _read_one(self, url: str, future: Future) -> None:
-        try:
-            data, error = future.result(timeout=self._timeout * 2), None
-        except FutureTimeout:
-            data, error = None, "timeout"
-        except Exception as exc:
-            data, error = None, _peer_error(exc)
+    def _publish(self, url: str, data: dict[str, Any] | None, error: str | None) -> None:
         with self._lock:
             previous = self._entries.get(url)
         try:
@@ -364,13 +363,43 @@ class PeerReader:
         with self._lock:
             self._entries[url] = entry
 
-    def read_once(self) -> None:
-        futures = {
-            url: self._pool.submit(self._fetch, url, timeout=self._timeout)
-            for url in self.peers
-        }
-        for url, future in futures.items():
-            self._read_one(url, future)
+    def _read(self, url: str) -> None:
+        try:
+            data, error = self._fetch(url, timeout=self._timeout), None
+        except Exception as exc:
+            data, error = None, _peer_error(exc)
+        self._publish(url, data, error)
+        with self._lock:
+            self._in_flight.pop(url, None)
+
+    def read_once(self, wait: bool = True) -> None:
+        """Start a read of every peer not already being read, and report
+        those still going past their deadline as "timeout". With ``wait``,
+        return once every read finished or passed its deadline."""
+        now = self._clock()
+        threads = []
+        for url in self.peers:
+            with self._lock:
+                started = self._in_flight.get(url)
+                if started is None:
+                    self._in_flight[url] = now
+            if started is not None:
+                if now - started > self._timeout * 2:
+                    self._publish(url, None, "timeout")
+                continue
+            t = threading.Thread(
+                target=self._read, args=(url,), daemon=True,
+                name="ctrlrelay-web-peer",
+            )
+            t.start()
+            threads.append((url, t))
+        if not wait:
+            return
+        deadline = time.monotonic() + self._timeout * 2
+        for url, t in threads:
+            t.join(max(0.0, deadline - time.monotonic()))
+            if t.is_alive():
+                self._publish(url, None, "timeout")
 
     def snapshot(self) -> dict[str, Any]:
         now = self._clock()
@@ -401,7 +430,6 @@ class PeerReader:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout)
-        self._pool.shutdown(wait=False, cancel_futures=True)
 
     def _run(self) -> None:
         while not self._stop.is_set():

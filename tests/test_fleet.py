@@ -159,7 +159,7 @@ class TestPeerEntry:
         assert again["last_known"]["name"] == "node-b"
 
     def test_peer_questions_come_through_for_needs_you(self) -> None:
-        e = peer_entry("http://b", data=_status("node-b", beat=NOW, needs=[QUESTION, "junk"]),
+        e = peer_entry("http://b", data=_status("node-b", beat=NOW, needs=[QUESTION]),
                        error=None, checked_at=NOW, previous=None, silent_after=300)
         [q] = e["needs_you"]
         assert (q["repo"], q["issue_number"], q["url"]) == ("o/r", 9, "v")
@@ -291,6 +291,30 @@ class TestRoundOneFixes:
         assert act["state"] == UNKNOWN
         assert act["slots"] is None and act["claims"] is None
 
+    def test_a_healthy_peer_is_published_while_another_is_stuck(self) -> None:
+        release = threading.Event()
+
+        def fetch(url, *, timeout):
+            if url == "http://stuck":
+                release.wait(5)
+                raise TimeoutError
+            return _status("node-c", beat=time.time())
+
+        reader = PeerReader(["http://stuck", "http://c"], interval_s=60, timeout_s=1,
+                            silent_after=300, fetch=fetch)
+        reader.read_once(wait=False)
+        for _ in range(100):
+            if reader.snapshot()["peers"][1]["reachable"]:
+                break
+            time.sleep(0.01)
+        # Published while the first peer is still stuck, not after it.
+        stuck, ok = reader.snapshot()["peers"]
+        assert ok["reachable"] and stuck["state"] == "not read yet"
+        # And a stuck peer is not read twice at once.
+        reader.read_once(wait=False)
+        release.set()
+        reader.stop()
+
     def test_a_stuck_peer_times_out_and_does_not_hold_the_others(self) -> None:
         release = threading.Event()
 
@@ -327,9 +351,9 @@ class TestRoundOneFixes:
         reader.read_once()
         b, c = reader.snapshot()["peers"]
         assert b["reachable"] and b["state"] == SILENT
-        assert b["needs_you"] == []
-        claims = (b["node"] or {}).get("claims")
-        assert claims in (None, [])
+        # A list holding anything that is not a question is unknown, not shorter.
+        assert b["needs_you"] is None
+        assert (b["node"] or {}).get("claims") is None
         assert c["reachable"]
         reader.stop()
 
@@ -358,3 +382,28 @@ class TestRoundOneFixes:
         with patch("os.replace", side_effect=OSError("no")):
             Heartbeat(tmp_path / "heartbeat.json").beat()
         assert list(tmp_path.iterdir()) == []
+
+
+
+class TestRoundTwoFixes:
+    def test_nan_usage_from_a_peer_is_unknown(self) -> None:
+        import json as _json
+
+        data = _json.loads(
+            '{"host": "b", "node": {"name": "b", "usage": {"five_hour": {"used": NaN}}}}'
+        )
+        e = peer_entry("http://b", data=data, error=None, checked_at=NOW,
+                       previous=None, silent_after=300)
+        assert e["node"]["usage"]["five_hour"] == "unknown"
+        _json.dumps(e, allow_nan=False)  # the page's JSON stays valid
+
+    def test_an_absurd_heartbeat_time_is_no_heartbeat(self, tmp_path: Path) -> None:
+        path = tmp_path / "heartbeat.json"
+        path.write_text('{"heartbeat_at": 999999999999999999999, "last_poll_at": 5}')
+        assert Heartbeat(path).read() is None
+
+    def test_too_many_claims_is_unknown_not_cut_short(self) -> None:
+        claims = [dict(CARD, issue_number=i) for i in range(1001)]
+        e = peer_entry("http://b", data={"host": "b", "node": {"name": "b", "claims": claims}},
+                       error=None, checked_at=NOW, previous=None, silent_after=300)
+        assert e["node"]["claims"] is None

@@ -30,6 +30,12 @@ _logger = get_logger("core.heartbeat")
 HEARTBEAT_SECONDS = 30.0
 
 
+def _is_time(value: object) -> bool:
+    """An epoch-seconds int between 2001 and 2286; anything else in the
+    file is damage, and a damaged heartbeat is no heartbeat."""
+    return type(value) is int and 1_000_000_000 <= value < 10_000_000_000
+
+
 class Heartbeat:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -77,11 +83,11 @@ class Heartbeat:
             return None
         beat = data.get("heartbeat_at")
         poll = data.get("last_poll_at")
-        if type(beat) is not int:
+        if not _is_time(beat):
             return None
         return {
             "heartbeat_at": beat,
-            "last_poll_at": poll if type(poll) is int else None,
+            "last_poll_at": poll if _is_time(poll) else None,
         }
 
     async def run(self, interval: float = HEARTBEAT_SECONDS) -> None:
