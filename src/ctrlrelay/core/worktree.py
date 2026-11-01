@@ -89,8 +89,136 @@ def _rejections_are_only_non_fast_forward(stderr: str) -> list[str]:
     return refs
 
 
+# How much of each stream a failing git command contributes to the
+# error it raises. #269: `git push --porcelain` writes its per-ref
+# status to STDOUT, so for a rejected push the remote's reason is on
+# stdout and stderr holds only `error: failed to push some refs to
+# '<url>'`. Dropping stdout left every failed push reported by its
+# least informative line — and that line names the URL, which sends
+# the reader after the transport or the credential when neither was
+# at fault.
+_GIT_ERROR_TAIL_CHARS = 1000
+# The reason is one porcelain line for the one ref we push. The cap is
+# for a remote that answers with an essay.
+_PUSH_REASON_MAX_CHARS = 500
+
+
+def _git_failure_detail(
+    stdout: str, stderr: str, returncode: int | None
+) -> str:
+    """Both streams of a failed git command, scrubbed and capped.
+
+    stderr first and whole: it carries git's own ``fatal:``/``error:``
+    lines and is what every existing caller's matcher reads. stdout
+    follows, labelled and capped, whenever it said anything — which for a
+    ``--porcelain`` command is where the answer is.
+
+    Redaction runs before the cap (see :mod:`ctrlrelay.core.redact`):
+    clipping first can store half a token, and half a token no longer
+    matches the pattern that would have caught it.
+
+    When both streams are empty the exit code is all there is, so it is
+    named rather than rendered as a message with nothing after the
+    colon.
+    """
+    from ctrlrelay.core.redact import redact_secrets, tail
+
+    parts: list[str] = []
+    # stderr whole, as the message carried it before stdout was added, so
+    # a matcher looking for git's words anywhere in it still finds them;
+    # stdout capped.
+    err = stderr.strip()
+    if err:
+        parts.append(redact_secrets(err))
+    out = stdout.strip()
+    if out:
+        parts.append("stdout: " + tail(redact_secrets(out), _GIT_ERROR_TAIL_CHARS))
+    if not parts:
+        return f"exited {returncode} with no output"
+    return "; ".join(parts)
+
+
+def parse_push_rejection(porcelain_stdout: str) -> str | None:
+    """The reason ``git push --porcelain`` gave for refusing a ref.
+
+    Porcelain status is one TAB-separated line per ref on **stdout**:
+    ``<flag>\\t<from>:<to>\\t<summary>``. A refused ref carries flag
+    ``!`` and the remote's reason in the summary — ``[rejected] (stale
+    info)``, ``[remote rejected] (pre-receive hook declined)``,
+    ``[remote rejected] (push declined due to repository rule
+    violations)``. Lines for refs that updated carry a different flag
+    and are not failures.
+
+    Returns ``None`` when no ref was rejected: the push died before it
+    got a per-ref answer (unreachable remote, bad credential, no such
+    repository), and then stderr is the whole story and must not be
+    dressed up as a rejection.
+
+    Also reads the non-porcelain form (``! [rejected] <src> -> <dst>
+    (reason)``), because the flag and the reason are in it too and a
+    caller should not have to know which form it has.
+    """
+    from ctrlrelay.core.redact import redact_secrets
+
+    reasons: list[str] = []
+    for raw in porcelain_stdout.splitlines():
+        line = raw.strip()
+        if not line.startswith("!"):
+            continue
+        if "\t" in raw:
+            # At most two splits: the summary keeps any tab inside it.
+            fields = [f.strip() for f in raw.split("\t", 2)]
+            ref = fields[1] if len(fields) > 1 else ""
+            summary = fields[2] if len(fields) > 2 else ""
+            # Scrubbed before anything is cut (what the remote says can
+            # carry a credential, and half a token no longer matches the
+            # pattern); then the ref whole and the remote's words capped,
+            # so a long ref cannot crowd out the reason.
+            ref, summary = redact_secrets(ref), redact_secrets(summary)
+            text = f"{ref} {summary[:_PUSH_REASON_MAX_CHARS]}".strip() or line
+        else:
+            text = redact_secrets(line.lstrip("! ").strip() or line)
+        reasons.append(text)
+    if not reasons:
+        return None
+    return "; ".join(reasons)
+
+
 class WorktreeError(Exception):
     """Raised when worktree operations fail."""
+
+
+class GitCommandError(WorktreeError):
+    """A git command exited non-zero, carrying both of its streams.
+
+    A ``WorktreeError`` like before, so every existing handler is
+    unaffected. The two attributes are for a caller that knows the
+    command's output format and can read more from it than the message
+    does — ``push --porcelain``, whose per-ref reason is on stdout.
+    """
+
+    def __init__(
+        self, message: str, *, stdout: str = "", stderr: str = ""
+    ) -> None:
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class PushRejectedError(WorktreeError):
+    """Git rejected the push for a ref, named with the reason it gave.
+
+    Decided by git itself before the remote is asked (a stale lease, a
+    non-fast-forward) or by the remote (a protection rule). Distinct from
+    :class:`ctrlrelay.core.publish.PushRefusedError`, which is the relay
+    declining to push at all. ``reason`` is the ``!`` line from
+    ``push --porcelain`` so a caller can log it as its own field
+    instead of parsing it back out of the message.
+    """
+
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class DefaultBranchDivergedError(WorktreeError):
@@ -340,14 +468,23 @@ class WorktreeManager:
             raise
 
         if proc.returncode != 0:
-            err = stderr.decode().strip()
+            err = stderr.decode(errors="replace").strip()
+            out = stdout.decode(errors="replace").strip()
             declined = (
                 _rejections_are_only_non_fast_forward(err)
                 if tolerate_non_fast_forward
                 else []
             )
             if not declined:
-                raise WorktreeError(f"git failed: {err}")
+                # Both streams, because which one carried the reason
+                # depends on the command: a `--porcelain` push puts it
+                # on stdout (#269).
+                raise GitCommandError(
+                    "git failed: "
+                    + _git_failure_detail(out, err, proc.returncode),
+                    stdout=out,
+                    stderr=err,
+                )
             stuck = sorted(set(declined) & protected_refs)
             if stuck:
                 raise DefaultBranchDivergedError(
@@ -1113,16 +1250,52 @@ class WorktreeManager:
                         "not overwriting it"
                     )
                 expected_remote_sha = remote
-            await self._run_git(
-                *git(
-                    "push", "--no-verify", "--porcelain",
-                    f"--force-with-lease=refs/heads/{branch}:"
-                    f"{expected_remote_sha}",
-                    url, f"{sha}:refs/heads/{branch}",
-                ),
-                env=env,
-                timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
-            )
+            try:
+                await self._run_git(
+                    *git(
+                        "push", "--no-verify", "--porcelain",
+                        f"--force-with-lease=refs/heads/{branch}:"
+                        f"{expected_remote_sha}",
+                        url, f"{sha}:refs/heads/{branch}",
+                    ),
+                    env=env,
+                    timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+                )
+            except GitCommandError as exc:
+                # The remote's reason for refusing the ref is on
+                # stdout, which the generic message now carries but
+                # buries after git's summary line. Pull it out so the
+                # reason leads, and hand it up as its own field (#269).
+                reason = parse_push_rejection(exc.stdout)
+                if reason is None:
+                    raise
+                from ctrlrelay.core.redact import redact_secrets, tail
+
+                said = tail(redact_secrets("; ".join(
+                    line.strip()
+                    for line in exc.stderr.splitlines()
+                    if line.strip().startswith("remote:")
+                )), _GIT_ERROR_TAIL_CHARS)
+                _logger.error(
+                    "publish.push.rejected",
+                    extra={
+                        "repo": repo,
+                        "session_id": session_id,
+                        "branch": branch,
+                        "sha": sha,
+                        "reason": reason,
+                    },
+                )
+                # The reason leads; git's own failure text follows, as the
+                # message carried it before, for anything matching on it.
+                raise PushRejectedError(
+                    f"git failed: push rejected by {url}: {reason}"
+                    + (f"; {said}" if said else "")
+                    # Already scrubbed where it was built; again here, so
+                    # this line does not depend on that.
+                    + f"; {redact_secrets(str(exc))}",
+                    reason=reason,
+                ) from exc
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
         log_event(

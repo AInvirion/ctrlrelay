@@ -737,6 +737,146 @@ class TestThePushGuard:
         assert "fix/issue-7" not in _git("for-each-ref", cwd=origin)
 
 
+class TestARejectedPushReportsWhyTheRemoteRefusedIt:
+    """#269: diagnosing two stranded issues took about an hour, almost
+    all of it spent recovering a reason git had already printed. The
+    log line for each failure was
+
+        git failed: error: failed to push some refs to '<url>'
+
+    which is git's summary line. The push runs with ``--porcelain``, so
+    the line naming the rejected ref and the remote's reason went to
+    STDOUT, and ``_run_git`` raised with stderr only.
+
+    The surviving line names the URL, which invited the conclusion that
+    the transport or the credential was at fault. Neither was: pushes
+    to the same URL with the same credential succeeded minutes before
+    and after.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_stale_lease_rejection_names_the_ref_and_the_reason(
+        self, tmp_path: Path, push_to_local_origin, caplog
+    ) -> None:
+        """The reported case exactly: stderr carries only the summary
+        line, and the reason exists on stdout or nowhere."""
+        from ctrlrelay.core.worktree import PushRejectedError
+
+        origin, bare, _ = _origin_and_bare(tmp_path)
+        push_to_local_origin(origin)
+        # The branch is on origin at `other`, and we lease on a sha it
+        # is not at -- what a resumed session sees when somebody else
+        # moved the branch. Real git answers `[rejected] (stale info)`.
+        other = _commit_on(bare, "someone", tmp_path)
+        _git("push", "-q", str(origin), f"{other}:refs/heads/fix/issue-7",
+             cwd=bare)
+        _commit_on(bare, "fix/issue-7", tmp_path)
+
+        caplog.set_level(logging.ERROR, logger="ctrlrelay.core.worktree")
+        with pytest.raises(PushRejectedError) as caught:
+            await _manager(tmp_path).push_run_branch(
+                "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
+                default_branch="main", expected_remote_sha="0" * 40,
+                relay_pushed_shas=frozenset({"0" * 40}),
+            )
+        message = str(caught.value)
+        assert "stale info" in message, "the reason is still being dropped"
+        assert "refs/heads/fix/issue-7" in message, "the ref is not named"
+        # Keep the url: the complaint was never that it is there, only
+        # that it was all that was there.
+        assert "https://github.com/owner/repo.git" in message
+        # And the reason is its own field, not something a reader has
+        # to parse back out of a capped message.
+        assert "stale info" in (caught.value.reason or "")
+        [rec] = [
+            r for r in caplog.records if r.msg == "publish.push.rejected"
+        ]
+        assert "stale info" in rec.reason
+        assert rec.branch == "fix/issue-7"
+        # Origin did not move.
+        assert _git("rev-parse", "refs/heads/fix/issue-7", cwd=origin) == other
+
+    @pytest.mark.asyncio
+    async def test_the_reason_was_on_stdout_and_nowhere_else(
+        self, tmp_path: Path, push_to_local_origin
+    ) -> None:
+        """A negative control for the test above: if the reason were on
+        stderr, including stdout would have been unnecessary and this
+        test would pass with the fix reverted. Run the same push as
+        plain git and read the two streams apart."""
+        origin, bare, _ = _origin_and_bare(tmp_path)
+        push_to_local_origin(origin)
+        other = _commit_on(bare, "someone", tmp_path)
+        _git("push", "-q", str(origin), f"{other}:refs/heads/fix/issue-7",
+             cwd=bare)
+        sha = _commit_on(bare, "fix/issue-7", tmp_path)
+
+        proc = subprocess.run(
+            ["git", "push", "--porcelain",
+             "--force-with-lease=refs/heads/fix/issue-7:" + "0" * 40,
+             str(origin), f"{sha}:refs/heads/fix/issue-7"],
+            cwd=bare, capture_output=True, text=True,
+        )
+        assert proc.returncode != 0
+        assert "stale info" in proc.stdout
+        assert "stale info" not in proc.stderr
+        assert "failed to push some refs" in proc.stderr
+
+    @pytest.mark.asyncio
+    async def test_a_remote_that_explains_itself_keeps_both_streams(
+        self, tmp_path: Path, push_to_local_origin
+    ) -> None:
+        """A hook rejection puts the summary on stdout and the remote's
+        own words on stderr behind `remote:`. Both are the reason, so
+        both are kept."""
+        from ctrlrelay.core.worktree import PushRejectedError
+
+        origin, bare, _ = _origin_and_bare(tmp_path)
+        push_to_local_origin(origin)
+        _commit_on(bare, "fix/issue-7", tmp_path)
+        hook = origin / "hooks" / "pre-receive"
+        hook.write_text(
+            "#!/bin/sh\n"
+            "echo 'refusing: required status check has not run' >&2\n"
+            "exit 1\n"
+        )
+        hook.chmod(0o755)
+
+        with pytest.raises(PushRejectedError) as caught:
+            await _manager(tmp_path).push_run_branch(
+                "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
+                default_branch="main", expected_remote_sha=None,
+                relay_pushed_shas=frozenset(),
+            )
+        message = str(caught.value)
+        assert "pre-receive hook declined" in message      # stdout
+        assert "required status check has not run" in message  # stderr
+        assert "fix/issue-7" not in _git("for-each-ref", cwd=origin)
+
+    @pytest.mark.asyncio
+    async def test_a_push_that_never_got_a_per_ref_answer_is_not_a_rejection(
+        self, tmp_path: Path, push_to_local_origin
+    ) -> None:
+        """No reachable remote means no `!` line, and stderr is the
+        whole story. Reporting that as a rejection would invent a
+        remote answer that was never given."""
+        from ctrlrelay.core.worktree import GitCommandError, PushRejectedError
+
+        origin, bare, _ = _origin_and_bare(tmp_path)
+        push_to_local_origin(origin)
+        _commit_on(bare, "fix/issue-7", tmp_path)
+        shutil.rmtree(origin)
+
+        with pytest.raises(GitCommandError) as caught:
+            await _manager(tmp_path).push_run_branch(
+                "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
+                default_branch="main", expected_remote_sha=None,
+                relay_pushed_shas=frozenset(),
+            )
+        assert not isinstance(caught.value, PushRejectedError)
+        assert "git failed:" in str(caught.value)
+
+
 class TestRefFilesAreReadOnlyWhenSafe:
     """The push reads the clone's branch heads from its ref files. The
     agent can write those files, so a symlink anywhere on the way, or a
@@ -1108,6 +1248,71 @@ class TestThePublisher:
             assert not result.success
             assert "refusing to reuse PR #5" in (result.error or "")
             assert "pr_number" not in result.outputs
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_push_puts_the_remotes_reason_in_the_event(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """#269 asked for the `!` line's reason in `dev.publish.failed`
+        as its own field. The message field is cut at 300 characters, so
+        a reason that only lives in the message is a reason that can be
+        cut out of it."""
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.core.worktree import PushRejectedError
+
+        reason = (
+            "refs/heads/fix/issue-7:refs/heads/fix/issue-7 "
+            "[remote rejected] (push declined due to repository rule "
+            "violations)"
+        )
+        db = StateDB(tmp_path / "state.db")
+        github = AsyncMock()
+        fake_relay_publish(github)
+        worktree = AsyncMock()
+        worktree.push_run_branch.side_effect = PushRejectedError(
+            f"git failed: push rejected by https://github.com/owner/repo.git: {reason}",
+            reason=reason,
+        )
+        caplog.set_level(logging.ERROR, logger="ctrlrelay.pipelines.dev")
+        try:
+            result = await _publisher(tmp_path, github, worktree, db).publish(
+                _done()
+            )
+        finally:
+            db.close()
+        assert not result.success
+        assert result.outputs["publish_failed"] is True
+        [rec] = [r for r in caplog.records if r.msg == "dev.publish.failed"]
+        assert rec.push_rejection == reason
+        assert rec.refused is False, "a remote refusal is not the relay's"
+        # And the message still names the url and the reason.
+        assert "repository rule violations" in (result.error or "")
+        assert "github.com/owner/repo" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_any_other_publish_failure_leaves_the_field_empty(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The field is None for a failure that is not a rejection,
+        rather than carrying whatever `.reason` some other exception
+        type happens to define."""
+        from ctrlrelay.core.state import StateDB
+
+        db = StateDB(tmp_path / "state.db")
+        github = AsyncMock()
+        fake_relay_publish(github)
+        worktree = AsyncMock()
+        worktree.push_run_branch.side_effect = OSError("no route to host")
+        caplog.set_level(logging.ERROR, logger="ctrlrelay.pipelines.dev")
+        try:
+            result = await _publisher(tmp_path, github, worktree, db).publish(
+                _done()
+            )
+        finally:
+            db.close()
+        assert not result.success
+        [rec] = [r for r in caplog.records if r.msg == "dev.publish.failed"]
+        assert rec.push_rejection is None
 
 
 class TestAFixRoundIsPushedByTheRelay:
