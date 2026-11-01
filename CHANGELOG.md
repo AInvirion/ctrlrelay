@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.3] - 2026-11-01
+
+A security fix: **upgrade every machine.** No config edit is required.
+
+### Fixed
+
+- Only issues the operator assigned to themselves are taken, as intended.
+  The check read `actor` on GitHub's `assigned` events, which is the account
+  assigned (the operator), not the one who assigned it (`assigner`), so an
+  issue anyone else assigned to the operator was taken too. It now reads
+  `assigner`, refuses an event without one, refuses an unnamed assignment
+  after the operator's last one, and reads every page of an issue's events.
+  The status page's "assigned by someone else" uses the same check (#275,
+  closes #274)
+
 ## [0.16.2] - 2026-11-01
 
 Status page changes only. **No config edit is required.**
@@ -2001,7 +2016,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.2...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.3...HEAD
+[0.16.3]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.15.0...v0.16.0
