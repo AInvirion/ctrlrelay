@@ -63,12 +63,28 @@ def _ts(text: str) -> float:
 
 
 class TestWindow:
-    def test_a_few_seconds_either_side_of_the_hour_is_one_window(self) -> None:
-        assert window_id(_ts("2026-11-01 05:59:58")) == window_id(_ts("2026-11-01 06:00:03"))
+    def test_the_window_is_the_minute_it_was_due(self) -> None:
         assert window_id(_ts("2026-11-01 06:00:00")) == "20261101T0600Z"
 
-    def test_the_next_day_is_a_new_window(self) -> None:
-        assert window_id(_ts("2026-11-01 06:00:00")) != window_id(_ts("2026-11-02 06:00:00"))
+    def test_two_fires_a_minute_apart_are_two_windows(self) -> None:
+        assert window_id(_ts("2026-11-01 06:00:00")) != window_id(_ts("2026-11-01 06:01:00"))
+
+    def test_late_and_early_starts_name_the_fire_they_belong_to(self) -> None:
+        from ctrlrelay.core.scheduler import last_fire_time
+
+        def due(cron: str, at: str) -> str:
+            now = datetime.strptime(at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            return last_fire_time(cron, UTC, now).strftime("%H:%M")
+
+        # A start a moment before the minute (clock skew) is that minute.
+        assert due("0 6 * * *", "2026-11-01 05:59:50") == "06:00"
+        # Hourly, asleep through 06:00 and 07:00: the scheduler coalesces
+        # them into one run for 07:00, and that is the window named.
+        assert due("0 * * * *", "2026-11-01 07:20:00") == "07:00"
+        # Every minute: each fire its own.
+        assert due("* * * * *", "2026-11-01 06:01:10") == "06:01"
+        # Weekly: found days back.
+        assert due("0 6 * * 1", "2026-11-01 07:00:00") == "06:00"
 
 
 class TestClaim:
@@ -104,7 +120,8 @@ class TestClaim:
     async def test_old_windows_are_pruned_recent_ones_kept(self) -> None:
         refs = Refs()
         for name in ("secops/20261020T0600Z", "secops/20261030T0600Z",
-                     "secops/not-a-window", "other/20261001T0600Z"):
+                     "secops/not-a-window", "other/20261001T0600Z",
+                     "secops/nested/20261001T0600Z"):
             refs.refs[f"o/r:{REF_PREFIX}/{name}"] = "x"
         await JobClaimer(refs, "node-a", window="20261101T0600Z").claim("o/r", "secops")
         left = sorted(k.split(":", 1)[1] for k in refs.refs)
@@ -112,6 +129,7 @@ class TestClaim:
         assert f"{REF_PREFIX}/secops/20261030T0600Z" in left  # 2 days
         assert f"{REF_PREFIX}/secops/not-a-window" in left  # not ours to judge
         assert f"{REF_PREFIX}/other/20261001T0600Z" in left  # another job
+        assert f"{REF_PREFIX}/secops/nested/20261001T0600Z" in left  # not a child
         assert KEEP_DAYS == 7
 
 
@@ -207,3 +225,62 @@ class TestALateRunKeepsItsWindow:
 
         monkeypatch.setattr("datetime.datetime", Frozen)
         assert cli_mod.sweep_window("0 6 * * *", "UTC") == "20261101T0600Z"
+
+
+
+class TestRoundOneFixes:
+    @pytest.mark.asyncio
+    async def test_a_busy_local_lock_claims_nothing(self, tmp_path) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        import ctrlrelay.pipelines.secops as secops_mod
+        from ctrlrelay.core.state import StateDB
+
+        refs = Refs()
+        db = StateDB(tmp_path / "s.db")
+        db.acquire_lock("o/a", "someone-else")
+        try:
+            [r] = await secops_mod.run_secops_all(
+                repos=[SimpleNamespace(name="o/a", automation=None)],
+                dispatcher=MagicMock(), github=MagicMock(), worktree=MagicMock(),
+                dashboard=None, state_db=db, transport=None, contexts_dir=tmp_path,
+                job_claims=JobClaimer(refs, "node-a", window="20261101T0600Z"),
+            )
+        finally:
+            db.close()
+        assert not r.success and "lock" in r.summary.lower()
+        assert refs.refs == {}  # the window stays free for another machine
+
+    @pytest.mark.asyncio
+    async def test_a_lost_claim_releases_the_local_lock(self, tmp_path) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        import ctrlrelay.pipelines.secops as secops_mod
+        from ctrlrelay.core.state import StateDB
+
+        refs = Refs()
+        await JobClaimer(refs, "node-b", window="20261101T0600Z").claim("o/a", "secops")
+        db = StateDB(tmp_path / "s.db")
+        try:
+            await secops_mod.run_secops_all(
+                repos=[SimpleNamespace(name="o/a", automation=None)],
+                dispatcher=MagicMock(), github=MagicMock(), worktree=MagicMock(),
+                dashboard=None, state_db=db, transport=None, contexts_dir=tmp_path,
+                job_claims=JobClaimer(refs, "node-a", window="20261101T0600Z"),
+            )
+            assert db.acquire_lock("o/a", "next")
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_an_unexpected_failure_is_an_error_result(self) -> None:
+        refs = Refs()
+
+        async def boom(*a):
+            raise KeyError("surprise")
+
+        refs.create_ref = boom
+        out = await JobClaimer(refs, "node-a", window="20261101T0600Z").claim("o/r", "secops")
+        assert not out.won and "KeyError" in out.error

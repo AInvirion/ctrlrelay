@@ -13,11 +13,11 @@ already exists"), so the first machine to create it holds the job for
 that window, with no race window to check: the same rule as issue claims,
 first claim wins, without the wait.
 
-``window`` is the time the job was *due* (from its cron rule, not when it
-actually started: a machine that was asleep runs it up to an hour late)
-rounded to ``WINDOW_SECONDS``, so two machines firing the same cron a few
-seconds apart, across a minute boundary, or one of them late, name the
-same window. A machine that dies holding a window loses only that window:
+``window`` is the exact minute the job was *due* by its cron rule
+(:func:`ctrlrelay.core.scheduler.last_fire_time`), not when it started: every
+machine works it out from the same rule, so machines a few seconds apart,
+or one of them late, name the same window, and two different fires never
+share one. A machine that dies holding a window loses only that window:
 the next window is a new ref.
 
 Old refs are deleted after ``KEEP_DAYS``.
@@ -36,16 +36,16 @@ from ctrlrelay.core.obs import get_logger, log_event
 _logger = get_logger("core.job_claims")
 
 REF_PREFIX = "refs/ctrlrelay/claims"
-WINDOW_SECONDS = 600
+# Claims older than this are deleted. A run more than an hour late is
+# dropped by the scheduler, so no machine can still be working on one.
 KEEP_DAYS = 7
 _WINDOW_FORMAT = "%Y%m%dT%H%MZ"
 
 
-def window_id(now: float, period: int = WINDOW_SECONDS) -> str:
-    """The run window ``now`` belongs to: rounded to the nearest
-    ``period``, so 05:59:58 and 06:00:03 are one window."""
-    rounded = int((now + period / 2) // period * period)
-    return datetime.fromtimestamp(rounded, tz=UTC).strftime(_WINDOW_FORMAT)
+def window_id(due: float) -> str:
+    """The window name for a run due at ``due`` (epoch seconds): that
+    minute, in UTC."""
+    return datetime.fromtimestamp(due, tz=UTC).strftime(_WINDOW_FORMAT)
 
 
 def ref_name(job: str, window: str) -> str:
@@ -78,6 +78,14 @@ class JobClaimer:
         self.window = window
 
     async def claim(self, repo: str, job: str) -> JobClaim:
+        """Never raises: anything unexpected is an error result, so one
+        repo's claim cannot end the sweep for the rest."""
+        try:
+            return await self._claim(repo, job)
+        except Exception as e:
+            return JobClaim(won=False, error=f"{type(e).__name__}: {str(e)[:200]}")
+
+    async def _claim(self, repo: str, job: str) -> JobClaim:
         window = self.window
         ref = ref_name(job, window)
         try:
@@ -90,7 +98,10 @@ class JobClaimer:
         if created:
             log_event(_logger, "jobs.claimed", repo=repo, job=job, window=window,
                       node=self.node)
-            await self._prune(repo, job, window)
+            try:
+                await self._prune(repo, job, window)
+            except Exception:
+                pass  # best-effort: the claim is made either way
             return JobClaim(won=True)
         owner = await self._owner(repo, ref)
         log_event(_logger, "jobs.skipped", repo=repo, job=job, window=window,
@@ -109,8 +120,9 @@ class JobClaimer:
     async def _prune(self, repo: str, job: str, current: str) -> None:
         """Best-effort: delete this job's refs older than ``KEEP_DAYS``.
         Only refs whose window parses are touched."""
+        prefix = f"{REF_PREFIX}/{job}/"
         try:
-            refs = await self.github.list_refs(repo, f"{REF_PREFIX}/{job}/")
+            refs = await self.github.list_refs(repo, prefix)
         except Exception:
             return
         try:
@@ -118,7 +130,9 @@ class JobClaimer:
         except ValueError:
             return
         for ref in refs:
-            window = ref.rsplit("/", 1)[-1]
+            window = ref[len(prefix):] if ref.startswith(prefix) else ""
+            if not window or "/" in window:
+                continue  # only this job's own windows, nothing nested
             try:
                 when = datetime.strptime(window, _WINDOW_FORMAT).replace(tzinfo=UTC)
             except ValueError:

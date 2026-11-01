@@ -1112,8 +1112,8 @@ def settle_claimed_elsewhere(
 
 
 def sweep_window(cron_expr: str, tz_name: str) -> str:
-    """The claim window of a scheduled run (#246): when the cron rule was
-    last due, rounded, or now if it was not due in the last day."""
+    """The claim window of a scheduled run (#246): the minute the cron rule
+    was last due; the current minute if it was not due in 40 days."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
 

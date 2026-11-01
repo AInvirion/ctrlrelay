@@ -338,19 +338,28 @@ def make_scheduler(timezone: str) -> Scheduler:
     return Scheduler(impl)
 
 
-def last_fire_time(cron_expr: str, timezone, now: datetime) -> datetime | None:
-    """The latest time ``cron_expr`` was due at or before ``now``, within
-    the last 25 hours; ``None`` if it was not due in that span.
+def last_fire_time(
+    cron_expr: str, timezone, now: datetime, *, slack: timedelta = timedelta(seconds=30),
+) -> datetime | None:
+    """The latest time ``cron_expr`` was due at or before ``now + slack``;
+    ``None`` if it was not due in the last 40 days.
 
-    A job the scheduler runs late (the machine was asleep; misfires run up
-    to an hour late) still belongs to the window it was due in, so two
-    machines agree on it however late either one starts (#246).
+    This is the run the scheduler is executing (#246). It coalesces missed
+    runs into one, for the latest of them, and drops a run more than an
+    hour late; so a late start belongs to the latest due time, and every
+    machine works out the same one from the same rule. ``slack`` covers a
+    scheduler that fires a moment before the minute by this machine's
+    clock. Searched in growing spans, so an every-minute rule does not
+    walk 40 days of minutes.
     """
     trigger = _build_vixie_trigger(cron_expr, timezone)
-    start = now - timedelta(hours=25)
-    previous = None
-    fire = trigger.get_next_fire_time(None, start)
-    while fire is not None and fire <= now:
-        previous = fire
-        fire = trigger.get_next_fire_time(fire, fire + timedelta(seconds=1))
-    return previous
+    limit = now + slack
+    for span in (timedelta(hours=2), timedelta(days=2), timedelta(days=40)):
+        previous = None
+        fire = trigger.get_next_fire_time(None, now - span)
+        while fire is not None and fire <= limit:
+            previous = fire
+            fire = trigger.get_next_fire_time(fire, fire + timedelta(seconds=1))
+        if previous is not None:
+            return previous
+    return None

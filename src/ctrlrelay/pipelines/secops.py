@@ -706,8 +706,23 @@ async def run_secops_all(
             ))
             continue
 
+        if not state_db.acquire_lock(repo, session_id):
+            results.append(PipelineResult(
+                success=False,
+                session_id=session_id,
+                summary=f"Could not acquire lock for {repo}",
+                error="Repository locked by another session",
+            ))
+            continue
+
+        # Claimed only once the local lock is held: a claim won and then
+        # lost to a busy lock would leave the window swept by nobody.
         if job_claims is not None:
-            claim = await job_claims.claim(repo, "secops")
+            try:
+                claim = await job_claims.claim(repo, "secops")
+            except BaseException:  # cancelled mid-claim: do not keep the lock
+                state_db.release_lock(repo, session_id)
+                raise
             if claim.error is not None:
                 # Could not tell whether another machine has it: running
                 # could sweep twice, so this window is skipped and the
@@ -718,6 +733,7 @@ async def run_secops_all(
                     summary=f"Skipped {repo}: could not claim this sweep",
                     error=f"sweep claim failed: {claim.error}",
                 ))
+                state_db.release_lock(repo, session_id)
                 continue
             if not claim.won:
                 results.append(PipelineResult(
@@ -725,16 +741,8 @@ async def run_secops_all(
                     session_id=session_id,
                     summary=f"Skipped {repo}: swept by {claim.owner} this window",
                 ))
+                state_db.release_lock(repo, session_id)
                 continue
-
-        if not state_db.acquire_lock(repo, session_id):
-            results.append(PipelineResult(
-                success=False,
-                session_id=session_id,
-                summary=f"Could not acquire lock for {repo}",
-                error="Repository locked by another session",
-            ))
-            continue
 
         worktree_path: Path | None = None
         session_row_inserted = False
