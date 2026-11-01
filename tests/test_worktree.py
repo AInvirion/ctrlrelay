@@ -2022,8 +2022,9 @@ class TestFetchWithTheSessionsBranchCheckedOut:
         monkeypatch.setattr(wt, "_clone_url", lambda repo: str(origin))
 
         async def push_to_url(repo, branch, **kw):
-            # As the relay does: straight to the remote, so the bare
-            # clone's own copy of the branch does not move.
+            # As the relay does: straight to the remote URL. (The agent's
+            # commits already moved the clone's branch ref, which the
+            # worktree shares; the push itself does not touch it.)
             path = wt._get_bare_repo_path(repo)
             sha = self._git("rev-parse", f"refs/heads/{branch}", cwd=path).strip()
             subprocess.run(
@@ -2136,7 +2137,15 @@ class TestFetchWithTheSessionsBranchCheckedOut:
         self._git("worktree", "add", "-q", str(tmp_path / "s"), "fix/issue-4", cwd=bare)
         branch = "refs/heads/fix/issue-4"
         assert self._sha(bare, branch) == self._sha(origin, branch)
+        # Plain git refuses this fetch although nothing would change ...
+        refused = subprocess.run(
+            ["git", "fetch", "origin", "refs/heads/*:refs/heads/*"],
+            cwd=bare, capture_output=True, text=True,
+        )
+        assert refused.returncode != 0
+        assert "refusing to fetch into branch" in refused.stderr
 
+        # ... and the relay's fetch does not.
         await wt.ensure_bare_repo("owner/repo")
 
     @pytest.mark.asyncio
