@@ -1170,3 +1170,162 @@ def test_page_links_exactly_the_numbers_the_server_lists(
 def test_a_question_that_is_not_text_renders_as_no_text(question: object) -> None:
     parts = _run_js(["questionParts"], f"questionParts({json.dumps(question)}, [])")
     assert parts == [{"text": "", "url": None}]
+
+
+# --- #257: the Today counters open the events they count ----------------------
+
+
+def _today_db(tmp_path: Path) -> Path:
+    import sqlite3
+
+    from ctrlrelay.web.status import _local_day
+
+    now = int(time.time())
+    # Placed by the local day, not by "now minus a minute", so a run just
+    # after midnight does not put them in yesterday.
+    start, _end = _local_day(now)
+    at = start + 3_600
+    db = StateDB(tmp_path / "state.db")
+    db.record_event("failed", repo=ALPHA, issue_number=215, session_id="s-fail",
+                    detail={"pipeline": "dev", "exit_code": 1, "question": None}, ts=at)
+    db.record_event("failed", repo=ALPHA, issue_number=216, session_id="s-gone",
+                    detail={"pipeline": "dev", "exit_code": None, "question": None}, ts=at + 30)
+    db.record_event("blocked", repo=ALPHA, issue_number=217, session_id="s-q",
+                    detail={"pipeline": "dev", "exit_code": None,
+                            "question": "Merge or leave? token=ghp_" + "b" * 36},
+                    ts=at + 40)
+    db.record_event("merged", repo=ALPHA, issue_number=218, detail={"pr_number": 9}, ts=at + 50)
+    # A failure on the day before is not today's.
+    db.record_event("failed", repo=ALPHA, issue_number=1, ts=start - 3_600)
+    db.close()
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute(
+        "INSERT INTO sessions (id, pipeline, repo, issue_number, status, started_at, "
+        "claude_exit_code, summary, output_tail) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("s-fail", "dev", ALPHA, 215, "failed", at - 60, 1,
+         "Error: push refused token=ghp_" + "a" * 36, "x" * 3000 + "\nTraceback: boom"),
+    )
+    conn.commit()
+    conn.close()
+    return tmp_path / "state.db"
+
+
+def test_api_events_kind_lists_todays_failures_with_their_reason(
+    tmp_path: Path, serve,
+) -> None:
+    _today_db(tmp_path)
+    config = _config(tmp_path)
+    srv = serve(config, _tracker(config, tmp_path))
+
+    status, out = srv.json("/api/events?kind=failed&day=today")
+
+    assert status == 200 and out["error"] is None
+    assert [e["issue_number"] for e in out["events"]] == [216, 215]
+    gone, fail = out["events"]
+    reason = fail["reason"]
+    assert reason["exit_code"] == 1
+    assert reason["summary"].startswith("Error: push refused")
+    assert "ghp_" not in reason["summary"]  # redacted
+    assert reason["output_tail"].endswith("Traceback: boom")
+    assert len(reason["output_tail"]) <= 2100
+    assert fail["url"].endswith(f"/{ALPHA}/issues/215")
+    # A failure whose session row is gone says so rather than inventing one.
+    assert gone["reason"] == {"exit_code": None, "summary": None, "output_tail": None,
+                              "question": None, "session": "not found"}
+
+
+def test_api_events_kind_blocked_carries_the_question_and_merged_the_pr(
+    tmp_path: Path, serve,
+) -> None:
+    _today_db(tmp_path)
+    config = _config(tmp_path)
+    srv = serve(config, _tracker(config, tmp_path))
+
+    _, blocked = srv.json("/api/events?kind=blocked&day=today")
+    question = blocked["events"][0]["reason"]["question"]
+    assert question.startswith("Merge or leave?") and "ghp_" not in question
+    _, merged = srv.json("/api/events?kind=merged&day=today")
+    assert merged["events"][0]["url"].endswith(f"/{ALPHA}/pull/9")
+
+
+@pytest.mark.parametrize("query", [
+    "kind=nope&day=today", "kind=failed", "kind=failed&day=yesterday",
+    "kind=failed&kind=merged&day=today", "kind=failed&day=today&x=1",
+])
+def test_api_events_bad_kind_query_is_400(tmp_path: Path, serve, query: str) -> None:
+    _today_db(tmp_path)
+    config = _config(tmp_path)
+    srv = serve(config, _tracker(config, tmp_path))
+
+    status, out = srv.json(f"/api/events?{query}")
+
+    assert status == 400 and out["error"]
+
+
+def test_api_events_kind_unreadable_says_so(tmp_path: Path, serve) -> None:
+    config = _config(tmp_path, db=tmp_path / "missing" / "state.db")
+    srv = serve(config, _tracker(config, tmp_path))
+
+    status, out = srv.json("/api/events?kind=failed&day=today")
+
+    assert status == 200
+    assert out["events"] is None and "could not be read" in out["error"]
+
+
+def test_every_today_counter_asks_for_a_kind_the_server_lists() -> None:
+    import re
+
+    from ctrlrelay.web.status import DAY_KINDS
+
+    script = _script()
+    today = re.search(r"var TODAY = \[(.*?)\];", script, re.S).group(1)
+    keys = re.findall(r'\["([a-z_]+)", "', today)
+    mapping = dict(re.findall(r'([a-z_]+): "([a-z_]+)"',
+                              re.search(r"var TODAY_KIND = \{(.*?)\};", script, re.S).group(1)))
+    assert len(keys) == 6
+    assert {mapping.get(k, k) for k in keys} == set(DAY_KINDS)
+    # The cards are buttons that open the list.
+    render = _js_function(script, "renderToday")
+    assert 'el("button", "card")' in render and "loadTodayList(true)" in render
+    # Only the newest list request may draw.
+    load = _js_function(script, "loadTodayList")
+    assert load.count("seq === todaySeq") == 2 and "seq !== todaySeq" in load
+    assert "++todaySeq" in load
+    # A refresh does not start a second request while one is out.
+    assert "!force && todayBusy === kind" in load
+    # ... and reads again when the outstanding one lands.
+    assert "todayStale && todayOpen === kind" in load
+
+
+
+def test_the_feed_scrubs_credentials_from_event_details(tmp_path: Path, serve) -> None:
+    _today_db(tmp_path)
+    config = _config(tmp_path)
+    srv = serve(config, _tracker(config, tmp_path))
+
+    _, events = srv.json("/api/events")
+    _, status = srv.json("/api/status")
+
+    for feed in (events["events"], status["feed"]):
+        [blocked] = [e for e in feed if e["kind"] == "blocked"]
+        assert blocked["detail"]["question"].startswith("Merge or leave?")
+        assert "ghp_" not in json.dumps(feed)
+
+
+
+def test_api_events_with_since_stays_the_feed_even_with_kind(tmp_path: Path, serve) -> None:
+    _today_db(tmp_path)
+    config = _config(tmp_path)
+    srv = serve(config, _tracker(config, tmp_path))
+
+    status, out = srv.json("/api/events?since=0&kind=failed")
+
+    assert status == 200 and "feed_total" in out and "kind" not in out
+
+
+def test_a_long_question_is_cut_visibly(tmp_path: Path) -> None:
+    from ctrlrelay.web.status import REASON_SUMMARY_CHARS, _reason
+
+    reason = _reason({"s_id": "s", "blocked_question": "q" * 900}, {})
+    assert len(reason["question"]) == REASON_SUMMARY_CHARS
+    assert reason["question"].endswith("…")

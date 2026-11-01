@@ -90,6 +90,17 @@ ul.plain > li { padding: 7px 0; border-bottom: 1px solid var(--line); }
 ul.plain > li:last-child { border-bottom: 0; }
 .today { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .today .n { font-size: 22px; font-weight: 700; }
+.today button.card {
+  font: inherit; color: inherit; text-align: left; cursor: pointer; width: 100%;
+}
+.today button.card:hover { border-color: var(--accent); }
+.today button.card[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+#today-list { margin-top: 10px; }
+#today-list .reason { font-size: 13px; color: var(--muted); margin: 2px 0 0; }
+#today-list pre {
+  white-space: pre-wrap; word-break: break-word; font-size: 12px; margin: 6px 0 0;
+  max-height: 260px; overflow: auto; background: var(--tag); padding: 8px; border-radius: 6px;
+}
 .feed .when { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 4.5em; }
 .feed .detail { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
 a { color: var(--accent); text-decoration: none; }
@@ -108,8 +119,8 @@ a:hover, a:focus-visible { text-decoration: underline; }
 .usage .bar { height: 6px; background: var(--line, #ddd); border-radius: 3px; margin: 2px 0 6px; }
 .usage .bar > span { display: block; height: 100%; border-radius: 3px; background: currentColor; }
 .usage .bar.high { color: var(--bad); }
-.fleet { margin: 0 20px 12px; }
-.strip { display: flex; flex-wrap: wrap; gap: 10px; }
+.fleet { margin: 18px 20px 4px; }
+.strip { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
 .strip .machine { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
   min-width: 190px; background: var(--panel); font-size: 13px; }
 .strip .machine.bad { border-color: var(--bad); }
@@ -164,6 +175,7 @@ details > summary .count { font-weight: 400; margin-left: 6px; }
     <section>
       <h2>Today</h2>
       <div id="today"><p class="unknown">loading…</p></div>
+      <div id="today-list" aria-live="polite"></div>
     </section>
   </div>
   <div>
@@ -835,19 +847,119 @@ function renderUsage(data, now) {
   put(target, lines);
 }
 
+// The event kind each Today counter counts (#257); the counter's own key
+// differs only for messages.
+var TODAY_KIND = { messages_sent: "message_sent" };
+var todayOpen = null;
+// Each list request is numbered; only the newest one may draw, so a slow
+// answer for an earlier refresh or another counter never replaces a newer one.
+var todaySeq = 0;
+// The kind whose list request is still out. A refresh does not start
+// another for it (on a slow server every answer would be overtaken and the
+// list would stay at "loading…"); a click always does.
+var todayBusy = null;
+// A refresh skipped while a request was out: read again when it lands, so
+// the list does not lag the count by more than one answer.
+var todayStale = false;
+
 function renderToday(data) {
   var target = document.getElementById("today");
   var t = data.today || {};
   var grid = el("div", "today");
   TODAY.forEach(function (pair) {
     var v = t[pair[0]];
-    var cell = el("div", "card");
+    var kind = TODAY_KIND[pair[0]] || pair[0];
+    var cell = el("button", "card");
+    cell.type = "button";
+    cell.setAttribute("aria-pressed", todayOpen === kind ? "true" : "false");
+    cell.title = "Show today's " + pair[1];
     if (typeof v === "number") { cell.appendChild(el("div", "n", v)); }
     else { cell.appendChild(el("div", "n unknown", "unknown")); }
     cell.appendChild(el("div", "muted", pair[1]));
+    cell.addEventListener("click", function () {
+      todayOpen = todayOpen === kind ? null : kind;
+      renderToday(lastData || data);
+      if (todayOpen) { put(document.getElementById("today-list"), [empty("loading…")]); }
+      loadTodayList(true);
+    });
     grid.appendChild(cell);
   });
   put(target, [grid]);
+}
+
+// The list behind the open counter, read again with every refresh so it
+// follows the count.
+function loadTodayList(force) {
+  var target = document.getElementById("today-list");
+  var kind = todayOpen;
+  if (!kind) { todaySeq++; todayBusy = null; put(target, []); return; }
+  if (!force && todayBusy === kind) { todayStale = true; return; }
+  var seq = ++todaySeq;
+  todayBusy = kind;
+  todayStale = false;
+  fetch("/api/events?kind=" + encodeURIComponent(kind) + "&day=today", { cache: "no-store" })
+    .then(function (resp) { return resp.json(); })
+    .then(function (data) { if (seq === todaySeq) { renderTodayList(data); } })
+    .catch(function (err) {
+      if (seq === todaySeq) {
+        put(target, [unknown("unknown: the list could not be read (" +
+          (err && err.message ? err.message : "error") + ")")]);
+      }
+    })
+    .then(function () {
+      if (seq !== todaySeq) { return; }
+      todayBusy = null;
+      if (todayStale && todayOpen === kind) { loadTodayList(false); }
+    });
+}
+
+function renderTodayList(data) {
+  var target = document.getElementById("today-list");
+  if (!Array.isArray(data.events)) {
+    put(target, [unknown("unknown: " + (data.error || "the list could not be read"))]);
+    return;
+  }
+  if (data.events.length === 0) { put(target, [empty("none today")]); return; }
+  var list = el("ul", "plain");
+  data.events.forEach(function (ev) {
+    var li = el("li", "card");
+    var row = el("div", "row");
+    row.appendChild(el("span", "when", clock(ev.ts)));
+    if (ev.repo) {
+      row.appendChild(ghLink(ev.url,
+        ev.repo + (typeof ev.issue_number === "number" ? "#" + ev.issue_number : ""), "repo"));
+    }
+    if (ev.session_id) { row.appendChild(el("span", "muted", ev.session_id)); }
+    li.appendChild(row);
+    var r = ev.reason;
+    if (r) {
+      if (r.session === "not found") {
+        li.appendChild(el("p", "reason", "the run's record is gone"));
+      }
+      if (typeof r.exit_code === "number") {
+        li.appendChild(el("p", "reason", "exit code " + r.exit_code));
+      }
+      if (r.question) { li.appendChild(el("p", "reason", "asked: " + r.question)); }
+      if (r.summary) { li.appendChild(el("p", "reason", r.summary)); }
+      if (r.output_tail) {
+        var more = el("details");
+        more.appendChild(el("summary", null, "output"));
+        more.appendChild(el("pre", null, r.output_tail));
+        li.appendChild(more);
+      }
+      if (!r.question && !r.summary && !r.output_tail && typeof r.exit_code !== "number"
+          && r.session !== "not found") {
+        li.appendChild(el("p", "reason", "no reason was recorded"));
+      }
+    } else {
+      var text = detailText(ev.detail);
+      if (text) { li.appendChild(el("div", "detail", text)); }
+    }
+    list.appendChild(li);
+  });
+  var note = data.truncated === true
+    ? el("p", "empty", "showing newest " + data.events.length + " of " + data.total) : null;
+  put(target, note ? [note, list] : [list]);
 }
 
 function detailText(detail) {
@@ -917,6 +1029,7 @@ function render(data) {
   renderWaiting(data);
   renderSkipped(data);
   renderToday(data);
+  loadTodayList();
   renderFleet(data, now);
   renderUsage(data, now);
   renderServer(data);

@@ -87,6 +87,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import urllib.parse
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
@@ -369,9 +370,23 @@ def _event_url(repo: Any, issue_number: Any, detail: Any) -> str | None:
     return github_url(repo, issue_number)
 
 
+def _scrubbed(detail: Any) -> Any:
+    """``detail`` with credential shapes removed from its text: a question
+    the agent asked is stored as it wrote it, and the page shows it."""
+    from ctrlrelay.core.redact import redact_secrets
+
+    if isinstance(detail, dict):
+        return {k: _scrubbed(v) for k, v in detail.items()}
+    if isinstance(detail, list):
+        return [_scrubbed(v) for v in detail]
+    if isinstance(detail, str):
+        return redact_secrets(detail)
+    return detail
+
+
 def _event(row: dict[str, Any]) -> dict[str, Any]:
     ts = int(row["ts"])
-    detail = _detail(row["detail"])
+    detail = _scrubbed(_detail(row["detail"]))
     return {
         "ts": ts,
         "time": _iso(ts),
@@ -789,6 +804,103 @@ def list_feed(*, db_path: Path, since_ts: int, limit: int | None = None) -> dict
         "feed_truncated": total > len(events),
         "limit": limit,
         "error": None,
+    }
+
+
+# The kinds a Today counter counts, which ``list_day_events`` lists (#257).
+DAY_KINDS = frozenset(_TODAY)
+# How much of a failed run's stored output and summary a row carries.
+REASON_TAIL_CHARS = 2000
+REASON_SUMMARY_CHARS = 500
+
+
+def _read_day_events(
+    conn: sqlite3.Connection, kind: str, start: int, end: int, limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    rows = conn.execute(
+        """SELECT e.ts, e.kind, e.repo, e.issue_number, e.session_id, e.detail,
+                  s.id AS s_id, s.claude_exit_code, s.summary, s.output_tail,
+                  s.blocked_question
+           FROM events e LEFT JOIN sessions s ON s.id = e.session_id
+           WHERE e.kind = ? AND e.ts >= ? AND e.ts < ?
+           ORDER BY e.ts DESC, e.id DESC LIMIT ?""",
+        (kind, start, end, int(limit)),
+    ).fetchall()
+    (total,) = conn.execute(
+        "SELECT count(*) FROM events WHERE kind = ? AND ts >= ? AND ts < ?",
+        (kind, start, end),
+    ).fetchone()
+    out = []
+    for r in rows:
+        row = dict(r)
+        event = _event(row)
+        if kind in ("failed", "blocked"):
+            event["reason"] = _reason(row, event["detail"])
+        out.append(event)
+    return out, int(total)
+
+
+def _cut(text: str, limit: int) -> str:
+    """``text`` up to ``limit`` characters, ending in "…" when cut."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _reason(row: dict[str, Any], detail: Any) -> dict[str, Any]:
+    """Why a run failed or stopped, from what the relay stored: the exit
+    code, its summary and output tail, and the question asked, each
+    scrubbed of credential shapes again here. ``session`` says when the run's row is gone."""
+    from ctrlrelay.core.redact import redact_secrets, tail
+
+    detail = detail if isinstance(detail, dict) else {}
+    exit_code = detail.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        exit_code = row.get("claude_exit_code")
+    question = detail.get("question") or row.get("blocked_question")
+    summary = row.get("summary")
+    output = row.get("output_tail")
+    reason: dict[str, Any] = {
+        "exit_code": exit_code if isinstance(exit_code, int) else None,
+        "summary": (
+            _cut(redact_secrets(summary), REASON_SUMMARY_CHARS)
+            if isinstance(summary, str) and summary else None
+        ),
+        "output_tail": (
+            tail(redact_secrets(output), REASON_TAIL_CHARS)
+            if isinstance(output, str) and output else None
+        ),
+        "question": (
+            _cut(redact_secrets(question), REASON_SUMMARY_CHARS)
+            if isinstance(question, str) and question else None
+        ),
+    }
+    if row.get("s_id") is None:
+        reason["session"] = "not found"
+    return reason
+
+
+def list_day_events(
+    *, db_path: Path, kind: str, now: int | None = None, limit: int | None = None,
+) -> dict:
+    """Today's events of one counted ``kind``, newest first, for the Today
+    counters (#257): ``{"kind", "events", "total", "truncated", "error"}``.
+    A failed or blocked event carries ``reason``. ``events`` and ``total``
+    are ``null`` when they could not be read, never an empty list."""
+    if limit is None:
+        limit = FEED_LIMIT
+    start, end = _local_day(int(now if now is not None else time.time()))
+    try:
+        events, total = _read(
+            Path(db_path),
+            lambda conn: _read_day_events(conn, kind, start, end, limit),
+        )
+    except Exception as exc:
+        return {
+            "kind": kind, "events": None, "total": None, "truncated": False,
+            "error": f"events could not be read ({db_path}): {type(exc).__name__}: {exc}",
+        }
+    return {
+        "kind": kind, "events": events, "total": total,
+        "truncated": total > len(events), "error": None,
     }
 
 
