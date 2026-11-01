@@ -266,7 +266,9 @@ class TestRunDevIssueReconcilesTheClaim:
     about.
     """
 
-    async def _run(self, tmp_path: Path, *, checkpoint, exit_code: int):
+    async def _run(
+        self, tmp_path: Path, *, checkpoint, exit_code: int, verify_raises=None,
+    ):
         from ctrlrelay.core.state import StateDB
         from ctrlrelay.pipelines.dev import run_dev_issue
 
@@ -278,6 +280,8 @@ class TestRunDevIssueReconcilesTheClaim:
         from ctrlrelay.core.pr_verifier import VerificationResult
 
         verifier.verify.return_value = VerificationResult(ready=True)
+        if verify_raises is not None:
+            verifier.verify.side_effect = verify_raises
 
         with (
             patch.object(worktree, "ensure_bare_repo", new_callable=AsyncMock),
@@ -381,6 +385,31 @@ class TestRunDevIssueReconcilesTheClaim:
         )
         assert result.success
         assert _retraction_bodies(github) == []
+
+    @pytest.mark.asyncio
+    async def test_an_exception_after_the_pr_opened_names_the_pr(
+        self, tmp_path: Path
+    ) -> None:
+        """#253: the run opened its pull request, then verification
+        raised. The retraction said no pull request was opened and the
+        issue was free to pick up, which invites a duplicate."""
+        from ctrlrelay.core.worktree import WorktreeError
+
+        result, github = await self._run(
+            tmp_path,
+            checkpoint={
+                "status": "DONE",
+                "summary": "done",
+                "outputs": {},
+            },
+            exit_code=0,
+            verify_raises=WorktreeError("git failed: fatal: refusing to fetch"),
+        )
+        assert not result.success
+        [body] = _retraction_bodies(github)
+        assert "Pull request #42 was opened" in body
+        assert "no pull request was opened" not in body
+        assert "free to pick up" not in body
 
     @pytest.mark.asyncio
     async def test_a_blocked_run_does_not_retract(
