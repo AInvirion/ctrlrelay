@@ -69,8 +69,8 @@ def node_activity(
 
     ``running`` and ``needs_you`` are the page's own sections; ``None``
     means that part of the state database could not be read. If either is
-    ``None``, the state is ``unknown`` and slots and claims are ``None``,
-    never empty or idle.
+    ``None``, slots and claims are ``None``, never empty, and the state is
+    ``unknown`` unless the heartbeat already makes it ``silent``.
 
     Precedence: ``silent`` (the daemon's heartbeat is missing or older than
     ``silent_after``; nothing else here can tell a stopped poller from a
@@ -340,13 +340,24 @@ class PeerReader:
         self._clock = clock
         self._lock = threading.Lock()
         self._entries: dict[str, dict[str, Any]] = {}
-        self._in_flight: dict[str, float] = {}
+        # Per peer: (when the read started, its identity) while one runs.
+        self._in_flight: dict[str, tuple[float, object]] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="ctrlrelay-web-fleet", daemon=True,
         )
 
-    def _publish(self, url: str, data: dict[str, Any] | None, error: str | None) -> None:
+    def _publish(
+        self,
+        url: str,
+        data: dict[str, Any] | None,
+        error: str | None,
+        *,
+        only_if_running: object | None = None,
+    ) -> None:
+        """Record one peer's entry. With ``only_if_running``, only while
+        that read is still unfinished: a "timeout" must never land on top
+        of the answer that read just delivered."""
         with self._lock:
             previous = self._entries.get(url)
         try:
@@ -361,16 +372,21 @@ class PeerReader:
                 silent_after=self._silent_after,
             )
         with self._lock:
+            if only_if_running is not None:
+                running = self._in_flight.get(url)
+                if running is None or running[1] is not only_if_running:
+                    return
             self._entries[url] = entry
 
-    def _read(self, url: str) -> None:
+    def _read(self, url: str, token: object) -> None:
         try:
             data, error = self._fetch(url, timeout=self._timeout), None
         except Exception as exc:
             data, error = None, _peer_error(exc)
         self._publish(url, data, error)
         with self._lock:
-            self._in_flight.pop(url, None)
+            if self._in_flight.get(url, (0, None))[1] is token:
+                del self._in_flight[url]
 
     def read_once(self, wait: bool = True) -> None:
         """Start a read of every peer not already being read, and report
@@ -379,27 +395,28 @@ class PeerReader:
         now = self._clock()
         threads = []
         for url in self.peers:
+            token = object()
             with self._lock:
-                started = self._in_flight.get(url)
-                if started is None:
-                    self._in_flight[url] = now
-            if started is not None:
-                if now - started > self._timeout * 2:
-                    self._publish(url, None, "timeout")
+                running = self._in_flight.get(url)
+                if running is None:
+                    self._in_flight[url] = (now, token)
+            if running is not None:
+                if now - running[0] > self._timeout * 2:
+                    self._publish(url, None, "timeout", only_if_running=running[1])
                 continue
             t = threading.Thread(
-                target=self._read, args=(url,), daemon=True,
+                target=self._read, args=(url, token), daemon=True,
                 name="ctrlrelay-web-peer",
             )
             t.start()
-            threads.append((url, t))
+            threads.append((url, t, token))
         if not wait:
             return
         deadline = time.monotonic() + self._timeout * 2
-        for url, t in threads:
+        for url, t, token in threads:
             t.join(max(0.0, deadline - time.monotonic()))
             if t.is_alive():
-                self._publish(url, None, "timeout")
+                self._publish(url, None, "timeout", only_if_running=token)
 
     def snapshot(self) -> dict[str, Any]:
         now = self._clock()

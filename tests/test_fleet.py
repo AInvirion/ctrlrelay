@@ -293,9 +293,11 @@ class TestRoundOneFixes:
 
     def test_a_healthy_peer_is_published_while_another_is_stuck(self) -> None:
         release = threading.Event()
+        stuck_calls = []
 
         def fetch(url, *, timeout):
             if url == "http://stuck":
+                stuck_calls.append(1)
                 release.wait(5)
                 raise TimeoutError
             return _status("node-c", beat=time.time())
@@ -312,6 +314,7 @@ class TestRoundOneFixes:
         assert ok["reachable"] and stuck["state"] == "not read yet"
         # And a stuck peer is not read twice at once.
         reader.read_once(wait=False)
+        assert len(stuck_calls) == 1
         release.set()
         reader.stop()
 
@@ -407,3 +410,15 @@ class TestRoundTwoFixes:
         e = peer_entry("http://b", data={"host": "b", "node": {"name": "b", "claims": claims}},
                        error=None, checked_at=NOW, previous=None, silent_after=300)
         assert e["node"]["claims"] is None
+
+
+
+class TestRoundThreeFixes:
+    def test_a_timeout_never_lands_on_an_answer_that_arrived(self) -> None:
+        reader = PeerReader(["http://b"], interval_s=60, timeout_s=1, silent_after=300,
+                            fetch=lambda url, *, timeout: _status("node-b", beat=time.time()))
+        token = object()
+        reader._in_flight["http://b"] = (time.time(), token)
+        reader._read("http://b", token)  # the answer arrives first ...
+        reader._publish("http://b", None, "timeout", only_if_running=token)  # ... then the deadline
+        assert reader.snapshot()["peers"][0]["reachable"] is True
