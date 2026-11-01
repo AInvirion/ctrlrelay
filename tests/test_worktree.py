@@ -2093,3 +2093,20 @@ class TestFetchWithTheSessionsBranchCheckedOut:
         assert len(prompts) == 2, result.error
         assert "BEHIND" in prompts[1]
         assert result.success, result.error
+
+    @pytest.mark.asyncio
+    async def test_prune_keeps_a_checked_out_branch_origin_deleted(
+        self, tmp_path: Path,
+    ) -> None:
+        """A branch deleted on GitHub while a session still has it checked
+        out is kept (the worktree is using it); others are still pruned."""
+        wt, origin, bare = self._setup(tmp_path)
+        self._git("branch", "other", cwd=origin)
+        await wt.ensure_bare_repo("owner/repo")
+        assert "other" in self._git("branch", "--list", "other", cwd=bare)
+        self._git("branch", "-D", "fix/issue-4", "other", cwd=origin)
+
+        await wt.ensure_bare_repo("owner/repo")
+
+        assert self._git("branch", "--list", "fix/issue-4", cwd=bare).strip()
+        assert not self._git("branch", "--list", "other", cwd=bare).strip()
