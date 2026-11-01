@@ -108,10 +108,10 @@ def _git_failure_detail(
 ) -> str:
     """Both streams of a failed git command, scrubbed and capped.
 
-    stderr first: it carries git's own ``fatal:``/``error:`` lines and
-    is what every existing caller's matcher reads. stdout follows,
-    labelled, whenever it said anything — which for a ``--porcelain``
-    command is where the answer is.
+    stderr first and whole: it carries git's own ``fatal:``/``error:``
+    lines and is what every existing caller's matcher reads. stdout
+    follows, labelled and capped, whenever it said anything — which for a
+    ``--porcelain`` command is where the answer is.
 
     Redaction runs before the cap (see :mod:`ctrlrelay.core.redact`):
     clipping first can store half a token, and half a token no longer
@@ -124,13 +124,15 @@ def _git_failure_detail(
     from ctrlrelay.core.redact import redact_secrets, tail
 
     parts: list[str] = []
-    for label, raw in (("", stderr), ("stdout: ", stdout)):
-        text = raw.strip()
-        if not text:
-            continue
-        parts.append(
-            label + tail(redact_secrets(text), _GIT_ERROR_TAIL_CHARS)
-        )
+    # stderr whole, as the message carried it before stdout was added, so
+    # a matcher looking for git's words anywhere in it still finds them;
+    # stdout capped.
+    err = stderr.strip()
+    if err:
+        parts.append(redact_secrets(err))
+    out = stdout.strip()
+    if out:
+        parts.append("stdout: " + tail(redact_secrets(out), _GIT_ERROR_TAIL_CHARS))
     if not parts:
         return f"exited {returncode} with no output"
     return "; ".join(parts)
@@ -156,6 +158,8 @@ def parse_push_rejection(porcelain_stdout: str) -> str | None:
     (reason)``), because the flag and the reason are in it too and a
     caller should not have to know which form it has.
     """
+    from ctrlrelay.core.redact import redact_secrets
+
     reasons: list[str] = []
     for raw in porcelain_stdout.splitlines():
         line = raw.strip()
@@ -165,12 +169,17 @@ def parse_push_rejection(porcelain_stdout: str) -> str | None:
             fields = [f.strip() for f in raw.split("\t")]
             ref = fields[1] if len(fields) > 1 else ""
             summary = fields[2] if len(fields) > 2 else ""
-            reasons.append(f"{ref} {summary}".strip() or line)
+            # The ref whole, the remote's words capped: a long ref must
+            # not crowd out the reason.
+            text = f"{ref} {summary[:_PUSH_REASON_MAX_CHARS]}".strip() or line
         else:
-            reasons.append(line.lstrip("! ").strip() or line)
+            text = line.lstrip("! ").strip() or line
+        # Scrubbed before anything is cut: what the remote says can carry
+        # a credential (a URL with a token in it).
+        reasons.append(redact_secrets(text))
     if not reasons:
         return None
-    return "; ".join(reasons)[:_PUSH_REASON_MAX_CHARS]
+    return "; ".join(reasons)
 
 
 class WorktreeError(Exception):
@@ -1257,11 +1266,13 @@ class WorktreeManager:
                 reason = parse_push_rejection(exc.stdout)
                 if reason is None:
                     raise
-                said = "; ".join(
+                from ctrlrelay.core.redact import redact_secrets, tail
+
+                said = tail(redact_secrets("; ".join(
                     line.strip()
                     for line in exc.stderr.splitlines()
                     if line.strip().startswith("remote:")
-                )
+                )), _GIT_ERROR_TAIL_CHARS)
                 _logger.error(
                     "publish.push.rejected",
                     extra={

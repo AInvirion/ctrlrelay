@@ -135,13 +135,16 @@ against the head this session last pushed (recorded in the state DB). An
 open PR found for the branch is reused only if its head repo is this repo and
 its base is the default branch.
 
-A push the **remote** refuses is a different thing, logged as
-`publish.push.rejected` with the per-ref reason git gave — a stale lease, a
-non-fast-forward, a branch-protection or repository-rule refusal. That reason
+A push git rejects for a ref is a different thing, logged as
+`publish.push.rejected` with the per-ref reason git gave. Some are decided by
+git itself before the remote is asked (a stale lease, a non-fast-forward:
+`[rejected]`), others by the remote (a branch-protection or repository-rule
+refusal: `[remote rejected]`). That reason
 comes from the `!` line of `git push --porcelain`, which git writes to
 **stdout**; stderr carries only `error: failed to push some refs to '<url>'`.
-Both streams of any failing git command now reach the error it raises, and the
-reason reaches `dev.publish.failed` as its own `push_rejection` field, so a
+Both streams of any failing git command now reach the error it raises (stderr
+whole, stdout capped, both scrubbed of credential shapes), and the reason
+reaches `dev.publish.failed` as its own `push_rejection` field, so a
 rejection is not reported as a URL and nothing else.
 
 Text the agent wrote is posted with `@`-mentions and

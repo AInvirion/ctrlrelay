@@ -2323,4 +2323,30 @@ class TestParsePushRejection:
         text = "!\tr:r\t[remote rejected] (" + "x" * 5000 + ")"
         reason = parse_push_rejection(text)
         assert reason is not None
-        assert len(reason) == _PUSH_REASON_MAX_CHARS
+        # The remote's words are capped; the ref ("r:r") is kept whole.
+        assert reason.startswith("r:r [remote rejected] (")
+        assert len(reason) == len("r:r ") + _PUSH_REASON_MAX_CHARS
+
+
+class TestPushErrorReviewFixes:
+    def test_the_rejection_reason_is_scrubbed(self) -> None:
+        from ctrlrelay.core.worktree import parse_push_rejection
+
+        token = "ghp_" + "d" * 36
+        out = f"!\trefs/heads/x:refs/heads/x\t[remote rejected] (see https://{token}@example.com)\n"
+        reason = parse_push_rejection(out)
+        assert reason is not None and token not in reason and "remote rejected" in reason
+
+    def test_a_long_ref_keeps_its_reason(self) -> None:
+        from ctrlrelay.core.worktree import parse_push_rejection
+
+        ref = "refs/heads/" + "a" * 600
+        reason = parse_push_rejection(f"!\t{ref}:{ref}\t[rejected] (stale info)\n")
+        assert reason.endswith("[rejected] (stale info)") and ref in reason
+
+    def test_stderr_is_kept_whole_for_matchers(self) -> None:
+        from ctrlrelay.core.worktree import _git_failure_detail
+
+        stderr = "fatal: 'x' is already checked out at '/w'\n" + "noise\n" * 400
+        detail = _git_failure_detail("", stderr, 128)
+        assert "already checked out" in detail
