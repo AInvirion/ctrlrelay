@@ -734,9 +734,10 @@ back. Up to 3 runs in all, counted in `publish_failures` in the same
 file, and the retraction comment on the issue says the relay will
 return rather than asking you to re-assign it. After the third run the
 issue stays in `seen_issues` and the relay says so **on the issue** —
-the commits are still on the run branch in the local checkout, nothing
-has been pushed, and the fix is to clear the cause and delete the
-number as above.
+the commits are still on the run branch in the local checkout (on
+GitHub too, if only opening the pull request failed), and the fix is to
+clear the cause and delete the number as above. If that comment cannot
+be posted, the chat line says so.
 
 A push the relay **refuses** (a protected or default branch, a base it
 did not expect, somebody else's commits on the branch) is not retried

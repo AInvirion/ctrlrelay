@@ -834,6 +834,10 @@ class IssuePoller:
             del counts[issue_number]
             self._save_state_best_effort()
 
+    def publish_failure_count(self, repo: str, issue_number: int) -> int:
+        """How many publish failures are counted for ``issue_number``."""
+        return self.publish_failures.get(repo, {}).get(issue_number, 0)
+
     def record_publish_failure(self, repo: str, issue_number: int) -> int:
         """Count one run of ``issue_number`` whose agent finished but
         whose branch the relay could not publish, and return how many

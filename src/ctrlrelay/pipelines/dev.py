@@ -541,15 +541,23 @@ def publish_retries_exhausted_comment(
     ``claim_is_live`` still reads the claim as retracted and
     ``format_issue_comments`` keeps it out of any agent's prompt.
     """
-    why = (error.strip().splitlines() or ["no error recorded"])[0][:200]
+    from ctrlrelay.core.redact import redact_secrets
+
+    # The error can carry text from outside the relay (git's and the
+    # remote's own words): scrubbed, one line, and shown as code so it
+    # cannot format the comment or mention anyone.
+    first = (error.strip().splitlines() or ["no error recorded"])[0]
+    why = redact_secrets(first).replace("`", "'")[:200]
     return (
         f"⛔ **CTRLRelay has stopped retrying this issue.** The agent "
         f"finished, but the relay could not publish the branch "
         f"{attempts} times in a row.\n\n"
         f"- Session: `{session_id}`\n"
-        f"- Last error: {why}\n\n"
+        f"- Last error: `{why}`\n\n"
         f"The commits are on the run branch in this machine's checkout "
-        f"of {repo}; nothing has been pushed. Fix the cause, then "
+        f"of {repo}. If the push itself failed they are not on GitHub; "
+        f"if only opening the pull request failed, the branch may "
+        f"already be there. Fix the cause, then "
         f"remove `{issue_number}` from `seen_issues` in "
         f"`poller_state.json` and restart the relay.\n\n"
         f"{AGENT_OUTCOME_MARKER}"

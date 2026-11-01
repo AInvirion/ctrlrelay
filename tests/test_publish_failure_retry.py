@@ -347,3 +347,52 @@ class TestRunDevIssueFlagsThePublishFailure:
         [body] = _retraction_bodies(github)
         assert "next poll" not in body
         assert "poller_state.json" in body
+
+
+class TestReviewFixes:
+    def test_the_stop_notice_shows_the_error_as_inert_scrubbed_code(self) -> None:
+        from ctrlrelay.pipelines.dev import publish_retries_exhausted_comment
+
+        body = publish_retries_exhausted_comment(
+            "s", repo=REPO, issue_number=7, attempts=3,
+            error="push rejected: ``# Pwned`` @someone token=ghp_" + "c" * 36 + "\nsecond",
+        )
+        [line] = [ln for ln in body.splitlines() if ln.startswith("- Last error:")]
+        assert line.startswith("- Last error: `") and line.endswith("`")
+        inner = line[len("- Last error: `"):-1]
+        assert "`" not in inner and "ghp_" not in inner and "second" not in body
+
+    def test_the_stop_notice_does_not_claim_nothing_was_pushed(self) -> None:
+        from ctrlrelay.pipelines.dev import publish_retries_exhausted_comment
+
+        body = publish_retries_exhausted_comment(
+            "s", repo=REPO, issue_number=7, attempts=3, error="gh pr create failed",
+        )
+        assert "nothing has been pushed" not in body
+        assert "may already be there" in body
+
+    @pytest.mark.asyncio
+    async def test_a_failed_stop_notice_is_said_in_chat(self, tmp_path: Path) -> None:
+        poller = _poller(tmp_path / "state.json")
+        github = AsyncMock()
+        github.comment_on_issue.side_effect = RuntimeError("gh down")
+        message = None
+        for _ in range(PUBLISH_ATTEMPTS):
+            poller.mark_seen(REPO, 7)
+            message = await settle_publish_failure(github, poller, REPO, 7, _publish_failed())
+        assert "could not be posted on the issue" in message
+
+    @pytest.mark.asyncio
+    async def test_the_issue_is_unmarked_before_the_count_is_saved(
+        self, tmp_path: Path,
+    ) -> None:
+        """A stop between the two saves costs one extra try, never a
+        stranded issue."""
+        poller = _poller(tmp_path / "state.json")
+        order: list[str] = []
+        real_unmark, real_record = poller.unmark_seen, poller.record_publish_failure
+        poller.unmark_seen = lambda r, n: (order.append("unmark"), real_unmark(r, n))[1]
+        poller.record_publish_failure = lambda r, n: (order.append("count"), real_record(r, n))[1]
+        poller.mark_seen(REPO, 7)
+        await settle_publish_failure(AsyncMock(), poller, REPO, 7, _publish_failed())
+        assert order == ["unmark", "count"]

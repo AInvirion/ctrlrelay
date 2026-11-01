@@ -1258,11 +1258,15 @@ async def settle_publish_failure(
             f"the branch, so it is not retrying. {result.error or ''}".strip()
         )
 
-    attempts = poller.record_publish_failure(repo, issue_number)
+    # Un-marked before the count is saved: a stop between the two saves
+    # then costs one extra try rather than a stranded issue.
+    attempts = poller.publish_failure_count(repo, issue_number) + 1
     retrying = attempts < PUBLISH_ATTEMPTS
     if retrying:
         poller.unmark_seen(repo, issue_number)
-    else:
+    poller.record_publish_failure(repo, issue_number)
+    notice_failed = False
+    if not retrying:
         poller.clear_publish_failures(repo, issue_number)
         try:
             await github.comment_on_issue(
@@ -1284,10 +1288,19 @@ async def settle_publish_failure(
                 issue_number=issue_number,
                 error=f"{type(e).__name__}: {str(e)[:200]}",
             )
-    return publish_failure_message(
+            notice_failed = True
+    message = publish_failure_message(
         repo, issue_number, result.error or "",
         attempts=attempts, retrying=retrying,
     )
+    if notice_failed:
+        # The issue's last word is still the retraction promising a
+        # retry; chat is now the only place that says it stopped.
+        message += (
+            " The note saying so could not be posted on the issue, which "
+            "still promises a retry."
+        )
+    return message
 
 
 def reclone_message(repo: str, set_aside: Path) -> str:
