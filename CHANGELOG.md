@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-11-01
+
+Status page changes only. **No config edit is required.**
+
+### Added
+
+- The Today counters (dispatched, PRs opened, merged, failed, blocked,
+  messages sent) are buttons: each opens today's events of that kind under
+  the counters. A failed run shows why (exit code, the run's summary and its
+  stored output), a blocked one the question, PRs link to the PR. New
+  `/api/events?kind=<kind>&day=today` (#271, closes #257)
+
+### Changed
+
+- A GitHub API bucket whose reset time has passed since the last read shows
+  as "refilled at <time>, not read since" instead of "unknown"; search,
+  which refills every minute, usually shows that way (#272)
+- More space under the header and between the Machines strip and "Who has
+  what" (#271)
+
+### Fixed
+
+- The live feed now scrubs credential shapes from event details: a
+  question an agent asked could show a token on the page (#271)
+
 ## [0.16.1] - 2026-11-01
 
 Fixes the chat bridge, which did not start on 0.16.0. **No config edit is
@@ -1976,7 +2001,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.2...HEAD
+[0.16.2]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.14.0...v0.15.0
