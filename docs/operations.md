@@ -285,6 +285,20 @@ Added in #247:
 |---|---|
 | `node` | This machine's own block: `name` (`node_id`); `usage`, the agent subscription's usage as the last run or probe read it: `status`, `read_at`, and for `five_hour` and `seven_day` each `{used (0 to 1), resets_at}`, or `"unknown"` for a window it could not read; the whole `usage` is `"unknown"` before any reading. `pause_at` is `usage.pause_at`, and `paused` is `{reason, until}` while the machine takes no new issues, else `null`. The page shows it in the **Usage** box. `node` is `null`, with a line in `errors`, only if reading it failed outright. |
 
+Added in #237: `node.github_api` is the account's GitHub API budget as this
+machine last read it: `read_at`, and for `core`, `search` and `graphql` each
+`{remaining, limit, resets_at, state}` with `state` one of `ok`, `low`, `out`,
+or `unknown` once its reset time has passed (the numbers are then old), or
+`"unknown"` in place of the object for a bucket it could not read; the whole value is `"unknown"`
+before any reading. The page shows it in the **Usage** box. Low and used-up
+buckets are described in [configuration: github_api]({{ '/configuration/' | relative_url }}#github_api).
+Which bucket a `gh` command spends is worked out from the command where the
+command says: `gh api` REST paths are `core`, `gh api graphql` is `graphql`,
+search paths and `gh search` are `search`. The other `gh` commands (`issue`,
+`pr`, `repo`, `run`) do not say which endpoints they call, so they are not
+held back; if GitHub refuses one as rate limited, the budget is read again at
+once.
+
 **Pausing for usage.** Every agent run reports the subscription's usage, and
 an idle machine refreshes it with one tiny call every `usage.probe_minutes`.
 When the 5-hour or 7-day window reaches `usage.pause_at`, or the status is not

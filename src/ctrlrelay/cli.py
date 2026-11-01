@@ -2631,7 +2631,7 @@ def poller_start(
             usage_store=usage_store,
         )
 
-        async def _usage_notice(text: str) -> None:
+        async def _chat_notice(text: str) -> None:
             transport = await connect_notify_transport(config)
             if transport is None:
                 return
@@ -2655,9 +2655,23 @@ def poller_start(
             usage_deferred.clear()
 
         usage_gate = UsageGate(
-            usage_store, threshold=config.usage.pause_at, notify=_usage_notice,
+            usage_store, threshold=config.usage.pause_at, notify=_chat_notice,
             on_resume=_wake_usage_deferred,
         )
+
+        # The account's GitHub API budget (#237): read on a schedule, shown
+        # on the page, and a gate on this process's `gh` calls whose bucket
+        # is known, so those fail fast as rate limited until the reset.
+        from ctrlrelay.core.github_budget import BudgetStore, GitHubBudget
+
+        github_budget = GitHubBudget(
+            BudgetStore.beside(config.paths.state_db),
+            low_at=config.github_api.low_at,
+            fetch=github.rate_limit,
+            notify=_chat_notice,
+            max_age=3 * config.github_api.check_minutes * 60,
+        )
+        github.budget = github_budget
         worktree = WorktreeManager(
             worktrees_dir=config.paths.worktrees,
             bare_repos_dir=config.paths.bare_repos,
@@ -3718,6 +3732,14 @@ def poller_start(
                 func=_run_usage_probe,
             )
             scheduler.add_cron_job(
+                name="github_budget",
+                cron_expr=(
+                    "0 * * * *" if config.github_api.check_minutes == 60
+                    else f"*/{config.github_api.check_minutes} * * * *"
+                ),
+                func=github_budget.refresh,
+            )
+            scheduler.add_cron_job(
                 name="question_expiry_sweeper",
                 cron_expr="0 * * * *",
                 func=_run_question_expiry_sweeper,
@@ -3841,8 +3863,13 @@ def poller_start(
                     )
 
             try:
+                await github_budget.refresh()
                 await run_poll_loop(
                     poller=poller, handler=handle_issue, interval=interval,
+                    interval_scale=lambda: (
+                        config.github_api.slow_factor
+                        if github_budget.is_low() else 1.0
+                    ),
                 )
             finally:
                 # Scheduler shutdown is async so it can cancel + await any
@@ -4121,8 +4148,25 @@ def web_start(
                 f"[red]Cannot listen on {config.web.host}:{config.web.port}:[/red] {e}"
             )
             raise typer.Exit(1)
+        from ctrlrelay.core.github_budget import LOW, OUT, BudgetStore
+
+        budget_store = BudgetStore.beside(config.paths.state_db)
+
+        def _budget_is_low() -> bool:
+            reading = budget_store.read(
+                max_age=3 * config.github_api.check_minutes * 60,
+            )
+            if reading is None:
+                return False
+            now = time.time()
+            return any(
+                b.state(config.github_api.low_at, now) in (LOW, OUT)
+                for b in reading.buckets.values()
+            )
+
         refresher = WaitingRefresher(
             tracker, interval_s=config.web.github_check_seconds,
+            budget_is_low=_budget_is_low,
         )
         refresher.start()
         try:
