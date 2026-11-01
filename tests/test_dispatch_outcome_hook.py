@@ -269,7 +269,7 @@ class TestTheFactoryRefusesToGuess:
     def test_an_explicit_none_is_accepted(self) -> None:
         from ctrlrelay.core.config import AgentConfig
 
-        d = make_agent_dispatcher(AgentConfig(), outcome_hook=None)
+        d = make_agent_dispatcher(AgentConfig(), outcome_hook=None, usage_store=None)
         assert d.outcome_hook is None
 
     def test_the_hook_is_carried_through_to_the_adapter(self) -> None:
@@ -278,7 +278,7 @@ class TestTheFactoryRefusesToGuess:
         async def hook(outcome):
             return None
 
-        d = make_agent_dispatcher(AgentConfig(), outcome_hook=hook)
+        d = make_agent_dispatcher(AgentConfig(), outcome_hook=hook, usage_store=None)
         assert d.outcome_hook is hook
 
 

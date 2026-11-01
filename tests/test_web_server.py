@@ -45,7 +45,7 @@ HOSTILE_FILE = '"><script>alert(1)<'
 TOP_KEYS = {
     "version", "host", "generated", "generated_ts", "running", "needs_you",
     "waiting", "skipped", "server", "today", "feed", "feed_total",
-    "feed_truncated", "feed_limit", "errors",
+    "feed_truncated", "feed_limit", "errors", "node",
 }
 
 
@@ -336,6 +336,8 @@ def test_api_status_contract(tmp_path: Path, serve) -> None:
     out = json.loads(body)
     assert set(out) == TOP_KEYS
     assert out["host"] == "test-node"
+    assert out["node"]["name"] == "test-node"
+    assert out["node"]["usage"] == "unknown"
     assert out["errors"] == []
     [card] = out["running"]
     # The title is only in titles(): #215 is running, so the waiting line

@@ -289,7 +289,7 @@ class TestMakeAgentDispatcher:
         # has to say whether dispatch health is recorded. Explicit None
         # here: this test is about the adapter type, not the hook, and
         # `tests/test_dispatch_outcome_hook.py` owns the hook's wiring.
-        adapter = make_agent_dispatcher(cfg, outcome_hook=None)
+        adapter = make_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
         assert isinstance(adapter, ClaudeDispatcher)
         assert adapter.default_timeout == 60
 
@@ -299,7 +299,7 @@ class TestMakeAgentDispatcher:
 
         cfg = AgentConfig(type="codex")
         with pytest.raises(NotImplementedError) as excinfo:
-            make_agent_dispatcher(cfg, outcome_hook=None)
+            make_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
         msg = str(excinfo.value).lower()
         assert "codex" in msg
         assert "agentadapter" in msg or "adapter" in msg
