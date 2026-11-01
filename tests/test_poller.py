@@ -2207,8 +2207,16 @@ class TestWhoAssignedIt:
         mock_github.list_assignment_events = AsyncMock(return_value=[event])
         assert not await self._poller(mock_github, state_file)._is_self_assigned("o/r", 784)
 
+    # Recorded from AInvirion/ctrlrelay#268 on 2026-11-01: the operator
+    # assigned it to themselves.
+    REAL_SELF = [{
+        "event": "assigned", "created_at": "2026-11-01T21:44:14Z",
+        "actor": {"login": "oscarvalenzuelab"},
+        "assignee": {"login": "oscarvalenzuelab"},
+        "assigner": {"login": "oscarvalenzuelab"},
+    }]
+
     @pytest.mark.asyncio
     async def test_a_real_self_assignment_is_taken(self, mock_github, state_file) -> None:
-        event = dict(self.REAL_FOREIGN[0], assigner={"login": "oscarvalenzuelab"})
-        mock_github.list_assignment_events = AsyncMock(return_value=[event])
+        mock_github.list_assignment_events = AsyncMock(return_value=self.REAL_SELF)
         assert await self._poller(mock_github, state_file)._is_self_assigned("o/r", 784)
