@@ -291,7 +291,10 @@ machine last read it: `read_at`, and for `core`, `search` and `graphql` each
 `{remaining, limit, resets_at, state}` with `state` one of `ok`, `low`, `out`,
 or `unknown` once its reset time has passed (the numbers are then old), or
 `"unknown"` in place of the object for a bucket it could not read; the whole value is `"unknown"`
-before any reading. The page shows it in the **Usage** box. Low and used-up
+before any reading. The page shows it in the **Usage** box; a bucket whose
+reset time has passed since the last read shows as "refilled at <time>, not
+read since" (GitHub refills it at that time), and `search`, which refills
+every minute, usually shows that way. Low and used-up
 buckets are described in [configuration: github_api]({{ '/configuration/' | relative_url }}#github_api).
 Which bucket a `gh` command spends is worked out from the command where the
 command says: `gh api` REST paths are `core`, `gh api graphql` is `graphql`,

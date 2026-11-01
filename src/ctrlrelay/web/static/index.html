@@ -794,16 +794,30 @@ function renderGitHubBudget(api, now, lines) {
   }
   ["core", "search", "graphql"].forEach(function (name) {
     var b = api[name];
-    if (!b || typeof b !== "object" || typeof b.remaining !== "number" ||
-        b.state === "unknown") {
-      lines.push(el("div", "line", "GitHub " + name + " unknown"));
-      return;
-    }
-    var high = b.state === "low" || b.state === "out";
-    lines.push(el("div", "line" + (high ? " high" : ""),
-      "GitHub " + name + " " + b.remaining + " of " + b.limit + " left" +
-      (b.state === "out" ? " (used up)" : "") + ", " + untilText(b.resets_at, now)));
+    var high = b && !refilled(b, now) && (b.state === "low" || b.state === "out");
+    lines.push(el("div", "line" + (high ? " high" : ""), budgetLine(name, b, now)));
   });
+}
+
+// One bucket's line. A reading whose reset time has passed is old: GitHub
+// has refilled that bucket since, so say that rather than "unknown" (search
+// refills every minute and is read every few, so it is usually in this state).
+function refilled(b, now) {
+  var reset = b && typeof b === "object" ? Date.parse(b.resets_at) : NaN;
+  return !isNaN(reset) && reset / 1000 <= now;
+}
+
+function budgetLine(name, b, now) {
+  if (!b || typeof b !== "object" || typeof b.remaining !== "number") {
+    return "GitHub " + name + " unknown";
+  }
+  if (refilled(b, now)) {
+    return "GitHub " + name + " refilled at " + clock(Date.parse(b.resets_at) / 1000) +
+      ", not read since";
+  }
+  if (b.state === "unknown") { return "GitHub " + name + " unknown"; }
+  return "GitHub " + name + " " + b.remaining + " of " + b.limit + " left" +
+    (b.state === "out" ? " (used up)" : "") + ", " + untilText(b.resets_at, now);
 }
 
 function renderUsage(data, now) {
