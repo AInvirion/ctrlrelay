@@ -332,7 +332,8 @@ class BridgeServer:
         # #248. ``node`` is this machine's name: every post starts with it,
         # and a reply to a post tagged with another machine's name is
         # ignored quietly. Required, so no construction drops the tag by
-        # omission; ``None`` posts untagged (one machine on its own chat).
+        # omission; the bridge always passes its node_id, and ``None``
+        # (untagged) is for tests and embedding.
         # ``shared``: other machines read this same chat, so a message
         # that is not a reply is acted on only when it names this machine.
         self.node = node
@@ -1068,8 +1069,8 @@ class BridgeServer:
         self, text: str, reply_to_post_id: str | None,
     ) -> tuple[bool, str]:
         """``(True, _)`` when the message belongs to another machine and
-        must be ignored quietly; else ``(False, text)`` with any address
-        to this machine removed (#248).
+        must be ignored quietly; else ``(False, text)``, on a shared chat
+        with any address to this machine removed (#248).
 
         A reply to a post this machine knows is its own. A reply to any
         other post: on a shared chat it is this machine's only when the post
@@ -1087,6 +1088,9 @@ class BridgeServer:
                     for q in self._pending_questions.values()
                 )
             if known:
+                if self.shared:
+                    mine, rest = addressed(text, self.node)
+                    return False, rest if mine else text
                 return False, text
             readable, post = await self._post_text(reply_to_post_id)
             owner = tagged_node(post) if readable else None
@@ -1096,14 +1100,21 @@ class BridgeServer:
                 # bot post from before #248), or names another machine is
                 # left alone, unless the reply itself names this machine
                 # ("node-a: pin" to an old untagged question).
+                mine, rest = addressed(text, self.node)
                 if owner == safe_node_name(self.node):
-                    return False, text
-                if owner is None:
-                    mine, rest = addressed(text, self.node)
-                    if mine:
-                        return False, rest
+                    return False, rest if mine else text
+                if owner is None and mine:
+                    return False, rest
                 return True, text
             if owner is not None and owner != safe_node_name(self.node):
+                # Another machine's (one bot per machine in one Telegram
+                # group), or this machine's under a node_id it no longer
+                # has. Logged as a warning: on a machine alone in its chat
+                # the second is the only way to get here.
+                _log.warning(
+                    "bridge: a reply to a post by %r was left alone; this "
+                    "machine is %r", owner, self.node,
+                )
                 return True, text
             return False, text
         if not self.shared:

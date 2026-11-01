@@ -128,7 +128,8 @@ class TelegramHandler:
 
     async def post_text(self, post_id: str) -> str | None:
         """The text of a message somebody replied to, as Telegram sent it
-        with the reply (#248). ``None`` if not seen."""
+        with the reply (#248); ``""`` when a person, not a bot, wrote it.
+        ``None`` if not seen."""
         return self._replied_texts.get(post_id)
 
     async def _poll_loop(self, handler: IncomingMessageHandler) -> None:
@@ -179,12 +180,14 @@ class TelegramHandler:
                     else None
                 )
                 if reply_id is not None:
-                    # Only the bot's own messages speak for a machine: a
-                    # person typing "[node-b] ..." is kept as untagged.
+                    # Only a bot's message speaks for a machine: a person
+                    # typing "[node-b] ..." is kept as untagged. Any bot
+                    # counts, not only this one: with one bot per machine
+                    # in a group, a reply to the other machine's bot must
+                    # read back with that machine's tag, or this machine
+                    # would take it for an untagged question of its own.
                     sender = getattr(msg.reply_to_message, "from_user", None)
-                    from_bot = bool(getattr(sender, "is_bot", False)) and (
-                        getattr(sender, "id", None) == getattr(self.bot, "id", None)
-                    )
+                    from_bot = bool(getattr(sender, "is_bot", False))
                     self._replied_texts[reply_id] = (
                         (msg.reply_to_message.text or "") if from_bot else ""
                     )

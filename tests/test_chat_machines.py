@@ -277,7 +277,9 @@ class TestRoundOneFixes:
         assert await h.post_text("p1") == "[node-b] x"
 
     @pytest.mark.asyncio
-    async def test_on_telegram_only_the_bots_own_message_keeps_its_tag(self) -> None:
+    async def test_on_telegram_a_bots_message_keeps_its_tag_and_a_persons_does_not(
+        self,
+    ) -> None:
         import asyncio
         from types import SimpleNamespace
 
@@ -299,7 +301,9 @@ class TestRoundOneFixes:
                 ),
             ))
 
-        batches = [[update(1, 10, 777, True), update(2, 11, 5, False)]]
+        # 10: this bot; 11: a person; 12: the other machine's bot in the group.
+        batches = [[update(1, 10, 777, True), update(2, 11, 5, False),
+                    update(3, 12, 888, True)]]
 
         async def get_updates(**kw):
             if batches:
@@ -311,6 +315,7 @@ class TestRoundOneFixes:
             await h._poll_loop(AsyncMock())
         assert await h.post_text("10") == "[node-b] pin or bump?"
         assert await h.post_text("11") == ""
+        assert await h.post_text("12") == "[node-b] pin or bump?"
 
 
     @pytest.mark.asyncio
@@ -364,3 +369,25 @@ class TestRoundOneFixes:
         BridgeServer(socket_path=tmp_path / "s", handler=h, node="node-a")
         await h._poll_loop(AsyncMock())
         assert h.send.await_args.args[0].startswith("[node-a] ")
+
+
+    @pytest.mark.asyncio
+    async def test_a_reply_to_the_other_machines_telegram_bot_is_left_alone(
+        self, tmp_path,
+    ) -> None:
+        """One bot per machine in one Telegram group (never `shared`)."""
+        channel, a, b = _bridges(tmp_path, shared=False)
+        wb = await _ask(b, "merge it?")
+        channel.posts["t-a"] = "[node-a] ❓ pin or bump?"  # node-a's bot, read back
+        await b._on_reply("pin", reply_to_post_id="t-a")
+        assert _answers(wb) == []
+
+    @pytest.mark.asyncio
+    async def test_naming_the_machine_in_a_reply_to_its_own_question_is_stripped(
+        self, tmp_path,
+    ) -> None:
+        channel, a, _ = _bridges(tmp_path, shared=True)
+        wa = await _ask(a, "pin or bump?")
+        a_post = next(iter(channel.posts))
+        await a._on_reply("node-a: pin", reply_to_post_id=a_post)
+        assert _answers(wa) == ["pin"]
