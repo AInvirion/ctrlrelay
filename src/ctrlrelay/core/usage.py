@@ -37,6 +37,7 @@ from ctrlrelay.core.obs import get_logger, log_event
 _logger = get_logger("core.usage")
 
 WINDOWS = ("five_hour", "seven_day")
+UNKNOWN_RESET_PAUSE_SECONDS = 3600
 # What `json.loads` raises on hostile input besides a decode error: an
 # integer past Python's digit limit (ValueError) and nesting past the
 # recursion limit (RecursionError). Any of them is unreadable, not fatal.
@@ -225,11 +226,12 @@ def pause_for(
     """Whether to stop taking new work.
 
     Paused when the status is not ``allowed`` or a window is at or above
-    ``threshold``, until that window's reset. A reading whose reset time
-    has passed says nothing about now, so it does not pause. A window
-    with no readable reset time does not pause on its own, since nothing
-    would ever say when to stop; a refused status with no reset time
-    anywhere pauses for an hour from the reading.
+    ``threshold``, until that window's reset (for the status, the event's
+    own reset). A reading whose reset time has passed says nothing about
+    now, so it does not pause. When the reset time is missing or cannot
+    be read, the pause lasts ``UNKNOWN_RESET_PAUSE_SECONDS`` from the
+    reading: long enough not to run into a known limit, short enough
+    that a later reading, from a run or the probe, decides again.
 
     An unknown reading does not pause: there is nothing to wait for, and
     pausing on it would stop a machine that has never read its usage
@@ -238,15 +240,14 @@ def pause_for(
     if reading is None:
         return None
     hits: list[tuple[str, int | None]] = []
+    fallback = reading.read_at + UNKNOWN_RESET_PAUSE_SECONDS
     if reading.status != ALLOWED:
-        until = reading.resets_at
-        if until is None:
-            resets = [w.resets_at for w in reading.windows.values() if w.resets_at]
-            until = max(resets) if resets else reading.read_at + 3600
+        until = reading.resets_at if reading.resets_at is not None else fallback
         hits.append((f"usage status is {reading.status}", until))
     for name, w in reading.windows.items():
-        if w.used >= threshold and w.resets_at is not None:
-            hits.append((f"{_label(name)} usage at {round(w.used * 100)}%", w.resets_at))
+        if w.used >= threshold:
+            until = w.resets_at if w.resets_at is not None else fallback
+            hits.append((f"{_label(name)} usage at {round(w.used * 100)}%", until))
     live = [(why, until) for why, until in hits if until > now]
     if not live:
         return None
@@ -387,6 +388,7 @@ async def probe_usage(
     *,
     timeout: float = 120.0,
     env: dict[str, str] | None = None,
+    still_idle: Callable[[], bool] | None = None,
 ) -> UsageReading | None:
     """One tiny agent call, for its usage reading only.
 
@@ -398,6 +400,10 @@ async def probe_usage(
     one (a refused call can still report the usage that refused it).
     Raises nothing but cancellation: it runs on a schedule, and its
     failure is only a missed refresh.
+
+    ``still_idle`` is asked before storing. When a run started while the
+    probe was out, that run's reading is the newer one, and the probe's
+    is dropped rather than written over it.
     """
     proc: asyncio.subprocess.Process | None = None
     try:
@@ -419,6 +425,9 @@ async def probe_usage(
         reading = parse_rate_limit_event(stdout.decode(errors="replace"))
         if reading is None:
             log_event(_logger, "usage.probe_failed", error="no usage in the output")
+            return None
+        if still_idle is not None and not still_idle():
+            log_event(_logger, "usage.probe_dropped", reason="a run started meanwhile")
             return None
         store.write(reading)
         return reading

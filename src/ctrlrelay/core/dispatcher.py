@@ -169,9 +169,12 @@ class ClaudeDispatcher:
     # here and in `make_agent_dispatcher`: ``None`` keeps no reading, and
     # a construction has to say so rather than get it by omission.
     usage_store: UsageStore | None = field(kw_only=True)
-    # Agent sessions running now. The idle usage probe waits for zero, so
-    # its reading never lands on top of a newer one from a run.
+    # Agent sessions running now, and started in all. The idle usage
+    # probe starts only at zero running and drops its reading if any
+    # session started while it was out, so it never overwrites a newer
+    # reading from a run.
     active: int = field(default=0, init=False)
+    started: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         # Only auto-resolve the bare default. Absolute paths, relative paths
@@ -328,6 +331,7 @@ class ClaudeDispatcher:
             cmd.extend(["--resume", resume_session_id])
 
         self.active += 1
+        self.started += 1
         try:
             return await self._run_session(
                 cmd=cmd,

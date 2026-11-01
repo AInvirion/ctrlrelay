@@ -3272,8 +3272,15 @@ def poller_start(
                 reading is None or time.time() - reading.read_at >= max_age
             ):
                 binary = getattr(dispatcher, "claude_binary", None)
+                started = getattr(dispatcher, "started", 0)
                 if binary:
-                    await probe_usage(binary, usage_store)
+                    await probe_usage(
+                        binary, usage_store,
+                        still_idle=lambda: (
+                            getattr(dispatcher, "started", 0) == started
+                            and getattr(dispatcher, "active", 0) == 0
+                        ),
+                    )
             # Also where a pause ends while nothing else is happening:
             # the resume line goes out without waiting for a new issue.
             await usage_gate.check()

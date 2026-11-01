@@ -341,7 +341,7 @@ usage:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `pause_at` | number (above 0, up to 1) | `0.9` | Take no new issues while the 5-hour or 7-day window is at or above this share, or while the status is anything but `allowed`. Runs already going finish. New issues are taken again after the window's reset time. |
+| `pause_at` | number (above 0, up to 1) | `0.9` | Take no new issues while the 5-hour or 7-day window is at or above this share, or while the status is anything but `allowed`. Runs already going finish. New issues are taken again after the window's reset time; when the reset time cannot be read, after an hour, when the next reading decides again. |
 | `probe_minutes` | int (>= 0) | `30` | When the last reading is older than this, the daemon makes one tiny agent call (no tools, no MCP servers, no user or project settings and so no hooks, one turn, in an empty directory) to read the usage again, so an idle machine's numbers do not go stale. `0` turns it off. Each probe is one short call on the subscription. |
 
 The usage comes from a field of the agent CLI's output that is not

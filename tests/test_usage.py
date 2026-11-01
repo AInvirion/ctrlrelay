@@ -106,8 +106,9 @@ class TestPause:
         assert "5-hour" in p.reason
 
     def test_a_status_that_is_not_allowed_pauses(self) -> None:
+        # No reset of its own: an hour, not the 7-day window's reset.
         p = pause_for(_reading(status="rejected"), threshold=0.9, now=NOW)
-        assert p is not None and p.until == NOW + 86400
+        assert p is not None and p.until == NOW + 3600
 
     def test_after_the_reset_the_old_reading_does_not_pause(self) -> None:
         r = _reading(windows={"five_hour": Window(0.99, NOW + 600)})
@@ -492,9 +493,10 @@ class TestRoundTwoFixes:
     def test_an_event_cut_off_inside_its_type_is_unreadable(self) -> None:
         assert parse_rate_limit_event(RECORDED + '{"type": "rate_lim\n', now=NOW) is None
 
-    def test_a_window_with_no_reset_time_does_not_pause(self) -> None:
+    def test_a_high_window_with_no_reset_time_pauses_for_an_hour_only(self) -> None:
         r = _reading(windows={"five_hour": Window(0.99, None)})
-        assert pause_for(r, threshold=0.9, now=NOW) is None
+        assert pause_for(r, threshold=0.9, now=NOW).until == NOW + 3600
+        assert pause_for(r, threshold=0.9, now=NOW + 3600) is None
 
     def test_a_refusal_with_no_reset_time_pauses_for_an_hour(self) -> None:
         r = UsageReading(
@@ -514,10 +516,10 @@ class TestRoundTwoFixes:
 class TestRoundThreeFixes:
     @pytest.mark.parametrize("line", [
         '{"type": "result", "session_id": "x", "n": ' + "9" * 5000 + "}",
-        "[" * 100000 + "]" * 100000,
+        '{"a":' * 100000 + "1" + "}" * 100000,
     ])
     def test_hostile_json_is_unreadable_not_a_crash(self, line: str) -> None:
-        assert parse_agent_session_id(RECORDED + line + "\n") is not None
+        assert parse_agent_session_id(line + "\n" + RECORDED) is not None
         assert parse_rate_limit_event(RECORDED + line + "\n", now=NOW) is None
         assert parse_agent_session_id(line) is None
 
@@ -570,3 +572,32 @@ class TestRoundThreeFixes:
             await task
         assert seen == [1]
         assert d.active == 0
+        assert d.started == 1
+
+
+
+class TestRoundFourFixes:
+    @pytest.mark.asyncio
+    async def test_a_probe_drops_its_reading_when_a_run_started_meanwhile(
+        self, tmp_path: Path,
+    ) -> None:
+        from ctrlrelay.core.usage import probe_usage
+
+        fake = tmp_path / "agent"
+        fake.write_text(f"#!/bin/sh\ncat {FIXTURE}\n")
+        fake.chmod(0o755)
+        store = UsageStore(tmp_path / "usage.json")
+        store.write(_reading(windows={"five_hour": Window(0.97, NOW + 600)}))
+        assert await probe_usage(str(fake), store, still_idle=lambda: False) is None
+        assert store.read().windows["five_hour"].used == 0.97
+
+    def test_a_file_that_is_not_utf8_reads_as_unknown(self, tmp_path: Path) -> None:
+        path = tmp_path / "usage.json"
+        path.write_bytes(b'{"status": "\xff\xfe"}')
+        assert UsageStore(path).read() is None
+
+    def test_the_dispatcher_counts_sessions_started(self) -> None:
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+        d = ClaudeDispatcher(claude_binary="claude", usage_store=None)
+        assert (d.active, d.started) == (0, 0)
