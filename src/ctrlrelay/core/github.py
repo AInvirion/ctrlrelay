@@ -9,6 +9,7 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Any
 
+from ctrlrelay.core.github_budget import GitHubBudget, bucket_for
 from ctrlrelay.core.obs import get_logger
 
 _logger = get_logger("core.github")
@@ -77,6 +78,12 @@ def _normalize_check(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _iso_utc(ts: int) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _find_gh() -> str:
     """Find gh binary, checking common paths if not in PATH."""
     gh = shutil.which("gh")
@@ -94,6 +101,14 @@ class GitHubCLI:
 
     gh_binary: str = field(default_factory=_find_gh)
     timeout: int = 60
+    # The account's API budget (#237). When a bucket is used up, calls
+    # that spend it fail here at once, as rate limited, until its reset,
+    # instead of each going to GitHub to fail there. ``None``: no gate.
+    budget: GitHubBudget | None = None
+
+    async def rate_limit(self) -> str:
+        """``/rate_limit``, raw. Free to call, and never gated."""
+        return await self._run_gh("api", "rate_limit")
 
     async def _run_gh(
         self, *args: str, timeout: int | None = None,
@@ -112,6 +127,15 @@ class GitHubCLI:
         effective_timeout = (
             self.timeout if timeout is None else timeout
         )
+        bucket = bucket_for(args)
+        if self.budget is not None and tuple(args) != ("api", "rate_limit"):
+            until = self.budget.blocked_until(bucket)
+            if until is not None:
+                # Worded so `classify_gh_failure` reads it as rate limited.
+                raise GitHubError(
+                    f"gh failed: API rate limit exceeded: the {bucket} budget "
+                    f"is used up until {_iso_utc(until)}; not calling GitHub"
+                )
         cmd = [self.gh_binary, *args]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -134,7 +158,10 @@ class GitHubCLI:
             raise
 
         if proc.returncode != 0:
-            raise GitHubError(f"gh failed: {stderr.decode().strip()}")
+            message = stderr.decode().strip()
+            if self.budget is not None and "rate limit" in message.lower():
+                self.budget.mark_out(bucket)
+            raise GitHubError(f"gh failed: {message}")
 
         return stdout.decode()
 
