@@ -1908,11 +1908,11 @@ class TestFetchWithTheSessionsBranchCheckedOut:
     own fix path, on ``fatal: refusing to fetch into branch
     'refs/heads/fix/issue-4' checked out at '<the session's worktree>'``.
 
-    The relay publishes by pushing straight to the remote, so the bare
-    clone's copy of the branch stays where it was while origin's moves.
-    The next fetch then has a branch to update that a worktree has
-    checked out, and git refuses the whole fetch: not even the default
-    branch, which the agent needs to rebase onto, is updated.
+    Git refuses to fetch into a branch a worktree has checked out
+    whenever the remote has a branch of that name, even an unchanged
+    one, and refuses the whole fetch with it: not even the default
+    branch, which the agent needs to rebase onto, is updated. Once the
+    run's branch is published, that is every fetch of the session.
     """
 
     _git = staticmethod(TestFetchSurvivesRewrittenBranches._git)
@@ -1943,8 +1943,8 @@ class TestFetchWithTheSessionsBranchCheckedOut:
         session = tmp_path / "wt" / "session"
         cls._git("worktree", "add", "-q", str(session), "fix/issue-4", cwd=bare)
 
-        # The run's commit reaches origin's branch without the bare
-        # clone's ref moving (the relay pushes to the URL) ...
+        # The run's branch exists on origin (here with a commit the
+        # clone does not have; an identical one is refused the same) ...
         cls._git("checkout", "-q", "fix/issue-4", cwd=origin)
         (origin / "g").write_text("the run's work\n")
         cls._git("add", ".", cwd=origin)
@@ -2110,3 +2110,46 @@ class TestFetchWithTheSessionsBranchCheckedOut:
 
         assert self._git("branch", "--list", "fix/issue-4", cwd=bare).strip()
         assert not self._git("branch", "--list", "other", cwd=bare).strip()
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_published_branch_was_refused_too(
+        self, tmp_path: Path,
+    ) -> None:
+        """The usual case: the branch on origin is exactly the session's.
+        Git refused that as well, so every fetch after publishing failed."""
+        import subprocess
+
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        self._git("init", "-q", "-b", "main", ".", cwd=origin)
+        (origin / "f").write_text("base\n")
+        self._git("add", ".", cwd=origin)
+        self._git("commit", "-qm", "base", cwd=origin)
+        self._git("branch", "fix/issue-4", cwd=origin)
+        wt = WorktreeManager(worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos")
+        bare = wt._get_bare_repo_path("owner/repo")
+        bare.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "-q", "--bare", str(origin), str(bare)],
+                       check=True, capture_output=True)
+        self._git("worktree", "add", "-q", str(tmp_path / "s"), "fix/issue-4", cwd=bare)
+        branch = "refs/heads/fix/issue-4"
+        assert self._sha(bare, branch) == self._sha(origin, branch)
+
+        await wt.ensure_bare_repo("owner/repo")
+
+    @pytest.mark.asyncio
+    async def test_with_no_default_branch_known_nothing_is_left_out(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.core.worktree import WorktreeError
+
+        wt, origin, bare = self._setup(tmp_path)
+        monkeypatch.setattr(
+            wt, "get_default_branch", AsyncMock(side_effect=WorktreeError("no HEAD")),
+        )
+        with pytest.raises(WorktreeError, match="refusing to fetch"):
+            await wt.ensure_bare_repo("owner/repo")
