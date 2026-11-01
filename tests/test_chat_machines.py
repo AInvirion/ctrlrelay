@@ -194,18 +194,8 @@ class TestTwoMachinesOneBot:
 
 
 class TestTelegramOneReaderPerBot:
-    @pytest.mark.asyncio
-    async def test_a_second_reader_fails_at_startup_with_one_clear_error(self) -> None:
-        from telegram.error import Conflict
-
-        from ctrlrelay.bridge.telegram_handler import TelegramBotInUseError, TelegramHandler
-
-        h = TelegramHandler.__new__(TelegramHandler)
-        h._offset = 0
-        h.bot = MagicMock()
-        h.bot.get_updates = AsyncMock(side_effect=Conflict("terminated by other getUpdates"))
-        with pytest.raises(TelegramBotInUseError, match="each machine needs its own bot"):
-            await h.preflight()
+    """Telegram cuts off the OLDER reader when a second starts, so the
+    machine that was running is the one that must say so and stop."""
 
     @pytest.mark.asyncio
     async def test_a_conflict_while_running_stops_instead_of_retrying(self, caplog) -> None:
@@ -219,9 +209,13 @@ class TestTelegramOneReaderPerBot:
         h.chat_id = 1
         h.bot = MagicMock()
         h.bot.get_updates = AsyncMock(side_effect=Conflict("terminated by other getUpdates"))
+        h.send = AsyncMock()
         await h._poll_loop(AsyncMock())  # returns: no retry loop
         assert h.bot.get_updates.await_count == 1
-        assert "already being read" in caplog.text
+        assert "each machine needs its own bot" in caplog.text
+        # Said once in the chat too, where the operator will see it.
+        [call] = h.send.await_args_list
+        assert "Stopped reading replies on this machine" in call.args[0]
 
     @pytest.mark.asyncio
     async def test_the_replied_to_text_is_kept_so_its_machine_can_be_read(self) -> None:
@@ -316,3 +310,21 @@ class TestRoundOneFixes:
             await h._poll_loop(AsyncMock())
         assert await h.post_text("10") == "[node-b] pin or bump?"
         assert await h.post_text("11") == ""
+
+
+    @pytest.mark.asyncio
+    async def test_on_a_shared_chat_a_reply_to_an_untagged_post_is_left_alone(
+        self, tmp_path,
+    ) -> None:
+        channel, a, b = _bridges(tmp_path, shared=True)
+        await _ask(a, "pin or bump?")
+        await _ask(b, "merge it?")
+        channel.posts["p-person"] = ""  # a person's post: reads back untagged
+        a._queue_orphan_reply_as_resume_answer = AsyncMock()
+        b._queue_orphan_reply_as_resume_answer = AsyncMock()
+        posts_before = dict(channel.posts)
+        await a._on_reply("pin", reply_to_post_id="p-person")
+        await b._on_reply("pin", reply_to_post_id="p-person")
+        a._queue_orphan_reply_as_resume_answer.assert_not_called()
+        b._queue_orphan_reply_as_resume_answer.assert_not_called()
+        assert channel.posts == posts_before

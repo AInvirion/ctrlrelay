@@ -1068,10 +1068,11 @@ class BridgeServer:
         to this machine removed (#248).
 
         A reply to a post this machine knows is its own. A reply to any
-        other post is another machine's when that post's tag names another
-        machine; a post with no tag, or one that cannot be read, is left to
-        the routing below as before. A fresh message on a shared chat is
-        this machine's only when it names it.
+        other post: on a shared chat it is this machine's only when the post
+        reads back with this machine's tag; on a machine's own chat it is
+        left alone only when its tag names another machine, and otherwise
+        routed as before. A fresh message on a shared chat is this
+        machine's only when it names it.
         """
         if self.node is None:
             return False, text
@@ -1084,12 +1085,13 @@ class BridgeServer:
             if known:
                 return False, text
             readable, post = await self._post_text(reply_to_post_id)
-            if not readable:
-                # On a shared chat, an unknown post that cannot be read is
-                # most likely another machine's: leave it. On its own chat
-                # a machine routes it as it always did.
-                return self.shared, text
-            owner = tagged_node(post)
+            owner = tagged_node(post) if readable else None
+            if self.shared:
+                # Only a post this machine can confirm as its own: one that
+                # cannot be read, has no machine tag (a person's post, or a
+                # bot post from before #248), or names another machine is
+                # left alone.
+                return owner != safe_node_name(self.node), text
             if owner is not None and owner != safe_node_name(self.node):
                 return True, text
             return False, text

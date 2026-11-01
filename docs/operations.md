@@ -466,7 +466,9 @@ o/r#7: ...`. Each machine acts only on **replies to its own posts**. A reply to
 a post another machine made is left to that machine, with nothing said in the
 channel; the machine reads the replied-to post to tell (on Telegram, from the
 reply itself). On a shared chat, a reply to a post that cannot be read is left
-alone too, since it is most likely another machine's.
+alone, and so is a reply to a post with no machine tag (a person's post, or a
+question posted before this version): answer those by naming the machine,
+`node-a: ...`.
 
 **Mattermost:** machines can share one bot and channel. Set
 `transport.mattermost.shared: true` on each. A message that is not a reply
@@ -476,12 +478,12 @@ meant for it. With one machine, leave `shared` off and plain answers work as
 before.
 
 **Telegram:** each machine needs **its own bot**. Telegram lets one process
-read a bot's messages at a time. A second machine on the same bot almost
-always fails at startup with "this Telegram bot is already being read by
-another process ... each machine needs its own bot"; if the check happens to
-miss the other reader, the first conflict while running gives the same
-message once and that machine stops reading, rather than retrying every few
-seconds.
+read a bot's messages at a time, and when a second one starts reading, it is
+the one already running that Telegram cuts off. There is no way to see the
+other reader before that happens. So the machine that loses the bot says so
+once, in its log and in the chat ("Stopped reading replies on this machine:
+another process started reading this Telegram bot ... each machine needs its
+own bot"), and stops reading, rather than fighting for it every few seconds.
 
 Only the bot's own posts count as a machine's: a person typing `[node-b] ...`
 in the channel does not speak for node-b.

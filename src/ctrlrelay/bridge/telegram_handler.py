@@ -14,16 +14,12 @@ _log = logging.getLogger(__name__)
 
 
 
-class TelegramBotInUseError(RuntimeError):
-    """Another process is already reading this bot's updates."""
-
-
 def bot_in_use_message(exc: BaseException) -> str:
     return (
-        "this Telegram bot is already being read by another process "
+        "another process started reading this Telegram bot "
         f"({exc}). Telegram allows one reader per bot, so each machine "
         "needs its own bot: create one with @BotFather and set its token "
-        "for this machine."
+        "for that machine."
     )
 
 
@@ -131,17 +127,6 @@ class TelegramHandler:
         with the reply (#248). ``None`` if not seen."""
         return self._replied_texts.get(post_id)
 
-    async def preflight(self) -> None:
-        """Fail at startup if another process is reading this bot's updates
-        right now (#248). Telegram allows one reader per bot. A short read
-        catches a reader that is mid-poll, which a running bridge almost
-        always is; one it misses shows up as a conflict on the first poll,
-        which ``_poll_loop`` logs once before it stops."""
-        try:
-            await self.bot.get_updates(offset=self._offset, timeout=0, limit=1)
-        except Conflict as e:
-            raise TelegramBotInUseError(bot_in_use_message(e)) from e
-
     async def _poll_loop(self, handler: IncomingMessageHandler) -> None:
         """Long-poll get_updates and forward messages from the configured chat."""
         while True:
@@ -154,9 +139,16 @@ class TelegramHandler:
             except asyncio.CancelledError:
                 raise
             except Conflict as e:
-                # Another machine took the bot over while this one ran:
-                # one clear error and stop, not a warning every 5 seconds.
-                _log.error("%s", bot_in_use_message(e))
+                # Another process started reading this bot. Telegram ends
+                # the OLDER reader's poll, so this is the machine that was
+                # already running: say so once, in the log and in the chat
+                # (sending still works), and stop rather than fight for it.
+                message = bot_in_use_message(e)
+                _log.error("%s", message)
+                try:
+                    await self.send(f"⚠️ Stopped reading replies on this machine: {message}")
+                except Exception:
+                    pass
                 return
             except Exception as e:
                 # Transient network / auth error. Back off and keep trying.
