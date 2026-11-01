@@ -167,15 +167,18 @@ login, does not):
   cannot read your SSH keys, `gh`'s login or the other credentials listed
   below;
 - read-only again: `sandbox_readonly_paths` (the agent CLI's settings, hooks,
-  plugins and skills, which your own sessions load) and, in the repository,
+  plugins and skills, and each project's memory under
+  `~/.claude/projects/*/memory`, which your own sessions load) and, in the
+  repository,
   `config`, `config.worktree`, `hooks` and the worktree's `.git` pointer,
   which every later git command there reads. One that does not exist yet
   inside a writable path is created first (an empty directory, or `{}` for a
   JSON file) so the agent cannot create it; if it cannot be created, the run
   does not start.
 
-Package caches (`XDG_CACHE_HOME`, which covers pip and uv, `npm_config_cache`,
-`GOMODCACHE`, and `CARGO_HOME`) point at `sandbox_cache_dir`, the agent's own,
+Package caches (`XDG_CACHE_HOME`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`,
+`npm_config_cache`, `GOMODCACHE` and `CARGO_HOME`) point at `sandbox_cache_dir`,
+which must not contain your home directory, the agent's own,
 never yours, so a run cannot poison a cache you build from. The first run of
 each project downloads its packages again. A tool that writes elsewhere in
 your home (Gradle's `~/.gradle`, for one) fails there until you add a
@@ -226,7 +229,7 @@ then run the check again. On a single-user laptop this is the whole setup.
 | `sandbox` | `"none"` or `"bwrap"` | `"none"` | `"bwrap"` runs the dev and task agents in the read-only sandbox above. |
 | `sandbox_hide_paths` | list of strings | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc`, `~/.local/share/keyrings`, `$XDG_RUNTIME_DIR/bus`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.config/ctrlrelay` | Made empty under `sandbox: bwrap`. A directory becomes an empty tmpfs, a file or socket becomes `/dev/null`, a missing path is skipped. |
 | `sandbox_writable_paths` | list of strings | `~/.claude` | Writable under `sandbox: bwrap`, besides the run's own paths. |
-| `sandbox_readonly_paths` | list of strings | `~/.claude/settings.json`, `settings.local.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `hooks`, `plugins`, `output-styles`, `scripts` (all under `~/.claude`) | Read-only again inside a writable path. |
+| `sandbox_readonly_paths` | list of strings | `~/.claude/settings.json`, `settings.local.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `hooks`, `plugins`, `output-styles`, `scripts`, `projects/*/memory` (all under `~/.claude`) | Read-only again inside a writable path. One `*` part matches the directories there at the start of each run; a missing path under a writable one is created first (an empty `memory` directory in each project, for one). |
 | `sandbox_cache_dir` | string | `~/.ctrlrelay/agent-cache` | The agent's own package cache under `sandbox: bwrap`. |
 
 ## transport
