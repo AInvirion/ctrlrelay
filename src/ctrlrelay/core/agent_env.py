@@ -195,6 +195,19 @@ DEFAULT_SANDBOX_HIDE_PATHS: tuple[str, ...] = (
     "~/.cargo/credentials.toml",
     # The relay's own config, which can hold chat tokens.
     "~/.config/ctrlrelay",
+    # Sockets: a read-only mount does not stop a connect. The session's
+    # runtime dir holds the keyring, gpg-agent, ssh-agent and podman
+    # sockets (the agent gets its own, empty, in its environment); the
+    # Docker socket can mount any of the paths above into a container.
+    "$XDG_RUNTIME_DIR",
+    "/run/docker.sock",
+    "/var/run/docker.sock",
+    # What the operator's own agent sessions run: shell snapshots sourced
+    # before each command, environment files sourced the same way, and the
+    # IDE connection locks. Empty and writable for the sandboxed run.
+    "~/.claude/shell-snapshots",
+    "~/.claude/session-env",
+    "~/.claude/ide",
 )
 
 # Writable inside the sandbox besides the run's own paths (#236): the
@@ -218,6 +231,8 @@ DEFAULT_SANDBOX_READONLY_PATHS: tuple[str, ...] = (
     "~/.claude/plugins",
     "~/.claude/output-styles",
     "~/.claude/scripts",
+    # The agent CLI itself, when installed under its state directory.
+    "~/.claude/local",
     # Each project's memory, which the operator's sessions in that project
     # load. One ``*`` part is expanded to the directories there now.
     "~/.claude/projects/*/memory",
@@ -270,9 +285,11 @@ def bwrap_prefix(
 
     In order, so each step wins over the one before: the whole
     filesystem read-only, a fresh ``/dev``, ``/proc`` and private
-    ``/tmp``; ``writable`` bound back writable; ``readonly`` bound
-    read-only again; and ``hide_paths`` made empty (a directory becomes an
-    empty tmpfs, a file ``/dev/null``) wherever they are. Bind sources are
+    ``/tmp``; ``writable`` bound back writable, and every directory
+    between one of those and a mount inside it made a mount point, so it
+    cannot be renamed away; ``readonly`` bound read-only again; and
+    ``hide_paths`` made empty (a directory becomes an empty tmpfs, a file
+    or socket ``/dev/null``) wherever they are. Bind sources are
     read from the host, so a path under ``/tmp`` binds normally. A
     hidden or writable path that does not exist is skipped (bwrap would
     otherwise have to create a mount point for it). A missing read-only
@@ -285,13 +302,14 @@ def bwrap_prefix(
         bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
         "--tmpfs", "/tmp", "--unshare-pid", "--die-with-parent",
     ]
-    open_dirs: list[Path] = []
+    opened: list[Path] = []
     for raw in _expand_globs(writable, dirs_only=False):
         p = _existing(raw)
-        if p is not None:
-            argv += ["--bind", str(p), str(p)]
-            if p.is_dir():
-                open_dirs.append(p)
+        if p is not None and p not in opened:
+            opened.append(p)
+    open_dirs = [p for p in opened if p.is_dir()]
+
+    locked: list[Path] = []
     for raw in _expand_globs(readonly):
         link = _expand(raw)
         if (
@@ -317,6 +335,34 @@ def bwrap_prefix(
             if not any(target.is_relative_to(d) for d in open_dirs):
                 continue  # nothing writable reaches it: it stays absent
             p = _create_readonly(target)
+        if p not in locked:
+            locked.append(p)
+
+    # A mount point cannot be renamed, but a plain directory above one
+    # can, and the mount moves with it: the agent could then make a new
+    # directory under the old name, which is the one later loaded. So
+    # every directory between a writable path and a mount inside it is
+    # made a mount point too.
+    pins: list[Path] = []
+    for m in [*opened, *locked]:
+        holders = [d for d in open_dirs if m != d and m.is_relative_to(d)]
+        if not holders:
+            continue
+        holder = max(holders, key=lambda d: len(d.parts))
+        a = m.parent
+        while a != holder:
+            if a not in pins and a not in opened and a not in locked:
+                pins.append(a)
+            a = a.parent
+
+    # Shallowest first, so a later bind never covers an earlier one inside
+    # it; every writable mount before every read-only one.
+    def depth(p: Path) -> int:
+        return len(p.parts)
+
+    for p in sorted([*opened, *pins], key=depth):
+        argv += ["--bind", str(p), str(p)]
+    for p in sorted(locked, key=depth):
         argv += ["--ro-bind", str(p), str(p)]
     # Last, so neither a writable nor a read-only path that contains or
     # names a hidden one brings it back.
@@ -336,8 +382,9 @@ def _expand_globs(
     paths: Sequence[str | Path], *, dirs_only: bool = True,
 ) -> list[str | Path]:
     """Each path with a ``*`` part replaced by one path per entry that part
-    matches now (directories only, unless ``dirs_only`` is false; never a
-    symlink), the rest of the path kept after it. Hidden names match."""
+    matches now, the rest of the path kept after it. Hidden names match.
+    With ``dirs_only`` (read-only paths), directories, a linked one by
+    where it leads; otherwise every entry but links (writable paths)."""
     out: list[str | Path] = []
     for raw in paths:
         text = os.path.expanduser(str(raw))
@@ -349,7 +396,13 @@ def _expand_globs(
         head = Path(*parts[: star + 1])
         rest = parts[star + 1:]
         for match in sorted(head.parent.glob(head.name)):
-            if match.is_symlink() or (dirs_only and not match.is_dir()):
+            if dirs_only:
+                # A linked directory counts where it leads, so what it
+                # holds is protected too.
+                if not match.is_dir():
+                    continue
+                match = match.resolve()
+            elif match.is_symlink():
                 continue
             out.append(match.joinpath(*rest))
     return out

@@ -269,6 +269,12 @@ class ClaudeDispatcher:
                 git_protected.append(d / name)
             if i == 0:
                 git_protected.append(d / "hooks")
+            else:
+                # A linked worktree's pointers back to the shared clone:
+                # rewritten, they would send git to a config of the agent's.
+                git_protected += [
+                    d / n for n in ("commondir", "gitdir") if (d / n).exists()
+                ]
         if dot_git.is_file():
             git_protected.append(dot_git)
 

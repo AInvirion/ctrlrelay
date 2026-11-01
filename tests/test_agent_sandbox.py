@@ -81,6 +81,12 @@ try create_project_memory "mkdir -p $M && touch $M/MEMORY.md"
 try repoint_dot_git "echo 'gitdir: /elsewhere' > .git"
 try worktree_config "echo planted >> $GITDIR/config.worktree"
 try read_hidden_in_writable "cat $HOME/.claude/secret-token"
+try repoint_commondir "echo /elsewhere > $GITDIR/commondir"
+try rename_worktrees "mv $GITCOMMON/worktrees $GITCOMMON/worktrees.x"
+P="$HOME/.claude/projects"
+try rename_project_for_memory "mv $P/-other $P/-other.x && mkdir -p $P/-other/memory"
+try read_shell_snapshot "cat $HOME/.claude/shell-snapshots/snapshot-bash.sh"
+try write_shell_snapshot "echo planted >> $HOME/.claude/shell-snapshots/snapshot-bash.sh"
 try write_agent_state "touch $HOME/.claude/projects/run-log"
 try write_hooks "touch $GITCOMMON/hooks/pre-push"
 try write_git_config "git config --file $GITCOMMON/config core.fsmonitor /bin/evil"
@@ -107,6 +113,8 @@ def home(monkeypatch):
     (h / ".claude" / "projects" / "-other" / "memory" / "MEMORY.md").write_text("mine\n")
     (h / ".claude" / "projects" / "-bare").mkdir()
     (h / ".claude" / "settings.json").write_text("{}")
+    (h / ".claude" / "shell-snapshots").mkdir()
+    (h / ".claude" / "shell-snapshots" / "snapshot-bash.sh").write_text("export MINE=1\n")
     (base / "shared").mkdir()
     (base / "shared" / "CLAUDE.md").write_text("shared\n")
     (h / ".claude" / "CLAUDE.md").symlink_to(base / "shared" / "CLAUDE.md")
@@ -176,6 +184,12 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         "repoint_dot_git": "no",
         "worktree_config": "no",
         "read_hidden_in_writable": "no",
+        "repoint_commondir": "no",
+        "rename_worktrees": "no",
+        "rename_project_for_memory": "no",
+        "read_shell_snapshot": "no",
+        # Into the sandbox's own empty copy; the real one is checked below.
+        "write_shell_snapshot": "yes",
         "write_agent_state": "yes",
         "write_hooks": "no",
         "write_git_config": "no",
@@ -188,6 +202,10 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
     assert not (h / ".local" / "bin" / "planted").exists()
     assert not (bare / "hooks" / "pre-push").exists()
     assert not (h / ".claude" / "settings.local.json").exists()
+    snap = h / ".claude" / "shell-snapshots" / "snapshot-bash.sh"
+    assert snap.read_text() == "export MINE=1\n"
+    assert (h / ".claude" / "projects" / "-other" / "memory" / "MEMORY.md").exists()
+    assert (gitdir / "commondir").read_text().strip() != "/elsewhere"
     assert (h / ".claude" / "CLAUDE.md").is_symlink()
     assert (home / "shared" / "CLAUDE.md").read_text() == "shared\n"
     assert (home / "agent-cache" / "uv" / "x").exists()
@@ -316,11 +334,14 @@ def test_a_hidden_path_wins_over_a_read_only_one_naming_it(tmp_path) -> None:
     ]
 
 
-def test_a_missing_git_config_is_made_a_file_not_a_directory(tmp_path) -> None:
+def test_a_missing_git_config_is_made_a_file_not_a_directory(
+    tmp_path, monkeypatch,
+) -> None:
     if BWRAP is None:
         pytest.skip("bwrap not installed")
     from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     wt = tmp_path / "wt"
     _git("init", "-q", str(wt), cwd=tmp_path)
     (wt / ".git" / "config").unlink()
