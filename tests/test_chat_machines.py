@@ -391,3 +391,17 @@ class TestRoundOneFixes:
         a_post = next(iter(channel.posts))
         await a._on_reply("node-a: pin", reply_to_post_id=a_post)
         assert _answers(wa) == ["pin"]
+
+    @pytest.mark.asyncio
+    async def test_after_a_restart_naming_the_machine_on_its_own_question_is_stripped(
+        self, tmp_path,
+    ) -> None:
+        channel, a, _ = _bridges(tmp_path, shared=True)
+        await _ask(a, "pin or bump?")
+        a_post = next(iter(channel.posts))
+        a._pending_questions.clear()  # the bridge restarted: nothing in memory
+        a._asked_sessions.clear()
+        a._queue_orphan_reply_as_resume_answer = AsyncMock(return_value={"status": "none"})
+        a._send_notice = AsyncMock()
+        await a._on_reply("node-a: pin", reply_to_post_id=a_post)
+        assert a._queue_orphan_reply_as_resume_answer.await_args.args[0] == "pin"
