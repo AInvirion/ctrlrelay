@@ -36,7 +36,7 @@ def _git(*args: str, cwd: Path) -> str:
     ).stdout.strip()
 
 
-def test_the_prefix_layers_read_only_writable_hidden_then_read_only(tmp_path) -> None:
+def test_the_prefix_layers_read_only_writable_read_only_then_hidden(tmp_path) -> None:
     from ctrlrelay.core.agent_env import bwrap_prefix
 
     hidden = tmp_path / "ssh"
@@ -55,8 +55,8 @@ def test_the_prefix_layers_read_only_writable_hidden_then_read_only(tmp_path) ->
         "/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
         "--tmpfs", "/tmp", "--unshare-pid", "--die-with-parent",
         "--bind", str(wt), str(wt),
-        "--tmpfs", str(hidden), "--ro-bind", "/dev/null", str(secret_file),
         "--ro-bind", str(settings), str(settings),
+        "--tmpfs", str(hidden), "--ro-bind", "/dev/null", str(secret_file),
         "--",
     ]
 
@@ -285,3 +285,14 @@ def test_a_read_only_path_that_cannot_be_made_stops_the_run(tmp_path) -> None:
             "/usr/bin/bwrap", [], writable=[open_dir],
             readonly=[open_dir / "plugins" / "hooks"],
         )
+
+
+def test_a_hidden_path_wins_over_a_read_only_one_naming_it(tmp_path) -> None:
+    from ctrlrelay.core.agent_env import bwrap_prefix
+
+    secret = tmp_path / "ssh"
+    secret.mkdir()
+    argv = bwrap_prefix("/usr/bin/bwrap", [str(secret)], readonly=[secret])
+    assert argv[-6:] == [
+        "--ro-bind", str(secret), str(secret), "--tmpfs", str(secret), "--",
+    ]

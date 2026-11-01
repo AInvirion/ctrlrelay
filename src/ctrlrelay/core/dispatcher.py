@@ -251,8 +251,13 @@ class ClaudeDispatcher:
         # git directory. The agent may not write them.
         git_protected: list[Path] = []
         for i, d in enumerate(repo_dirs):
-            names = ("config", "config.worktree") + (("hooks",) if i == 0 else ())
-            git_protected += [d / n for n in names]
+            # Files, made here when missing: the sandbox would otherwise
+            # make a missing name without a suffix a directory.
+            for name in ("config", "config.worktree"):
+                (d / name).touch(exist_ok=True)
+                git_protected.append(d / name)
+            if i == 0:
+                git_protected.append(d / "hooks")
         if dot_git.is_file():
             git_protected.append(dot_git)
 

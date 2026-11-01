@@ -247,9 +247,8 @@ def _existing(raw: str | Path) -> Path | None:
     expanded = os.path.expandvars(os.path.expanduser(str(raw)))
     if "$" in expanded:
         return None
-    p = Path(expanded)
-    if p.is_symlink():
-        p = p.resolve()
+    # Every link on the way resolved, so the bind names the real place.
+    p = Path(os.path.realpath(expanded))
     return p if p.exists() else None
 
 
@@ -264,9 +263,10 @@ def bwrap_prefix(
 
     In order, so each step wins over the one before: the whole
     filesystem read-only, a fresh ``/dev``, ``/proc`` and private
-    ``/tmp``; ``writable`` bound back writable; ``hide_paths`` made empty
-    (a directory becomes an empty tmpfs, a file ``/dev/null``), also
-    inside a writable path; and ``readonly`` bound read-only again. A
+    ``/tmp``; ``writable`` bound back writable; ``readonly`` bound
+    read-only again; and ``hide_paths`` made empty (a directory becomes an
+    empty tmpfs, a file ``/dev/null``) wherever they are. Bind sources are
+    read from the host, so a path under ``/tmp`` binds normally. A
     hidden or writable path that does not exist is skipped (bwrap would
     otherwise have to create a mount point for it). A missing read-only
     path inside a writable one is created first (see
@@ -284,16 +284,6 @@ def bwrap_prefix(
         if p is not None:
             argv += ["--bind", str(p), str(p)]
             open_dirs.append(p)
-    # After the writable binds, so a writable path that contains a hidden
-    # one does not bring it back.
-    for raw in hide_paths:
-        p = _existing(raw)
-        if p is None:
-            continue
-        if p.is_dir():
-            argv += ["--tmpfs", str(p)]
-        else:
-            argv += ["--ro-bind", "/dev/null", str(p)]
     for raw in readonly:
         p = _existing(raw)
         if p is None:
@@ -309,6 +299,16 @@ def bwrap_prefix(
                 continue  # nothing writable reaches it: it stays absent
             p = _create_readonly(target)
         argv += ["--ro-bind", str(p), str(p)]
+    # Last, so neither a writable nor a read-only path that contains or
+    # names a hidden one brings it back.
+    for raw in hide_paths:
+        p = _existing(raw)
+        if p is None:
+            continue
+        if p.is_dir():
+            argv += ["--tmpfs", str(p)]
+        else:
+            argv += ["--ro-bind", "/dev/null", str(p)]
     argv.append("--")
     return argv
 
