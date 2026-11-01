@@ -30,6 +30,7 @@ import socket
 import threading
 import time
 import urllib.parse
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path
@@ -38,6 +39,7 @@ from typing import Any, Protocol
 from ctrlrelay import __version__
 from ctrlrelay.core.config import Config, WebConfig
 from ctrlrelay.core.obs import get_logger, log_event
+from ctrlrelay.core.usage import UsageStore, pause_for, usage_json
 from ctrlrelay.web.health import read_server_health
 from ctrlrelay.web.status import build_status, list_feed
 
@@ -260,9 +262,30 @@ class StatusServer(ThreadingHTTPServer):
             ("worktrees", Path(self.config.paths.worktrees)),
         ])
 
+    def node(self) -> dict[str, Any]:
+        """This machine's own block: its name and subscription usage
+        (#247). Whether it is paused is worked out from the same reading
+        and threshold the daemon uses, so the page needs no line to it."""
+        reading = UsageStore.beside(self.config.paths.state_db).read()
+        pause = pause_for(
+            reading, threshold=self.config.usage.pause_at, now=time.time(),
+        )
+        return {
+            "name": self.config.node_id,
+            "usage": usage_json(reading),
+            "pause_at": self.config.usage.pause_at,
+            "paused": None if pause is None else {
+                "reason": pause.reason,
+                "until": None if pause.until is None else datetime.fromtimestamp(
+                    pause.until, tz=UTC,
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        }
+
     def status(self) -> dict[str, Any]:
         web = self.config.web
         return build_status(
+            node=self.node,
             db_path=self.config.paths.state_db,
             waiting=self.waiting.snapshot(),
             server=self.server_health,

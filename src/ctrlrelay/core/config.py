@@ -747,6 +747,18 @@ class ClaimsConfig(BaseModel):
         return self
 
 
+class UsageConfig(BaseModel):
+    """Pausing before the agent subscription's limit (#247)."""
+
+    # Stop taking new work when the 5-hour or 7-day window reaches this
+    # share of the limit (0 to 1). Runs already going finish.
+    pause_at: float = Field(default=0.9, gt=0, le=1)
+    # While idle, read the usage with a tiny agent call this often, so
+    # the numbers do not go stale. 0 turns it off. Each probe is one
+    # short agent call on the subscription.
+    probe_minutes: int = Field(default=30, ge=0)
+
+
 class Config(BaseModel):
     """Root configuration model for ctrlrelay orchestrator."""
 
@@ -761,6 +773,9 @@ class Config(BaseModel):
     schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     claims: ClaimsConfig = Field(default_factory=ClaimsConfig)
+
+
+    usage: UsageConfig = Field(default_factory=UsageConfig)
     personalization: Personalization | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
 

@@ -104,6 +104,10 @@ a:hover, a:focus-visible { text-decoration: underline; }
 .server .line { padding: 3px 0; font-size: 14px; font-variant-numeric: tabular-nums; }
 .server .line.low { color: var(--bad); font-weight: 600; }
 .server .line.low::before { content: "low: "; }
+.usage .line.high { color: var(--bad); font-weight: 600; }
+.usage .bar { height: 6px; background: var(--line, #ddd); border-radius: 3px; margin: 2px 0 6px; }
+.usage .bar > span { display: block; height: 100%; border-radius: 3px; background: currentColor; }
+.usage .bar.high { color: var(--bad); }
 details > summary {
   cursor: pointer; font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
   color: var(--muted); margin: 0 0 8px; font-weight: 700;
@@ -147,6 +151,10 @@ details > summary .count { font-weight: 400; margin-left: 6px; }
     </section>
   </div>
   <div>
+    <section class="server usage">
+      <h2>Usage</h2>
+      <div id="usage"><p class="unknown">loading…</p></div>
+    </section>
     <section class="server">
       <h2>Server</h2>
       <div id="server"><p class="unknown">loading…</p></div>
@@ -596,6 +604,56 @@ function renderServer(data) {
   put(target, lines);
 }
 
+// #247: the agent subscription's 5-hour and 7-day windows. A window the
+// server could not read says "unknown", never 0%.
+var WINDOW_LABELS = { five_hour: "5-hour", seven_day: "7-day" };
+
+function untilText(iso, now) {
+  var t = Date.parse(iso);
+  if (isNaN(t)) { return "reset time unknown"; }
+  var secs = Math.round(t / 1000 - now);
+  return secs > 0 ? "resets in " + duration(secs) : "reset passed";
+}
+
+function renderUsage(data, now) {
+  var target = document.getElementById("usage");
+  var n = data.node;
+  if (!n || typeof n !== "object") {
+    put(target, [unknown("unknown: usage could not be read")]);
+    return;
+  }
+  var lines = [];
+  if (n.paused && typeof n.paused === "object") {
+    lines.push(el("div", "line high", "paused: " + n.paused.reason +
+      (n.paused.until ? " (" + untilText(n.paused.until, now) + ")" : "")));
+  }
+  var u = n.usage;
+  if (!u || typeof u !== "object") {
+    lines.push(unknown("unknown: no usage reading yet"));
+    put(target, lines);
+    return;
+  }
+  ["five_hour", "seven_day"].forEach(function (name) {
+    var w = u[name];
+    if (!w || typeof w !== "object" || typeof w.used !== "number") {
+      lines.push(el("div", "line", WINDOW_LABELS[name] + " unknown"));
+      return;
+    }
+    var high = typeof n.pause_at === "number" && w.used >= n.pause_at;
+    lines.push(el("div", "line" + (high ? " high" : ""),
+      WINDOW_LABELS[name] + " " + pct(w.used * 100) + " used, " + untilText(w.resets_at, now)));
+    var bar = el("div", "bar" + (high ? " high" : ""));
+    var fill = el("span");
+    fill.style.width = Math.max(0, Math.min(100, w.used * 100)).toFixed(0) + "%";
+    bar.appendChild(fill);
+    lines.push(bar);
+  });
+  var readAt = Date.parse(u.read_at);
+  lines.push(el("div", "muted", "status " + (u.status || "unknown") + ", read " +
+    (isNaN(readAt) ? "at an unknown time" : duration(Math.max(0, Math.round(now - readAt / 1000))) + " ago")));
+  put(target, lines);
+}
+
 function renderToday(data) {
   var target = document.getElementById("today");
   var t = data.today || {};
@@ -678,6 +736,7 @@ function render(data) {
   renderWaiting(data);
   renderSkipped(data);
   renderToday(data);
+  renderUsage(data, now);
   renderServer(data);
   renderFeed(data);
 }

@@ -10,7 +10,6 @@ so pipelines can stay agent-agnostic.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 import tempfile
@@ -29,6 +28,11 @@ from ctrlrelay.core.agent_env import (
 from ctrlrelay.core.binaries import resolve_binary
 from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
+from ctrlrelay.core.usage import (
+    UsageStore,
+    parse_agent_session_id,
+    parse_rate_limit_event,
+)
 
 if TYPE_CHECKING:
     from ctrlrelay.core.config import AgentConfig
@@ -161,6 +165,10 @@ class ClaudeDispatcher:
     # unprivileged user namespaces allowed, which not every host has.
     sandbox: str = "none"
     sandbox_hide_paths: tuple[str, ...] = DEFAULT_SANDBOX_HIDE_PATHS
+    # Where each run's subscription usage reading is kept (#247). ``None``
+    # keeps no reading; `make_agent_dispatcher` requires the caller to say
+    # so, like ``outcome_hook``.
+    usage_store: UsageStore | None = None
 
     def __post_init__(self) -> None:
         # Only auto-resolve the bare default. Absolute paths, relative paths
@@ -307,7 +315,10 @@ class ClaudeDispatcher:
             *prefix,
             self.claude_binary,
             "-p", prompt,
-            "--output-format", "json",
+            # stream-json, not json: only the stream carries the
+            # `rate_limit_event` line with the subscription usage (#247).
+            # `--verbose` is required with it in print mode.
+            "--output-format", "stream-json", "--verbose",
             "--dangerously-skip-permissions",
         ]
         if resume_session_id:
@@ -553,6 +564,7 @@ class ClaudeDispatcher:
             )
 
         agent_session_id = _extract_agent_session_id(stdout_text)
+        self._record_usage(stdout_text, ident)
 
         log_event(
             _logger,
@@ -585,29 +597,40 @@ class ClaudeDispatcher:
         )
 
 
+    def _record_usage(self, stdout_text: str, ident: dict) -> None:
+        """Keep the run's usage reading. A run with no readable reading
+        leaves the last one in place rather than writing "unknown" over
+        it: the last real number, with its time, is the better answer."""
+        if self.usage_store is None:
+            return
+        try:
+            reading = parse_rate_limit_event(stdout_text)
+        except Exception as e:  # an undocumented field: never fail the run
+            log_event(
+                _logger, "dispatcher.usage.parse_failed", **ident,
+                error=str(e)[:200],
+            )
+            return
+        if reading is None:
+            log_event(_logger, "dispatcher.usage.absent", **ident)
+            return
+        self.usage_store.write(reading)
+
+
 def _elapsed_ms(started: float) -> int:
     """Milliseconds since ``started`` (a :func:`time.monotonic` reading)."""
     return int((time.monotonic() - started) * 1000)
 
 
 def _extract_agent_session_id(stdout_text: str) -> str | None:
-    """Pull Claude's session UUID out of ``claude -p --output-format json``.
+    """The agent's session UUID, required by ``--resume``.
 
-    Claude emits a single JSON object on stdout whose ``session_id`` field is
-    the UUID required by ``--resume``. If the output is empty or not JSON
-    (errors, interrupted runs) we return ``None`` and let the caller decide
-    how to fall back.
+    Read from the stream-json lines (#247), with the single object of the
+    older ``--output-format json`` still accepted. ``None`` when nothing
+    carries one (errors, interrupted runs), and the caller decides how to
+    fall back.
     """
-    if not stdout_text.strip():
-        return None
-    try:
-        payload = json.loads(stdout_text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    value = payload.get("session_id")
-    return value if isinstance(value, str) and value else None
+    return parse_agent_session_id(stdout_text)
 
 
 class AgentAdapter(Protocol):
@@ -644,6 +667,7 @@ def make_agent_dispatcher(
     agent_config: "AgentConfig",
     *,
     outcome_hook: DispatchOutcomeHook | None,
+    usage_store: UsageStore | None,
 ) -> AgentAdapter:
     """Build an adapter for the configured ``agent.type``.
 
@@ -658,6 +682,10 @@ def make_agent_dispatcher(
     reads as an ordinary call. Making it required hands the
     enumeration of call sites to the interpreter and the suite instead
     of to whoever remembers.
+
+    ``usage_store`` is required for the same reason (#247): a run that
+    keeps no usage reading leaves the page showing an older number, or
+    unknown, and the pause before the limit blind.
     """
     t = agent_config.type
     if t == "claude":
@@ -667,6 +695,7 @@ def make_agent_dispatcher(
             outcome_hook=outcome_hook,
             sandbox=agent_config.sandbox,
             sandbox_hide_paths=tuple(agent_config.sandbox_hide_paths),
+            usage_store=usage_store,
         )
     raise NotImplementedError(
         f"agent.type={t!r} has no adapter yet. Implement one that "
