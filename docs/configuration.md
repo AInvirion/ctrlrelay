@@ -348,6 +348,30 @@ The usage comes from a field of the agent CLI's output that is not
 documented. When it is missing or cannot be read, the page says
 **unknown**, never 0%, and the machine does not pause on it. A run whose output carries no readable usage records unknown too, so an older number stops pausing the machine.
 
+## github_api
+
+Watching the account's GitHub API budget. Every machine and session on the
+account spends the same hourly budget per bucket (`core`, `search`,
+`graphql`).
+
+```yaml
+github_api:
+  low_at: 0.2
+  check_minutes: 5
+  slow_factor: 3
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `low_at` | number (between 0 and 1) | `0.2` | A bucket below this share of its limit is low: the poll interval is multiplied by `slow_factor`, the status page skips its waiting-line refresh, and one chat line goes out. |
+| `check_minutes` | int (1-60) | `5` | How often the daemon reads `/rate_limit`. That call does not count against the budget. |
+| `slow_factor` | number (1-20) | `3` | The poll interval multiplier while any bucket is low. |
+
+When a bucket is used up, the daemon makes no call that spends it until its
+reset: such a call fails at once as rate limited, one chat line says when it
+resets, and the poller picks up again on its own afterwards. A budget it
+could not read is shown as unknown and slows nothing.
+
 ## repos
 
 A list of repositories the orchestrator manages.

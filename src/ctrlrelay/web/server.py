@@ -30,11 +30,11 @@ import socket
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any, Protocol
 
 from ctrlrelay import __version__

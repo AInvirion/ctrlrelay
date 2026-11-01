@@ -615,6 +615,25 @@ function untilText(iso, now) {
   return secs > 0 ? "resets in " + duration(secs) : "reset passed";
 }
 
+// #237: the account's GitHub API budget, shared by every machine on it.
+function renderGitHubBudget(api, now, lines) {
+  if (!api || typeof api !== "object") {
+    lines.push(el("div", "line", "GitHub API unknown"));
+    return;
+  }
+  ["core", "search", "graphql"].forEach(function (name) {
+    var b = api[name];
+    if (!b || typeof b !== "object" || typeof b.remaining !== "number") {
+      lines.push(el("div", "line", "GitHub " + name + " unknown"));
+      return;
+    }
+    var high = b.state === "low" || b.state === "out";
+    lines.push(el("div", "line" + (high ? " high" : ""),
+      "GitHub " + name + " " + b.remaining + " of " + b.limit + " left" +
+      (b.state === "out" ? " (used up)" : "") + ", " + untilText(b.resets_at, now)));
+  });
+}
+
 function renderUsage(data, now) {
   var target = document.getElementById("usage");
   var n = data.node;
@@ -630,6 +649,7 @@ function renderUsage(data, now) {
   var u = n.usage;
   if (!u || typeof u !== "object") {
     lines.push(unknown("unknown: no usage reading yet"));
+    renderGitHubBudget(n.github_api, now, lines);
     put(target, lines);
     return;
   }
@@ -648,6 +668,7 @@ function renderUsage(data, now) {
     bar.appendChild(fill);
     lines.push(bar);
   });
+  renderGitHubBudget(n.github_api, now, lines);
   var readAt = Date.parse(u.read_at);
   lines.push(el("div", "muted", "status " + (u.status || "unknown") + ", read " +
     (isNaN(readAt) ? "at an unknown time" : duration(Math.max(0, Math.round(now - readAt / 1000))) + " ago")));

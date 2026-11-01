@@ -2631,7 +2631,7 @@ def poller_start(
             usage_store=usage_store,
         )
 
-        async def _usage_notice(text: str) -> None:
+        async def _chat_notice(text: str) -> None:
             transport = await connect_notify_transport(config)
             if transport is None:
                 return
@@ -2655,9 +2655,22 @@ def poller_start(
             usage_deferred.clear()
 
         usage_gate = UsageGate(
-            usage_store, threshold=config.usage.pause_at, notify=_usage_notice,
+            usage_store, threshold=config.usage.pause_at, notify=_chat_notice,
             on_resume=_wake_usage_deferred,
         )
+
+        # The account's GitHub API budget (#237): read on a schedule, shown
+        # on the page, and the gate every `gh` call of this process passes,
+        # so a used-up bucket fails fast as rate limited until its reset.
+        from ctrlrelay.core.github_budget import BudgetStore, GitHubBudget
+
+        github_budget = GitHubBudget(
+            BudgetStore.beside(config.paths.state_db),
+            low_at=config.github_api.low_at,
+            fetch=github.rate_limit,
+            notify=_chat_notice,
+        )
+        github.budget = github_budget
         worktree = WorktreeManager(
             worktrees_dir=config.paths.worktrees,
             bare_repos_dir=config.paths.bare_repos,
@@ -3718,6 +3731,11 @@ def poller_start(
                 func=_run_usage_probe,
             )
             scheduler.add_cron_job(
+                name="github_budget",
+                cron_expr=f"*/{config.github_api.check_minutes} * * * *",
+                func=github_budget.refresh,
+            )
+            scheduler.add_cron_job(
                 name="question_expiry_sweeper",
                 cron_expr="0 * * * *",
                 func=_run_question_expiry_sweeper,
@@ -3841,8 +3859,13 @@ def poller_start(
                     )
 
             try:
+                await github_budget.refresh()
                 await run_poll_loop(
                     poller=poller, handler=handle_issue, interval=interval,
+                    interval_scale=lambda: (
+                        config.github_api.slow_factor
+                        if github_budget.is_low() else 1.0
+                    ),
                 )
             finally:
                 # Scheduler shutdown is async so it can cancel + await any

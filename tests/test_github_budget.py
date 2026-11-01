@@ -194,3 +194,96 @@ class TestTheGhGate:
             with pytest.raises(GitHubError):
                 await gh._run_gh("api", "repos/o/r")
         assert budget.blocked_until("core") == NOW + 3000
+
+
+class TestSlowingDown:
+    @pytest.mark.asyncio
+    async def test_the_poll_interval_scales_while_low(self, monkeypatch) -> None:
+        from unittest.mock import MagicMock
+
+        import ctrlrelay.core.poller as poller_mod
+
+        slept: list[float] = []
+
+        async def fake_sleep(s: float) -> None:
+            slept.append(s)
+
+        monkeypatch.setattr(poller_mod.asyncio, "sleep", fake_sleep)
+        poller = MagicMock()
+        poller.poll = AsyncMock(return_value=[])
+        low = iter([False, True, True])
+        await poller_mod.run_poll_loop(
+            poller=poller, handler=AsyncMock(), interval=100, max_iterations=4,
+            interval_scale=lambda: 3.0 if next(low) else 1.0,
+        )
+        assert slept == [100, 300, 300]
+
+    @pytest.mark.asyncio
+    async def test_a_scale_that_raises_counts_as_one(self, monkeypatch) -> None:
+        from unittest.mock import MagicMock
+
+        import ctrlrelay.core.poller as poller_mod
+
+        slept: list[float] = []
+
+        async def fake_sleep(s: float) -> None:
+            slept.append(s)
+
+        monkeypatch.setattr(poller_mod.asyncio, "sleep", fake_sleep)
+        poller = MagicMock()
+        poller.poll = AsyncMock(return_value=[])
+
+        def broken() -> float:
+            raise RuntimeError("no reading")
+
+        await poller_mod.run_poll_loop(
+            poller=poller, handler=AsyncMock(), interval=100, max_iterations=2,
+            interval_scale=broken,
+        )
+        assert slept == [100]
+
+    def test_the_waiting_line_skips_its_github_calls_while_low(self) -> None:
+        import time as _time
+
+        from ctrlrelay.web.server import WaitingRefresher
+
+        tracker = AsyncMock()
+        refresher = WaitingRefresher(tracker, interval_s=0.05, budget_is_low=lambda: True)
+        refresher.start()
+        _time.sleep(0.2)
+        refresher.stop()
+        tracker.refresh.assert_not_awaited()
+
+        tracker = AsyncMock()
+        refresher = WaitingRefresher(tracker, interval_s=0.05, budget_is_low=lambda: False)
+        refresher.start()
+        _time.sleep(0.2)
+        refresher.stop()
+        assert tracker.refresh.await_count >= 1
+
+
+class TestTheStatusBlock:
+    def test_unknown_then_numbers(self, tmp_path: Path) -> None:
+        from ctrlrelay.core.config import Config
+        from ctrlrelay.web.server import StatusServer
+
+        config = Config.model_validate({
+            "node_id": "node-a",
+            "paths": {k: str(tmp_path / k) for k in
+                      ("state_db", "worktrees", "bare_repos", "contexts", "skills")},
+            "transport": {"type": "file_mock", "file_mock": {
+                "inbox": str(tmp_path / "in"), "outbox": str(tmp_path / "out"),
+            }},
+        })
+        server = StatusServer.__new__(StatusServer)
+        server.config = config
+        assert server.node()["github_api"] == "unknown"
+        import time as _time
+
+        now = int(_time.time())
+        BudgetStore.beside(config.paths.state_db).write(
+            parse_rate_limit(rate_limit(core=100, reset=now + 600), now=now),
+        )
+        block = server.node()["github_api"]
+        assert block["core"]["remaining"] == 100
+        assert block["core"]["state"] == LOW
