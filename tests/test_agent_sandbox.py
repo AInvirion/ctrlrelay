@@ -296,3 +296,19 @@ def test_a_hidden_path_wins_over_a_read_only_one_naming_it(tmp_path) -> None:
     assert argv[-6:] == [
         "--ro-bind", str(secret), str(secret), "--tmpfs", str(secret), "--",
     ]
+
+
+def test_a_missing_git_config_is_made_a_file_not_a_directory(tmp_path) -> None:
+    if BWRAP is None:
+        pytest.skip("bwrap not installed")
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    wt = tmp_path / "wt"
+    _git("init", "-q", str(wt), cwd=tmp_path)
+    (wt / ".git" / "config").unlink()
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
+        sandbox_cache_dir=str(tmp_path / "c"),
+    )
+    d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)
+    assert (wt / ".git" / "config").is_file()
