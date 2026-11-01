@@ -1292,3 +1292,18 @@ def test_every_today_counter_asks_for_a_kind_the_server_lists() -> None:
     assert load.count("seq === todaySeq") == 3 and "++todaySeq" in load
     # A refresh does not start a second request while one is out.
     assert "!force && todayBusy === kind" in load
+
+
+
+def test_the_feed_scrubs_credentials_from_event_details(tmp_path: Path, serve) -> None:
+    _today_db(tmp_path)
+    config = _config(tmp_path)
+    srv = serve(config, _tracker(config, tmp_path))
+
+    _, events = srv.json("/api/events")
+    _, status = srv.json("/api/status")
+
+    for feed in (events["events"], status["feed"]):
+        [blocked] = [e for e in feed if e["kind"] == "blocked"]
+        assert blocked["detail"]["question"].startswith("Merge or leave?")
+        assert "ghp_" not in json.dumps(feed)

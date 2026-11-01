@@ -370,9 +370,23 @@ def _event_url(repo: Any, issue_number: Any, detail: Any) -> str | None:
     return github_url(repo, issue_number)
 
 
+def _scrubbed(detail: Any) -> Any:
+    """``detail`` with credential shapes removed from its text: a question
+    the agent asked is stored as it wrote it, and the page shows it."""
+    from ctrlrelay.core.redact import redact_secrets
+
+    if isinstance(detail, dict):
+        return {k: _scrubbed(v) for k, v in detail.items()}
+    if isinstance(detail, list):
+        return [_scrubbed(v) for v in detail]
+    if isinstance(detail, str):
+        return redact_secrets(detail)
+    return detail
+
+
 def _event(row: dict[str, Any]) -> dict[str, Any]:
     ts = int(row["ts"])
-    detail = _detail(row["detail"])
+    detail = _scrubbed(_detail(row["detail"]))
     return {
         "ts": ts,
         "time": _iso(ts),
