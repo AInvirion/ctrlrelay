@@ -225,13 +225,13 @@ async def test_a_state_file_outside_the_worktree_is_refused(home: Path) -> None:
         )
 
 
-def test_a_read_only_path_that_cannot_be_made_stops_the_run(tmp_path) -> None:
+def test_a_dangling_link_at_a_read_only_path_stops_the_run(tmp_path) -> None:
     from ctrlrelay.core.agent_env import SandboxUnavailableError, bwrap_prefix
 
     open_dir = tmp_path / "open"
     open_dir.mkdir()
     (open_dir / "settings.local.json").symlink_to(tmp_path / "gone" / "x.json")
-    with pytest.raises(SandboxUnavailableError, match="cannot create"):
+    with pytest.raises(SandboxUnavailableError, match="link to something missing"):
         bwrap_prefix(
             "/usr/bin/bwrap", [], writable=[open_dir],
             readonly=[open_dir / "settings.local.json"],
@@ -271,3 +271,17 @@ def test_the_agent_caches_are_its_own(tmp_path) -> None:
     env = agent_cache_env(tmp_path)
     assert all(Path(v).is_relative_to(tmp_path) for v in env.values())
     assert {"XDG_CACHE_HOME", "npm_config_cache", "GOMODCACHE", "CARGO_HOME"} <= set(env)
+
+
+def test_a_read_only_path_that_cannot_be_made_stops_the_run(tmp_path) -> None:
+    from ctrlrelay.core.agent_env import SandboxUnavailableError, bwrap_prefix
+
+    open_dir = tmp_path / "open"
+    open_dir.mkdir()
+    (open_dir / "plugins").write_text("a file where a directory goes")
+    # A file named like a directory blocks creating hooks inside it.
+    with pytest.raises(SandboxUnavailableError, match="cannot create"):
+        bwrap_prefix(
+            "/usr/bin/bwrap", [], writable=[open_dir],
+            readonly=[open_dir / "plugins" / "hooks"],
+        )

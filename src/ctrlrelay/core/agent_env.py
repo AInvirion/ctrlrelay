@@ -301,8 +301,10 @@ def bwrap_prefix(
             if target is None:
                 continue
             # Spelled through the same links as the writable paths, which
-            # were resolved: ``~/.claude`` may itself be a symlink.
-            target = Path(os.path.realpath(target))
+            # were resolved: ``~/.claude`` may itself be a symlink. The last
+            # part is not followed, so a dangling link is judged where it
+            # sits.
+            target = Path(os.path.realpath(target.parent)) / target.name
             if not any(target.is_relative_to(d) for d in open_dirs):
                 continue  # nothing writable reaches it: it stays absent
             p = _create_readonly(target)
@@ -324,10 +326,16 @@ def _create_readonly(p: Path) -> Path:
     ``settings.local.json`` with a hook in it, or a git hook, which then
     runs later as the operator. A name with a suffix is made a file (``{}``
     for JSON, so the agent CLI still parses it), anything else an empty
-    directory. A dangling symlink gets its target created. Raises
-    :class:`SandboxUnavailableError` when it cannot be made: the run does
-    not start rather than start with the path open.
+    directory. Raises :class:`SandboxUnavailableError` when it cannot be
+    made, a dangling symlink included (the agent could replace the link):
+    the run does not start rather than start with the path open.
     """
+    if p.is_symlink():
+        raise SandboxUnavailableError(
+            f"agent.sandbox: {p} is a link to something missing, which the "
+            "agent could replace; remove the link, or take the path out of "
+            "agent.sandbox_readonly_paths"
+        )
     try:
         if p.suffix:
             p.parent.mkdir(parents=True, exist_ok=True)
