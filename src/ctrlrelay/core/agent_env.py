@@ -280,6 +280,7 @@ def bwrap_prefix(
     *,
     writable: Sequence[str | Path] = (),
     readonly: Sequence[str | Path] = (),
+    copies: Sequence[tuple[Path, Path]] = (),
 ) -> list[str]:
     """Argv prefix that runs a command in a read-only copy of this machine.
 
@@ -287,7 +288,8 @@ def bwrap_prefix(
     filesystem read-only, a fresh ``/dev``, ``/proc`` and private
     ``/tmp``; ``writable`` bound back writable, and every directory
     between one of those and a mount inside it made a mount point, so it
-    cannot be renamed away; ``readonly`` bound read-only again; and
+    cannot be renamed away; each ``(copy, path)`` in ``copies`` shown
+    writable at ``path``; ``readonly`` bound read-only again; and
     ``hide_paths`` made empty (a directory becomes an empty tmpfs, a file
     or socket ``/dev/null``) wherever they are. Bind sources are
     read from the host, so a path under ``/tmp`` binds normally. A
@@ -362,6 +364,8 @@ def bwrap_prefix(
 
     for p in sorted([*opened, *pins], key=depth):
         argv += ["--bind", str(p), str(p)]
+    for src, dest in copies:
+        argv += ["--bind", str(src), str(dest)]
     for p in sorted(locked, key=depth):
         argv += ["--ro-bind", str(p), str(p)]
     # Last, so neither a writable nor a read-only path that contains or

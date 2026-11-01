@@ -81,6 +81,7 @@ try create_project_memory "mkdir -p $M && touch $M/MEMORY.md"
 try repoint_dot_git "echo 'gitdir: /elsewhere' > .git"
 try worktree_config "echo planted >> $GITDIR/config.worktree"
 try read_hidden_in_writable "cat $HOME/.claude/secret-token"
+try write_main_config "echo planted >> $HOME/.claude.json"
 try repoint_commondir "echo /elsewhere > $GITDIR/commondir"
 try rename_worktrees "mv $GITCOMMON/worktrees $GITCOMMON/worktrees.x"
 P="$HOME/.claude/projects"
@@ -113,6 +114,7 @@ def home(monkeypatch):
     (h / ".claude" / "projects" / "-other" / "memory" / "MEMORY.md").write_text("mine\n")
     (h / ".claude" / "projects" / "-bare").mkdir()
     (h / ".claude" / "settings.json").write_text("{}")
+    (h / ".claude.json").write_text('{"mcpServers": {}}')
     (h / ".claude" / "shell-snapshots").mkdir()
     (h / ".claude" / "shell-snapshots" / "snapshot-bash.sh").write_text("export MINE=1\n")
     (base / "shared").mkdir()
@@ -184,6 +186,8 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         "repoint_dot_git": "no",
         "worktree_config": "no",
         "read_hidden_in_writable": "no",
+        # Its own copy; the real one is checked below.
+        "write_main_config": "yes",
         "repoint_commondir": "no",
         "rename_worktrees": "no",
         "rename_project_for_memory": "no",
@@ -202,6 +206,7 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
     assert not (h / ".local" / "bin" / "planted").exists()
     assert not (bare / "hooks" / "pre-push").exists()
     assert not (h / ".claude" / "settings.local.json").exists()
+    assert (h / ".claude.json").read_text() == '{"mcpServers": {}}'
     snap = h / ".claude" / "shell-snapshots" / "snapshot-bash.sh"
     assert snap.read_text() == "export MINE=1\n"
     assert (h / ".claude" / "projects" / "-other" / "memory" / "MEMORY.md").exists()

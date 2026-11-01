@@ -160,49 +160,58 @@ login, does not):
 
 - everything is read-only, so the toolchain you installed (in `/usr`, in
   `~/.local`, `~/.cargo`, ...) still runs;
-- writable: the run's worktree, its repository's git directory (so it can
-  commit), a private `/tmp`, `sandbox_writable_paths` and `sandbox_cache_dir`.
-  The agent CLI's state directory is opened entry by entry (`~/.claude/*`):
-  what is in it can be written, but nothing can be added to it, removed or
-  replaced, so a `settings.json` that is a link elsewhere cannot be swapped
-  for a file of the agent's. Log the agent CLI in on the machine before
-  turning the sandbox on, so its files exist;
-- `sandbox_hide_paths` are empty, also inside a writable path: the agent
-  cannot read your SSH keys, `gh`'s login or the other credentials listed
-  below;
-- read-only again, over those: `sandbox_readonly_paths` (the agent CLI's settings, hooks,
-  plugins and skills, and each project's memory under
-  `~/.claude/projects/*/memory`, which your own sessions load) and, in the
-  repository,
-  `config`, `config.worktree`, `hooks` and the worktree's `.git` pointer,
-  which every later git command there reads. One that does not exist yet
-  inside a writable path is created first (an empty directory, or `{}` for a
-  JSON file) so the agent cannot create it; if it cannot be created, the run
-  does not start.
+- writable: the run's worktree, its repository's git directories (so it can
+  commit), a private `/tmp`, the run's own empty `gh` and runtime
+  directories, `sandbox_writable_paths` and `sandbox_cache_dir`. The agent
+  CLI's state directory is opened entry by entry (`~/.claude/*`): what is in
+  it can be written, but nothing can be added to it, removed or replaced, so
+  a `settings.json` that is a link elsewhere cannot be swapped for a file of
+  the agent's. Log the agent CLI in on the machine before turning the
+  sandbox on, so its files exist. The CLI's main config, `~/.claude.json`,
+  which also holds your MCP server commands, is a private copy for each run;
+- `sandbox_hide_paths` are empty, also inside a writable path: your SSH keys,
+  `gh`'s login, the other credentials listed below, the sockets in your
+  session's runtime directory and Docker's (a read-only mount does not stop
+  a connection to a socket, so add any other socket here), and the agent
+  CLI's shell snapshots, session environment files and IDE locks, which your
+  own sessions run (the sandboxed run gets an empty, writable one of each);
+- read-only again, over those: `sandbox_readonly_paths` (the agent CLI's
+  settings, hooks, plugins, skills and install, and each project's memory
+  under `~/.claude/projects/*/memory`, which your own sessions load) and, in
+  the repository, `config`, `config.worktree`, `hooks`, a linked worktree's
+  `commondir` and `gitdir`, and the worktree's `.git` pointer, which every
+  later git command there reads. One that does not exist yet inside a
+  writable path is created first (an empty directory, or `{}` for a JSON
+  file) so the agent cannot create it; if it cannot be created, the run does
+  not start. Every directory between a writable path and one of these is
+  pinned too, so it cannot be renamed away and recreated.
 
 Package caches (`XDG_CACHE_HOME`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`,
-`npm_config_cache`, `GOMODCACHE` and `CARGO_HOME`) point at `sandbox_cache_dir`,
-which must not contain your home directory, the agent's own,
-never yours, so a run cannot poison a cache you build from. The first run of
-each project downloads its packages again. A tool that writes elsewhere in
-your home (Gradle's `~/.gradle`, for one) fails there until you add a
-directory for it to `sandbox_writable_paths`.
+`npm_config_cache`, `GOMODCACHE`, and `CARGO_HOME`) point at
+`sandbox_cache_dir`: the agent's own, never yours, so a run cannot poison a
+cache you build from. It must not contain your home directory. The first run
+of each project downloads its packages again. `CARGO_HOME` also moves Cargo's
+own config, so a `~/.cargo/config.toml` (registries, linker) does not apply
+there. A tool that writes elsewhere in your home (Gradle's `~/.gradle`, for
+one) fails there until you add a directory for it to
+`sandbox_writable_paths`.
 
 What it still allows: the agent reads the agent CLI's login (it needs it to
 run) and anything readable that is not hidden. The login file is opened as a
 file, so a refresh that replaces it by renaming fails inside the sandbox; a
 long-lived token from `claude setup-token`, in the environment, avoids
-refreshes there; it writes objects and refs in
-its repository's git directory, which the relay's push already treats as
-untrusted. A read-only path that is a link, inside a directory opened
+refreshes there. It writes objects and refs in its repository's git
+directory, which the relay's push already treats as untrusted, and session
+transcripts under `~/.claude/projects`, which a later `--resume` of that
+session reads. A read-only path that is a link, inside a directory opened
 whole, protects its target and not the link, which the agent can replace;
-the log names any as `agent_env.sandbox.readonly_link_replaceable` (none
-with the defaults). The run's checkpoint file must be inside its
-worktree (it always is for dev and task runs). It does not account for your
-own setup giving another way in: a hidden file with a second hard link
-elsewhere, your home mounted at a second path, or an `include.path` in a
-clone's git config pointing at a file the agent can write. ctrlrelay's own
-clones have none of these.
+the log names any as `agent_env.sandbox.readonly_link_replaceable` (none with
+the defaults). The run's checkpoint file must be inside its worktree (it
+always is for dev and task runs). It does not account for your own setup
+giving another way in: a hidden file with a second hard link elsewhere, your
+home mounted at a second path, or an `include.path` in a clone's git config
+pointing at a file the agent can write. ctrlrelay's own clones have none of
+these.
 
 **Setting it up.** Linux only. Install bubblewrap (`sudo apt install
 bubblewrap`), then check it runs as your user:

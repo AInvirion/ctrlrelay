@@ -278,6 +278,16 @@ class ClaudeDispatcher:
         if dot_git.is_file():
             git_protected.append(dot_git)
 
+        # The agent CLI rewrites its main config file on every start, and it
+        # also holds the operator's MCP server commands: the run gets its
+        # own copy, thrown away with the private dir.
+        copies: list[tuple[Path, Path]] = []
+        main_config = Path.home() / ".claude.json"
+        if main_config.is_file() and not main_config.is_symlink():
+            copy = private_root / "claude.json"
+            shutil.copyfile(main_config, copy)
+            copy.chmod(0o600)
+            copies.append((copy, main_config))
         return bwrap_prefix(
             self._bwrap,
             self.sandbox_hide_paths,
@@ -286,6 +296,7 @@ class ClaudeDispatcher:
                 *self.sandbox_writable_paths,
             ],
             readonly=[*self.sandbox_readonly_paths, *git_protected],
+            copies=copies,
         )
 
     async def _report_outcome(
