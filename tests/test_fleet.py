@@ -103,7 +103,7 @@ class TestNodeActivity:
         assert self._act(running=[CARD])["state"] == WORKING
         assert self._act(running=[CARD], paused={"reason": "x"})["state"] == PAUSED_LIMIT
 
-    def test_no_or_old_heartbeat_is_silent_whatever_else_is_true(self) -> None:
+    def test_no_or_old_heartbeat_is_silent_when_the_database_reads(self) -> None:
         assert self._act(heartbeat=None, running=[CARD])["state"] == SILENT
         assert self._act(heartbeat={"heartbeat_at": NOW - 301})["state"] == SILENT
         assert self._act(heartbeat={"heartbeat_at": NOW - 300})["state"] == IDLE
@@ -269,7 +269,7 @@ class TestConfig:
 
         from ctrlrelay.core.config import FleetConfig
 
-        with pytest.raises(ValidationError, match="label"):
+        with pytest.raises(ValidationError, match="not an email address"):
             FleetConfig(account_label="me@example.com")
         assert FleetConfig(account_label="max-2").account_label == "max-2"
 
@@ -454,3 +454,96 @@ class TestRoundThreeFixes:
         reader._read("http://b", token)  # the answer arrives first ...
         reader._publish("http://b", None, "timeout", only_if_running=token)  # ... then the deadline
         assert reader.snapshot()["peers"][0]["reachable"] is True
+
+
+class TestColdReviewFixes:
+    def test_a_huge_usage_number_does_not_unreach_the_peer(self) -> None:
+        import json as _json
+
+        data = _json.loads('{"host": "b", "node": {"name": "b", "usage": {"five_hour": '
+                           '{"used": 1' + "0" * 400 + '}}}, "needs_you": []}')
+        e = peer_entry("http://b", data=data, error=None, checked_at=NOW,
+                       previous=None, silent_after=300)
+        assert e["reachable"] and e["node"]["usage"]["five_hour"] == "unknown"
+
+    def test_a_running_sweep_is_a_claim(self) -> None:
+        act = node_activity(
+            running=[dict(CARD, issue_number=None)], needs_you=[],
+            heartbeat={"heartbeat_at": NOW}, paused=None, now=NOW, silent_after=300,
+        )
+        assert act["slots"]["busy"] == 1
+        assert [(c["kind"], c["issue_number"]) for c in act["claims"]] == [("sweep", None)]
+
+    def test_a_peer_clock_behind_ours_is_not_silent(self) -> None:
+        # The peer's clock is 10 minutes behind: its fresh heartbeat looks
+        # 10 minutes old on ours.
+        data = _status("node-b", beat=NOW - 600)
+        data["generated_ts"] = int(NOW - 600)
+        e = peer_entry("http://b", data=data, error=None, checked_at=NOW,
+                       previous=None, silent_after=300)
+        assert e["state"] == "idle"
+
+    def test_a_thread_that_will_not_start_does_not_strand_the_peer(self, monkeypatch) -> None:
+        reader = PeerReader(["http://b", "http://c"], interval_s=60, timeout_s=1,
+                            silent_after=300,
+                            fetch=lambda url, *, timeout: _status("node-c", beat=time.time()))
+        real_start = threading.Thread.start
+        calls = []
+
+        def start(self):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("can't start new thread")
+            real_start(self)
+
+        monkeypatch.setattr(threading.Thread, "start", start)
+        reader.read_once()
+        b, c = reader.snapshot()["peers"]
+        assert "could not start" in b["error"] and c["reachable"]
+        assert "http://b" not in reader._in_flight
+
+    def test_a_trickling_peer_is_cut_off_at_the_deadline(self) -> None:
+        class Slow(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    for _ in range(50):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.1)
+                except OSError:
+                    pass
+
+            def log_message(self, *a) -> None:
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                fetch_peer(f"http://127.0.0.1:{srv.server_address[1]}", timeout=0.3)
+            assert time.monotonic() - started < 2
+        finally:
+            srv.shutdown()
+
+    def test_the_heartbeat_file_is_readable_by_other_users(self, tmp_path: Path) -> None:
+        import stat
+
+        Heartbeat(tmp_path / "heartbeat.json").beat()
+        mode = stat.S_IMODE((tmp_path / "heartbeat.json").stat().st_mode)
+        assert mode & 0o044 == 0o044
+
+    def test_a_broken_chat_probe_keeps_the_node_block(self, tmp_path: Path, monkeypatch) -> None:
+        import ctrlrelay.cli as cli_mod
+        from ctrlrelay.web.server import StatusServer
+
+        def boom(config):
+            raise RuntimeError("bad chat config")
+
+        monkeypatch.setattr(cli_mod, "_bridge_socket_settings", boom)
+        server = StatusServer.__new__(StatusServer)
+        assert server._chat.__func__(type("S", (), {"config": None})()) == {
+            "transport": None, "connected": None,
+        }

@@ -62,6 +62,8 @@ class Heartbeat:
             fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".heartbeat-")
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f)
+            # mkstemp makes it 0600; the web server may run as another user.
+            os.chmod(tmp, 0o644)
             os.replace(tmp, self.path)
             tmp = None
         except Exception as e:

@@ -313,7 +313,8 @@ Added in #249:
 
 **The page with peers.** A **Machines** strip shows one card per machine,
 this one first: state, slots, 5-hour and 7-day usage, heartbeat age. A card is
-red when the machine is paused, silent or not reachable. A peer that does not
+red when the machine is paused, silent, unknown, not reachable, or not read
+yet. A peer that does not
 answer is shown as **not reachable from here**, with the reason (`timeout`,
 `refused`, `name not found`, `bad host header`, an HTTP status) and its last
 known numbers greyed out, never as idle. **Who has what** lists every claimed

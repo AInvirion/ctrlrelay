@@ -303,15 +303,18 @@ class StatusServer(ThreadingHTTPServer):
         there. ``None`` when no chat is configured. ``connected`` says the
         socket exists, which is what the daemon itself checks before it
         sends; it cannot see further into the bridge."""
-        from ctrlrelay.cli import _bridge_socket_settings
+        try:
+            from ctrlrelay.cli import _bridge_socket_settings
 
-        settings = _bridge_socket_settings(self.config)
-        if settings is None:
-            return None
-        return {
-            "transport": self.config.transport.type.value,
-            "connected": settings[0].exists(),
-        }
+            settings = _bridge_socket_settings(self.config)
+            if settings is None:
+                return None
+            transport = getattr(self.config.transport.type, "value",
+                                str(self.config.transport.type))
+            return {"transport": transport, "connected": settings[0].exists()}
+        except Exception:
+            # The chat probe must not take the rest of the node block with it.
+            return {"transport": None, "connected": None}
 
     def status(self) -> dict[str, Any]:
         web = self.config.web

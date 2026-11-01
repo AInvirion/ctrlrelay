@@ -28,7 +28,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from ctrlrelay.core.obs import get_logger
+from ctrlrelay.core.obs import get_logger, log_event
 
 _logger = get_logger("web.fleet")
 
@@ -97,12 +97,14 @@ def node_activity(
     if running is not None and needs_you is not None:
         claims = []
         for card in running:
-            if card.get("issue_number") is None:
-                continue
+            # A run with no issue (the security sweep) is still work this
+            # machine holds: listed as a sweep, not left out while the
+            # slots count it.
+            number = card.get("issue_number")
             claims.append({
                 "repo": card.get("repo"),
-                "issue_number": card.get("issue_number"),
-                "kind": "issue",
+                "issue_number": number,
+                "kind": "issue" if number is not None else "sweep",
                 "phase": card.get("phase"),
                 "since": card.get("started"),
                 "url": card.get("url"),
@@ -154,8 +156,22 @@ def fetch_peer(url: str, *, timeout: float) -> dict[str, Any]:
     """One peer's ``/api/status``. Raises on anything that is not one."""
     target = url.rstrip("/") + "/api/status"
     request = urllib.request.Request(target, headers={"Accept": "application/json"})
+    # ``timeout`` bounds each socket wait; the body is also read against a
+    # wall-clock deadline, so a peer trickling one byte at a time cannot
+    # hold the read for longer than ``timeout * 2`` in all.
+    deadline = time.monotonic() + timeout * 2
+    chunks: list[bytes] = []
+    size = 0
     with urllib.request.urlopen(request, timeout=timeout) as resp:  # noqa: S310
-        body = resp.read(MAX_PEER_BYTES + 1)
+        while size <= MAX_PEER_BYTES:
+            if time.monotonic() > deadline:
+                raise TimeoutError("the answer took too long")
+            chunk = resp.read1(65536)  # what has arrived, not a full 64 KB
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    body = b"".join(chunks)
     if len(body) > MAX_PEER_BYTES:
         raise ValueError("answer too large to be a status page")
     data = json.loads(body)
@@ -187,7 +203,7 @@ def _clean_claims(raw: Any) -> list[dict[str, Any]] | None:
             return None
         number = c.get("issue_number")
         repo = _text(c.get("repo"))
-        if type(number) is not int or repo is None:
+        if repo is None or not (type(number) is int or number is None):
             return None
         out.append({
             "repo": repo, "issue_number": number, "kind": _text(c.get("kind"), 40),
@@ -198,8 +214,10 @@ def _clean_claims(raw: Any) -> list[dict[str, Any]] | None:
 
 
 def _clean_questions(raw: Any) -> list[dict[str, Any]] | None:
-    """The peer's open questions, or ``None`` (unknown) on the same terms
-    as :func:`_clean_claims`."""
+    """The peer's open questions, or ``None`` (unknown) when the list is
+    missing, too long, or holds an entry that is not a question (an
+    object with a repo). A question may lack an issue number (a sweep's);
+    its ``refs`` are display links only and keep at most 20 valid ones."""
     if not isinstance(raw, list) or len(raw) > _MAX_ITEMS:
         return None
     out = []
@@ -235,9 +253,13 @@ def _clean_window(raw: Any) -> Any:
     used = raw.get("used")
     if isinstance(used, bool) or not isinstance(used, (int, float)):
         return "unknown"
-    if not math.isfinite(float(used)):  # NaN would break the page's JSON
+    try:
+        value = float(used)
+    except OverflowError:  # an integer with hundreds of digits
         return "unknown"
-    return {"used": float(used), "resets_at": _text(raw.get("resets_at"), 40)}
+    if not math.isfinite(value):  # NaN would break the page's JSON
+        return "unknown"
+    return {"used": value, "resets_at": _text(raw.get("resets_at"), 40)}
 
 
 def _clean_node(raw: Any) -> dict[str, Any] | None:
@@ -263,11 +285,16 @@ def _clean_node(raw: Any) -> dict[str, Any] | None:
     }
 
 
-def _state_at(node: dict[str, Any] | None, now: float, silent_after: float) -> str:
+def _state_at(
+    node: dict[str, Any] | None, now: float, silent_after: float, offset: float = 0.0,
+) -> str:
     """A reachable peer's state as of ``now``: its heartbeat ages between
-    reads, so this is worked out when the page asks, not when read."""
+    reads, so this is worked out when the page asks, not when read.
+    ``offset`` is how far this machine's clock is ahead of the peer's
+    (measured from the peer's own ``generated_ts``), so the heartbeat is
+    aged on the peer's clock, not compared across two."""
     beat = _parse_iso(node.get("heartbeat_at")) if node else None
-    if beat is None or now - beat > silent_after:
+    if beat is None or (now - offset) - beat > silent_after:
         return SILENT
     return (node or {}).get("state") or UNKNOWN
 
@@ -300,13 +327,20 @@ def peer_entry(
             "needs_you": None,
         }
     node = _clean_node(data.get("node"))
+    generated = data.get("generated_ts")
+    offset = (
+        checked_at - generated
+        if type(generated) is int and 1_000_000_000 <= generated < 10_000_000_000
+        else 0.0
+    )
     return {
         "url": url,
         "name": (node or {}).get("name") or _text(data.get("host"), 100),
         "reachable": True,
         "checked_at": _iso(checked_at),
+        "clock_offset": offset,
         "error": None,
-        "state": _state_at(node, checked_at, silent_after),
+        "state": _state_at(node, checked_at, silent_after, offset),
         "node": node,
         "last_known": None,
         "needs_you": _clean_questions(data.get("needs_you")),
@@ -393,7 +427,12 @@ class PeerReader:
             data, error = self._fetch(url, timeout=self._timeout), None
         except Exception as exc:
             data, error = None, _peer_error(exc)
-        self._publish(url, data, error, finishing=token)
+        try:
+            self._publish(url, data, error, finishing=token)
+        finally:
+            with self._lock:  # never leave the peer marked as being read
+                if self._in_flight.get(url, (0, None))[1] is token:
+                    del self._in_flight[url]
 
     def read_once(self, wait: bool = True) -> None:
         """Start a read of every peer not already being read, and report
@@ -415,7 +454,13 @@ class PeerReader:
                 target=self._read, args=(url, token), daemon=True,
                 name="ctrlrelay-web-peer",
             )
-            t.start()
+            try:
+                t.start()
+            except RuntimeError as exc:  # no thread to be had: try next cycle
+                with self._lock:
+                    self._in_flight.pop(url, None)
+                self._publish(url, None, f"could not start a read: {exc}")
+                continue
             threads.append((url, t, token))
         if not wait:
             return
@@ -440,7 +485,10 @@ class PeerReader:
                 elif entry["reachable"]:
                     peers.append({
                         **entry,
-                        "state": _state_at(entry["node"], now, self._silent_after),
+                        "state": _state_at(
+                            entry["node"], now, self._silent_after,
+                            entry.get("clock_offset", 0.0),
+                        ),
                     })
                 else:
                     peers.append(dict(entry))
@@ -460,8 +508,8 @@ class PeerReader:
             try:
                 self.read_once()
             except Exception as exc:  # never let the thread die quietly
-                _logger.warning(
-                    "web.fleet_read_failed",
-                    extra={"error": f"{type(exc).__name__}: {exc}"[:300]},
+                log_event(
+                    _logger, "web.fleet_read_failed",
+                    error=f"{type(exc).__name__}: {exc}"[:300],
                 )
             self._stop.wait(self._interval)

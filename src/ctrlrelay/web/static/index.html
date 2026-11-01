@@ -566,11 +566,15 @@ function machineCard(name, node, state, bad, now, extra) {
       ", 7-day " + usagePct(node, "seven_day")));
     box.appendChild(el("div", "line", "heartbeat " + ago(node.heartbeat_at, now)));
     if (node.account_label) { box.appendChild(el("div", "muted", node.account_label)); }
+    box.appendChild(el("div", "muted", "version " + (node.version || "unknown")));
   }
   return box;
 }
 
 var BAD_STATES = { "paused-limit": 1, "silent": 1, "unknown": 1 };
+function isBad(state) {
+  return typeof state !== "string" || Object.prototype.hasOwnProperty.call(BAD_STATES, state);
+}
 
 // #249: this machine and every peer. A peer that does not answer is "not
 // reachable from here" with the reason, and its last known numbers greyed
@@ -579,7 +583,7 @@ function renderFleet(data, now) {
   var cards = [];
   var me = data.node;
   cards.push(machineCard(me && me.name || data.host, me, me && me.state,
-    !me || BAD_STATES[me.state], now, "this machine"));
+    !me || isBad(me.state), now, "this machine"));
   var peers = data.fleet && Array.isArray(data.fleet.peers) ? data.fleet.peers : [];
   peers.forEach(function (p) {
     if (p.reachable === false) {
@@ -595,7 +599,7 @@ function renderFleet(data, now) {
       cards.push(c);
     } else {
       cards.push(machineCard(p.name || p.url, p.node, p.state,
-        p.reachable !== true || BAD_STATES[p.state], now, null));
+        p.reachable !== true || isBad(p.state), now, null));
     }
   });
   put(document.getElementById("fleet-strip"), cards);
@@ -633,7 +637,8 @@ function renderWho(data, now, peers) {
       var tr = el("tr");
       tr.appendChild(el("td", null, r.machine));
       var td = el("td");
-      td.appendChild(ghLink(r.c.url, r.c.repo + "#" + r.c.issue_number, "title"));
+      td.appendChild(ghLink(r.c.url, typeof r.c.issue_number === "number"
+        ? r.c.repo + "#" + r.c.issue_number : r.c.repo + " (" + (r.c.kind || "run") + ")", "title"));
       tr.appendChild(td);
       tr.appendChild(el("td", null, r.c.phase || "unknown"));
       tr.appendChild(el("td", null, r.c.since ? ago(r.c.since, now) : "unknown"));
