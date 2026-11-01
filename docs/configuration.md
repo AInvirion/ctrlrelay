@@ -155,18 +155,24 @@ dotfiles and ctrlrelay's install. On macOS the login keychain is reachable
 whatever the environment says. `sandbox: "bwrap"` closes this on Linux.
 
 **`sandbox: "bwrap"` (#236).** The dev and task agents run under bubblewrap
-in a read-only copy of the machine:
+in a read-only copy of the machine (the secops agent, which needs your GitHub
+login, does not):
 
 - everything is read-only, so the toolchain you installed (in `/usr`, in
   `~/.local`, `~/.cargo`, ...) still runs;
-- `sandbox_hide_paths` are empty: the agent cannot read your SSH keys, `gh`'s
-  login or the other credentials listed below;
 - writable: the run's worktree, its repository's git directory (so it can
   commit), a private `/tmp`, `sandbox_writable_paths` (the agent CLI's own
   state) and `sandbox_cache_dir`;
-- read-only again inside those: `sandbox_readonly_paths` (the agent CLI's
-  settings, hooks, plugins and skills, which your own sessions load) and the
-  repository's `config` and `hooks`, which every later git command there runs.
+- `sandbox_hide_paths` are empty, also inside a writable path: the agent
+  cannot read your SSH keys, `gh`'s login or the other credentials listed
+  below;
+- read-only again: `sandbox_readonly_paths` (the agent CLI's settings, hooks,
+  plugins and skills, which your own sessions load) and, in the repository,
+  `config`, `config.worktree`, `hooks` and the worktree's `.git` pointer,
+  which every later git command there reads. One that does not exist yet
+  inside a writable path is created first (an empty directory, or `{}` for a
+  JSON file) so the agent cannot create it; if it cannot be created, the run
+  does not start.
 
 Package caches (`XDG_CACHE_HOME`, `npm_config_cache`, `GOMODCACHE`) point at
 `sandbox_cache_dir`, the agent's own, never yours, so a run cannot poison a
@@ -177,7 +183,10 @@ What it still allows: the agent reads the agent CLI's login (it needs it to
 run) and anything readable that is not hidden; it writes objects and refs in
 its repository's git directory, which the relay's push already treats as
 untrusted. A read-only path that is a symlink protects its target, not the
-link.
+link: the agent can replace the link. The dispatcher logs
+`dispatcher.sandbox.readonly_symlink` naming any; replace such a link with
+the file itself to protect it. The run's checkpoint file must be inside its
+worktree (it always is for dev and task runs).
 
 **Setting it up.** Linux only. Install bubblewrap (`sudo apt install
 bubblewrap`), then check it runs as your user:
