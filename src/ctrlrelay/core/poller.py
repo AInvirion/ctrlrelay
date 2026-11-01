@@ -617,6 +617,18 @@ class IssuePoller:
             return True
 
         events = await self.github.list_assignment_events(repo, issue_number)
+        # An assignment that names nobody cannot be ruled out as the latest
+        # one, by someone else: refuse rather than skip past it.
+        if any(not (e.get("assignee") or {}).get("login") for e in events):
+            log_event(
+                _logger,
+                "poll.issue.foreign_assignment",
+                repo=repo,
+                number=issue_number,
+                assigner_login=None,
+                reason="assignment_without_assignee",
+            )
+            return False
         relevant = [
             e
             for e in events

@@ -490,6 +490,8 @@ class TestGitHubCLI:
 
             args = mock_run.call_args[0]
             assert "api" in args and "--paginate" in args
+            # Only assigned events, one per line across every page.
+            assert args[args.index("--jq") + 1] == '.[] | select(.event=="assigned")'
             assert "/repos/owner/repo/issues/42/events" in args
 
     @pytest.mark.asyncio

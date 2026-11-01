@@ -2217,6 +2217,17 @@ class TestWhoAssignedIt:
     }]
 
     @pytest.mark.asyncio
+    async def test_a_later_assignment_naming_nobody_is_refused(
+        self, mock_github, state_file,
+    ) -> None:
+        later = {"event": "assigned", "created_at": "2026-11-02T00:00:00Z",
+                 "actor": None, "assignee": None, "assigner": {"login": "mausisa-nico"}}
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[*self.REAL_SELF, later],
+        )
+        assert not await self._poller(mock_github, state_file)._is_self_assigned("o/r", 268)
+
+    @pytest.mark.asyncio
     async def test_a_real_self_assignment_is_taken(self, mock_github, state_file) -> None:
         mock_github.list_assignment_events = AsyncMock(return_value=self.REAL_SELF)
         assert await self._poller(mock_github, state_file)._is_self_assigned("o/r", 784)
