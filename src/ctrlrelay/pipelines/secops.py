@@ -15,6 +15,7 @@ from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.events import EventKind, emit_event, emit_outcome
 from ctrlrelay.core.github import GitHubCLI
+from ctrlrelay.core.job_claims import JobClaimer
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.question_expiry import (
     QuestionHold,
@@ -647,8 +648,15 @@ async def run_secops_all(
     archived: ArchivedRepoTracker | None = None,
     *,
     hold_repeats: bool = False,
+    job_claims: JobClaimer | None,
 ) -> list[PipelineResult]:
     """Run secops pipeline on all configured repos.
+
+    ``job_claims`` (#246): with several machines on one account, each
+    repo's sweep for this run window is claimed first, and a machine that
+    loses the claim skips that repo. Required, so no caller drops it by
+    omission; ``None`` is a sweep someone started by hand, which runs
+    regardless.
 
     ``hold_repeats`` (#214) holds back a question that went unanswered
     on earlier sweeps instead of posting it every morning; see
@@ -697,6 +705,27 @@ async def run_secops_all(
                 summary=f"Skipped {repo}: repository is archived on GitHub",
             ))
             continue
+
+        if job_claims is not None:
+            claim = await job_claims.claim(repo, "secops")
+            if claim.error is not None:
+                # Could not tell whether another machine has it: running
+                # could sweep twice, so this window is skipped and the
+                # next one tries again.
+                results.append(PipelineResult(
+                    success=False,
+                    session_id=session_id,
+                    summary=f"Skipped {repo}: could not claim this sweep",
+                    error=f"sweep claim failed: {claim.error}",
+                ))
+                continue
+            if not claim.won:
+                results.append(PipelineResult(
+                    success=True,
+                    session_id=session_id,
+                    summary=f"Skipped {repo}: swept by {claim.owner} this window",
+                ))
+                continue
 
         if not state_db.acquire_lock(repo, session_id):
             results.append(PipelineResult(

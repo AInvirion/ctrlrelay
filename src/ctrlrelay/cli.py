@@ -15,6 +15,7 @@ from ctrlrelay import __version__
 from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 from ctrlrelay.core.events import EventKind, emit_event
 from ctrlrelay.core.github import GitHubCLI, GitHubError
+from ctrlrelay.core.job_claims import JobClaimer
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier
 from ctrlrelay.core.question_expiry import (
@@ -1110,6 +1111,21 @@ def settle_claimed_elsewhere(
     )
 
 
+def sweep_window(cron_expr: str, tz_name: str) -> str:
+    """The claim window of a scheduled run (#246): when the cron rule was
+    last due, rounded, or now if it was not due in the last day."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from ctrlrelay.core.job_claims import window_id
+    from ctrlrelay.core.scheduler import last_fire_time
+
+    tz = ZoneInfo(tz_name)
+    now = datetime.now(tz)
+    due = last_fire_time(cron_expr, tz, now)
+    return window_id((due or now).timestamp())
+
+
 def defer_for_usage(poller, repo: str, issue_number: int, pause) -> str:
     """Leave an issue for later while this machine is paused for usage
     (#247), and say why. It is offered again at the pause's end; the
@@ -2133,6 +2149,8 @@ def run_secops(
             # Someone ran this by hand and is waiting for the question;
             # holding a repeat back is for the unattended daily sweep.
             hold_repeats=False,
+            # Run by hand: swept here whatever the other machines do (#246).
+            job_claims=None,
         )
 
     try:
@@ -3247,6 +3265,11 @@ def poller_start(
                     # Unattended and daily: a question nobody answered
                     # is held back on a widening schedule (#214).
                     hold_repeats=True,
+                    # Once per window across machines on the account (#246).
+                    job_claims=JobClaimer(
+                        github, config.node_id,
+                        window=sweep_window(config.schedules.secops_cron, config.timezone),
+                    ),
                 )
                 ok = sum(1 for r in results if r.success)
                 console.print(

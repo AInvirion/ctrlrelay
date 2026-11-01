@@ -443,6 +443,7 @@ async def test_task_and_secops_record_dispatched_and_outcome(
     repo.automation = None
 
     [sec] = await run_secops_all(
+        job_claims=None,
         repos=[repo], dispatcher=sec_dispatcher, github=MagicMock(),
         worktree=sec_worktree, dashboard=None, state_db=sec_db,
         transport=None, contexts_dir=tmp_path / "contexts",
@@ -928,6 +929,7 @@ async def test_a_run_that_fails_before_its_session_exists_records_nothing(
     repo.name = "o/s"
     repo.automation = None
     [sec] = await run_secops_all(
+        job_claims=None,
         repos=[repo], dispatcher=AsyncMock(), github=MagicMock(),
         worktree=sec_worktree, dashboard=None, state_db=db, transport=None,
         contexts_dir=tmp_path / "contexts",

@@ -480,6 +480,41 @@ schedules:
   secops_cron: "0 6 * * *"   # daily 6am; use "0 6 * * 1" for weekly (Mondays)
 ```
 
+### With several machines on one account
+
+Every machine runs the same schedule. Each job is either split, so it runs
+once across the machines, or belongs to the machine by design:
+
+| Job | Runs | Where its claim lives |
+|---|---|---|
+| `secops` (security sweep) | once per run window across machines, per repo | a git ref in that repo, `refs/ctrlrelay/claims/secops/<window>` |
+| merge watcher and post-merge steps | on the machine that ran the issue | none needed: only that machine watches its own pull requests |
+| `pending_resume_sweeper` (every minute) | on each machine | none: it drains this machine's own unanswered questions |
+| `question_expiry_sweeper` (hourly) | on each machine | none: it retires this machine's own questions |
+| `usage_probe` (every 5 minutes) | on each machine | none: each machine reads its own subscription |
+| `github_budget` | on each machine | none: a free read of the shared budget |
+| `personalization_auto_pull` | on each machine | none: each machine syncs its own copy |
+
+**How the sweep is split.** Before sweeping a repo, a machine creates the
+ref `refs/ctrlrelay/claims/secops/<window>` in it, pointing at a small blob
+that holds its `node_id`. Creating a ref on GitHub is all or nothing: the
+first machine creates it and sweeps; every other machine gets "already
+exists", reads the owner's name from the blob, logs `jobs.skipped`, and skips
+that repo. The ref is not a branch and GitHub shows it nowhere in its
+interface.
+
+`<window>` is the time the sweep was **due** by its cron rule (not when it
+started: a machine that was asleep runs it up to an hour late) rounded to 10
+minutes, for example `20261101T0600Z`, so machines a few seconds apart, or one
+of them late, agree on it. A machine that dies holding a window loses only
+that window: the next one is a new ref. Refs older than 7 days are deleted by
+the next machine that claims.
+
+If a machine cannot create the ref (GitHub down, no write access), it skips
+the repo for that window rather than risk a second sweep, and says so in the
+sweep results; the next window tries again. A sweep started by hand
+(`ctrlrelay run secops`) is not claimed and always runs.
+
 An invalid cron expression fails at config load time rather than silently
 disabling the job. If the machine is asleep at the fire time, the job runs
 when it wakes — up to one hour late; older misfires are coalesced into a

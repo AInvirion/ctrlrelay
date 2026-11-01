@@ -627,6 +627,58 @@ class GitHubCLI:
             raise GitHubError("could not read the GitHub login")
         return login
 
+    async def create_blob(self, repo: str, content: str) -> str:
+        """Store ``content`` as a git blob; return its sha (#246)."""
+        sha = (await self._run_gh(
+            "api", "-X", "POST", f"repos/{repo}/git/blobs",
+            "-f", f"content={content}", "-f", "encoding=utf-8", "--jq", ".sha",
+        )).strip()
+        if not sha:
+            raise GitHubError("creating a blob returned no sha")
+        return sha
+
+    async def create_ref(self, repo: str, ref: str, sha: str) -> bool:
+        """Create ``ref`` at ``sha``. ``True`` if created, ``False`` if it
+        already existed (GitHub answers 422 "Reference already exists");
+        anything else raises. All-or-nothing on GitHub's side, which is
+        what makes it a claim (#246)."""
+        try:
+            await self._run_gh(
+                "api", "-X", "POST", f"repos/{repo}/git/refs",
+                "-f", f"ref={ref}", "-f", f"sha={sha}", "--jq", ".ref",
+            )
+        except GitHubError as e:
+            if "reference already exists" in str(e).lower():
+                return False
+            raise
+        return True
+
+    async def get_ref_sha(self, repo: str, ref: str) -> str:
+        """The sha ``ref`` points at (``ref`` given as ``refs/...``)."""
+        path = ref.removeprefix("refs/")
+        return (await self._run_gh(
+            "api", f"repos/{repo}/git/ref/{path}", "--jq", ".object.sha",
+        )).strip()
+
+    async def get_blob(self, repo: str, sha: str) -> str:
+        """A blob's content, base64 as GitHub returns it."""
+        return (await self._run_gh(
+            "api", f"repos/{repo}/git/blobs/{sha}", "--jq", ".content",
+        )).strip()
+
+    async def list_refs(self, repo: str, prefix: str) -> list[str]:
+        """Refs whose name starts with ``prefix`` (``refs/...``)."""
+        path = prefix.removeprefix("refs/")
+        out = await self._run_gh(
+            "api", "--paginate", f"repos/{repo}/git/matching-refs/{path}",
+            "--jq", ".[].ref",
+        )
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    async def delete_ref(self, repo: str, ref: str) -> None:
+        path = ref.removeprefix("refs/")
+        await self._run_gh("api", "-X", "DELETE", f"repos/{repo}/git/refs/{path}")
+
     async def comment_on_pr(self, repo: str, pr_number: int, body: str) -> None:
         """Post a comment on a PR."""
         await self._run_gh(

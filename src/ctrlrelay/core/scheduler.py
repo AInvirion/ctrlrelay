@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.combining import OrTrigger
@@ -335,3 +336,21 @@ def make_scheduler(timezone: str) -> Scheduler:
     """
     impl = AsyncIOScheduler(timezone=timezone)
     return Scheduler(impl)
+
+
+def last_fire_time(cron_expr: str, timezone, now: datetime) -> datetime | None:
+    """The latest time ``cron_expr`` was due at or before ``now``, within
+    the last 25 hours; ``None`` if it was not due in that span.
+
+    A job the scheduler runs late (the machine was asleep; misfires run up
+    to an hour late) still belongs to the window it was due in, so two
+    machines agree on it however late either one starts (#246).
+    """
+    trigger = _build_vixie_trigger(cron_expr, timezone)
+    start = now - timedelta(hours=25)
+    previous = None
+    fire = trigger.get_next_fire_time(None, start)
+    while fire is not None and fire <= now:
+        previous = fire
+        fire = trigger.get_next_fire_time(fire, fire + timedelta(seconds=1))
+    return previous
