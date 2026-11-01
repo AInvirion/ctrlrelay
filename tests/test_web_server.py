@@ -45,7 +45,7 @@ HOSTILE_FILE = '"><script>alert(1)<'
 TOP_KEYS = {
     "version", "host", "generated", "generated_ts", "running", "needs_you",
     "waiting", "skipped", "server", "today", "feed", "feed_total",
-    "feed_truncated", "feed_limit", "errors", "node",
+    "feed_truncated", "feed_limit", "errors", "node", "fleet",
 }
 
 

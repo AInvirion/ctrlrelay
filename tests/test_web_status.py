@@ -49,7 +49,7 @@ WAITING_OK = {
 TOP_KEYS = {
     "version", "host", "generated", "generated_ts", "running", "needs_you",
     "waiting", "skipped", "server", "today", "feed", "feed_total",
-    "feed_truncated", "feed_limit", "errors", "node",
+    "feed_truncated", "feed_limit", "errors", "node", "fleet",
 }
 # What a server-health reader returns; build_status passes it through whole.
 SERVER_OK = {
