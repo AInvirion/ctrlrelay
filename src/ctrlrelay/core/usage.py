@@ -77,8 +77,8 @@ class UsageReading:
         if not isinstance(data, dict):
             return None
         status = data.get("status")
-        read_at = data.get("read_at")
-        if not isinstance(status, str) or type(read_at) is not int:
+        read_at = _timestamp(data.get("read_at"))
+        if not isinstance(status, str) or read_at is None:
             return None
         windows = {}
         for name in WINDOWS:
@@ -240,7 +240,9 @@ def pause_for(
     if reading is None:
         return None
     hits: list[tuple[str, int | None]] = []
-    fallback = reading.read_at + UNKNOWN_RESET_PAUSE_SECONDS
+    # From the reading, or from now if the reading claims to be from the
+    # future (a clock set back): an hour, never longer.
+    fallback = int(min(reading.read_at, now)) + UNKNOWN_RESET_PAUSE_SECONDS
     if reading.status != ALLOWED:
         until = reading.resets_at if reading.resets_at is not None else fallback
         hits.append((f"usage status is {reading.status}", until))
@@ -311,6 +313,15 @@ class UsageStore:
             os.replace(tmp, self.path)
         except Exception as e:
             log_event(_logger, "usage.write_failed", path=str(self.path), error=str(e)[:200])
+
+    def last_attempt_at(self) -> int | None:
+        """When the last reading was taken, readable or not. The probe
+        ages on this, so an unknown reading is not probed every tick."""
+        try:
+            data = json.loads(self.path.read_text())
+        except (OSError, *_UNPARSEABLE):
+            return None
+        return _timestamp(data.get("read_at")) if isinstance(data, dict) else None
 
     def read(self) -> UsageReading | None:
         try:

@@ -1112,8 +1112,8 @@ def settle_claimed_elsewhere(
 
 def defer_for_usage(poller, repo: str, issue_number: int, pause) -> str:
     """Leave an issue for later while this machine is paused for usage
-    (#247), and say why. It is offered again at the pause's end, or
-    sooner if the pause ends early (the gate's resume wakes it)."""
+    (#247), and say why. It is offered again at the pause's end; the
+    caller also registers it so the gate's resume can wake it sooner."""
     poller.recheck_at(repo, issue_number, float(pause.until))
     return f"#{issue_number} in {repo} left for later: {pause.reason}."
 
@@ -2638,7 +2638,12 @@ def poller_start(
             try:
                 await transport.send(text)
             finally:
-                await transport.close()
+                # Bounded on its own: a transport that hung in send (and
+                # was cancelled by the gate's timeout) can hang here too.
+                try:
+                    await asyncio.wait_for(transport.close(), timeout=5)
+                except Exception:
+                    pass
 
         # Issues left for later while paused, offered again the moment
         # the pause ends rather than at the reset time each was given.
@@ -3269,11 +3274,11 @@ def poller_start(
                         pass
 
         async def _run_usage_probe() -> None:
-            reading = usage_store.read()
+            last = usage_store.last_attempt_at()
             max_age = config.usage.probe_minutes * 60
             idle = getattr(dispatcher, "active", 0) == 0
             if idle and max_age > 0 and (
-                reading is None or time.time() - reading.read_at >= max_age
+                last is None or time.time() - last >= max_age
             ):
                 binary = getattr(dispatcher, "claude_binary", None)
                 started = getattr(dispatcher, "started", 0)
@@ -3704,8 +3709,9 @@ def poller_start(
             # merged by hand days earlier.
             # Keep the usage reading fresh while idle (#247), and end a
             # pause on time even with the probe off. A run reads the usage
-            # anyway, so the probe only fires when the last reading is
-            # older than the interval.
+            # anyway, so the probe only fires when the last reading, or
+            # the last attempt that found none, is older than the
+            # interval.
             scheduler.add_cron_job(
                 name="usage_probe",
                 cron_expr="*/5 * * * *",

@@ -400,7 +400,7 @@ class TestRoundOneFixes:
     def test_a_stored_file_with_garbage_numbers_reads_safely(self, tmp_path: Path) -> None:
         path = tmp_path / "usage.json"
         path.write_text(
-            '{"status": "allowed", "read_at": 1,'
+            '{"status": "allowed", "read_at": 1793490000,'
             ' "five_hour": {"used": 0.5, "resets_at": 1e999}}'
         )
         r = UsageStore(path).read()
@@ -487,7 +487,7 @@ class TestRoundTwoFixes:
         assert "five_hour" not in r.windows
         path = tmp_path / "usage.json"
         path.write_text(
-            '{"status": "allowed", "read_at": 1, '
+            '{"status": "allowed", "read_at": 1793490000, '
             f'"five_hour": {{"used": 0.5, "resets_at": {huge}}}}}'
         )
         assert UsageStore(path).read().windows["five_hour"].resets_at is None
@@ -597,3 +597,31 @@ class TestRoundFourFixes:
         path = tmp_path / "usage.json"
         path.write_bytes(b'{"status": "\xff\xfe"}')
         assert UsageStore(path).read() is None
+
+
+
+class TestColdReviewFixes:
+    def test_a_stored_read_time_that_is_not_a_time_reads_as_unknown(
+        self, tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "usage.json"
+        path.write_text('{"status": "rejected", "read_at": 100000000000000000000}')
+        assert UsageStore(path).read() is None
+
+    def test_a_reading_from_the_future_pauses_an_hour_from_now_at_most(self) -> None:
+        r = UsageReading(status="rejected", windows={}, read_at=NOW + 86400)
+        assert pause_for(r, threshold=0.9, now=NOW).until == NOW + 3600
+
+    def test_an_unknown_reading_still_has_an_attempt_time(self, tmp_path: Path) -> None:
+        store = UsageStore(tmp_path / "usage.json")
+        assert store.last_attempt_at() is None
+        store.mark_unknown(now=NOW)
+        assert store.read() is None
+        assert store.last_attempt_at() == NOW
+
+    def test_the_session_id_comes_from_the_result_line(self) -> None:
+        lines = [
+            '{"type": "system", "subtype": "init", "session_id": "from-init"}',
+            '{"type": "result", "subtype": "success", "session_id": "from-result"}',
+        ]
+        assert parse_agent_session_id("\n".join(lines)) == "from-result"
