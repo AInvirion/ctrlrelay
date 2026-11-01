@@ -246,7 +246,10 @@ class Scheduler:
             # Which fire this run is (#246). The scheduler moved the job's
             # next run time on when it submitted this one, so the fire just
             # before that is this run's, however late it started; with
-            # coalescing it is the latest of the missed ones.
+            # coalescing it is the latest of the missed ones. Read before
+            # the first await: this coroutine runs on the loop turn after
+            # submission, before the scheduler can move on again, and a
+            # second instance of a running job is never started.
             _due = None
             try:
                 job = self._impl.get_job(name)
@@ -371,17 +374,12 @@ def current_due_time() -> datetime | None:
 
 def last_fire_time(cron_expr: str, timezone, now: datetime) -> datetime | None:
     """The latest time ``cron_expr`` was due at or before ``now``; ``None``
-    if it was not due in the last 40 days.
+    if it was not due in the last 40 days (#246).
 
-    This is the run the scheduler is executing (#246), read from this
-    machine's own clock, which is the clock the scheduler fired by (it
-    never fires before the due time). It coalesces missed runs into one,
-    for the latest of them, so a late start belongs to the latest due
-    time, and every machine works out the same one from the same rule.
-    It assumes a run starts before the rule is next due, which holds for
-    any schedule less frequent than the run takes to start. Searched in
-    growing spans, so an every-minute rule does not walk 40 days of
-    minutes.
+    The scheduler wrapper passes a second before the job's next planned
+    run, which names the run executing now; ``sweep_window`` falls back to
+    the current time outside a scheduled run. Searched in growing spans,
+    so an every-minute rule does not walk 40 days of minutes.
     """
     trigger = _build_vixie_trigger(cron_expr, timezone)
     limit = now

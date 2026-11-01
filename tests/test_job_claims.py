@@ -214,7 +214,9 @@ class TestTheSweep:
 
 
 class TestALateRunKeepsItsWindow:
-    def test_a_run_55_minutes_late_names_the_window_it_was_due_in(self, monkeypatch) -> None:
+    def test_outside_a_scheduled_run_the_window_is_the_last_due_time(
+        self, monkeypatch,
+    ) -> None:
         from datetime import datetime
 
         import ctrlrelay.cli as cli_mod
