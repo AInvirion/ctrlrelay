@@ -147,20 +147,72 @@ push. The push itself runs from a fresh relay-owned git dir under
 `~/.ctrlrelay/push/`, reads the clone's branch heads from its ref files, and
 never reads the clone's config, which every worktree shares.
 
-**What it does not guarantee.** The agent still runs as your user. A
-deliberately hostile agent can read `~/.config/gh/hosts.yml`, `~/.ssh` and
-anything else in your home directory and use them by hand; it can write
-anywhere your user can, including your dotfiles and ctrlrelay's install; and
-it can write to `~/.ctrlrelay/push/`, the bare clone's object store and any
-`objects/info/alternates` chain it adds there, racing a push. On macOS the
-login keychain is reachable whatever the environment says. Closing that needs
-a separate user or a read-only home (#236). The next setting hides the
-credential paths; it does not stop the writes.
+**What it does not guarantee without a sandbox.** The agent still runs as
+your user. With `sandbox: "none"` a deliberately hostile agent can read
+`~/.config/gh/hosts.yml`, `~/.ssh` and anything else in your home directory
+and use them by hand, and it can write anywhere your user can, including your
+dotfiles and ctrlrelay's install. On macOS the login keychain is reachable
+whatever the environment says. `sandbox: "bwrap"` closes this on Linux.
+
+**`sandbox: "bwrap"` (#236).** The dev and task agents run under bubblewrap
+in a read-only copy of the machine:
+
+- everything is read-only, so the toolchain you installed (in `/usr`, in
+  `~/.local`, `~/.cargo`, ...) still runs;
+- `sandbox_hide_paths` are empty: the agent cannot read your SSH keys, `gh`'s
+  login or the other credentials listed below;
+- writable: the run's worktree, its repository's git directory (so it can
+  commit), a private `/tmp`, `sandbox_writable_paths` (the agent CLI's own
+  state) and `sandbox_cache_dir`;
+- read-only again inside those: `sandbox_readonly_paths` (the agent CLI's
+  settings, hooks, plugins and skills, which your own sessions load) and the
+  repository's `config` and `hooks`, which every later git command there runs.
+
+Package caches (`XDG_CACHE_HOME`, `npm_config_cache`, `GOMODCACHE`) point at
+`sandbox_cache_dir`, the agent's own, never yours, so a run cannot poison a
+cache you build from. The first run of each project downloads its packages
+again.
+
+What it still allows: the agent reads the agent CLI's login (it needs it to
+run) and anything readable that is not hidden; it writes objects and refs in
+its repository's git directory, which the relay's push already treats as
+untrusted. A read-only path that is a symlink protects its target, not the
+link.
+
+**Setting it up.** Linux only. Install bubblewrap (`sudo apt install
+bubblewrap`), then check it runs as your user:
+
+```bash
+bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true && echo works
+```
+
+If that prints `works`, set `agent.sandbox: "bwrap"` and restart the daemons.
+ctrlrelay refuses to start if it is set and `bwrap` is missing. If it fails
+with `setting up uid map: Permission denied` (Ubuntu 24.04 and later restrict
+unprivileged user namespaces through AppArmor), allow it for `bwrap` only:
+
+```bash
+sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+PROFILE
+sudo apparmor_parser -r /etc/apparmor.d/bwrap
+```
+
+then run the check again. On a single-user laptop this is the whole setup.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `sandbox` | `"none"` or `"bwrap"` | `"none"` | `"bwrap"` runs the dev and task agents under bubblewrap with `sandbox_hide_paths` replaced by empty mounts. Linux only; needs `bwrap` installed and unprivileged user namespaces allowed (on Ubuntu 24.04+ an AppArmor profile for `bwrap`). ctrlrelay refuses to start if it is set and `bwrap` is missing. |
-| `sandbox_hide_paths` | list of strings | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc`, `~/.local/share/keyrings`, `$XDG_RUNTIME_DIR/bus` | Paths hidden under `sandbox: bwrap`. A directory becomes an empty tmpfs, a file or socket becomes `/dev/null`, a missing path is skipped. |
+| `sandbox` | `"none"` or `"bwrap"` | `"none"` | `"bwrap"` runs the dev and task agents in the read-only sandbox above. |
+| `sandbox_hide_paths` | list of strings | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc`, `~/.local/share/keyrings`, `$XDG_RUNTIME_DIR/bus`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.config/ctrlrelay` | Made empty under `sandbox: bwrap`. A directory becomes an empty tmpfs, a file or socket becomes `/dev/null`, a missing path is skipped. |
+| `sandbox_writable_paths` | list of strings | `~/.claude` | Writable under `sandbox: bwrap`, besides the run's own paths. |
+| `sandbox_readonly_paths` | list of strings | `~/.claude/settings.json`, `settings.local.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `hooks`, `plugins`, `output-styles`, `scripts` (all under `~/.claude`) | Read-only again inside a writable path. |
+| `sandbox_cache_dir` | string | `~/.ctrlrelay/agent-cache` | The agent's own package cache under `sandbox: bwrap`. |
 
 ## transport
 

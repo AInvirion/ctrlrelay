@@ -69,6 +69,8 @@ try read_gh_login "cat $HOME/.config/gh/hosts.yml"
 try write_bashrc "echo planted >> $HOME/.bashrc"
 try write_local_bin "touch $HOME/.local/bin/planted"
 try write_settings "echo planted >> $HOME/.claude/settings.json"
+try create_local_settings "echo planted > $HOME/.claude/settings.local.json"
+try create_git_hook "mkdir -p $GITCOMMON/hooks && touch $GITCOMMON/hooks/post-checkout"
 try write_agent_state "touch $HOME/.claude/projects/run-log"
 try write_hooks "touch $GITCOMMON/hooks/pre-push"
 try write_git_config "git config --file $GITCOMMON/config core.fsmonitor /bin/evil"
@@ -139,6 +141,8 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         "write_bashrc": "no",
         "write_local_bin": "no",
         "write_settings": "no",
+        "create_local_settings": "no",
+        "create_git_hook": "no",
         "write_agent_state": "yes",
         "write_hooks": "no",
         "write_git_config": "no",
@@ -150,6 +154,7 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
     assert (h / ".claude" / "settings.json").read_text() == "{}"
     assert not (h / ".local" / "bin" / "planted").exists()
     assert not (bare / "hooks" / "pre-push").exists()
+    assert (h / ".claude" / "settings.local.json").read_text() == "{}\n"
     assert (home / "agent-cache" / "uv" / "x").exists()
     assert _git("log", "-1", "--format=%s", "run", cwd=bare) == "change"
 

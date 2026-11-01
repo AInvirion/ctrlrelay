@@ -266,9 +266,10 @@ def bwrap_prefix(
     filesystem read-only, a fresh ``/dev``, ``/proc`` and private
     ``/tmp``; ``hide_paths`` made empty (a directory becomes an empty
     tmpfs, a file ``/dev/null``); ``writable`` bound back writable; and
-    ``readonly`` bound read-only again inside those. A path that does
-    not exist is skipped (bwrap would otherwise have to create a mount
-    point for it). The child gets its own process namespace and dies
+    ``readonly`` bound read-only again inside those. A hidden or writable
+    path that does not exist is skipped (bwrap would otherwise have to
+    create a mount point for it); a missing read-only one is created
+    first (see :func:`_create_readonly`). The child gets its own process namespace and dies
     with the relay.
     """
     argv = [
@@ -288,11 +289,38 @@ def bwrap_prefix(
         if p is not None:
             argv += ["--bind", str(p), str(p)]
     for raw in readonly:
-        p = _existing(raw)
+        p = _existing(raw) or _create_readonly(raw)
         if p is not None:
             argv += ["--ro-bind", str(p), str(p)]
     argv.append("--")
     return argv
+
+
+def _create_readonly(raw: str | Path) -> Path | None:
+    """Create a missing read-only path, so it can be bound read-only.
+
+    Skipping it would leave the agent free to create it inside a writable
+    parent: a ``settings.local.json`` with a hook in it, or a git hook,
+    which then runs later as the operator. A name with a suffix is made a
+    file (``{}`` for JSON, so the agent CLI still parses it), anything else
+    an empty directory. ``None`` when it cannot be made, for a path whose
+    parent does not exist either (nothing writable is there to create it
+    in).
+    """
+    expanded = os.path.expandvars(os.path.expanduser(str(raw)))
+    if "$" in expanded:
+        return None
+    p = Path(expanded)
+    if not p.parent.is_dir():
+        return None
+    try:
+        if p.suffix:
+            p.write_text("{}\n" if p.suffix == ".json" else "")
+        else:
+            p.mkdir()
+    except OSError:
+        return None
+    return p
 
 
 def git_dirs(working_dir: Path) -> list[Path]:
