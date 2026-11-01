@@ -727,6 +727,30 @@ file, so a restart does not reset it. Each retry posts a fresh claim
 comment and, when it fails, a fresh "nothing is working on this" comment
 on the issue.
 
+A run whose **agent finished but whose branch the relay could not
+publish** is retried the same way, for the same reason: the issue is
+already in `seen_issues`, so without this nothing would ever bring it
+back. Up to 3 runs in all, counted in `publish_failures` in the same
+file, and the retraction comment on the issue says the relay will
+return rather than asking you to re-assign it. After the third run the
+issue stays in `seen_issues` and the relay says so **on the issue** —
+the commits are still on the run branch in the local checkout (on
+GitHub too, if only opening the pull request failed), and the fix is to
+clear the cause and delete the number as above. If that comment cannot
+be posted, the chat line says so.
+
+A push the relay **refuses** (a protected or default branch, a base it
+did not expect, somebody else's commits on the branch) is not retried
+at all: the relay reaches the same refusal every time, so another run
+would spend a whole agent to arrive at it. The issue stays in
+`seen_issues` and the comment names what to do.
+
+Re-assigning an issue, or re-applying its automation label, does **not**
+make the poller look at it again. The skip decision reads the issue
+number only — no assignee and no labels — so the number has to leave
+`seen_issues` (and the relay has to be restarted, since the running
+poller holds the set in memory and rewrites the file from it).
+
 ### A repo whose history was replaced
 
 If the local copy's default branch can no longer fast-forward to GitHub's

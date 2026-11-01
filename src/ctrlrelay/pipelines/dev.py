@@ -299,6 +299,22 @@ def claim_is_live(comments: list[dict[str, Any]] | None) -> bool:
     return live
 
 
+# What an operator must actually do to make the relay look at an issue
+# it has already handled (#268). The skip decision in `IssuePoller.poll`
+# is keyed on the issue NUMBER: it reads no assignee and no label, so
+# re-assigning the issue or re-applying the automation label — which is
+# what this comment used to advise — changes nothing at all. An operator
+# who followed that sentence got silence, and no way to tell it from a
+# relay that was simply idle.
+MANUAL_RETRY_ROUTE = (
+    "The relay skips issues it has already handled by number, so "
+    "re-assigning this one or re-applying its automation label will not "
+    "start another run. To have the relay try again, remove this issue's "
+    "number from `seen_issues` in `poller_state.json` and restart the "
+    "relay."
+)
+
+
 def claim_failure_comment(
     session_id: str,
     *,
@@ -306,6 +322,7 @@ def claim_failure_comment(
     exit_code: int | None,
     pr_number: int | None = None,
     claim_id: str | None = None,
+    will_retry: bool = False,
 ) -> str:
     """The comment that reconciles the claim with a failed outcome.
 
@@ -317,7 +334,16 @@ def claim_failure_comment(
     equally wrong about both.
 
     Ends in what happens next. A retraction that only says "it
-    failed" leaves a reader with the same question they started with.
+    failed" leaves a reader with the same question they started with
+    — and one that names a next step the code does not implement is
+    worse than silence, because the reader stops looking.
+
+    ``will_retry`` is for the failure the relay itself recovers from:
+    the branch the relay could not publish (#268), where the issue goes
+    back to the poller and the next poll runs it again. Then the comment
+    says so and asks for nothing. Otherwise it names the one route that
+    works, which is NOT the re-assign / re-label route it used to
+    advise — see ``MANUAL_RETRY_ROUTE``.
     """
     if pr_number is not None:
         opening = (
@@ -326,8 +352,12 @@ def claim_failure_comment(
             "This supersedes any claim above."
         )
         next_step = (
+            f"When the relay's poller is running, it tries this issue "
+            f"again on its next poll and pushes to PR #{pr_number} then, "
+            "a limited number of times, and says here if it stops."
+            if will_retry else
             f"Review PR #{pr_number} on its own merits — it is not "
-            "waiting on anything from this relay."
+            f"waiting on anything from this relay. {MANUAL_RETRY_ROUTE}"
         )
     else:
         opening = (
@@ -336,8 +366,11 @@ def claim_failure_comment(
             "working on this issue."
         )
         next_step = (
-            "This issue is free to pick up. Re-assign it (or re-apply the "
-            "automation label) to have the relay try again."
+            "When the relay's poller is running, it picks this issue up "
+            "again on its next poll and starts a fresh run, a limited "
+            "number of times, and says here if it stops."
+            if will_retry else
+            f"This issue is free to pick up. {MANUAL_RETRY_ROUTE}"
         )
 
     exit_line = (
@@ -406,6 +439,7 @@ async def reconcile_claim_on_failure(
     pr_number: int | None = None,
     claim_posted: bool = True,
     claim_id: str | None = None,
+    will_retry: bool = False,
 ) -> bool:
     """Post the retraction. Returns whether a comment was written.
 
@@ -433,6 +467,7 @@ async def reconcile_claim_on_failure(
                 exit_code=exit_code,
                 pr_number=pr_number,
                 claim_id=claim_id,
+                will_retry=will_retry,
             ),
         )
     except asyncio.CancelledError:
@@ -461,6 +496,75 @@ async def reconcile_claim_on_failure(
         pr_number=pr_number,
     )
     return True
+
+def publish_failure_is_retryable(result: PipelineResult) -> bool:
+    """Whether the relay should offer this failed run's issue again
+    (#268).
+
+    True for a run whose agent finished and whose branch the relay then
+    could not publish, unless the push was *refused*. The distinction is
+    the whole point: a refusal (`PushRefusedError` — the wrong base, a
+    branch the relay will not write, somebody else's lease) is a decision
+    the relay re-reaches every time, so retrying it burns a full agent
+    run to arrive at the same answer. Everything else at that step is a
+    network or `gh` failure, which the next poll may well get past.
+
+    The pipeline reads this to decide what its retraction comment
+    promises; the daemon reads the same function to decide whether to
+    un-mark the issue. One predicate, so the comment and the behaviour
+    cannot drift apart — a comment that promises a retry nobody performs
+    is the defect this ticket is about.
+    """
+    if result.success or result.blocked:
+        return False
+    outputs = result.outputs or {}
+    return bool(
+        outputs.get("publish_failed") and not outputs.get("publish_refused")
+    )
+
+
+def publish_retries_exhausted_comment(
+    session_id: str,
+    *,
+    repo: str,
+    issue_number: int,
+    attempts: int,
+    error: str,
+) -> str:
+    """The comment for a publish the relay has stopped retrying (#268).
+
+    Posted by the daemon, not the pipeline, because only the daemon
+    knows the attempt count. It exists because the retraction already
+    on the issue promised a retry: without this, the last word on the
+    issue is a promise the relay has quietly stopped keeping, which is
+    the same silence the ticket was filed about one step further on.
+
+    Carries ``AGENT_OUTCOME_MARKER`` so it is findable, and so
+    ``claim_is_live`` still reads the claim as retracted and
+    ``format_issue_comments`` keeps it out of any agent's prompt.
+    """
+    from ctrlrelay.core.redact import redact_secrets
+
+    # The error can carry text from outside the relay (git's and the
+    # remote's own words): scrubbed, one line, and shown as code so it
+    # cannot format the comment or mention anyone.
+    first = (error.strip().splitlines() or ["no error recorded"])[0]
+    why = redact_secrets(first).replace("`", "'")[:200]
+    return (
+        f"⛔ **CTRLRelay has stopped retrying this issue.** The agent "
+        f"finished, but the relay could not publish the branch "
+        f"{attempts} times in a row.\n\n"
+        f"- Session: `{session_id}`\n"
+        f"- Last error: `{why}`\n\n"
+        f"The commits are on the run branch in this machine's checkout "
+        f"of {repo}. If the push itself failed they are not on GitHub; "
+        f"if only opening the pull request failed, the branch may "
+        f"already be there. Fix the cause, then "
+        f"remove `{issue_number}` from `seen_issues` in "
+        f"`poller_state.json` and restart the relay.\n\n"
+        f"{AGENT_OUTCOME_MARKER}"
+    )
+
 
 # Discussion budget for the prompt. Newest comments are kept because a
 # redirect is far likelier to be the latest word than the first reply,
@@ -1129,6 +1233,10 @@ class _Publisher:
                 },
             )
             outputs["publish_failed"] = True
+            # A refusal is a decision the relay re-reaches every time
+            # (#268): the daemon must not spend another agent run on it.
+            if refused:
+                outputs["publish_refused"] = True
             if self.pr_number is not None:
                 outputs["pr_number"] = self.pr_number
                 outputs["pr_url"] = self.pr_url
@@ -2139,6 +2247,11 @@ async def run_dev_issue(
                 pr_number=pr_for_comment,
                 claim_posted=claim_may_stand,
                 claim_id=claim_id,
+                # The agent finished and only the publish failed (#268):
+                # the daemon hands the issue back to the poller, so the
+                # comment says the relay will return rather than asking
+                # the reader for an action that does nothing.
+                will_retry=publish_failure_is_retryable(result),
             )
 
         return result
