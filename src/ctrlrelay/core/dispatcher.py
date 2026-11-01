@@ -169,6 +169,9 @@ class ClaudeDispatcher:
     # here and in `make_agent_dispatcher`: ``None`` keeps no reading, and
     # a construction has to say so rather than get it by omission.
     usage_store: UsageStore | None = field(kw_only=True)
+    # Agent sessions running now. The idle usage probe waits for zero, so
+    # its reading never lands on top of a newer one from a run.
+    active: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         # Only auto-resolve the bare default. Absolute paths, relative paths
@@ -324,6 +327,7 @@ class ClaudeDispatcher:
         if resume_session_id:
             cmd.extend(["--resume", resume_session_id])
 
+        self.active += 1
         try:
             return await self._run_session(
                 cmd=cmd,
@@ -339,6 +343,7 @@ class ClaudeDispatcher:
                 issue_number=issue_number,
             )
         finally:
+            self.active -= 1
             if private_root is not None:
                 shutil.rmtree(private_root, ignore_errors=True)
 

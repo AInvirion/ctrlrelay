@@ -37,6 +37,10 @@ from ctrlrelay.core.obs import get_logger, log_event
 _logger = get_logger("core.usage")
 
 WINDOWS = ("five_hour", "seven_day")
+# What `json.loads` raises on hostile input besides a decode error: an
+# integer past Python's digit limit (ValueError) and nesting past the
+# recursion limit (RecursionError). Any of them is unreadable, not fatal.
+_UNPARSEABLE = (ValueError, RecursionError)
 ALLOWED = "allowed"
 
 
@@ -134,7 +138,7 @@ def parse_rate_limit_event(
             continue
         try:
             event = json.loads(line)
-        except json.JSONDecodeError:
+        except _UNPARSEABLE:
             # Every line of a stream-json run is JSON. One that is not was
             # cut off or damaged, and could have been a later event, even
             # one cut inside its type: what came before it is not trusted.
@@ -184,7 +188,7 @@ def parse_agent_session_id(stdout_text: str) -> str | None:
             continue
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError:
+        except _UNPARSEABLE:
             continue
         if not isinstance(payload, dict):
             continue
@@ -198,7 +202,7 @@ def parse_agent_session_id(stdout_text: str) -> str | None:
         return found
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError:
+    except _UNPARSEABLE:
         return None
     if isinstance(payload, dict):
         value = payload.get("session_id")
@@ -310,7 +314,7 @@ class UsageStore:
     def read(self) -> UsageReading | None:
         try:
             return UsageReading.from_json(json.loads(self.path.read_text()))
-        except (OSError, ValueError):
+        except (OSError, *_UNPARSEABLE):
             return None
 
 
@@ -366,12 +370,15 @@ class UsageGate:
         if self.notify is None:
             return
         try:
-            await self.notify(text)
+            # Bounded: the gate stands in front of every new issue, and a
+            # chat send that hangs must not hold the daemon with it.
+            await asyncio.wait_for(self.notify(text), timeout=NOTIFY_TIMEOUT_SECONDS)
         except Exception as e:
             log_event(_logger, "usage.notify_failed", error=str(e)[:200])
 
 
 PROBE_PROMPT = "Reply with the single word ok."
+NOTIFY_TIMEOUT_SECONDS = 30.0
 
 
 async def probe_usage(

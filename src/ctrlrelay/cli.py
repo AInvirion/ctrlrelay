@@ -3267,7 +3267,8 @@ def poller_start(
         async def _run_usage_probe() -> None:
             reading = usage_store.read()
             max_age = config.usage.probe_minutes * 60
-            if max_age > 0 and (
+            idle = getattr(dispatcher, "active", 0) == 0
+            if idle and max_age > 0 and (
                 reading is None or time.time() - reading.read_at >= max_age
             ):
                 binary = getattr(dispatcher, "claude_binary", None)

@@ -425,11 +425,16 @@ class TestRoundOneFixes:
         from ctrlrelay.core.usage import probe_usage
 
         fake = tmp_path / "agent"
-        fake.write_text(f"#!/bin/sh\ncat {FIXTURE}\nexit 2\n")
+        refused = tmp_path / "refused.jsonl"
+        refused.write_text(RECORDED.replace(
+            '"status": "allowed", "resetsAt": 1793503200',
+            '"status": "rejected", "resetsAt": 1793503200',
+        ))
+        fake.write_text(f"#!/bin/sh\ncat {refused}\nexit 2\n")
         fake.chmod(0o755)
         store = UsageStore(tmp_path / "usage.json")
         assert await probe_usage(str(fake), store) is not None
-        assert store.read().windows["five_hour"].used == 0.28
+        assert store.read().status == "rejected"
 
     @pytest.mark.asyncio
     async def test_a_probe_that_raises_anything_returns_none(self, tmp_path: Path) -> None:
@@ -503,3 +508,65 @@ class TestRoundTwoFixes:
 
         with pytest.raises(TypeError, match="usage_store"):
             ClaudeDispatcher(claude_binary="claude")
+
+
+
+class TestRoundThreeFixes:
+    @pytest.mark.parametrize("line", [
+        '{"type": "result", "session_id": "x", "n": ' + "9" * 5000 + "}",
+        "[" * 100000 + "]" * 100000,
+    ])
+    def test_hostile_json_is_unreadable_not_a_crash(self, line: str) -> None:
+        assert parse_agent_session_id(RECORDED + line + "\n") is not None
+        assert parse_rate_limit_event(RECORDED + line + "\n", now=NOW) is None
+        assert parse_agent_session_id(line) is None
+
+    @pytest.mark.asyncio
+    async def test_a_hung_chat_send_does_not_hold_the_gate(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        import asyncio
+
+        import ctrlrelay.core.usage as usage_mod
+        from ctrlrelay.core.usage import UsageGate
+
+        monkeypatch.setattr(usage_mod, "NOTIFY_TIMEOUT_SECONDS", 0.05)
+        store = UsageStore(tmp_path / "usage.json")
+        store.write(_reading(status="rejected"))
+
+        async def hang(_t: str) -> None:
+            await asyncio.Event().wait()
+
+        gate = UsageGate(store, threshold=0.9, notify=hang, clock=lambda: NOW)
+        assert await asyncio.wait_for(gate.check(), timeout=2) is not None
+
+    @pytest.mark.asyncio
+    async def test_the_dispatcher_counts_its_running_sessions(self, tmp_path: Path) -> None:
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+        d = ClaudeDispatcher(claude_binary="claude", usage_store=None)
+        seen: list[int] = []
+        release = asyncio.Event()
+
+        async def communicate():
+            seen.append(d.active)
+            await release.wait()
+            return (b"", b"")
+
+        proc = AsyncMock()
+        proc.communicate.side_effect = communicate
+        proc.returncode = 0
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            task = asyncio.create_task(d.spawn_session(
+                github_access=False, session_id="s", prompt="p",
+                working_dir=tmp_path, state_file=tmp_path / "state.json",
+            ))
+            while not seen:
+                await asyncio.sleep(0)
+            release.set()
+            await task
+        assert seen == [1]
+        assert d.active == 0
