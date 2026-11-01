@@ -3778,6 +3778,13 @@ def poller_start(
                 f"{personalization_cron_summary}[/dim]"
             )
 
+            # The heartbeat the status page reads (#249). Its own task, so
+            # it moves while a run holds the poll loop as well as while idle.
+            from ctrlrelay.core.heartbeat import Heartbeat
+
+            heartbeat = Heartbeat.beside(config.paths.state_db)
+            heartbeat_task = asyncio.create_task(heartbeat.run())
+
             # Now the slow startup: first-run seeding (one gh call per
             # repo). Done inside _main so the scheduler is already up.
             if first_run:
@@ -3870,8 +3877,10 @@ def poller_start(
                         config.github_api.slow_factor
                         if github_budget.is_low() else 1.0
                     ),
+                    on_poll=heartbeat.polled,
                 )
             finally:
+                heartbeat_task.cancel()
                 # Scheduler shutdown is async so it can cancel + await any
                 # in-flight job tasks (e.g. a scheduled secops sweep that was
                 # running when SIGTERM arrived). Without awaiting here the
@@ -4142,7 +4151,16 @@ def web_start(
             sessions=make_sessions_reader(config.paths.state_db),
         )
         try:
-            httpd = make_server(config, waiting=tracker)
+            from ctrlrelay.web.fleet import PeerReader
+
+            fleet_cfg = config.fleet
+            peers = PeerReader(
+                fleet_cfg.peers,
+                interval_s=fleet_cfg.check_seconds,
+                timeout_s=fleet_cfg.timeout_seconds,
+                silent_after=fleet_cfg.silent_after_seconds,
+            ) if fleet_cfg.peers else None
+            httpd = make_server(config, waiting=tracker, peers=peers)
         except OSError as e:
             console.print(
                 f"[red]Cannot listen on {config.web.host}:{config.web.port}:[/red] {e}"
@@ -4169,9 +4187,13 @@ def web_start(
             budget_is_low=_budget_is_low,
         )
         refresher.start()
+        if peers is not None:
+            peers.start()
         try:
             httpd.serve_forever()
         finally:
+            if peers is not None:
+                peers.stop()
             refresher.stop()
             httpd.server_close()
     finally:

@@ -40,8 +40,10 @@ from typing import Any, Protocol
 from ctrlrelay import __version__
 from ctrlrelay.core.config import Config, WebConfig
 from ctrlrelay.core.github_budget import BudgetStore, budget_json
+from ctrlrelay.core.heartbeat import Heartbeat
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.usage import UsageStore, pause_for, usage_json
+from ctrlrelay.web.fleet import PeerReader
 from ctrlrelay.web.health import read_server_health
 from ctrlrelay.web.status import build_status, list_feed
 
@@ -233,10 +235,13 @@ class StatusServer(ThreadingHTTPServer):
         waiting: _Tracker,
         *,
         home: Path | None = None,
+        peers: PeerReader | None = None,
     ) -> None:
         self.config = config
         self.waiting = waiting
         self.home = home
+        # The other machines' pages, read on their own timer (#249).
+        self.peers = peers
         self.page = load_page(config.web.refresh_seconds)
         self.host_names = allowed_host_names(config.web)
         self._misdirected: set[str] = set()
@@ -281,6 +286,8 @@ class StatusServer(ThreadingHTTPServer):
                 ),
                 low_at=api.low_at, now=time.time(),
             ),
+            "account_label": self.config.fleet.account_label,
+            "chat": self._chat(),
             "usage": usage_json(reading),
             "pause_at": self.config.usage.pause_at,
             "paused": None if pause is None else {
@@ -291,9 +298,27 @@ class StatusServer(ThreadingHTTPServer):
             },
         }
 
+    def _chat(self) -> dict[str, Any] | None:
+        """Which chat this machine uses, and whether its bridge socket is
+        there. ``None`` when no chat is configured. ``connected`` says the
+        socket exists, which is what the daemon itself checks before it
+        sends; it cannot see further into the bridge."""
+        from ctrlrelay.cli import _bridge_socket_settings
+
+        settings = _bridge_socket_settings(self.config)
+        if settings is None:
+            return None
+        return {
+            "transport": self.config.transport.type.value,
+            "connected": settings[0].exists(),
+        }
+
     def status(self) -> dict[str, Any]:
         web = self.config.web
         return build_status(
+            heartbeat=Heartbeat.beside(self.config.paths.state_db).read,
+            silent_after_s=self.config.fleet.silent_after_seconds,
+            fleet=self.peers.snapshot if self.peers is not None else None,
             node=self.node,
             db_path=self.config.paths.state_db,
             waiting=self.waiting.snapshot(),
@@ -308,13 +333,17 @@ class StatusServer(ThreadingHTTPServer):
 
 
 def make_server(
-    config: Config, *, waiting: _Tracker, home: Path | None = None,
+    config: Config,
+    *,
+    waiting: _Tracker,
+    home: Path | None = None,
+    peers: PeerReader | None = None,
 ) -> ThreadingHTTPServer:
     """Bind ``config.web.host:port`` and return the (not yet serving) server.
 
     Logs one ``web.started`` line naming the bound address, and a warning
     when the host is every interface."""
-    srv = StatusServer(config, waiting, home=home)
+    srv = StatusServer(config, waiting, home=home, peers=peers)
     host, port = srv.server_address[:2]
     shown = f"[{host}]" if ":" in str(host) else host
     log_event(_logger, "web.started", address=f"http://{shown}:{port}/",
