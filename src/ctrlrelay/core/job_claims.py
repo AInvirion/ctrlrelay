@@ -57,7 +57,7 @@ def ref_name(job: str, window: str) -> str:
 @dataclass(frozen=True)
 class JobClaim:
     """``won``; or lost to ``owner`` (``"unknown"`` if its note could not
-    be read); or ``error`` when the claim could not be made at all."""
+    be read); or ``error`` when it could not be established either way."""
 
     won: bool
     owner: str | None = None
@@ -80,8 +80,9 @@ class JobClaimer:
         self.window = window
 
     async def claim(self, repo: str, job: str) -> JobClaim:
-        """Never raises: anything unexpected is an error result, so one
-        repo's claim cannot end the sweep for the rest."""
+        """Never raises an ``Exception``: anything unexpected before the ref
+        exists is an error result, so one repo's claim cannot end the sweep
+        for the rest. Cancellation propagates."""
         try:
             return await self._claim(repo, job)
         except Exception as e:
@@ -98,14 +99,20 @@ class JobClaimer:
                       window=window, error=str(e)[:200])
             return JobClaim(won=False, error=f"{type(e).__name__}: {str(e)[:200]}")
         if created:
-            log_event(_logger, "jobs.claimed", repo=repo, job=job, window=window,
-                      node=self.node)
+            # Won, whatever happens next: nothing after this may turn a
+            # claim that exists into an error, or nobody would sweep.
             try:
+                log_event(_logger, "jobs.claimed", repo=repo, job=job,
+                          window=window, node=self.node)
                 await self._prune(repo, job, window)
             except Exception:
-                pass  # best-effort: the claim is made either way
+                pass
             return JobClaim(won=True)
         owner = await self._owner(repo, ref)
+        if owner == self.node:
+            # Ours already: an earlier create whose answer was lost, or a
+            # run of this machine's in the same window.
+            return JobClaim(won=True)
         log_event(_logger, "jobs.skipped", repo=repo, job=job, window=window,
                   node=self.node, owner=owner)
         return JobClaim(won=False, owner=owner)

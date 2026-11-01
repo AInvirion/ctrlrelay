@@ -79,8 +79,7 @@ class TestWindow:
         # Fired on the minute, or seconds after it: that minute.
         assert due("0 6 * * *", "2026-11-01 06:00:00") == "11-01 06:00"
         assert due("* * * * *", "2026-11-01 06:00:35") == "11-01 06:00"
-        # Hourly, asleep through 06:00 and 07:00: the scheduler coalesces
-        # them into one run for 07:00, and that is the window named.
+        # Hourly, started at 07:20: the latest due time is 07:00.
         assert due("0 * * * *", "2026-11-01 07:20:00") == "11-01 07:00"
         # Every minute: each fire its own.
         assert due("* * * * *", "2026-11-01 06:01:10") == "11-01 06:01"
@@ -213,7 +212,7 @@ class TestTheSweep:
 
 
 
-class TestALateRunKeepsItsWindow:
+class TestTheWindowOutsideAScheduledRun:
     def test_outside_a_scheduled_run_the_window_is_the_last_due_time(
         self, monkeypatch,
     ) -> None:
@@ -278,16 +277,35 @@ class TestRoundOneFixes:
             db.close()
 
     @pytest.mark.asyncio
-    async def test_an_unexpected_failure_is_an_error_result(self, monkeypatch) -> None:
+    async def test_an_unexpected_failure_before_the_ref_exists_is_an_error(self) -> None:
+        refs = Refs()
+
+        async def boom(*a, **k):
+            raise KeyError("surprise")
+
+        refs.create_blob = boom
+        out = await JobClaimer(refs, "node-a", window="20261101T0600Z").claim("o/r", "secops")
+        assert not out.won and "KeyError" in out.error
+
+    @pytest.mark.asyncio
+    async def test_a_claim_that_exists_is_won_whatever_fails_after(self, monkeypatch) -> None:
         import ctrlrelay.core.job_claims as mod
 
         def boom(*a, **k):
-            raise KeyError("surprise")
+            raise KeyError("logging down")
 
-        # Outside the API calls' own handler: the logging after a win.
         monkeypatch.setattr(mod, "log_event", boom)
-        out = await JobClaimer(Refs(), "node-a", window="20261101T0600Z").claim("o/r", "secops")
-        assert not out.won and "KeyError" in out.error
+        refs = Refs()
+        out = await JobClaimer(refs, "node-a", window="20261101T0600Z").claim("o/r", "secops")
+        assert out.won and refs.refs
+
+    @pytest.mark.asyncio
+    async def test_a_claim_already_ours_is_won(self) -> None:
+        refs = Refs()
+        first = JobClaimer(refs, "node-a", window="20261101T0600Z")
+        assert (await first.claim("o/r", "secops")).won
+        again = JobClaimer(refs, "node-a", window="20261101T0600Z")
+        assert (await again.claim("o/r", "secops")).won
 
 
 
@@ -346,3 +364,22 @@ class TestTheSchedulerSaysWhichRun:
         finally:
             await sched.shutdown()
         assert seen[0].astimezone(UTC) == datetime(2026, 11, 1, 5, 59, tzinfo=UTC)
+
+
+class TestCreateRef:
+    @pytest.mark.asyncio
+    async def test_only_github_naming_the_ref_back_is_a_create(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from ctrlrelay.core.github import GitHubCLI, GitHubError
+
+        gh = GitHubCLI(gh_binary="gh")
+        ref = "refs/ctrlrelay/claims/secops/20261101T0600Z"
+        with patch.object(gh, "_run_gh", AsyncMock(return_value=ref + "\n")):
+            assert await gh.create_ref("o/r", ref, "abc") is True
+        with patch.object(gh, "_run_gh", AsyncMock(return_value="")):
+            with pytest.raises(GitHubError):
+                await gh.create_ref("o/r", ref, "abc")
+        exists = GitHubError("gh failed: Reference already exists (HTTP 422)")
+        with patch.object(gh, "_run_gh", AsyncMock(side_effect=exists)):
+            assert await gh.create_ref("o/r", ref, "abc") is False

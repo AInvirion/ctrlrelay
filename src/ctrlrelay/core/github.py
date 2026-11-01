@@ -643,14 +643,17 @@ class GitHubCLI:
         anything else raises. All-or-nothing on GitHub's side, which is
         what makes it a claim (#246)."""
         try:
-            await self._run_gh(
+            created = (await self._run_gh(
                 "api", "-X", "POST", f"repos/{repo}/git/refs",
                 "-f", f"ref={ref}", "-f", f"sha={sha}", "--jq", ".ref",
-            )
+            )).strip()
         except GitHubError as e:
             if "reference already exists" in str(e).lower():
                 return False
             raise
+        if created != ref:
+            # Only GitHub naming the ref back proves it was created.
+            raise GitHubError(f"creating {ref} returned {created[:100]!r}")
         return True
 
     async def get_ref_sha(self, repo: str, ref: str) -> str:

@@ -497,7 +497,7 @@ once across the machines, or belongs to the machine by design:
 
 **How the sweep is split.** Before sweeping a repo, a machine creates the
 ref `refs/ctrlrelay/claims/secops/<window>` in it, pointing at a small blob
-that holds its `node_id`. Creating a ref on GitHub is all or nothing: the
+that holds its `node_id` (in the same safe form the issue claims use). Creating a ref on GitHub is all or nothing: the
 first machine creates it and sweeps; every other machine gets "already
 exists", reads the owner's name from the blob, logs `jobs.skipped`, and skips
 that repo. The ref is not a branch and GitHub shows it nowhere in its
@@ -509,7 +509,7 @@ machines a few seconds apart, or one started late, agree on it. A machine
 that was asleep runs a missed sweep once, up to an hour late, for the latest
 time it was due, and names that window. A machine that dies holding a window loses only
 that window: the next one is a new ref. Refs older than 30 days are deleted by
-the next machine that claims.
+the next machine that wins a claim.
 
 A machine claims a repo only once it holds that repo's local lock, so it
 never wins a claim and then finds the repo busy on its own side. (A machine
