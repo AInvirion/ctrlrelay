@@ -424,17 +424,21 @@ class GitHubCLI:
     ) -> list[dict[str, Any]]:
         """List ``assigned`` events for an issue in chronological order.
 
-        Returns the GitHub issue-events payload filtered to ``event == "assigned"``.
-        Each entry includes ``actor`` (who performed the assignment) and
-        ``assignee`` (who was assigned). Used by the poller to verify that the
-        most recent self-assignment was actually performed by the operator.
+        Returns the GitHub issue-events payload filtered to ``event == "assigned"``,
+        every page of it. Each entry includes ``assigner`` (who performed the
+        assignment) and ``assignee`` (who was assigned); its ``actor`` is the
+        assignee too, not who made it (#274). Used by the poller to verify
+        that the most recent self-assignment was actually performed by the
+        operator.
         """
+        # Every page: on an issue with more than one page of events the
+        # latest assignment would otherwise be missed.
         output = await self._run_gh(
-            "api",
+            "api", "--paginate",
             f"/repos/{repo}/issues/{issue_number}/events",
-            "--jq", '[.[] | select(.event=="assigned")]',
+            "--jq", '.[] | select(.event=="assigned")',
         )
-        return json.loads(output) if output.strip() else []
+        return [json.loads(line) for line in output.splitlines() if line.strip()]
 
     async def get_issue(
         self,

@@ -634,8 +634,12 @@ class IssuePoller:
             return False
 
         # Events endpoint returns chronological order; the last one wins.
+        # Who made the assignment is ``assigner``. On an ``assigned`` event
+        # ``actor`` is the account assigned, which is always the operator
+        # here, so reading it let anyone's assignment through (#274). No
+        # ``assigner`` is treated as foreign.
         latest = relevant[-1]
-        assigner_login = (latest.get("actor") or {}).get("login")
+        assigner_login = (latest.get("assigner") or {}).get("login")
         if assigner_login == self.username:
             return True
 

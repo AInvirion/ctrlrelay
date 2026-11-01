@@ -460,17 +460,21 @@ class TestGitHubCLI:
         """Should return only 'assigned' events for an issue."""
         from ctrlrelay.core.github import GitHubCLI
 
-        mock_output = json.dumps([
+        # ``gh api --paginate --jq '.[] | ...'`` prints one event per line,
+        # across every page.
+        mock_output = "\n".join(json.dumps(e) for e in [
             {
                 "event": "assigned",
                 "actor": {"login": "alice"},
                 "assignee": {"login": "alice"},
+                "assigner": {"login": "alice"},
                 "created_at": "2026-01-01T00:00:00Z",
             },
             {
                 "event": "assigned",
-                "actor": {"login": "bob"},
+                "actor": {"login": "alice"},
                 "assignee": {"login": "alice"},
+                "assigner": {"login": "bob"},
                 "created_at": "2026-01-02T00:00:00Z",
             },
         ])
@@ -481,11 +485,11 @@ class TestGitHubCLI:
             events = await gh.list_assignment_events("owner/repo", 42)
 
             assert len(events) == 2
-            assert events[0]["actor"]["login"] == "alice"
-            assert events[1]["actor"]["login"] == "bob"
+            assert events[0]["assigner"]["login"] == "alice"
+            assert events[1]["assigner"]["login"] == "bob"
 
             args = mock_run.call_args[0]
-            assert "api" in args
+            assert "api" in args and "--paginate" in args
             assert "/repos/owner/repo/issues/42/events" in args
 
     @pytest.mark.asyncio

@@ -407,12 +407,14 @@ class _FakeGitHub:
         return [copy.deepcopy(r) for r in self.by_label.get((repo, label), [])]
 
 
-def _assigned_by(actor: str) -> list[dict]:
-    """`list_assignment_events` output: GitHub `assigned` issue events."""
+def _assigned_by(assigner: str) -> list[dict]:
+    """`list_assignment_events` output, as GitHub returns it: ``actor`` is the
+    account assigned, ``assigner`` the one that assigned (#274)."""
     return [{
         "event": "assigned",
-        "actor": {"login": actor},
+        "actor": {"login": "octo"},
         "assignee": {"login": "octo"},
+        "assigner": {"login": assigner},
         "created_at": "2026-10-20T10:00:00Z",
     }]
 

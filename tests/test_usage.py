@@ -361,7 +361,7 @@ class TestAPausedMachineTakesTheIssueAfterTheReset:
         gh.list_issues_by_label = AsyncMock(return_value=[])
         gh.list_assignment_events = AsyncMock(return_value=[{
             "event": "assigned", "actor": {"login": "alice"},
-            "assignee": {"login": "alice"},
+            "assignee": {"login": "alice"}, "assigner": {"login": "alice"},
         }])
         poller = IssuePoller(
             github=gh, username="alice", repos=["o/r"],
