@@ -331,3 +331,44 @@ class TestTheStatusBlock:
         )
         assert out["node"] is None
         assert any("node: RuntimeError" in e for e in out["errors"])
+
+
+class TestAPausedMachineTakesTheIssueAfterTheReset:
+    @pytest.mark.asyncio
+    async def test_left_until_the_reset_then_offered_again(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        import ctrlrelay.core.poller as poller_mod
+        from ctrlrelay.cli import defer_for_usage
+        from ctrlrelay.core.poller import IssuePoller
+        from ctrlrelay.core.usage import UsageGate
+
+        now = [float(NOW)]
+        monkeypatch.setattr(poller_mod.time, "time", lambda: now[0])
+        gh = MagicMock()
+        gh.list_assigned_issues = AsyncMock(return_value=[{"number": 7, "title": "t"}])
+        gh.list_issues_by_label = AsyncMock(return_value=[])
+        gh.list_assignment_events = AsyncMock(return_value=[{
+            "event": "assigned", "actor": {"login": "alice"},
+            "assignee": {"login": "alice"},
+        }])
+        poller = IssuePoller(
+            github=gh, username="alice", repos=["o/r"],
+            state_file=tmp_path / "poller_state.json",
+        )
+        store = UsageStore(tmp_path / "usage.json")
+        store.write(_reading(windows={"five_hour": Window(0.95, NOW + 600)}))
+        gate = UsageGate(store, threshold=0.9, clock=lambda: now[0])
+
+        [item] = await poller.poll()
+        pause = await gate.check()
+        assert pause is not None
+        defer_for_usage(poller, "o/r", item["issue"]["number"], pause, 30)
+
+        now[0] = NOW + 599
+        assert await poller.poll() == []
+        now[0] = NOW + 600
+        assert [i["issue"]["number"] for i in await poller.poll()] == [7]
+        assert await gate.check() is None
