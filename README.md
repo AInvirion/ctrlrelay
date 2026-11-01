@@ -87,11 +87,11 @@ are on the roadmap (see [Roadmap](#roadmap)).
       new issue  │       │  blocked session
                  │       │
       ┌──────────▼──┐  ┌─▼───────────────────┐
-      │ dev pipeline│  │ Telegram bridge     │
-      │ in worktree │  │ (socket ↔ bot API)  │
+      │ dev pipeline│  │ chat bridge         │
+      │ in worktree │  │ (socket ↔ chat API) │
       │ agent CLI   │  └──────────┬──────────┘
       └──────┬──────┘             │
-             │ PR opened          │ DM you
+             │ PR opened          │ asks you
              ▼                    ▼
       ┌────────────┐         ┌─────────┐
       │ PR watcher │         │   You   │
@@ -166,7 +166,7 @@ Run as a supervised daemon (launchd on macOS / systemd on Linux) — see
 
 - [Getting started][docs-start]
 - [Configuration][docs-config]
-- [Telegram bridge][docs-bridge]
+- [Chat bridge (Telegram or Mattermost)][docs-bridge]
 - [Feedback loop][docs-feedback]
 - [CLI reference][docs-cli]
 - [Operations (launchd / systemd / scheduled jobs)][ops-docs]

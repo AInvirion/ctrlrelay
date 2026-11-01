@@ -184,7 +184,7 @@ installer uses. Save under `~/.config/systemd/user/`.
 
 ```ini
 [Unit]
-Description=ctrlrelay Telegram bridge
+Description=ctrlrelay chat bridge (Telegram or Mattermost)
 After=network-online.target
 
 [Service]

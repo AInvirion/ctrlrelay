@@ -52,7 +52,7 @@ pytest --cov=src/ctrlrelay --cov-report=term-missing
 `pyproject.toml` sets `pythonpath = ["src"]` and `testpaths = ["tests"]` so
 pytest finds the package without an extra install step on a fresh checkout.
 
-The Telegram bridge tests stub the network — no real bot token is required to
+The chat bridge tests stub the network — no real bot token is required to
 run the suite. Tests that exercise the dev / secops pipelines use the
 `file_mock` transport so they stay hermetic.
 
@@ -112,7 +112,7 @@ ctrlrelay/
 │   ├── cli.py                   # Typer CLI entry point
 │   ├── core/                    # Dispatcher, worktree, state, config, ...
 │   ├── pipelines/               # dev, secops, post_merge
-│   ├── bridge/                  # Telegram bridge daemon
+│   ├── bridge/                  # chat bridge daemon (Telegram, Mattermost)
 │   ├── transports/              # SocketTransport, FileMockTransport
 │   └── dashboard/               # Optional dashboard push client
 ├── tests/                       # pytest suites (one file per module)

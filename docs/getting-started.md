@@ -24,7 +24,7 @@ and running the dev pipeline against a real GitHub issue. Allow about 15 minutes
 Optional:
 
 - [`uv`](https://github.com/astral-sh/uv) for faster installs.
-- A Telegram bot if you want the human-in-the-loop bridge — see [Telegram bridge]({{ '/bridge/' | relative_url }}).
+- A Telegram bot or a Mattermost server if you want the human-in-the-loop bridge — see [Chat bridge]({{ '/bridge/' | relative_url }}).
 
 ## Install
 
@@ -127,8 +127,8 @@ What happens:
 
 If Claude blocks asking a question, the answer mechanism only works when a
 transport is connected. With `file_mock`, you'll see the question on the console
-but cannot resume. Switch to the Telegram transport to actually answer — see
-[Telegram bridge]({{ '/bridge/' | relative_url }}) and [Feedback loop]({{ '/feedback-loop/' | relative_url }}).
+but cannot resume. Switch to the Telegram or Mattermost transport to actually
+answer — see [Chat bridge]({{ '/bridge/' | relative_url }}) and [Feedback loop]({{ '/feedback-loop/' | relative_url }}).
 
 ## Your first poller tick
 
@@ -151,7 +151,7 @@ To run the poller as a long-lived background service, see [Operations]({{ '/oper
 ## Where to next
 
 - [Configuration]({{ '/configuration/' | relative_url }}) — every key in `orchestrator.yaml`.
-- [Telegram bridge]({{ '/bridge/' | relative_url }}) — how to set up the human-in-the-loop channel.
+- [Chat bridge]({{ '/bridge/' | relative_url }}) — how to set up the human-in-the-loop channel.
 - [Feedback loop]({{ '/feedback-loop/' | relative_url }}) — what `BLOCKED_NEEDS_INPUT` actually does end-to-end.
 - [CLI reference]({{ '/cli/' | relative_url }}) — every subcommand and flag.
 - [Operations]({{ '/operations/' | relative_url }}) — running ctrlrelay as a service.

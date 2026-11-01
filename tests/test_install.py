@@ -352,3 +352,14 @@ class TestInstallCli:
         assert result.exit_code == 0, result.output
         assert (target_dir / "ctrlrelay-bridge.service").exists()
         assert (target_dir / "ctrlrelay-poller.service").exists()
+
+
+def test_the_bridge_unit_names_the_chat_bridge_not_one_provider(tmp_path) -> None:
+    """The bridge serves Telegram or Mattermost; its unit says so."""
+    from ctrlrelay.install import render_systemd
+
+    [bridge] = [
+        u for u in render_systemd(workdir=tmp_path, target_dir=tmp_path)
+        if u.service == "bridge"
+    ]
+    assert "Description=ctrlrelay chat bridge (Telegram or Mattermost)" in bridge.content

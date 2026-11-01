@@ -25,7 +25,7 @@ mitigation within **14 days** for high-severity issues.
 In-scope:
 
 - The `ctrlrelay` CLI and its pipelines (`dev`, `secops`, scheduled jobs).
-- The Telegram bridge and socket transport.
+- The chat bridge (Telegram or Mattermost) and socket transport.
 - Anything in `src/` and `config/`.
 
 Out-of-scope:
