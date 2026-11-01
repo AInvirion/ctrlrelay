@@ -53,7 +53,6 @@ push already treats as untrusted (#219).
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 import shutil
@@ -324,20 +323,11 @@ def bwrap_prefix(
     open_dirs = [p for p in opened if p.is_dir()]
 
     locked: list[Path] = []
-    for raw in _expand_globs(readonly):
+    links: list[Path] = []
+    for raw in _expand_globs(readonly, links=links):
         link = _expand(raw)
-        if (
-            link is not None and link.is_symlink() and any(
-                Path(os.path.realpath(link.parent)).is_relative_to(d)
-                for d in open_dirs
-            )
-        ):
-            # The bind protects the target; the link itself sits in a
-            # writable directory and can be replaced.
-            logging.getLogger(__name__).warning(
-                "agent_env.sandbox.readonly_link_replaceable",
-                extra={"path": str(link)},
-            )
+        if link is not None and link.is_symlink():
+            links.append(link)
         p = _existing(raw)
         if p is None:
             target = _expand(raw)
@@ -353,6 +343,18 @@ def bwrap_prefix(
             p = _create_readonly(target)
         if p not in locked:
             locked.append(p)
+
+    # A read-only bind protects a link's target, not the link: where the
+    # link sits writable, the agent could replace it with a file of its
+    # own under the name that is loaded. Refused, like a dangling one.
+    for link in links:
+        if _writable_at(Path(os.path.realpath(link.parent)), opened, locked):
+            raise SandboxUnavailableError(
+                f"agent.sandbox: {link} is a link in a directory the agent "
+                "can write, so it could be replaced; replace the link with "
+                "what it points to, or take the path out of "
+                "agent.sandbox_readonly_paths"
+            )
 
     # A mount point cannot be renamed, but a plain directory above one
     # can, and the mount moves with it: the agent could then make a new
@@ -397,8 +399,21 @@ def bwrap_prefix(
     return argv
 
 
+def _writable_at(where: Path, opened: list[Path], locked: list[Path]) -> bool:
+    """Whether ``where`` is writable in the sandbox: the nearest mount at
+    or above it decides."""
+    holders = [p for p in [*opened, *locked] if where.is_relative_to(p)]
+    if not holders:
+        return False
+    nearest = max(holders, key=lambda p: (len(p.parts), p in locked))
+    return nearest not in locked and nearest.is_dir()
+
+
 def _expand_globs(
-    paths: Sequence[str | Path], *, dirs_only: bool = True,
+    paths: Sequence[str | Path],
+    *,
+    dirs_only: bool = True,
+    links: list[Path] | None = None,
 ) -> list[str | Path]:
     """Each path with a ``*`` part replaced by one path per entry that part
     matches now, the rest of the path kept after it. Hidden names match.
@@ -420,13 +435,8 @@ def _expand_globs(
                 # holds is protected too.
                 if not match.is_dir():
                     continue
-                if match.is_symlink():
-                    # What it leads to is protected; the link itself can be
-                    # replaced if it sits somewhere writable.
-                    logging.getLogger(__name__).warning(
-                        "agent_env.sandbox.readonly_link_replaceable",
-                        extra={"path": str(match)},
-                    )
+                if match.is_symlink() and links is not None:
+                    links.append(match)  # judged by the caller
                 match = match.resolve()
             elif match.is_symlink():
                 continue

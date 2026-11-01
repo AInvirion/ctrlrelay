@@ -283,7 +283,7 @@ class ClaudeDispatcher:
                 # Every worktree's git dir is in here: the others belong to
                 # other runs, so the folder is read-only and only this
                 # run's own (bound later, deeper) is writable.
-                if len(repo_dirs) > 1 and repo_dirs[1].parent == d / "worktrees":
+                if (d / "worktrees").exists():
                     git_protected.append(d / "worktrees")
             else:
                 # A linked worktree's pointers back to the shared clone:
@@ -303,7 +303,8 @@ class ClaudeDispatcher:
             copy = private_root / "claude.json"
             shutil.copyfile(main_config, copy)
             copy.chmod(0o600)
-            copies.append((copy, main_config))
+            # At the real path: a bind on a link lands where it leads.
+            copies.append((copy, Path(os.path.realpath(main_config))))
         return bwrap_prefix(
             self._bwrap,
             self.sandbox_hide_paths,

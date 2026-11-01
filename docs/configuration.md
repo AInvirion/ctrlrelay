@@ -188,9 +188,11 @@ login, does not):
   which every later git command there reads. So the agent cannot change git
   config (`git config`, `git remote add`, a branch with `--track`), and a
   global `commit.gpgsign = true` makes its commits fail, since your GPG
-  agent is hidden. One that does not exist yet inside a
-  writable path is created first (an empty directory, or `{}` for a JSON
-  file) so the agent cannot create it; if it cannot be created, the run does
+  agent is hidden. Submodules cannot be updated or committed in from a
+  sandboxed run. One that does not exist yet inside a
+  writable path is created first so the agent cannot create it (`{}` for a
+  JSON file; an empty file for a Markdown file or git's `config`,
+  `config.worktree`, `commondir` and `gitdir`; otherwise an empty directory); if it cannot be created, the run does
   not start. Every directory between a writable path and one of these is
   pinned too, so it cannot be renamed away and recreated.
 
@@ -211,9 +213,9 @@ long-lived token from `claude setup-token`, in the environment, avoids
 refreshes there. It writes objects and refs in its repository's git
 directory, which the relay's push already treats as untrusted, and session
 transcripts under `~/.claude/projects`, which a later `--resume` of that
-session reads. A read-only path that is a link, inside a directory opened
-whole, protects its target and not the link, which the agent can replace;
-the log names any it finds as `agent_env.sandbox.readonly_link_replaceable`.
+session reads. A read-only path that is a link, in a directory the agent
+can write, could be swapped for a file of the agent's, so a run with one
+does not start; the error names it.
 `~/.claude/*` opens every entry not listed as read-only or hidden, so an
 entry a later agent CLI version adds that your own sessions run needs adding
 to one of those lists. The run's checkpoint file must be inside its worktree (it

@@ -410,26 +410,28 @@ def test_a_cache_dir_that_contains_home_is_refused(tmp_path, monkeypatch) -> Non
         d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)
 
 
-def test_a_replaceable_read_only_link_is_named_and_an_entry_level_one_is_not(
-    tmp_path, caplog,
+def test_a_replaceable_read_only_link_stops_the_run_and_an_entry_level_one_does_not(
+    tmp_path,
 ) -> None:
-    import logging
-
-    from ctrlrelay.core.agent_env import bwrap_prefix
+    from ctrlrelay.core.agent_env import SandboxUnavailableError, bwrap_prefix
 
     state = tmp_path / "state"
     state.mkdir()
     (tmp_path / "real.json").write_text("{}")
     (state / "settings.json").symlink_to(tmp_path / "real.json")
     (state / "projects").mkdir()
-    with caplog.at_level(logging.WARNING):
-        bwrap_prefix("/usr/bin/bwrap", [], writable=[f"{state}/*"],
-                     readonly=[state / "settings.json"])
-        assert not [r for r in caplog.records if "replaceable" in r.getMessage()]
+    (tmp_path / "mem").mkdir()
+    (state / "projects" / "-p").symlink_to(tmp_path / "mem")
+    # Entry by entry: the directory holding the link is not writable.
+    bwrap_prefix("/usr/bin/bwrap", [], writable=[f"{state}/*"],
+                 readonly=[state / "settings.json"])
+    with pytest.raises(SandboxUnavailableError, match="could be replaced"):
         bwrap_prefix("/usr/bin/bwrap", [], writable=[state],
                      readonly=[state / "settings.json"])
-    [rec] = [r for r in caplog.records if "replaceable" in r.getMessage()]
-    assert rec.path == str(state / "settings.json")
+    # A linked project directory, matched by a pattern, in a writable one.
+    with pytest.raises(SandboxUnavailableError, match="could be replaced"):
+        bwrap_prefix("/usr/bin/bwrap", [], writable=[f"{state}/*"],
+                     readonly=[f"{state}/projects/*"])
 
 
 def test_claude_config_dir_set_is_refused(tmp_path, monkeypatch) -> None:
@@ -447,3 +449,52 @@ def test_claude_config_dir_set_is_refused(tmp_path, monkeypatch) -> None:
     with pytest.raises(SandboxUnavailableError, match="CLAUDE_CONFIG_DIR"):
         d._sandbox_prefix({"CLAUDE_CONFIG_DIR": "/x"}, wt,
                           wt / ".ctrlrelay" / "state.json", tmp_path)
+
+
+def test_other_worktrees_are_locked_from_a_main_worktree_run_too(
+    tmp_path, monkeypatch,
+) -> None:
+    if BWRAP is None:
+        pytest.skip("bwrap not installed")
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    wt = tmp_path / "wt"
+    _git("init", "-q", str(wt), cwd=tmp_path)
+    (wt / ".git" / "worktrees" / "other").mkdir(parents=True)
+    private = tmp_path / "private"
+    private.mkdir()
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
+        sandbox_cache_dir=str(tmp_path / "c"),
+    )
+    argv = d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", private)
+    locked = str((wt / ".git" / "worktrees").resolve())
+    assert argv[argv.index(locked) - 1] == "--ro-bind"
+
+
+def test_a_linked_main_config_is_copied_to_where_it_leads(
+    tmp_path, monkeypatch,
+) -> None:
+    if BWRAP is None:
+        pytest.skip("bwrap not installed")
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    real = tmp_path / "dotfiles" / "claude.json"
+    real.parent.mkdir()
+    real.write_text("{}")
+    (home / ".claude.json").symlink_to(real)
+    wt = tmp_path / "wt"
+    _git("init", "-q", str(wt), cwd=tmp_path)
+    private = tmp_path / "private"
+    private.mkdir()
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
+        sandbox_cache_dir=str(tmp_path / "c"),
+    )
+    argv = d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", private)
+    i = argv.index(str(private / "claude.json"))
+    assert argv[i - 1:i + 2] == ["--bind", str(private / "claude.json"), str(real)]
