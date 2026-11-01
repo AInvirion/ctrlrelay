@@ -1193,22 +1193,6 @@ class TestAFixRoundIsPushedByTheRelay:
         assert "gh run view" not in fix_prompt
 
 
-def test_the_bwrap_prefix_hides_only_the_named_paths(tmp_path: Path) -> None:
-    from ctrlrelay.core.agent_env import bwrap_prefix
-
-    d = tmp_path / "ssh"
-    d.mkdir()
-    f = tmp_path / "netrc"
-    f.write_text("machine x")
-    argv = bwrap_prefix(
-        "/usr/bin/bwrap", [str(d), str(f), str(tmp_path / "missing")]
-    )
-    assert argv == [
-        "/usr/bin/bwrap", "--dev-bind", "/", "/", "--die-with-parent",
-        "--tmpfs", str(d), "--ro-bind", "/dev/null", str(f), "--",
-    ]
-
-
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap not installed")
 def test_under_bwrap_the_hidden_dir_reads_empty(tmp_path: Path) -> None:
     from ctrlrelay.core.agent_env import bwrap_prefix

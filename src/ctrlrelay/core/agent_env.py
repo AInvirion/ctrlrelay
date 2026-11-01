@@ -39,13 +39,16 @@ refused; a remote branch ctrlrelay did not push is not overwritten;
 agent-written PR and comment text is sanitized; and an agent that only
 uses its normal tooling (git, gh, ssh as configured) cannot push.
 
-What it does NOT guarantee: the agent runs as the same OS user, so a
-deliberately hostile agent can still read credential files
-(``~/.config/gh/hosts.yml``, ``~/.ssh``), use them by hand, and write
-to the relay's push directory, the bare clone's object store and any
-``objects/info/alternates`` chain it adds there, racing a push. Closing
-that needs a separate user or a read-only home (#236). ``agent.sandbox:
-bwrap`` hides the credential paths; it does not stop the writes.
+What it does NOT guarantee: the agent runs as the same OS user, so
+without a sandbox a deliberately hostile agent can still read credential
+files (``~/.config/gh/hosts.yml``, ``~/.ssh``), use them by hand, and
+write anywhere the operator can: dotfiles, shell startup files, the
+relay's own install. ``agent.sandbox: bwrap`` (#236) closes that: the
+whole filesystem is read-only, the credential paths are empty, and only
+the run's worktree, its repository's git directory, a private ``/tmp``,
+the agent CLI's own state and an agent-only cache are writable. Within
+the git directory it can still write objects and refs, which the relay's
+push already treats as untrusted (#219).
 """
 
 from __future__ import annotations
@@ -178,7 +181,44 @@ DEFAULT_SANDBOX_HIDE_PATHS: tuple[str, ...] = (
     # reach it either.
     "~/.local/share/keyrings",
     "$XDG_RUNTIME_DIR/bus",
+    # Other credentials an operator's home commonly holds (#236).
+    "~/.gnupg",
+    "~/.aws",
+    "~/.azure",
+    "~/.config/gcloud",
+    "~/.kube",
+    "~/.docker/config.json",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.cargo/credentials",
+    "~/.cargo/credentials.toml",
+    # The relay's own config, which can hold chat tokens.
+    "~/.config/ctrlrelay",
 )
+
+# Writable inside the sandbox besides the run's own paths (#236): the
+# agent CLI keeps its login, session logs and history here.
+DEFAULT_SANDBOX_WRITABLE_PATHS: tuple[str, ...] = ("~/.claude",)
+
+# Read-only again inside a writable path: what the operator's own agent
+# sessions load and run (settings with hooks, plugins, skills, agents),
+# so a run cannot plant something that runs later as the operator.
+DEFAULT_SANDBOX_READONLY_PATHS: tuple[str, ...] = (
+    "~/.claude/settings.json",
+    "~/.claude/settings.local.json",
+    "~/.claude/CLAUDE.md",
+    "~/.claude/agents",
+    "~/.claude/commands",
+    "~/.claude/skills",
+    "~/.claude/hooks",
+    "~/.claude/plugins",
+    "~/.claude/output-styles",
+    "~/.claude/scripts",
+)
+
+# The agent's package caches: its own, never the operator's, so a run
+# cannot poison a cache the operator builds from later.
+DEFAULT_SANDBOX_CACHE_DIR = "~/.ctrlrelay/agent-cache"
 
 
 class SandboxUnavailableError(RuntimeError):
@@ -200,29 +240,83 @@ def resolve_bwrap() -> str:
     )
 
 
-def bwrap_prefix(bwrap: str, hide_paths: Sequence[str]) -> list[str]:
-    """Argv prefix that runs a command with ``hide_paths`` made empty.
+def _existing(raw: str | Path) -> Path | None:
+    """``raw`` with ``~`` and variables expanded and a symlink followed,
+    or ``None`` when it names nothing. An unset variable names nothing:
+    a literal "$XDG_RUNTIME_DIR" is not a path."""
+    expanded = os.path.expandvars(os.path.expanduser(str(raw)))
+    if "$" in expanded:
+        return None
+    p = Path(expanded)
+    if p.is_symlink():
+        p = p.resolve()
+    return p if p.exists() else None
 
-    The rest of the filesystem is bound through unchanged and writable,
-    so the agent's toolchain, caches and the model CLI's own state
-    behave exactly as without the sandbox. Only the named paths change:
-    a directory becomes an empty tmpfs and a file becomes /dev/null.
-    A path that does not exist is skipped (bwrap would otherwise have
-    to create a mount point for it).
+
+def bwrap_prefix(
+    bwrap: str,
+    hide_paths: Sequence[str],
+    *,
+    writable: Sequence[str | Path] = (),
+    readonly: Sequence[str | Path] = (),
+) -> list[str]:
+    """Argv prefix that runs a command in a read-only copy of this machine.
+
+    In order, so each step wins over the one before: the whole
+    filesystem read-only, a fresh ``/dev``, ``/proc`` and private
+    ``/tmp``; ``hide_paths`` made empty (a directory becomes an empty
+    tmpfs, a file ``/dev/null``); ``writable`` bound back writable; and
+    ``readonly`` bound read-only again inside those. A path that does
+    not exist is skipped (bwrap would otherwise have to create a mount
+    point for it). The child gets its own process namespace and dies
+    with the relay.
     """
-    argv = [bwrap, "--dev-bind", "/", "/", "--die-with-parent"]
+    argv = [
+        bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+        "--tmpfs", "/tmp", "--unshare-pid", "--die-with-parent",
+    ]
     for raw in hide_paths:
-        expanded = os.path.expandvars(os.path.expanduser(raw))
-        if "$" in expanded:
-            # An unset variable: there is nothing at a path we cannot
-            # name, and a literal "$XDG_RUNTIME_DIR" is not a path.
+        p = _existing(raw)
+        if p is None:
             continue
-        p = Path(expanded)
-        if p.is_symlink():
-            p = p.resolve()
         if p.is_dir():
             argv += ["--tmpfs", str(p)]
-        elif p.exists():
+        else:
             argv += ["--ro-bind", "/dev/null", str(p)]
+    for raw in writable:
+        p = _existing(raw)
+        if p is not None:
+            argv += ["--bind", str(p), str(p)]
+    for raw in readonly:
+        p = _existing(raw)
+        if p is not None:
+            argv += ["--ro-bind", str(p), str(p)]
     argv.append("--")
     return argv
+
+
+def git_dirs(working_dir: Path) -> list[Path]:
+    """The worktree's git directories (its own and the shared one), which
+    a commit writes to; empty when ``working_dir`` is not in a repository."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute",
+             "--git-common-dir", "--git-dir"],
+            cwd=working_dir, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [Path(line) for line in out.stdout.splitlines() if line.strip()]
+
+
+def agent_cache_env(cache_dir: Path) -> dict[str, str]:
+    """Point the usual package caches at the agent's own ``cache_dir``."""
+    return {
+        "XDG_CACHE_HOME": str(cache_dir),
+        "npm_config_cache": str(cache_dir / "npm"),
+        "GOMODCACHE": str(cache_dir / "go-mod"),
+    }

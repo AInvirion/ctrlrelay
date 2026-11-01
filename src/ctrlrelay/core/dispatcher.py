@@ -20,9 +20,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ctrlrelay.core.agent_env import (
+    DEFAULT_SANDBOX_CACHE_DIR,
     DEFAULT_SANDBOX_HIDE_PATHS,
+    DEFAULT_SANDBOX_READONLY_PATHS,
+    DEFAULT_SANDBOX_WRITABLE_PATHS,
+    agent_cache_env,
     build_agent_env,
     bwrap_prefix,
+    git_dirs,
     resolve_bwrap,
 )
 from ctrlrelay.core.binaries import resolve_binary
@@ -158,13 +163,18 @@ class ClaudeDispatcher:
     # construction site has to say which of those it is, rather than
     # inheriting the pre-#204 silence by omission.
     outcome_hook: DispatchOutcomeHook | None = None
-    # "none" or "bwrap" (#219). With "bwrap", a spawn WITHOUT GitHub
-    # access runs under bubblewrap with ``sandbox_hide_paths`` replaced
-    # by empty mounts, so the agent cannot read the SSH key or gh's
-    # stored login either. Off by default: it needs bwrap installed and
-    # unprivileged user namespaces allowed, which not every host has.
+    # "none" or "bwrap" (#219, #236). With "bwrap", a spawn WITHOUT GitHub
+    # access runs under bubblewrap in a read-only copy of the machine:
+    # ``sandbox_hide_paths`` empty, and only the worktree, its git
+    # directory, a private /tmp, ``sandbox_writable_paths`` (minus
+    # ``sandbox_readonly_paths``) and ``sandbox_cache_dir`` writable. Off
+    # by default: it needs bwrap installed and unprivileged user
+    # namespaces allowed, which not every host has.
     sandbox: str = "none"
     sandbox_hide_paths: tuple[str, ...] = DEFAULT_SANDBOX_HIDE_PATHS
+    sandbox_writable_paths: tuple[str, ...] = DEFAULT_SANDBOX_WRITABLE_PATHS
+    sandbox_readonly_paths: tuple[str, ...] = DEFAULT_SANDBOX_READONLY_PATHS
+    sandbox_cache_dir: str = DEFAULT_SANDBOX_CACHE_DIR
     # Where each run's subscription usage reading is kept (#247). Required,
     # here and in `make_agent_dispatcher`: ``None`` keeps no reading, and
     # a construction has to say so rather than get it by omission.
@@ -293,7 +303,27 @@ class ClaudeDispatcher:
                 base_env, gh_config_dir=gh_config_dir, runtime_dir=runtime_dir,
             )
             if self._bwrap is not None:
-                prefix = bwrap_prefix(self._bwrap, self.sandbox_hide_paths)
+                cache_dir = Path(self.sandbox_cache_dir).expanduser()
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                state_file.parent.mkdir(parents=True, exist_ok=True)
+                env.update(agent_cache_env(cache_dir))
+                repo_dirs = git_dirs(working_dir)
+                prefix = bwrap_prefix(
+                    self._bwrap,
+                    self.sandbox_hide_paths,
+                    writable=[
+                        working_dir, *repo_dirs, state_file.parent,
+                        private_root, cache_dir, *self.sandbox_writable_paths,
+                    ],
+                    # The shared git directory's config and hooks are run
+                    # by every later git command in that clone, the
+                    # relay's included: the agent may not write them.
+                    readonly=[
+                        *self.sandbox_readonly_paths,
+                        *(d / name for d in repo_dirs[:1]
+                          for name in ("config", "hooks")),
+                    ],
+                )
         env["CTRLRELAY_SESSION_ID"] = session_id
         env["CTRLRELAY_STATE_FILE"] = str(state_file)
 
@@ -316,7 +346,7 @@ class ClaudeDispatcher:
         # is handed no credential to push with, not what it is allowed
         # to type. That stops an agent using normal tooling; one that
         # deliberately reads credential files as the same OS user is
-        # not stopped until #236 (separate user / read-only home).
+        # stopped only by ``agent.sandbox: bwrap`` (#236).
         cmd = [
             *prefix,
             self.claude_binary,
@@ -707,6 +737,9 @@ def make_agent_dispatcher(
             outcome_hook=outcome_hook,
             sandbox=agent_config.sandbox,
             sandbox_hide_paths=tuple(agent_config.sandbox_hide_paths),
+            sandbox_writable_paths=tuple(agent_config.sandbox_writable_paths),
+            sandbox_readonly_paths=tuple(agent_config.sandbox_readonly_paths),
+            sandbox_cache_dir=agent_config.sandbox_cache_dir,
             usage_store=usage_store,
         )
     raise NotImplementedError(
