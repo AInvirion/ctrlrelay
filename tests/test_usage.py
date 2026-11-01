@@ -371,7 +371,7 @@ class TestAPausedMachineTakesTheIssueAfterTheReset:
         [item] = await poller.poll()
         pause = await gate.check()
         assert pause is not None
-        defer_for_usage(poller, "o/r", item["issue"]["number"], pause, 30)
+        defer_for_usage(poller, "o/r", item["issue"]["number"], pause)
 
         now[0] = NOW + 599
         assert await poller.poll() == []
@@ -419,15 +419,17 @@ class TestRoundOneFixes:
         assert parse_rate_limit_event(RECORDED + cut_short + "\n", now=NOW) is None
 
     @pytest.mark.asyncio
-    async def test_a_probe_that_exits_non_zero_stores_nothing(self, tmp_path: Path) -> None:
+    async def test_a_refused_probe_still_reports_the_usage_that_refused_it(
+        self, tmp_path: Path,
+    ) -> None:
         from ctrlrelay.core.usage import probe_usage
 
         fake = tmp_path / "agent"
         fake.write_text(f"#!/bin/sh\ncat {FIXTURE}\nexit 2\n")
         fake.chmod(0o755)
         store = UsageStore(tmp_path / "usage.json")
-        assert await probe_usage(str(fake), store) is None
-        assert store.read() is None
+        assert await probe_usage(str(fake), store) is not None
+        assert store.read().windows["five_hour"].used == 0.28
 
     @pytest.mark.asyncio
     async def test_a_probe_that_raises_anything_returns_none(self, tmp_path: Path) -> None:
@@ -440,12 +442,17 @@ class TestRoundOneFixes:
 
     @pytest.mark.asyncio
     async def test_a_probe_that_times_out_is_killed(self, tmp_path: Path) -> None:
+        import os
+
         from ctrlrelay.core.usage import probe_usage
 
         fake = tmp_path / "agent"
-        fake.write_text("#!/bin/sh\nexec sleep 30\n")
+        fake.write_text(f"#!/bin/sh\necho $$ > {tmp_path}/pid\nexec sleep 30\n")
         fake.chmod(0o755)
-        assert await probe_usage(str(fake), UsageStore(tmp_path / "u.json"), timeout=0.5) is None
+        assert await probe_usage(str(fake), UsageStore(tmp_path / "u.json"), timeout=1) is None
+        pid = int((tmp_path / "pid").read_text())
+        with pytest.raises(ProcessLookupError):  # killed and reaped, not left behind
+            os.kill(pid, 0)
 
     @pytest.mark.asyncio
     async def test_resuming_wakes_the_issues_left_for_later(self, tmp_path: Path) -> None:
@@ -461,3 +468,38 @@ class TestRoundOneFixes:
         store.write(_reading())  # a probe reads it lower before the reset
         await gate.check()
         assert woke == [True]
+
+
+
+class TestRoundTwoFixes:
+    def test_a_number_with_hundreds_of_digits_is_unknown(self, tmp_path: Path) -> None:
+        huge = "9" * 400
+        text = RECORDED.replace('"utilization": 0.28', f'"utilization": {huge}')
+        r = parse_rate_limit_event(text, now=NOW)
+        assert "five_hour" not in r.windows
+        path = tmp_path / "usage.json"
+        path.write_text(
+            '{"status": "allowed", "read_at": 1, '
+            f'"five_hour": {{"used": 0.5, "resets_at": {huge}}}}}'
+        )
+        assert UsageStore(path).read().windows["five_hour"].resets_at is None
+
+    def test_an_event_cut_off_inside_its_type_is_unreadable(self) -> None:
+        assert parse_rate_limit_event(RECORDED + '{"type": "rate_lim\n', now=NOW) is None
+
+    def test_a_window_with_no_reset_time_does_not_pause(self) -> None:
+        r = _reading(windows={"five_hour": Window(0.99, None)})
+        assert pause_for(r, threshold=0.9, now=NOW) is None
+
+    def test_a_refusal_with_no_reset_time_pauses_for_an_hour(self) -> None:
+        r = UsageReading(
+            status="rejected", windows={"five_hour": Window(0.99, None)}, read_at=NOW,
+        )
+        assert pause_for(r, threshold=0.9, now=NOW).until == NOW + 3600
+        assert pause_for(r, threshold=0.9, now=NOW + 3600) is None
+
+    def test_a_dispatcher_cannot_be_built_without_saying_where_usage_goes(self) -> None:
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+        with pytest.raises(TypeError, match="usage_store"):
+            ClaudeDispatcher(claude_binary="claude")

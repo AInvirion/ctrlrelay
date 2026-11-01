@@ -84,7 +84,7 @@ async def _spawn_and_capture_env(
         proc.returncode = 0
         return proc
 
-    d = ClaudeDispatcher(claude_binary="/bin/true")
+    d = ClaudeDispatcher(usage_store=None, claude_binary="/bin/true")
     with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
         await d.spawn_session(
             session_id="s-219",

@@ -50,7 +50,7 @@ class TestEverySpawnReportsItsOutcome:
         async def hook(outcome):
             seen.append(outcome)
 
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps({
             "version": "1",
@@ -87,7 +87,7 @@ session_id="s",
         async def hook(outcome):
             seen.append(outcome)
 
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch(
             "asyncio.create_subprocess_exec",
             return_value=_proc(
@@ -122,7 +122,7 @@ session_id="s",
         async def hook(outcome):
             seen.append(outcome)
 
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch(
             "asyncio.create_subprocess_exec", return_value=_proc(returncode=0)
         ):
@@ -143,6 +143,7 @@ session_id="s",
             seen.append(outcome)
 
         d = ClaudeDispatcher(
+            usage_store=None,
             claude_binary="claude", default_timeout=1, outcome_hook=hook
         )
         proc = AsyncMock()
@@ -176,7 +177,7 @@ session_id="s",
         async def hook(outcome):
             seen.append(outcome)
 
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch(
             "asyncio.create_subprocess_exec",
             side_effect=FileNotFoundError("no such file"),
@@ -204,7 +205,7 @@ class TestTheHookCannotBreakADispatch:
         async def hook(outcome):
             raise RuntimeError("the database is locked")
 
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch(
             "asyncio.create_subprocess_exec", return_value=_proc(returncode=0)
         ):
@@ -224,7 +225,7 @@ session_id="s",
         async def hook(outcome):
             raise asyncio.CancelledError()
 
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch(
             "asyncio.create_subprocess_exec", return_value=_proc(returncode=0)
         ):
@@ -239,7 +240,7 @@ session_id="s",
 
     @pytest.mark.asyncio
     async def test_no_hook_is_a_no_op(self, tmp_path: Path) -> None:
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=None)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=None)
         with patch(
             "asyncio.create_subprocess_exec", return_value=_proc(returncode=0)
         ):
@@ -882,7 +883,7 @@ class TestCommunicateFailuresAreReported:
         proc.returncode = None
         proc.kill = MagicMock()
         proc.wait = AsyncMock()
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(OSError):
                 await d.spawn_session(
@@ -916,7 +917,7 @@ session_id="s",
         async def hook(outcome):
             seen.append(outcome)
 
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(asyncio.CancelledError):
                 await d.spawn_session(
@@ -1293,7 +1294,7 @@ class TestTheChildIsReapedWithoutLosingTheCause:
         proc.returncode = None
         proc.kill = MagicMock(side_effect=ProcessLookupError())
         proc.wait = AsyncMock()
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(OSError) as excinfo:
                 await d.spawn_session(
@@ -1325,7 +1326,7 @@ class TestInvalidUtf8FromAChildIsNotLost:
         proc = AsyncMock()
         proc.communicate.return_value = (b"\xff\xfe not utf-8", b"\x80bad")
         proc.returncode = 1
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             result = await d.spawn_session(
                 github_access=False,
@@ -1481,7 +1482,7 @@ class TestAnUnreadExitStatusIsNotReportedAsHealthy:
         proc = AsyncMock()
         proc.communicate.return_value = (b"", b"")
         proc.returncode = None
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             await d.spawn_session(
                 github_access=False,
@@ -1509,7 +1510,7 @@ session_id="s",
         proc = AsyncMock()
         proc.communicate.return_value = (b"", b"")
         proc.returncode = 0
-        d = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        d = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             await d.spawn_session(
                 github_access=False,

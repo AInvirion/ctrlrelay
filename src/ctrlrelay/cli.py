@@ -1110,14 +1110,11 @@ def settle_claimed_elsewhere(
     )
 
 
-def defer_for_usage(poller, repo: str, issue_number: int, pause, probe_minutes: int) -> str:
+def defer_for_usage(poller, repo: str, issue_number: int, pause) -> str:
     """Leave an issue for later while this machine is paused for usage
-    (#247), and say why. It is offered again at the reset time, or, when
-    no reset time is known, after the next probe could have read one."""
-    until = pause.until
-    if until is None:
-        until = time.time() + max(probe_minutes, 5) * 60
-    poller.recheck_at(repo, issue_number, float(until))
+    (#247), and say why. It is offered again at the pause's end, or
+    sooner if the pause ends early (the gate's resume wakes it)."""
+    poller.recheck_at(repo, issue_number, float(pause.until))
     return f"#{issue_number} in {repo} left for later: {pause.reason}."
 
 
@@ -2865,9 +2862,7 @@ def poller_start(
             # already going are not touched.
             pause = await usage_gate.check()
             if pause is not None:
-                deferred = defer_for_usage(
-                    poller, repo, issue_number, pause, config.usage.probe_minutes,
-                )
+                deferred = defer_for_usage(poller, repo, issue_number, pause)
                 usage_deferred.add((repo, issue_number))
                 console.print(f"[yellow]{deferred}[/yellow]")
                 return
@@ -3272,7 +3267,9 @@ def poller_start(
         async def _run_usage_probe() -> None:
             reading = usage_store.read()
             max_age = config.usage.probe_minutes * 60
-            if reading is None or time.time() - reading.read_at >= max_age:
+            if max_age > 0 and (
+                reading is None or time.time() - reading.read_at >= max_age
+            ):
                 binary = getattr(dispatcher, "claude_binary", None)
                 if binary:
                     await probe_usage(binary, usage_store)
@@ -3693,15 +3690,15 @@ def poller_start(
             # rows stay live targets for orphan reply routing and get
             # re-posted every sweep, including ones whose PR was
             # merged by hand days earlier.
-            # Keep the usage reading fresh while idle (#247). A run reads
-            # it anyway, so the probe only fires when the last reading is
+            # Keep the usage reading fresh while idle (#247), and end a
+            # pause on time even with the probe off. A run reads the usage
+            # anyway, so the probe only fires when the last reading is
             # older than the interval.
-            if config.usage.probe_minutes > 0:
-                scheduler.add_cron_job(
-                    name="usage_probe",
-                    cron_expr="*/5 * * * *",
-                    func=_run_usage_probe,
-                )
+            scheduler.add_cron_job(
+                name="usage_probe",
+                cron_expr="*/5 * * * *",
+                func=_run_usage_probe,
+            )
             scheduler.add_cron_job(
                 name="question_expiry_sweeper",
                 cron_expr="0 * * * *",

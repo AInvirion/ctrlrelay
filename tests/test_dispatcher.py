@@ -14,7 +14,7 @@ class TestClaudeDispatcher:
         """Should set CTRLRELAY env vars for checkpoint protocol."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"", b"")
@@ -48,7 +48,7 @@ session_id="test-123",
         """Should kill process on timeout."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude", default_timeout=1)
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude", default_timeout=1)
 
         mock_proc = AsyncMock()
         mock_proc.communicate.side_effect = asyncio.TimeoutError()
@@ -80,7 +80,7 @@ session_id="test-123",
         after the daemon exits."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude", default_timeout=60)
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude", default_timeout=60)
 
         mock_proc = AsyncMock()
         mock_proc.returncode = None  # still running
@@ -107,7 +107,7 @@ session_id="test-cancel",
         """Should parse DONE checkpoint state."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b'{"result": "ok"}', b"")
@@ -145,7 +145,7 @@ session_id="test-123",
         it to the returned SessionResult as agent_session_id."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         agent_uuid = "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
         payload = json.dumps({
@@ -187,7 +187,7 @@ session_id="dev-o-r-1-abc",
         """If Claude didn't emit JSON (e.g. error output), agent_session_id is None."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"not json at all", b"")
@@ -212,7 +212,7 @@ session_id="sid",
         dispatcher does not substitute our composite id."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         agent_uuid = "b6a0e6f8-8e9b-4e4f-9a33-5a2e1f7c8a10"
 
@@ -245,7 +245,7 @@ session_id="dev-o-r-1-abc",
         """Fresh spawns (resume_session_id=None) must not include --resume."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"{}", b"")
@@ -270,7 +270,7 @@ session_id="dev-o-r-1-abc",
         """Should parse BLOCKED_NEEDS_INPUT checkpoint state."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"", b"")
@@ -324,7 +324,7 @@ class TestDispatcherLogging:
     ) -> None:
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="/usr/bin/claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="/usr/bin/claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"{}", b"")
@@ -356,7 +356,7 @@ session_id="dev-o-r-9-abc",
     async def test_session_start_marks_resume(self, tmp_path: Path, caplog) -> None:
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"{}", b"")
@@ -384,7 +384,7 @@ session_id="dev-o-r-9-abc",
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
         from ctrlrelay.core.obs import hash_text
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         prompt = "SUPER-SECRET-PROMPT-NEEDLE"
         mock_proc = AsyncMock()
@@ -430,7 +430,7 @@ session_id="sid",
     ) -> None:
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"{}", b"")
@@ -471,7 +471,7 @@ session_id="sid",
         that used to vanish silently."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"{}", b"")
@@ -498,7 +498,7 @@ session_id="sid",
     ) -> None:
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"{}", b"")
@@ -529,7 +529,7 @@ session_id="sid",
     ) -> None:
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"", b"boom: could not start\n")
@@ -559,7 +559,7 @@ session_id="sid",
         exception type, plus the timeout value that was applied."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude", default_timeout=1)
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude", default_timeout=1)
 
         mock_proc = AsyncMock()
         mock_proc.communicate.side_effect = asyncio.TimeoutError()
@@ -589,7 +589,7 @@ session_id="sid",
     ) -> None:
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         mock_proc = AsyncMock()
         mock_proc.returncode = None
@@ -621,7 +621,7 @@ session_id="sid",
         unrecorded."""
         from ctrlrelay.core.dispatcher import ClaudeDispatcher
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
 
         caplog.clear()
         with caplog.at_level(logging.INFO, logger="ctrlrelay"):

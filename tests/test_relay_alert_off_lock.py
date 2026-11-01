@@ -108,7 +108,7 @@ class TestAWedgedBridgeDoesNotHoldTheLock:
         """
         db = StateDB(tmp_path / "state.db")
         hook = cli_module.make_dispatch_outcome_hook(_config(threshold=1), db)
-        dispatcher = ClaudeDispatcher(claude_binary="claude", outcome_hook=hook)
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude", outcome_hook=hook)
         wedged = Wedged()
         repo_lock = asyncio.Lock()
         try:

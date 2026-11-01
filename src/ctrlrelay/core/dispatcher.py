@@ -165,10 +165,10 @@ class ClaudeDispatcher:
     # unprivileged user namespaces allowed, which not every host has.
     sandbox: str = "none"
     sandbox_hide_paths: tuple[str, ...] = DEFAULT_SANDBOX_HIDE_PATHS
-    # Where each run's subscription usage reading is kept (#247). ``None``
-    # keeps no reading; `make_agent_dispatcher` requires the caller to say
-    # so, like ``outcome_hook``.
-    usage_store: UsageStore | None = None
+    # Where each run's subscription usage reading is kept (#247). Required,
+    # here and in `make_agent_dispatcher`: ``None`` keeps no reading, and
+    # a construction has to say so rather than get it by omission.
+    usage_store: UsageStore | None = field(kw_only=True)
 
     def __post_init__(self) -> None:
         # Only auto-resolve the bare default. Absolute paths, relative paths

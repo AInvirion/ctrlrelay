@@ -28,7 +28,7 @@ class TestSecopsIntegration:
         context_dir.mkdir(parents=True)
         (context_dir / "CLAUDE.md").write_text("# Test context")
 
-        dispatcher = ClaudeDispatcher(claude_binary="claude")
+        dispatcher = ClaudeDispatcher(usage_store=None, claude_binary="claude")
         github = GitHubCLI()
         worktree = WorktreeManager(
             worktrees_dir=worktrees_dir,

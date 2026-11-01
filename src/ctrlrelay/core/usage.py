@@ -91,7 +91,10 @@ def _number(value: Any) -> float | None:
     # infinities are numbers to `json.loads` and nothing else is.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError:  # an integer with hundreds of digits
+        return None
     return value if math.isfinite(value) else None
 
 
@@ -127,12 +130,15 @@ def parse_rate_limit_event(
     """
     last = None
     for line in stdout_text.splitlines():
-        if '"rate_limit_event"' not in line:
+        if not line.strip():
             continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            last = None  # a broken event line still replaces the earlier one
+            # Every line of a stream-json run is JSON. One that is not was
+            # cut off or damaged, and could have been a later event, even
+            # one cut inside its type: what came before it is not trusted.
+            last = None
             continue
         if isinstance(event, dict) and event.get("type") == "rate_limit_event":
             last = event
@@ -203,11 +209,10 @@ def parse_agent_session_id(stdout_text: str) -> str | None:
 
 @dataclass(frozen=True)
 class Pause:
-    """Why new work is paused, and until when (``None``: no reset time
-    known, so look again after the next reading)."""
+    """Why new work is paused, and until when."""
 
     reason: str
-    until: int | None
+    until: int
 
 
 def pause_for(
@@ -217,7 +222,10 @@ def pause_for(
 
     Paused when the status is not ``allowed`` or a window is at or above
     ``threshold``, until that window's reset. A reading whose reset time
-    has passed says nothing about now, so it does not pause.
+    has passed says nothing about now, so it does not pause. A window
+    with no readable reset time does not pause on its own, since nothing
+    would ever say when to stop; a refused status with no reset time
+    anywhere pauses for an hour from the reading.
 
     An unknown reading does not pause: there is nothing to wait for, and
     pausing on it would stop a machine that has never read its usage
@@ -230,17 +238,17 @@ def pause_for(
         until = reading.resets_at
         if until is None:
             resets = [w.resets_at for w in reading.windows.values() if w.resets_at]
-            until = max(resets) if resets else None
+            until = max(resets) if resets else reading.read_at + 3600
         hits.append((f"usage status is {reading.status}", until))
     for name, w in reading.windows.items():
-        if w.used >= threshold:
+        if w.used >= threshold and w.resets_at is not None:
             hits.append((f"{_label(name)} usage at {round(w.used * 100)}%", w.resets_at))
-    live = [(why, until) for why, until in hits if until is None or until > now]
+    live = [(why, until) for why, until in hits if until > now]
     if not live:
         return None
-    known = [u for _, u in live if u is not None]
-    until = max(known) if known else None
-    return Pause(reason="; ".join(why for why, _ in live), until=until)
+    return Pause(
+        reason="; ".join(why for why, _ in live), until=max(u for _, u in live),
+    )
 
 
 def _label(name: str) -> str:
@@ -378,9 +386,11 @@ async def probe_usage(
     Run with no tools (so it cannot read a file or run a command), no MCP
     servers, no user or project settings (so no hooks), one turn, in an
     empty temporary directory. Returns the reading and stores it; a call
-    that fails or carries no reading returns ``None`` and leaves the
-    store alone. Never raises: it runs on a schedule, and its failure is
-    only a missed refresh.
+    that carries no reading returns ``None`` and leaves the store alone.
+    A call that exits non-zero is logged, and its reading kept if it has
+    one (a refused call can still report the usage that refused it).
+    Raises nothing but cancellation: it runs on a schedule, and its
+    failure is only a missed refresh.
     """
     proc: asyncio.subprocess.Process | None = None
     try:
@@ -399,7 +409,6 @@ async def probe_usage(
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         if proc.returncode != 0:
             log_event(_logger, "usage.probe_failed", exit_code=proc.returncode)
-            return None
         reading = parse_rate_limit_event(stdout.decode(errors="replace"))
         if reading is None:
             log_event(_logger, "usage.probe_failed", error="no usage in the output")
