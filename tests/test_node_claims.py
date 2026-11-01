@@ -9,6 +9,7 @@ on that one thread.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -630,12 +631,14 @@ class TestKeeper:
                 raise asyncio.CancelledError
             await asyncio.sleep(0)
 
+        a_body = thread.comments[0]["body"]
         keeper = ClaimKeeper(
             thread, REPO, 1, a.claim, settings("node-a"), clock=clock, sleep=one_tick,
         )
         keeper.start()
         await keeper._task
         assert keeper.taken_over_by == "node-b"
+        assert thread.comments[0]["body"] == a_body  # not refreshed
         assert other_owner(thread.comments, settings("node-c"), clock()).node == "node-b"
         assert await keeper.hold() is False
 
@@ -729,7 +732,7 @@ BLOCKED = {"status": "BLOCKED_NEEDS_INPUT", "question": "which one?"}
 class TestTwoMachinesThroughTheDevRun:
     @pytest.mark.asyncio
     async def test_exactly_one_machine_runs_the_issue(self, tmp_path: Path) -> None:
-        thread = Thread(Clock())
+        thread = Thread(Clock(float(int(time.time()))))
         # Both machines read an empty thread and both post before either
         # reads back: the race the check exists for, not one machine
         # simply seeing the other's claim first.
@@ -778,11 +781,12 @@ class TestTwoMachinesThroughTheDevRun:
 
     @pytest.mark.asyncio
     async def test_a_failed_run_releases_its_claim_by_id(self, tmp_path: Path) -> None:
-        clock = Clock()
+        clock = Clock(float(int(time.time())))
         thread = Thread(clock)
         a = _machine(tmp_path / "a", thread, checkpoint=None, exit_code=1)
         result = await _run(a, "node-a", tmp_path / "a")
         assert not result.success
+        assert a[3].spawn_session.await_count == 1
         assert other_owner(thread.comments, settings("node-b"), clock()) is None
         claim_id = parse_claims(thread.comments[:1], ACCOUNT)[0].claim_id
         assert release_marker(claim_id) in thread.comments[-1]["body"]
@@ -791,7 +795,7 @@ class TestTwoMachinesThroughTheDevRun:
     async def test_a_skipped_issue_is_looked_at_again_when_the_claim_could_go_stale(
         self, tmp_path: Path,
     ) -> None:
-        clock = Clock()
+        clock = Clock(float(int(time.time())))
         thread = Thread(clock)
         thread.add(claim_body("node-a", "aaa", WORKING, clock()))
         b = _machine(tmp_path / "b", thread, checkpoint=None, exit_code=0)
@@ -920,7 +924,7 @@ class TestTheTaskRunClaimsToo:
 
     @pytest.mark.asyncio
     async def test_a_task_another_machine_holds_is_skipped(self, tmp_path: Path) -> None:
-        clock = Clock()
+        clock = Clock(float(int(time.time())))
         thread = Thread(clock)
         thread.add(claim_body("node-a", "aaa", WORKING, clock()))
         result, dispatcher = await self._run(tmp_path, thread, "node-b", 0)
@@ -929,7 +933,7 @@ class TestTheTaskRunClaimsToo:
 
     @pytest.mark.asyncio
     async def test_a_failed_task_releases_its_claim(self, tmp_path: Path) -> None:
-        clock = Clock()
+        clock = Clock(float(int(time.time())))
         thread = Thread(clock)
         result, dispatcher = await self._run(tmp_path, thread, "node-a", 1)
         assert not result.success
@@ -939,3 +943,64 @@ class TestTheTaskRunClaimsToo:
         # Released by its own id, not merely gone stale.
         assert release_marker(posted.claim_id) in thread.comments[-1]["body"]
         assert parse_claims(thread.comments, ACCOUNT) == []
+
+
+
+class TestColdReviewFixes:
+    def test_the_account_matches_whatever_its_case(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        thread.add(claim_body("node-a", "aaa", WORKING, clock()), author="Relay-Bot")
+        assert [c.node for c in parse_claims(thread.comments, "relay-bot")] == ["node-a"]
+
+    def test_unknown_is_not_a_machine_name(self) -> None:
+        with pytest.raises(ValueError, match="reserved"):
+            safe_node_name("unknown")
+
+    def test_an_unreadable_comment_id_counts_as_taken(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        thread.add(claim_body("node-a", "aaa", WORKING, clock()))
+        thread.comments[0]["id"] = "not-a-number"
+        assert other_owner(thread.comments, settings("node-b"), clock()).node == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_an_adopted_claim_starts_fresh_and_working(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        thread.add(claim_body("node-a", "aaa", HELD, clock()))
+        clock.t += 5 * 86400
+        out = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        assert out.claim.state == WORKING
+        assert out.claim.updated_at == clock()
+
+    @pytest.mark.asyncio
+    async def test_a_hold_waits_for_a_refresh_already_on_the_wire(self) -> None:
+        clock = Clock()
+        thread = Thread(clock)
+        a = await acquire_claim(
+            thread, REPO, 1, settings("node-a"), clock=clock, sleep=no_sleep,
+        )
+        real_edit = thread.edit_issue_comment
+        release = asyncio.Event()
+        order: list[str] = []
+
+        async def edit(repo, cid, body):
+            state = "held" if "state=held" in body else "working"
+            if state == "working":
+                await release.wait()
+            order.append(state)
+            await real_edit(repo, cid, body)
+
+        thread.edit_issue_comment = edit
+        keeper = ClaimKeeper(thread, REPO, 1, a.claim, settings("node-a"), clock=clock)
+        refresh = asyncio.create_task(keeper._write(WORKING))
+        await asyncio.sleep(0)
+        hold = asyncio.create_task(keeper._write(HELD))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(refresh, hold)
+        assert order == ["working", "held"]
+        assert "state=held" in thread.comments[0]["body"]

@@ -760,9 +760,9 @@ class IssuePoller:
     def recheck_at(self, repo: str, issue_number: int, when: float) -> None:
         """Leave ``issue_number`` alone until ``when``, then offer it again.
 
-        For an issue another machine has claimed (#245): its claim can
-        only go stale at a known time, so asking before then costs a
-        GitHub call per poll and can change nothing.
+        For an issue another machine has claimed (#245): asking on every
+        poll costs GitHub calls for an answer that rarely changes. A
+        claim released earlier than ``when`` is noticed at ``when``.
         """
         self.recheck_after.setdefault(repo, {})[issue_number] = when
         self.unmark_seen(repo, issue_number)

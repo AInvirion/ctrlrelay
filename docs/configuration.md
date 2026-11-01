@@ -33,7 +33,7 @@ repos:        [ ... ]
 | Key | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `version` | string | no | `"1"` | Config schema version. Currently always `"1"`. |
-| `node_id` | string | no | `socket.gethostname()` | Free-form identifier for this machine. Surfaces in dashboard heartbeats, session logs, and the claim comment on every issue it takes, so machines sharing one account must each have a different one. Defaults to the OS hostname when omitted, null, or blank — set explicitly only if the hostname is meaningless (CI runners, ephemeral containers). |
+| `node_id` | string | no | `socket.gethostname()` | Free-form identifier for this machine. Surfaces in dashboard heartbeats, session logs, and the claim comment on every issue it takes, so machines sharing one account must each have a different one. `unknown` is reserved (it names claims from older versions). Defaults to the OS hostname when omitted, null, or blank — set explicitly only if the hostname is meaningless (CI runners, ephemeral containers). |
 | `timezone` | string | no | `"UTC"` | IANA timezone (e.g. `America/Santiago`). Used for scheduling. |
 | `paths` | object | **yes** | — | See [paths](#paths). |
 | `claude` | object | no | (defaults) | See [claude](#claude). |

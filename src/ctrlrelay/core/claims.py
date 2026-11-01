@@ -31,6 +31,7 @@ The rules, in the order they are applied:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import re
 import secrets
 import time
@@ -73,6 +74,10 @@ def safe_node_name(node: str) -> str:
     name = node.strip()
     if not name:
         raise ValueError("a machine needs a non-empty node_id to claim issues")
+    if name == UNKNOWN_NODE:
+        # The owner name of claims from before #245: a machine called
+        # this would take every one of them for its own.
+        raise ValueError(f"node_id {UNKNOWN_NODE!r} is reserved; set another")
     return quote(name, safe="._-")
 
 
@@ -191,7 +196,8 @@ def parse_claims(comments: list[dict[str, Any]] | None, account: str) -> list[Cl
     """Every claim not yet released, oldest first. Stale ones included."""
     claims: list[Claim] = []
     for comment in comments or []:
-        if _author(comment) != account:
+        # Logins are case-insensitive on GitHub.
+        if (_author(comment) or "").lower() != account.lower():
             continue
         body = comment.get("body") or ""
         released = _RELEASE_RE.search(body)
@@ -213,6 +219,8 @@ def parse_claims(comments: list[dict[str, Any]] | None, account: str) -> list[Cl
         try:
             comment_id = int(comment.get("id"))
         except (TypeError, ValueError):
+            # Unreadable, so it counts as taken, never as free.
+            claims.append(Claim(0, UNKNOWN_NODE, None, HELD, None))
             continue
         if "node" not in attrs:
             claims.append(Claim(comment_id, UNKNOWN_NODE, None, HELD, None))
@@ -332,7 +340,10 @@ async def acquire_claim(
                 settings.node, mine.claim_id, WORKING, now, replaces=mine.replaces,
             ),
         )
-        return ClaimOutcome(won=True, claim=mine)
+        return ClaimOutcome(
+            won=True,
+            claim=dataclasses.replace(mine, state=WORKING, updated_at=now),
+        )
 
     claim_id = secrets.token_hex(6)
     stale = _stale_claims(comments, settings, now)
@@ -446,6 +457,9 @@ class ClaimKeeper:
         self._clock = clock
         self._sleep = sleep
         self._task: asyncio.Task[None] | None = None
+        # One write at a time: a hold must not be overtaken on the wire by
+        # a refresh that was already in flight when the run ended.
+        self._write_lock = asyncio.Lock()
         self.issue_number = issue_number
         # Set when another machine took the issue over while this run was
         # still working: the claim went stale (GitHub unreachable for the
@@ -458,6 +472,10 @@ class ClaimKeeper:
         )
 
     async def _write(self, state: str) -> bool:
+        async with self._write_lock:
+            return await self._write_unlocked(state)
+
+    async def _write_unlocked(self, state: str) -> bool:
         try:
             await self.github.edit_issue_comment(
                 self.repo, self.claim.comment_id,

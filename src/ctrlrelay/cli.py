@@ -1099,6 +1099,10 @@ def settle_claimed_elsewhere(
     if recheck_at is None:
         recheck_at = _time.time() + settings.stale_after_seconds
     poller.recheck_at(repo, issue_number, float(recheck_at))
+    log_event(
+        _logger, "claims.skipped", repo=repo, issue_number=issue_number,
+        node=settings.node, owner=owner,
+    )
     return (
         f"#{issue_number} in {repo} is claimed by {owner}; "
         "skipping it for now."

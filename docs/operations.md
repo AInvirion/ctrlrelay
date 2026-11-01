@@ -353,15 +353,17 @@ comments, so no machine's clock decides. The loser posts "Backing off:
 ctrlrelay on node-a has this issue" and drops it.
 
 **Skipping.** A machine that finds another machine's live claim does not
-start the run and does not announce the issue in chat. It logs
-`claims.skipped` with the owner.
+start the run, and logs `claims.skipped` with the owner. It looks before
+announcing the issue in chat, so it stays quiet about issues already taken;
+only a machine that loses the race check itself has announced the issue
+first.
 
 **The stale rule.** While a run works, its machine edits the claim every
 `claims.refresh_seconds`, which moves the comment's `updated_at`. A
 `working` claim not refreshed for `claims.stale_after_seconds` is stale:
 that machine is treated as stopped, and another machine may take the issue
-(its claim names the claim it replaced, and a replaced claim never counts
-again, however it is edited later). A skipping machine looks again at
+(its claim names the claim it replaced, and a replaced claim does not count
+while the claim that replaced it stands, however it is edited). A skipping machine looks again at
 exactly the time the claim could go stale, not on every poll. If a machine
 whose claim was taken over is in fact still running, it stops refreshing
 its claim and logs `claims.taken_over`; its run is not stopped.
@@ -375,7 +377,10 @@ When the run ends:
   background, until the stale time counted from its last good write. If that
   also fails, or the machine stops, the claim goes stale like a working one.
 - **failed**: the failure comment releases that one claim
-  (`<!-- ctrlrelay:released id=... -->`), and the issue is free again.
+  (`<!-- ctrlrelay:released id=... -->`), and the issue is free again. One
+  exception: a run that was waiting for an answer and fails after it is
+  resumed posts no release (the resume path never posted a failure comment),
+  so its claim stays held. Delete the claim comment to free that issue.
 
 A claim from a version before this (`<!-- ctrlrelay:claimed -->` with no
 machine name) counts as taken by `unknown` and never goes stale.
