@@ -272,16 +272,6 @@ class ClaudeDispatcher:
         if dot_git.is_file():
             git_protected.append(dot_git)
 
-        linked = [
-            raw for raw in self.sandbox_readonly_paths
-            if Path(os.path.expanduser(raw)).is_symlink()
-        ]
-        if linked:
-            # A read-only bind protects the link's target; the link itself
-            # sits in a writable directory and can be replaced.
-            _logger.warning(
-                "dispatcher.sandbox.readonly_symlink", extra={"paths": linked},
-            )
         return bwrap_prefix(
             self._bwrap,
             self.sandbox_hide_paths,

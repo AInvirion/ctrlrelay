@@ -371,3 +371,25 @@ def test_a_cache_dir_that_contains_home_is_refused(tmp_path, monkeypatch) -> Non
     )
     with pytest.raises(SandboxUnavailableError, match="contains the home directory"):
         d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)
+
+
+def test_a_replaceable_read_only_link_is_named_and_an_entry_level_one_is_not(
+    tmp_path, caplog,
+) -> None:
+    import logging
+
+    from ctrlrelay.core.agent_env import bwrap_prefix
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (tmp_path / "real.json").write_text("{}")
+    (state / "settings.json").symlink_to(tmp_path / "real.json")
+    (state / "projects").mkdir()
+    with caplog.at_level(logging.WARNING):
+        bwrap_prefix("/usr/bin/bwrap", [], writable=[f"{state}/*"],
+                     readonly=[state / "settings.json"])
+        assert not [r for r in caplog.records if "replaceable" in r.getMessage()]
+        bwrap_prefix("/usr/bin/bwrap", [], writable=[state],
+                     readonly=[state / "settings.json"])
+    [rec] = [r for r in caplog.records if "replaceable" in r.getMessage()]
+    assert rec.path == str(state / "settings.json")

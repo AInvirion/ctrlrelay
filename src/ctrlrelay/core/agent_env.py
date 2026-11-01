@@ -53,6 +53,7 @@ push already treats as untrusted (#219).
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -292,6 +293,17 @@ def bwrap_prefix(
             if p.is_dir():
                 open_dirs.append(p)
     for raw in _expand_globs(readonly):
+        link = _expand(raw)
+        if (
+            link is not None and link.is_symlink()
+            and Path(os.path.realpath(link.parent)) in open_dirs
+        ):
+            # The bind protects the target; the link itself sits in a
+            # writable directory and can be replaced.
+            logging.getLogger(__name__).warning(
+                "agent_env.sandbox.readonly_link_replaceable",
+                extra={"path": str(link)},
+            )
         p = _existing(raw)
         if p is None:
             target = _expand(raw)

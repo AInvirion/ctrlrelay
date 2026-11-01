@@ -161,12 +161,16 @@ login, does not):
 - everything is read-only, so the toolchain you installed (in `/usr`, in
   `~/.local`, `~/.cargo`, ...) still runs;
 - writable: the run's worktree, its repository's git directory (so it can
-  commit), a private `/tmp`, `sandbox_writable_paths` (the agent CLI's own
-  state) and `sandbox_cache_dir`;
+  commit), a private `/tmp`, `sandbox_writable_paths` and `sandbox_cache_dir`.
+  The agent CLI's state directory is opened entry by entry (`~/.claude/*`):
+  what is in it can be written, but nothing can be added to it, removed or
+  replaced, so a `settings.json` that is a link elsewhere cannot be swapped
+  for a file of the agent's. Log the agent CLI in on the machine before
+  turning the sandbox on, so its files exist;
 - `sandbox_hide_paths` are empty, also inside a writable path: the agent
   cannot read your SSH keys, `gh`'s login or the other credentials listed
   below;
-- read-only again: `sandbox_readonly_paths` (the agent CLI's settings, hooks,
+- read-only again, over those: `sandbox_readonly_paths` (the agent CLI's settings, hooks,
   plugins and skills, and each project's memory under
   `~/.claude/projects/*/memory`, which your own sessions load) and, in the
   repository,
@@ -185,12 +189,15 @@ your home (Gradle's `~/.gradle`, for one) fails there until you add a
 directory for it to `sandbox_writable_paths`.
 
 What it still allows: the agent reads the agent CLI's login (it needs it to
-run) and anything readable that is not hidden; it writes objects and refs in
+run) and anything readable that is not hidden. The login file is opened as a
+file, so a refresh that replaces it by renaming fails inside the sandbox; a
+long-lived token from `claude setup-token`, in the environment, avoids
+refreshes there; it writes objects and refs in
 its repository's git directory, which the relay's push already treats as
-untrusted. A read-only path that is a symlink protects its target, not the
-link: the agent can replace the link. The dispatcher logs
-`dispatcher.sandbox.readonly_symlink` naming any; replace such a link with
-the file itself to protect it. The run's checkpoint file must be inside its
+untrusted. A read-only path that is a link, inside a directory opened
+whole, protects its target and not the link, which the agent can replace;
+the log names any as `agent_env.sandbox.readonly_link_replaceable` (none
+with the defaults). The run's checkpoint file must be inside its
 worktree (it always is for dev and task runs). It does not account for your
 own setup giving another way in: a hidden file with a second hard link
 elsewhere, your home mounted at a second path, or an `include.path` in a
@@ -228,7 +235,7 @@ then run the check again. On a single-user laptop this is the whole setup.
 |---|---|---|---|
 | `sandbox` | `"none"` or `"bwrap"` | `"none"` | `"bwrap"` runs the dev and task agents in the read-only sandbox above. |
 | `sandbox_hide_paths` | list of strings | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc`, `~/.local/share/keyrings`, `$XDG_RUNTIME_DIR/bus`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.config/ctrlrelay` | Made empty under `sandbox: bwrap`. A directory becomes an empty tmpfs, a file or socket becomes `/dev/null`, a missing path is skipped. |
-| `sandbox_writable_paths` | list of strings | `~/.claude` | Writable under `sandbox: bwrap`, besides the run's own paths. |
+| `sandbox_writable_paths` | list of strings | `~/.claude/*` | Writable under `sandbox: bwrap`, besides the run's own paths. A last part of `*` opens each entry in the directory now (not links), not the directory itself. |
 | `sandbox_readonly_paths` | list of strings | `~/.claude/settings.json`, `settings.local.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `hooks`, `plugins`, `output-styles`, `scripts`, `projects/*/memory` (all under `~/.claude`) | Read-only again inside a writable path. One `*` part matches the directories there at the start of each run; a missing path under a writable one is created first (an empty `memory` directory in each project, for one). |
 | `sandbox_cache_dir` | string | `~/.ctrlrelay/agent-cache` | The agent's own package cache under `sandbox: bwrap`. |
 
