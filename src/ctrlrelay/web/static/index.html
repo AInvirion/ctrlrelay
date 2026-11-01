@@ -854,6 +854,10 @@ var todayOpen = null;
 // Each list request is numbered; only the newest one may draw, so a slow
 // answer for an earlier refresh or another counter never replaces a newer one.
 var todaySeq = 0;
+// The kind whose list request is still out. A refresh does not start
+// another for it (on a slow server every answer would be overtaken and the
+// list would stay at "loading…"); a click always does.
+var todayBusy = null;
 
 function renderToday(data) {
   var target = document.getElementById("today");
@@ -873,7 +877,7 @@ function renderToday(data) {
       todayOpen = todayOpen === kind ? null : kind;
       renderToday(lastData || data);
       if (todayOpen) { put(document.getElementById("today-list"), [empty("loading…")]); }
-      loadTodayList();
+      loadTodayList(true);
     });
     grid.appendChild(cell);
   });
@@ -882,11 +886,13 @@ function renderToday(data) {
 
 // The list behind the open counter, read again with every refresh so it
 // follows the count.
-function loadTodayList() {
+function loadTodayList(force) {
   var target = document.getElementById("today-list");
   var kind = todayOpen;
+  if (!kind) { todaySeq++; todayBusy = null; put(target, []); return; }
+  if (!force && todayBusy === kind) { return; }
   var seq = ++todaySeq;
-  if (!kind) { put(target, []); return; }
+  todayBusy = kind;
   fetch("/api/events?kind=" + encodeURIComponent(kind) + "&day=today", { cache: "no-store" })
     .then(function (resp) { return resp.json(); })
     .then(function (data) { if (seq === todaySeq) { renderTodayList(data); } })
@@ -895,7 +901,8 @@ function loadTodayList() {
         put(target, [unknown("unknown: the list could not be read (" +
           (err && err.message ? err.message : "error") + ")")]);
       }
-    });
+    })
+    .then(function () { if (seq === todaySeq) { todayBusy = null; } });
 }
 
 function renderTodayList(data) {
@@ -919,7 +926,7 @@ function renderTodayList(data) {
     var r = ev.reason;
     if (r) {
       if (r.session === "not found") {
-        li.appendChild(el("p", "reason", "the run's record is gone; no reason kept"));
+        li.appendChild(el("p", "reason", "the run's record is gone"));
       }
       if (typeof r.exit_code === "number") {
         li.appendChild(el("p", "reason", "exit code " + r.exit_code));

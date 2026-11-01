@@ -1286,7 +1286,9 @@ def test_every_today_counter_asks_for_a_kind_the_server_lists() -> None:
     assert {mapping.get(k, k) for k in keys} == set(DAY_KINDS)
     # The cards are buttons that open the list.
     render = _js_function(script, "renderToday")
-    assert 'el("button", "card")' in render and "loadTodayList()" in render
+    assert 'el("button", "card")' in render and "loadTodayList(true)" in render
     # Only the newest list request may draw.
     load = _js_function(script, "loadTodayList")
-    assert load.count("seq === todaySeq") == 2 and "++todaySeq" in load
+    assert load.count("seq === todaySeq") == 3 and "++todaySeq" in load
+    # A refresh does not start a second request while one is out.
+    assert "!force && todayBusy === kind" in load
