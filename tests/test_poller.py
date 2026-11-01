@@ -43,11 +43,15 @@ def state_file(tmp_path: Path) -> Path:
     return tmp_path / "poller_state.json"
 
 
-def make_assigned_event(actor_login: str, assignee_login: str) -> dict:
+def make_assigned_event(assigner_login: str, assignee_login: str) -> dict:
+    """An ``assigned`` event as GitHub's issue events API returns it: ``actor``
+    is the account ASSIGNED (#274), and who made the assignment is in
+    ``assigner``. The first argument is the one that made it."""
     return {
         "event": "assigned",
-        "actor": {"login": actor_login},
+        "actor": {"login": assignee_login},
         "assignee": {"login": assignee_login},
+        "assigner": {"login": assigner_login},
         "created_at": "2026-01-01T00:00:00Z",
     }
 
@@ -2170,3 +2174,71 @@ class TestArchivedRepoSkip:
 
         assert poller.archived_tracker is tracker
         assert tracker.archived_repos == {"owner/repo-a"}
+
+
+
+class TestWhoAssignedIt:
+    """#274: who made an assignment is ``assigner``, never ``actor``."""
+
+    # Recorded from AInvirion/zzsites#784 on 2026-11-01: another account
+    # moved the issue to the operator. ``actor`` names the operator.
+    REAL_FOREIGN = [{
+        "event": "assigned", "created_at": "2026-11-01T21:24:13Z",
+        "actor": {"login": "oscarvalenzuelab"},
+        "assignee": {"login": "oscarvalenzuelab"},
+        "assigner": {"login": "mausisa-nico"},
+    }]
+
+    def _poller(self, gh, state_file):
+        return IssuePoller(github=gh, username="oscarvalenzuelab", repos=["o/r"],
+                           state_file=state_file)
+
+    @pytest.mark.asyncio
+    async def test_the_recorded_foreign_assignment_is_refused(
+        self, mock_github, state_file,
+    ) -> None:
+        mock_github.list_assignment_events = AsyncMock(return_value=self.REAL_FOREIGN)
+        assert not await self._poller(mock_github, state_file)._is_self_assigned("o/r", 784)
+
+    @pytest.mark.asyncio
+    async def test_an_event_with_no_assigner_is_refused(self, mock_github, state_file) -> None:
+        event = dict(self.REAL_FOREIGN[0])
+        del event["assigner"]
+        mock_github.list_assignment_events = AsyncMock(return_value=[event])
+        assert not await self._poller(mock_github, state_file)._is_self_assigned("o/r", 784)
+
+    # Recorded from AInvirion/ctrlrelay#268 on 2026-11-01: the operator
+    # assigned it to themselves.
+    REAL_SELF = [{
+        "event": "assigned", "created_at": "2026-11-01T21:44:14Z",
+        "actor": {"login": "oscarvalenzuelab"},
+        "assignee": {"login": "oscarvalenzuelab"},
+        "assigner": {"login": "oscarvalenzuelab"},
+    }]
+
+    @pytest.mark.asyncio
+    async def test_a_later_assignment_naming_nobody_is_refused(
+        self, mock_github, state_file,
+    ) -> None:
+        later = {"event": "assigned", "created_at": "2026-11-02T00:00:00Z",
+                 "actor": None, "assignee": None, "assigner": {"login": "mausisa-nico"}}
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[*self.REAL_SELF, later],
+        )
+        assert not await self._poller(mock_github, state_file)._is_self_assigned("o/r", 268)
+
+    @pytest.mark.asyncio
+    async def test_an_earlier_assignment_naming_nobody_does_not_block_a_later_self_one(
+        self, mock_github, state_file,
+    ) -> None:
+        earlier = {"event": "assigned", "created_at": "2026-10-01T00:00:00Z",
+                   "actor": None, "assignee": None, "assigner": None}
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[earlier, *self.REAL_SELF],
+        )
+        assert await self._poller(mock_github, state_file)._is_self_assigned("o/r", 268)
+
+    @pytest.mark.asyncio
+    async def test_a_real_self_assignment_is_taken(self, mock_github, state_file) -> None:
+        mock_github.list_assignment_events = AsyncMock(return_value=self.REAL_SELF)
+        assert await self._poller(mock_github, state_file)._is_self_assigned("o/r", 784)

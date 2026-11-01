@@ -617,6 +617,25 @@ class IssuePoller:
             return True
 
         events = await self.github.list_assignment_events(repo, issue_number)
+        # An assignment after the operator's last one that names nobody
+        # cannot be ruled out as a newer one by someone else: refuse rather
+        # than skip past it. One before it is overtaken and does not count.
+        last_mine = max(
+            (i for i, e in enumerate(events)
+             if (e.get("assignee") or {}).get("login") == self.username),
+            default=-1,
+        )
+        if any(not (e.get("assignee") or {}).get("login")
+               for e in events[last_mine + 1:]):
+            log_event(
+                _logger,
+                "poll.issue.foreign_assignment",
+                repo=repo,
+                number=issue_number,
+                assigner_login=None,
+                reason="assignment_without_assignee",
+            )
+            return False
         relevant = [
             e
             for e in events
@@ -634,8 +653,12 @@ class IssuePoller:
             return False
 
         # Events endpoint returns chronological order; the last one wins.
+        # Who made the assignment is ``assigner``. On an ``assigned`` event
+        # ``actor`` is the account assigned, which is always the operator
+        # here, so reading it let anyone's assignment through (#274). No
+        # ``assigner`` is treated as foreign.
         latest = relevant[-1]
-        assigner_login = (latest.get("actor") or {}).get("login")
+        assigner_login = (latest.get("assigner") or {}).get("login")
         if assigner_login == self.username:
             return True
 
