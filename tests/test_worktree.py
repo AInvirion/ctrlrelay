@@ -76,7 +76,7 @@ class TestWorktreeManager:
         bare.mkdir(parents=True)
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            mock_git.return_value = ""
+            mock_git.return_value = "refs/heads/main\n"
             await manager.ensure_bare_repo("owner/repo")
 
         # symbolic-ref (default-branch lookup), the worktree listing
