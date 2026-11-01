@@ -1341,6 +1341,7 @@ def _budget_line(name: str, bucket: object, now: float) -> str:
         "function duration(s) {" + _js_function(script, "duration") + "}",
         "function clock(ts) {" + _js_function(script, "clock") + "}",
         "function untilText(iso, now) {" + _js_function(script, "untilText") + "}",
+        "function refilled(b, now) {" + _js_function(script, "refilled") + "}",
         "function budgetLine(name, b, now) {" + _js_function(script, "budgetLine") + "}",
         "process.stdout.write(JSON.stringify(budgetLine("
         + json.dumps(name) + ", " + json.dumps(bucket) + ", " + json.dumps(now) + ")));",
@@ -1363,3 +1364,8 @@ def test_a_bucket_past_its_reset_reads_as_refilled_not_unknown() -> None:
     assert _budget_line("graphql", fresh, now).startswith("GitHub graphql 4381 of 5000 left")
     # No reading at all is still unknown.
     assert _budget_line("search", "unknown", now) == "GitHub search unknown"
+
+
+def test_a_refilled_bucket_is_not_highlighted() -> None:
+    render = _js_function(_script(), "renderGitHubBudget")
+    assert "!refilled(b, now)" in render
