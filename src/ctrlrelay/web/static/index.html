@@ -539,7 +539,7 @@ function usagePct(node, name) {
 
 function machineCard(name, node, state, bad, now, extra) {
   var box = el("div", "machine" + (bad ? " bad" : ""));
-  box.appendChild(el("div", "name", name || "unknown"));
+  if (name !== null) { box.appendChild(el("div", "name", name || "unknown")); }
   box.appendChild(el("div", "state", state || "unknown"));
   if (extra) { box.appendChild(el("div", "muted", extra)); }
   if (node && typeof node === "object") {
