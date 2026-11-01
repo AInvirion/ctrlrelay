@@ -1,7 +1,8 @@
 """The GitHub API budget this account has left, and what to do about it (#237).
 
 Every call from the account, on every machine and every session, spends
-one shared hourly budget per bucket (``core``, ``search``, ``graphql``).
+one shared budget per bucket (``core``, ``search``, ``graphql``), each
+with its own reset time.
 When a bucket runs out, every later call fails until it resets, and the
 poller would quietly miss new issues for that long.
 
@@ -156,6 +157,8 @@ def bucket_for(args: Sequence[str]) -> str | None:
             return None  # free, and the read that ends a block: never held
         if path.startswith("graphql"):
             return "graphql"
+        if path.startswith("search/code"):
+            return None  # its own `code_search` bucket, not tracked here
         if path.startswith("search/"):
             return "search"
         return "core"
@@ -377,9 +380,9 @@ class GitHubBudget:
             resets = _iso(b.resets_at)
             if state == OUT:
                 text = (
-                    f"⛔ GitHub {name} API budget used up ({b.limit} an hour, "
-                    f"shared by every machine on the account). GitHub calls are "
-                    f"paused until it resets at {resets}."
+                    f"⛔ GitHub {name} API budget used up ({b.limit} per window, "
+                    f"shared by every machine on the account). Calls known to "
+                    f"spend it are held until it resets at {resets}."
                 )
             elif state == LOW and before == OUT:
                 text = (

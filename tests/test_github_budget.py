@@ -501,3 +501,31 @@ class TestRoundFourFixes:
         )
         await budget.refresh()
         assert said == []
+
+
+
+class TestRoundFiveFixes:
+    def test_code_search_is_not_counted_as_search(self) -> None:
+        assert bucket_for(("api", "search/code?q=x")) is None
+        assert bucket_for(("api", "search/issues?q=x")) == "search"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("args", [
+        ("api", "rate_limit"), ("api", "/rate_limit"), ("api", "-i", "rate_limit"),
+    ])
+    async def test_the_rate_limit_read_reaches_github_with_everything_used_up(
+        self, tmp_path: Path, args,
+    ) -> None:
+        from ctrlrelay.core.github import GitHubCLI
+
+        budget = GitHubBudget(
+            BudgetStore(tmp_path / "b.json"), low_at=0.2, fetch=AsyncMock(), clock=lambda: NOW,
+        )
+        budget.reading = parse_rate_limit(rate_limit(core=0, search=0, graphql=0), now=NOW)
+        gh = GitHubCLI(gh_binary="gh", budget=budget)
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"{}", b"")
+        proc.returncode = 0
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as spawn:
+            await gh._run_gh(*args)
+        assert spawn.call_count == 1

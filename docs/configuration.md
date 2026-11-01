@@ -351,7 +351,7 @@ documented. When it is missing or cannot be read, the page says
 ## github_api
 
 Watching the account's GitHub API budget. Every machine and session on the
-account spends the same hourly budget per bucket (`core`, `search`,
+account spends the same budget per bucket (`core`, `search`,
 `graphql`).
 
 ```yaml
