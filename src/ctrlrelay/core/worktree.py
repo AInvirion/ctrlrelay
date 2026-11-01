@@ -169,14 +169,15 @@ def parse_push_rejection(porcelain_stdout: str) -> str | None:
             fields = [f.strip() for f in raw.split("\t")]
             ref = fields[1] if len(fields) > 1 else ""
             summary = fields[2] if len(fields) > 2 else ""
-            # The ref whole, the remote's words capped: a long ref must
-            # not crowd out the reason.
+            # Scrubbed before anything is cut (what the remote says can
+            # carry a credential, and half a token no longer matches the
+            # pattern); then the ref whole and the remote's words capped,
+            # so a long ref cannot crowd out the reason.
+            ref, summary = redact_secrets(ref), redact_secrets(summary)
             text = f"{ref} {summary[:_PUSH_REASON_MAX_CHARS]}".strip() or line
         else:
-            text = line.lstrip("! ").strip() or line
-        # Scrubbed before anything is cut: what the remote says can carry
-        # a credential (a URL with a token in it).
-        reasons.append(redact_secrets(text))
+            text = redact_secrets(line.lstrip("! ").strip() or line)
+        reasons.append(text)
     if not reasons:
         return None
     return "; ".join(reasons)
@@ -1283,9 +1284,12 @@ class WorktreeManager:
                         "reason": reason,
                     },
                 )
+                # The reason leads; git's own failure text follows, as the
+                # message carried it before, for anything matching on it.
                 raise PushRejectedError(
                     f"push rejected by {url}: {reason}"
-                    + (f"; {said}" if said else ""),
+                    + (f"; {said}" if said else "")
+                    + f"; {exc}",
                     reason=reason,
                 ) from exc
         finally:

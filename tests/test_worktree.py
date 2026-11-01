@@ -2350,3 +2350,14 @@ class TestPushErrorReviewFixes:
         stderr = "fatal: 'x' is already checked out at '/w'\n" + "noise\n" * 400
         detail = _git_failure_detail("", stderr, 128)
         assert "already checked out" in detail
+
+
+def test_a_token_across_the_cap_is_scrubbed_whole() -> None:
+    from ctrlrelay.core.worktree import _PUSH_REASON_MAX_CHARS, parse_push_rejection
+
+    token = "ghp_" + "e" * 36
+    # The token starts just before the cap, so cutting first would leave
+    # a fragment the redaction pattern no longer matches.
+    pad = "x" * (_PUSH_REASON_MAX_CHARS - 10)
+    reason = parse_push_rejection(f"!\tr:r\t[remote rejected] ({pad}{token})\n")
+    assert "ghp_" not in reason and "eeeeee" not in reason
