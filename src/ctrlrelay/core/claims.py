@@ -54,9 +54,10 @@ RELEASE_MARKER_PREFIX = "<!-- ctrlrelay:released"
 DISPATCH_FAILED_MARKER = "<!-- ctrlrelay:dispatch-failed -->"
 
 UNKNOWN_NODE = "unknown"
-# Every claim id this process posted or adopted (#250): a claim under this
-# machine's name that is not in here was written by another process.
-OWN_CLAIM_IDS: set[str] = set()
+# Written on every claim this process posts or refreshes (#250), so a claim
+# under this machine's name with another ``run`` was written by another
+# process. Adopting a claim rewrites it with this one.
+PROCESS_RUN = secrets.token_hex(4)
 WORKING = "working"
 HELD = "held"
 
@@ -113,6 +114,10 @@ class Claim:
     # stale ones. Kept on every refresh: it is how a machine that comes
     # back finds out its claim was taken.
     replaces: str | None = None
+    # The writing process, and the time it wrote, from the marker. ``None``
+    # on a claim from a version before #250.
+    run: str | None = None
+    seen: float | None = None
 
     def stale_at(self, stale_after: float) -> float | None:
         """When this claim goes stale, or ``None`` if it never does."""
@@ -151,6 +156,7 @@ def claim_body(
     *,
     replaces: str | None = None,
     taking_over_from: list[Claim] | None = None,
+    run: str | None = None,
 ) -> str:
     """The claim comment. ``seen`` changes on every refresh, so the edit
     is a real change and GitHub moves the comment's ``updated_at``."""
@@ -174,7 +180,7 @@ def claim_body(
     replaced = f" replaces={replaces}" if replaces else ""
     marker = (
         f"{CLAIM_MARKER_PREFIX} node={node} id={claim_id} state={state}"
-        f"{replaced} seen={_now_iso(now)} -->"
+        f"{replaced} run={run or PROCESS_RUN} seen={_now_iso(now)} -->"
     )
     return f"{line}\n\n{marker}"
 
@@ -238,6 +244,8 @@ def parse_claims(comments: list[dict[str, Any]] | None, account: str) -> list[Cl
                     comment.get("updated_at") or comment.get("created_at")
                 ),
                 replaces=attrs.get("replaces"),
+                run=attrs.get("run"),
+                seen=_parse_time(attrs.get("seen")),
             )
         )
     return claims
@@ -328,7 +336,6 @@ async def acquire_claim(
     live = live_claims(comments, settings, now)
     if live and live[0].claim_id is not None:
         mine = live[0]
-        OWN_CLAIM_IDS.add(mine.claim_id)
         # An earlier run's background hold must not mark this new run's
         # claim held after it starts working.
         pending = _BACKGROUND_HOLDS.pop(mine.claim_id, None)
@@ -350,7 +357,6 @@ async def acquire_claim(
         )
 
     claim_id = secrets.token_hex(6)
-    OWN_CLAIM_IDS.add(claim_id)
     stale = _stale_claims(comments, settings, now)
     # Everything already replaced is replaced again, so the history does
     # not depend on the claim that first recorded it: if that claim is

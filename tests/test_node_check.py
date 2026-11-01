@@ -63,30 +63,57 @@ class TestNodeId:
 class TestDuplicateFromClaims:
     def test_a_claim_under_my_name_written_after_i_started_is_another_process(self) -> None:
         started = NOW - 100
-        comments = [_comment(claim_body("node-a", "x1", WORKING, NOW - 60), NOW - 60)]
+        comments = [_comment(
+            claim_body("node-a", "x1", WORKING, NOW - 60, run="other"), NOW - 60,
+        )]
         assert claim_refreshed_by_another(comments, ME, started_at=started)
 
     def test_my_own_leftover_is_not_however_recent(self) -> None:
         # Written 5 seconds before this process started: a restart within
         # the refresh interval leaves exactly this.
         started = NOW - 55
-        comments = [_comment(claim_body("node-a", "x1", WORKING, NOW - 60), NOW - 60)]
+        comments = [_comment(
+            claim_body("node-a", "x1", WORKING, NOW - 60, run="earlier"), NOW - 60,
+        )]
         assert not claim_refreshed_by_another(comments, ME, started_at=started)
 
     def test_held_claims_and_other_machines_are_not(self) -> None:
         comments = [
-            _comment(claim_body("node-a", "x1", HELD, NOW - 10), NOW - 10),
-            _comment(claim_body("node-b", "x2", WORKING, NOW - 10), NOW - 10),
+            _comment(claim_body("node-a", "x1", HELD, NOW - 10, run="other"), NOW - 10),
+            _comment(claim_body("node-b", "x2", WORKING, NOW - 10, run="other"), NOW - 10),
         ]
         assert not claim_refreshed_by_another(comments, ME, started_at=NOW - 100)
+
+    def test_a_claim_this_process_wrote_or_adopted_never_counts(self) -> None:
+        # Written after start, by this process: the issue came round again
+        # after this process ran it.
+        comments = [_comment(claim_body("node-a", "x1", WORKING, NOW - 10), NOW - 10)]
+        assert not claim_refreshed_by_another(comments, ME, started_at=NOW - 100)
+
+    def test_a_leftover_is_judged_by_its_own_clock_not_githubs(self) -> None:
+        # Written before this restart by this machine's clock; GitHub's
+        # clock, ahead of this one, stamped the comment after it.
+        comments = [_comment(
+            claim_body("node-a", "x1", WORKING, NOW - 60, run="earlier"), NOW + 30,
+        )]
+        assert not claim_refreshed_by_another(comments, ME, started_at=NOW - 55)
+
+    def test_a_claim_from_before_the_run_marker_is_not_counted(self) -> None:
+        body = claim_body("node-a", "x1", WORKING, NOW - 10, run="gone").replace(
+            " run=gone", "",
+        )
+        assert "run=" not in body
+        assert not claim_refreshed_by_another(
+            [_comment(body, NOW - 10)], ME, started_at=NOW - 100,
+        )
 
 
 class TestPeersWithMyName:
     @pytest.mark.asyncio
     async def test_finds_the_peer_answering_as_me_and_ignores_the_rest(self) -> None:
         answers = {
-            "http://b": {"host": "b", "node": {"name": "node-b"}},
-            "http://dup": {"host": "x", "node": {"name": "node-a"}},
+            "http://b": {"host": "b", "generated_ts": 1, "node": {"name": "node-b"}},
+            "http://dup": {"host": "x", "generated_ts": 1, "node": {"name": "node-a"}},
         }
 
         def fetch(url, *, timeout):
@@ -118,7 +145,8 @@ class TestRunChecks:
         def fetch(url, *, timeout):
             if url == "http://down":
                 raise ConnectionRefusedError
-            return {"host": "x", "node": {"name": "node-b" if url == "http://b" else "node-a"}}
+            return {"host": "x", "generated_ts": 1,
+                    "node": {"name": "node-b" if url == "http://b" else "node-a"}}
 
         checks = await run_checks(
             self._config(["http://b", "http://down", "http://self"]),
@@ -202,7 +230,7 @@ class TestThePeekWarns:
         monkeypatch.setattr(cli_mod, "PROCESS_STARTED_AT", now - 60)
         github = AsyncMock()
         github.list_issue_comments.return_value = [
-            _comment(claim_body("node-a", "x1", WORKING, now - 30), now - 30),
+            _comment(claim_body("node-a", "x1", WORKING, now - 30, run="other"), now - 30),
         ]
         seen = []
         await peek_claim_owner(github, "o/r", 7, ME, on_duplicate=lambda r, n: seen.append((r, n)))
@@ -212,7 +240,9 @@ class TestThePeekWarns:
 
 class TestRoundOneFixes:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("answer", [None, [], {}, {"node": {"name": 5}}])
+    @pytest.mark.parametrize("answer", [
+        None, [], {}, {"node": {"name": 5}, "generated_ts": 1}, {"host": "unrelated"},
+    ])
     async def test_an_answer_that_is_not_a_status_page_fails(self, answer) -> None:
         async def login() -> str:
             return "a"
@@ -297,17 +327,3 @@ class TestRoundOneFixes:
         result = CliRunner().invoke(app, ["node", "check", "--no-agent", "-c", str(cfg)])
         assert result.exit_code == 0, result.output
         assert seen["probe"] is None
-
-
-
-class TestRoundTwoFixes:
-    def test_a_claim_this_process_made_is_never_a_duplicate(self) -> None:
-        from ctrlrelay.core.claims import OWN_CLAIM_IDS
-
-        comments = [_comment(claim_body("node-a", "mine1", WORKING, NOW - 10), NOW - 10)]
-        OWN_CLAIM_IDS.add("mine1")
-        try:
-            assert not claim_refreshed_by_another(comments, ME, started_at=NOW - 100)
-        finally:
-            OWN_CLAIM_IDS.discard("mine1")
-        assert claim_refreshed_by_another(comments, ME, started_at=NOW - 100)

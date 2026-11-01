@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ctrlrelay.core.claims import (
-    OWN_CLAIM_IDS,
+    PROCESS_RUN,
     WORKING,
     ClaimSettings,
     parse_claims,
@@ -41,19 +41,23 @@ def claim_refreshed_by_another(
     """A working claim under this machine's name, written after this
     process started, on an issue this process is not running.
 
-    A claim this process posted or adopted is never counted (they are in
-    ``OWN_CLAIM_IDS``), and neither is one written before ``started_at``,
-    which is this machine's own from before a restart however recent. A
-    working claim under its name that is neither was written by another
-    process using the same name.
+    Each claim names the process that last wrote it (``run``) and when, by
+    that process's clock (``seen``). One written by this process, or
+    adopted by it (adopting rewrites it), carries ``PROCESS_RUN`` and never
+    counts. One from this machine before a restart carries an older run,
+    but its ``seen`` is by this machine's clock and not after
+    ``started_at``. Another process's claim on a live run is refreshed, so
+    it is caught by its next refresh even when its clock runs behind. A
+    claim from a version before #250 names no run and is never counted.
     """
     for claim in parse_claims(comments, settings.account):
         if (
             claim.node == settings.node
             and claim.state == WORKING
-            and claim.claim_id not in OWN_CLAIM_IDS
-            and claim.updated_at is not None
-            and claim.updated_at > started_at
+            and claim.run is not None
+            and claim.run != PROCESS_RUN
+            and claim.seen is not None
+            and claim.seen > started_at
         ):
             return True
     return False
@@ -87,7 +91,9 @@ async def fetch_detached(
 def _peer_name(data: Any) -> str | None:
     """The name a peer's status page gives itself, or ``None`` when the
     answer is not a status page."""
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or not isinstance(
+        data.get("generated_ts"), (int, float),
+    ):
         return None
     node = data.get("node")
     name = node.get("name") if isinstance(node, dict) else None
