@@ -84,6 +84,9 @@ class AgentConfig(BaseModel):
     type: str = "claude"
     binary: str = "claude"
     default_timeout_seconds: int = 1800
+    # Not used: the dispatcher always runs stream-json, which is the only
+    # output that carries the subscription usage (#247). Kept so existing
+    # configs still load.
     output_format: str = "json"
     # #219. "bwrap" runs the dev and task agents under bubblewrap with
     # the paths below replaced by empty mounts, so the agent cannot
@@ -773,8 +776,6 @@ class Config(BaseModel):
     schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     claims: ClaimsConfig = Field(default_factory=ClaimsConfig)
-
-
     usage: UsageConfig = Field(default_factory=UsageConfig)
     personalization: Personalization | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
