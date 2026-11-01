@@ -1652,6 +1652,13 @@ async def run_dev_issue(
     # number that was sitting in the result.
     last_exit_code: int | None = None
 
+    # The relay's publisher, once the agent has run: it knows the pull
+    # request number as soon as the PR exists (#253). The exception path
+    # reads it so a failure after the PR opened says so, instead of "no
+    # pull request was opened ... free to pick up", which invites a
+    # second run and a duplicate PR.
+    publisher: _Publisher | None = None
+
     # Whether this run's `sessions` row exists. An event for a session
     # that was never recorded would name a session nothing else knows.
     session_row_inserted = False
@@ -2239,6 +2246,7 @@ async def run_dev_issue(
             session_id=session_id,
             reason=f"{type(e).__name__}: {str(e)[:200]}",
             exit_code=last_exit_code,
+            pr_number=publisher.pr_number if publisher is not None else None,
             claim_posted=claim_may_stand,
             claim_id=claim_id,
         )

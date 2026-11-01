@@ -76,12 +76,14 @@ class TestWorktreeManager:
         bare.mkdir(parents=True)
 
         with patch.object(manager, "_run_git", new_callable=AsyncMock) as mock_git:
-            mock_git.return_value = ""
+            mock_git.return_value = "refs/heads/main\n"
             await manager.ensure_bare_repo("owner/repo")
 
-        # symbolic-ref (default-branch lookup), then the fetch.
-        assert mock_git.await_count == 2
+        # symbolic-ref (default-branch lookup), the worktree listing
+        # (#253: checked-out branches are left out), then the fetch.
+        assert mock_git.await_count == 3
         assert mock_git.await_args_list[0].args[0] == "symbolic-ref"
+        assert mock_git.await_args_list[1].args[:2] == ("worktree", "list")
         args = mock_git.await_args.args
         # Must be a fetch, not --all, with the explicit refspec.
         assert args[0] == "fetch"
@@ -1899,3 +1901,264 @@ class TestNonFastForwardClassifier:
         assert _rejections_are_only_non_fast_forward(
             "From github.com:o/r\n   abc..def  main -> main\n"
         ) == []
+
+
+class TestFetchWithTheSessionsBranchCheckedOut:
+    """#253: a dev run whose pull request went BEHIND mid-run died in its
+    own fix path, on ``fatal: refusing to fetch into branch
+    'refs/heads/fix/issue-4' checked out at '<the session's worktree>'``.
+
+    Git refuses to fetch into a branch a worktree has checked out
+    whenever the remote has a branch of that name, even an unchanged
+    one, and refuses the whole fetch with it: not even the default
+    branch, which the agent needs to rebase onto, is updated. Once the
+    run's branch is published, that is every fetch of the session.
+    """
+
+    _git = staticmethod(TestFetchSurvivesRewrittenBranches._git)
+
+    @classmethod
+    def _setup(cls, tmp_path: Path):
+        import subprocess
+
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        cls._git("init", "-q", "-b", "main", ".", cwd=origin)
+        (origin / "f").write_text("base\n")
+        cls._git("add", ".", cwd=origin)
+        cls._git("commit", "-qm", "base", cwd=origin)
+        cls._git("branch", "fix/issue-4", cwd=origin)
+
+        wt = WorktreeManager(
+            worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos",
+        )
+        bare = wt._get_bare_repo_path("owner/repo")
+        bare.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "clone", "-q", "--bare", str(origin), str(bare)],
+            check=True, capture_output=True,
+        )
+        session = tmp_path / "wt" / "session"
+        cls._git("worktree", "add", "-q", str(session), "fix/issue-4", cwd=bare)
+
+        # The run's branch exists on origin (here with a commit the
+        # clone does not have; an identical one is refused the same) ...
+        cls._git("checkout", "-q", "fix/issue-4", cwd=origin)
+        (origin / "g").write_text("the run's work\n")
+        cls._git("add", ".", cwd=origin)
+        cls._git("commit", "-qm", "the run's work", cwd=origin)
+        # ... and another pull request merges into main meanwhile.
+        cls._git("checkout", "-q", "main", cwd=origin)
+        (origin / "f").write_text("main moved\n")
+        cls._git("commit", "-qam", "main moved", cwd=origin)
+        return wt, origin, bare
+
+    @staticmethod
+    def _sha(repo: Path, ref: str) -> str:
+        return TestFetchSurvivesRewrittenBranches._sha(repo, ref)
+
+    @pytest.mark.asyncio
+    async def test_the_fetch_updates_main_and_leaves_the_checked_out_branch(
+        self, tmp_path: Path,
+    ) -> None:
+        wt, origin, bare = self._setup(tmp_path)
+        branch_before = self._sha(bare, "refs/heads/fix/issue-4")
+
+        await wt.ensure_bare_repo("owner/repo")  # raised before #253
+
+        # main is what the agent rebases onto, so it must be current.
+        assert self._sha(bare, "refs/heads/main") == self._sha(origin, "refs/heads/main")
+        # The session's checked-out branch is not moved under its worktree.
+        assert self._sha(bare, "refs/heads/fix/issue-4") == branch_before
+
+
+    @pytest.mark.asyncio
+    async def test_the_default_branch_is_never_left_out(self, tmp_path: Path) -> None:
+        """If a worktree ever had the default branch checked out, leaving
+        it out would cut every later session from a stale tree. The
+        loud refusal stays the answer there."""
+        wt, origin, bare = self._setup(tmp_path)
+        self._git("worktree", "add", "-q", "--detach", str(tmp_path / "d"), cwd=bare)
+        self._git("checkout", "-q", "main", cwd=tmp_path / "d")
+        from ctrlrelay.core.worktree import WorktreeError
+
+        with pytest.raises(WorktreeError, match="refusing to fetch into branch 'refs/heads/main'"):
+            await wt.ensure_bare_repo("owner/repo")
+
+    @pytest.mark.asyncio
+    async def test_a_dev_run_whose_pr_goes_behind_reaches_the_fix_prompt(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The incident end to end, on real repositories: the run opens
+        its pull request, another one merges into main, verification says
+        BEHIND, and the fix round must reach the agent with the rebase
+        prompt, with the PR branch checked out in the session worktree."""
+        import json
+        import subprocess
+        from unittest.mock import AsyncMock, MagicMock
+
+        from ctrlrelay.core.checkpoint import read_checkpoint
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher, SessionResult
+        from ctrlrelay.core.github import GitHubCLI
+        from ctrlrelay.core.pr_verifier import VerificationResult
+        from ctrlrelay.core.state import StateDB
+        from ctrlrelay.core.worktree import WorktreeManager
+        from ctrlrelay.pipelines.dev import run_dev_issue
+
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        self._git("init", "-q", "-b", "main", ".", cwd=origin)
+        (origin / "f").write_text("base\n")
+        self._git("add", ".", cwd=origin)
+        self._git("commit", "-qm", "base", cwd=origin)
+        # Pushes land on a non-bare origin's branches, not its HEAD.
+        self._git("config", "receive.denyCurrentBranch", "ignore", cwd=origin)
+
+        wt = WorktreeManager(
+            worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos",
+        )
+        monkeypatch.setattr(wt, "_clone_url", lambda repo: str(origin))
+
+        async def push_to_url(repo, branch, **kw):
+            # As the relay does: straight to the remote URL. (The agent's
+            # commits already moved the clone's branch ref, which the
+            # worktree shares; the push itself does not touch it.)
+            path = wt._get_bare_repo_path(repo)
+            sha = self._git("rev-parse", f"refs/heads/{branch}", cwd=path).strip()
+            subprocess.run(
+                ["git", "push", "-q", str(origin), f"{sha}:refs/heads/{branch}"],
+                cwd=path, check=True, capture_output=True,
+            )
+            return sha
+
+        monkeypatch.setattr(wt, "push_run_branch", push_to_url)
+
+        github = AsyncMock(spec=GitHubCLI)
+        github.get_issue.return_value = {"number": 4, "title": "t", "body": "b", "comments": []}
+        github.get_default_branch.return_value = "main"
+        github.list_prs.return_value = []
+        github.create_pr.return_value = {"number": 46, "url": "https://x/pull/46"}
+
+        prompts: list[str] = []
+
+        async def spawn(**kw):
+            prompts.append(kw["prompt"])
+            work = Path(kw["working_dir"])
+            (work / f"change{len(prompts)}").write_text("x\n")
+            self._git("add", ".", cwd=work)
+            self._git("commit", "-qm", f"agent {len(prompts)}", cwd=work)
+            state_file = kw["state_file"]
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps({
+                "version": "1", "status": "DONE", "session_id": kw["session_id"],
+                "timestamp": "2026-10-31T23:45:00Z", "summary": "done", "outputs": {},
+            }))
+            return SessionResult(
+                session_id=kw["session_id"], exit_code=0, stdout="", stderr="",
+                state=read_checkpoint(state_file),
+            )
+
+        dispatcher = AsyncMock(spec=ClaudeDispatcher)
+        dispatcher.spawn_session.side_effect = spawn
+
+        verdicts = iter([
+            VerificationResult(ready=False, mergeable="MERGEABLE", merge_state_status="BEHIND"),
+            VerificationResult(ready=True),
+        ])
+
+        async def verify(*a, **kw):
+            verdict = next(verdicts)
+            if verdict.merge_state_status == "BEHIND":
+                # Another pull request merged while this run worked.
+                self._git("checkout", "-q", "main", cwd=origin)
+                (origin / "f").write_text("main moved\n")
+                self._git("commit", "-qam", "main moved", cwd=origin)
+            return verdict
+
+        verifier = MagicMock()
+        verifier.verify = AsyncMock(side_effect=verify)
+        state_db = StateDB(tmp_path / "state.db")
+        try:
+            result = await run_dev_issue(
+                claims=None,
+                repo="owner/repo", issue_number=4, branch_template="fix/issue-{n}",
+                dispatcher=dispatcher, github=github, worktree=wt, dashboard=None,
+                state_db=state_db, transport=None, contexts_dir=tmp_path / "ctx",
+                pr_verifier=verifier, code_review=MagicMock(method="off"),
+            )
+        finally:
+            state_db.close()
+
+        assert len(prompts) == 2, result.error
+        assert "BEHIND" in prompts[1]
+        assert result.success, result.error
+
+    @pytest.mark.asyncio
+    async def test_prune_keeps_a_checked_out_branch_origin_deleted(
+        self, tmp_path: Path,
+    ) -> None:
+        """A branch deleted on GitHub while a session still has it checked
+        out is kept (the worktree is using it); others are still pruned."""
+        wt, origin, bare = self._setup(tmp_path)
+        self._git("branch", "other", cwd=origin)
+        await wt.ensure_bare_repo("owner/repo")
+        assert "other" in self._git("branch", "--list", "other", cwd=bare)
+        self._git("branch", "-D", "fix/issue-4", "other", cwd=origin)
+
+        await wt.ensure_bare_repo("owner/repo")
+
+        assert self._git("branch", "--list", "fix/issue-4", cwd=bare).strip()
+        assert not self._git("branch", "--list", "other", cwd=bare).strip()
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_published_branch_was_refused_too(
+        self, tmp_path: Path,
+    ) -> None:
+        """The usual case: the branch on origin is exactly the session's.
+        Git refused that as well, so every fetch after publishing failed."""
+        import subprocess
+
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        self._git("init", "-q", "-b", "main", ".", cwd=origin)
+        (origin / "f").write_text("base\n")
+        self._git("add", ".", cwd=origin)
+        self._git("commit", "-qm", "base", cwd=origin)
+        self._git("branch", "fix/issue-4", cwd=origin)
+        wt = WorktreeManager(worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos")
+        bare = wt._get_bare_repo_path("owner/repo")
+        bare.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "-q", "--bare", str(origin), str(bare)],
+                       check=True, capture_output=True)
+        self._git("worktree", "add", "-q", str(tmp_path / "s"), "fix/issue-4", cwd=bare)
+        branch = "refs/heads/fix/issue-4"
+        assert self._sha(bare, branch) == self._sha(origin, branch)
+        # Plain git refuses this fetch although nothing would change ...
+        refused = subprocess.run(
+            ["git", "fetch", "origin", "refs/heads/*:refs/heads/*"],
+            cwd=bare, capture_output=True, text=True,
+        )
+        assert refused.returncode != 0
+        assert "refusing to fetch into branch" in refused.stderr
+
+        # ... and the relay's fetch does not.
+        await wt.ensure_bare_repo("owner/repo")
+
+    @pytest.mark.asyncio
+    async def test_with_no_default_branch_known_nothing_is_left_out(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from ctrlrelay.core.worktree import WorktreeError
+
+        wt, origin, bare = self._setup(tmp_path)
+        monkeypatch.setattr(
+            wt, "get_default_branch", AsyncMock(side_effect=WorktreeError("no HEAD")),
+        )
+        with pytest.raises(WorktreeError, match="refusing to fetch"):
+            await wt.ensure_bare_repo("owner/repo")

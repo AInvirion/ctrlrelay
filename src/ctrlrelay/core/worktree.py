@@ -1199,11 +1199,31 @@ class WorktreeManager:
                 # branch to protect. create_worktree fails on the same
                 # lookup, so the stale-tree risk never reaches a session.
                 default_branch = ""
+            # Branches a worktree has checked out are left out of the
+            # fetch (#253). Git refuses to fetch into a checked-out
+            # branch whenever the remote has a branch of that name, even
+            # one that would not change (measured on git 2.43), and it
+            # refuses the WHOLE fetch with it, default branch included.
+            # Once a dev run's branch is published, every fetch during
+            # that session failed: a run whose pull request went BEHIND
+            # died in its own fix round. The session's worktree is the
+            # authority for its branch until it ends.
+            #
+            # The default branch is never left out: sessions are cut from
+            # it, so a stale one is worse than a loud failure. With no
+            # default branch known nothing is left out, for the same
+            # reason: it could be one of the checked-out branches.
+            skip = [
+                f"^refs/heads/{branch}"
+                for branch in await self._checked_out_branches(bare_path)
+                if branch != default_branch
+            ] if default_branch else []
             try:
                 await self._run_git(
                     "fetch", "--prune", "origin",
                     _BOT_BRANCH_REFSPEC,
                     "refs/heads/*:refs/heads/*",
+                    *skip,
                     cwd=bare_path,
                     timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
                     tolerate_non_fast_forward=True,
@@ -1218,6 +1238,18 @@ class WorktreeManager:
             await self._clone_bare(repo, bare_path)
 
         return bare_path
+
+    async def _checked_out_branches(self, bare_path: Path) -> list[str]:
+        """Branches checked out in this clone's linked worktrees."""
+        listing = await self._run_git(
+            "worktree", "list", "--porcelain", cwd=bare_path,
+        )
+        prefix = "branch refs/heads/"
+        return [
+            line[len(prefix):]
+            for line in listing.splitlines()
+            if line.startswith(prefix)
+        ]
 
     def _clone_url(self, repo: str) -> str:
         """Where a bare clone comes from. Never the old clone's
