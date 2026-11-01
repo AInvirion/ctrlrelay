@@ -189,6 +189,7 @@ class TestTheGhGate:
     @pytest.mark.parametrize("stderr,reads", [
         (b"HTTP 403: API rate limit exceeded for user", 1),
         (b"You have exceeded a secondary rate limit", 0),
+        (b"HTTP 403: API rate limit exceeded (secondary rate limit)", 0),
         (b"HTTP 502: bad gateway", 0),
     ])
     async def test_only_a_primary_rate_limit_answer_triggers_a_read(
