@@ -36,7 +36,7 @@ def _git(*args: str, cwd: Path) -> str:
     ).stdout.strip()
 
 
-def test_the_prefix_layers_read_only_hidden_writable_then_read_only(tmp_path) -> None:
+def test_the_prefix_layers_read_only_writable_hidden_then_read_only(tmp_path) -> None:
     from ctrlrelay.core.agent_env import bwrap_prefix
 
     hidden = tmp_path / "ssh"
@@ -54,8 +54,8 @@ def test_the_prefix_layers_read_only_hidden_writable_then_read_only(tmp_path) ->
     assert argv == [
         "/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
         "--tmpfs", "/tmp", "--unshare-pid", "--die-with-parent",
-        "--tmpfs", str(hidden), "--ro-bind", "/dev/null", str(secret_file),
         "--bind", str(wt), str(wt),
+        "--tmpfs", str(hidden), "--ro-bind", "/dev/null", str(secret_file),
         "--ro-bind", str(settings), str(settings),
         "--",
     ]
@@ -71,6 +71,11 @@ try write_local_bin "touch $HOME/.local/bin/planted"
 try write_settings "echo planted >> $HOME/.claude/settings.json"
 try create_local_settings "echo planted > $HOME/.claude/settings.local.json"
 try create_git_hook "mkdir -p $GITCOMMON/hooks && touch $GITCOMMON/hooks/post-checkout"
+try hardlink_settings "ln $HOME/.claude/settings.json ./hl && echo planted >> ./hl"
+try hardlink_git_config "ln $GITCOMMON/config ./hl2 && echo planted >> ./hl2"
+try repoint_dot_git "echo 'gitdir: /elsewhere' > .git"
+try worktree_config "echo planted >> $GITDIR/config.worktree"
+try read_hidden_in_writable "cat $HOME/.claude/secret-token"
 try write_agent_state "touch $HOME/.claude/projects/run-log"
 try write_hooks "touch $GITCOMMON/hooks/pre-push"
 try write_git_config "git config --file $GITCOMMON/config core.fsmonitor /bin/evil"
@@ -118,13 +123,20 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
     wt = home / "wt"
     _git("worktree", "add", "-q", "-b", "run", str(wt), "main", cwd=bare)
 
+    # Not there before the run: the agent must not be able to create it.
+    shutil.rmtree(bare / "hooks")
+    (h / ".claude" / "secret-token").write_text("token")
+    gitdir = Path(_git("rev-parse", "--path-format=absolute", "--git-dir", cwd=wt))
     agent = home / "agent.sh"
     agent.write_text(AGENT)
     agent.chmod(0o755)
+    from ctrlrelay.core.agent_env import DEFAULT_SANDBOX_HIDE_PATHS
+
     d = ClaudeDispatcher(
         usage_store=None, claude_binary=str(agent), sandbox="bwrap",
-        extra_env={"GITCOMMON": str(bare)},
+        extra_env={"GITCOMMON": str(bare), "GITDIR": str(gitdir)},
         sandbox_cache_dir=str(home / "agent-cache"),
+        sandbox_hide_paths=(*DEFAULT_SANDBOX_HIDE_PATHS, "~/.claude/secret-token"),
     )
     await d.spawn_session(
         session_id="s-236", prompt="p", working_dir=wt,
@@ -143,6 +155,11 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         "write_settings": "no",
         "create_local_settings": "no",
         "create_git_hook": "no",
+        "hardlink_settings": "no",
+        "hardlink_git_config": "no",
+        "repoint_dot_git": "no",
+        "worktree_config": "no",
+        "read_hidden_in_writable": "no",
         "write_agent_state": "yes",
         "write_hooks": "no",
         "write_git_config": "no",
@@ -157,6 +174,8 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
     assert (h / ".claude" / "settings.local.json").read_text() == "{}\n"
     assert (home / "agent-cache" / "uv" / "x").exists()
     assert _git("log", "-1", "--format=%s", "run", cwd=bare) == "change"
+    assert (wt / ".git").read_text().startswith("gitdir: ")
+    assert "planted" not in (bare / "config").read_text()
 
 
 @pytest.mark.asyncio
@@ -183,3 +202,46 @@ async def test_control_without_the_sandbox_the_same_agent_reaches_everything(
     assert "read_ssh_key=yes" in report
     assert "write_bashrc=yes" in report
     assert "write_settings=yes" in report
+
+
+
+@pytest.mark.asyncio
+async def test_a_state_file_outside_the_worktree_is_refused(home: Path) -> None:
+    from ctrlrelay.core.agent_env import SandboxUnavailableError
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    wt = home / "wt"
+    wt.mkdir()
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
+        sandbox_cache_dir=str(home / "c"),
+    ) if BWRAP else None
+    if d is None:
+        pytest.skip("bwrap not installed")
+    with pytest.raises(SandboxUnavailableError, match="outside the worktree"):
+        await d.spawn_session(
+            session_id="s", prompt="p", working_dir=wt,
+            state_file=home / "home" / "state.json", github_access=False,
+        )
+
+
+def test_a_read_only_path_that_cannot_be_made_stops_the_run(tmp_path) -> None:
+    from ctrlrelay.core.agent_env import SandboxUnavailableError, bwrap_prefix
+
+    open_dir = tmp_path / "open"
+    open_dir.mkdir()
+    (open_dir / "settings.local.json").symlink_to(tmp_path / "gone" / "x.json")
+    with pytest.raises(SandboxUnavailableError, match="cannot create"):
+        bwrap_prefix(
+            "/usr/bin/bwrap", [], writable=[open_dir],
+            readonly=[open_dir / "settings.local.json"],
+        )
+
+
+def test_a_missing_read_only_path_nothing_writable_reaches_is_left_alone(
+    tmp_path,
+) -> None:
+    from ctrlrelay.core.agent_env import bwrap_prefix
+
+    bwrap_prefix("/usr/bin/bwrap", [], writable=[], readonly=[tmp_path / "hooks"])
+    assert not (tmp_path / "hooks").exists()

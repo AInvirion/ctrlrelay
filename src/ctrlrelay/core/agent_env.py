@@ -264,18 +264,28 @@ def bwrap_prefix(
 
     In order, so each step wins over the one before: the whole
     filesystem read-only, a fresh ``/dev``, ``/proc`` and private
-    ``/tmp``; ``hide_paths`` made empty (a directory becomes an empty
-    tmpfs, a file ``/dev/null``); ``writable`` bound back writable; and
-    ``readonly`` bound read-only again inside those. A hidden or writable
-    path that does not exist is skipped (bwrap would otherwise have to
-    create a mount point for it); a missing read-only one is created
-    first (see :func:`_create_readonly`). The child gets its own process namespace and dies
-    with the relay.
+    ``/tmp``; ``writable`` bound back writable; ``hide_paths`` made empty
+    (a directory becomes an empty tmpfs, a file ``/dev/null``), also
+    inside a writable path; and ``readonly`` bound read-only again. A
+    hidden or writable path that does not exist is skipped (bwrap would
+    otherwise have to create a mount point for it). A missing read-only
+    path inside a writable one is created first (see
+    :func:`_create_readonly`); elsewhere it stays absent, since nothing
+    can create it. The child gets its own process namespace and dies with
+    the relay.
     """
     argv = [
         bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
         "--tmpfs", "/tmp", "--unshare-pid", "--die-with-parent",
     ]
+    open_dirs: list[Path] = []
+    for raw in writable:
+        p = _existing(raw)
+        if p is not None:
+            argv += ["--bind", str(p), str(p)]
+            open_dirs.append(p)
+    # After the writable binds, so a writable path that contains a hidden
+    # one does not bring it back.
     for raw in hide_paths:
         p = _existing(raw)
         if p is None:
@@ -284,43 +294,50 @@ def bwrap_prefix(
             argv += ["--tmpfs", str(p)]
         else:
             argv += ["--ro-bind", "/dev/null", str(p)]
-    for raw in writable:
-        p = _existing(raw)
-        if p is not None:
-            argv += ["--bind", str(p), str(p)]
     for raw in readonly:
-        p = _existing(raw) or _create_readonly(raw)
-        if p is not None:
-            argv += ["--ro-bind", str(p), str(p)]
+        p = _existing(raw)
+        if p is None:
+            target = _expand(raw)
+            if target is None or not any(
+                target.is_relative_to(d) for d in open_dirs
+            ):
+                continue  # nothing writable reaches it: it stays absent
+            p = _create_readonly(target)
+        argv += ["--ro-bind", str(p), str(p)]
     argv.append("--")
     return argv
 
 
-def _create_readonly(raw: str | Path) -> Path | None:
-    """Create a missing read-only path, so it can be bound read-only.
-
-    Skipping it would leave the agent free to create it inside a writable
-    parent: a ``settings.local.json`` with a hook in it, or a git hook,
-    which then runs later as the operator. A name with a suffix is made a
-    file (``{}`` for JSON, so the agent CLI still parses it), anything else
-    an empty directory. ``None`` when it cannot be made, for a path whose
-    parent does not exist either (nothing writable is there to create it
-    in).
-    """
+def _expand(raw: str | Path) -> Path | None:
     expanded = os.path.expandvars(os.path.expanduser(str(raw)))
-    if "$" in expanded:
-        return None
-    p = Path(expanded)
-    if not p.parent.is_dir():
-        return None
+    return None if "$" in expanded else Path(expanded)
+
+
+def _create_readonly(p: Path) -> Path:
+    """Create a missing read-only path inside a writable one, so it can be
+    bound read-only.
+
+    Skipping it would leave the agent free to create it: a
+    ``settings.local.json`` with a hook in it, or a git hook, which then
+    runs later as the operator. A name with a suffix is made a file (``{}``
+    for JSON, so the agent CLI still parses it), anything else an empty
+    directory. A dangling symlink gets its target created. Raises
+    :class:`SandboxUnavailableError` when it cannot be made: the run does
+    not start rather than start with the path open.
+    """
     try:
         if p.suffix:
+            p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("{}\n" if p.suffix == ".json" else "")
         else:
-            p.mkdir()
-    except OSError:
-        return None
-    return p
+            p.mkdir(parents=True)
+    except OSError as e:
+        raise SandboxUnavailableError(
+            f"agent.sandbox: cannot create {p} to keep it read-only "
+            f"({type(e).__name__}: {e}); fix or remove it, or take it out "
+            "of agent.sandbox_readonly_paths"
+        ) from e
+    return p.resolve()
 
 
 def git_dirs(working_dir: Path) -> list[Path]:

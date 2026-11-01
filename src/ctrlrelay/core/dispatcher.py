@@ -24,6 +24,7 @@ from ctrlrelay.core.agent_env import (
     DEFAULT_SANDBOX_HIDE_PATHS,
     DEFAULT_SANDBOX_READONLY_PATHS,
     DEFAULT_SANDBOX_WRITABLE_PATHS,
+    SandboxUnavailableError,
     agent_cache_env,
     build_agent_env,
     bwrap_prefix,
@@ -204,6 +205,77 @@ class ClaudeDispatcher:
             resolve_bwrap() if self.sandbox == "bwrap" else None
         )
 
+    def _sandbox_prefix(
+        self,
+        env: dict[str, str],
+        working_dir: Path,
+        state_file: Path,
+        private_root: Path,
+    ) -> list[str]:
+        """The bwrap argv for one run (#236), and the agent's cache
+        variables set in ``env``. Raises :class:`SandboxUnavailableError`
+        rather than start a run it cannot confine as configured."""
+        cache_raw = os.path.expandvars(os.path.expanduser(self.sandbox_cache_dir))
+        if "$" in cache_raw:
+            raise SandboxUnavailableError(
+                f"agent.sandbox_cache_dir {self.sandbox_cache_dir!r} names an "
+                "unset variable"
+            )
+        cache_dir = Path(cache_raw)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise SandboxUnavailableError(
+                f"agent.sandbox_cache_dir {cache_dir}: {type(e).__name__}: {e}"
+            ) from e
+        # The checkpoint is written inside the worktree; a state file
+        # elsewhere would need its directory opened, which could be home.
+        if not state_file.parent.resolve().is_relative_to(working_dir.resolve()):
+            raise SandboxUnavailableError(
+                f"the state file {state_file} is outside the worktree "
+                f"{working_dir}, so the sandbox cannot let the agent write it"
+            )
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        env.update(agent_cache_env(cache_dir))
+
+        dot_git = working_dir / ".git"
+        repo_dirs = git_dirs(working_dir)
+        if dot_git.exists() and not repo_dirs:
+            raise SandboxUnavailableError(
+                f"could not find the git directories of {working_dir}, so "
+                "the agent could not commit; not starting it"
+            )
+        # What every later git command in this clone runs, the relay's
+        # included: its config (core.hooksPath, core.fsmonitor, filters),
+        # per-worktree config, hooks, and the worktree's pointer to its
+        # git directory. The agent may not write them.
+        git_protected: list[Path] = []
+        for i, d in enumerate(repo_dirs):
+            names = ("config", "config.worktree") + (("hooks",) if i == 0 else ())
+            git_protected += [d / n for n in names]
+        if dot_git.is_file():
+            git_protected.append(dot_git)
+
+        linked = [
+            raw for raw in self.sandbox_readonly_paths
+            if Path(os.path.expanduser(raw)).is_symlink()
+        ]
+        if linked:
+            # A read-only bind protects the link's target; the link itself
+            # sits in a writable directory and can be replaced.
+            _logger.warning(
+                "dispatcher.sandbox.readonly_symlink", extra={"paths": linked},
+            )
+        return bwrap_prefix(
+            self._bwrap,
+            self.sandbox_hide_paths,
+            writable=[
+                working_dir, *repo_dirs, private_root, cache_dir,
+                *self.sandbox_writable_paths,
+            ],
+            readonly=[*self.sandbox_readonly_paths, *git_protected],
+        )
+
     async def _report_outcome(
         self,
         *,
@@ -303,27 +375,13 @@ class ClaudeDispatcher:
                 base_env, gh_config_dir=gh_config_dir, runtime_dir=runtime_dir,
             )
             if self._bwrap is not None:
-                cache_dir = Path(self.sandbox_cache_dir).expanduser()
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                state_file.parent.mkdir(parents=True, exist_ok=True)
-                env.update(agent_cache_env(cache_dir))
-                repo_dirs = git_dirs(working_dir)
-                prefix = bwrap_prefix(
-                    self._bwrap,
-                    self.sandbox_hide_paths,
-                    writable=[
-                        working_dir, *repo_dirs, state_file.parent,
-                        private_root, cache_dir, *self.sandbox_writable_paths,
-                    ],
-                    # The shared git directory's config and hooks are run
-                    # by every later git command in that clone, the
-                    # relay's included: the agent may not write them.
-                    readonly=[
-                        *self.sandbox_readonly_paths,
-                        *(d / name for d in repo_dirs[:1]
-                          for name in ("config", "hooks")),
-                    ],
-                )
+                try:
+                    prefix = self._sandbox_prefix(
+                        env, working_dir, state_file, private_root,
+                    )
+                except Exception:
+                    shutil.rmtree(private_root, ignore_errors=True)
+                    raise
         env["CTRLRELAY_SESSION_ID"] = session_id
         env["CTRLRELAY_STATE_FILE"] = str(state_file)
 
