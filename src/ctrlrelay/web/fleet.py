@@ -11,7 +11,8 @@ module adds what the page needs to show the others:
 
 A peer that does not answer is "not reachable from here", with the
 reason and its last known block, never "idle". A peer that answers with
-an old heartbeat is "silent": its web server is up, its poller is not.
+an old heartbeat is "silent": its web server is up, and nothing confirms
+its poller is.
 """
 
 from __future__ import annotations

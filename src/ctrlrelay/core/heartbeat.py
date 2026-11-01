@@ -10,7 +10,7 @@ daemon writes a small file beside the state database:
 * ``last_poll_at``, after each poll of GitHub.
 
 A page that finds the heartbeat old says the machine is **silent**: the
-web server answers but the poller is not working.
+web server answers but nothing confirms the poller is working.
 """
 
 from __future__ import annotations
