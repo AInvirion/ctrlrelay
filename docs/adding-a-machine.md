@@ -113,6 +113,8 @@ Start the bridge, the poller and the status page as on the first machine
 ([Operations]({{ '/operations/' | relative_url }})). At startup, and while it
 runs, the poller warns, in its log and in chat, if another process uses its
 name: at startup, a peer whose status page answers with its name; while it
-runs, a claim under its name that another process is writing.
+runs, a claim under its name that another process is refreshing, on an issue
+it looks at. Neither is certain to catch every case, so give each machine
+its own `node_id` rather than relying on the warning.
 
 Then open either machine's status page: the **Machines** strip shows both.

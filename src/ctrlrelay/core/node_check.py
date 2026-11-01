@@ -47,8 +47,15 @@ def claim_refreshed_by_another(
     counts. One from this machine before a restart carries an older run,
     but its ``seen`` is by this machine's clock and not after
     ``started_at``. Another process's claim on a live run is refreshed, so
-    it is caught by its next refresh even when its clock runs behind. A
-    claim from a version before #250 names no run and is never counted.
+    it is caught once a refresh is stamped after ``started_at`` by that
+    process's clock: on the first refresh when the clocks agree, later (or
+    not, on a short run) when its clock is behind. A claim from a version
+    before #250 names no run and is never counted. It is a warning, not a
+    proof: a clock stepped back across a restart can show this machine's
+    own leftover as another process's.
+
+    Only the issues the daemon looks at are read: a refresh on an issue it
+    never looks at again is not seen.
     """
     for claim in parse_claims(comments, settings.account):
         if (

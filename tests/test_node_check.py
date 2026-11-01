@@ -84,7 +84,7 @@ class TestDuplicateFromClaims:
         ]
         assert not claim_refreshed_by_another(comments, ME, started_at=NOW - 100)
 
-    def test_a_claim_this_process_wrote_or_adopted_never_counts(self) -> None:
+    def test_a_claim_this_process_wrote_never_counts(self) -> None:
         # Written after start, by this process: the issue came round again
         # after this process ran it.
         comments = [_comment(claim_body("node-a", "x1", WORKING, NOW - 10), NOW - 10)]

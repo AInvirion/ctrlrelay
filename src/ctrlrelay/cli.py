@@ -2958,8 +2958,8 @@ def poller_start(
             await watch_transport.connect()
             return watch_transport
 
-        # #250: another process using this machine's node_id. Said once
-        # per run of the daemon, in the log and in chat.
+        # #250: another process using this machine's node_id. Logged each
+        # time it is seen; said in chat and on the console once per run.
         duplicate_warned: list[bool] = []
 
         def _duplicate_name(where: str, number: int | None = None) -> None:
