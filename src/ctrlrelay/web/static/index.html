@@ -858,6 +858,9 @@ var todaySeq = 0;
 // another for it (on a slow server every answer would be overtaken and the
 // list would stay at "loading…"); a click always does.
 var todayBusy = null;
+// A refresh skipped while a request was out: read again when it lands, so
+// the list does not lag the count by more than one answer.
+var todayStale = false;
 
 function renderToday(data) {
   var target = document.getElementById("today");
@@ -890,9 +893,10 @@ function loadTodayList(force) {
   var target = document.getElementById("today-list");
   var kind = todayOpen;
   if (!kind) { todaySeq++; todayBusy = null; put(target, []); return; }
-  if (!force && todayBusy === kind) { return; }
+  if (!force && todayBusy === kind) { todayStale = true; return; }
   var seq = ++todaySeq;
   todayBusy = kind;
+  todayStale = false;
   fetch("/api/events?kind=" + encodeURIComponent(kind) + "&day=today", { cache: "no-store" })
     .then(function (resp) { return resp.json(); })
     .then(function (data) { if (seq === todaySeq) { renderTodayList(data); } })
@@ -902,7 +906,11 @@ function loadTodayList(force) {
           (err && err.message ? err.message : "error") + ")")]);
       }
     })
-    .then(function () { if (seq === todaySeq) { todayBusy = null; } });
+    .then(function () {
+      if (seq !== todaySeq) { return; }
+      todayBusy = null;
+      if (todayStale && todayOpen === kind) { loadTodayList(false); }
+    });
 }
 
 function renderTodayList(data) {

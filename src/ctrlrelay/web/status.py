@@ -840,6 +840,11 @@ def _read_day_events(
     return out, int(total)
 
 
+def _cut(text: str, limit: int) -> str:
+    """``text`` up to ``limit`` characters, ending in "…" when cut."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _reason(row: dict[str, Any], detail: Any) -> dict[str, Any]:
     """Why a run failed or stopped, from what the relay stored: the exit
     code, its summary and output tail, and the question asked, each
@@ -856,7 +861,7 @@ def _reason(row: dict[str, Any], detail: Any) -> dict[str, Any]:
     reason: dict[str, Any] = {
         "exit_code": exit_code if isinstance(exit_code, int) else None,
         "summary": (
-            redact_secrets(summary)[:REASON_SUMMARY_CHARS]
+            _cut(redact_secrets(summary), REASON_SUMMARY_CHARS)
             if isinstance(summary, str) and summary else None
         ),
         "output_tail": (
@@ -864,7 +869,7 @@ def _reason(row: dict[str, Any], detail: Any) -> dict[str, Any]:
             if isinstance(output, str) and output else None
         ),
         "question": (
-            redact_secrets(question)[:REASON_SUMMARY_CHARS]
+            _cut(redact_secrets(question), REASON_SUMMARY_CHARS)
             if isinstance(question, str) and question else None
         ),
     }

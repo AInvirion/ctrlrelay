@@ -206,8 +206,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, srv.status())
         elif url.path == "/api/events":
             query = urllib.parse.parse_qs(url.query, keep_blank_values=True)
-            if "kind" in query:
-                # One Today counter's events (#257).
+            if "kind" in query and "since" not in query:
+                # One Today counter's events (#257). A query with ``since``
+                # is the feed, as it was before ``kind`` existed.
                 kinds, days = query.get("kind"), query.get("day")
                 if (
                     len(kinds) != 1 or kinds[0] not in DAY_KINDS

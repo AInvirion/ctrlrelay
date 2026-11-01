@@ -1250,7 +1250,7 @@ def test_api_events_kind_blocked_carries_the_question_and_merged_the_pr(
 
 @pytest.mark.parametrize("query", [
     "kind=nope&day=today", "kind=failed", "kind=failed&day=yesterday",
-    "kind=failed&kind=merged&day=today", "kind=failed&day=today&since=1",
+    "kind=failed&kind=merged&day=today", "kind=failed&day=today&x=1",
 ])
 def test_api_events_bad_kind_query_is_400(tmp_path: Path, serve, query: str) -> None:
     _today_db(tmp_path)
@@ -1289,9 +1289,12 @@ def test_every_today_counter_asks_for_a_kind_the_server_lists() -> None:
     assert 'el("button", "card")' in render and "loadTodayList(true)" in render
     # Only the newest list request may draw.
     load = _js_function(script, "loadTodayList")
-    assert load.count("seq === todaySeq") == 3 and "++todaySeq" in load
+    assert load.count("seq === todaySeq") == 2 and "seq !== todaySeq" in load
+    assert "++todaySeq" in load
     # A refresh does not start a second request while one is out.
     assert "!force && todayBusy === kind" in load
+    # ... and reads again when the outstanding one lands.
+    assert "todayStale && todayOpen === kind" in load
 
 
 
@@ -1307,3 +1310,22 @@ def test_the_feed_scrubs_credentials_from_event_details(tmp_path: Path, serve) -
         [blocked] = [e for e in feed if e["kind"] == "blocked"]
         assert blocked["detail"]["question"].startswith("Merge or leave?")
         assert "ghp_" not in json.dumps(feed)
+
+
+
+def test_api_events_with_since_stays_the_feed_even_with_kind(tmp_path: Path, serve) -> None:
+    _today_db(tmp_path)
+    config = _config(tmp_path)
+    srv = serve(config, _tracker(config, tmp_path))
+
+    status, out = srv.json("/api/events?since=0&kind=failed")
+
+    assert status == 200 and "feed_total" in out and "kind" not in out
+
+
+def test_a_long_question_is_cut_visibly(tmp_path: Path) -> None:
+    from ctrlrelay.web.status import REASON_SUMMARY_CHARS, _reason
+
+    reason = _reason({"s_id": "s", "blocked_question": "q" * 900}, {})
+    assert len(reason["question"]) == REASON_SUMMARY_CHARS
+    assert reason["question"].endswith("…")
