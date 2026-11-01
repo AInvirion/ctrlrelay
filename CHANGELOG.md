@@ -21,16 +21,20 @@ three things before upgrading:
   name no other machine on the account uses. A missing `node_id` still
   defaults to the hostname.
 - **If you already run `agent.sandbox: bwrap`**, it is now much stricter:
-  the agent can write only its worktree, its git dirs, a private `/tmp`,
-  the entries of `~/.claude` and its own cache. Anything else a run wrote
+  by default the agent can write its worktree, its git dirs, a private
+  `/tmp`, its own empty `gh` and runtime dirs, the entries of `~/.claude`,
+  its own cache and any `sandbox_writable_paths`, minus the read-only and
+  hidden paths inside those. Anything else a run wrote
   (a cache in your home, `git config`, submodules, commit signing) fails
   there. It also refuses to start with `CLAUDE_CONFIG_DIR` set or with a
   read-only path that is a replaceable link. Read the sandbox section of the
   configuration docs before upgrading such a machine.
 - **Upgrade every machine on an account to the same version.** Claims now
   name the machine and the process that wrote them, and an older version
-  reads them differently. With a shared Mattermost bot, a question asked
-  before the upgrade carries no machine tag: answer it with
+  reads them differently. A claim comment left by an older version counts
+  as taken by `unknown` and never goes stale: once nothing is working that
+  issue, delete the comment to free it. With a shared Mattermost bot, a
+  question asked before the upgrade carries no machine tag: answer it with
   `node-a: ...`.
 
 ### Added
@@ -43,7 +47,9 @@ three things before upgrading:
   machine cannot refresh its claim for longer than the stale time (a long
   GitHub outage) can be taken over while it still runs, so keep the
   machines' clocks synchronised and the stale time well above any outage
-  you expect (#252, closes #245)
+  you expect. A run that fails after being resumed from a question leaves
+  its claim held; delete the claim comment to free that issue (#252,
+  closes #245)
 - The scheduled security sweep runs at most once per repository and
   scheduled time across machines: the first to create the ref
   `refs/ctrlrelay/claims/secops/<window>` in the repository runs it. A
@@ -57,13 +63,18 @@ three things before upgrading:
   per machine. When a second process starts reading the same bot, Telegram
   cuts off the one already running, which now says so once, in its log and
   in the chat, and stops reading (#260, closes #248)
-- Subscription usage: read from each agent run, shown on the status page,
-  and new work pauses when usage reaches `usage.pause_at` (default 90%) until
-  the window resets; an idle probe every `usage.probe_minutes` keeps the
-  reading fresh (#254, closes #247)
+- Subscription usage: read from each agent run and shown on the status
+  page. New issues wait while the 5-hour or 7-day window is at or above
+  `usage.pause_at` (default 90%), or the status is anything but `allowed`,
+  until the window's reset; runs already going finish, and a usage that
+  could not be read never pauses. An idle probe every `usage.probe_minutes`
+  keeps the reading fresh (#254, closes #247)
 - GitHub API budget: watched every `github_api.check_minutes`; polling slows
-  by `github_api.slow_factor` below `github_api.low_at` and pauses until the
-  reset when it is used up, with an alert (#256, closes #237)
+  by `github_api.slow_factor` while the `core` or `graphql` bucket is below
+  `github_api.low_at` (not `search`, which resets every minute), with one
+  chat line. When a bucket is used up, calls known to spend it
+  (`gh api`, `gh search`) wait for its reset; other `gh` commands are not
+  held back (#256, closes #237)
 - Status page: a Machines strip and who-has-what for every machine listed in
   `fleet.peers` (each machine's `web.allowed_hosts` must hold the name the
   others use for it), plus this machine's usage and API budget (#258,
@@ -72,9 +83,10 @@ three things before upgrading:
   and peers, exit 1 on any failure; the poller warns at startup and while
   running if another process uses this machine's `node_id`; new guide
   `docs/adding-a-machine.md` (#261, closes #250)
-- `agent.sandbox: bwrap` is now a read-only copy of the machine: only the
-  run's worktree, its git dirs, a private `/tmp`, the entries of `~/.claude`
-  and an agent-only cache (`agent.sandbox_cache_dir`) are writable; the
+- `agent.sandbox: bwrap` is now a read-only copy of the machine: by default
+  only the run's worktree, its git dirs, a private `/tmp`, the entries of
+  `~/.claude` and an agent-only cache (`agent.sandbox_cache_dir`) are
+  writable; the
   agent CLI's settings, hooks, plugins, skills and project memory, and the
   repository's git config and hooks, stay read-only; more credentials and
   the session's sockets are hidden; `~/.claude.json` is a private copy per
