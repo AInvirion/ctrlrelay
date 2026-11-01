@@ -604,6 +604,7 @@ async def test_bridge_send_and_ask_record_events(tmp_path: Path) -> None:
     socket_path = Path(sock_dir) / "b.sock"
     db = StateDB(tmp_path / "state.db")
     server = BridgeServer(
+        node=None,
         socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
     )
     task = asyncio.create_task(server.start())

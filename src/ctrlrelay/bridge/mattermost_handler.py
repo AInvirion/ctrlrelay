@@ -188,6 +188,15 @@ class MattermostHandler:
     async def send(self, text: str) -> str:
         return await self._post(text)
 
+    async def post_text(self, post_id: str) -> str | None:
+        """The text of one post, to see which machine posted it (#248).
+        ``None`` when it cannot be read."""
+        r = await self._client.get(f"/posts/{post_id}")
+        if r.status_code != 200:
+            return None
+        message = r.json().get("message")
+        return message if isinstance(message, str) else None
+
     async def ask(
         self, question: str, options: list[str] | None = None
     ) -> str:

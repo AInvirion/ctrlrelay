@@ -459,6 +459,28 @@ Limits to know:
   failure comment as ending every claim, including another machine's, and
   posts claims without a machine name. Upgrade all machines together.
 
+### Chat with several machines
+
+Every message a machine posts starts with its name: `[node-a] ❓ Blocked on
+o/r#7: ...`. Each machine acts only on **replies to its own posts**. A reply to
+a post another machine made is left to that machine, with nothing said in the
+channel; the machine reads the replied-to post to tell (on Telegram, from the
+reply itself).
+
+**Mattermost:** machines can share one bot and channel. Set
+`transport.mattermost.shared: true` on each. A message that is not a reply
+then reaches a machine only when it names it, `node-a: pin` or `@node-a pin`;
+a plain message is left alone by every machine, since none could tell it was
+meant for it. With one machine, leave `shared` off and plain answers work as
+before.
+
+**Telegram:** each machine needs **its own bot**. Telegram lets one process
+read a bot's messages at a time; a second machine on the same bot fails at
+startup with "this Telegram bot is already being read by another process
+... each machine needs its own bot", and a machine that loses its bot to
+another while running logs that once and stops reading, rather than retrying
+every few seconds.
+
 ## Scheduled jobs
 
 The poller daemon also hosts an in-process cron (APScheduler). The jobs run

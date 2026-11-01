@@ -26,7 +26,7 @@ class TestBridgeServer:
         """Server should create socket file."""
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
@@ -40,7 +40,7 @@ class TestBridgeServer:
         """Socket should have 0600 permissions."""
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
@@ -61,7 +61,7 @@ class TestBridgeServer:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
@@ -84,7 +84,7 @@ class TestBridgeServer:
         """Server should remove socket file on stop."""
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
         assert socket_path.exists()
@@ -108,7 +108,7 @@ class TestBridgeServer:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
@@ -164,7 +164,7 @@ class TestBridgeServer:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
@@ -210,7 +210,7 @@ class TestBridgeServer:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
         server.handler.ask = AsyncMock(return_value="42")  # type: ignore[attr-defined]
@@ -261,6 +261,7 @@ class TestBridgeServer:
         )
 
         server = BridgeServer(
+            node=None,
             socket_path=socket_path,
             handler=FakeChatHandler(),
             state_db=db,
@@ -315,6 +316,7 @@ class TestBridgeServer:
         )
 
         server = BridgeServer(
+            node=None,
             socket_path=socket_path,
             handler=FakeChatHandler(),
             state_db=db,
@@ -372,6 +374,7 @@ class TestBridgeServer:
         )
 
         server = BridgeServer(
+            node=None,
             socket_path=socket_path,
             handler=FakeChatHandler(),
             state_db=db,
@@ -420,7 +423,7 @@ class TestBridgeServer:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
 
@@ -527,7 +530,7 @@ class TestReplyRoutingIsStrict:
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
         server.handler.ask = AsyncMock(side_effect=["111", "222"])  # type: ignore[attr-defined]
@@ -583,6 +586,7 @@ class TestReplyRoutingIsStrict:
         )
 
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -643,6 +647,7 @@ class TestReplyRoutingIsStrict:
             )
 
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -671,7 +676,7 @@ class TestReplyRoutingIsStrict:
         without limit in a bridge that runs for weeks."""
         from ctrlrelay.bridge.server import _ASKED_SESSIONS_MAX, BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
 
         async with server._pending_lock:
             for i in range(_ASKED_SESSIONS_MAX + 25):
@@ -691,7 +696,7 @@ class TestReplyRoutingIsStrict:
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
         server.handler.ask = AsyncMock(return_value="777")  # type: ignore[attr-defined]
@@ -731,7 +736,7 @@ class TestReplyRoutingIsStrict:
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
         server.handler.ask = AsyncMock(return_value="900")  # type: ignore[attr-defined]
@@ -778,7 +783,7 @@ class TestReplyRoutingIsStrict:
         from ctrlrelay.bridge.protocol import BridgeMessage, BridgeOp, serialize_message
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
         server.handler.ask = AsyncMock(side_effect=["111", "222"])  # type: ignore[attr-defined]
@@ -842,6 +847,7 @@ class TestReplyRoutingIsStrict:
         )
 
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -885,6 +891,7 @@ class TestReplyRoutingIsStrict:
         )
 
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -939,7 +946,7 @@ class TestReplyRoutingIsStrict:
         )
         from ctrlrelay.bridge.server import BridgeServer
 
-        server = BridgeServer(socket_path=socket_path, handler=FakeChatHandler())
+        server = BridgeServer(node=None, socket_path=socket_path, handler=FakeChatHandler())
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
         server.handler.ask = AsyncMock(side_effect=["111", "222"])  # type: ignore[attr-defined]
@@ -998,6 +1005,7 @@ class TestReplyRoutingIsStrict:
             )
 
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -1131,6 +1139,7 @@ class TestStaleReplyToDoesNotMisroute:
             question="merge the torch bump?",
         )
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -1279,6 +1288,7 @@ class TestStaleReplyToDoesNotMisroute:
             question="merge the mypy bump?",
         )
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -1642,6 +1652,7 @@ class TestErrorCodeSurvivesADeploySkew:
         from ctrlrelay.bridge.server import BridgeServer
 
         return BridgeServer(
+            node=None,
             socket_path=socket_path,
             handler=FakeChatHandler(name=name),
         )
@@ -1739,7 +1750,7 @@ class TestStartRunsTheHandlerPreflight:
                 raise RuntimeError("bot is not a member of the channel")
 
         handler = Unverifiable()
-        server = BridgeServer(socket_path=socket_path, handler=handler)
+        server = BridgeServer(node=None, socket_path=socket_path, handler=handler)
         # Bounded: without the preflight, start() reaches serve_forever
         # and this test would hang rather than fail.
         with pytest.raises(HandlerConfigError, match="not a member"):
@@ -1765,7 +1776,7 @@ class TestStartRunsTheHandlerPreflight:
                 self.preflights += 1
 
         handler = Verifiable()
-        server = BridgeServer(socket_path=socket_path, handler=handler)
+        server = BridgeServer(node=None, socket_path=socket_path, handler=handler)
         task = asyncio.create_task(server.start())
         await asyncio.sleep(0.1)
         try:
@@ -1824,6 +1835,7 @@ class TestTheBridgeSharesItsChannelWithPeople:
             )
 
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -1870,6 +1882,7 @@ class TestTheBridgeSharesItsChannelWithPeople:
             )
 
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -2004,6 +2017,7 @@ class TestARepeatedQuestionSaysSo:
 
         db = self._db(tmp_path, earlier_question=self.EARLIER)
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -2035,6 +2049,7 @@ class TestARepeatedQuestionSaysSo:
             .replace("#201", "#197").replace("#168", "#150"),
         )
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -2062,6 +2077,7 @@ class TestARepeatedQuestionSaysSo:
 
         db.list_pending_resumes_for_repo = boom  # type: ignore[method-assign]
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -2087,6 +2103,7 @@ class TestARepeatedQuestionSaysSo:
 
         db = self._db(tmp_path, earlier_question=self.EARLIER, scale=1000)
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -2146,6 +2163,7 @@ class TestARepeatedQuestionSaysSo:
             )
         db.commit()
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -2189,6 +2207,7 @@ class TestARepeatedQuestionSaysSo:
         db = self._db(tmp_path, earlier_question=self.EARLIER)
         db.get_pending_resume = lambda sid: {"session_id": sid}  # type: ignore[method-assign]
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -2232,6 +2251,7 @@ class TestARepeatedQuestionSaysSo:
             repo=self.REPO, question=self.NOW_Q,
         )
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -2279,6 +2299,7 @@ class TestARepeatedQuestionSaysSo:
             repo=self.REPO, question=self.NOW_Q,
         )
         server = BridgeServer(
+            node=None,
             socket_path=socket_path, handler=FakeChatHandler(), state_db=db,
         )
         task = asyncio.create_task(server.start())
@@ -2371,6 +2392,7 @@ class TestAReplyToAnOlderPostReachesTheOpenOne:
         )
         db.commit()
         server = BridgeServer(
+            node=None,
             socket_path=tmp_path / "b.sock", handler=FakeChatHandler(),
             state_db=db,
         )

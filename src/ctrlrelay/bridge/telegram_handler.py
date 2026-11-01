@@ -6,12 +6,25 @@ import asyncio
 import logging
 
 from telegram import Bot, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.error import NetworkError, TimedOut
+from telegram.error import Conflict, NetworkError, TimedOut
 
 from ctrlrelay.bridge.handler import IncomingMessageHandler
 
 _log = logging.getLogger(__name__)
 
+
+
+class TelegramBotInUseError(RuntimeError):
+    """Another process is already reading this bot's updates."""
+
+
+def bot_in_use_message(exc: BaseException) -> str:
+    return (
+        "this Telegram bot is already being read by another process "
+        f"({exc}). Telegram allows one reader per bot, so each machine "
+        "needs its own bot: create one with @BotFather and set its token "
+        "for this machine."
+    )
 
 
 def is_ambiguous_delivery(exc: BaseException) -> bool:
@@ -40,6 +53,9 @@ class TelegramHandler:
         self.chat_id = chat_id
         self._poll_task: asyncio.Task | None = None
         self._offset: int = 0
+        # message id -> text of a message somebody replied to (#248): lets
+        # the server see which machine posted it. Bounded.
+        self._replied_texts: dict[str, str] = {}
 
     def is_ambiguous_delivery(self, exc: BaseException) -> bool:
         """Per the ChatHandler contract. Delegates to the module-level
@@ -110,6 +126,20 @@ class TelegramHandler:
             pass
         self._poll_task = None
 
+    async def post_text(self, post_id: str) -> str | None:
+        """The text of a message somebody replied to, as Telegram sent it
+        with the reply (#248). ``None`` if not seen."""
+        return self._replied_texts.get(post_id)
+
+    async def preflight(self) -> None:
+        """Fail at startup if another process is already reading this
+        bot's updates (#248). Telegram allows one reader per bot; a second
+        one gets a conflict on every poll, for ever."""
+        try:
+            await self.bot.get_updates(offset=self._offset, timeout=0, limit=1)
+        except Conflict as e:
+            raise TelegramBotInUseError(bot_in_use_message(e)) from e
+
     async def _poll_loop(self, handler: IncomingMessageHandler) -> None:
         """Long-poll get_updates and forward messages from the configured chat."""
         while True:
@@ -121,6 +151,11 @@ class TelegramHandler:
                 )
             except asyncio.CancelledError:
                 raise
+            except Conflict as e:
+                # Another machine took the bot over while this one ran:
+                # one clear error and stop, not a warning every 5 seconds.
+                _log.error("%s", bot_in_use_message(e))
+                return
             except Exception as e:
                 # Transient network / auth error. Back off and keep trying.
                 _log.warning("telegram get_updates failed: %s", e)
@@ -142,6 +177,10 @@ class TelegramHandler:
                     if msg.reply_to_message is not None
                     else None
                 )
+                if reply_id is not None:
+                    self._replied_texts[reply_id] = msg.reply_to_message.text or ""
+                    while len(self._replied_texts) > 256:
+                        self._replied_texts.pop(next(iter(self._replied_texts)))
                 try:
                     await handler(text, reply_id)
                 except Exception as e:

@@ -236,6 +236,7 @@ See [Telegram bridge]({{ '/bridge/' | relative_url }}) for the full setup walkth
 | `ask_timeout_seconds` | int | `900` | Same meaning as the Telegram key above: it bounds only the in-session wait, and a later reply still resolves through `pending_resumes`. |
 | `question_ttl_seconds` | int | `172800` (48h) | Same meaning as the Telegram key above. |
 | `question_retention_days` | int | `90` | Same meaning as the Telegram key above. |
+| `shared` | bool | `false` | Other machines use this same bot and channel (see [Operations: chat with several machines]({{ '/operations/' | relative_url }}#chat-with-several-machines)). Each machine then acts only on replies to its own questions and on messages that name it (`node-a: ...`); a message that names no machine is left alone. |
 
 **The bot must be a member of that channel.** A bot without `post:all` cannot
 post where it is not a member — and, the part that is easy to miss, it does not

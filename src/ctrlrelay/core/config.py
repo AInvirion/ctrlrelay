@@ -184,6 +184,10 @@ class MattermostConfig(BaseModel):
     ask_timeout_seconds: int = Field(default=900, ge=60)
     question_ttl_seconds: int = Field(default=172800, ge=3600)
     question_retention_days: int = Field(default=90, ge=1)
+    # #248: other machines use this same bot and channel. Each machine then
+    # acts only on replies to its own questions, and on messages that name
+    # it ("node-a: ..."); a message that names no machine is left alone.
+    shared: bool = False
 
     @field_validator("socket_path", mode="before")
     @classmethod
