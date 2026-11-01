@@ -2660,8 +2660,8 @@ def poller_start(
         )
 
         # The account's GitHub API budget (#237): read on a schedule, shown
-        # on the page, and the gate every `gh` call of this process passes,
-        # so a used-up bucket fails fast as rate limited until its reset.
+        # on the page, and a gate on this process's `gh` calls whose bucket
+        # is known, so those fail fast as rate limited until the reset.
         from ctrlrelay.core.github_budget import BudgetStore, GitHubBudget
 
         github_budget = GitHubBudget(

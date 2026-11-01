@@ -42,6 +42,8 @@ BUCKETS = ("core", "search", "graphql")
 OK, LOW, OUT, UNKNOWN = "ok", "low", "out", "unknown"
 # Epoch seconds between 2001 and 2286; outside that a reset is not a time.
 _MIN_TS, _MAX_TS = 1_000_000_000, 10_000_000_000
+_MAX_LIMIT = 10_000_000
+NOTIFY_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -104,7 +106,11 @@ def _bucket(raw: Any, *, reset_key: str) -> Bucket | None:
     )
     if remaining is None or limit is None or reset is None:
         return None
-    if not _MIN_TS <= reset < _MAX_TS or limit < 0:
+    if not _MIN_TS <= reset < _MAX_TS:
+        return None
+    # A real bucket: a positive limit no bigger than any GitHub uses, and
+    # 0 <= remaining <= limit. Anything else is unreadable, not empty.
+    if not 0 < limit <= _MAX_LIMIT or not 0 <= remaining <= limit:
         return None
     return Bucket(remaining=remaining, limit=limit, resets_at=reset)
 
@@ -146,6 +152,8 @@ def bucket_for(args: Sequence[str]) -> str | None:
         return "search"
     if args[0] == "api":
         path = _api_endpoint(args[1:]).lstrip("/")
+        if path.split("?")[0] == "rate_limit":
+            return None  # free, and the read that ends a block: never held
         if path.startswith("graphql"):
             return "graphql"
         if path.startswith("search/"):
@@ -288,7 +296,16 @@ class GitHubBudget:
         # What a previous run left is used until the first read, unless it
         # is older than ``max_age``: then it is about a time nobody knows.
         self.reading: BudgetReading | None = store.read(max_age=max_age, now=clock())
+        # What was last announced per bucket. Seeded from the saved reading
+        # (when still fresh), so a restart does not repeat a "low" line for
+        # a state that has not changed.
         self._said: dict[str, str] = {}
+        if self.reading is not None:
+            now = clock()
+            for name, b in self.reading.buckets.items():
+                state = b.state(low_at, now)
+                if state != UNKNOWN:
+                    self._said[name] = state
         self._marking: asyncio.Task[BudgetReading | None] | None = None
         # One read at a time: a slow read finishing after a newer one must
         # not put an older "used up" back in force.
@@ -380,6 +397,8 @@ class GitHubBudget:
                       remaining=b.remaining, limit=b.limit, resets_at=resets)
             if self.notify is not None:
                 try:
-                    await self.notify(text)
+                    # Bounded: this runs under the refresh lock, and a chat
+                    # send that hangs must not stop budget reads with it.
+                    await asyncio.wait_for(self.notify(text), timeout=NOTIFY_TIMEOUT_SECONDS)
                 except Exception as e:
                     log_event(_logger, "github_budget.notify_failed", error=str(e)[:200])

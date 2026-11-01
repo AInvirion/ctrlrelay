@@ -69,7 +69,7 @@ class TestState:
 
 class TestWhichBucket:
     @pytest.mark.parametrize("args,bucket", [
-        (("api", "rate_limit"), "core"),
+        (("api", "rate_limit"), None),
         (("api", "/repos/o/r/issues/1/events", "--jq", "."), "core"),
         (("api", "--paginate", "repos/o/r/issues/1/comments"), "core"),
         (("api", "graphql", "-f", "query=..."), "graphql"),
@@ -452,3 +452,52 @@ class TestRoundThreeFixes:
         with patch("tempfile.mkstemp", side_effect=OSError("disk full")):
             store.write(parse_rate_limit(rate_limit(core=4000), now=NOW))
         assert store.read() is None
+
+
+
+class TestRoundFourFixes:
+    def test_the_rate_limit_read_is_never_held_whatever_its_spelling(self) -> None:
+        for args in (("api", "rate_limit"), ("api", "/rate_limit"), ("api", "-i", "rate_limit")):
+            assert bucket_for(args) is None
+
+    @pytest.mark.parametrize("remaining,limit", [(-1, 5000), (10, 0), (6000, 5000), (1, 10**400)])
+    def test_an_impossible_bucket_is_unknown(self, remaining: int, limit: int) -> None:
+        text = json.dumps({"resources": {
+            "core": {"limit": limit, "remaining": remaining, "reset": NOW + 60},
+        }})
+        assert parse_rate_limit(text, now=NOW) is None
+
+    @pytest.mark.asyncio
+    async def test_a_hung_chat_send_does_not_hold_the_reads(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        import asyncio
+
+        import ctrlrelay.core.github_budget as mod
+
+        monkeypatch.setattr(mod, "NOTIFY_TIMEOUT_SECONDS", 0.05)
+
+        async def hang(_t: str) -> None:
+            await asyncio.Event().wait()
+
+        budget = GitHubBudget(
+            BudgetStore(tmp_path / "b.json"), low_at=0.2,
+            fetch=AsyncMock(return_value=rate_limit(core=0)), notify=hang, clock=lambda: NOW,
+        )
+        assert await asyncio.wait_for(budget.refresh(), timeout=2) is not None
+
+    @pytest.mark.asyncio
+    async def test_a_restart_does_not_repeat_an_unchanged_state(self, tmp_path: Path) -> None:
+        store = BudgetStore(tmp_path / "b.json")
+        store.write(parse_rate_limit(rate_limit(core=100), now=NOW))
+        said: list[str] = []
+
+        async def notify(t: str) -> None:
+            said.append(t)
+
+        budget = GitHubBudget(
+            store, low_at=0.2, fetch=AsyncMock(return_value=rate_limit(core=90)),
+            notify=notify, clock=lambda: NOW + 60, max_age=900,
+        )
+        await budget.refresh()
+        assert said == []

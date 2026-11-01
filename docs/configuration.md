@@ -364,7 +364,7 @@ github_api:
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `low_at` | number (between 0 and 1) | `0.2` | A bucket below this share of its limit is low: the poll interval is multiplied by `slow_factor`, the status page skips its waiting-line refresh, and one chat line goes out. |
-| `check_minutes` | int (1-60) | `5` | How often the daemon reads `/rate_limit`. That call does not count against the budget. |
+| `check_minutes` | int dividing 60 (1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60) | `5` | How often the daemon reads `/rate_limit`. That call does not count against the budget. |
 | `slow_factor` | number (1-20) | `3` | The poll interval multiplier while any bucket is low. |
 
 When a bucket is used up, the daemon makes no call it knows spends that
