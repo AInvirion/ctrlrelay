@@ -193,6 +193,11 @@ DEFAULT_SANDBOX_HIDE_PATHS: tuple[str, ...] = (
     "~/.pypirc",
     "~/.cargo/credentials",
     "~/.cargo/credentials.toml",
+    "~/.config/doctl",
+    "~/.password-store",
+    "~/.1password",
+    "~/.docker/run",
+    "~/.docker/desktop",
     # The relay's own config, which can hold chat tokens.
     "~/.config/ctrlrelay",
     # Sockets: a read-only mount does not stop a connect. The session's
@@ -200,6 +205,8 @@ DEFAULT_SANDBOX_HIDE_PATHS: tuple[str, ...] = (
     # sockets (the agent gets its own, empty, in its environment); the
     # Docker socket can mount any of the paths above into a container.
     "$XDG_RUNTIME_DIR",
+    # The same, by uid, for a relay started where the variable is unset.
+    f"/run/user/{os.getuid()}",
     "/run/docker.sock",
     "/var/run/docker.sock",
     # What the operator's own agent sessions run: shell snapshots sourced
@@ -208,6 +215,8 @@ DEFAULT_SANDBOX_HIDE_PATHS: tuple[str, ...] = (
     "~/.claude/shell-snapshots",
     "~/.claude/session-env",
     "~/.claude/ide",
+    # Snapshots that a rewind writes back into the operator's files.
+    "~/.claude/file-history",
 )
 
 # Writable inside the sandbox besides the run's own paths (#236): the
@@ -231,6 +240,9 @@ DEFAULT_SANDBOX_READONLY_PATHS: tuple[str, ...] = (
     "~/.claude/plugins",
     "~/.claude/output-styles",
     "~/.claude/scripts",
+    "~/.claude/rules",
+    # What the browser extension's native host runs.
+    "~/.claude/chrome",
     # The agent CLI itself, when installed under its state directory.
     "~/.claude/local",
     # Each project's memory, which the operator's sessions in that project
@@ -315,8 +327,10 @@ def bwrap_prefix(
     for raw in _expand_globs(readonly):
         link = _expand(raw)
         if (
-            link is not None and link.is_symlink()
-            and Path(os.path.realpath(link.parent)) in open_dirs
+            link is not None and link.is_symlink() and any(
+                Path(os.path.realpath(link.parent)).is_relative_to(d)
+                for d in open_dirs
+            )
         ):
             # The bind protects the target; the link itself sits in a
             # writable directory and can be replaced.
@@ -357,17 +371,18 @@ def bwrap_prefix(
                 pins.append(a)
             a = a.parent
 
-    # Shallowest first, so a later bind never covers an earlier one inside
-    # it; every writable mount before every read-only one.
     def depth(p: Path) -> int:
         return len(p.parts)
 
-    for p in sorted([*opened, *pins], key=depth):
-        argv += ["--bind", str(p), str(p)]
+    mounts = [(p, "--bind") for p in [*opened, *pins] if p not in locked]
+    mounts += [(p, "--ro-bind") for p in locked]
+    # By depth, so a mount inside another always comes after it, whichever
+    # kind each is: a read-only directory can hold a writable one (the
+    # shared clone's ``worktrees`` and this run's own in it).
+    for p, kind in sorted(mounts, key=lambda m: (depth(m[0]), m[1] == "--ro-bind")):
+        argv += [kind, str(p), str(p)]
     for src, dest in copies:
         argv += ["--bind", str(src), str(dest)]
-    for p in sorted(locked, key=depth):
-        argv += ["--ro-bind", str(p), str(p)]
     # Last, so neither a writable nor a read-only path that contains or
     # names a hidden one brings it back.
     for raw in hide_paths:
@@ -405,6 +420,13 @@ def _expand_globs(
                 # holds is protected too.
                 if not match.is_dir():
                     continue
+                if match.is_symlink():
+                    # What it leads to is protected; the link itself can be
+                    # replaced if it sits somewhere writable.
+                    logging.getLogger(__name__).warning(
+                        "agent_env.sandbox.readonly_link_replaceable",
+                        extra={"path": str(match)},
+                    )
                 match = match.resolve()
             elif match.is_symlink():
                 continue
@@ -417,15 +439,22 @@ def _expand(raw: str | Path) -> Path | None:
     return None if "$" in expanded else Path(expanded)
 
 
+# What a missing read-only path is made as: these a file, anything else
+# a directory.
+_FILE_SUFFIXES = frozenset({".json", ".md", ".worktree"})
+_FILE_NAMES = frozenset({"config", "commondir", "gitdir"})
+
+
 def _create_readonly(p: Path) -> Path:
     """Create a missing read-only path inside a writable one, so it can be
     bound read-only.
 
     Skipping it would leave the agent free to create it: a
     ``settings.local.json`` with a hook in it, or a git hook, which then
-    runs later as the operator. A name with a suffix is made a file (``{}``
-    for JSON, so the agent CLI still parses it), anything else an empty
-    directory. Raises :class:`SandboxUnavailableError` when it cannot be
+    runs later as the operator. A JSON file is made ``{}`` (so the agent
+    CLI still parses it); a Markdown file and git's ``config``,
+    ``config.worktree``, ``commondir`` and ``gitdir`` are made empty files;
+    anything else an empty directory. Raises :class:`SandboxUnavailableError` when it cannot be
     made, a dangling symlink included (the agent could replace the link):
     the run does not start rather than start with the path open.
     """
@@ -436,7 +465,7 @@ def _create_readonly(p: Path) -> Path:
             "agent.sandbox_readonly_paths"
         )
     try:
-        if p.suffix:
+        if p.suffix in _FILE_SUFFIXES or p.name in _FILE_NAMES:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("{}\n" if p.suffix == ".json" else "")
         else:
@@ -457,15 +486,20 @@ def git_dirs(working_dir: Path) -> list[Path]:
 
     try:
         out = subprocess.run(
-            ["git", "rev-parse", "--path-format=absolute",
+            ["git", "rev-parse", "--path-format=absolute", "--show-toplevel",
              "--git-common-dir", "--git-dir"],
             cwd=working_dir, capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return []
-    if out.returncode != 0:
+    lines = [line for line in out.stdout.splitlines() if line.strip()]
+    if out.returncode != 0 or len(lines) != 3:
         return []
-    return [Path(line) for line in out.stdout.splitlines() if line.strip()]
+    # A directory that is not a repository itself but sits inside one (a
+    # home kept in git) would otherwise name that repository's.
+    if Path(lines[0]).resolve() != working_dir.resolve():
+        return []
+    return [Path(line) for line in lines[1:]]
 
 
 def agent_cache_env(cache_dir: Path) -> dict[str, str]:
@@ -477,6 +511,7 @@ def agent_cache_env(cache_dir: Path) -> dict[str, str]:
         "UV_CACHE_DIR": str(cache_dir / "uv"),
         "npm_config_cache": str(cache_dir / "npm"),
         "GOMODCACHE": str(cache_dir / "go-mod"),
+        "GRADLE_USER_HOME": str(cache_dir / "gradle"),
         # Cargo keeps its registry under CARGO_HOME; the toolchain itself
         # is found through PATH and RUSTUP_HOME, which stay as they are.
         "CARGO_HOME": str(cache_dir / "cargo"),

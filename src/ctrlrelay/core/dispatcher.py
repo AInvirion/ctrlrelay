@@ -215,6 +215,12 @@ class ClaudeDispatcher:
         """The bwrap argv for one run (#236), and the agent's cache
         variables set in ``env``. Raises :class:`SandboxUnavailableError`
         rather than start a run it cannot confine as configured."""
+        if env.get("CLAUDE_CONFIG_DIR"):
+            raise SandboxUnavailableError(
+                "CLAUDE_CONFIG_DIR is set, and the sandbox only knows the "
+                "agent CLI's default state (~/.claude, ~/.claude.json); "
+                "unset it for the relay to run with agent.sandbox: bwrap"
+            )
         cache_raw = os.path.expandvars(os.path.expanduser(self.sandbox_cache_dir))
         if "$" in cache_raw:
             raise SandboxUnavailableError(
@@ -253,8 +259,9 @@ class ClaudeDispatcher:
             # worktree with no ``.git`` lets it plant one, hooks and all,
             # for the relay's later git commands there.
             raise SandboxUnavailableError(
-                f"could not find the git directories of {working_dir}; "
-                "not starting the agent"
+                f"could not find the git directories of {working_dir} (it "
+                "must be a git worktree's top, and git 2.31 or later is "
+                "needed); not starting the agent"
             )
         # What every later git command in this clone runs, the relay's
         # included: its config (core.hooksPath, core.fsmonitor, filters),
@@ -267,8 +274,17 @@ class ClaudeDispatcher:
             for name in ("config", "config.worktree"):
                 (d / name).touch(exist_ok=True)
                 git_protected.append(d / name)
+            # Submodules' git dirs, whose config git reads in each
+            # submodule when run in this one.
+            if (d / "modules").exists():
+                git_protected.append(d / "modules")
             if i == 0:
                 git_protected.append(d / "hooks")
+                # Every worktree's git dir is in here: the others belong to
+                # other runs, so the folder is read-only and only this
+                # run's own (bound later, deeper) is writable.
+                if len(repo_dirs) > 1 and repo_dirs[1].parent == d / "worktrees":
+                    git_protected.append(d / "worktrees")
             else:
                 # A linked worktree's pointers back to the shared clone:
                 # rewritten, they would send git to a config of the agent's.
@@ -283,7 +299,7 @@ class ClaudeDispatcher:
         # own copy, thrown away with the private dir.
         copies: list[tuple[Path, Path]] = []
         main_config = Path.home() / ".claude.json"
-        if main_config.is_file() and not main_config.is_symlink():
+        if main_config.is_file():
             copy = private_root / "claude.json"
             shutil.copyfile(main_config, copy)
             copy.chmod(0o600)

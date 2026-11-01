@@ -80,7 +80,9 @@ M="$HOME/.claude/projects/-bare/memory"
 try create_project_memory "mkdir -p $M && touch $M/MEMORY.md"
 try repoint_dot_git "echo 'gitdir: /elsewhere' > .git"
 try worktree_config "echo planted >> $GITDIR/config.worktree"
-try read_hidden_in_writable "cat $HOME/.claude/secret-token"
+try read_hidden_in_writable "grep -q token $HOME/.claude/secret-token"
+try other_run_commondir "echo /elsewhere > $GITCOMMON/worktrees/other/commondir"
+try rename_other_run "mv $GITCOMMON/worktrees/other $GITCOMMON/worktrees/other.x"
 try write_main_config "echo planted >> $HOME/.claude.json"
 try repoint_commondir "echo /elsewhere > $GITDIR/commondir"
 try rename_worktrees "mv $GITCOMMON/worktrees $GITCOMMON/worktrees.x"
@@ -144,6 +146,8 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
     _git("push", "-q", str(bare), "main", cwd=seed)
     wt = home / "wt"
     _git("worktree", "add", "-q", "-b", "run", str(wt), "main", cwd=bare)
+    # Another run's worktree in the same clone.
+    _git("worktree", "add", "-q", "-b", "other", str(home / "other"), "main", cwd=bare)
 
     # Not there before the run: the agent must not be able to create it.
     shutil.rmtree(bare / "hooks")
@@ -186,6 +190,8 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         "repoint_dot_git": "no",
         "worktree_config": "no",
         "read_hidden_in_writable": "no",
+        "other_run_commondir": "no",
+        "rename_other_run": "no",
         # Its own copy; the real one is checked below.
         "write_main_config": "yes",
         "repoint_commondir": "no",
@@ -354,11 +360,13 @@ def test_a_missing_git_config_is_made_a_file_not_a_directory(
         usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
         sandbox_cache_dir=str(tmp_path / "c"),
     )
-    d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)
+    private = tmp_path / "private"
+    private.mkdir()
+    d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", private)
     assert (wt / ".git" / "config").is_file()
 
 
-@pytest.mark.parametrize("make", ["nothing", "dangling"])
+@pytest.mark.parametrize("make", ["nothing", "dangling", "inside-another"])
 def test_a_worktree_whose_git_directory_cannot_be_found_is_refused(
     tmp_path, make,
 ) -> None:
@@ -371,6 +379,9 @@ def test_a_worktree_whose_git_directory_cannot_be_found_is_refused(
     wt.mkdir()
     if make == "dangling":
         (wt / ".git").symlink_to(tmp_path / "gone")
+    if make == "inside-another":
+        # A home kept in git: the enclosing repository is not this run's.
+        _git("init", "-q", str(tmp_path), cwd=tmp_path)
     d = ClaudeDispatcher(
         usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
         sandbox_cache_dir=str(tmp_path / "c"),
@@ -419,3 +430,20 @@ def test_a_replaceable_read_only_link_is_named_and_an_entry_level_one_is_not(
                      readonly=[state / "settings.json"])
     [rec] = [r for r in caplog.records if "replaceable" in r.getMessage()]
     assert rec.path == str(state / "settings.json")
+
+
+def test_claude_config_dir_set_is_refused(tmp_path, monkeypatch) -> None:
+    if BWRAP is None:
+        pytest.skip("bwrap not installed")
+    from ctrlrelay.core.agent_env import SandboxUnavailableError
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    wt = tmp_path / "wt"
+    _git("init", "-q", str(wt), cwd=tmp_path)
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
+        sandbox_cache_dir=str(tmp_path / "c"),
+    )
+    with pytest.raises(SandboxUnavailableError, match="CLAUDE_CONFIG_DIR"):
+        d._sandbox_prefix({"CLAUDE_CONFIG_DIR": "/x"}, wt,
+                          wt / ".ctrlrelay" / "state.json", tmp_path)
