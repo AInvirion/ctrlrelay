@@ -503,12 +503,12 @@ exists", reads the owner's name from the blob, logs `jobs.skipped`, and skips
 that repo. The ref is not a branch and GitHub shows it nowhere in its
 interface.
 
-`<window>` is the minute the sweep was **due** by its cron rule, for example
-`20261101T0600Z`, not when it started: every machine works it out from the
-same rule, so machines a few seconds apart agree on it. A machine that was
-asleep runs a missed sweep once, up to an hour late, for the latest time it
-was due, and names that window. A machine that dies holding a window loses only
-that window: the next one is a new ref. Refs older than 7 days are deleted by
+`<window>` is the minute the sweep was **due**, for example
+`20261101T0600Z`, as the scheduler planned that run, not when it started:
+machines a few seconds apart, or one started late, agree on it. A machine
+that was asleep runs a missed sweep once, up to an hour late, for the latest
+time it was due, and names that window. A machine that dies holding a window loses only
+that window: the next one is a new ref. Refs older than 30 days are deleted by
 the next machine that claims.
 
 A machine claims a repo only once it holds that repo's local lock, so it

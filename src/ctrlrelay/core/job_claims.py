@@ -20,7 +20,8 @@ or one of them late, name the same window, and two different fires never
 share one. A machine that dies holding a window loses only that window:
 the next window is a new ref.
 
-Old refs are deleted after ``KEEP_DAYS``.
+Old refs are deleted after ``KEEP_DAYS``; the claim's job only needs it
+while its run lasts.
 """
 
 from __future__ import annotations
@@ -36,9 +37,10 @@ from ctrlrelay.core.obs import get_logger, log_event
 _logger = get_logger("core.job_claims")
 
 REF_PREFIX = "refs/ctrlrelay/claims"
-# Claims older than this are deleted. A run more than an hour late is
-# dropped by the scheduler, so no machine can still be working on one.
-KEEP_DAYS = 7
+# Claims older than this are deleted. A sweep that is still running a week
+# after it was due would lose its claim to the prune; sweeps take minutes
+# to hours, so 30 days leaves a wide margin.
+KEEP_DAYS = 30
 _WINDOW_FORMAT = "%Y%m%dT%H%MZ"
 
 

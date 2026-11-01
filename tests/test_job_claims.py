@@ -120,18 +120,18 @@ class TestClaim:
     @pytest.mark.asyncio
     async def test_old_windows_are_pruned_recent_ones_kept(self) -> None:
         refs = Refs()
-        for name in ("secops/20261020T0600Z", "secops/20261030T0600Z",
+        for name in ("secops/20261001T0600Z", "secops/20261030T0600Z",
                      "secops/not-a-window", "other/20261001T0600Z",
                      "secops/nested/20261001T0600Z"):
             refs.refs[f"o/r:{REF_PREFIX}/{name}"] = "x"
         await JobClaimer(refs, "node-a", window="20261101T0600Z").claim("o/r", "secops")
         left = sorted(k.split(":", 1)[1] for k in refs.refs)
-        assert f"{REF_PREFIX}/secops/20261020T0600Z" not in left  # 12 days
+        assert f"{REF_PREFIX}/secops/20261001T0600Z" not in left  # 31 days
         assert f"{REF_PREFIX}/secops/20261030T0600Z" in left  # 2 days
         assert f"{REF_PREFIX}/secops/not-a-window" in left  # not ours to judge
         assert f"{REF_PREFIX}/other/20261001T0600Z" in left  # another job
         assert f"{REF_PREFIX}/secops/nested/20261001T0600Z" in left  # not a child
-        assert KEEP_DAYS == 7
+        assert KEEP_DAYS == 30
 
 
 class TestTheSweep:
@@ -276,12 +276,42 @@ class TestRoundOneFixes:
             db.close()
 
     @pytest.mark.asyncio
-    async def test_an_unexpected_failure_is_an_error_result(self) -> None:
-        refs = Refs()
+    async def test_an_unexpected_failure_is_an_error_result(self, monkeypatch) -> None:
+        import ctrlrelay.core.job_claims as mod
 
-        async def boom(*a):
+        def boom(*a, **k):
             raise KeyError("surprise")
 
-        refs.create_ref = boom
-        out = await JobClaimer(refs, "node-a", window="20261101T0600Z").claim("o/r", "secops")
+        # Outside the API calls' own handler: the logging after a win.
+        monkeypatch.setattr(mod, "log_event", boom)
+        out = await JobClaimer(Refs(), "node-a", window="20261101T0600Z").claim("o/r", "secops")
         assert not out.won and "KeyError" in out.error
+
+
+
+class TestTheSchedulerSaysWhichRun:
+    @pytest.mark.asyncio
+    async def test_a_run_started_late_names_the_fire_the_scheduler_planned(self) -> None:
+        from datetime import timedelta
+
+        from ctrlrelay.core.scheduler import current_due_time, make_scheduler
+
+        seen = []
+
+        async def job() -> None:
+            seen.append(current_due_time())
+
+        sched = make_scheduler("UTC")
+        sched.add_cron_job(name="every-minute", cron_expr="* * * * *", func=job)
+        sched.start()
+        try:
+            planned = sched._impl.get_job("every-minute")
+            this_fire = planned.next_run_time
+            # The scheduler submits this fire and moves on to the next ...
+            planned.modify(next_run_time=this_fire + timedelta(minutes=1))
+            # ... and the run itself starts 59 seconds late.
+            await planned.func()
+        finally:
+            await sched.shutdown()
+        assert seen == [this_fire]
+        assert current_due_time() is None  # nothing leaks out of the run

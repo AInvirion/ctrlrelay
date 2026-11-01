@@ -19,6 +19,7 @@ is required.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 
@@ -242,6 +243,21 @@ class Scheduler:
             task = asyncio.current_task()
             if task is not None:
                 self._running_jobs.add(task)
+            # Which fire this run is (#246). The scheduler moved the job's
+            # next run time on when it submitted this one, so the fire just
+            # before that is this run's, however late it started; with
+            # coalescing it is the latest of the missed ones.
+            _due = None
+            try:
+                job = self._impl.get_job(name)
+                if job is not None and job.next_run_time is not None:
+                    _due = last_fire_time(
+                        cron_expr, self._impl.timezone,
+                        job.next_run_time - timedelta(seconds=1),
+                    )
+            except Exception:
+                _due = None
+            due_token = _CURRENT_DUE.set(_due)
             log_event(_logger, "scheduler.job.start", job=name, cron=cron_expr)
             try:
                 await func()
@@ -258,6 +274,7 @@ class Scheduler:
                     error=str(e)[:200],
                 )
             finally:
+                _CURRENT_DUE.reset(due_token)
                 if task is not None:
                     self._running_jobs.discard(task)
 
@@ -336,6 +353,18 @@ def make_scheduler(timezone: str) -> Scheduler:
     """
     impl = AsyncIOScheduler(timezone=timezone)
     return Scheduler(impl)
+
+
+# The due time of the scheduled run executing in this task, or None.
+_CURRENT_DUE: contextvars.ContextVar[datetime | None] = contextvars.ContextVar(
+    "ctrlrelay_scheduler_due", default=None,
+)
+
+
+def current_due_time() -> datetime | None:
+    """When the scheduled run executing now was due, as the scheduler
+    planned it; ``None`` outside a scheduled run (#246)."""
+    return _CURRENT_DUE.get()
 
 
 def last_fire_time(cron_expr: str, timezone, now: datetime) -> datetime | None:

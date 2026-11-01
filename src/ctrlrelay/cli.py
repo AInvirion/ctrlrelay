@@ -1112,18 +1112,22 @@ def settle_claimed_elsewhere(
 
 
 def sweep_window(cron_expr: str, tz_name: str) -> str:
-    """The claim window of a scheduled run (#246): the minute the cron rule
-    was last due; the current minute if it was not due in 40 days."""
+    """The claim window of a scheduled run (#246): the due time the
+    scheduler planned for the run executing now. Outside one (or if the
+    scheduler could not say), the minute the cron rule was last due, or
+    the current minute if it was not due in 40 days."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
     from ctrlrelay.core.job_claims import window_id
-    from ctrlrelay.core.scheduler import last_fire_time
+    from ctrlrelay.core.scheduler import current_due_time, last_fire_time
 
-    tz = ZoneInfo(tz_name)
-    now = datetime.now(tz)
-    due = last_fire_time(cron_expr, tz, now)
-    return window_id((due or now).timestamp())
+    due = current_due_time()
+    if due is None:
+        tz = ZoneInfo(tz_name)
+        now = datetime.now(tz)
+        due = last_fire_time(cron_expr, tz, now) or now
+    return window_id(due.timestamp())
 
 
 def defer_for_usage(poller, repo: str, issue_number: int, pause) -> str:
