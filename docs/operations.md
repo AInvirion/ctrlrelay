@@ -291,10 +291,12 @@ machine last read it: `read_at`, and for `core`, `search` and `graphql` each
 or `"unknown"` for a bucket it could not read; the whole value is `"unknown"`
 before any reading. The page shows it in the **Usage** box. Low and used-up
 buckets are described in [configuration: github_api]({{ '/configuration/' | relative_url }}#github_api).
-Which bucket a `gh` command spends is worked out from the command: `gh api`
-REST paths are `core`, `gh api graphql` is `graphql`, search paths and
-`gh search` are `search`, and the other `gh` commands are counted as
-`graphql`.
+Which bucket a `gh` command spends is worked out from the command where the
+command says: `gh api` REST paths are `core`, `gh api graphql` is `graphql`,
+search paths and `gh search` are `search`. The other `gh` commands (`issue`,
+`pr`, `repo`, `run`) do not say which endpoints they call, so they are not
+held back; if GitHub refuses one as rate limited, the budget is read again at
+once.
 
 **Pausing for usage.** Every agent run reports the subscription's usage, and
 an idle machine refreshes it with one tiny call every `usage.probe_minutes`.

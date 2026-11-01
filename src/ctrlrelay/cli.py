@@ -4149,7 +4149,9 @@ def web_start(
         budget_store = BudgetStore.beside(config.paths.state_db)
 
         def _budget_is_low() -> bool:
-            reading = budget_store.read()
+            reading = budget_store.read(
+                max_age=3 * config.github_api.check_minutes * 60,
+            )
             if reading is None:
                 return False
             now = time.time()

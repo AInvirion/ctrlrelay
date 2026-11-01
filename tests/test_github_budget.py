@@ -45,8 +45,8 @@ class TestParsing:
 
     @pytest.mark.parametrize("text", [
         "", "nope", "{}", '{"resources": {}}',
-        json.dumps({"resources": {"core": {"limit": "5000", "remaining": 1, "reset": 1}}}),
-        json.dumps({"resources": {"core": {"limit": True, "remaining": 1, "reset": 1}}}),
+        json.dumps({"resources": {"core": {"limit": "5000", "remaining": 1, "reset": NOW + 60}}}),
+        json.dumps({"resources": {"core": {"limit": True, "remaining": 1, "reset": NOW + 60}}}),
     ])
     def test_unreadable_is_none_never_a_full_or_empty_budget(self, text: str) -> None:
         assert parse_rate_limit(text, now=NOW) is None
@@ -75,12 +75,13 @@ class TestWhichBucket:
         (("api", "graphql", "-f", "query=..."), "graphql"),
         (("api", "search/issues?q=x"), "search"),
         (("search", "issues", "x"), "search"),
-        (("issue", "view", "1", "--repo", "o/r"), "graphql"),
-        (("pr", "list", "--repo", "o/r"), "graphql"),
+        (("issue", "view", "1", "--repo", "o/r"), None),
+        (("issue", "comment", "1", "--repo", "o/r", "--body", "x"), None),
+        (("pr", "list", "--repo", "o/r"), None),
         (("api", "-X", "GET", "search/issues", "-f", "q=x"), "search"),
         (("api", "--method", "POST", "graphql", "-f", "query=x"), "graphql"),
         (("api", "-H", "Accept: x", "repos/o/r"), "core"),
-        (("run", "view", "--job", "1", "--log-failed"), "core"),
+        (("run", "view", "--job", "1", "--log-failed"), None),
     ])
     def test_bucket(self, args, bucket) -> None:
         assert bucket_for(args) == bucket
@@ -369,3 +370,63 @@ class TestRoundOneFixes:
         else:
             with pytest.raises(ValidationError):
                 GitHubApiConfig(check_minutes=minutes)
+
+
+
+class TestRoundTwoFixes:
+    @pytest.mark.asyncio
+    async def test_an_older_read_cannot_finish_after_a_newer_one(self, tmp_path: Path) -> None:
+        import asyncio
+
+        gate = asyncio.Event()
+        answers = [rate_limit(core=0), rate_limit(core=4000)]
+
+        async def fetch() -> str:
+            answer = answers.pop(0)
+            if "\"remaining\": 0" in answer:
+                await gate.wait()  # the "used up" read is slow
+            return answer
+
+        budget = GitHubBudget(
+            BudgetStore(tmp_path / "b.json"), low_at=0.2, fetch=fetch, clock=lambda: NOW,
+        )
+        slow = asyncio.create_task(budget.refresh())
+        await asyncio.sleep(0)
+        fast = asyncio.create_task(budget.refresh())
+        await asyncio.sleep(0)
+        gate.set()
+        await asyncio.gather(slow, fast)
+        # Serialised: the newer read is the one standing.
+        assert budget.blocked_until("core") is None
+        assert budget.reading.buckets["core"].remaining == 4000
+
+    def test_a_failed_unknown_write_removes_the_old_numbers(self, tmp_path: Path) -> None:
+        store = BudgetStore(tmp_path / "b.json")
+        store.write(parse_rate_limit(rate_limit(core=0), now=NOW))
+        with patch("tempfile.mkstemp", side_effect=OSError("disk full")):
+            store.mark_unknown(NOW)
+        assert store.read() is None
+
+    def test_numbers_the_daemon_stopped_writing_expire(self, tmp_path: Path) -> None:
+        store = BudgetStore(tmp_path / "b.json")
+        store.write(parse_rate_limit(rate_limit(core=0), now=NOW))
+        assert store.read(max_age=900, now=NOW + 900) is not None
+        assert store.read(max_age=900, now=NOW + 901) is None
+
+    @pytest.mark.asyncio
+    async def test_commands_whose_bucket_is_unknown_are_never_held_back(
+        self, tmp_path: Path,
+    ) -> None:
+        from ctrlrelay.core.github import GitHubCLI
+
+        budget = GitHubBudget(
+            BudgetStore(tmp_path / "b.json"), low_at=0.2, fetch=AsyncMock(), clock=lambda: NOW,
+        )
+        budget.reading = parse_rate_limit(rate_limit(core=0, graphql=0), now=NOW)
+        gh = GitHubCLI(gh_binary="gh", budget=budget)
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"", b"")
+        proc.returncode = 0
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as spawn:
+            await gh._run_gh("issue", "comment", "1", "--repo", "o/r", "--body", "x")
+        assert spawn.call_count == 1

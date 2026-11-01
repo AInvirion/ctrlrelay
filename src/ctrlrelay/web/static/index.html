@@ -623,7 +623,8 @@ function renderGitHubBudget(api, now, lines) {
   }
   ["core", "search", "graphql"].forEach(function (name) {
     var b = api[name];
-    if (!b || typeof b !== "object" || typeof b.remaining !== "number") {
+    if (!b || typeof b !== "object" || typeof b.remaining !== "number" ||
+        b.state === "unknown") {
       lines.push(el("div", "line", "GitHub " + name + " unknown"));
       return;
     }

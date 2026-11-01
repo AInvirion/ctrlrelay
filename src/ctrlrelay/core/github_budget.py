@@ -128,18 +128,20 @@ def parse_rate_limit(text: str, *, now: float | None = None) -> BudgetReading | 
     return BudgetReading(buckets=buckets, read_at=int(time.time() if now is None else now))
 
 
-def bucket_for(args: Sequence[str]) -> str:
-    """Which bucket a ``gh`` command spends, as far as the command says.
+def bucket_for(args: Sequence[str]) -> str | None:
+    """Which bucket a ``gh`` command spends, or ``None`` when that is not
+    known.
 
     ``gh api``: the endpoint argument (skipping options and their values)
     is ``graphql``, a ``search/`` path, or REST (``core``). ``gh search``
-    is ``search``. ``gh run`` and ``gh release`` are REST. The rest of the
-    commands this relay uses (``issue``, ``pr``, ``repo``) go through
-    GraphQL. A best effort: the exact endpoints of a ``gh`` command are
-    not part of its interface.
+    is ``search``. The other commands (``issue``, ``pr``, ``repo``,
+    ``run``) are ``None``: which endpoints they call is not part of their
+    interface, and a guess would either block a call whose bucket is fine
+    or let one through to a used-up one. They are not gated; if GitHub
+    refuses one as rate limited, that answer triggers a fresh read.
     """
     if not args:
-        return "core"
+        return None
     if args[0] == "search":
         return "search"
     if args[0] == "api":
@@ -149,9 +151,7 @@ def bucket_for(args: Sequence[str]) -> str:
         if path.startswith("search/"):
             return "search"
         return "core"
-    if args[0] in ("run", "release"):
-        return "core"
-    return "graphql"
+    return None
 
 
 # `gh api` options that take a value as the next argument.
@@ -232,12 +232,28 @@ class BudgetStore:
             os.replace(tmp, self.path)
         except Exception as e:
             log_event(_logger, "github_budget.write_failed", error=str(e)[:200])
+            # Could not say unknown: at least do not leave the old numbers
+            # to be read as current.
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    def read(self) -> BudgetReading | None:
+    def read(
+        self, *, max_age: float | None = None, now: float | None = None,
+    ) -> BudgetReading | None:
+        """The stored reading, or ``None``. With ``max_age``, a reading older
+        than that is ``None`` too: the daemon writes one every few minutes,
+        so an old one means it stopped writing, and its numbers are not
+        current whatever they say."""
         try:
-            return BudgetReading.from_json(json.loads(self.path.read_text()))
+            reading = BudgetReading.from_json(json.loads(self.path.read_text()))
         except (OSError, ValueError, RecursionError):
             return None
+        if reading is not None and max_age is not None:
+            if (time.time() if now is None else now) - reading.read_at > max_age:
+                return None
+        return reading
 
 
 class GitHubBudget:
@@ -266,10 +282,13 @@ class GitHubBudget:
         self.reading: BudgetReading | None = store.read()
         self._said: dict[str, str] = {}
         self._marking: asyncio.Task[BudgetReading | None] | None = None
+        # One read at a time: a slow read finishing after a newer one must
+        # not put an older "used up" back in force.
+        self._refresh_lock = asyncio.Lock()
 
-    def blocked_until(self, bucket: str) -> int | None:
+    def blocked_until(self, bucket: str | None) -> int | None:
         """The reset time, while ``bucket`` is out; otherwise ``None``."""
-        if self.reading is None:
+        if self.reading is None or bucket is None:
             return None
         b = self.reading.buckets.get(bucket)
         if b is None or b.state(self.low_at, self._clock()) != OUT:
@@ -298,6 +317,10 @@ class GitHubBudget:
             pass
 
     async def refresh(self) -> BudgetReading | None:
+        async with self._refresh_lock:
+            return await self._refresh()
+
+    async def _refresh(self) -> BudgetReading | None:
         try:
             text = await self._fetch()
             reading = parse_rate_limit(text, now=self._clock())

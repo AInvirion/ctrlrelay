@@ -276,7 +276,9 @@ class StatusServer(ThreadingHTTPServer):
         return {
             "name": self.config.node_id,
             "github_api": budget_json(
-                BudgetStore.beside(self.config.paths.state_db).read(),
+                BudgetStore.beside(self.config.paths.state_db).read(
+                    max_age=3 * api.check_minutes * 60,
+                ),
                 low_at=api.low_at, now=time.time(),
             ),
             "usage": usage_json(reading),
