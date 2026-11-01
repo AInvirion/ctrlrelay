@@ -936,6 +936,7 @@ class TestADevRunEndsWithTheRelayPublishing:
         state_db = StateDB(tmp_path / "state.db")
         try:
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo", issue_number=7,
                 branch_template="fix/issue-{n}", dispatcher=dispatcher,
                 github=github, worktree=_manager(tmp_path), dashboard=None,
@@ -1001,6 +1002,7 @@ class TestADevRunEndsWithTheRelayPublishing:
         state_db = StateDB(tmp_path / "state.db")
         try:
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo", issue_number=7, branch_template="main",
                 dispatcher=dispatcher, github=github, worktree=worktree,
                 dashboard=None, state_db=state_db, transport=None,
@@ -1163,6 +1165,7 @@ class TestAFixRoundIsPushedByTheRelay:
         state_db = StateDB(tmp_path / "state.db")
         try:
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo", issue_number=7,
                 branch_template="fix/issue-{n}", dispatcher=dispatcher,
                 github=github, worktree=worktree, dashboard=None,

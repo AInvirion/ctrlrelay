@@ -159,6 +159,7 @@ async def test_dev_marks_a_clone_failure_as_before_dispatch(tmp_path: Path) -> N
     dispatcher = AsyncMock()
 
     result = await run_dev_issue(
+        claims=None,
         repo=REPO, issue_number=7, branch_template="fix/issue-{n}",
         dispatcher=dispatcher, github=github, worktree=worktree,
         dashboard=None, state_db=StateDB(tmp_path / "state.db"),
@@ -185,6 +186,7 @@ async def test_dev_does_not_mark_a_failure_once_the_pipeline_runs(
     monkeypatch.setattr(DevPipeline, "run", run)
 
     result = await run_dev_issue(
+        claims=None,
         repo=REPO, issue_number=7, branch_template="fix/issue-{n}",
         dispatcher=dispatcher, github=github, worktree=worktree,
         dashboard=None, state_db=StateDB(tmp_path / "state.db"),
@@ -206,6 +208,7 @@ async def test_task_marks_a_clone_failure_as_before_dispatch(tmp_path: Path) -> 
     dispatcher = AsyncMock()
 
     result = await run_task_issue(
+        claims=None,
         repo=REPO, issue_number=7, dispatcher=dispatcher, github=github,
         worktree=worktree, dashboard=None,
         state_db=StateDB(tmp_path / "state.db"), transport=None,
@@ -231,6 +234,7 @@ async def test_task_does_not_mark_a_failure_once_the_pipeline_runs(
     monkeypatch.setattr(TaskPipeline, "run", run)
 
     result = await run_task_issue(
+        claims=None,
         repo=REPO, issue_number=7, dispatcher=dispatcher, github=github,
         worktree=worktree, dashboard=None,
         state_db=StateDB(tmp_path / "state.db"), transport=None,

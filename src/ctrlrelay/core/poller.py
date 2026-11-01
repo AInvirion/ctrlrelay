@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -135,6 +136,10 @@ class IssuePoller:
     # (#234). Persisted with seen_issues so a restart does not reset
     # the limit on a permanent problem.
     pre_dispatch_failures: dict[str, dict[int, int]] = field(default_factory=dict)
+    # Issues another machine holds (#245), per repo: when to look again,
+    # as an epoch time. In memory only; after a restart the issue is
+    # simply checked once more.
+    recheck_after: dict[str, dict[int, float]] = field(default_factory=dict)
     accept_foreign_assignments: set[str] = field(default_factory=set)
     exclude_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
     include_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
@@ -446,6 +451,8 @@ class IssuePoller:
 
                 if number in seen_for_repo:
                     continue
+                if not self._recheck_due(repo, number):
+                    continue
 
                 # Exclude-label filter runs before the assignment-event
                 # lookup so operator-only issues never trigger a second
@@ -749,6 +756,25 @@ class IssuePoller:
         if seen and issue_number in seen:
             seen.discard(issue_number)
             self._save_state_best_effort()
+
+    def recheck_at(self, repo: str, issue_number: int, when: float) -> None:
+        """Leave ``issue_number`` alone until ``when``, then offer it again.
+
+        For an issue another machine has claimed (#245): asking on every
+        poll costs GitHub calls for an answer that rarely changes. A
+        claim released earlier than ``when`` is noticed at ``when``.
+        """
+        self.recheck_after.setdefault(repo, {})[issue_number] = when
+        self.unmark_seen(repo, issue_number)
+
+    def _recheck_due(self, repo: str, issue_number: int) -> bool:
+        pending = self.recheck_after.get(repo)
+        if not pending or issue_number not in pending:
+            return True
+        if time.time() < pending[issue_number]:
+            return False
+        del pending[issue_number]
+        return True
 
     def record_pre_dispatch_failure(self, repo: str, issue_number: int) -> int:
         """Count one run of ``issue_number`` that failed before the agent

@@ -723,6 +723,30 @@ def _validate_cron_expression(v: str, field: str) -> str:
     return v
 
 
+class ClaimsConfig(BaseModel):
+    """Timings for claims on a shared account (#245).
+
+    The refresh and stale times are compared across machines' clocks
+    (GitHub's ``updated_at`` against this machine's now), so the stale
+    time is minutes, not seconds, and far above any clock drift.
+    """
+
+    race_wait_seconds: float = Field(default=5.0, ge=0, le=60)
+    refresh_seconds: float = Field(default=300.0, ge=30)
+    stale_after_seconds: float = Field(default=1800.0, ge=300)
+
+    @model_validator(mode="after")
+    def stale_after_covers_several_refreshes(self) -> "ClaimsConfig":
+        # One missed refresh (a GitHub blip) must not make a live run
+        # look stopped.
+        if self.stale_after_seconds < 3 * self.refresh_seconds:
+            raise ValueError(
+                "claims.stale_after_seconds must be at least three times "
+                "claims.refresh_seconds"
+            )
+        return self
+
+
 class Config(BaseModel):
     """Root configuration model for ctrlrelay orchestrator."""
 
@@ -736,6 +760,7 @@ class Config(BaseModel):
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
     web: WebConfig = Field(default_factory=WebConfig)
+    claims: ClaimsConfig = Field(default_factory=ClaimsConfig)
     personalization: Personalization | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
 

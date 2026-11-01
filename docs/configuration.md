@@ -33,13 +33,14 @@ repos:        [ ... ]
 | Key | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `version` | string | no | `"1"` | Config schema version. Currently always `"1"`. |
-| `node_id` | string | no | `socket.gethostname()` | Free-form identifier for this machine. Surfaces in dashboard heartbeats and session logs. Defaults to the OS hostname when omitted, null, or blank — set explicitly only if the hostname is meaningless (CI runners, ephemeral containers). |
+| `node_id` | string | no | `socket.gethostname()` | Free-form identifier for this machine. Surfaces in dashboard heartbeats, session logs, and the claim comment on every issue it takes, so machines sharing one account must each have a different one. `unknown` is reserved (it names claims from older versions). Defaults to the OS hostname when omitted, null, or blank — set explicitly only if the hostname is meaningless (CI runners, ephemeral containers). |
 | `timezone` | string | no | `"UTC"` | IANA timezone (e.g. `America/Santiago`). Used for scheduling. |
 | `paths` | object | **yes** | — | See [paths](#paths). |
 | `claude` | object | no | (defaults) | See [claude](#claude). |
 | `transport` | object | **yes** | — | See [transport](#transport). |
 | `dashboard` | object | no | (defaults) | See [dashboard](#dashboard). |
 | `web` | object | no | (defaults) | The read-only status page. See [web](#web). |
+| `claims` | object | no | (defaults) | Claim timings for several machines on one account. See [claims](#claims). |
 | `repos` | list | no | `[]` | See [repos](#repos). |
 | `schedules` | object | no | (defaults) | See [schedules](#schedules). |
 | `personalization` | object | no | unset | Cross-machine sync of Claude state. See [personalization](#personalization) and [Personalization sync]({{ '/personalization/' | relative_url }}). |
@@ -307,6 +308,24 @@ web:
 
 The page has no login and shows repository names, issue titles and the
 questions agents asked. **Never expose it to the internet.**
+
+## claims
+
+How machines that share one GitHub account keep off each other's issues.
+See [Operations: several machines on one account]({{ '/operations/' | relative_url }}#several-machines-on-one-account).
+
+```yaml
+claims:
+  race_wait_seconds: 5
+  refresh_seconds: 300
+  stale_after_seconds: 1800
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `race_wait_seconds` | number (0-60) | `5` | Wait between posting a claim and reading the comments back to see who won. |
+| `refresh_seconds` | number (>= 30) | `300` | How often a working machine edits its claim to show it is alive. |
+| `stale_after_seconds` | number (>= 300) | `1800` | A working claim not refreshed for this long is treated as a stopped machine's, and another machine may take the issue. Must be at least three times `refresh_seconds`. |
 
 ## repos
 

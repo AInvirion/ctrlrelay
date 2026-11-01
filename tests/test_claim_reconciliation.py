@@ -313,6 +313,7 @@ class TestRunDevIssueReconcilesTheClaim:
             exists_remote.return_value = False
             default_branch.return_value = "main"
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=853,
                 branch_template="fix/issue-{n}",
@@ -436,6 +437,7 @@ class TestRunDevIssueReconcilesTheClaim:
             exists_remote.return_value = False
             create.side_effect = RuntimeError("worktree add failed")
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=853,
                 branch_template="fix/issue-{n}",
@@ -481,6 +483,7 @@ class TestRunDevIssueReconcilesTheClaim:
         github.get_issue.side_effect = RuntimeError("gh api 502")
         state_db = StateDB(tmp_path / "state.db")
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=853,
             branch_template="fix/issue-{n}",
@@ -516,6 +519,7 @@ class TestRunDevIssueReconcilesTheClaim:
         # A peer already holds the repo lock.
         state_db.acquire_lock("owner/repo", "someone-elses-session")
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=853,
             branch_template="fix/issue-{n}",
@@ -587,6 +591,7 @@ class TestTheExceptionPathNamesTheExitCodeItHas:
             # the exception arrives AFTER the exit code is known.
             remove.side_effect = RuntimeError("worktree remove failed")
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=853,
                 branch_template="fix/issue-{n}",
@@ -640,6 +645,7 @@ class TestAClaimWhoseResponseWasLostIsStillReconciled:
         github.comment_on_issue.side_effect = flaky_comment
         state_db = StateDB(tmp_path / "state.db")
         result = await run_dev_issue(
+            claims=None,
             repo="owner/repo",
             issue_number=853,
             branch_template="fix/issue-{n}",
@@ -737,6 +743,7 @@ class TestTheRealPipelineRecordsTheExitCode:
             exists_local.return_value = False
             exists_remote.return_value = False
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=853,
                 branch_template="fix/issue-{n}",
@@ -879,6 +886,7 @@ class TestARetractionCancelsTheClaim:
             exists_local.return_value = False
             exists_remote.return_value = False
             await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=853,
                 branch_template="fix/issue-{n}",
@@ -1002,6 +1010,7 @@ class TestAResumedWorkersExitCodeIsTheOneReported:
             # The late exception, after the resume has reported exit 9.
             remove.side_effect = RuntimeError("worktree remove failed")
             result = await run_dev_issue(
+                claims=None,
                 repo="owner/repo",
                 issue_number=853,
                 branch_template="fix/issue-{n}",

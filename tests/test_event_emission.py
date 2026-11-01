@@ -146,6 +146,7 @@ async def _dev_run(tmp_path: Path, db: StateDB, *, spawn, transport=None):
     verifier.verify.return_value = VerificationResult(ready=True)
 
     return await run_dev_issue(
+        claims=None,
         repo="o/r",
         issue_number=1,
         branch_template="fix/issue-{n}",
@@ -234,6 +235,7 @@ async def test_ci_and_review_that_did_not_pass_finish_with_ok_false(
     github.get_issue.return_value = {"number": 1, "title": "x", "body": ""}
 
     result = await dev_mod.run_dev_issue(
+        claims=None,
         repo="o/r", issue_number=1, branch_template="fix/issue-{n}",
         dispatcher=dispatcher, github=github, worktree=worktree,
         dashboard=None, state_db=db, transport=None,
@@ -283,6 +285,7 @@ async def test_dev_run_that_raises_records_failed(tmp_path: Path) -> None:
     github.get_issue.return_value = {"number": 1, "title": "x", "body": ""}
 
     result = await run_dev_issue(
+        claims=None,
         repo="o/r", issue_number=1, branch_template="fix/issue-{n}",
         dispatcher=dispatcher, github=github, worktree=worktree,
         dashboard=None, state_db=db, transport=None,
@@ -401,6 +404,7 @@ async def test_task_and_secops_record_dispatched_and_outcome(
     db = StateDB(tmp_path / "state.db")
     dispatcher, worktree, github = _task_fakes(tmp_path, _task_spawn("DONE"))
     task = await run_task_issue(
+        claims=None,
         repo="o/r", issue_number=55, dispatcher=dispatcher, github=github,
         worktree=worktree, dashboard=None, state_db=db, transport=None,
         contexts_dir=tmp_path / "contexts",
@@ -472,6 +476,7 @@ async def test_a_resumed_task_records_how_it_ended(tmp_path: Path) -> None:
         tmp_path, _task_spawn("BLOCKED_NEEDS_INPUT", "which build?"),
     )
     blocked = await run_task_issue(
+        claims=None,
         repo="o/r", issue_number=55, dispatcher=dispatcher, github=github,
         worktree=worktree, dashboard=None, state_db=db, transport=None,
         contexts_dir=tmp_path / "contexts",
@@ -903,12 +908,14 @@ async def test_a_run_that_fails_before_its_session_exists_records_nothing(
     worktree.remove_context_symlink = MagicMock()
 
     dev = await run_dev_issue(
+        claims=None,
         repo="o/r", issue_number=1, branch_template="fix/issue-{n}",
         dispatcher=AsyncMock(), github=github, worktree=worktree,
         dashboard=None, state_db=db, transport=None,
         contexts_dir=tmp_path / "contexts",
     )
     task = await run_task_issue(
+        claims=None,
         repo="o/t", issue_number=2, dispatcher=AsyncMock(), github=github,
         worktree=worktree, dashboard=None, state_db=db, transport=None,
         contexts_dir=tmp_path / "contexts",
@@ -963,6 +970,7 @@ async def test_pr_opened_records_once_after_verify_returns(
         fake_relay_publish(github, pr_number=7, repo="o/r")
         github.get_issue.return_value = {"number": 1, "title": "x", "body": ""}
         return await run_dev_issue(
+            claims=None,
             repo="o/r", issue_number=1, branch_template="fix/issue-{n}",
             dispatcher=dispatcher, github=github, worktree=worktree,
             dashboard=None, state_db=db, transport=None,
