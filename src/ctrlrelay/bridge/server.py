@@ -337,6 +337,10 @@ class BridgeServer:
         # that is not a reply is acted on only when it names this machine.
         self.node = node
         self.shared = shared
+        # The handler posts one message of its own (Telegram's "stopped
+        # reading"); it tags it with this name too.
+        if node is not None and hasattr(handler, "node_label"):
+            handler.node_label = node
         # The server holds a handler and knows nothing about tokens, chat
         # ids or URLs. Which chat app this is resolves at construction, in
         # one place, from config — see ctrlrelay.bridge.make_handler.
@@ -1090,8 +1094,15 @@ class BridgeServer:
                 # Only a post this machine can confirm as its own: one that
                 # cannot be read, has no machine tag (a person's post, or a
                 # bot post from before #248), or names another machine is
-                # left alone.
-                return owner != safe_node_name(self.node), text
+                # left alone, unless the reply itself names this machine
+                # ("node-a: pin" to an old untagged question).
+                if owner == safe_node_name(self.node):
+                    return False, text
+                if owner is None:
+                    mine, rest = addressed(text, self.node)
+                    if mine:
+                        return False, rest
+                return True, text
             if owner is not None and owner != safe_node_name(self.node):
                 return True, text
             return False, text

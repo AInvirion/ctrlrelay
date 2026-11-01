@@ -206,6 +206,7 @@ class TestTelegramOneReaderPerBot:
         h = TelegramHandler.__new__(TelegramHandler)
         h._offset = 0
         h._replied_texts = {}
+        h.node_label = None
         h.chat_id = 1
         h.bot = MagicMock()
         h.bot.get_updates = AsyncMock(side_effect=Conflict("terminated by other getUpdates"))
@@ -317,8 +318,8 @@ class TestRoundOneFixes:
         self, tmp_path,
     ) -> None:
         channel, a, b = _bridges(tmp_path, shared=True)
-        await _ask(a, "pin or bump?")
-        await _ask(b, "merge it?")
+        wa = await _ask(a, "pin or bump?")
+        wb = await _ask(b, "merge it?")
         channel.posts["p-person"] = ""  # a person's post: reads back untagged
         a._queue_orphan_reply_as_resume_answer = AsyncMock()
         b._queue_orphan_reply_as_resume_answer = AsyncMock()
@@ -328,3 +329,38 @@ class TestRoundOneFixes:
         a._queue_orphan_reply_as_resume_answer.assert_not_called()
         b._queue_orphan_reply_as_resume_answer.assert_not_called()
         assert channel.posts == posts_before
+        assert _answers(wa) == [] and _answers(wb) == []
+
+    @pytest.mark.asyncio
+    async def test_naming_the_machine_in_a_reply_to_an_old_untagged_question_works(
+        self, tmp_path,
+    ) -> None:
+        channel, a, b = _bridges(tmp_path, shared=True)
+        channel.posts["p-old"] = ""  # a question from before this version
+        a._queue_orphan_reply_as_resume_answer = AsyncMock(return_value={"status": "none"})
+        a._send_notice = AsyncMock()
+        b._queue_orphan_reply_as_resume_answer = AsyncMock()
+        await a._on_reply("node-a: pin", reply_to_post_id="p-old")
+        await b._on_reply("node-a: pin", reply_to_post_id="p-old")
+        a._queue_orphan_reply_as_resume_answer.assert_awaited_once()
+        assert a._queue_orphan_reply_as_resume_answer.await_args.args[0] == "pin"
+        b._queue_orphan_reply_as_resume_answer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_telegram_stop_notice_names_its_machine(self, tmp_path) -> None:
+        from telegram.error import Conflict
+
+        from ctrlrelay.bridge.server import BridgeServer
+        from ctrlrelay.bridge.telegram_handler import TelegramHandler
+
+        h = TelegramHandler.__new__(TelegramHandler)
+        h._offset = 0
+        h._replied_texts = {}
+        h.node_label = None
+        h.chat_id = 1
+        h.bot = MagicMock()
+        h.bot.get_updates = AsyncMock(side_effect=Conflict("terminated by other getUpdates"))
+        h.send = AsyncMock()
+        BridgeServer(socket_path=tmp_path / "s", handler=h, node="node-a")
+        await h._poll_loop(AsyncMock())
+        assert h.send.await_args.args[0].startswith("[node-a] ")

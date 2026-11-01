@@ -9,6 +9,7 @@ from telegram import Bot, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.error import Conflict, NetworkError, TimedOut
 
 from ctrlrelay.bridge.handler import IncomingMessageHandler
+from ctrlrelay.bridge.node_tag import tag
 
 _log = logging.getLogger(__name__)
 
@@ -49,6 +50,9 @@ class TelegramHandler:
         self.chat_id = chat_id
         self._poll_task: asyncio.Task | None = None
         self._offset: int = 0
+        # Set by the bridge server: this machine's name, for the one notice
+        # this handler posts on its own.
+        self.node_label: str | None = None
         # message id -> text of a message somebody replied to (#248): lets
         # the server see which machine posted it. Bounded.
         self._replied_texts: dict[str, str] = {}
@@ -145,8 +149,11 @@ class TelegramHandler:
                 # (sending still works), and stop rather than fight for it.
                 message = bot_in_use_message(e)
                 _log.error("%s", message)
+                notice = f"⚠️ Stopped reading replies on this machine: {message}"
+                if self.node_label:
+                    notice = tag(self.node_label, notice)
                 try:
-                    await self.send(f"⚠️ Stopped reading replies on this machine: {message}")
+                    await self.send(notice)
                 except Exception:
                     pass
                 return
