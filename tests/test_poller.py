@@ -2228,6 +2228,17 @@ class TestWhoAssignedIt:
         assert not await self._poller(mock_github, state_file)._is_self_assigned("o/r", 268)
 
     @pytest.mark.asyncio
+    async def test_an_earlier_assignment_naming_nobody_does_not_block_a_later_self_one(
+        self, mock_github, state_file,
+    ) -> None:
+        earlier = {"event": "assigned", "created_at": "2026-10-01T00:00:00Z",
+                   "actor": None, "assignee": None, "assigner": None}
+        mock_github.list_assignment_events = AsyncMock(
+            return_value=[earlier, *self.REAL_SELF],
+        )
+        assert await self._poller(mock_github, state_file)._is_self_assigned("o/r", 268)
+
+    @pytest.mark.asyncio
     async def test_a_real_self_assignment_is_taken(self, mock_github, state_file) -> None:
         mock_github.list_assignment_events = AsyncMock(return_value=self.REAL_SELF)
         assert await self._poller(mock_github, state_file)._is_self_assigned("o/r", 784)

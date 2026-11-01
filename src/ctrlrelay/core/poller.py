@@ -617,9 +617,16 @@ class IssuePoller:
             return True
 
         events = await self.github.list_assignment_events(repo, issue_number)
-        # An assignment that names nobody cannot be ruled out as the latest
-        # one, by someone else: refuse rather than skip past it.
-        if any(not (e.get("assignee") or {}).get("login") for e in events):
+        # An assignment after the operator's last one that names nobody
+        # cannot be ruled out as a newer one by someone else: refuse rather
+        # than skip past it. One before it is overtaken and does not count.
+        last_mine = max(
+            (i for i, e in enumerate(events)
+             if (e.get("assignee") or {}).get("login") == self.username),
+            default=-1,
+        )
+        if any(not (e.get("assignee") or {}).get("login")
+               for e in events[last_mine + 1:]):
             log_event(
                 _logger,
                 "poll.issue.foreign_assignment",
