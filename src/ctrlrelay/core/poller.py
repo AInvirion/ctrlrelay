@@ -54,12 +54,16 @@ def _is_issues_disabled_error(exc: Exception) -> bool:
     return "has disabled issues" in str(exc).lower()
 
 
-def _read_pre_dispatch_failures(raw: object) -> dict[str, dict[int, int]]:
-    """``pre_dispatch_failures`` from the state file, keeping only
-    entries that are an issue number and a positive whole count (#234).
-    Anything else is dropped rather than trusted: a negative count would
-    lift the retry limit, and a value that cannot convert would stop the
-    poller from loading at all."""
+def _read_failure_counts(raw: object) -> dict[str, dict[int, int]]:
+    """A per-repo, per-issue retry counter from the state file, keeping
+    only entries that are an issue number and a positive whole count
+    (#234). Anything else is dropped rather than trusted: a negative
+    count would lift the retry limit, and a value that cannot convert
+    would stop the poller from loading at all.
+
+    Shared by ``pre_dispatch_failures`` and ``publish_failures`` (#268):
+    one shape, one validator, so a second counter cannot be added with
+    a weaker guard than the first."""
     out: dict[str, dict[int, int]] = {}
     if not isinstance(raw, dict):
         return out
@@ -137,6 +141,11 @@ class IssuePoller:
     # (#234). Persisted with seen_issues so a restart does not reset
     # the limit on a permanent problem.
     pre_dispatch_failures: dict[str, dict[int, int]] = field(default_factory=dict)
+    # Runs whose agent finished but whose branch the relay could not
+    # publish, per repo and issue (#268). Bounds the retry the same way
+    # and for the same reason: the cause may be a blip, and it may be
+    # permanent, and only a counter tells them apart.
+    publish_failures: dict[str, dict[int, int]] = field(default_factory=dict)
     # Issues another machine holds (#245), per repo: when to look again,
     # as an epoch time. In memory only; after a restart the issue is
     # simply checked once more.
@@ -187,8 +196,11 @@ class IssuePoller:
             data = json.loads(self.state_file.read_text())
             raw = data.get("seen_issues", {})
             self.seen_issues = {repo: set(numbers) for repo, numbers in raw.items()}
-            self.pre_dispatch_failures = _read_pre_dispatch_failures(
+            self.pre_dispatch_failures = _read_failure_counts(
                 data.get("pre_dispatch_failures"),
+            )
+            self.publish_failures = _read_failure_counts(
+                data.get("publish_failures"),
             )
         except (ValueError, OSError, AttributeError, TypeError):
             # Corrupt or unreadable state — start fresh. ValueError
@@ -197,6 +209,7 @@ class IssuePoller:
             # shape, e.g. a list at the top level or for seen_issues.
             self.seen_issues = {}
             self.pre_dispatch_failures = {}
+            self.publish_failures = {}
 
     def _save_state(self) -> None:
         """Persist seen issues and a ``last_poll`` timestamp to the state file."""
@@ -207,6 +220,11 @@ class IssuePoller:
             "pre_dispatch_failures": {
                 repo: {str(n): c for n, c in sorted(counts.items())}
                 for repo, counts in self.pre_dispatch_failures.items()
+                if counts
+            },
+            "publish_failures": {
+                repo: {str(n): c for n, c in sorted(counts.items())}
+                for repo, counts in self.publish_failures.items()
                 if counts
             },
             "last_poll": datetime.now(timezone.utc).isoformat(),
@@ -812,6 +830,22 @@ class IssuePoller:
     def clear_pre_dispatch_failures(self, repo: str, issue_number: int) -> None:
         """Forget the count once a run reaches the agent or is given up."""
         counts = self.pre_dispatch_failures.get(repo)
+        if counts and issue_number in counts:
+            del counts[issue_number]
+            self._save_state_best_effort()
+
+    def record_publish_failure(self, repo: str, issue_number: int) -> int:
+        """Count one run of ``issue_number`` whose agent finished but
+        whose branch the relay could not publish, and return how many
+        there have been (#268). Saved best-effort, like ``unmark_seen``."""
+        counts = self.publish_failures.setdefault(repo, {})
+        counts[issue_number] = counts.get(issue_number, 0) + 1
+        self._save_state_best_effort()
+        return counts[issue_number]
+
+    def clear_publish_failures(self, repo: str, issue_number: int) -> None:
+        """Forget the count once a run publishes or is given up."""
+        counts = self.publish_failures.get(repo)
         if counts and issue_number in counts:
             del counts[issue_number]
             self._save_state_best_effort()

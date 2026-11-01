@@ -1183,6 +1183,113 @@ def settle_pre_dispatch_failure(poller, repo: str, issue_number: int, result):
     )
 
 
+# Runs of one issue whose branch the relay may fail to publish before
+# the poller stops retrying it (#268). Same shape and same reason as
+# PRE_DISPATCH_ATTEMPTS: a blip deserves another poll, a permanent cause
+# must not spend one full agent run per poll forever.
+PUBLISH_ATTEMPTS = 3
+
+
+def publish_failure_message(
+    repo: str, issue_number: int, error: str, *, attempts: int, retrying: bool,
+) -> str:
+    """The chat line for a run whose branch the relay could not publish."""
+    why = (error.strip().splitlines() or ["no error recorded"])[0][:200]
+    if retrying:
+        return (
+            f"\u23f3 #{issue_number} in {repo}: the agent finished but the "
+            f"relay could not publish the branch (try {attempts} of "
+            f"{PUBLISH_ATTEMPTS}): {why}. Will retry on the next poll."
+        )
+    return (
+        f"\u274c #{issue_number} in {repo}: could not publish the branch "
+        f"{attempts} times; not retrying. Last error: {why}. The commits "
+        "are on the run branch locally; fix the cause, then remove the "
+        "issue number from seen_issues in poller_state.json to try again."
+    )
+
+
+async def settle_publish_failure(
+    github, poller, repo: str, issue_number: int, result,
+):
+    """Decide what a failed publish means for retrying its issue (#268).
+
+    `poll()` marks an issue seen BEFORE handing it to the handler, so a
+    publish failure nobody un-marks drops the issue forever: the claim
+    is retracted, the automation label is still on it, and the relay
+    never comes back. Nothing in the logs says why, because from the
+    relay's own point of view nothing is wrong.
+
+    So: the agent finished and only the publish failed, and the push was
+    not refused -> count it, and below ``PUBLISH_ATTEMPTS`` un-mark the
+    issue so the next poll runs it again. At the limit the issue stays
+    seen, the count is dropped, and the relay says on the ISSUE that it
+    has stopped — the retraction already there promised a retry, and a
+    promise silently abandoned is the original defect one step on.
+
+    A refused push is not retried at all: the relay re-reaches that
+    refusal every time, so another attempt costs a whole agent run to
+    arrive at the same answer. Returns the chat line, or ``None`` for
+    any result this is not about.
+
+    Writing the issue comment is best-effort: this runs after a run that
+    has already failed, and a `gh` error here must not replace the run's
+    real failure with a different one.
+    """
+    from ctrlrelay.pipelines.dev import (
+        publish_failure_is_retryable,
+        publish_retries_exhausted_comment,
+    )
+
+    outputs = result.outputs or {}
+    if result.success or result.blocked or not outputs.get("publish_failed"):
+        poller.clear_publish_failures(repo, issue_number)
+        return None
+    if not publish_failure_is_retryable(result):
+        # Refused, not failed. Left seen deliberately; the pipeline's
+        # retraction on the issue already names the operator action.
+        poller.clear_publish_failures(repo, issue_number)
+        log_event(
+            _logger, "publish.refused_not_retried", repo=repo,
+            issue_number=issue_number, error=(result.error or "")[:200],
+        )
+        return (
+            f"\u26d4 #{issue_number} in {repo}: the relay refused to push "
+            f"the branch, so it is not retrying. {result.error or ''}".strip()
+        )
+
+    attempts = poller.record_publish_failure(repo, issue_number)
+    retrying = attempts < PUBLISH_ATTEMPTS
+    if retrying:
+        poller.unmark_seen(repo, issue_number)
+    else:
+        poller.clear_publish_failures(repo, issue_number)
+        try:
+            await github.comment_on_issue(
+                repo=repo,
+                issue_number=issue_number,
+                body=publish_retries_exhausted_comment(
+                    result.session_id,
+                    repo=repo,
+                    issue_number=issue_number,
+                    attempts=attempts,
+                    error=result.error or "",
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event(
+                _logger, "publish.exhausted_notice_failed", repo=repo,
+                issue_number=issue_number,
+                error=f"{type(e).__name__}: {str(e)[:200]}",
+            )
+    return publish_failure_message(
+        repo, issue_number, result.error or "",
+        attempts=attempts, retrying=retrying,
+    )
+
+
 def reclone_message(repo: str, set_aside: Path) -> str:
     """The chat line for a clone that was set aside and cloned again
     (#234). Names where the old copy went, because nothing deletes it."""
@@ -3167,6 +3274,23 @@ def poller_start(
                         except Exception:
                             pass
                     return
+
+                # The agent finished and the relay could not publish the
+                # branch (#268). Un-marked so the next poll runs it
+                # again, bounded, because the issue is already marked
+                # seen and nothing else would ever bring it back. No
+                # early return: a fix round that failed to push still
+                # has a pull request below that needs its merge watcher.
+                publish_note = await settle_publish_failure(
+                    github, poller, repo, issue_number, result,
+                )
+                if publish_note is not None:
+                    console.print(f"[yellow]{publish_note}[/yellow]")
+                    if connected_transport is not None:
+                        try:
+                            await connected_transport.send(publish_note)
+                        except Exception:
+                            pass
 
                 # Lock-contended DURING PR verification (issue #29): the
                 # PR already exists AND verification decided it wasn't

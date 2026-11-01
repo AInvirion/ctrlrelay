@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed publish no longer strands the issue. `poll()` marks an issue seen
+  before handing it to the handler, so a run whose agent finished but whose
+  branch the relay could not push stayed in `seen_issues` forever: the claim
+  was retracted, the automation label was still on it, and the relay never
+  came back. The issue is now un-marked for the next poll, up to 3 runs,
+  counted in `publish_failures` in `poller_state.json` so a restart does not
+  reset the limit. After the third the relay says on the issue that it has
+  stopped, and a *refused* push is not retried at all — the relay reaches the
+  same refusal every time (#268)
+- The retraction comment no longer advises a retry that cannot work. It said
+  to re-assign the issue or re-apply its automation label, but the skip
+  decision reads the issue number alone — no assignee, no labels — so neither
+  did anything. It now says the relay will return when it will, and otherwise
+  names the one route that works (#268)
+
+
 ## [0.16.3] - 2026-11-01
 
 A security fix: **upgrade every machine.** No config edit is required.
