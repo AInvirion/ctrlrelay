@@ -2643,8 +2643,18 @@ def poller_start(
             finally:
                 await transport.close()
 
+        # Issues left for later while paused, offered again the moment
+        # the pause ends rather than at the reset time each was given.
+        usage_deferred: set[tuple[str, int]] = set()
+
+        def _wake_usage_deferred() -> None:
+            for repo_name, number in sorted(usage_deferred):
+                poller.recheck_at(repo_name, number, 0.0)
+            usage_deferred.clear()
+
         usage_gate = UsageGate(
             usage_store, threshold=config.usage.pause_at, notify=_usage_notice,
+            on_resume=_wake_usage_deferred,
         )
         worktree = WorktreeManager(
             worktrees_dir=config.paths.worktrees,
@@ -2858,6 +2868,7 @@ def poller_start(
                 deferred = defer_for_usage(
                     poller, repo, issue_number, pause, config.usage.probe_minutes,
                 )
+                usage_deferred.add((repo, issue_number))
                 console.print(f"[yellow]{deferred}[/yellow]")
                 return
 

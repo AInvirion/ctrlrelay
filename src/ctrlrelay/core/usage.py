@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import tempfile
 import time
@@ -50,11 +51,16 @@ class UsageReading:
     status: str
     windows: dict[str, Window]
     read_at: int
+    # When the status itself resets (the event's top-level ``resetsAt``):
+    # a refusal on the 5-hour window ends at that window's reset, not at
+    # the 7-day one.
+    resets_at: int | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
             "status": self.status,
             "read_at": self.read_at,
+            "resets_at": self.resets_at,
             **{
                 name: {"used": w.used, "resets_at": w.resets_at}
                 for name, w in self.windows.items()
@@ -74,14 +80,31 @@ class UsageReading:
             w = _window(data.get(name), used_key="used", reset_key="resets_at")
             if w is not None:
                 windows[name] = w
-        return cls(status=status, windows=windows, read_at=read_at)
+        return cls(
+            status=status, windows=windows, read_at=read_at,
+            resets_at=_timestamp(data.get("resets_at")),
+        )
 
 
 def _number(value: Any) -> float | None:
-    # bool is an int in Python; True is not a utilization.
+    # bool is an int in Python; True is not a utilization. NaN and the
+    # infinities are numbers to `json.loads` and nothing else is.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+# Epoch seconds between 2001 and 2286: anything outside is not a reset
+# time, and would not survive `datetime.fromtimestamp` either.
+_MIN_TS, _MAX_TS = 1_000_000_000, 10_000_000_000
+
+
+def _timestamp(value: Any) -> int | None:
+    number = _number(value)
+    if number is None or not _MIN_TS <= number < _MAX_TS:
+        return None
+    return int(number)
 
 
 def _window(raw: Any, *, used_key: str, reset_key: str) -> Window | None:
@@ -90,8 +113,7 @@ def _window(raw: Any, *, used_key: str, reset_key: str) -> Window | None:
     used = _number(raw.get(used_key))
     if used is None or not 0 <= used <= 1.5:
         return None
-    reset = _number(raw.get(reset_key))
-    return Window(used=used, resets_at=None if reset is None else int(reset))
+    return Window(used=used, resets_at=_timestamp(raw.get(reset_key)))
 
 
 def parse_rate_limit_event(
@@ -99,40 +121,43 @@ def parse_rate_limit_event(
 ) -> UsageReading | None:
     """The last ``rate_limit_event`` in a stream-json run, or ``None``.
 
-    ``None`` when there is no such line, or it does not carry a status
-    and at least one window with a utilization. A half-understood line
-    is not a reading.
+    Only the last one is read: when it does not carry a status and at
+    least one window with a utilization, the answer is ``None``, not an
+    earlier event's numbers. A half-understood line is not a reading.
     """
-    reading = None
+    last = None
     for line in stdout_text.splitlines():
         if '"rate_limit_event"' not in line:
             continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            last = None  # a broken event line still replaces the earlier one
             continue
-        if not isinstance(event, dict) or event.get("type") != "rate_limit_event":
-            continue
-        info = event.get("rate_limit_info")
-        if not isinstance(info, dict):
-            continue
-        status = info.get("status")
-        unified = info.get("unifiedWindows")
-        if not isinstance(status, str) or not isinstance(unified, dict):
-            continue
-        windows = {}
-        for name in WINDOWS:
-            w = _window(unified.get(name), used_key="utilization", reset_key="resetsAt")
-            if w is not None:
-                windows[name] = w
-        if not windows:
-            continue
-        reading = UsageReading(
-            status=status,
-            windows=windows,
-            read_at=int(time.time() if now is None else now),
-        )
-    return reading
+        if isinstance(event, dict) and event.get("type") == "rate_limit_event":
+            last = event
+    if last is None:
+        return None
+    info = last.get("rate_limit_info")
+    if not isinstance(info, dict):
+        return None
+    status = info.get("status")
+    unified = info.get("unifiedWindows")
+    if not isinstance(status, str) or not isinstance(unified, dict):
+        return None
+    windows = {}
+    for name in WINDOWS:
+        w = _window(unified.get(name), used_key="utilization", reset_key="resetsAt")
+        if w is not None:
+            windows[name] = w
+    if not windows:
+        return None
+    return UsageReading(
+        status=status,
+        windows=windows,
+        read_at=int(time.time() if now is None else now),
+        resets_at=_timestamp(info.get("resetsAt")),
+    )
 
 
 def parse_agent_session_id(stdout_text: str) -> str | None:
@@ -202,8 +227,10 @@ def pause_for(
         return None
     hits: list[tuple[str, int | None]] = []
     if reading.status != ALLOWED:
-        resets = [w.resets_at for w in reading.windows.values() if w.resets_at]
-        until = max(resets) if resets else None
+        until = reading.resets_at
+        if until is None:
+            resets = [w.resets_at for w in reading.windows.values() if w.resets_at]
+            until = max(resets) if resets else None
         hits.append((f"usage status is {reading.status}", until))
     for name, w in reading.windows.items():
         if w.used >= threshold:
@@ -253,11 +280,21 @@ class UsageStore:
     def write(self, reading: UsageReading) -> None:
         """Best-effort: a reading that cannot be saved is logged and lost,
         never allowed to fail the run that produced it."""
+        self._write_json(reading.to_json())
+
+    def mark_unknown(self, now: float | None = None) -> None:
+        """The latest run carried no readable usage: record that, so the
+        page says unknown and an older number stops pausing the machine."""
+        self._write_json({
+            "unknown": True, "read_at": int(time.time() if now is None else now),
+        })
+
+    def _write_json(self, data: dict[str, Any]) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".usage-")
             with os.fdopen(fd, "w") as f:
-                json.dump(reading.to_json(), f)
+                json.dump(data, f)
             os.replace(tmp, self.path)
         except Exception as e:
             log_event(_logger, "usage.write_failed", path=str(self.path), error=str(e)[:200])
@@ -282,11 +319,16 @@ class UsageGate:
         *,
         threshold: float,
         notify: Callable[[str], Awaitable[None]] | None = None,
+        on_resume: Callable[[], None] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.store = store
         self.threshold = threshold
         self.notify = notify
+        # Called when a pause ends, so issues left until the reset are
+        # offered again now rather than at the reset time they were
+        # given (usage can drop early, e.g. when a probe reads it again).
+        self.on_resume = on_resume
         self._clock = clock
         self.paused: Pause | None = None
 
@@ -304,6 +346,11 @@ class UsageGate:
             )
         elif pause is None and was is not None:
             log_event(_logger, "usage.resumed")
+            if self.on_resume is not None:
+                try:
+                    self.on_resume()
+                except Exception as e:
+                    log_event(_logger, "usage.resume_hook_failed", error=str(e)[:200])
             await self._say("▶️ Usage is below the limit again; taking new work.")
         return pause
 
@@ -328,18 +375,20 @@ async def probe_usage(
 ) -> UsageReading | None:
     """One tiny agent call, for its usage reading only.
 
-    Run in an empty temporary directory, with no tools allowed and one
-    turn, so it reads nothing and costs as little as a call can. Returns
-    the reading, or ``None`` when the call failed or carried none; the
-    stored reading is left as it was in that case.
+    Run with no tools (so it cannot read a file or run a command), no MCP
+    servers, no user or project settings (so no hooks), one turn, in an
+    empty temporary directory. Returns the reading and stores it; a call
+    that fails or carries no reading returns ``None`` and leaves the
+    store alone. Never raises: it runs on a schedule, and its failure is
+    only a missed refresh.
     """
-    with tempfile.TemporaryDirectory(prefix="ctrlrelay-usage-") as cwd:
-        try:
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="ctrlrelay-usage-") as cwd:
             proc = await asyncio.create_subprocess_exec(
                 binary, "-p", PROBE_PROMPT,
                 "--output-format", "stream-json", "--verbose",
-                # No tools and no MCP servers: it can read and run nothing.
-                "--tools", "", "--strict-mcp-config",
+                "--tools", "", "--strict-mcp-config", "--setting-sources", "",
                 "--max-turns", "1",
                 cwd=cwd,
                 env=env,
@@ -347,20 +396,30 @@ async def probe_usage(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-        except OSError as e:
-            log_event(_logger, "usage.probe_failed", error=str(e)[:200])
-            return None
-        try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
-            log_event(_logger, "usage.probe_failed", error="timed out")
+        if proc.returncode != 0:
+            log_event(_logger, "usage.probe_failed", exit_code=proc.returncode)
             return None
-    reading = parse_rate_limit_event(stdout.decode(errors="replace"))
-    if reading is None:
-        log_event(_logger, "usage.probe_failed", error="no usage in the output",
-                  exit_code=proc.returncode)
+        reading = parse_rate_limit_event(stdout.decode(errors="replace"))
+        if reading is None:
+            log_event(_logger, "usage.probe_failed", error="no usage in the output")
+            return None
+        store.write(reading)
+        return reading
+    except asyncio.CancelledError:
+        await _reap(proc)
+        raise
+    except Exception as e:
+        await _reap(proc)
+        log_event(_logger, "usage.probe_failed", error=f"{type(e).__name__}: {e}"[:200])
         return None
-    store.write(reading)
-    return reading
+
+
+async def _reap(proc: asyncio.subprocess.Process | None) -> None:
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=10)
+    except Exception:
+        pass

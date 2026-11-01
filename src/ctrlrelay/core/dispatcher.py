@@ -599,8 +599,9 @@ class ClaudeDispatcher:
 
     def _record_usage(self, stdout_text: str, ident: dict) -> None:
         """Keep the run's usage reading. A run with no readable reading
-        leaves the last one in place rather than writing "unknown" over
-        it: the last real number, with its time, is the better answer."""
+        records unknown: an older number must not go on pausing the
+        machine, or be shown as current, after the latest run could not
+        confirm it."""
         if self.usage_store is None:
             return
         try:
@@ -610,9 +611,11 @@ class ClaudeDispatcher:
                 _logger, "dispatcher.usage.parse_failed", **ident,
                 error=str(e)[:200],
             )
+            self.usage_store.mark_unknown()
             return
         if reading is None:
             log_event(_logger, "dispatcher.usage.absent", **ident)
+            self.usage_store.mark_unknown()
             return
         self.usage_store.write(reading)
 

@@ -207,7 +207,7 @@ class TestTheDispatcherKeepsTheReading:
         assert store.read().windows["five_hour"].used == 0.28
 
     @pytest.mark.asyncio
-    async def test_a_run_with_no_reading_keeps_the_last_one(self, tmp_path: Path) -> None:
+    async def test_a_run_with_no_reading_records_unknown(self, tmp_path: Path) -> None:
         from unittest.mock import AsyncMock, patch
 
         store = UsageStore(tmp_path / "usage.json")
@@ -220,7 +220,9 @@ class TestTheDispatcherKeepsTheReading:
                 github_access=False, session_id="s", prompt="p",
                 working_dir=tmp_path, state_file=tmp_path / "state.json",
             )
-        assert store.read() == _reading()
+        # The older number would otherwise go on pausing the machine.
+        assert store.read() is None
+        assert json.loads(store.path.read_text())["unknown"] is True
 
     def test_every_daemon_and_command_dispatcher_says_where_usage_goes(self) -> None:
         import inspect
@@ -229,6 +231,10 @@ class TestTheDispatcherKeepsTheReading:
 
         param = inspect.signature(make_agent_dispatcher).parameters["usage_store"]
         assert param.default is inspect.Parameter.empty
+        from ctrlrelay.core.config import AgentConfig
+
+        with pytest.raises(TypeError, match="usage_store"):
+            make_agent_dispatcher(AgentConfig(), outcome_hook=None)
 
 
 class TestProbe:
@@ -249,7 +255,7 @@ class TestProbe:
         reading = await probe_usage(str(fake), store)
         assert reading is not None and store.read() == reading
         args = (tmp_path / "args").read_text()
-        assert "--tools  --strict-mcp-config" in args
+        assert "--tools  --strict-mcp-config --setting-sources  " in args
         assert "--max-turns 1" in args
 
     @pytest.mark.asyncio
@@ -372,3 +378,78 @@ class TestAPausedMachineTakesTheIssueAfterTheReset:
         now[0] = NOW + 600
         assert [i["issue"]["number"] for i in await poller.poll()] == [7]
         assert await gate.check() is None
+
+
+
+class TestRoundOneFixes:
+    @pytest.mark.parametrize("bad", ["1e999", "NaN", "Infinity", "-1", "99999999999"])
+    def test_a_reset_that_is_not_a_time_is_unknown_not_a_crash(self, bad: str) -> None:
+        text = RECORDED.replace('"resetsAt": 1793503200, "status"', f'"resetsAt": {bad}, "status"')
+        r = parse_rate_limit_event(text, now=NOW)
+        assert r is not None and r.windows["five_hour"].resets_at is None
+        assert usage_json(r)["five_hour"]["resets_at"] is None
+
+    def test_a_utilization_that_is_not_finite_is_unknown(self) -> None:
+        text = RECORDED.replace('"utilization": 0.28', '"utilization": NaN')
+        r = parse_rate_limit_event(text, now=NOW)
+        assert "five_hour" not in r.windows
+
+    def test_a_stored_file_with_garbage_numbers_reads_safely(self, tmp_path: Path) -> None:
+        path = tmp_path / "usage.json"
+        path.write_text('{"status": "allowed", "read_at": 1, "five_hour": {"used": 0.5, "resets_at": 1e999}}')
+        r = UsageStore(path).read()
+        assert r.windows["five_hour"].resets_at is None
+
+    def test_a_refusal_ends_at_its_own_reset_not_the_weekly_one(self) -> None:
+        text = (RECORDED.replace('"status": "allowed", "resetsAt": 1793503200', '"status": "rejected", "resetsAt": 1793503200'))
+        r = parse_rate_limit_event(text, now=NOW)
+        assert r.resets_at == 1793503200
+        assert pause_for(r, threshold=0.9, now=NOW).until == 1793503200
+
+    def test_only_the_last_event_counts_even_when_it_is_broken(self) -> None:
+        broken = '{"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}}'
+        assert parse_rate_limit_event(RECORDED + broken + "\n", now=NOW) is None
+
+    @pytest.mark.asyncio
+    async def test_a_probe_that_exits_non_zero_stores_nothing(self, tmp_path: Path) -> None:
+        from ctrlrelay.core.usage import probe_usage
+
+        fake = tmp_path / "agent"
+        fake.write_text(f"#!/bin/sh\ncat {FIXTURE}\nexit 2\n")
+        fake.chmod(0o755)
+        store = UsageStore(tmp_path / "usage.json")
+        assert await probe_usage(str(fake), store) is None
+        assert store.read() is None
+
+    @pytest.mark.asyncio
+    async def test_a_probe_that_raises_anything_returns_none(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        from ctrlrelay.core.usage import probe_usage
+
+        with patch("asyncio.create_subprocess_exec", side_effect=ValueError("bad")):
+            assert await probe_usage("agent", UsageStore(tmp_path / "u.json")) is None
+
+    @pytest.mark.asyncio
+    async def test_a_probe_that_times_out_is_killed(self, tmp_path: Path) -> None:
+        from ctrlrelay.core.usage import probe_usage
+
+        fake = tmp_path / "agent"
+        fake.write_text("#!/bin/sh\nexec sleep 30\n")
+        fake.chmod(0o755)
+        assert await probe_usage(str(fake), UsageStore(tmp_path / "u.json"), timeout=0.5) is None
+
+    @pytest.mark.asyncio
+    async def test_resuming_wakes_the_issues_left_for_later(self, tmp_path: Path) -> None:
+        from ctrlrelay.core.usage import UsageGate
+
+        store = UsageStore(tmp_path / "usage.json")
+        woke: list[bool] = []
+        gate = UsageGate(store, threshold=0.9, on_resume=lambda: woke.append(True),
+                         clock=lambda: NOW)
+        store.write(_reading(windows={"five_hour": Window(0.95, NOW + 600)}))
+        await gate.check()
+        assert woke == []
+        store.write(_reading())  # a probe reads it lower before the reset
+        await gate.check()
+        assert woke == [True]

@@ -264,7 +264,7 @@ class TestTheFactoryRefusesToGuess:
         from ctrlrelay.core.config import AgentConfig
 
         with pytest.raises(TypeError):
-            make_agent_dispatcher(AgentConfig())
+            make_agent_dispatcher(AgentConfig(), usage_store=None)
 
     def test_an_explicit_none_is_accepted(self) -> None:
         from ctrlrelay.core.config import AgentConfig
