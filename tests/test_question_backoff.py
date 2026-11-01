@@ -380,6 +380,7 @@ async def _sweep(
     repo.name = MINER
     repo.automation = None
     results = await run_secops_all(
+        job_claims=None,
         repos=[repo],
         dispatcher=dispatcher,
         github=MagicMock(),
@@ -701,6 +702,7 @@ class TestOneResultPerRepo:
         transport.ask.side_effect = TransportUnansweredError("nobody answered")
 
         results = await run_secops_all(
+            job_claims=None,
             repos=repos, dispatcher=dispatcher, github=MagicMock(),
             worktree=worktree, dashboard=dashboard, state_db=db,
             transport=transport, contexts_dir=tmp_path / "contexts",

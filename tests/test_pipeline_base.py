@@ -339,6 +339,7 @@ class TestEveryAlertGoesThroughFailureText:
         repo.name = "owner/repo1"
 
         await run_secops_all(
+            job_claims=None,
             hold_repeats=False,
             repos=[repo],
             dispatcher=mock_dispatcher,

@@ -19,7 +19,9 @@ is required.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.combining import OrTrigger
@@ -241,6 +243,26 @@ class Scheduler:
             task = asyncio.current_task()
             if task is not None:
                 self._running_jobs.add(task)
+            # Which fire this run is (#246). The scheduler moved the job's
+            # next run time on when it submitted this one, so the fire just
+            # before that is this run's, however late it started; with
+            # coalescing it is the latest of the missed ones. Read before
+            # the first await: this coroutine runs on the loop turn after
+            # submission, before the scheduler can move on again, and a
+            # second instance of a running job is never started.
+            _due = None
+            try:
+                job = self._impl.get_job(name)
+                if job is not None and job.next_run_time is not None:
+                    # In UTC: a second before a local time can land in the
+                    # wrong half of a repeated daylight-saving hour.
+                    _due = last_fire_time(
+                        cron_expr, self._impl.timezone,
+                        job.next_run_time.astimezone(UTC) - timedelta(seconds=1),
+                    )
+            except Exception:
+                _due = None
+            due_token = _CURRENT_DUE.set(_due)
             log_event(_logger, "scheduler.job.start", job=name, cron=cron_expr)
             try:
                 await func()
@@ -257,6 +279,7 @@ class Scheduler:
                     error=str(e)[:200],
                 )
             finally:
+                _CURRENT_DUE.reset(due_token)
                 if task is not None:
                     self._running_jobs.discard(task)
 
@@ -335,3 +358,37 @@ def make_scheduler(timezone: str) -> Scheduler:
     """
     impl = AsyncIOScheduler(timezone=timezone)
     return Scheduler(impl)
+
+
+# The due time of the scheduled run executing in this task, or None.
+_CURRENT_DUE: contextvars.ContextVar[datetime | None] = contextvars.ContextVar(
+    "ctrlrelay_scheduler_due", default=None,
+)
+
+
+def current_due_time() -> datetime | None:
+    """When the scheduled run executing now was due, as the scheduler
+    planned it; ``None`` outside a scheduled run (#246)."""
+    return _CURRENT_DUE.get()
+
+
+def last_fire_time(cron_expr: str, timezone, now: datetime) -> datetime | None:
+    """The latest time ``cron_expr`` was due at or before ``now``; ``None``
+    if it was not due in the last 40 days (#246).
+
+    The scheduler wrapper passes a second before the job's next planned
+    run, which names the run executing now; ``sweep_window`` falls back to
+    the current time outside a scheduled run. Searched in growing spans,
+    so an every-minute rule does not walk 40 days of minutes.
+    """
+    trigger = _build_vixie_trigger(cron_expr, timezone)
+    limit = now
+    for span in (timedelta(hours=2), timedelta(days=2), timedelta(days=40)):
+        previous = None
+        fire = trigger.get_next_fire_time(None, now - span)
+        while fire is not None and fire <= limit:
+            previous = fire
+            fire = trigger.get_next_fire_time(fire, fire + timedelta(seconds=1))
+        if previous is not None:
+            return previous
+    return None
