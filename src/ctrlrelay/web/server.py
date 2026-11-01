@@ -45,7 +45,7 @@ from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.usage import UsageStore, pause_for, usage_json
 from ctrlrelay.web.fleet import PeerReader
 from ctrlrelay.web.health import read_server_health
-from ctrlrelay.web.status import build_status, list_feed
+from ctrlrelay.web.status import DAY_KINDS, build_status, list_day_events, list_feed
 
 _logger = get_logger("web.server")
 
@@ -206,6 +206,22 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, srv.status())
         elif url.path == "/api/events":
             query = urllib.parse.parse_qs(url.query, keep_blank_values=True)
+            if "kind" in query:
+                # One Today counter's events (#257).
+                kinds, days = query.get("kind"), query.get("day")
+                if (
+                    len(kinds) != 1 or kinds[0] not in DAY_KINDS
+                    or days != ["today"] or set(query) != {"kind", "day"}
+                ):
+                    self._json(400, {
+                        "error": "kind must be one of " + ", ".join(sorted(DAY_KINDS))
+                        + ", with day=today and nothing else",
+                    })
+                    return
+                self._json(200, list_day_events(
+                    db_path=srv.config.paths.state_db, kind=kinds[0],
+                ))
+                return
             values = query.get("since")
             if values is None:
                 since = srv.default_since()
