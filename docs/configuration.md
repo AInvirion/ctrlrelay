@@ -19,7 +19,7 @@ pydantic schema in
 
 ```yaml
 version: "1"
-node_id: "my-laptop"
+node_id: "node-a"
 timezone: "America/New_York"
 
 paths:        { ... }
@@ -696,7 +696,7 @@ matches Claude Code's own path encoding rule (`/Users/foo/Projects/bar`
 
 ```yaml
 version: "1"
-node_id: "studio-mac"
+node_id: "node-b"
 timezone: "America/Santiago"
 
 paths:
