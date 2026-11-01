@@ -1846,10 +1846,14 @@ def bridge_start(
         from ctrlrelay.core.state import StateDB
         state_db = StateDB(config.paths.state_db)
 
+        # #248: this machine's name on every post, and whether other
+        # machines read the same chat (Mattermost only).
         server = BridgeServer(
             socket_path=socket_path,
             handler=handler,
             state_db=state_db,
+            node=config.node_id,
+            shared=bool(getattr(chat_config, "shared", False)),
         )
 
         loop = asyncio.new_event_loop()
