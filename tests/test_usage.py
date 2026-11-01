@@ -396,12 +396,18 @@ class TestRoundOneFixes:
 
     def test_a_stored_file_with_garbage_numbers_reads_safely(self, tmp_path: Path) -> None:
         path = tmp_path / "usage.json"
-        path.write_text('{"status": "allowed", "read_at": 1, "five_hour": {"used": 0.5, "resets_at": 1e999}}')
+        path.write_text(
+            '{"status": "allowed", "read_at": 1,'
+            ' "five_hour": {"used": 0.5, "resets_at": 1e999}}'
+        )
         r = UsageStore(path).read()
         assert r.windows["five_hour"].resets_at is None
 
     def test_a_refusal_ends_at_its_own_reset_not_the_weekly_one(self) -> None:
-        text = (RECORDED.replace('"status": "allowed", "resetsAt": 1793503200', '"status": "rejected", "resetsAt": 1793503200'))
+        text = RECORDED.replace(
+            '"status": "allowed", "resetsAt": 1793503200',
+            '"status": "rejected", "resetsAt": 1793503200',
+        )
         r = parse_rate_limit_event(text, now=NOW)
         assert r.resets_at == 1793503200
         assert pause_for(r, threshold=0.9, now=NOW).until == 1793503200
@@ -409,6 +415,8 @@ class TestRoundOneFixes:
     def test_only_the_last_event_counts_even_when_it_is_broken(self) -> None:
         broken = '{"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}}'
         assert parse_rate_limit_event(RECORDED + broken + "\n", now=NOW) is None
+        cut_short = '{"type": "rate_limit_event", "rate_limit_info": {"stat'
+        assert parse_rate_limit_event(RECORDED + cut_short + "\n", now=NOW) is None
 
     @pytest.mark.asyncio
     async def test_a_probe_that_exits_non_zero_stores_nothing(self, tmp_path: Path) -> None:
