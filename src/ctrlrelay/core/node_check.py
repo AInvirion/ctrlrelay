@@ -10,6 +10,7 @@ claims, chat tags and the status page would then mix the two up.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -26,26 +27,67 @@ class Check:
 
 
 def claim_refreshed_by_another(
-    comments: list[dict[str, Any]] | None, settings: ClaimSettings, now: float,
+    comments: list[dict[str, Any]] | None,
+    settings: ClaimSettings,
+    *,
+    started_at: float,
 ) -> bool:
-    """A working claim under this machine's name, refreshed within the last
-    1.5 refresh intervals, on an issue this machine is not running.
+    """A working claim under this machine's name, written after this
+    process started, on an issue this process is not running.
 
     Called where the daemon peeks at an issue it is about to consider, so
-    it holds no claim there. Its own claims from before a restart are not
-    refreshed any more and age out of the window; one that is still being
-    refreshed is another process using this name.
+    this process holds no claim there and has written none on it since it
+    started. A claim under its name updated after ``started_at`` was
+    therefore written by another process using the same name. Its own
+    claims from before a restart were written before ``started_at``,
+    however recently, and never count.
     """
-    window = settings.refresh_seconds * 1.5
     for claim in parse_claims(comments, settings.account):
         if (
             claim.node == settings.node
             and claim.state == WORKING
             and claim.updated_at is not None
-            and now - claim.updated_at <= window
+            and claim.updated_at > started_at
         ):
             return True
     return False
+
+
+async def fetch_detached(
+    fetch: Callable[..., dict[str, Any]], url: str, *, timeout: float,
+) -> dict[str, Any]:
+    """``fetch(url, timeout=...)`` in a daemon thread, given up after
+    ``timeout * 3``. Not an executor thread: one stuck in a name lookup
+    would hold the process at exit; a daemon thread is simply dropped."""
+    loop = asyncio.get_running_loop()
+    done: asyncio.Future[dict[str, Any]] = loop.create_future()
+
+    def run() -> None:
+        try:
+            result = fetch(url, timeout=timeout)
+        except BaseException as e:  # noqa: BLE001 - handed to the waiter
+            loop.call_soon_threadsafe(
+                lambda exc=e: done.done() or done.set_exception(exc),
+            )
+        else:
+            loop.call_soon_threadsafe(
+                lambda: done.done() or done.set_result(result),
+            )
+
+    threading.Thread(target=run, daemon=True, name="ctrlrelay-peer-check").start()
+    return await asyncio.wait_for(done, timeout=timeout * 3)
+
+
+def _peer_name(data: Any) -> str | None:
+    """The name a peer's status page gives itself, or ``None`` when the
+    answer is not a status page."""
+    if not isinstance(data, dict):
+        return None
+    node = data.get("node")
+    name = node.get("name") if isinstance(node, dict) else None
+    if not isinstance(name, str):
+        name = data.get("host")
+    return name if isinstance(name, str) and name.strip() else None
 
 
 async def peers_with_my_name(
@@ -60,14 +102,11 @@ async def peers_with_my_name(
     found = []
     for url in peers:
         try:
-            data = await asyncio.wait_for(
-                asyncio.to_thread(fetch, url, timeout=timeout), timeout=timeout * 3,
-            )
+            data = await fetch_detached(fetch, url, timeout=timeout)
         except Exception:
             continue
-        node = data.get("node") if isinstance(data, dict) else None
-        name = node.get("name") if isinstance(node, dict) else None
-        if isinstance(name, str) and safe_node_name(name) == me:
+        name = _peer_name(data)
+        if name is not None and safe_node_name(name) == me:
             found.append(url)
     return found
 
@@ -87,7 +126,12 @@ async def run_checks(
         login = await github_login()
         checks.append(Check("GitHub login", True, login))
     except Exception as e:
-        checks.append(Check("GitHub login", False, f"{type(e).__name__}: {str(e)[:200]}"))
+        checks.append(Check(
+            "GitHub login", False,
+            f"{type(e).__name__}: {str(e)[:200]}. Run `gh auth status`; if it "
+            "is not logged in, run `gh auth login` with a token of this "
+            "machine's own, on the same account as the other machines",
+        ))
 
     if agent_probe is None:
         checks.append(Check("agent login", None, "skipped (--no-agent)"))
@@ -96,7 +140,11 @@ async def run_checks(
         try:
             reading = await agent_probe()
         except Exception as e:
-            reading, error = None, f"{type(e).__name__}: {str(e)[:200]}"
+            reading, error = None, (
+                f"{type(e).__name__}: {str(e)[:200]}. Check `agent.binary` in "
+                "orchestrator.yaml points at the agent CLI, and run it once by "
+                "hand to log in"
+            )
         else:
             error = None
         if reading is not None:
@@ -116,18 +164,27 @@ async def run_checks(
         checks.append(Check("peers", None, "none configured (fleet.peers)"))
     for url in peers:
         try:
-            data = await asyncio.wait_for(
-                asyncio.to_thread(fetch, url, timeout=config.fleet.timeout_seconds),
-                timeout=config.fleet.timeout_seconds * 3,
-            )
+            data = await fetch_detached(fetch, url, timeout=config.fleet.timeout_seconds)
         except Exception as e:
             from ctrlrelay.web.fleet import _peer_error
 
-            checks.append(Check(f"peer {url}", False, _peer_error(e)))
+            reason = "timeout" if isinstance(e, TimeoutError) else _peer_error(e)
+            checks.append(Check(
+                f"peer {url}", False,
+                f"{reason}. Check the URL, that the peer's status page is "
+                "running (`ctrlrelay web status` there) and listens on an "
+                "address this machine can reach (`web.host`), and that this "
+                "network allows the connection",
+            ))
             continue
-        node = data.get("node") if isinstance(data.get("node"), dict) else {}
-        name = node.get("name") or data.get("host")
-        if isinstance(name, str) and safe_node_name(name) == safe_node_name(config.node_id):
+        name = _peer_name(data)
+        if name is None:
+            checks.append(Check(
+                f"peer {url}", False,
+                "answered, but not with a ctrlrelay status page. Check the "
+                "URL points at the peer's `ctrlrelay web` port",
+            ))
+        elif safe_node_name(name) == safe_node_name(config.node_id):
             checks.append(Check(
                 f"peer {url}", False,
                 f"answers with this machine's own name {name!r}: two machines "

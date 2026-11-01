@@ -26,6 +26,10 @@ from ctrlrelay.core.usage import UsageGate, UsageStore, probe_usage
 from ctrlrelay.transports.base import Transport
 
 _logger = get_logger("cli")
+# When this process started: a claim under this machine's name written
+# after it, on an issue this process is not running, is another process's
+# (#250).
+PROCESS_STARTED_AT = time.time()
 
 # Startup probe cap. `GitHubCLI` uses 60s for ordinary calls; this one
 # gates daemon startup, so a hung gh must not wedge it indefinitely.
@@ -1091,7 +1095,9 @@ async def peek_claim_owner(
     except Exception:
         return None
     now = _time.time()
-    if on_duplicate is not None and claim_refreshed_by_another(comments, settings, now):
+    if on_duplicate is not None and claim_refreshed_by_another(
+        comments, settings, started_at=PROCESS_STARTED_AT,
+    ):
         on_duplicate(repo, issue_number)
     return other_owner(comments, settings, now)
 
@@ -2074,12 +2080,15 @@ def node_check(
         raise typer.Exit(1)
 
     github = GitHubCLI()
-    binary = config.agent.binary if config.agent.binary != "claude" else _find_claude()
-    probe = None if no_agent else (
-        lambda: probe_usage(binary, UsageStore.beside(config.paths.state_db))
-    )
+
+    async def probe():
+        # Found only when the check runs: --no-agent must not depend on it.
+        binary = config.agent.binary if config.agent.binary != "claude" else _find_claude()
+        return await probe_usage(binary, UsageStore.beside(config.paths.state_db))
+
     checks = asyncio.run(run_checks(
-        config, github_login=github.get_login, agent_probe=probe, fetch=fetch_peer,
+        config, github_login=github.get_login,
+        agent_probe=None if no_agent else probe, fetch=fetch_peer,
     ))
     for c in checks:
         mark = "[green]✓[/green]" if c.ok else ("[dim]–[/dim]" if c.ok is None else "[red]✗[/red]")

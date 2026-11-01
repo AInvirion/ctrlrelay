@@ -61,20 +61,24 @@ class TestNodeId:
 
 
 class TestDuplicateFromClaims:
-    def test_a_claim_under_my_name_still_being_refreshed_is_another_process(self) -> None:
+    def test_a_claim_under_my_name_written_after_i_started_is_another_process(self) -> None:
+        started = NOW - 100
         comments = [_comment(claim_body("node-a", "x1", WORKING, NOW - 60), NOW - 60)]
-        assert claim_refreshed_by_another(comments, ME, NOW)
+        assert claim_refreshed_by_another(comments, ME, started_at=started)
 
-    def test_my_own_leftover_from_before_a_restart_is_not(self) -> None:
-        comments = [_comment(claim_body("node-a", "x1", WORKING, NOW - 900), NOW - 900)]
-        assert not claim_refreshed_by_another(comments, ME, NOW)
+    def test_my_own_leftover_is_not_however_recent(self) -> None:
+        # Written 5 seconds before this process started: a restart within
+        # the refresh interval leaves exactly this.
+        started = NOW - 55
+        comments = [_comment(claim_body("node-a", "x1", WORKING, NOW - 60), NOW - 60)]
+        assert not claim_refreshed_by_another(comments, ME, started_at=started)
 
     def test_held_claims_and_other_machines_are_not(self) -> None:
         comments = [
             _comment(claim_body("node-a", "x1", HELD, NOW - 10), NOW - 10),
             _comment(claim_body("node-b", "x2", WORKING, NOW - 10), NOW - 10),
         ]
-        assert not claim_refreshed_by_another(comments, ME, NOW)
+        assert not claim_refreshed_by_another(comments, ME, started_at=NOW - 100)
 
 
 class TestPeersWithMyName:
@@ -125,7 +129,8 @@ class TestRunChecks:
         assert got["GitHub login"] == (True, "the-account")
         assert got["agent login"][0] is True and "12%" in got["agent login"][1]
         assert got["peer http://b"][0] is True
-        assert got["peer http://down"] == (False, "refused")
+        assert got["peer http://down"][0] is False
+        assert got["peer http://down"][1].startswith("refused. Check the URL")
         assert got["peer http://self"][0] is False
         assert "own name" in got["peer http://self"][1]
 
@@ -143,6 +148,7 @@ class TestRunChecks:
         )
         got = {c.name: c for c in checks}
         assert got["GitHub login"].ok is False and "not logged in" in got["GitHub login"].detail
+        assert "gh auth login" in got["GitHub login"].detail
         assert got["agent login"].ok is False and "log in" in got["agent login"].detail
         assert got["peers"].ok is None
 
@@ -185,13 +191,15 @@ class TestTheCommand:
 
 class TestThePeekWarns:
     @pytest.mark.asyncio
-    async def test_the_claim_peek_reports_a_duplicate_name(self) -> None:
+    async def test_the_claim_peek_reports_a_duplicate_name(self, monkeypatch) -> None:
         import time
         from unittest.mock import AsyncMock
 
+        import ctrlrelay.cli as cli_mod
         from ctrlrelay.cli import peek_claim_owner
 
         now = time.time()
+        monkeypatch.setattr(cli_mod, "PROCESS_STARTED_AT", now - 60)
         github = AsyncMock()
         github.list_issue_comments.return_value = [
             _comment(claim_body("node-a", "x1", WORKING, now - 30), now - 30),
@@ -199,3 +207,68 @@ class TestThePeekWarns:
         seen = []
         await peek_claim_owner(github, "o/r", 7, ME, on_duplicate=lambda r, n: seen.append((r, n)))
         assert seen == [("o/r", 7)]
+
+
+
+class TestRoundOneFixes:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("answer", [None, [], {}, {"node": {"name": 5}}])
+    async def test_an_answer_that_is_not_a_status_page_fails(self, answer) -> None:
+        async def login() -> str:
+            return "a"
+
+        checks = await run_checks(
+            SimpleNamespace(node_id="node-a", fleet=SimpleNamespace(
+                peers=["http://x"], timeout_seconds=1)),
+            github_login=login, agent_probe=None, fetch=lambda url, *, timeout: answer,
+        )
+        [peer] = [c for c in checks if c.name == "peer http://x"]
+        assert peer.ok is False and "not with a ctrlrelay status page" in peer.detail
+
+    @pytest.mark.asyncio
+    async def test_a_hung_peer_is_given_up_without_holding_the_process(self) -> None:
+        import threading
+
+        from ctrlrelay.core.node_check import fetch_detached
+
+        hold = threading.Event()
+
+        def stuck(url, *, timeout):
+            hold.wait(30)
+            return {}
+
+        with pytest.raises(TimeoutError):
+            await fetch_detached(stuck, "http://x", timeout=0.05)
+        stuck_threads = [t for t in threading.enumerate() if t.name == "ctrlrelay-peer-check"]
+        assert stuck_threads and all(t.daemon for t in stuck_threads)
+        hold.set()
+
+    def test_no_agent_never_looks_for_the_agent(self, tmp_path, monkeypatch) -> None:
+        from typer.testing import CliRunner
+
+        import ctrlrelay.core.dispatcher as disp
+        import ctrlrelay.core.node_check as nc
+        from ctrlrelay.cli import app
+
+        def boom():
+            raise RuntimeError("no agent binary here")
+
+        monkeypatch.setattr(disp, "_find_claude", boom)
+        seen = {}
+
+        async def fake_run_checks(config, **kw):
+            seen["probe"] = kw["agent_probe"]
+            return [nc.Check("node_id", True, "node-a")]
+
+        monkeypatch.setattr(nc, "run_checks", fake_run_checks)
+        cfg = tmp_path / "orchestrator.yaml"
+        cfg.write_text(
+            'version: "1"\nnode_id: "node-a"\n'
+            f'paths: {{state_db: "{tmp_path}/s.db", worktrees: "{tmp_path}/w", '
+            f'bare_repos: "{tmp_path}/r", contexts: "{tmp_path}/c", skills: "{tmp_path}/k"}}\n'
+            f'transport: {{type: file_mock, file_mock: {{inbox: "{tmp_path}/i", '
+            f'outbox: "{tmp_path}/o"}}}}\n'
+        )
+        result = CliRunner().invoke(app, ["node", "check", "--no-agent", "-c", str(cfg)])
+        assert result.exit_code == 0, result.output
+        assert seen["probe"] is None
