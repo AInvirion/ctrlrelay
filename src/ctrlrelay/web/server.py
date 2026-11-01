@@ -34,10 +34,12 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from ctrlrelay import __version__
 from ctrlrelay.core.config import Config, WebConfig
+from ctrlrelay.core.github_budget import BudgetStore, budget_json
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.usage import UsageStore, pause_for, usage_json
 from ctrlrelay.web.health import read_server_health
@@ -270,8 +272,13 @@ class StatusServer(ThreadingHTTPServer):
         pause = pause_for(
             reading, threshold=self.config.usage.pause_at, now=time.time(),
         )
+        api = self.config.github_api
         return {
             "name": self.config.node_id,
+            "github_api": budget_json(
+                BudgetStore.beside(self.config.paths.state_db).read(),
+                low_at=api.low_at, now=time.time(),
+            ),
             "usage": usage_json(reading),
             "pause_at": self.config.usage.pause_at,
             "paused": None if pause is None else {
@@ -323,9 +330,18 @@ class WaitingRefresher:
 
     thread_name = "ctrlrelay-web-waiting"
 
-    def __init__(self, tracker: _Refreshable, *, interval_s: float) -> None:
+    def __init__(
+        self,
+        tracker: _Refreshable,
+        *,
+        interval_s: float,
+        budget_is_low: Callable[[], bool] | None = None,
+    ) -> None:
         self._tracker = tracker
         self._interval = interval_s
+        # #237: the waiting line is the first thing to give up GitHub calls
+        # when the account's budget is low. It is informational only.
+        self._budget_is_low = budget_is_low
         self._loop = asyncio.new_event_loop()
         # Not bound to a loop until first awaited, so it can be made here
         # and a stop() that comes before the first refresh is not lost.
@@ -358,7 +374,10 @@ class WaitingRefresher:
     async def _main(self) -> None:
         while not self._stop.is_set():
             try:
-                await self._tracker.refresh()
+                if self._budget_is_low is not None and self._budget_is_low():
+                    _logger.info("web.waiting_refresh_skipped_budget_low")
+                else:
+                    await self._tracker.refresh()
             except Exception as exc:
                 _logger.warning(
                     "web.waiting_refresh_failed",

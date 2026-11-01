@@ -4121,8 +4121,23 @@ def web_start(
                 f"[red]Cannot listen on {config.web.host}:{config.web.port}:[/red] {e}"
             )
             raise typer.Exit(1)
+        from ctrlrelay.core.github_budget import LOW, OUT, BudgetStore
+
+        budget_store = BudgetStore.beside(config.paths.state_db)
+
+        def _budget_is_low() -> bool:
+            reading = budget_store.read()
+            if reading is None:
+                return False
+            now = time.time()
+            return any(
+                b.state(config.github_api.low_at, now) in (LOW, OUT)
+                for b in reading.buckets.values()
+            )
+
         refresher = WaitingRefresher(
             tracker, interval_s=config.web.github_check_seconds,
+            budget_is_low=_budget_is_low,
         )
         refresher.start()
         try:

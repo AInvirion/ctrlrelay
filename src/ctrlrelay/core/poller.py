@@ -974,6 +974,7 @@ async def run_poll_loop(
     handler: Callable[[str, dict[str, Any]], Awaitable[None]],
     interval: int = 300,
     max_iterations: int | None = None,
+    interval_scale: Callable[[], float] | None = None,
 ) -> None:
     """Run the polling loop.
 
@@ -982,6 +983,9 @@ async def run_poll_loop(
         handler: Async function to call for each new issue (repo, issue)
         interval: Seconds between polls
         max_iterations: Max iterations (None = infinite)
+        interval_scale: Asked before each sleep; the interval is multiplied
+            by what it returns (#237: longer polls while the GitHub API
+            budget is low). A scale that raises counts as 1.
 
     Iteration resilience: any non-cancellation exception from the poll or a
     handler call is logged as ``poll.iteration.failed`` and the loop sleeps
@@ -1029,4 +1033,10 @@ async def run_poll_loop(
 
         iterations += 1
         if max_iterations is None or iterations < max_iterations:
-            await asyncio.sleep(interval)
+            scale = 1.0
+            if interval_scale is not None:
+                try:
+                    scale = max(1.0, float(interval_scale()))
+                except Exception:
+                    scale = 1.0
+            await asyncio.sleep(interval * scale)
