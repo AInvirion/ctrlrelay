@@ -7,23 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.4] - 2026-11-01
+
+Fixes for runs whose work could not be published. **No config edit is
+required.** `poller_state.json` gains a `publish_failures` count, added
+automatically.
+
 ### Fixed
 
 - A failed publish no longer strands the issue. `poll()` marks an issue seen
   before handing it to the handler, so a run whose agent finished but whose
-  branch the relay could not push stayed in `seen_issues` forever: the claim
-  was retracted, the automation label was still on it, and the relay never
-  came back. The issue is now un-marked for the next poll, up to 3 runs,
-  counted in `publish_failures` in `poller_state.json` so a restart does not
-  reset the limit. After the third the relay says on the issue that it has
-  stopped, and a *refused* push is not retried at all — the relay reaches the
-  same refusal every time (#268)
+  branch the relay could not publish stayed in `seen_issues` forever: the
+  claim was retracted, the automation label was still on it, and the relay
+  never came back. The issue is now un-marked for the next poll, up to 3
+  runs, counted in `publish_failures` in `poller_state.json` (saved together
+  with the un-mark) so a restart does not reset the limit. After the third
+  the relay says on the issue that it has stopped, with the error scrubbed,
+  and says so in chat if that comment cannot be posted. A *refused* push is
+  not retried at all: the relay reaches the same refusal every time (#278,
+  closes #268)
 - The retraction comment no longer advises a retry that cannot work. It said
   to re-assign the issue or re-apply its automation label, but the skip
-  decision reads the issue number alone — no assignee, no labels — so neither
-  did anything. It now says the relay will return when it will, and otherwise
-  names the one route that works (#268)
-
+  decision reads the issue number alone, so neither did anything. It now
+  says that while the poller is running the relay tries again a limited
+  number of times and says so if it stops, and otherwise names the one route
+  that works (#278, closes #268)
+- A failed push says why. The rejected ref and git's reason (a stale lease,
+  a non-fast-forward, a protection rule) lead the error, the remote's own
+  `remote:` lines follow, and the reason reaches `dev.publish.failed` as its
+  own `push_rejection` field. Before, only git's summary line naming the URL
+  survived. Every failing git command now reports both of its output
+  streams, scrubbed of credential shapes (#277, closes #269)
 
 ## [0.16.3] - 2026-11-01
 
@@ -2034,7 +2048,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.3...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.4...HEAD
+[0.16.4]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.0...v0.16.1
