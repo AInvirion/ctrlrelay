@@ -765,8 +765,9 @@ class UsageConfig(BaseModel):
 class GitHubApiConfig(BaseModel):
     """Watching the account's GitHub API budget (#237)."""
 
-    # A bucket below this share of its hourly limit is "low": non-urgent
-    # work slows down and one chat line goes out.
+    # A bucket below this share of its limit is "low": non-urgent work
+    # slows down and one chat line goes out. Not applied to `search`,
+    # which resets every minute.
     low_at: float = Field(default=0.2, gt=0, lt=1)
     # How often the daemon reads /rate_limit (a free call). A divisor of
     # 60, since it runs as a `*/N` cron: other values give uneven gaps.

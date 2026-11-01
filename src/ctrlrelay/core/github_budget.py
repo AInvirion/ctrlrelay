@@ -25,6 +25,7 @@ A reading that could not be taken is ``None``, published as
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import tempfile
@@ -52,6 +53,7 @@ class Bucket:
     remaining: int
     limit: int
     resets_at: int
+    per_minute: bool = False
 
     def state(self, low_at: float, now: float) -> str:
         if now >= self.resets_at:
@@ -60,7 +62,10 @@ class Bucket:
             return UNKNOWN
         if self.remaining <= 0:
             return OUT
-        if self.limit > 0 and self.remaining / self.limit < low_at:
+        # `search` resets every minute: "low" there is one burst, gone by
+        # the next read, and would only flap the chat and the poll interval.
+        # It is still held back when used up.
+        if self.limit > 0 and self.remaining / self.limit < low_at and not self.per_minute:
             return LOW
         return OK
 
@@ -87,7 +92,7 @@ class BudgetReading:
         for name in BUCKETS:
             b = _bucket(data.get(name), reset_key="resets_at")
             if b is not None:
-                buckets[name] = b
+                buckets[name] = dataclasses.replace(b, per_minute=name == "search")
         if not _MIN_TS <= data["read_at"] < _MAX_TS:
             return None
         return cls(buckets=buckets, read_at=data["read_at"]) if buckets else None
@@ -129,7 +134,7 @@ def parse_rate_limit(text: str, *, now: float | None = None) -> BudgetReading | 
     for name in BUCKETS:
         b = _bucket(resources.get(name), reset_key="reset")
         if b is not None:
-            buckets[name] = b
+            buckets[name] = dataclasses.replace(b, per_minute=name == "search")
     if not buckets:
         return None
     return BudgetReading(buckets=buckets, read_at=int(time.time() if now is None else now))
@@ -150,9 +155,13 @@ def bucket_for(args: Sequence[str]) -> str | None:
     if not args:
         return None
     if args[0] == "search":
-        return "search"
+        # `gh search code` spends its own `code_search` bucket.
+        return None if len(args) > 1 and args[1] == "code" else "search"
     if args[0] == "api":
-        path = _api_endpoint(args[1:]).lstrip("/")
+        path = _api_endpoint(args[1:])
+        if "://" in path:  # a full URL: keep only the path after the host
+            path = path.split("://", 1)[1].partition("/")[2]
+        path = path.lstrip("/")
         if path.split("?")[0] == "rate_limit":
             return None  # free, and the read that ends a block: never held
         if path.startswith("graphql"):
@@ -223,37 +232,33 @@ class BudgetStore:
         return cls(Path(state_db).parent / "github_budget.json")
 
     def write(self, reading: BudgetReading) -> None:
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".github-budget-")
-            with os.fdopen(fd, "w") as f:
-                json.dump(reading.to_json(), f)
-            os.replace(tmp, self.path)
-        except Exception as e:
-            log_event(_logger, "github_budget.write_failed", error=str(e)[:200])
-            # Older numbers must not stand as current on the page.
-            try:
-                self.path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        self._write_json(reading.to_json())
 
     def mark_unknown(self, now: float) -> None:
         """The latest read failed: the page says unknown, not the older
         numbers as if current."""
+        self._write_json({"unknown": True, "read_at": int(now)})
+
+    def _write_json(self, data: dict[str, Any]) -> None:
+        """Atomic replace. On failure the temp file is removed and so is
+        the old file: older numbers must not stand as current."""
+        tmp: str | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".github-budget-")
             with os.fdopen(fd, "w") as f:
-                json.dump({"unknown": True, "read_at": int(now)}, f)
+                json.dump(data, f)
             os.replace(tmp, self.path)
+            tmp = None
         except Exception as e:
             log_event(_logger, "github_budget.write_failed", error=str(e)[:200])
-            # Could not say unknown: at least do not leave the old numbers
-            # to be read as current.
-            try:
-                self.path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            for leftover in (tmp, self.path):
+                if leftover is None:
+                    continue
+                try:
+                    Path(leftover).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def read(
         self, *, max_age: float | None = None, now: float | None = None,
@@ -376,7 +381,6 @@ class GitHubBudget:
             before = self._said.get(name, OK)
             if state == before:
                 continue
-            self._said[name] = state
             resets = _iso(b.resets_at)
             if state == OUT:
                 text = (
@@ -404,4 +408,9 @@ class GitHubBudget:
                     # send that hangs must not stop budget reads with it.
                     await asyncio.wait_for(self.notify(text), timeout=NOTIFY_TIMEOUT_SECONDS)
                 except Exception as e:
+                    # Not recorded as said: the next read tries again while
+                    # the state holds, so nobody is told "back" about a
+                    # state they were never told of.
                     log_event(_logger, "github_budget.notify_failed", error=str(e)[:200])
+                    continue
+            self._said[name] = state

@@ -1,7 +1,7 @@
 """The GitHub API budget (#237).
 
-``RATE_LIMIT`` has the shape of a real ``gh api rate_limit`` answer,
-taken on 31 Oct 2026 and trimmed to the three buckets read here.
+``rate_limit()`` builds an answer in the shape of a real ``gh api
+rate_limit`` one (31 Oct 2026), reduced to the three buckets read here.
 """
 
 from __future__ import annotations
@@ -529,3 +529,56 @@ class TestRoundFiveFixes:
         with patch("asyncio.create_subprocess_exec", return_value=proc) as spawn:
             await gh._run_gh(*args)
         assert spawn.call_count == 1
+
+
+
+class TestColdReviewFixes:
+    def test_gh_search_code_is_its_own_bucket(self) -> None:
+        assert bucket_for(("search", "code", "x")) is None
+        assert bucket_for(("search", "issues", "x")) == "search"
+
+    def test_a_full_url_endpoint_is_classified_by_its_path(self) -> None:
+        assert bucket_for(("api", "https://api.github.com/graphql")) == "graphql"
+        assert bucket_for(("api", "https://api.github.com/search/issues?q=x")) == "search"
+        assert bucket_for(("api", "https://api.github.com/repos/o/r")) == "core"
+
+    def test_search_is_never_low_only_out(self) -> None:
+        r = parse_rate_limit(rate_limit(search=2), now=NOW)
+        assert r.buckets["search"].state(0.2, NOW) == OK
+        r = parse_rate_limit(rate_limit(search=0), now=NOW)
+        assert r.buckets["search"].state(0.2, NOW) == OUT
+        stored = BudgetReading.from_json(r.to_json())
+        assert stored.buckets["search"].per_minute
+
+    @pytest.mark.asyncio
+    async def test_a_line_that_failed_to_send_is_sent_again(self, tmp_path: Path) -> None:
+        sent: list[str] = []
+        fail = [True]
+
+        async def notify(t: str) -> None:
+            if fail[0]:
+                raise OSError("chat down")
+            sent.append(t)
+
+        budget = GitHubBudget(
+            BudgetStore(tmp_path / "b.json"), low_at=0.2,
+            fetch=AsyncMock(return_value=rate_limit(core=0)), notify=notify, clock=lambda: NOW,
+        )
+        await budget.refresh()
+        assert sent == []
+        fail[0] = False
+        await budget.refresh()
+        assert len(sent) == 1 and "used up" in sent[0]
+
+    def test_a_failed_write_leaves_no_temp_file(self, tmp_path: Path) -> None:
+        store = BudgetStore(tmp_path / "b.json")
+        with patch("os.replace", side_effect=OSError("no")):
+            store.write(parse_rate_limit(rate_limit(), now=NOW))
+        assert list(tmp_path.iterdir()) == []
+
+    def test_sixty_minutes_is_a_valid_schedule(self) -> None:
+        from ctrlrelay.core.config import GitHubApiConfig
+        from ctrlrelay.core.scheduler import _build_vixie_trigger
+
+        assert GitHubApiConfig(check_minutes=60).check_minutes == 60
+        _build_vixie_trigger("0 * * * *", timezone=None)

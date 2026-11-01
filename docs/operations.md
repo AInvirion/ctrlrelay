@@ -288,7 +288,8 @@ Added in #247:
 Added in #237: `node.github_api` is the account's GitHub API budget as this
 machine last read it: `read_at`, and for `core`, `search` and `graphql` each
 `{remaining, limit, resets_at, state}` with `state` one of `ok`, `low`, `out`,
-or `"unknown"` for a bucket it could not read; the whole value is `"unknown"`
+or `unknown` once its reset time has passed (the numbers are then old), or
+`"unknown"` in place of the object for a bucket it could not read; the whole value is `"unknown"`
 before any reading. The page shows it in the **Usage** box. Low and used-up
 buckets are described in [configuration: github_api]({{ '/configuration/' | relative_url }}#github_api).
 Which bucket a `gh` command spends is worked out from the command where the

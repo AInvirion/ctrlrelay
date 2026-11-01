@@ -3733,7 +3733,10 @@ def poller_start(
             )
             scheduler.add_cron_job(
                 name="github_budget",
-                cron_expr=f"*/{config.github_api.check_minutes} * * * *",
+                cron_expr=(
+                    "0 * * * *" if config.github_api.check_minutes == 60
+                    else f"*/{config.github_api.check_minutes} * * * *"
+                ),
                 func=github_budget.refresh,
             )
             scheduler.add_cron_job(
