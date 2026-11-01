@@ -54,6 +54,9 @@ RELEASE_MARKER_PREFIX = "<!-- ctrlrelay:released"
 DISPATCH_FAILED_MARKER = "<!-- ctrlrelay:dispatch-failed -->"
 
 UNKNOWN_NODE = "unknown"
+# Every claim id this process posted or adopted (#250): a claim under this
+# machine's name that is not in here was written by another process.
+OWN_CLAIM_IDS: set[str] = set()
 WORKING = "working"
 HELD = "held"
 
@@ -325,6 +328,7 @@ async def acquire_claim(
     live = live_claims(comments, settings, now)
     if live and live[0].claim_id is not None:
         mine = live[0]
+        OWN_CLAIM_IDS.add(mine.claim_id)
         # An earlier run's background hold must not mark this new run's
         # claim held after it starts working.
         pending = _BACKGROUND_HOLDS.pop(mine.claim_id, None)
@@ -346,6 +350,7 @@ async def acquire_claim(
         )
 
     claim_id = secrets.token_hex(6)
+    OWN_CLAIM_IDS.add(claim_id)
     stale = _stale_claims(comments, settings, now)
     # Everything already replaced is replaced again, so the history does
     # not depend on the claim that first recorded it: if that claim is

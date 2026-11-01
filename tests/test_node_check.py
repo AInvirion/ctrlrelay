@@ -225,6 +225,31 @@ class TestRoundOneFixes:
         [peer] = [c for c in checks if c.name == "peer http://x"]
         assert peer.ok is False and "not with a ctrlrelay status page" in peer.detail
 
+    def test_a_process_exits_while_a_peer_read_is_still_hung(self, tmp_path) -> None:
+        import subprocess
+        import sys
+        import time as _time
+
+        script = tmp_path / "hang.py"
+        script.write_text(
+            "import asyncio, threading\n"
+            "from ctrlrelay.core.node_check import fetch_detached\n"
+            "def stuck(url, *, timeout):\n"
+            "    threading.Event().wait()\n"
+            "async def main():\n"
+            "    try:\n"
+            "        await fetch_detached(stuck, 'http://x', timeout=0.05)\n"
+            "    except TimeoutError:\n"
+            "        print('gave up')\n"
+            "asyncio.run(main())\n"
+        )
+        started = _time.monotonic()
+        out = subprocess.run([sys.executable, str(script)], capture_output=True,
+                             text=True, timeout=20)
+        assert out.returncode == 0, out.stderr
+        assert "gave up" in out.stdout
+        assert _time.monotonic() - started < 15
+
     @pytest.mark.asyncio
     async def test_a_hung_peer_is_given_up_without_holding_the_process(self) -> None:
         import threading
@@ -272,3 +297,17 @@ class TestRoundOneFixes:
         result = CliRunner().invoke(app, ["node", "check", "--no-agent", "-c", str(cfg)])
         assert result.exit_code == 0, result.output
         assert seen["probe"] is None
+
+
+
+class TestRoundTwoFixes:
+    def test_a_claim_this_process_made_is_never_a_duplicate(self) -> None:
+        from ctrlrelay.core.claims import OWN_CLAIM_IDS
+
+        comments = [_comment(claim_body("node-a", "mine1", WORKING, NOW - 10), NOW - 10)]
+        OWN_CLAIM_IDS.add("mine1")
+        try:
+            assert not claim_refreshed_by_another(comments, ME, started_at=NOW - 100)
+        finally:
+            OWN_CLAIM_IDS.discard("mine1")
+        assert claim_refreshed_by_another(comments, ME, started_at=NOW - 100)

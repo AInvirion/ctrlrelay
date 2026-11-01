@@ -16,7 +16,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from ctrlrelay.core.claims import WORKING, ClaimSettings, parse_claims, safe_node_name
+from ctrlrelay.core.claims import (
+    OWN_CLAIM_IDS,
+    WORKING,
+    ClaimSettings,
+    parse_claims,
+    safe_node_name,
+)
 
 
 @dataclass(frozen=True)
@@ -35,17 +41,17 @@ def claim_refreshed_by_another(
     """A working claim under this machine's name, written after this
     process started, on an issue this process is not running.
 
-    Called where the daemon peeks at an issue it is about to consider, so
-    this process holds no claim there and has written none on it since it
-    started. A claim under its name updated after ``started_at`` was
-    therefore written by another process using the same name. Its own
-    claims from before a restart were written before ``started_at``,
-    however recently, and never count.
+    A claim this process posted or adopted is never counted (they are in
+    ``OWN_CLAIM_IDS``), and neither is one written before ``started_at``,
+    which is this machine's own from before a restart however recent. A
+    working claim under its name that is neither was written by another
+    process using the same name.
     """
     for claim in parse_claims(comments, settings.account):
         if (
             claim.node == settings.node
             and claim.state == WORKING
+            and claim.claim_id not in OWN_CLAIM_IDS
             and claim.updated_at is not None
             and claim.updated_at > started_at
         ):
@@ -188,7 +194,9 @@ async def run_checks(
             checks.append(Check(
                 f"peer {url}", False,
                 f"answers with this machine's own name {name!r}: two machines "
-                "share a node_id, or the peer URL points back at this machine",
+                "share a node_id, or the peer URL points back at this machine. "
+                "Give each machine its own node_id in orchestrator.yaml, and "
+                "check this peer URL is the other machine's",
             ))
         else:
             checks.append(Check(f"peer {url}", True, f"reachable, {name}"))
