@@ -21,6 +21,7 @@ from ctrlrelay.core.question_expiry import (
     DEFAULT_RETENTION_DAYS,
     expire_stale_questions,
 )
+from ctrlrelay.core.usage import UsageGate, UsageStore, probe_usage
 from ctrlrelay.transports.base import Transport
 
 _logger = get_logger("cli")
@@ -1109,6 +1110,14 @@ def settle_claimed_elsewhere(
     )
 
 
+def defer_for_usage(poller, repo: str, issue_number: int, pause) -> str:
+    """Leave an issue for later while this machine is paused for usage
+    (#247), and say why. It is offered again at the pause's end; the
+    caller also registers it so the gate's resume can wake it sooner."""
+    poller.recheck_at(repo, issue_number, float(pause.until))
+    return f"#{issue_number} in {repo} left for later: {pause.reason}."
+
+
 def settle_pre_dispatch_failure(poller, repo: str, issue_number: int, result):
     """Decide what a finished run means for retrying its issue (#234).
 
@@ -2060,7 +2069,10 @@ def run_secops(
     # and a relay-health alert about their own single run would be
     # noise. The keyword is required, so choosing None is explicit
     # rather than inherited by omission (#204).
-    dispatcher = make_agent_dispatcher(config.agent, outcome_hook=None)
+    dispatcher = make_agent_dispatcher(
+        config.agent, outcome_hook=None,
+        usage_store=UsageStore.beside(config.paths.state_db),
+    )
     github = GitHubCLI()
     worktree = WorktreeManager(
         worktrees_dir=config.paths.worktrees,
@@ -2215,7 +2227,10 @@ def run_dev(
     # and a relay-health alert about their own single run would be
     # noise. The keyword is required, so choosing None is explicit
     # rather than inherited by omission (#204).
-    dispatcher = make_agent_dispatcher(config.agent, outcome_hook=None)
+    dispatcher = make_agent_dispatcher(
+        config.agent, outcome_hook=None,
+        usage_store=UsageStore.beside(config.paths.state_db),
+    )
     github = GitHubCLI()
     worktree = WorktreeManager(
         worktrees_dir=config.paths.worktrees,
@@ -2609,9 +2624,39 @@ def poller_start(
         # The daemon is the case #204 is about: nothing is watching,
         # so every spawn's exit code and output tail are recorded and
         # a run of failures raises one alert.
+        usage_store = UsageStore.beside(config.paths.state_db)
         dispatcher = make_agent_dispatcher(
             config.agent,
             outcome_hook=make_dispatch_outcome_hook(config, state_db),
+            usage_store=usage_store,
+        )
+
+        async def _usage_notice(text: str) -> None:
+            transport = await connect_notify_transport(config)
+            if transport is None:
+                return
+            try:
+                await transport.send(text)
+            finally:
+                # Bounded on its own: a transport that hung in send (and
+                # was cancelled by the gate's timeout) can hang here too.
+                try:
+                    await asyncio.wait_for(transport.close(), timeout=5)
+                except Exception:
+                    pass
+
+        # Issues left for later while paused, offered again the moment
+        # the pause ends rather than at the reset time each was given.
+        usage_deferred: set[tuple[str, int]] = set()
+
+        def _wake_usage_deferred() -> None:
+            for repo_name, number in sorted(usage_deferred):
+                poller.recheck_at(repo_name, number, 0.0)
+            usage_deferred.clear()
+
+        usage_gate = UsageGate(
+            usage_store, threshold=config.usage.pause_at, notify=_usage_notice,
+            on_resume=_wake_usage_deferred,
         )
         worktree = WorktreeManager(
             worktrees_dir=config.paths.worktrees,
@@ -2817,6 +2862,19 @@ def poller_start(
         async def handle_issue(repo: str, issue: dict) -> None:
             issue_number = issue["number"]
             title = issue.get("title", "")
+
+            # Near the subscription limit (#247): take no new work. Runs
+            # already going are not touched.
+            pause = await usage_gate.check()
+            if pause is not None:
+                deferred = defer_for_usage(poller, repo, issue_number, pause)
+                usage_deferred.add((repo, issue_number))
+                # The pause may have ended while this check was still
+                # sending its chat line; then nothing would wake it.
+                if usage_gate.paused is None:
+                    _wake_usage_deferred()
+                console.print(f"[yellow]{deferred}[/yellow]")
+                return
 
             owner = await peek_claim_owner(github, repo, issue_number, claims)
             if owner is not None:
@@ -3214,6 +3272,27 @@ def poller_start(
                         await secops_transport.close()
                     except Exception:
                         pass
+
+        async def _run_usage_probe() -> None:
+            last = usage_store.last_attempt_at()
+            max_age = config.usage.probe_minutes * 60
+            idle = getattr(dispatcher, "active", 0) == 0
+            if idle and max_age > 0 and (
+                last is None or time.time() - last >= max_age
+            ):
+                binary = getattr(dispatcher, "claude_binary", None)
+                started = getattr(dispatcher, "started", 0)
+                if binary:
+                    await probe_usage(
+                        binary, usage_store,
+                        still_idle=lambda: (
+                            getattr(dispatcher, "started", 0) == started
+                            and getattr(dispatcher, "active", 0) == 0
+                        ),
+                    )
+            # Also where a pause ends while nothing else is happening:
+            # the resume line goes out without waiting for a new issue.
+            await usage_gate.check()
 
         async def _run_question_expiry_sweeper() -> None:
             """Retire BLOCKED questions the operator can no longer
@@ -3628,6 +3707,16 @@ def poller_start(
             # rows stay live targets for orphan reply routing and get
             # re-posted every sweep, including ones whose PR was
             # merged by hand days earlier.
+            # Keep the usage reading fresh while idle (#247), and end a
+            # pause on time even with the probe off. A run reads the usage
+            # anyway, so the probe only fires when the last reading, or
+            # the last attempt that found none, is older than the
+            # interval.
+            scheduler.add_cron_job(
+                name="usage_probe",
+                cron_expr="*/5 * * * *",
+                func=_run_usage_probe,
+            )
             scheduler.add_cron_job(
                 name="question_expiry_sweeper",
                 cron_expr="0 * * * *",

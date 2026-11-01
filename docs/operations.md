@@ -279,6 +279,20 @@ Fields added in #232 (all in `/api/status`):
 | `skipped` | Every open issue assigned to you that the poller will **not** pick up and is not running, from the same search as the waiting line (no extra GitHub calls): `repo`, `issue_number`, `title`, `url`, `updated`/`updated_ts` and `reason`, one of `repo not in config`, `excluded label <label>`, `already handled once (won't retry)`, `missing required label <label>` (several joined with "or": any one admits it), `assigned by someone else`. `null` until GitHub has answered once; `waiting.status` and `waiting.last_good_ts` say how current it is. The page shows it collapsed, with a count. |
 | `server` | This machine's health, read on each request: `load_1m`, `load_5m`, `load_15m`, `cpu_count`, `memory` (`total_bytes`, `available_bytes`, `available_pct`, `low`), `disks` (one each for `home` and `worktrees`: `name`, `path`, `total_bytes`, `free_bytes`, `free_pct`, `low`), `uptime_s`, and `unavailable` (why any number is `null`; memory and uptime are `null` off Linux). `low` is true below 10% free and the page marks it. The whole section is `null`, with a line in `errors`, only if reading it failed outright. |
 
+Added in #247:
+
+| Field | What |
+|---|---|
+| `node` | This machine's own block: `name` (`node_id`); `usage`, the agent subscription's usage as the last run or probe read it: `status`, `read_at`, and for `five_hour` and `seven_day` each `{used (0 to 1), resets_at}`, or `"unknown"` for a window it could not read; the whole `usage` is `"unknown"` before any reading. `pause_at` is `usage.pause_at`, and `paused` is `{reason, until}` while the machine takes no new issues, else `null`. The page shows it in the **Usage** box. `node` is `null`, with a line in `errors`, only if reading it failed outright. |
+
+**Pausing for usage.** Every agent run reports the subscription's usage, and
+an idle machine refreshes it with one tiny call every `usage.probe_minutes`.
+When the 5-hour or 7-day window reaches `usage.pause_at`, or the status is not
+`allowed`, the machine stops taking new issues (runs already going finish),
+sends one chat line, and takes issues again after the window's reset, with one
+more chat line. A usage it could not read is shown as unknown and never pauses
+it. See [configuration: usage]({{ '/configuration/' | relative_url }}#usage).
+
 Try it on loopback first (the default `web.host` is `127.0.0.1`, port `8787`):
 
 ```bash

@@ -85,7 +85,7 @@ claude:
 |---|---|---|---|
 | `binary` | string | `"claude"` | Path to the `claude` executable. The bare name `"claude"` is auto-resolved at startup using `shutil.which("claude")`, then `~/.local/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude`. Set an absolute path to skip lookup (useful under launchd/systemd where PATH is minimal). |
 | `default_timeout_seconds` | int | `1800` | Per-session timeout passed to `asyncio.wait_for`. Sessions that exceed this are killed and reported as failed. |
-| `output_format` | string | `"json"` | Forwarded as `--output-format` to `claude -p`. |
+| `output_format` | string | `"json"` | Not used. The relay always runs `claude -p --output-format stream-json --verbose`, because only that output carries the subscription usage it reads (see [usage](#usage)). Kept so existing configs still load. |
 
 ctrlrelay always invokes claude with `--dangerously-skip-permissions` so the
 agent does not pause on tool-permission prompts in headless runs. This is
@@ -326,6 +326,27 @@ claims:
 | `race_wait_seconds` | number (0-60) | `5` | Wait between posting a claim and reading the comments back to see who won. |
 | `refresh_seconds` | number (>= 30) | `300` | How often a working machine edits its claim to show it is alive. |
 | `stale_after_seconds` | number (>= 300) | `1800` | A working claim not refreshed for this long is treated as a stopped machine's, and another machine may take the issue. Must be at least three times `refresh_seconds`. |
+
+## usage
+
+Pausing before the agent subscription's limit. Each run reports the
+subscription's 5-hour and 7-day usage; the status page shows it, and a
+machine stops taking new issues near the limit.
+
+```yaml
+usage:
+  pause_at: 0.9
+  probe_minutes: 30
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `pause_at` | number (above 0, up to 1) | `0.9` | Take no new issues while the 5-hour or 7-day window is at or above this share, or while the status is anything but `allowed`. Runs already going finish. New issues are taken again after the window's reset time; when the reset time cannot be read, after an hour, when the next reading decides again. |
+| `probe_minutes` | int (>= 0) | `30` | When the last reading, or the last attempt that found none, is older than this, the daemon makes one tiny agent call (no tools, no MCP servers, no user or project settings and so no hooks, one turn, in an empty directory) to read the usage again, so an idle machine's numbers do not go stale. `0` turns it off. Each probe is one short call on the subscription. |
+
+The usage comes from a field of the agent CLI's output that is not
+documented. When it is missing or cannot be read, the page says
+**unknown**, never 0%, and the machine does not pause on it. A run whose output carries no readable usage records unknown too, so an older number stops pausing the machine.
 
 ## repos
 

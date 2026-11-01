@@ -607,6 +607,7 @@ def build_status(
     history_days: int = 7,
     home: Path | None = None,
     titles: Mapping[str, str] | None = None,
+    node: Callable[[], dict] | None = None,
 ) -> dict:
     """Everything the page shows, as the documented JSON contract. Never
     raises for a database problem; see the module docstring.
@@ -614,7 +615,10 @@ def build_status(
     ``server`` reads the machine's health (``web.health``); it is called
     here so that a reader that raises makes the section ``null`` with an
     error, never a partial one. ``waiting`` is the tracker's snapshot; its
-    ``skipped`` list is published as the top-level ``skipped``."""
+    ``skipped`` list is published as the top-level ``skipped``.
+
+    ``node`` reads this machine's own block (#247: its usage); like
+    ``server``, a reader that raises makes it ``null`` with an error."""
     if now is None:
         now = int(datetime.now(UTC).timestamp())
     errors: list[str] = []
@@ -629,6 +633,12 @@ def build_status(
     except Exception as exc:
         errors.append(f"server: {type(exc).__name__}: {exc}"[:300])
         server_health = None
+    node_block: dict | None = None
+    if node is not None:
+        try:
+            node_block = node()
+        except Exception as exc:
+            errors.append(f"node: {type(exc).__name__}: {exc}"[:300])
     day_start, day_end = _local_day(now)
     feed_since = now - history_days * 86_400
     feed_limit = FEED_LIMIT
@@ -706,6 +716,7 @@ def build_status(
     return {
         "version": version,
         "host": host,
+        "node": node_block,
         "generated": _iso(now),
         "generated_ts": now,
         "running": running,
