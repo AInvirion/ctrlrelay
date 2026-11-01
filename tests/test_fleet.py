@@ -289,6 +289,11 @@ class TestRoundOneFixes:
             paused={"reason": "x"}, now=NOW, silent_after=300,
         )
         assert act["state"] == UNKNOWN
+        # Not hidden under "silent" either.
+        assert node_activity(
+            running=None, needs_you=None, heartbeat=None, paused=None,
+            now=NOW, silent_after=300,
+        )["state"] == UNKNOWN
         assert act["slots"] is None and act["claims"] is None
 
     def test_a_healthy_peer_is_published_while_another_is_stuck(self) -> None:
@@ -324,19 +329,23 @@ class TestRoundOneFixes:
         def fetch(url, *, timeout):
             if url == "http://stuck":
                 release.wait(5)
-                raise TimeoutError
+                raise ConnectionRefusedError
             return _status("node-c", beat=time.time())
 
         reader = PeerReader(["http://stuck", "http://c"], interval_s=60, timeout_s=0.1,
                             silent_after=300, fetch=fetch)
-        started = time.monotonic()
-        reader.read_once()
-        release.set()
-        assert time.monotonic() - started < 2
-        stuck, ok = reader.snapshot()["peers"]
-        assert stuck["error"] == "timeout" and not stuck["reachable"]
-        assert ok["reachable"] and ok["name"] == "node-c"
-        reader.stop()
+        try:
+            started = time.monotonic()
+            reader.read_once()
+            assert time.monotonic() - started < 2
+            # Taken while the stuck read is still blocked: the deadline
+            # published this, not the read itself.
+            stuck, ok = reader.snapshot()["peers"]
+            assert stuck["error"] == "timeout" and not stuck["reachable"]
+            assert ok["reachable"] and ok["name"] == "node-c"
+        finally:
+            release.set()
+            reader.stop()
 
     @pytest.mark.parametrize("bad_node", [
         {"name": "b", "heartbeat_at": "9999999-01-01T00:00:00Z", "claims": [None, 3]},

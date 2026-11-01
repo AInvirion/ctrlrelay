@@ -71,20 +71,21 @@ def node_activity(
     ``running`` and ``needs_you`` are the page's own sections; ``None``
     means that part of the state database could not be read. If either is
     ``None``, slots and claims are ``None``, never empty, and the state is
-    ``unknown`` unless the heartbeat already makes it ``silent``.
+    ``unknown``.
 
-    Precedence: ``silent`` (the daemon's heartbeat is missing or older than
-    ``silent_after``; nothing else here can tell a stopped poller from a
-    quiet one), then ``unknown`` (the database could not be read), then
-    ``paused-limit``, then ``working`` or ``idle``.
+    Precedence: ``unknown`` (the database could not be read; the page's
+    errors say why), then ``silent`` (the daemon's heartbeat is missing or
+    older than ``silent_after``; nothing else here can tell a stopped
+    poller from a quiet one), then ``paused-limit``, then ``working`` or
+    ``idle``. Both of the first two are shown as a problem.
     """
     beat = heartbeat.get("heartbeat_at") if heartbeat else None
     silent = beat is None or now - beat > silent_after
     readable = running is not None and needs_you is not None
-    if silent:
-        state = SILENT
-    elif not readable:
+    if not readable:
         state = UNKNOWN
+    elif silent:
+        state = SILENT
     elif paused:
         state = PAUSED_LIMIT
     elif running:
@@ -317,10 +318,13 @@ class PeerReader:
     ``fleet`` block and never waits on the network.
 
     Each peer is read in its own thread, at most one read in flight per
-    peer, and each read's result is published the moment it arrives. A
-    read still going ``timeout_s * 2`` after it started is reported as
-    "timeout"; it is left to finish, and its peer is not read again until
-    it has. So a stuck peer costs one thread and holds up no other peer.
+    peer, and each read's result is published the moment it arrives. The
+    deadline, ``timeout_s * 2`` from a read's start, is checked when a
+    cycle waits for its reads and again at each later cycle while the read
+    is still going; past it, the peer is reported as "timeout". The read
+    is left to finish (a late but complete answer is published then, with
+    its own time), and its peer is not read again until it has. So a stuck
+    peer costs one thread and holds up no other peer.
     """
 
     def __init__(
