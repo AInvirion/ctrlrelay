@@ -54,8 +54,9 @@ three things before upgrading:
   scheduled time across machines: the first to create the ref
   `refs/ctrlrelay/claims/secops/<window>` in the repository runs it. A
   machine that dies holding a window, or a ref that cannot be created,
-  leaves that repository unswept for that window; the next window is new
-  (#259, closes #246)
+  leaves that repository unswept for that window; the next window is new.
+  Keep `repos`, `schedules` and `timezone` the same on every machine, or
+  they name different windows (#259, closes #246)
 - Chat with several machines: questions are tagged with the machine's name
   and a machine ignores replies to another's. Mattermost machines can share
   one bot and channel with `transport.mattermost.shared: true` (a message
@@ -66,15 +67,17 @@ three things before upgrading:
 - Subscription usage: read from each agent run and shown on the status
   page. New issues wait while the 5-hour or 7-day window is at or above
   `usage.pause_at` (default 90%), or the status is anything but `allowed`,
-  until the window's reset; runs already going finish, and a usage that
+  until the window's reset (or an hour, when the reset time cannot be read,
+  and then the next reading decides); runs already going finish, and a usage that
   could not be read never pauses. An idle probe every `usage.probe_minutes`
   keeps the reading fresh (#254, closes #247)
 - GitHub API budget: watched every `github_api.check_minutes`; polling slows
   by `github_api.slow_factor` while the `core` or `graphql` bucket is below
   `github_api.low_at` (not `search`, which resets every minute), with one
   chat line. When a bucket is used up, calls known to spend it
-  (`gh api`, `gh search`) wait for its reset; other `gh` commands are not
-  held back (#256, closes #237)
+  (`gh api`, `gh search`) fail at once as rate limited until its reset, and
+  the poller resumes after it; other `gh` commands are not held back (#256,
+  closes #237)
 - Status page: a Machines strip and who-has-what for every machine listed in
   `fleet.peers` (each machine's `web.allowed_hosts` must hold the name the
   others use for it), plus this machine's usage and API budget (#258,
