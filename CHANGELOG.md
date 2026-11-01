@@ -9,16 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.16.0] - 2026-11-01
 
-Several machines can now run ctrlrelay on one GitHub account without taking
-the same work, and the dev and task agents can run in a read-only sandbox.
-Every new config value has a default, and nothing is added to the database,
-so **no config edit is required** to upgrade. One exception: a `node_id`
-that is a placeholder (`localhost`, `unknown`, `my-laptop`, `changeme`, ...)
-is now refused at startup; set a real name.
+Several machines can now run ctrlrelay on one GitHub account, each claiming
+an issue before it works it, and the dev and task agents can run in a
+read-only sandbox. Every new config value has a default and nothing is added
+to the database, so for most installs **no config edit is required**. Check
+three things before upgrading:
 
-**Upgrade every machine on an account to the same version.** Claims now name
-the machine and the process that wrote them, and an older version reads them
-differently.
+- **A placeholder `node_id` is refused at startup**: `localhost`,
+  `localhost.localdomain`, `unknown`, `my-laptop`, `studio-mac` (both were
+  examples in earlier docs), `changeme`, `example`, `node`, `hostname`. Set a
+  name no other machine on the account uses. A missing `node_id` still
+  defaults to the hostname.
+- **If you already run `agent.sandbox: bwrap`**, it is now much stricter:
+  the agent can write only its worktree, its git dirs, a private `/tmp`,
+  the entries of `~/.claude` and its own cache. Anything else a run wrote
+  (a cache in your home, `git config`, submodules, commit signing) fails
+  there. It also refuses to start with `CLAUDE_CONFIG_DIR` set or with a
+  read-only path that is a replaceable link. Read the sandbox section of the
+  configuration docs before upgrading such a machine.
+- **Upgrade every machine on an account to the same version.** Claims now
+  name the machine and the process that wrote them, and an older version
+  reads them differently. With a shared Mattermost bot, a question asked
+  before the upgrade carries no machine tag: answer it with
+  `node-a: ...`.
 
 ### Added
 
@@ -26,16 +39,24 @@ differently.
   claims the issue with a comment naming itself, waits
   `claims.race_wait_seconds` and backs off if another machine's claim came
   first; claims are refreshed while the run lasts and taken over once stale
-  (`claims.refresh_seconds`, `claims.stale_after_seconds`) (#252, closes #245)
-- The scheduled security sweep runs once per scheduled time across machines:
-  the first to create the ref `refs/ctrlrelay/claims/secops/<window>` in the
-  repository runs it (#259, closes #246)
+  (`claims.refresh_seconds`, `claims.stale_after_seconds`). A run whose
+  machine cannot refresh its claim for longer than the stale time (a long
+  GitHub outage) can be taken over while it still runs, so keep the
+  machines' clocks synchronised and the stale time well above any outage
+  you expect (#252, closes #245)
+- The scheduled security sweep runs at most once per repository and
+  scheduled time across machines: the first to create the ref
+  `refs/ctrlrelay/claims/secops/<window>` in the repository runs it. A
+  machine that dies holding a window, or a ref that cannot be created,
+  leaves that repository unswept for that window; the next window is new
+  (#259, closes #246)
 - Chat with several machines: questions are tagged with the machine's name
   and a machine ignores replies to another's. Mattermost machines can share
   one bot and channel with `transport.mattermost.shared: true` (a message
   that is not a reply must start with `node-b: ...`); Telegram needs one bot
-  per machine, and a second reader of the same bot now stops with one clear
-  message (#260, closes #248)
+  per machine. When a second process starts reading the same bot, Telegram
+  cuts off the one already running, which now says so once, in its log and
+  in the chat, and stops reading (#260, closes #248)
 - Subscription usage: read from each agent run, shown on the status page,
   and new work pauses when usage reaches `usage.pause_at` (default 90%) until
   the window resets; an idle probe every `usage.probe_minutes` keeps the
@@ -69,8 +90,11 @@ differently.
 - The agent runs with `--output-format stream-json` (the only output that
   carries the usage reading); `agent.output_format` is read and ignored
   (#254)
-- A repository whose history was replaced upstream is re-cloned, and an
-  issue that failed before the agent started is retried (#244, closes #234)
+- A repository whose history was replaced upstream is re-cloned, unless a
+  worktree still uses the clone (finish or clean up the run first); an issue
+  that failed before the agent started is retried on the next polls, up to
+  three tries, then left as seen like any other failed run, with a chat
+  line saying so (#244, closes #234)
 
 ### Fixed
 
