@@ -1329,3 +1329,37 @@ def test_a_long_question_is_cut_visibly(tmp_path: Path) -> None:
     reason = _reason({"s_id": "s", "blocked_question": "q" * 900}, {})
     assert len(reason["question"]) == REASON_SUMMARY_CHARS
     assert reason["question"].endswith("…")
+
+
+def _budget_line(name: str, bucket: object, now: float) -> str:
+    """Run the page's own budgetLine in node."""
+    node = shutil.which("node") or shutil.which("nodejs")
+    if node is None:
+        pytest.skip("node is not installed, so the page's script cannot run here")
+    script = _script()
+    program = "\n".join([
+        "function duration(s) {" + _js_function(script, "duration") + "}",
+        "function clock(ts) {" + _js_function(script, "clock") + "}",
+        "function untilText(iso, now) {" + _js_function(script, "untilText") + "}",
+        "function budgetLine(name, b, now) {" + _js_function(script, "budgetLine") + "}",
+        "process.stdout.write(JSON.stringify(budgetLine("
+        + json.dumps(name) + ", " + json.dumps(bucket) + ", " + json.dumps(now) + ")));",
+    ])
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True,
+                          timeout=30, check=True)
+    return json.loads(done.stdout)
+
+
+def test_a_bucket_past_its_reset_reads_as_refilled_not_unknown() -> None:
+    now = 1_793_560_200.0
+    passed = {"remaining": 4710, "limit": 5000, "state": "unknown",
+              "resets_at": "2026-11-01T19:07:08+00:00"}
+    text = _budget_line("core", passed, now)
+    assert text.startswith("GitHub core refilled at ") and "not read since" in text
+    assert "unknown" not in text and "4710" not in text
+
+    fresh = {"remaining": 4381, "limit": 5000, "state": "ok",
+             "resets_at": "2026-11-01T19:23:20+00:00"}
+    assert _budget_line("graphql", fresh, now).startswith("GitHub graphql 4381 of 5000 left")
+    # No reading at all is still unknown.
+    assert _budget_line("search", "unknown", now) == "GitHub search unknown"
