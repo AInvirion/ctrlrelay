@@ -56,14 +56,36 @@ class TestHeartbeat:
         Heartbeat(blocker / "heartbeat.json").beat()
 
     @pytest.mark.asyncio
-    async def test_it_beats_on_its_own_while_the_loop_is_busy(self, tmp_path: Path) -> None:
+    async def test_it_beats_on_its_own_while_a_run_holds_the_poll_loop(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
         import asyncio
+        from unittest.mock import AsyncMock, MagicMock
 
+        import ctrlrelay.core.heartbeat as hb_mod
+        from ctrlrelay.core.poller import run_poll_loop
+
+        clock = [NOW]
+        monkeypatch.setattr(hb_mod.time, "time", lambda: clock[0])
         hb = Heartbeat(tmp_path / "heartbeat.json")
-        task = asyncio.create_task(hb.run(interval=0.01))
-        await asyncio.sleep(0.05)
+        beats: list[int] = []
+
+        async def long_run(repo, issue) -> None:
+            # A run that holds the loop while time passes.
+            for _ in range(5):
+                clock[0] += 30
+                await asyncio.sleep(0.02)
+                beats.append(hb.read()["heartbeat_at"])
+
+        poller = MagicMock()
+        poller.poll = AsyncMock(return_value=[{"repo": "o/r", "issue": {"number": 1}}])
+        task = asyncio.create_task(hb.run(interval=0.005))
+        await run_poll_loop(poller=poller, handler=long_run, interval=0, max_iterations=1,
+                            on_poll=hb.polled)
         task.cancel()
-        assert hb.read() is not None
+        # The heartbeat kept moving during the run, not only around it.
+        assert len(set(beats)) > 1
+        assert hb.read()["last_poll_at"] == int(NOW)
 
 
 class TestNodeActivity:
@@ -139,7 +161,8 @@ class TestPeerEntry:
     def test_peer_questions_come_through_for_needs_you(self) -> None:
         e = peer_entry("http://b", data=_status("node-b", beat=NOW, needs=[QUESTION, "junk"]),
                        error=None, checked_at=NOW, previous=None, silent_after=300)
-        assert e["needs_you"] == [QUESTION]
+        [q] = e["needs_you"]
+        assert (q["repo"], q["issue_number"], q["url"]) == ("o/r", 9, "v")
 
 
 class _Peer(BaseHTTPRequestHandler):
@@ -257,3 +280,81 @@ class TestConfig:
 
         with pytest.raises(ValidationError):
             FleetConfig(peers=["node-b:8787"])
+
+
+class TestRoundOneFixes:
+    def test_an_unreadable_questions_table_is_unknown_not_idle(self) -> None:
+        act = node_activity(
+            running=[], needs_you=None, heartbeat={"heartbeat_at": NOW},
+            paused={"reason": "x"}, now=NOW, silent_after=300,
+        )
+        assert act["state"] == UNKNOWN
+        assert act["slots"] is None and act["claims"] is None
+
+    def test_a_stuck_peer_times_out_and_does_not_hold_the_others(self) -> None:
+        release = threading.Event()
+
+        def fetch(url, *, timeout):
+            if url == "http://stuck":
+                release.wait(5)
+                raise TimeoutError
+            return _status("node-c", beat=time.time())
+
+        reader = PeerReader(["http://stuck", "http://c"], interval_s=60, timeout_s=0.1,
+                            silent_after=300, fetch=fetch)
+        started = time.monotonic()
+        reader.read_once()
+        release.set()
+        assert time.monotonic() - started < 2
+        stuck, ok = reader.snapshot()["peers"]
+        assert stuck["error"] == "timeout" and not stuck["reachable"]
+        assert ok["reachable"] and ok["name"] == "node-c"
+        reader.stop()
+
+    @pytest.mark.parametrize("bad_node", [
+        {"name": "b", "heartbeat_at": "9999999-01-01T00:00:00Z", "claims": [None, 3]},
+        {"name": "b", "heartbeat_at": "x", "claims": "lots", "slots": [1]},
+        {"name": ["b"], "usage": {"five_hour": {"used": "93%"}}},
+    ])
+    def test_a_peer_sending_garbage_is_cleaned_not_fatal(self, bad_node) -> None:
+        reader = PeerReader(
+            ["http://b", "http://c"], interval_s=60, timeout_s=1, silent_after=300,
+            fetch=lambda url, *, timeout: (
+                {"host": "b", "node": bad_node, "needs_you": [None, {"repo": 5}]}
+                if url == "http://b" else _status("node-c", beat=time.time())
+            ),
+        )
+        reader.read_once()
+        b, c = reader.snapshot()["peers"]
+        assert b["reachable"] and b["state"] == SILENT
+        assert b["needs_you"] == []
+        claims = (b["node"] or {}).get("claims")
+        assert claims in (None, [])
+        assert c["reachable"]
+        reader.stop()
+
+    def test_a_peer_with_no_question_list_is_unknown_not_empty(self) -> None:
+        e = peer_entry("http://b", data={"host": "b", "node": None}, error=None,
+                       checked_at=NOW, previous=None, silent_after=300)
+        assert e["needs_you"] is None
+        down = peer_entry("http://b", data=None, error="refused", checked_at=NOW,
+                          previous=None, silent_after=300)
+        assert down["needs_you"] is None
+
+    def test_a_peer_goes_silent_between_reads(self) -> None:
+        now = [time.time()]
+        reader = PeerReader(["http://b"], interval_s=600, timeout_s=1, silent_after=300,
+                            fetch=lambda url, *, timeout: _status("node-b", beat=now[0]),
+                            clock=lambda: now[0])
+        reader.read_once()
+        assert reader.snapshot()["peers"][0]["state"] == "idle"
+        now[0] += 301
+        assert reader.snapshot()["peers"][0]["state"] == SILENT
+        reader.stop()
+
+    def test_a_failed_heartbeat_write_leaves_no_temp_file(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        with patch("os.replace", side_effect=OSError("no")):
+            Heartbeat(tmp_path / "heartbeat.json").beat()
+        assert list(tmp_path.iterdir()) == []

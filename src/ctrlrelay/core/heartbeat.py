@@ -50,14 +50,21 @@ class Heartbeat:
         """Best-effort: a heartbeat that cannot be written is logged, never
         allowed to stop the daemon it reports on."""
         data = {"heartbeat_at": now, "last_poll_at": self._last_poll_at, "pid": os.getpid()}
+        tmp: str | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".heartbeat-")
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f)
             os.replace(tmp, self.path)
+            tmp = None
         except Exception as e:
             log_event(_logger, "heartbeat.write_failed", error=str(e)[:200])
+            if tmp is not None:  # every 30 s: never leave one behind per failure
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def read(self) -> dict[str, Any] | None:
         """``{heartbeat_at, last_poll_at}`` as epoch ints (``last_poll_at``

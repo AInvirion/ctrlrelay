@@ -475,25 +475,41 @@ function renderBusy(data) {
 
 function renderNeeds(data, now) {
   var target = document.getElementById("needs");
-  if (!Array.isArray(data.needs_you)) {
-    setCount("needs-count", null);
-    put(target, [unknown("unknown: questions could not be read")]);
-    return;
-  }
   var here = (data.node && data.node.name) || data.host || "this machine";
-  var cards = data.needs_you.map(function (q) { return needCard(q, now, here); });
-  peerNeeds(data).forEach(function (pq) { cards.push(needCard(pq.q, now, pq.name)); });
-  setCount("needs-count", cards.length);
-  put(target, cards.length ? cards : [empty("no open questions")]);
+  var cards = [];
+  var unknownFrom = [];
+  if (Array.isArray(data.needs_you)) {
+    data.needs_you.forEach(function (q) { cards.push(needCard(q, now, here)); });
+  } else {
+    unknownFrom.push(here);
+  }
+  var peers = peerNeeds(data);
+  peers.known.forEach(function (pq) { cards.push(needCard(pq.q, now, pq.name)); });
+  unknownFrom = unknownFrom.concat(peers.unknown);
+  // A count only when every machine's questions were read.
+  if (unknownFrom.length) {
+    setCount("needs-count", null);
+  } else {
+    setCount("needs-count", cards.length);
+  }
+  var parts = cards.slice();
+  if (unknownFrom.length) {
+    parts.push(unknown("unknown: questions could not be read for " + unknownFrom.join(", ")));
+  } else if (!cards.length) {
+    parts.push(empty("no open questions"));
+  }
+  put(target, parts);
 }
 
 // #249: questions from the other machines, each tagged with its machine.
 function peerNeeds(data) {
-  var out = [];
+  var out = { known: [], unknown: [] };
   var peers = data.fleet && Array.isArray(data.fleet.peers) ? data.fleet.peers : [];
   peers.forEach(function (p) {
-    (Array.isArray(p.needs_you) ? p.needs_you : []).forEach(function (q) {
-      out.push({ q: q, name: p.name || p.url });
+    var name = p.name || p.url;
+    if (!Array.isArray(p.needs_you)) { out.unknown.push(name); return; }
+    p.needs_you.forEach(function (q) {
+      if (q && typeof q === "object") { out.known.push({ q: q, name: name }); }
     });
   });
   return out;
@@ -591,7 +607,9 @@ function renderWho(data, now, peers) {
   var add = function (name, node) {
     var claims = node && Array.isArray(node.claims) ? node.claims : null;
     if (claims === null) { return false; }
-    claims.forEach(function (c) { rows.push({ machine: name, c: c }); });
+    claims.forEach(function (c) {
+      if (c && typeof c === "object") { rows.push({ machine: name, c: c }); }
+    });
     return true;
   };
   var unknownFrom = [];
@@ -604,7 +622,8 @@ function renderWho(data, now, peers) {
   var target = document.getElementById("who");
   var parts = [];
   if (rows.length === 0) {
-    parts.push(empty("nothing claimed"));
+    // "nothing claimed" only when every machine's claims were read.
+    if (!unknownFrom.length) { parts.push(empty("nothing claimed")); }
   } else {
     var table = el("table", "who");
     var head = el("tr");
