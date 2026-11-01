@@ -357,7 +357,7 @@ def claim_failure_comment(
             "a limited number of times, and says here if it stops."
             if will_retry else
             f"Review PR #{pr_number} on its own merits — it is not "
-            "waiting on anything from this relay."
+            f"waiting on anything from this relay. {MANUAL_RETRY_ROUTE}"
         )
     else:
         opening = (

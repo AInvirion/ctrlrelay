@@ -220,6 +220,15 @@ class TestSettlePublishFailure:
         assert 7 in poller.seen_issues[REPO]
         assert 7 not in poller.publish_failures.get(REPO, {})
 
+        await settle_publish_failure(github, poller, REPO, 7, _publish_failed())
+        poller.mark_seen(REPO, 7)
+        blocked = PipelineResult(
+            success=False, blocked=True, session_id="s", summary="asked",
+            outputs={"publish_failed": True},
+        )
+        assert await settle_publish_failure(github, poller, REPO, 7, blocked) is None
+        assert 7 not in poller.publish_failures.get(REPO, {})
+
     @pytest.mark.asyncio
     async def test_the_count_survives_a_restart(self, tmp_path: Path) -> None:
         """A permanent cause must not get a fresh budget every restart."""
@@ -418,3 +427,12 @@ class TestReviewFixes:
         assert "When the relay's poller is running" in body
         assert "says here if it stops" in body
         assert "Nothing is needed from you" not in body
+
+
+def test_a_refused_push_with_a_pr_still_names_the_retry_route() -> None:
+    from ctrlrelay.pipelines.dev import MANUAL_RETRY_ROUTE, claim_failure_comment
+
+    body = claim_failure_comment(
+        "s", reason="push refused", exit_code=0, pr_number=12, will_retry=False,
+    )
+    assert MANUAL_RETRY_ROUTE in body and "Review PR #12" in body
