@@ -73,10 +73,18 @@ def main() -> None:
         from ctrlrelay.core.state import StateDB
         state_db = StateDB(Path(args.state_db))
 
+    # #248: this machine's name on every post, and whether other machines
+    # read the same chat (Mattermost only; each needs its own Telegram bot).
+    chat_cfg = (
+        config.transport.mattermost
+        if config.transport.type.value == "mattermost" else None
+    )
     server = BridgeServer(
         socket_path=Path(socket_path),
         handler=handler,
         state_db=state_db,
+        node=config.node_id,
+        shared=bool(getattr(chat_cfg, "shared", False)),
     )
 
     loop = asyncio.new_event_loop()

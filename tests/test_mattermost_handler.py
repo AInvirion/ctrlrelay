@@ -755,7 +755,7 @@ class TestPreflight:
         # then upgrades and never acks, and start_polling times out.
         h._connect = lambda: _as_coro(_FakeSocket([]))  # type: ignore[method-assign]
         socket_path = tmp_path / "b.sock"
-        server = BridgeServer(socket_path=socket_path, handler=h)
+        server = BridgeServer(node=None, socket_path=socket_path, handler=h)
         with pytest.raises(HandlerConfigError, match="not a member"):
             await asyncio.wait_for(server.start(), timeout=2)
         assert h._poll_task is None, "polling must not start on a failed preflight"

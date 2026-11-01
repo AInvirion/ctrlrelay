@@ -188,6 +188,19 @@ class MattermostHandler:
     async def send(self, text: str) -> str:
         return await self._post(text)
 
+    async def post_text(self, post_id: str) -> str | None:
+        """The text of one of the bot's own posts, to see which machine
+        posted it (#248). ``""`` for a post someone else wrote: a person
+        typing ``[node-b] ...`` does not speak for node-b. Raises when the
+        post cannot be read."""
+        r = await self._client.get(f"/posts/{post_id}")
+        r.raise_for_status()
+        post = r.json()
+        if str(post.get("user_id")) != await self._me():
+            return ""
+        message = post.get("message")
+        return message if isinstance(message, str) else ""
+
     async def ask(
         self, question: str, options: list[str] | None = None
     ) -> str:

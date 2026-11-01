@@ -6,12 +6,22 @@ import asyncio
 import logging
 
 from telegram import Bot, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.error import NetworkError, TimedOut
+from telegram.error import Conflict, NetworkError, TimedOut
 
 from ctrlrelay.bridge.handler import IncomingMessageHandler
+from ctrlrelay.bridge.node_tag import tag
 
 _log = logging.getLogger(__name__)
 
+
+
+def bot_in_use_message(exc: BaseException) -> str:
+    return (
+        "another process started reading this Telegram bot "
+        f"({exc}). Telegram allows one reader per bot, so each machine "
+        "needs its own bot: create one with @BotFather and set its token "
+        "for that machine."
+    )
 
 
 def is_ambiguous_delivery(exc: BaseException) -> bool:
@@ -40,6 +50,12 @@ class TelegramHandler:
         self.chat_id = chat_id
         self._poll_task: asyncio.Task | None = None
         self._offset: int = 0
+        # Set by the bridge server: this machine's name, for the one notice
+        # this handler posts on its own.
+        self.node_label: str | None = None
+        # message id -> text of a message somebody replied to (#248): lets
+        # the server see which machine posted it. Bounded.
+        self._replied_texts: dict[str, str] = {}
 
     def is_ambiguous_delivery(self, exc: BaseException) -> bool:
         """Per the ChatHandler contract. Delegates to the module-level
@@ -110,6 +126,12 @@ class TelegramHandler:
             pass
         self._poll_task = None
 
+    async def post_text(self, post_id: str) -> str | None:
+        """The text of a message somebody replied to, as Telegram sent it
+        with the reply (#248); ``""`` when a person, not a bot, wrote it.
+        ``None`` if not seen."""
+        return self._replied_texts.get(post_id)
+
     async def _poll_loop(self, handler: IncomingMessageHandler) -> None:
         """Long-poll get_updates and forward messages from the configured chat."""
         while True:
@@ -121,6 +143,21 @@ class TelegramHandler:
                 )
             except asyncio.CancelledError:
                 raise
+            except Conflict as e:
+                # Another process started reading this bot. Telegram ends
+                # the OLDER reader's poll, so this is the machine that was
+                # already running: say so once, in the log and in the chat
+                # (sending still works), and stop rather than fight for it.
+                message = bot_in_use_message(e)
+                _log.error("%s", message)
+                notice = f"⚠️ Stopped reading replies on this machine: {message}"
+                if self.node_label:
+                    notice = tag(self.node_label, notice)
+                try:
+                    await self.send(notice)
+                except Exception:
+                    pass
+                return
             except Exception as e:
                 # Transient network / auth error. Back off and keep trying.
                 _log.warning("telegram get_updates failed: %s", e)
@@ -142,6 +179,20 @@ class TelegramHandler:
                     if msg.reply_to_message is not None
                     else None
                 )
+                if reply_id is not None:
+                    # Only a bot's message speaks for a machine: a person
+                    # typing "[node-b] ..." is kept as untagged. Any bot
+                    # counts, not only this one: with one bot per machine
+                    # in a group, a reply to the other machine's bot must
+                    # read back with that machine's tag, or this machine
+                    # would take it for an untagged question of its own.
+                    sender = getattr(msg.reply_to_message, "from_user", None)
+                    from_bot = bool(getattr(sender, "is_bot", False))
+                    self._replied_texts[reply_id] = (
+                        (msg.reply_to_message.text or "") if from_bot else ""
+                    )
+                    while len(self._replied_texts) > 256:
+                        self._replied_texts.pop(next(iter(self._replied_texts)))
                 try:
                     await handler(text, reply_id)
                 except Exception as e:

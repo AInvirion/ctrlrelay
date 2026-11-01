@@ -207,6 +207,7 @@ class TestBridgeServerLogging:
 
         try:
             server = BridgeServer(
+                node=None,
                 socket_path=socket_path, handler=mock_handler
             )
             task = asyncio.create_task(server.start())
@@ -551,6 +552,7 @@ class TestBridgeServerDeliverySemantics:
 
         try:
             server = BridgeServer(
+                node=None,
                 socket_path=socket_path, handler=mock_handler
             )
             task = asyncio.create_task(server.start())
@@ -620,6 +622,7 @@ class TestBridgeServerDeliverySemantics:
 
         try:
             server = BridgeServer(
+                node=None,
                 socket_path=socket_path, handler=mock_handler
             )
             task = asyncio.create_task(server.start())
@@ -810,6 +813,7 @@ class TestSensitivePayloadsAreNotLogged:
 
         try:
             server = BridgeServer(
+                node=None,
                 socket_path=socket_path, handler=mock_handler
             )
             task = asyncio.create_task(server.start())

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ctrlrelay import __version__
+from ctrlrelay.bridge.node_tag import addressed, tag, tagged_node
 from ctrlrelay.bridge.protocol import (
     BridgeMessage,
     BridgeOp,
@@ -21,6 +22,7 @@ from ctrlrelay.bridge.protocol import (
     parse_message,
     serialize_message,
 )
+from ctrlrelay.core.claims import safe_node_name
 from ctrlrelay.core.events import EventKind, emit_event
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.question_expiry import (
@@ -322,8 +324,24 @@ class BridgeServer:
         socket_path: Path,
         handler: "ChatHandler",
         state_db: "StateDB | None" = None,
+        *,
+        node: str | None,
+        shared: bool = False,
     ) -> None:
         self.socket_path = socket_path
+        # #248. ``node`` is this machine's name: every post starts with it,
+        # and a reply to a post tagged with another machine's name is
+        # ignored quietly. Required, so no construction drops the tag by
+        # omission; the bridge always passes its node_id, and ``None``
+        # (untagged) is for tests and embedding.
+        # ``shared``: other machines read this same chat, so a message
+        # that is not a reply is acted on only when it names this machine.
+        self.node = node
+        self.shared = shared
+        # The handler posts one message of its own (Telegram's "stopped
+        # reading"); it tags it with this name too.
+        if node is not None and hasattr(handler, "node_label"):
+            handler.node_label = node
         # The server holds a handler and knows nothing about tokens, chat
         # ids or URLs. Which chat app this is resolves at construction, in
         # one place, from config — see ctrlrelay.bridge.make_handler.
@@ -472,7 +490,7 @@ class BridgeServer:
                 elif note:
                     text = note
             try:
-                post_id = await self.handler.send(text)
+                post_id = await self.handler.send(self._tagged(text))
                 # A SEND that names a session is answerable too: the secops
                 # sweep fans out one "blocked on <repo>" message per repo
                 # after the run, and that message is the most recent — and
@@ -536,13 +554,13 @@ class BridgeServer:
                 # request.
                 received_at = time.monotonic()
                 post_id = await self.handler.ask(
-                    format_question(
+                    self._tagged(format_question(
                         question,
                         repo=msg.repo,
                         session_id=msg.session_id,
                         issue_number=msg.issue_number,
                         repeat_note=repeat_note,
-                    ),
+                    )),
                     options=msg.options,
                 )
                 async with self._pending_lock:
@@ -774,6 +792,16 @@ class BridgeServer:
         a handler's single inbound loop, so releasing early cannot
         interleave two replies.
         """
+        elsewhere, text = await self._addressed_elsewhere(text, reply_to_post_id)
+        if elsewhere:
+            # Another machine's question or command: not ours to answer,
+            # and nothing is said in the channel about it.
+            log_event(
+                _logger, "bridge.reply.other_machine",
+                reply_to_post_id=reply_to_post_id, text_length=len(text),
+            )
+            return
+
         match: _PendingQuestion | None = None
         hinted_session_id: str | None = None
         live_listing: str | None = None
@@ -1030,9 +1058,87 @@ class BridgeServer:
         if log:
             _log.info("%s", log)
         try:
-            await self.handler.send(text)
+            await self.handler.send(self._tagged(text))
         except Exception as e:
             _log.warning("bridge: failed to notify operator: %s", e)
+
+    def _tagged(self, text: str) -> str:
+        return tag(self.node, text) if self.node else text
+
+    async def _addressed_elsewhere(
+        self, text: str, reply_to_post_id: str | None,
+    ) -> tuple[bool, str]:
+        """``(True, _)`` when the message belongs to another machine and
+        must be ignored quietly; else ``(False, text)``, on a shared chat
+        with any address to this machine removed (#248).
+
+        A reply to a post this machine knows is its own. A reply to any
+        other post: on a shared chat it is this machine's only when the post
+        reads back with this machine's tag; on a machine's own chat it is
+        left alone only when its tag names another machine, and otherwise
+        routed as before. A fresh message on a shared chat is this
+        machine's only when it names it.
+        """
+        if self.node is None:
+            return False, text
+        if reply_to_post_id is not None:
+            async with self._pending_lock:
+                known = reply_to_post_id in self._asked_sessions or any(
+                    q.post_id == reply_to_post_id
+                    for q in self._pending_questions.values()
+                )
+            if known:
+                if self.shared:
+                    mine, rest = addressed(text, self.node)
+                    return False, rest if mine else text
+                return False, text
+            readable, post = await self._post_text(reply_to_post_id)
+            owner = tagged_node(post) if readable else None
+            if self.shared:
+                # Only a post this machine can confirm as its own: one that
+                # cannot be read, has no machine tag (a person's post, or a
+                # bot post from before #248), or names another machine is
+                # left alone, unless the reply itself names this machine
+                # ("node-a: pin" to an old untagged question).
+                mine, rest = addressed(text, self.node)
+                if owner == safe_node_name(self.node):
+                    return False, rest if mine else text
+                if owner is None and mine:
+                    return False, rest
+                return True, text
+            if owner is not None and owner != safe_node_name(self.node):
+                # Another machine's (one bot per machine in one Telegram
+                # group), or this machine's under a node_id it no longer
+                # has. Logged as a warning: on a machine alone in its chat
+                # the second is the only way to get here.
+                _log.warning(
+                    "bridge: a reply to a post by %r was left alone; this "
+                    "machine is %r", owner, self.node,
+                )
+                return True, text
+            return False, text
+        if not self.shared:
+            # One machine on its own chat: messages are taken as typed, so
+            # an answer that happens to start with this machine's name is
+            # not cut.
+            return False, text
+        mine, rest = addressed(text, self.node)
+        if mine:
+            return False, rest
+        return True, text
+
+    async def _post_text(self, post_id: str) -> tuple[bool, str | None]:
+        """``(readable, text)`` of a post. ``text`` is ``""`` for a post the
+        bot did not write and ``None`` when the handler has no such read."""
+        reader = getattr(self.handler, "post_text", None)
+        if reader is None:
+            return False, None
+        try:
+            text = await reader(post_id)
+        except Exception as e:
+            _log.info("bridge: could not read post %s: %s", post_id, e)
+            return False, None
+        return text is not None, text
 
     async def _queue_orphan_reply_as_resume_answer(
         self, text: str, *, session_id: str | None = None
