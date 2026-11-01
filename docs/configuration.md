@@ -367,8 +367,10 @@ github_api:
 | `check_minutes` | int (1-60) | `5` | How often the daemon reads `/rate_limit`. That call does not count against the budget. |
 | `slow_factor` | number (1-20) | `3` | The poll interval multiplier while any bucket is low. |
 
-When a bucket is used up, the daemon makes no call that spends it until its
-reset: such a call fails at once as rate limited, one chat line says when it
+When a bucket is used up, the daemon makes no call it knows spends that
+bucket until its reset (`gh api` calls and `gh search`; other `gh` commands do
+not say which bucket they spend and are not held back): such a call fails at
+once as rate limited, one chat line says when it
 resets, and the poller picks up again on its own afterwards. A budget it
 could not read is shown as unknown and slows nothing.
 

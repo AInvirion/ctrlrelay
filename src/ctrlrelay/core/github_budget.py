@@ -220,6 +220,11 @@ class BudgetStore:
             os.replace(tmp, self.path)
         except Exception as e:
             log_event(_logger, "github_budget.write_failed", error=str(e)[:200])
+            # Older numbers must not stand as current on the page.
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def mark_unknown(self, now: float) -> None:
         """The latest read failed: the page says unknown, not the older
@@ -273,13 +278,16 @@ class GitHubBudget:
         fetch: Callable[[], Awaitable[str]],
         notify: Callable[[str], Awaitable[None]] | None = None,
         clock: Callable[[], float] = time.time,
+        max_age: float | None = None,
     ) -> None:
         self.store = store
         self.low_at = low_at
         self._fetch = fetch
         self.notify = notify
         self._clock = clock
-        self.reading: BudgetReading | None = store.read()
+        # What a previous run left is used until the first read, unless it
+        # is older than ``max_age``: then it is about a time nobody knows.
+        self.reading: BudgetReading | None = store.read(max_age=max_age, now=clock())
         self._said: dict[str, str] = {}
         self._marking: asyncio.Task[BudgetReading | None] | None = None
         # One read at a time: a slow read finishing after a newer one must

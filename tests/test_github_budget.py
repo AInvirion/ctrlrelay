@@ -182,7 +182,7 @@ class TestTheGhGate:
         proc.communicate.return_value = (b"{}", b"")
         proc.returncode = 0
         with patch("asyncio.create_subprocess_exec", return_value=proc) as spawn:
-            await gh._run_gh("issue", "view", "1", "--repo", "o/r")  # graphql
+            await gh._run_gh("api", "graphql", "-f", "query=x")  # graphql, not out
             await gh.rate_limit()
         assert spawn.call_count == 2
 
@@ -430,3 +430,25 @@ class TestRoundTwoFixes:
         with patch("asyncio.create_subprocess_exec", return_value=proc) as spawn:
             await gh._run_gh("issue", "comment", "1", "--repo", "o/r", "--body", "x")
         assert spawn.call_count == 1
+
+
+
+class TestRoundThreeFixes:
+    def test_a_restart_ignores_an_old_saved_budget(self, tmp_path: Path) -> None:
+        store = BudgetStore(tmp_path / "b.json")
+        store.write(parse_rate_limit(rate_limit(core=0, reset=NOW + 3000), now=NOW))
+        later = GitHubBudget(
+            store, low_at=0.2, fetch=AsyncMock(), clock=lambda: NOW + 1000, max_age=900,
+        )
+        assert later.blocked_until("core") is None
+        soon = GitHubBudget(
+            store, low_at=0.2, fetch=AsyncMock(), clock=lambda: NOW + 100, max_age=900,
+        )
+        assert soon.blocked_until("core") == NOW + 3000
+
+    def test_a_failed_write_of_a_fresh_reading_removes_the_old(self, tmp_path: Path) -> None:
+        store = BudgetStore(tmp_path / "b.json")
+        store.write(parse_rate_limit(rate_limit(core=0), now=NOW))
+        with patch("tempfile.mkstemp", side_effect=OSError("disk full")):
+            store.write(parse_rate_limit(rate_limit(core=4000), now=NOW))
+        assert store.read() is None

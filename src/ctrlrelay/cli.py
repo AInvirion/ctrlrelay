@@ -2669,6 +2669,7 @@ def poller_start(
             low_at=config.github_api.low_at,
             fetch=github.rate_limit,
             notify=_chat_notice,
+            max_age=3 * config.github_api.check_minutes * 60,
         )
         github.budget = github_budget
         worktree = WorktreeManager(
