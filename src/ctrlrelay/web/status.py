@@ -93,6 +93,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
+from ctrlrelay.web.fleet import node_activity
 from ctrlrelay.web.links import github_url
 from ctrlrelay.web.transcript import Phase, furthest_of, read_activity
 from ctrlrelay.web.waiting import SessionsReader
@@ -608,6 +609,9 @@ def build_status(
     home: Path | None = None,
     titles: Mapping[str, str] | None = None,
     node: Callable[[], dict] | None = None,
+    heartbeat: Callable[[], dict | None] | None = None,
+    silent_after_s: int = 300,
+    fleet: Callable[[], dict] | None = None,
 ) -> dict:
     """Everything the page shows, as the documented JSON contract. Never
     raises for a database problem; see the module docstring.
@@ -713,10 +717,33 @@ def build_status(
         if not isinstance(snap["feed"], _Missing):
             feed, feed_total = snap["feed"]
 
+    if node_block is not None:
+        try:
+            beat = heartbeat() if heartbeat is not None else None
+        except Exception as exc:
+            errors.append(f"heartbeat: {type(exc).__name__}: {exc}"[:300])
+            beat = None
+        node_block = {
+            "version": version,
+            **node_block,
+            **node_activity(
+                running=running, needs_you=needs_you, heartbeat=beat,
+                paused=node_block.get("paused"), now=now,
+                silent_after=silent_after_s,
+            ),
+        }
+    fleet_block: dict | None = None
+    if fleet is not None:
+        try:
+            fleet_block = fleet()
+        except Exception as exc:
+            errors.append(f"fleet: {type(exc).__name__}: {exc}"[:300])
+
     return {
         "version": version,
         "host": host,
         "node": node_block,
+        "fleet": fleet_block,
         "generated": _iso(now),
         "generated_ts": now,
         "running": running,

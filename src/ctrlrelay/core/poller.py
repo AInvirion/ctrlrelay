@@ -976,6 +976,7 @@ async def run_poll_loop(
     interval: int = 300,
     max_iterations: int | None = None,
     interval_scale: Callable[[], float] | None = None,
+    on_poll: Callable[[], None] | None = None,
 ) -> None:
     """Run the polling loop.
 
@@ -987,6 +988,9 @@ async def run_poll_loop(
         interval_scale: Asked before each sleep; the interval is multiplied
             by what it returns (#237: longer polls while the GitHub API
             budget is low). A scale that raises counts as 1.
+        on_poll: Called after each poll that answered (#249: the status
+            page's "last poll" time). A callback that raises is logged and
+            never stops the loop.
 
     Iteration resilience: any non-cancellation exception from the poll or a
     handler call is logged as ``poll.iteration.failed`` and the loop sleeps
@@ -1000,6 +1004,14 @@ async def run_poll_loop(
         # shouldn't skip the rest of the batch.
         try:
             new_issues = await poller.poll()
+            if on_poll is not None:
+                try:
+                    on_poll()
+                except Exception as e:
+                    log_event(
+                        _logger, "poll.on_poll_failed",
+                        reason=type(e).__name__, error=str(e)[:200],
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as e:

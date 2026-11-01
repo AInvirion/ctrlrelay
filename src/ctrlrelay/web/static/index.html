@@ -108,6 +108,16 @@ a:hover, a:focus-visible { text-decoration: underline; }
 .usage .bar { height: 6px; background: var(--line, #ddd); border-radius: 3px; margin: 2px 0 6px; }
 .usage .bar > span { display: block; height: 100%; border-radius: 3px; background: currentColor; }
 .usage .bar.high { color: var(--bad); }
+.fleet { margin: 0 20px 12px; }
+.strip { display: flex; flex-wrap: wrap; gap: 10px; }
+.strip .machine { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
+  min-width: 190px; background: var(--panel); font-size: 13px; }
+.strip .machine.bad { border-color: var(--bad); }
+.strip .machine.bad .state { color: var(--bad); font-weight: 700; }
+.strip .machine.greyed .last { opacity: .55; }
+.strip .machine .name { font-weight: 700; font-size: 14px; }
+table.who { border-collapse: collapse; width: 100%; font-size: 13px; }
+table.who th, table.who td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
 details > summary {
   cursor: pointer; font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
   color: var(--muted); margin: 0 0 8px; font-weight: 700;
@@ -125,6 +135,12 @@ details > summary .count { font-weight: 400; margin-left: 6px; }
 </header>
 <p id="banner" role="alert"></p>
 <ul id="errors" aria-live="polite"></ul>
+<section class="fleet" aria-label="machines">
+  <h2>Machines</h2>
+  <div id="fleet-strip" class="strip"><p class="unknown">loading…</p></div>
+  <h2>Who has what</h2>
+  <div id="who"><p class="unknown">loading…</p></div>
+</section>
 <main>
   <div>
     <section>
@@ -459,16 +475,50 @@ function renderBusy(data) {
 
 function renderNeeds(data, now) {
   var target = document.getElementById("needs");
-  if (!Array.isArray(data.needs_you)) {
-    setCount("needs-count", null);
-    put(target, [unknown("unknown: questions could not be read")]);
-    return;
+  var here = (data.node && data.node.name) || data.host || "this machine";
+  var cards = [];
+  var unknownFrom = [];
+  if (Array.isArray(data.needs_you)) {
+    data.needs_you.forEach(function (q) { cards.push(needCard(q, now, here)); });
+  } else {
+    unknownFrom.push(here);
   }
-  setCount("needs-count", data.needs_you.length);
-  if (data.needs_you.length === 0) { put(target, [empty("no open questions")]); return; }
-  put(target, data.needs_you.map(function (q) {
+  var peers = peerNeeds(data);
+  peers.known.forEach(function (pq) { cards.push(needCard(pq.q, now, pq.name)); });
+  unknownFrom = unknownFrom.concat(peers.unknown);
+  // A count only when every machine's questions were read.
+  if (unknownFrom.length) {
+    setCount("needs-count", null);
+  } else {
+    setCount("needs-count", cards.length);
+  }
+  var parts = cards.slice();
+  if (unknownFrom.length) {
+    parts.push(unknown("unknown: questions could not be read for " + unknownFrom.join(", ")));
+  } else if (!cards.length) {
+    parts.push(empty("no open questions"));
+  }
+  put(target, parts);
+}
+
+// #249: questions from the other machines, each tagged with its machine.
+function peerNeeds(data) {
+  var out = { known: [], unknown: [] };
+  var peers = data.fleet && Array.isArray(data.fleet.peers) ? data.fleet.peers : [];
+  peers.forEach(function (p) {
+    var name = p.name || p.url;
+    if (!Array.isArray(p.needs_you)) { out.unknown.push(name); return; }
+    p.needs_you.forEach(function (q) {
+      if (q && typeof q === "object") { out.known.push({ q: q, name: name }); }
+    });
+  });
+  return out;
+}
+
+function needCard(q, now, machine) {
     var box = el("div", "card");
     var top = el("div", "row");
+    top.appendChild(el("span", "tag", "on " + machine));
     top.appendChild(el("span", "repo", q.repo));
     if (typeof q.issue_number === "number") {
       top.appendChild(ghLink(q.url, issueText(q.repo, q.issue_number, q.title), "title"));
@@ -490,7 +540,116 @@ function renderNeeds(data, now) {
       box.appendChild(el("div", "muted", "held back; asked again at " + clock(q.held_until_ts)));
     }
     return box;
-  }));
+}
+
+function ago(iso, now) {
+  var t = Date.parse(iso);
+  return isNaN(t) ? "unknown" : duration(Math.max(0, Math.round(now - t / 1000))) + " ago";
+}
+
+function usagePct(node, name) {
+  var u = node && node.usage;
+  var w = u && typeof u === "object" ? u[name] : null;
+  return w && typeof w.used === "number" ? pct(w.used * 100) : "unknown";
+}
+
+function machineCard(name, node, state, bad, now, extra) {
+  var box = el("div", "machine" + (bad ? " bad" : ""));
+  if (name !== null) { box.appendChild(el("div", "name", name || "unknown")); }
+  box.appendChild(el("div", "state", state || "unknown"));
+  if (extra) { box.appendChild(el("div", "muted", extra)); }
+  if (node && typeof node === "object") {
+    var s = node.slots;
+    box.appendChild(el("div", "line", "slots " + (s && typeof s.busy === "number"
+      ? s.busy + "/" + s.total : "unknown")));
+    box.appendChild(el("div", "line", "5-hour " + usagePct(node, "five_hour") +
+      ", 7-day " + usagePct(node, "seven_day")));
+    box.appendChild(el("div", "line", "heartbeat " + ago(node.heartbeat_at, now)));
+    if (node.account_label) { box.appendChild(el("div", "muted", node.account_label)); }
+    box.appendChild(el("div", "muted", "version " + (node.version || "unknown")));
+  }
+  return box;
+}
+
+var BAD_STATES = { "paused-limit": 1, "silent": 1, "unknown": 1 };
+function isBad(state) {
+  return typeof state !== "string" || Object.prototype.hasOwnProperty.call(BAD_STATES, state);
+}
+
+// #249: this machine and every peer. A peer that does not answer is "not
+// reachable from here" with the reason, and its last known numbers greyed
+// out; never shown as idle.
+function renderFleet(data, now) {
+  var cards = [];
+  var me = data.node;
+  cards.push(machineCard(me && me.name || data.host, me, me && me.state,
+    !me || isBad(me.state), now, "this machine"));
+  var peers = data.fleet && Array.isArray(data.fleet.peers) ? data.fleet.peers : [];
+  peers.forEach(function (p) {
+    if (p.reachable === false) {
+      var c = machineCard(p.name || p.url, null, "not reachable from here", true, now,
+        (p.error || "no answer") + (p.checked_at ? ", checked " + ago(p.checked_at, now) : ""));
+      if (p.last_known) {
+        var last = machineCard(null, p.last_known, "last known: " + (p.last_known.state || "unknown"),
+          false, now, null);
+        last.className = "last";
+        c.appendChild(last);
+        c.className += " greyed";
+      }
+      cards.push(c);
+    } else {
+      cards.push(machineCard(p.name || p.url, p.node, p.state,
+        p.reachable !== true || isBad(p.state), now, null));
+    }
+  });
+  put(document.getElementById("fleet-strip"), cards);
+  renderWho(data, now, peers);
+}
+
+function renderWho(data, now, peers) {
+  var rows = [];
+  var add = function (name, node) {
+    var claims = node && Array.isArray(node.claims) ? node.claims : null;
+    if (claims === null) { return false; }
+    claims.forEach(function (c) {
+      if (c && typeof c === "object") { rows.push({ machine: name, c: c }); }
+    });
+    return true;
+  };
+  var unknownFrom = [];
+  if (!add((data.node && data.node.name) || data.host, data.node)) {
+    unknownFrom.push((data.node && data.node.name) || data.host);
+  }
+  peers.forEach(function (p) {
+    if (!add(p.name || p.url, p.node)) { unknownFrom.push(p.name || p.url); }
+  });
+  var target = document.getElementById("who");
+  var parts = [];
+  if (rows.length === 0) {
+    // "nothing claimed" only when every machine's claims were read.
+    if (!unknownFrom.length) { parts.push(empty("nothing claimed")); }
+  } else {
+    var table = el("table", "who");
+    var head = el("tr");
+    ["machine", "issue", "phase", "since"].forEach(function (h) { head.appendChild(el("th", null, h)); });
+    table.appendChild(head);
+    rows.forEach(function (r) {
+      var tr = el("tr");
+      tr.appendChild(el("td", null, r.machine));
+      var td = el("td");
+      td.appendChild(ghLink(r.c.url, typeof r.c.issue_number === "number"
+        ? r.c.repo + "#" + r.c.issue_number : r.c.repo + " (" + (r.c.kind || "run") + ")", "title"));
+      tr.appendChild(td);
+      tr.appendChild(el("td", null, r.c.phase || "unknown"));
+      tr.appendChild(el("td", null, r.c.since ? ago(r.c.since, now) : "unknown"));
+      table.appendChild(tr);
+    });
+    parts.push(table);
+  }
+  if (unknownFrom.length) {
+    parts.push(el("p", "muted", "claims unknown for: " + unknownFrom.join(", ")));
+  }
+  put(target, parts);
 }
 
 function renderWaiting(data) {
@@ -758,6 +917,7 @@ function render(data) {
   renderWaiting(data);
   renderSkipped(data);
   renderToday(data);
+  renderFleet(data, now);
   renderUsage(data, now);
   renderServer(data);
   renderFeed(data);

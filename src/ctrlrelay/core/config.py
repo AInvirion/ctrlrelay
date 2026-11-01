@@ -786,6 +786,41 @@ class GitHubApiConfig(BaseModel):
     slow_factor: float = Field(default=3.0, ge=1, le=20)
 
 
+class FleetConfig(BaseModel):
+    """The other machines this one's status page shows (#249)."""
+
+    # Each peer's status page base URL, e.g. "http://node-b:8787". Each
+    # peer must list this machine's name for it in its web.allowed_hosts,
+    # or it refuses the read (HTTP 421).
+    peers: list[str] = Field(default_factory=list)
+    # How often the server reads each peer, and how long it waits.
+    check_seconds: int = Field(default=60, ge=10)
+    timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    # A machine whose daemon heartbeat is older than this is "silent".
+    silent_after_seconds: int = Field(default=300, ge=60)
+    # A name for this machine's agent subscription, shown on the page.
+    # A label such as "max-2", never an email address.
+    account_label: str | None = None
+
+    @field_validator("account_label")
+    @classmethod
+    def not_an_email(cls, v: str | None) -> str | None:
+        if v is not None and "@" in v:
+            raise ValueError(
+                "fleet.account_label is shown on the status page: use a "
+                "label, not an email address"
+            )
+        return v
+
+    @field_validator("peers")
+    @classmethod
+    def http_urls(cls, v: list[str]) -> list[str]:
+        for url in v:
+            if not url.startswith(("http://", "https://")):
+                raise ValueError(f"fleet.peers: {url!r} is not an http(s) URL")
+        return v
+
+
 class Config(BaseModel):
     """Root configuration model for ctrlrelay orchestrator."""
 
@@ -802,6 +837,7 @@ class Config(BaseModel):
     claims: ClaimsConfig = Field(default_factory=ClaimsConfig)
     usage: UsageConfig = Field(default_factory=UsageConfig)
     github_api: GitHubApiConfig = Field(default_factory=GitHubApiConfig)
+    fleet: FleetConfig = Field(default_factory=FleetConfig)
     personalization: Personalization | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
 
