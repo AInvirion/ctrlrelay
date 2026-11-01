@@ -83,13 +83,14 @@ async def fetch_detached(
         try:
             result = fetch(url, timeout=timeout)
         except BaseException as e:  # noqa: BLE001 - handed to the waiter
-            loop.call_soon_threadsafe(
-                lambda exc=e: done.done() or done.set_exception(exc),
-            )
+            settle = lambda exc=e: done.done() or done.set_exception(exc)  # noqa: E731
         else:
-            loop.call_soon_threadsafe(
-                lambda: done.done() or done.set_result(result),
-            )
+            settle = lambda: done.done() or done.set_result(result)  # noqa: E731
+        try:
+            loop.call_soon_threadsafe(settle)
+        except RuntimeError:
+            # Given up on, and the loop has since closed: nobody is waiting.
+            pass
 
     threading.Thread(target=run, daemon=True, name="ctrlrelay-peer-check").start()
     return await asyncio.wait_for(done, timeout=timeout * 3)

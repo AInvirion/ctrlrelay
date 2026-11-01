@@ -40,7 +40,9 @@ class TestNodeId:
     def test_a_placeholder_is_refused_with_what_to_do(self, bad) -> None:
         from pydantic import ValidationError
 
-        with pytest.raises(ValidationError, match="does not name this machine"):
+        with pytest.raises(
+            ValidationError, match="does not name this machine: set node_id in",
+        ):
             self._config(bad)
 
     def test_a_real_name_and_the_hostname_default_are_fine(self, monkeypatch) -> None:
@@ -327,3 +329,66 @@ class TestRoundOneFixes:
         result = CliRunner().invoke(app, ["node", "check", "--no-agent", "-c", str(cfg)])
         assert result.exit_code == 0, result.output
         assert seen["probe"] is None
+
+
+
+class TestColdReviewFixes:
+    @pytest.mark.asyncio
+    async def test_a_refused_peer_is_reported_as_unreachable_through_the_real_fetch(
+        self,
+    ) -> None:
+        import socket
+
+        from ctrlrelay.web.fleet import fetch_peer
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        async def login() -> str:
+            return "a"
+
+        url = f"http://127.0.0.1:{port}"
+        checks = await run_checks(
+            SimpleNamespace(node_id="node-a", fleet=SimpleNamespace(
+                peers=[url], timeout_seconds=2)),
+            github_login=login, agent_probe=None, fetch=fetch_peer,
+        )
+        [peer] = [c for c in checks if c.name == f"peer {url}"]
+        assert peer.ok is False
+        assert "not with a ctrlrelay status page" not in peer.detail
+        assert "Check the URL" in peer.detail
+
+    def test_a_late_answer_after_the_loop_closed_is_dropped_quietly(self) -> None:
+        import asyncio
+        import threading
+
+        from ctrlrelay.core.node_check import fetch_detached
+
+        release = threading.Event()
+        finished = threading.Event()
+        errors = []
+        old_hook = threading.excepthook
+        threading.excepthook = lambda args: errors.append(args.exc_value)
+
+        def slow(url, *, timeout):
+            release.wait(10)
+            try:
+                return {}
+            finally:
+                finished.set()
+
+        async def main():
+            with pytest.raises(TimeoutError):
+                await fetch_detached(slow, "http://x", timeout=0.05)
+
+        try:
+            asyncio.run(main())
+            release.set()
+            assert finished.wait(10)
+            for t in threading.enumerate():
+                if t.name == "ctrlrelay-peer-check":
+                    t.join(5)
+        finally:
+            threading.excepthook = old_hook
+        assert errors == []

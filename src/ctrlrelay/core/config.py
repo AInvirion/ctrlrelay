@@ -825,8 +825,8 @@ class FleetConfig(BaseModel):
         return v
 
 
-# node_id values that cannot tell machines apart (#250): the examples in
-# the docs, container and placeholder hostnames, and the owner name of
+# node_id values that cannot tell machines apart (#250): placeholder and
+# container hostnames, examples from earlier docs, and the owner name of
 # claims from before #245.
 PLACEHOLDER_NODE_IDS = frozenset({
     "unknown", "localhost", "localhost.localdomain", "my-laptop",

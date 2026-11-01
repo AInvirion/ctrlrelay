@@ -2049,7 +2049,6 @@ def bridge_test(
         raise typer.Exit(1)
 
 
-# Run subcommand group
 node_app = typer.Typer(help="This machine's setup (#250).")
 app.add_typer(node_app, name="node")
 
@@ -2961,6 +2960,9 @@ def poller_start(
         # #250: another process using this machine's node_id. Logged each
         # time it is seen; said in chat and on the console once per run.
         duplicate_warned: list[bool] = []
+        # Held so the one chat notice is not dropped by the loop's weak
+        # reference to it before it is sent.
+        _notice_tasks: set[asyncio.Task] = set()
 
         def _duplicate_name(where: str, number: int | None = None) -> None:
             text = (
@@ -2968,8 +2970,11 @@ def poller_start(
                 f"node_id {config.node_id!r} ("
                 + (f"it is refreshing a claim on {where}#{number}" if number
                    else f"{where} answers with this name")
-                + "). Claims, chat and the status page will mix the two up: "
-                "give each machine its own node_id (docs/adding-a-machine.md)."
+                + "). Claims, chat and the status page will mix the two up. "
+                "If it is another machine, give each machine its own node_id "
+                "(docs/adding-a-machine.md); if it is a second process on "
+                "this machine, such as a `ctrlrelay run` by hand, this is "
+                "expected while it runs."
             )
             log_event(_logger, "node.duplicate_name", node=config.node_id,
                       where=where, issue_number=number)
@@ -2977,7 +2982,17 @@ def poller_start(
                 return
             duplicate_warned.append(True)
             console.print(f"[red]{text}[/red]")
-            asyncio.get_running_loop().create_task(_chat_notice(text))
+
+            async def send() -> None:
+                try:
+                    await _chat_notice(text)
+                except Exception as e:
+                    log_event(_logger, "node.duplicate_notice_failed",
+                              error=f"{type(e).__name__}: {str(e)[:200]}")
+
+            task = asyncio.get_running_loop().create_task(send())
+            _notice_tasks.add(task)
+            task.add_done_callback(_notice_tasks.discard)
 
         async def handle_issue(repo: str, issue: dict) -> None:
             issue_number = issue["number"]
