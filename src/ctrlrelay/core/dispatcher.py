@@ -237,13 +237,26 @@ class ClaudeDispatcher:
             )
         state_file.parent.mkdir(parents=True, exist_ok=True)
         env.update(agent_cache_env(cache_dir))
+        # A writable directory that does not exist yet would stay on the
+        # read-only root, and the agent CLI could not create its state.
+        for raw in self.sandbox_writable_paths:
+            p = Path(os.path.expanduser(raw))
+            if not p.exists() and not p.is_symlink() and not p.suffix:
+                try:
+                    p.mkdir(parents=True)
+                except OSError:
+                    pass  # left read-only; the agent CLI says what it lacks
 
         dot_git = working_dir / ".git"
         repo_dirs = git_dirs(working_dir)
-        if dot_git.exists() and not repo_dirs:
+        if not repo_dirs:
+            # Every sandboxed run is in a git worktree. Without its git
+            # directory the agent could not commit, and a writable
+            # worktree with no ``.git`` lets it plant one, hooks and all,
+            # for the relay's later git commands there.
             raise SandboxUnavailableError(
-                f"could not find the git directories of {working_dir}, so "
-                "the agent could not commit; not starting it"
+                f"could not find the git directories of {working_dir}; "
+                "not starting the agent"
             )
         # What every later git command in this clone runs, the relay's
         # included: its config (core.hooksPath, core.fsmonitor, filters),

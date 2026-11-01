@@ -312,3 +312,41 @@ def test_a_missing_git_config_is_made_a_file_not_a_directory(tmp_path) -> None:
     )
     d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)
     assert (wt / ".git" / "config").is_file()
+
+
+@pytest.mark.parametrize("make", ["nothing", "dangling"])
+def test_a_worktree_whose_git_directory_cannot_be_found_is_refused(
+    tmp_path, make,
+) -> None:
+    if BWRAP is None:
+        pytest.skip("bwrap not installed")
+    from ctrlrelay.core.agent_env import SandboxUnavailableError
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    if make == "dangling":
+        (wt / ".git").symlink_to(tmp_path / "gone")
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
+        sandbox_cache_dir=str(tmp_path / "c"),
+    )
+    with pytest.raises(SandboxUnavailableError, match="git directories"):
+        d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)
+
+
+def test_a_missing_agent_state_dir_is_made_writable(tmp_path, monkeypatch) -> None:
+    if BWRAP is None:
+        pytest.skip("bwrap not installed")
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    wt = tmp_path / "wt"
+    _git("init", "-q", str(wt), cwd=tmp_path)
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
+        sandbox_cache_dir=str(tmp_path / "c"), sandbox_readonly_paths=(),
+    )
+    argv = d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", tmp_path)
+    state = str(tmp_path / "home" / ".claude")
+    assert ["--bind", state, state] == argv[argv.index(state) - 1: argv.index(state) + 2]
