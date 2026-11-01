@@ -122,14 +122,24 @@ class TestTwoMachinesOneBot:
     async def test_a_reply_to_another_machines_old_question_is_not_routed_here(
         self, tmp_path,
     ) -> None:
-        """B restarted, or never knew A's post: the orphan router must not
-        apply A's answer to B's own persisted question."""
-        channel, a, b = _bridges(tmp_path, shared=True)
+        """B restarted, or never knew A's post, and has a question of its
+        own waiting in its database: A's answer must not be applied to it,
+        and B must say nothing."""
+        from ctrlrelay.core.state import StateDB
+
+        channel, a, b = _bridges(tmp_path, shared=False)
+        b.state_db = StateDB(tmp_path / "b.db")
+        b.state_db.add_pending_resume("dev-b-1", "dev", "o/r", "merge it?")
         await _ask(a, "pin or bump?")
         a_post = next(iter(channel.posts))
-        b._queue_orphan_reply_as_resume_answer = AsyncMock()
-        await b._on_reply("pin", reply_to_post_id=a_post)
-        b._queue_orphan_reply_as_resume_answer.assert_not_called()
+        posts_before = dict(channel.posts)
+        try:
+            await b._on_reply("pin", reply_to_post_id=a_post)
+            [row] = b.state_db.list_unanswered_pending_resumes()
+            assert row["session_id"] == "dev-b-1"  # still unanswered
+        finally:
+            b.state_db.close()
+        assert channel.posts == posts_before
 
     @pytest.mark.asyncio
     async def test_on_a_shared_chat_a_plain_message_must_name_the_machine(
@@ -162,8 +172,18 @@ class TestTwoMachinesOneBot:
         assert list(channel.posts.values()) == ["[node-a] something"]
 
     @pytest.mark.asyncio
-    async def test_an_unreadable_post_is_routed_as_before(self, tmp_path) -> None:
-        channel, a, _ = _bridges(tmp_path, shared=True)
+    async def test_on_a_shared_chat_an_unreadable_post_is_left_alone(self, tmp_path) -> None:
+        _, a, _ = _bridges(tmp_path, shared=True)
+        a.handler.post_text = AsyncMock(side_effect=RuntimeError("502"))
+        a._queue_orphan_reply_as_resume_answer = AsyncMock()
+        await a._on_reply("pin", reply_to_post_id="p999")
+        a._queue_orphan_reply_as_resume_answer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_its_own_chat_an_unreadable_post_is_routed_as_before(
+        self, tmp_path,
+    ) -> None:
+        channel, a, _ = _bridges(tmp_path, shared=False)
         a.handler.post_text = AsyncMock(side_effect=RuntimeError("502"))
         a._queue_orphan_reply_as_resume_answer = AsyncMock(
             return_value={"status": "none"},
@@ -215,7 +235,10 @@ class TestTelegramOneReaderPerBot:
         h.chat_id = 1
         update = SimpleNamespace(update_id=5, message=SimpleNamespace(
             chat=SimpleNamespace(id=1), text="pin",
-            reply_to_message=SimpleNamespace(message_id=42, text="[node-b] pin or bump?"),
+            reply_to_message=SimpleNamespace(
+            message_id=42, text="[node-b] pin or bump?",
+            from_user=SimpleNamespace(id=777, is_bot=True),
+        ),
         ))
         calls = [[update]]
 
@@ -225,7 +248,71 @@ class TestTelegramOneReaderPerBot:
             raise __import__("asyncio").CancelledError
 
         h.bot = MagicMock()
+        h.bot.id = 777
         h.bot.get_updates = get_updates
         with pytest.raises(__import__("asyncio").CancelledError):
             await h._poll_loop(AsyncMock())
         assert await h.post_text("42") == "[node-b] pin or bump?"
+
+
+
+class TestRoundOneFixes:
+    @pytest.mark.asyncio
+    async def test_on_its_own_chat_an_answer_starting_with_its_name_is_kept_whole(
+        self, tmp_path,
+    ) -> None:
+        _, a, _ = _bridges(tmp_path, shared=False)
+        wa = await _ask(a, "status?")
+        await a._on_reply("node-a is healthy", reply_to_post_id=None)
+        assert _answers(wa) == ["node-a is healthy"]
+
+    @pytest.mark.asyncio
+    async def test_a_person_typing_a_tag_does_not_speak_for_a_machine(self) -> None:
+        from ctrlrelay.bridge.mattermost_handler import MattermostHandler
+
+        h = MattermostHandler.__new__(MattermostHandler)
+        h._bot_user_id = "bot"
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"user_id": "a-person", "message": "[node-b] x"})
+        h._client = MagicMock()
+        h._client.get = AsyncMock(return_value=resp)
+        assert await h.post_text("p1") == ""
+        resp.json = MagicMock(return_value={"user_id": "bot", "message": "[node-b] x"})
+        assert await h.post_text("p1") == "[node-b] x"
+
+    @pytest.mark.asyncio
+    async def test_on_telegram_only_the_bots_own_message_keeps_its_tag(self) -> None:
+        import asyncio
+        from types import SimpleNamespace
+
+        from ctrlrelay.bridge.telegram_handler import TelegramHandler
+
+        h = TelegramHandler.__new__(TelegramHandler)
+        h._offset = 0
+        h._replied_texts = {}
+        h.chat_id = 1
+        h.bot = MagicMock()
+        h.bot.id = 777
+
+        def update(uid: int, mid: int, sender_id: int, is_bot: bool):
+            return SimpleNamespace(update_id=uid, message=SimpleNamespace(
+                chat=SimpleNamespace(id=1), text="pin",
+                reply_to_message=SimpleNamespace(
+                    message_id=mid, text="[node-b] pin or bump?",
+                    from_user=SimpleNamespace(id=sender_id, is_bot=is_bot),
+                ),
+            ))
+
+        batches = [[update(1, 10, 777, True), update(2, 11, 5, False)]]
+
+        async def get_updates(**kw):
+            if batches:
+                return batches.pop()
+            raise asyncio.CancelledError
+
+        h.bot.get_updates = get_updates
+        with pytest.raises(asyncio.CancelledError):
+            await h._poll_loop(AsyncMock())
+        assert await h.post_text("10") == "[node-b] pin or bump?"
+        assert await h.post_text("11") == ""

@@ -1083,24 +1083,38 @@ class BridgeServer:
                 )
             if known:
                 return False, text
-            owner = tagged_node(await self._post_text(reply_to_post_id))
+            readable, post = await self._post_text(reply_to_post_id)
+            if not readable:
+                # On a shared chat, an unknown post that cannot be read is
+                # most likely another machine's: leave it. On its own chat
+                # a machine routes it as it always did.
+                return self.shared, text
+            owner = tagged_node(post)
             if owner is not None and owner != safe_node_name(self.node):
                 return True, text
+            return False, text
+        if not self.shared:
+            # One machine on its own chat: messages are taken as typed, so
+            # an answer that happens to start with this machine's name is
+            # not cut.
             return False, text
         mine, rest = addressed(text, self.node)
         if mine:
             return False, rest
-        return self.shared, text
+        return True, text
 
-    async def _post_text(self, post_id: str) -> str | None:
+    async def _post_text(self, post_id: str) -> tuple[bool, str | None]:
+        """``(readable, text)`` of a post. ``text`` is ``""`` for a post the
+        bot did not write and ``None`` when the handler has no such read."""
         reader = getattr(self.handler, "post_text", None)
         if reader is None:
-            return None
+            return False, None
         try:
-            return await reader(post_id)
+            text = await reader(post_id)
         except Exception as e:
             _log.info("bridge: could not read post %s: %s", post_id, e)
-            return None
+            return False, None
+        return text is not None, text
 
     async def _queue_orphan_reply_as_resume_answer(
         self, text: str, *, session_id: str | None = None

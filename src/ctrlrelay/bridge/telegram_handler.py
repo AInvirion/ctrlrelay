@@ -132,9 +132,11 @@ class TelegramHandler:
         return self._replied_texts.get(post_id)
 
     async def preflight(self) -> None:
-        """Fail at startup if another process is already reading this
-        bot's updates (#248). Telegram allows one reader per bot; a second
-        one gets a conflict on every poll, for ever."""
+        """Fail at startup if another process is reading this bot's updates
+        right now (#248). Telegram allows one reader per bot. A short read
+        catches a reader that is mid-poll, which a running bridge almost
+        always is; one it misses shows up as a conflict on the first poll,
+        which ``_poll_loop`` logs once before it stops."""
         try:
             await self.bot.get_updates(offset=self._offset, timeout=0, limit=1)
         except Conflict as e:
@@ -178,7 +180,15 @@ class TelegramHandler:
                     else None
                 )
                 if reply_id is not None:
-                    self._replied_texts[reply_id] = msg.reply_to_message.text or ""
+                    # Only the bot's own messages speak for a machine: a
+                    # person typing "[node-b] ..." is kept as untagged.
+                    sender = getattr(msg.reply_to_message, "from_user", None)
+                    from_bot = bool(getattr(sender, "is_bot", False)) and (
+                        getattr(sender, "id", None) == getattr(self.bot, "id", None)
+                    )
+                    self._replied_texts[reply_id] = (
+                        (msg.reply_to_message.text or "") if from_bot else ""
+                    )
                     while len(self._replied_texts) > 256:
                         self._replied_texts.pop(next(iter(self._replied_texts)))
                 try:
