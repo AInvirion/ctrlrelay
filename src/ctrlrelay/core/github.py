@@ -445,7 +445,10 @@ class GitHubCLI:
         if any(p.get("incomplete") for p in pages):
             raise GitHubError("GitHub marked the search incomplete")
         rows = [row for p in pages for row in p["items"]]
-        total = pages[0].get("total")
+        totals = {p.get("total") for p in pages}
+        # Every page must agree on the total: one that changed mid-way means
+        # the result set moved while it was being read.
+        total = totals.pop() if len(totals) == 1 else None
         if not isinstance(total, int) or len(rows) < total:
             raise GitHubError(
                 f"the search returned {len(rows)} of {total} issues, so the "

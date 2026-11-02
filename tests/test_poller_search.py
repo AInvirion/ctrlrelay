@@ -176,6 +176,16 @@ class TestTheSearchCall:
                 await GitHubCLI().search_open_issues(repos=["o/a"], label="go")
 
     @pytest.mark.asyncio
+    async def test_pages_that_disagree_on_the_total_are_refused(self) -> None:
+        from ctrlrelay.core.github import GitHubCLI
+
+        p1 = self._page([{"number": 1, "repo": "o/a"}], total=2)
+        p2 = self._page([{"number": 2, "repo": "o/a"}], total=3)
+        with patch.object(GitHubCLI, "_run_gh", AsyncMock(return_value=p1 + "\n" + p2)):
+            with pytest.raises(GitHubError):
+                await GitHubCLI().search_open_issues(repos=["o/a"], assignee="alice")
+
+    @pytest.mark.asyncio
     async def test_pages_are_joined(self) -> None:
         from ctrlrelay.core.github import GitHubCLI
 
