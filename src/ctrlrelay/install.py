@@ -32,6 +32,9 @@ if TYPE_CHECKING:  # import cost: the CLI defers config loading too
 
 _TEMPLATE_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Variables the unit templates set themselves; a token under one of these
+# names would make two competing entries.
+_UNIT_SETS_ITSELF = frozenset({"PATH", "PYTHONUNBUFFERED", "HOME"})
 
 # The variable the bridge and poller read their chat token from when
 # nothing names one. It is the Telegram default from ``TelegramConfig``,
@@ -130,6 +133,11 @@ def _build_substitution_values(
             f"bot_token_env {token_env_var!r} is not an environment variable "
             "name (letters, digits and _, not starting with a digit)"
         )
+    if token_env_var.upper() in _UNIT_SETS_ITSELF:
+        raise ValueError(
+            f"bot_token_env {token_env_var!r} is a variable the units already "
+            "set for themselves; name the token something else"
+        )
     values["TOKEN_ENV_VAR"] = token_env_var
     # Pass through the bot token from the current environment if the
     # operator has it exported at install time. Without it, the value
@@ -148,9 +156,10 @@ def _token_value_for(platform: str, token: str | None, name: str) -> str:
     ``${NAME}`` placeholder when there is none (the caller reports it)."""
     if not token:
         return "${" + name + "}"
-    if any(c in token for c in "\r\n\x00"):
+    if any((ord(c) < 32 and c != "\t") or ord(c) in (0xFFFE, 0xFFFF) for c in token):
         raise ValueError(
-            f"${name} contains a line break or NUL, which no unit file can carry"
+            f"${name} contains a line break or another control character, "
+            "which no unit file can carry"
         )
     if platform == "launchd":
         from xml.sax.saxutils import escape

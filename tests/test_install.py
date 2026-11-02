@@ -812,7 +812,7 @@ class TestTokenIsWrittenSafely:
         env = plistlib.loads(bridge.content.encode())["EnvironmentVariables"]
         assert env["MY_TOKEN"] == "a&b<c>d"
 
-    @pytest.mark.parametrize("bad", ["a\nExecStart=/bin/evil", "a\rb"])
+    @pytest.mark.parametrize("bad", ["a\nExecStart=/bin/evil", "a\rb", "a\x01b", "a\x1bb"])
     def test_a_token_with_a_line_break_is_refused(self, tmp_path, monkeypatch, bad) -> None:
         from ctrlrelay.install import render_systemd
 
@@ -844,3 +844,11 @@ class TestTokenIsWrittenSafely:
         monkeypatch.setenv("MY_TOKEN", "${SECRET}")
         units = render_systemd(workdir=tmp_path, target_dir=tmp_path, token_env_var="MY_TOKEN")
         assert all("SECRET" not in u.unresolved for u in units)
+
+
+@pytest.mark.parametrize("name", ["PATH", "PYTHONUNBUFFERED", "home"])
+def test_a_token_named_like_a_variable_the_unit_sets_is_refused(tmp_path, name) -> None:
+    from ctrlrelay.install import render_systemd
+
+    with pytest.raises(ValueError, match="already set"):
+        render_systemd(workdir=tmp_path, target_dir=tmp_path, token_env_var=name)
