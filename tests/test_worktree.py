@@ -80,25 +80,39 @@ class TestWorktreeManager:
             await manager.ensure_bare_repo("owner/repo")
 
         # symbolic-ref (default-branch lookup), the worktree listing
-        # (#253: checked-out branches are left out), then the fetch.
-        assert mock_git.await_count == 3
+        # (#253: checked-out branches are left out), then the two
+        # fetches (#243: only the bot one prunes).
+        assert mock_git.await_count == 4
         assert mock_git.await_args_list[0].args[0] == "symbolic-ref"
         assert mock_git.await_args_list[1].args[:2] == ("worktree", "list")
-        args = mock_git.await_args.args
-        # Must be a fetch, not --all, with the explicit refspec.
-        assert args[0] == "fetch"
-        assert "origin" in args
+        bot, heads = (c.args for c in mock_git.await_args_list[2:])
+
+        # The bot fetch: force refspec, and the only --prune there is.
+        assert bot[0] == "fetch"
+        assert "origin" in bot
+        assert "--prune" in bot
+        assert "+refs/heads/dependabot/*:refs/heads/dependabot/*" in bot
+        assert "refs/heads/*:refs/heads/*" not in bot
+
+        # The branch fetch: every other branch, no prune.
+        assert heads[0] == "fetch"
+        assert "origin" in heads
         # Non-force refspec on purpose: a force fetch
         # would destroy unpushed local commits in the dev pipeline's
         # branch-reuse flow. Fast-forward-only fixes the stale-
         # default-branch case while leaving divergent dev branches
         # for the reuse logic to handle.
-        assert "refs/heads/*:refs/heads/*" in args
-        assert "+refs/heads/*:refs/heads/*" not in args
-        assert "--prune" in args
+        assert "refs/heads/*:refs/heads/*" in heads
+        assert "+refs/heads/*:refs/heads/*" not in heads
+        # #243: pruning here deletes every branch origin does not have,
+        # including one that was never pushed.
+        assert "--prune" not in heads
+        # Disjoint from the bot fetch, so a rebased bot branch is never
+        # a rejection the plain refspec has to tolerate.
+        assert "^refs/heads/dependabot/*" in heads
         # Explicit refspec must win over the bare `--all` that used to
         # silently no-op on refspec-less repos.
-        assert "--all" not in args
+        assert "--all" not in bot and "--all" not in heads
 
     @pytest.mark.asyncio
     async def test_remove_worktree(self, tmp_path: Path) -> None:
@@ -2096,11 +2110,19 @@ class TestFetchWithTheSessionsBranchCheckedOut:
         assert result.success, result.error
 
     @pytest.mark.asyncio
-    async def test_prune_keeps_a_checked_out_branch_origin_deleted(
+    async def test_a_branch_origin_deleted_is_kept_whoever_holds_it(
         self, tmp_path: Path,
     ) -> None:
         """A branch deleted on GitHub while a session still has it checked
-        out is kept (the worktree is using it); others are still pruned."""
+        out is kept — the worktree is using it.
+
+        ``other`` is kept too now, and that assertion is the one this
+        test used to make the other way round. #243: a prune over
+        ``refs/heads/*`` cannot tell a branch origin deleted from one
+        origin never had, so keeping both is the cost of not losing
+        unpushed work. ``dependabot/*`` is still pruned, pinned in
+        :class:`TestLocalOnlyBranchSurvivesTheFetch`.
+        """
         wt, origin, bare = self._setup(tmp_path)
         self._git("branch", "other", cwd=origin)
         await wt.ensure_bare_repo("owner/repo")
@@ -2110,7 +2132,7 @@ class TestFetchWithTheSessionsBranchCheckedOut:
         await wt.ensure_bare_repo("owner/repo")
 
         assert self._git("branch", "--list", "fix/issue-4", cwd=bare).strip()
-        assert not self._git("branch", "--list", "other", cwd=bare).strip()
+        assert self._git("branch", "--list", "other", cwd=bare).strip()
 
     @pytest.mark.asyncio
     async def test_an_unchanged_published_branch_was_refused_too(
@@ -2368,3 +2390,124 @@ def test_a_tab_inside_the_reason_is_kept() -> None:
 
     reason = parse_push_rejection("!\tr:r\t[remote rejected] (rule failed:\tcheck required)\n")
     assert reason.endswith("check required)")
+
+
+class TestLocalOnlyBranchSurvivesTheFetch:
+    """#243: ``--prune`` paired with ``refs/heads/*:refs/heads/*`` makes
+    git delete every local branch origin does not have. Measured on
+    31 Oct: a branch made in the clone was removed by the next fetch
+    (``- [deleted]  (none)  -> held``). A blocked session whose branch
+    was never pushed lost it the next time any run touched that repo,
+    and its commits were then reachable only from the worktree's HEAD —
+    one ``git gc`` from gone.
+
+    Pruning stays on for the bot branches, which are the ones that
+    actually pile up and never carry local work.
+    """
+
+    _git = staticmethod(TestFetchSurvivesRewrittenBranches._git)
+    _sha = staticmethod(TestFetchSurvivesRewrittenBranches._sha)
+
+    @classmethod
+    def _setup(cls, tmp_path: Path):
+        """origin with main and one bot branch; a clone of it that also
+        holds a local-only branch and a bot branch origin dropped."""
+        import subprocess
+
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        cls._git("init", "-q", "-b", "main", ".", cwd=origin)
+        (origin / "f").write_text("base\n")
+        cls._git("add", ".", cwd=origin)
+        cls._git("commit", "-qm", "base", cwd=origin)
+        cls._git("branch", "dependabot/uv/kept-1.0", cwd=origin)
+
+        wt = WorktreeManager(
+            worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos",
+        )
+        bare = wt._get_bare_repo_path("owner/repo")
+        bare.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "clone", "-q", "--bare", str(origin), str(bare)],
+            check=True, capture_output=True,
+        )
+
+        # A branch that only ever existed here: the unpushed work.
+        tree = cls._git("rev-parse", "refs/heads/main^{tree}", cwd=bare).strip()
+        unpushed = cls._git(
+            "commit-tree", tree, "-p", "refs/heads/main",
+            "-m", "work the session never pushed", cwd=bare,
+        ).strip()
+        cls._git("update-ref", "refs/heads/fix/issue-9", unpushed, cwd=bare)
+        # A bot branch origin has already deleted.
+        cls._git(
+            "branch", "dependabot/uv/gone-0.9", "refs/heads/main", cwd=bare,
+        )
+
+        # main moves on origin so the fetch has real work to do.
+        (origin / "f").write_text("main moved\n")
+        cls._git("commit", "-qam", "main moved", cwd=origin)
+        return wt, origin, bare, unpushed
+
+    @pytest.mark.asyncio
+    async def test_an_unpushed_branch_is_still_there_after_a_fetch(
+        self, tmp_path: Path,
+    ) -> None:
+        wt, origin, bare, unpushed = self._setup(tmp_path)
+
+        await wt.ensure_bare_repo("owner/repo")
+
+        # The reported loss: the ref is gone, not merely stale.
+        assert self._sha(bare, "refs/heads/fix/issue-9") == unpushed
+        # And the fetch still did its job.
+        assert self._sha(bare, "refs/heads/main") == \
+            self._sha(origin, "refs/heads/main")
+
+    @pytest.mark.asyncio
+    async def test_an_unpushed_branch_held_by_a_worktree_survives(
+        self, tmp_path: Path,
+    ) -> None:
+        """The case as measured: the branch was checked out in a blocked
+        session's worktree. #253 leaves a checked-out branch out of the
+        fetch, which also spared it the prune — but only while the clone
+        can name its default branch. With no symbolic HEAD nothing is
+        left out, and under a pruning refspec the ref went anyway."""
+        wt, origin, bare, unpushed = self._setup(tmp_path)
+        self._git(
+            "worktree", "add", "-q", str(tmp_path / "wt" / "blocked"),
+            "fix/issue-9", cwd=bare,
+        )
+        # Detach HEAD: `symbolic-ref HEAD` then fails, which is the
+        # "clone cannot name a default branch" case, and the skip list
+        # is empty by design there.
+        self._git(
+            "update-ref", "--no-deref", "HEAD", "refs/heads/main", cwd=bare,
+        )
+
+        await wt.ensure_bare_repo("owner/repo")
+
+        assert self._sha(bare, "refs/heads/fix/issue-9") == unpushed
+
+    @pytest.mark.asyncio
+    async def test_a_bot_branch_origin_deleted_is_still_pruned(
+        self, tmp_path: Path,
+    ) -> None:
+        """Dropping the prune wholesale would leave every dependabot ref
+        the repo has ever had in the clone forever."""
+        import subprocess
+
+        wt, origin, bare, _ = self._setup(tmp_path)
+
+        await wt.ensure_bare_repo("owner/repo")
+
+        gone = subprocess.run(
+            ["git", "rev-parse", "--verify", "-q",
+             "refs/heads/dependabot/uv/gone-0.9"],
+            cwd=bare, capture_output=True, text=True,
+        )
+        assert gone.returncode != 0, gone.stdout
+        # The one origin still has is untouched.
+        assert self._sha(bare, "refs/heads/dependabot/uv/kept-1.0") == \
+            self._sha(origin, "refs/heads/dependabot/uv/kept-1.0")
