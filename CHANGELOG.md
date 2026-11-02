@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-11-01
+
 ### Fixed
 
 - Installed bridge and poller units carry the token variable the configured
@@ -2107,7 +2109,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.4...v0.17.0
 [0.16.4]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.2...v0.16.3
