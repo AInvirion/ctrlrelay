@@ -34,12 +34,19 @@ and restart on failure — the templates below already do this.
 
 Recommended: let `ctrlrelay install launchd` render the plists for you.
 It substitutes `${USER}`, `${HOME}`, the absolute `ctrlrelay` path,
-your working directory, and (when exported) `CTRLRELAY_TELEGRAM_TOKEN`
-into the in-package templates and writes them to
-`~/Library/LaunchAgents/`.
+your working directory, and (when exported) your chat token into the
+in-package templates and writes them to `~/Library/LaunchAgents/`.
+
+The token goes into the plist under the variable your transport names
+in `transport.<type>.bot_token_env` — `CTRLRELAY_TELEGRAM_TOKEN` for
+Telegram, `CTRLRELAY_MATTERMOST_TOKEN` for Mattermost, or whatever you
+renamed that setting to. The command reads your `orchestrator.yaml` to
+find out which; pass `--config` if it is somewhere the usual search
+does not look. Export that variable before running, or the plist keeps
+a placeholder and the command says which variable to export.
 
 ```bash
-export CTRLRELAY_TELEGRAM_TOKEN=your-bot-token
+export CTRLRELAY_MATTERMOST_TOKEN=your-bot-token   # or _TELEGRAM_, per your config
 ctrlrelay install launchd \
   --workdir ~/Projects/ctrlrelay \
   --label-prefix com.yourname \
@@ -158,8 +165,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.ctrlrelay-po
 Recommended: `ctrlrelay install systemd` renders the user unit files
 for you (no root needed) and writes them to `~/.config/systemd/user/`.
 
+As on macOS, the bridge and poller units carry the token under the
+variable `transport.<type>.bot_token_env` names, read from your
+`orchestrator.yaml` (`--config` to point at a different one). Export
+that variable before running.
+
 ```bash
-export CTRLRELAY_TELEGRAM_TOKEN=your-bot-token
+export CTRLRELAY_MATTERMOST_TOKEN=your-bot-token   # or _TELEGRAM_, per your config
 ctrlrelay install systemd \
   --workdir ~/Projects/ctrlrelay \
   --poller-interval 300
@@ -190,6 +202,8 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Projects/ctrlrelay
+# The variable your transport names in bot_token_env — use
+# CTRLRELAY_MATTERMOST_TOKEN on a Mattermost config.
 Environment=CTRLRELAY_TELEGRAM_TOKEN=your-bot-token-here
 ExecStart=%h/.local/bin/ctrlrelay bridge start --foreground
 Restart=always
@@ -211,6 +225,8 @@ After=network-online.target ctrlrelay-bridge.service
 [Service]
 Type=simple
 WorkingDirectory=%h/Projects/ctrlrelay
+# The variable your transport names in bot_token_env — use
+# CTRLRELAY_MATTERMOST_TOKEN on a Mattermost config.
 Environment=CTRLRELAY_TELEGRAM_TOKEN=your-bot-token-here
 ExecStart=%h/.local/bin/ctrlrelay poller start --foreground --interval 300
 Restart=always

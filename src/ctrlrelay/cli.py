@@ -5052,6 +5052,12 @@ def setup(
         console.print("  daemon unit files:")
         for p in result.daemon_units:
             console.print(f"    - {p}")
+        if result.daemon_unresolved:
+            console.print(
+                "  [yellow]warning:[/yellow] the units still carry "
+                f"{', '.join('${'+v+'}' for v in result.daemon_unresolved)}; "
+                "export it and re-run with --force, or edit the files by hand."
+            )
         console.print(
             "\n[bold]Next:[/bold] bootstrap the daemons via:\n"
             "  launchctl bootstrap gui/$(id -u) <plist>"
@@ -5463,11 +5469,48 @@ def _print_install_summary(
                 f"  [yellow]warning:[/yellow] unresolved template variables: "
                 f"{', '.join('${'+v+'}' for v in unit.unresolved)}"
             )
-            if "CTRLRELAY_TELEGRAM_TOKEN" in unit.unresolved:
+            # Name the variable this install actually needs. It is
+            # whatever `transport.<type>.bot_token_env` says, so hinting
+            # a fixed CTRLRELAY_TELEGRAM_TOKEN sent a Mattermost
+            # operator to export a variable nothing reads (#267).
+            if unit.token_env_var in unit.unresolved:
                 console.print(
-                    "  [dim]hint: export CTRLRELAY_TELEGRAM_TOKEN before "
+                    f"  [dim]hint: export {unit.token_env_var} before "
                     "re-running, or edit the file by hand.[/dim]"
                 )
+
+
+def _install_token_env_var(config_path: str | None) -> str:
+    """Which env var the rendered units should carry the chat token in.
+
+    Reads the active transport's ``bot_token_env`` so a Mattermost box
+    gets its own variable (#267). Exits non-zero on a config that was
+    asked for and cannot be loaded: rendering the Telegram default on
+    the strength of a path the operator got wrong would write a unit for
+    a transport they are not running. Finding no config at all is a
+    different case — nothing names a transport, so the historical
+    default stands and the summary flags it as unresolved.
+    """
+    from ctrlrelay.install import DEFAULT_TOKEN_ENV_VAR, token_env_var_from_config
+
+    if config_path is None:
+        try:
+            path = resolve_config_path(None)
+        except ConfigError:
+            console.print(
+                f"[yellow]No orchestrator.yaml found, so nothing names the chat "
+                f"transport: the units carry ${DEFAULT_TOKEN_ENV_VAR}. Pass "
+                "--config to use your transport's token variable.[/yellow]"
+            )
+            return DEFAULT_TOKEN_ENV_VAR
+    else:
+        path = resolve_config_path(config_path)
+    try:
+        config = load_config(path)
+    except ConfigError as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+    return token_env_var_from_config(config)
 
 
 @install_app.command("launchd")
@@ -5499,8 +5542,17 @@ def install_launchd(
         "--dry-run",
         help="Print what would be written without touching the filesystem.",
     ),
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
 ) -> None:
     """Render and install bridge + poller plists for macOS launchd.
+
+    The plists carry the chat token in the variable the configured
+    transport names, so export that variable before running.
 
     After running, load the agents with:
       launchctl bootstrap gui/$(id -u) <plist-path>
@@ -5512,6 +5564,7 @@ def install_launchd(
         label_prefix=label_prefix,
         poller_interval=poller_interval,
         target_dir=target_dir,
+        token_env_var=_install_token_env_var(config_path),
     )
     written: list[Path] = []
     if not dry_run:
@@ -5547,8 +5600,17 @@ def install_systemd(
         "--dry-run",
         help="Print what would be written without touching the filesystem.",
     ),
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
 ) -> None:
     """Render and install bridge, poller and status-page systemd user units (Linux).
+
+    The bridge and poller units carry the chat token in the variable the
+    configured transport names, so export that variable before running.
 
     After running, enable with:
       systemctl --user daemon-reload
@@ -5562,6 +5624,7 @@ def install_systemd(
         workdir=workdir,
         poller_interval=poller_interval,
         target_dir=target_dir,
+        token_env_var=_install_token_env_var(config_path),
     )
     written: list[Path] = []
     if not dry_run:

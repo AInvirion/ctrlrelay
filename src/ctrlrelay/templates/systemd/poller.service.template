@@ -5,7 +5,13 @@ After=network-online.target ctrlrelay-bridge.service
 [Service]
 Type=simple
 WorkingDirectory=${WORKDIR}
-Environment=CTRLRELAY_TELEGRAM_TOKEN=${CTRLRELAY_TELEGRAM_TOKEN}
+# The chat token. Both the variable name and its value are
+# substituted at install time: the name is whatever the active
+# transport's `bot_token_env` setting says, the value comes from that
+# variable in the installing shell's environment. Naming one
+# provider's variable here gave every other transport a unit with no
+# usable token in it, so the bridge could not log in (#267).
+Environment="${TOKEN_ENV_VAR}=${TOKEN_ENV_VALUE}"
 # Without PYTHONUNBUFFERED, ctrlrelay's stdout sits in Python's stdio
 # buffer instead of flushing line-by-line, making `tail -f` and
 # `journalctl -f` lag noticeably.

@@ -135,6 +135,9 @@ class SetupResult:
     personalization_summary: str | None = None
     personalization_failed: bool = False
     daemon_units: list[Path] = field(default_factory=list)
+    # Template variables the written units still carry as placeholders,
+    # e.g. a token variable that was not set when setup ran.
+    daemon_unresolved: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -597,8 +600,9 @@ def run_setup(options: SetupOptions) -> SetupResult:
             personalization_failed = True
 
     daemon_units: list[Path] = []
+    daemon_unresolved: list[str] = []
     if options.install_daemons:
-        daemon_units = _install_daemons(options)
+        daemon_units, daemon_unresolved = _install_daemons(options, config)
 
     return SetupResult(
         config_out=options.config_out,
@@ -610,19 +614,33 @@ def run_setup(options: SetupOptions) -> SetupResult:
         personalization_summary=personalization_summary,
         personalization_failed=personalization_failed,
         daemon_units=daemon_units,
+        daemon_unresolved=daemon_unresolved,
     )
 
 
-def _install_daemons(options: SetupOptions) -> list[Path]:
+def _install_daemons(
+    options: SetupOptions, config: Config,
+) -> tuple[list[Path], list[str]]:
     """Render and write launchd or systemd unit files based on platform.
 
-    Sets ``CTRLRELAY_TELEGRAM_TOKEN`` from ``options.telegram_token`` so
-    the rendered unit doesn't carry the literal ``${...}`` placeholder.
+    Exports the chosen transport's token so the rendered unit doesn't
+    carry the literal ``${...}`` placeholder, and tells the renderer
+    which variable the config it just wrote names. Before #267 the
+    renderer only ever read ``CTRLRELAY_TELEGRAM_TOKEN``, so a
+    Mattermost setup exported ``options.mattermost_token`` into an
+    environment nothing looked at and wrote a unit naming a Telegram
+    variable the operator never sets.
+
     Returns the list of paths written so the CLI can print them.
     """
     import sys
 
-    from ctrlrelay.install import render_launchd, render_systemd, write_units
+    from ctrlrelay.install import (
+        render_launchd,
+        render_systemd,
+        token_env_var_from_config,
+        write_units,
+    )
 
     # Restore the token to the env so render_* picks it up. We don't
     # leak it back to the caller's env — restore the prior value at the
@@ -640,13 +658,20 @@ def _install_daemons(options: SetupOptions) -> list[Path]:
     # checkout. Operators who want a different workdir can re-run
     # `ctrlrelay install launchd --workdir <path> --force` later.
     workdir = Path.home()
+    # Read back off the config this run wrote rather than mapping the
+    # transport to a name here: `bot_token_env` is the only thing the
+    # bridge itself reads, so one source of truth keeps the unit and the
+    # bridge from disagreeing.
+    token_env_var = token_env_var_from_config(config)
     try:
         if sys.platform == "darwin":
             units = render_launchd(
-                workdir=workdir, label_prefix="com.ctrlrelay"
+                workdir=workdir,
+                label_prefix="com.ctrlrelay",
+                token_env_var=token_env_var,
             )
         else:
-            units = render_systemd(workdir=workdir)
+            units = render_systemd(workdir=workdir, token_env_var=token_env_var)
         written = write_units(units, overwrite=options.force)
     finally:
         # Restore BOTH, for the reason the telegram one was restored: a
@@ -662,4 +687,5 @@ def _install_daemons(options: SetupOptions) -> list[Path]:
             else:
                 os.environ[var] = prior
 
-    return written
+    unresolved = sorted({v for u in units for v in u.unresolved})
+    return written, unresolved

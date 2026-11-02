@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Installed bridge and poller units carry the token variable the configured
+  transport names, not a fixed Telegram one. `ctrlrelay install
+  launchd|systemd` and `ctrlrelay setup --install-daemons` read
+  `transport.<type>.bot_token_env` and render `Environment=<that
+  name>=<value>` (systemd) or the matching plist entry (launchd), with the
+  value taken from that variable in the installing shell. A Mattermost
+  install previously got a unit naming `CTRLRELAY_TELEGRAM_TOKEN`, which it
+  never sets, so the bridge could not log in once systemd or launchd started
+  it — the server here only worked because the line had been added by hand.
+  The unresolved-variable hint names the same variable, and the install
+  commands take `--config` to say which `orchestrator.yaml` to read
+  (closes #267)
 - Updating a repository's clone no longer deletes local branches GitHub does
   not have. The fetch paired `--prune` with `refs/heads/*:refs/heads/*`, which
   tells git to delete every local branch missing from origin: a branch made in
@@ -23,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   branch-reuse path already recognises a local-only ref and decides whether
   its commits are merged. Because a renamed default branch is no longer
   pruned either, each update also asks GitHub which branch is the default
-  and points the clone at it when it changed (#243).
+  and points the clone at it when it changed and the branch here is at origin's
+  commit (#243).
 
 ## [0.17.0] - 2026-11-01
 

@@ -68,7 +68,7 @@ Key flags:
 | `--telegram-chat-id ID` | none | Required for `--transport=telegram`. |
 | `--personalization-repo OWNER/REPO` | none | Adds a personalization block. |
 | `--no-personalization` | off | Skip the personalization prompt entirely. |
-| `--install-daemons` | (prompted) | Render and write launchd/systemd unit files. Reads `$CTRLRELAY_TELEGRAM_TOKEN` so the rendered plist isn't a placeholder. |
+| `--install-daemons` | (prompted) | Render and write launchd/systemd unit files. Reads the token variable the chosen transport names (`$CTRLRELAY_TELEGRAM_TOKEN`, `$CTRLRELAY_MATTERMOST_TOKEN`) so the rendered unit isn't a placeholder. |
 | `--skip-archived/--include-archived` | skip | gh repo list filter. |
 | `--skip-forks/--include-forks` | skip | gh repo list filter. |
 | `--yes` / `-y` | off | Accept every default; never prompt. |
