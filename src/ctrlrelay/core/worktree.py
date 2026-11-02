@@ -1442,10 +1442,51 @@ class WorktreeManager:
                 )
             except DefaultBranchDivergedError as e:
                 await self._set_aside_and_reclone(repo, bare_path, e)
+            else:
+                await self._follow_origin_default(repo, bare_path, default_branch)
         else:
             await self._clone_bare(repo, bare_path)
 
         return bare_path
+
+    async def _follow_origin_default(
+        self, repo: str, bare_path: Path, default_branch: str,
+    ) -> None:
+        """Point the clone's HEAD at origin's default branch when origin
+        changed it. The fetch no longer prunes branches (#243), so a
+        renamed default's old branch stays here, and without this the
+        clone would keep cutting sessions from it. Best effort: a failed
+        lookup leaves HEAD as it was, and a new default this clone does
+        not hold yet is left for the next update."""
+        try:
+            out = await self._run_git(
+                "ls-remote", "--symref", "origin", "HEAD",
+                cwd=bare_path, timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+            )
+        except WorktreeError:
+            return
+        prefix, suffix = "ref: refs/heads/", "\tHEAD"
+        new = next(
+            (line[len(prefix):-len(suffix)] for line in out.splitlines()
+             if line.startswith(prefix) and line.endswith(suffix)),
+            "",
+        )
+        if not new or new == default_branch:
+            return
+        try:
+            await self._run_git(
+                "rev-parse", "--verify", "--quiet", f"refs/heads/{new}",
+                cwd=bare_path,
+            )
+            await self._run_git(
+                "symbolic-ref", "HEAD", f"refs/heads/{new}", cwd=bare_path,
+            )
+        except WorktreeError:
+            return
+        log_event(
+            _logger, "worktree.default_branch_changed", repo=repo,
+            old=default_branch or None, new=new,
+        )
 
     async def _checked_out_branches(self, bare_path: Path) -> list[str]:
         """Branches checked out in this clone's linked worktrees."""

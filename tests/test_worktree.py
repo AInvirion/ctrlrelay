@@ -82,10 +82,12 @@ class TestWorktreeManager:
         # symbolic-ref (default-branch lookup), the worktree listing
         # (#253: checked-out branches are left out), then the two
         # fetches (#243: only the bot one prunes).
-        assert mock_git.await_count == 4
+        # Then one lookup of origin's default branch (it may have moved).
+        assert mock_git.await_count == 5
         assert mock_git.await_args_list[0].args[0] == "symbolic-ref"
         assert mock_git.await_args_list[1].args[:2] == ("worktree", "list")
-        bot, heads = (c.args for c in mock_git.await_args_list[2:])
+        bot, heads = (c.args for c in mock_git.await_args_list[2:4])
+        assert mock_git.await_args_list[4].args[:3] == ("ls-remote", "--symref", "origin")
 
         # The bot fetch: force refspec, and the only --prune there is.
         assert bot[0] == "fetch"
@@ -1702,6 +1704,31 @@ class TestFetchSurvivesRewrittenBranches:
         # protection the non-force refspec exists for; a blanket "+"
         # would silently destroy a prior session's unpushed work.
         assert self._sha(target, "refs/heads/fix/issue-1") == before_fix
+
+    @pytest.mark.asyncio
+    async def test_a_renamed_default_branch_is_followed(self, tmp_path: Path) -> None:
+        """The fetch no longer prunes (#243), so after origin renames its
+        default the old branch stays in the clone; HEAD must follow origin
+        or sessions are cut from the old one."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        origin, bare = self._build_repos(tmp_path)
+        wt = WorktreeManager(
+            worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos",
+        )
+        target = wt._get_bare_repo_path("owner/repo")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        bare.rename(target)
+        self._git("remote", "set-url", "origin", str(origin), cwd=target)
+        # origin renames its default: main -> trunk (and HEAD with it).
+        self._git("checkout", "-q", "-b", "trunk", "main", cwd=origin)
+        self._git("branch", "-q", "-D", "main", cwd=origin)
+
+        await wt.ensure_bare_repo("owner/repo")
+
+        assert await wt.get_default_branch("owner/repo") == "trunk"
+        # The old branch is kept, not pruned (#243).
+        assert self._sha(target, "refs/heads/main")
 
     @pytest.mark.asyncio
     async def test_real_errors_still_raise(self, tmp_path: Path) -> None:
