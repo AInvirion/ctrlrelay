@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Installed bridge and poller units carry the token variable the configured
+  transport names, not a fixed Telegram one. `ctrlrelay install
+  launchd|systemd` and `ctrlrelay setup --install-daemons` read
+  `transport.<type>.bot_token_env` and render `Environment=<that
+  name>=<value>` (systemd) or the matching plist entry (launchd), with the
+  value taken from that variable in the installing shell. A Mattermost
+  install previously got a unit naming `CTRLRELAY_TELEGRAM_TOKEN`, which it
+  never sets, so the bridge could not log in once systemd or launchd started
+  it — the server here only worked because the line had been added by hand.
+  The unresolved-variable hint names the same variable, and the install
+  commands take `--config` to say which `orchestrator.yaml` to read
+  (closes #267)
+
 ## [0.16.4] - 2026-11-01
 
 Fixes for runs whose work could not be published. **No config edit is

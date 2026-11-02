@@ -821,6 +821,78 @@ class TestSetupCli:
         repo_list_cmd = next(c for c in captured if c[:3] == ["gh", "repo", "list"])
         assert "--source" not in repo_list_cmd
 
+    def test_mattermost_install_daemons_renders_the_mattermost_token(
+        self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#267: `setup --install-daemons` on Mattermost writes a usable unit.
+
+        This is the route an operator installs by, and it was the broken
+        one: the setup code exported CTRLRELAY_MATTERMOST_TOKEN for the
+        renderer, the renderer only ever read
+        CTRLRELAY_TELEGRAM_TOKEN, and the unit it wrote named a Telegram
+        variable the operator never sets. Starting the bridge under
+        systemd or launchd then failed to log in, and the server here
+        only worked because the token line was added by hand.
+        """
+        from ctrlrelay import install as install_mod
+        from ctrlrelay import setup as setup_mod
+
+        tmp_config_out = tmp_path / "cfg.yaml"
+        monkeypatch.setattr(setup_mod, "DEFAULT_CONFIG_OUT", tmp_config_out)
+        monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+        monkeypatch.setenv("CTRLRELAY_MATTERMOST_TOKEN", "mm-token-xyz")
+        monkeypatch.delenv("CTRLRELAY_TELEGRAM_TOKEN", raising=False)
+
+        # Keep the write inside tmp: this test must not touch
+        # ~/Library/LaunchAgents or ~/.config/systemd/user on a machine
+        # that may be running a real ctrlrelay.
+        target_dir = tmp_path / "units"
+        original_render_launchd = install_mod.render_launchd
+        original_render_systemd = install_mod.render_systemd
+
+        def render_launchd_to_tmp(**kwargs):  # type: ignore[no-untyped-def]
+            kwargs["target_dir"] = target_dir
+            return original_render_launchd(**kwargs)
+
+        def render_systemd_to_tmp(**kwargs):  # type: ignore[no-untyped-def]
+            kwargs["target_dir"] = target_dir
+            return original_render_systemd(**kwargs)
+
+        monkeypatch.setattr(install_mod, "render_launchd", render_launchd_to_tmp)
+        monkeypatch.setattr(install_mod, "render_systemd", render_systemd_to_tmp)
+
+        fake_gh["repos_by_owner"] = {"alice": []}
+        result = runner.invoke(
+            app,
+            [
+                "setup",
+                "--yes",
+                "--repo-root", str(tmp_path / "Projects"),
+                "--config-out", str(tmp_config_out),
+                "--no-personalization",
+                "--transport", "mattermost",
+                "--mattermost-url", "https://chat.example.test",
+                "--mattermost-channel-id", "c" * 26,
+                "--install-daemons",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        # Whichever platform the suite runs on, the bridge unit written
+        # has to hand the bridge the token under the name the config
+        # names — which is what the bridge itself reads.
+        written = sorted(target_dir.iterdir())
+        assert written, f"no units written to {target_dir}"
+        bridge = next(p for p in written if "bridge" in p.name)
+        text = bridge.read_text()
+        assert "mm-token-xyz" in text
+        assert "CTRLRELAY_MATTERMOST_TOKEN" in text
+        # And not under a name nothing reads: the config says
+        # bot_token_env is the Mattermost variable, so a unit setting the
+        # Telegram one is setting something the bridge never looks at.
+        assert "Environment=CTRLRELAY_TELEGRAM_TOKEN" not in text
+        assert "<key>CTRLRELAY_TELEGRAM_TOKEN</key>" not in text
+
     def test_clone_failure_surfaces_nonzero_exit_even_with_daemons(
         self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

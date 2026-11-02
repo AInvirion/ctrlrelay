@@ -18,6 +18,7 @@ out of docs and hand-edit /Users/$ME/... paths. Coverage focuses on:
 
 from __future__ import annotations
 
+import plistlib
 from pathlib import Path
 
 import pytest
@@ -38,11 +39,59 @@ def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     side effect (#137) — without this, running the suite would create
     that directory (and touch unit-file permissions) under the real
     developer/CI home.
+
+    It also cuts this module off from config discovery. ``ctrlrelay
+    install`` reads the active transport to learn which token variable
+    to render (#267), and ``default_config_search_paths`` walks $HOME,
+    $XDG_CONFIG_HOME, $CTRLRELAY_CONFIG and every ``config/`` directory
+    from cwd upwards. A developer box with a real orchestrator.yaml in
+    any of those would otherwise decide what these tests assert — and
+    on a Mattermost box the Telegram cases would fail for a reason that
+    has nothing to do with the code.
     """
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.delenv("CTRLRELAY_CONFIG", raising=False)
+    scratch_cwd = tmp_path / "cwd"
+    scratch_cwd.mkdir()
+    monkeypatch.chdir(scratch_cwd)
     return home
+
+
+def _write_config(path: Path, transport: dict, *, tmp_path: Path) -> Path:
+    """A minimal valid orchestrator.yaml carrying ``transport``."""
+    import yaml
+
+    config = {
+        "version": "1",
+        "node_id": "test-node",
+        "timezone": "UTC",
+        "paths": {
+            "state_db": str(tmp_path / "state.db"),
+            "worktrees": str(tmp_path / "worktrees"),
+            "bare_repos": str(tmp_path / "repos"),
+            "contexts": str(tmp_path / "contexts"),
+            "skills": str(tmp_path / "skills"),
+        },
+        "agent": {"binary": "claude"},
+        "transport": transport,
+        "dashboard": {"enabled": False},
+        "repos": [],
+    }
+    path.write_text(yaml.dump(config))
+    return path
+
+
+MATTERMOST_TRANSPORT = {
+    "type": "mattermost",
+    "mattermost": {
+        "url": "https://chat.example.com",
+        "bot_token_env": "CTRLRELAY_MATTERMOST_TOKEN",
+        "channel_id": "abcdefghijklmnopqrstuvwxyz",
+    },
+}
 
 
 @pytest.fixture
@@ -363,3 +412,363 @@ def test_the_bridge_unit_names_the_chat_bridge_not_one_provider(tmp_path) -> Non
         if u.service == "bridge"
     ]
     assert "Description=ctrlrelay chat bridge (Telegram or Mattermost)" in bridge.content
+
+
+def _systemd_env(content: str) -> dict[str, str]:
+    """The ``Environment=`` assignments systemd would read, as a dict.
+
+    Parsed rather than matched as text so a variable named in a ``#``
+    comment — which systemd ignores — cannot satisfy an assertion about
+    what the unit sets, in either direction.
+    """
+    env: dict[str, str] = {}
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped.startswith("Environment="):
+            continue
+        name, _, value = stripped[len("Environment="):].partition("=")
+        env[name] = value
+    return env
+
+
+def _plist_env(content: str) -> dict[str, str]:
+    """``EnvironmentVariables`` as launchd would read it."""
+    parsed = plistlib.loads(content.encode("utf-8"))
+    return {k: str(v) for k, v in parsed["EnvironmentVariables"].items()}
+
+
+def _plist_env_value(content: str, key: str) -> str:
+    """The value launchd would read for ``key``, by parsing the plist.
+
+    Parsed rather than grepped for two reasons. ``<string>1</string>``
+    already appears for PYTHONUNBUFFERED, so an ``in`` check would pass
+    for a plist that named the token key and gave it somebody else's
+    value — and a key sitting inside an XML comment would satisfy a text
+    match while launchd never sees it. Raises when the key is absent, so
+    a missing entry cannot read as an empty value.
+    """
+    env = _plist_env(content)
+    if key not in env:
+        raise AssertionError(
+            f"{key} is not in EnvironmentVariables; got {sorted(env)}"
+        )
+    return str(env[key])
+
+
+class TestTokenVariableFollowsTheTransport:
+    """#267: the unit carries the variable the transport names.
+
+    The installer used to hard-code ``CTRLRELAY_TELEGRAM_TOKEN`` in both
+    templates, so a Mattermost box got a unit with no token in it at all
+    and the bridge could not log in once systemd or launchd started it.
+    """
+
+    def test_systemd_units_name_the_mattermost_variable(
+        self, workdir: Path, target_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CTRLRELAY_MATTERMOST_TOKEN", "mm-token-xyz")
+        units = render_systemd(
+            workdir=workdir,
+            target_dir=target_dir,
+            token_env_var="CTRLRELAY_MATTERMOST_TOKEN",
+        )
+        for service in ("bridge", "poller"):
+            [unit] = [u for u in units if u.service == service]
+            env = _systemd_env(unit.content)
+            assert env.get("CTRLRELAY_MATTERMOST_TOKEN") == "mm-token-xyz", (
+                f"{service} unit sets {sorted(env)}"
+            )
+            # Not merely accompanied: the unit must no longer set a
+            # Telegram variable this operator never exports.
+            assert "CTRLRELAY_TELEGRAM_TOKEN" not in env
+            assert unit.unresolved == []
+
+    def test_launchd_plists_name_the_mattermost_variable(
+        self, workdir: Path, target_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CTRLRELAY_MATTERMOST_TOKEN", "mm-token-xyz")
+        units = render_launchd(
+            workdir=workdir,
+            target_dir=target_dir,
+            token_env_var="CTRLRELAY_MATTERMOST_TOKEN",
+        )
+        for unit in units:
+            value = _plist_env_value(unit.content, "CTRLRELAY_MATTERMOST_TOKEN")
+            assert value == "mm-token-xyz"
+            assert "CTRLRELAY_TELEGRAM_TOKEN" not in _plist_env(unit.content)
+            assert unit.unresolved == []
+
+    def test_unset_mattermost_token_is_flagged_under_its_own_name(
+        self, workdir: Path, target_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The operator has to be told which variable to export. Flagging
+        # CTRLRELAY_TELEGRAM_TOKEN on a Mattermost box sends them to set a
+        # variable nothing reads.
+        monkeypatch.delenv("CTRLRELAY_MATTERMOST_TOKEN", raising=False)
+        units = render_systemd(
+            workdir=workdir,
+            target_dir=target_dir,
+            token_env_var="CTRLRELAY_MATTERMOST_TOKEN",
+        )
+        for service in ("bridge", "poller"):
+            [unit] = [u for u in units if u.service == service]
+            env = _systemd_env(unit.content)
+            assert (
+                env.get("CTRLRELAY_MATTERMOST_TOKEN")
+                == "${CTRLRELAY_MATTERMOST_TOKEN}"
+            )
+            assert unit.unresolved == ["CTRLRELAY_MATTERMOST_TOKEN"]
+            assert unit.token_env_var == "CTRLRELAY_MATTERMOST_TOKEN"
+
+    def test_an_arbitrary_variable_name_is_honoured(
+        self, workdir: Path, target_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # bot_token_env is free text, not one of two known names: an
+        # operator may point either transport at any variable.
+        monkeypatch.setenv("MY_OWN_BOT_TOKEN", "house-token")
+        units = render_systemd(
+            workdir=workdir, target_dir=target_dir, token_env_var="MY_OWN_BOT_TOKEN"
+        )
+        [bridge] = [u for u in units if u.service == "bridge"]
+        assert _systemd_env(bridge.content).get("MY_OWN_BOT_TOKEN") == "house-token"
+
+    def test_telegram_is_still_the_default_and_renders_as_before(
+        self, workdir: Path, target_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CTRLRELAY_TELEGRAM_TOKEN", "abc:test-token-xyz")
+        units = render_systemd(workdir=workdir, target_dir=target_dir)
+        [bridge] = [u for u in units if u.service == "bridge"]
+        assert (
+            _systemd_env(bridge.content).get("CTRLRELAY_TELEGRAM_TOKEN")
+            == "abc:test-token-xyz"
+        )
+
+    def test_the_status_page_unit_gets_no_token_whichever_transport(
+        self, workdir: Path, target_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The web unit sends nothing, so it has no business holding a
+        # token — renaming the variable must not sneak one in.
+        monkeypatch.setenv("CTRLRELAY_MATTERMOST_TOKEN", "mm-token-xyz")
+        units = render_systemd(
+            workdir=workdir,
+            target_dir=target_dir,
+            token_env_var="CTRLRELAY_MATTERMOST_TOKEN",
+        )
+        [web] = [u for u in units if u.service == "web"]
+        assert "mm-token-xyz" not in web.content
+        assert "CTRLRELAY_MATTERMOST_TOKEN" not in _systemd_env(web.content)
+        assert web.unresolved == []
+
+
+class TestInstallCliReadsTheTransportFromConfig:
+    """The operator's route: ``ctrlrelay install`` with a config."""
+
+    def test_systemd_install_writes_the_configured_mattermost_variable(
+        self,
+        runner: CliRunner,
+        workdir: Path,
+        target_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("CTRLRELAY_MATTERMOST_TOKEN", "mm-token-xyz")
+        config = _write_config(
+            tmp_path / "orchestrator.yaml", MATTERMOST_TRANSPORT, tmp_path=tmp_path
+        )
+        result = runner.invoke(
+            app,
+            [
+                "install", "systemd",
+                "--workdir", str(workdir),
+                "--target-dir", str(target_dir),
+                "--config", str(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        for name in ("ctrlrelay-bridge.service", "ctrlrelay-poller.service"):
+            env = _systemd_env((target_dir / name).read_text())
+            assert env.get("CTRLRELAY_MATTERMOST_TOKEN") == "mm-token-xyz", (
+                f"{name} sets {sorted(env)}"
+            )
+            assert "CTRLRELAY_TELEGRAM_TOKEN" not in env
+
+    def test_launchd_install_writes_the_configured_mattermost_variable(
+        self,
+        runner: CliRunner,
+        workdir: Path,
+        target_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("CTRLRELAY_MATTERMOST_TOKEN", "mm-token-xyz")
+        config = _write_config(
+            tmp_path / "orchestrator.yaml", MATTERMOST_TRANSPORT, tmp_path=tmp_path
+        )
+        result = runner.invoke(
+            app,
+            [
+                "install", "launchd",
+                "--workdir", str(workdir),
+                "--target-dir", str(target_dir),
+                "--label-prefix", "com.test",
+                "--config", str(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        for service in ("bridge", "poller"):
+            written = (
+                target_dir / f"com.test.ctrlrelay-{service}.plist"
+            ).read_text()
+            assert (
+                _plist_env_value(written, "CTRLRELAY_MATTERMOST_TOKEN")
+                == "mm-token-xyz"
+            )
+            assert "CTRLRELAY_TELEGRAM_TOKEN" not in _plist_env(written)
+
+    def test_the_unresolved_hint_names_the_configured_variable(
+        self,
+        runner: CliRunner,
+        workdir: Path,
+        target_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("CTRLRELAY_MATTERMOST_TOKEN", raising=False)
+        config = _write_config(
+            tmp_path / "orchestrator.yaml", MATTERMOST_TRANSPORT, tmp_path=tmp_path
+        )
+        result = runner.invoke(
+            app,
+            [
+                "install", "systemd",
+                "--workdir", str(workdir),
+                "--target-dir", str(target_dir),
+                "--config", str(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        plain = " ".join(result.output.split())
+        assert "export CTRLRELAY_MATTERMOST_TOKEN" in plain
+        assert "CTRLRELAY_TELEGRAM_TOKEN" not in plain
+
+    def test_a_telegram_config_with_its_own_variable_name_is_followed(
+        self,
+        runner: CliRunner,
+        workdir: Path,
+        target_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Reading bot_token_env, not the transport type: Telegram pointed
+        # at a renamed variable has to render that name too.
+        monkeypatch.setenv("MY_TELEGRAM_TOKEN", "abc:renamed")
+        config = _write_config(
+            tmp_path / "orchestrator.yaml",
+            {
+                "type": "telegram",
+                "telegram": {
+                    "bot_token_env": "MY_TELEGRAM_TOKEN",
+                    "chat_id": 12345,
+                },
+            },
+            tmp_path=tmp_path,
+        )
+        result = runner.invoke(
+            app,
+            [
+                "install", "systemd",
+                "--workdir", str(workdir),
+                "--target-dir", str(target_dir),
+                "--config", str(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        written = (target_dir / "ctrlrelay-bridge.service").read_text()
+        assert _systemd_env(written).get("MY_TELEGRAM_TOKEN") == "abc:renamed"
+
+    def test_no_config_anywhere_keeps_the_telegram_default(
+        self,
+        runner: CliRunner,
+        workdir: Path,
+        target_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Nothing names a transport, so the historical placeholder stands
+        # and the warning tells the operator to export it.
+        monkeypatch.delenv("CTRLRELAY_TELEGRAM_TOKEN", raising=False)
+        result = runner.invoke(
+            app,
+            [
+                "install", "systemd",
+                "--workdir", str(workdir),
+                "--target-dir", str(target_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        written = (target_dir / "ctrlrelay-bridge.service").read_text()
+        assert (
+            _systemd_env(written).get("CTRLRELAY_TELEGRAM_TOKEN")
+            == "${CTRLRELAY_TELEGRAM_TOKEN}"
+        )
+
+    def test_a_config_path_that_does_not_exist_exits_nonzero(
+        self,
+        runner: CliRunner,
+        workdir: Path,
+        target_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        # Silently falling back to the Telegram default here would write a
+        # unit for a transport the operator did not ask for, on the
+        # strength of a path they got wrong.
+        result = runner.invoke(
+            app,
+            [
+                "install", "systemd",
+                "--workdir", str(workdir),
+                "--target-dir", str(target_dir),
+                "--config", str(tmp_path / "nope.yaml"),
+            ],
+        )
+        assert result.exit_code == 1
+        assert "config" in result.output.lower()
+        assert not (target_dir / "ctrlrelay-bridge.service").exists()
+
+    def test_a_file_mock_config_keeps_the_telegram_placeholder(
+        self,
+        runner: CliRunner,
+        workdir: Path,
+        target_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # file_mock has no chat token and no bridge; there is no variable
+        # to name, so the unit keeps the placeholder it has always had and
+        # the warning stands. Pinned so the choice is deliberate.
+        monkeypatch.delenv("CTRLRELAY_TELEGRAM_TOKEN", raising=False)
+        config = _write_config(
+            tmp_path / "orchestrator.yaml",
+            {
+                "type": "file_mock",
+                "file_mock": {
+                    "inbox": str(tmp_path / "inbox"),
+                    "outbox": str(tmp_path / "outbox"),
+                },
+            },
+            tmp_path=tmp_path,
+        )
+        result = runner.invoke(
+            app,
+            [
+                "install", "systemd",
+                "--workdir", str(workdir),
+                "--target-dir", str(target_dir),
+                "--config", str(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        written = (target_dir / "ctrlrelay-bridge.service").read_text()
+        assert (
+            _systemd_env(written).get("CTRLRELAY_TELEGRAM_TOKEN")
+            == "${CTRLRELAY_TELEGRAM_TOKEN}"
+        )
