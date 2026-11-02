@@ -1731,6 +1731,39 @@ class TestFetchSurvivesRewrittenBranches:
         assert self._sha(target, "refs/heads/main")
 
     @pytest.mark.asyncio
+    async def test_a_new_default_held_at_another_commit_is_not_followed(
+        self, tmp_path: Path,
+    ) -> None:
+        """A local branch named like origin's new default but at a
+        different commit (stale, or diverged) must not become HEAD."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        origin, bare = self._build_repos(tmp_path)
+        wt = WorktreeManager(
+            worktrees_dir=tmp_path / "wt", bare_repos_dir=tmp_path / "repos",
+        )
+        target = wt._get_bare_repo_path("owner/repo")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        bare.rename(target)
+        self._git("remote", "set-url", "origin", str(origin), cwd=target)
+        self._git("checkout", "-q", "-b", "trunk", "main", cwd=origin)
+        self._git("branch", "-q", "-D", "main", cwd=origin)
+
+        real = wt._run_git
+
+        async def run_git(*args, **kwargs):
+            out = await real(*args, **kwargs)
+            if args[:2] == ("ls-remote", "--symref"):
+                # origin reports trunk at a commit this clone does not hold.
+                out = "ref: refs/heads/trunk\tHEAD\n" + "f" * 40 + "\tHEAD\n"
+            return out
+
+        wt._run_git = run_git
+        await wt.ensure_bare_repo("owner/repo")
+
+        assert await wt.get_default_branch("owner/repo") == "main"
+
+    @pytest.mark.asyncio
     async def test_real_errors_still_raise(self, tmp_path: Path) -> None:
         """Failing open would turn an unreachable remote into a silent
         no-op and run pipelines against a stale tree."""
