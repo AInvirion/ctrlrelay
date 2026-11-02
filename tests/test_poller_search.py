@@ -256,6 +256,13 @@ class TestRoundTwoFixes:
                  label_by="ALICE")
         poller = _poller(gh, tmp_path, ["o/a"], include_labels_by_repo={"o/a": ["go"]})
         assert [x["issue"]["number"] for x in await poller.poll()] == [1]
+        # And the other way round: configured with capitals, reported without.
+        gh2 = _gh({}, {"go": {"o/a": [_issue(1, labels=["go"], assignees=())]}},
+                  label_by="alice")
+        upper = IssuePoller(github=gh2, username="ALICE", repos=["o/a"],
+                            state_file=tmp_path / "s2.json",
+                            include_labels_by_repo={"o/a": ["go"]})
+        assert [x["issue"]["number"] for x in await upper.poll()] == [1]
 
     @pytest.mark.asyncio
     async def test_many_owners_split_into_few_short_queries(self) -> None:
