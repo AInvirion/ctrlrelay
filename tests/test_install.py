@@ -426,8 +426,21 @@ def _systemd_env(content: str) -> dict[str, str]:
         stripped = line.strip()
         if stripped.startswith("#") or not stripped.startswith("Environment="):
             continue
-        name, _, value = stripped[len("Environment="):].partition("=")
-        env[name] = value
+        assignment = stripped[len("Environment="):]
+        if len(assignment) >= 2 and assignment[0] == assignment[-1] == '"':
+            # A quoted assignment: \\ and \" are escapes, %% is a literal %.
+            inner = assignment[1:-1]
+            out, i = [], 0
+            while i < len(inner):
+                if inner[i] == "\\" and i + 1 < len(inner):
+                    out.append(inner[i + 1])
+                    i += 2
+                else:
+                    out.append(inner[i])
+                    i += 1
+            assignment = "".join(out)
+        name, _, value = assignment.partition("=")
+        env[name] = value.replace("%%", "%")
     return env
 
 
@@ -772,3 +785,62 @@ class TestInstallCliReadsTheTransportFromConfig:
             _systemd_env(written).get("CTRLRELAY_TELEGRAM_TOKEN")
             == "${CTRLRELAY_TELEGRAM_TOKEN}"
         )
+
+
+class TestTokenIsWrittenSafely:
+    """Review fixes on #267: the token cannot break out of a unit file, a
+    missing one is reported by name, and the secret is never echoed."""
+
+    def test_systemd_quotes_and_escapes_the_token(self, tmp_path, monkeypatch) -> None:
+        from ctrlrelay.install import render_systemd
+
+        monkeypatch.setenv("MY_TOKEN", 'a"b\\c%d e')
+        [bridge] = [u for u in render_systemd(workdir=tmp_path, target_dir=tmp_path,
+                                              token_env_var="MY_TOKEN") if u.service == "bridge"]
+        assert 'Environment="MY_TOKEN=a\\"b\\\\c%%d e"' in bridge.content
+        assert _systemd_env(bridge.content)["MY_TOKEN"] == 'a"b\\c%d e'
+        assert bridge.unresolved == []
+
+    def test_launchd_xml_escapes_the_token(self, tmp_path, monkeypatch) -> None:
+        import plistlib
+
+        from ctrlrelay.install import render_launchd
+
+        monkeypatch.setenv("MY_TOKEN", "a&b<c>d")
+        [bridge] = [u for u in render_launchd(workdir=tmp_path, target_dir=tmp_path,
+                                              token_env_var="MY_TOKEN") if u.service == "bridge"]
+        env = plistlib.loads(bridge.content.encode())["EnvironmentVariables"]
+        assert env["MY_TOKEN"] == "a&b<c>d"
+
+    @pytest.mark.parametrize("bad", ["a\nExecStart=/bin/evil", "a\rb"])
+    def test_a_token_with_a_line_break_is_refused(self, tmp_path, monkeypatch, bad) -> None:
+        from ctrlrelay.install import render_systemd
+
+        monkeypatch.setenv("MY_TOKEN", bad)
+        with pytest.raises(ValueError, match="line break"):
+            render_systemd(workdir=tmp_path, target_dir=tmp_path, token_env_var="MY_TOKEN")
+
+    @pytest.mark.parametrize("bad", ["MY TOKEN", "1TOKEN", "A=B", "A}B"])
+    def test_a_variable_name_that_is_not_one_is_refused(self, tmp_path, bad) -> None:
+        from ctrlrelay.install import render_systemd
+
+        with pytest.raises(ValueError, match="not an environment variable"):
+            render_systemd(workdir=tmp_path, target_dir=tmp_path, token_env_var=bad)
+
+    def test_a_missing_lower_case_token_is_reported_by_name(self, tmp_path, monkeypatch) -> None:
+        from ctrlrelay.install import render_systemd
+
+        monkeypatch.delenv("my_bot_token", raising=False)
+        units = render_systemd(workdir=tmp_path, target_dir=tmp_path,
+                               token_env_var="my_bot_token")
+        [bridge] = [u for u in units if u.service == "bridge"]
+        assert "my_bot_token" in bridge.unresolved
+
+    def test_a_token_that_looks_like_a_placeholder_is_not_reported_or_echoed(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        from ctrlrelay.install import render_systemd
+
+        monkeypatch.setenv("MY_TOKEN", "${SECRET}")
+        units = render_systemd(workdir=tmp_path, target_dir=tmp_path, token_env_var="MY_TOKEN")
+        assert all("SECRET" not in u.unresolved for u in units)

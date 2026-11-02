@@ -891,6 +891,7 @@ class TestSetupCli:
         # bot_token_env is the Mattermost variable, so a unit setting the
         # Telegram one is setting something the bridge never looks at.
         assert "Environment=CTRLRELAY_TELEGRAM_TOKEN" not in text
+        assert 'Environment="CTRLRELAY_TELEGRAM_TOKEN' not in text
         assert "<key>CTRLRELAY_TELEGRAM_TOKEN</key>" not in text
 
     def test_clone_failure_surfaces_nonzero_exit_even_with_daemons(

@@ -31,6 +31,7 @@ if TYPE_CHECKING:  # import cost: the CLI defers config loading too
     from ctrlrelay.core.config import Config
 
 _TEMPLATE_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # The variable the bridge and poller read their chat token from when
 # nothing names one. It is the Telegram default from ``TelegramConfig``,
@@ -122,6 +123,13 @@ def _build_substitution_values(
     }
     # The templates name the token variable twice over: ``TOKEN_ENV_VAR``
     # is the name the unit sets, ``TOKEN_ENV_VALUE`` is what it sets it to.
+    # The name is free text in the config, so it must be a plain variable
+    # name before it goes into a unit file.
+    if not _ENV_NAME_RE.fullmatch(token_env_var):
+        raise ValueError(
+            f"bot_token_env {token_env_var!r} is not an environment variable "
+            "name (letters, digits and _, not starting with a digit)"
+        )
     values["TOKEN_ENV_VAR"] = token_env_var
     # Pass through the bot token from the current environment if the
     # operator has it exported at install time. Without it, the value
@@ -133,6 +141,42 @@ def _build_substitution_values(
     token = os.environ.get(token_env_var)
     values["TOKEN_ENV_VALUE"] = token if token else "${" + token_env_var + "}"
     return values
+
+
+def _token_value_for(platform: str, token: str | None, name: str) -> str:
+    """The token as it may be written into a unit of ``platform``, or a
+    ``${NAME}`` placeholder when there is none (the caller reports it)."""
+    if not token:
+        return "${" + name + "}"
+    if any(c in token for c in "\r\n\x00"):
+        raise ValueError(
+            f"${name} contains a line break or NUL, which no unit file can carry"
+        )
+    if platform == "launchd":
+        from xml.sax.saxutils import escape
+
+        return escape(token)
+    # systemd: the template quotes the whole assignment; inside it a
+    # backslash and a double quote are escaped, and % is a specifier.
+    return token.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+
+
+def _render(raw: str, values: dict[str, str], platform: str) -> tuple[str, list[str]]:
+    """``raw`` rendered, and what it left unresolved. The token goes in
+    escaped for ``platform``; whether it is missing is known directly, never
+    read back out of the rendered text, which would echo a token that
+    happens to look like ``${...}`` and miss a lower-case variable name."""
+    name = values["TOKEN_ENV_VAR"]
+    token = os.environ.get(name)
+    unresolved = _missing_vars(
+        _substitute(raw, {**values, "TOKEN_ENV_VALUE": "token"}),
+    )
+    if not token and "${TOKEN_ENV_VALUE}" in raw:
+        unresolved = sorted(set(unresolved) | {name})
+    rendered = _substitute(
+        raw, {**values, "TOKEN_ENV_VALUE": _token_value_for(platform, token, name)},
+    )
+    return rendered, unresolved
 
 
 def render_launchd(
@@ -166,7 +210,7 @@ def render_launchd(
     units: list[RenderedUnit] = []
     for service in ("bridge", "poller"):
         raw = _read_template("launchd", f"{service}.plist.template")
-        rendered = _substitute(raw, values)
+        rendered, unresolved = _render(raw, values, "launchd")
         target = target_dir / f"{label_prefix}.ctrlrelay-{service}.plist"
         units.append(
             RenderedUnit(
@@ -174,7 +218,7 @@ def render_launchd(
                 service=service,
                 content=rendered,
                 target_path=target,
-                unresolved=_missing_vars(rendered),
+                unresolved=unresolved,
                 token_env_var=token_env_var,
             )
         )
@@ -214,7 +258,7 @@ def render_systemd(
     units: list[RenderedUnit] = []
     for service in ("bridge", "poller", "web"):
         raw = _read_template("systemd", f"{service}.service.template")
-        rendered = _substitute(raw, values)
+        rendered, unresolved = _render(raw, values, "systemd")
         target = target_dir / f"ctrlrelay-{service}.service"
         units.append(
             RenderedUnit(
@@ -222,7 +266,7 @@ def render_systemd(
                 service=service,
                 content=rendered,
                 target_path=target,
-                unresolved=_missing_vars(rendered),
+                unresolved=unresolved,
                 token_env_var=token_env_var,
             )
         )

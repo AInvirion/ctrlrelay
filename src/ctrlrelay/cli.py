@@ -5491,6 +5491,11 @@ def _install_token_env_var(config_path: str | None) -> str:
         try:
             path = resolve_config_path(None)
         except ConfigError:
+            console.print(
+                f"[yellow]No orchestrator.yaml found, so nothing names the chat "
+                f"transport: the units carry ${DEFAULT_TOKEN_ENV_VAR}. Pass "
+                "--config to use your transport's token variable.[/yellow]"
+            )
             return DEFAULT_TOKEN_ENV_VAR
     else:
         path = resolve_config_path(config_path)

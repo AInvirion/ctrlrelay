@@ -11,7 +11,7 @@ WorkingDirectory=${WORKDIR}
 # variable in the installing shell's environment. Naming one
 # provider's variable here gave every other transport a unit with no
 # usable token in it, so the bridge could not log in (#267).
-Environment=${TOKEN_ENV_VAR}=${TOKEN_ENV_VALUE}
+Environment="${TOKEN_ENV_VAR}=${TOKEN_ENV_VALUE}"
 # Without PYTHONUNBUFFERED, ctrlrelay's stdout sits in Python's stdio
 # buffer instead of flushing line-by-line, making `tail -f` and
 # `journalctl -f` lag noticeably.
