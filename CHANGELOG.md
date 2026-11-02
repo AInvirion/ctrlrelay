@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A third agent backend: `agent.type: "opencode"` runs sessions through
+  `opencode run --format json --auto`, which can target a self-hosted
+  OpenAI-compatible endpoint (ollama, llama.cpp, LM Studio, MLX) and so lets
+  the dev pipeline run on a local model instead of a hosted API. The endpoint,
+  its credential and the model list stay in opencode's own config; ctrlrelay
+  names the model with `agent.opencode.model` (`provider/model`) and the
+  binary with `agent.opencode.binary` — its own block, because `agent.binary`
+  is claude's and most configs set it to the literal `"claude"`.
+- `repos[].agent_type` opts a single repository into another backend, with
+  `agent.type` the default for every other one. Per repo rather than global on
+  purpose: ctrlrelay works unattended over issue and pull-request text from
+  many repositories and opens pull requests, so a weaker model behind the
+  whole daemon would produce bad pull requests at machine speed with nobody
+  watching. An unroutable session goes to the default backend, never to the
+  opt-in one, and repo names match case-insensitively. A value no adapter
+  answers to stops the daemon at startup naming the repository, the same way
+  an unknown `agent.type` already did (closes #286)
+
+### Changed
+
+- The subprocess machinery every CLI-driven adapter shares — the timeout, the
+  kill on cancel, the replacing decode, the checkpoint read and #204's outcome
+  report on every exit path — moved from `ClaudeDispatcher` to a
+  `CliAgentAdapter` base both adapters inherit. A second copy of it is how the
+  next backend gets dispatch failures that nothing counts.
+- `ctrlrelay node check` skips its agent-login row, and says why, when the
+  global `agent.type` is not `claude`. That check is a `claude -p` call reading
+  the claude subscription, so on another backend it reported a failed login
+  against a CLI the deployment does not use.
+
+### Known limits
+
+- The `opencode` backend writes no usage reading. A self-hosted model has no
+  subscription window, and recording "unknown" after every run would erase a
+  reading the claude backend holds and un-pause a machine that is at its limit.
+- `agent.sandbox: "bwrap"` is **refused**, not ignored, alongside an `opencode`
+  backend: that confinement binds `~/.claude/*` writable and copies
+  `~/.claude.json`, so it is written for one CLI. Running unconfined under a
+  config that says otherwise would be worse than a daemon that will not start.
+  Credential stripping (#219) applies to every backend either way.
+- Whether a given local model can drive the pipeline is a separate question
+  from whether the adapter is correct, and this change does not answer it.
+  Measured on an M1 Max on 2026-11-01: `qwen2.5-coder:32b-instruct-q4_K_M`
+  emitted **no tool calls at all** (0/3) while advertising `tools` in its
+  metadata, and `qwen3-coder:30b` emitted them (3/3). ctrlrelay's agents signal
+  DONE / BLOCKED / FAILED by running a shell command that writes the checkpoint
+  file, so a model that cannot call tools cannot finish a session. A declared
+  capability is not evidence; only a live call is.
+
 ## [0.17.1] - 2026-11-01
 
 ### Fixed

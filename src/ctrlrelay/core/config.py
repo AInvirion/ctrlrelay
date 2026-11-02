@@ -74,16 +74,47 @@ class PathsConfig(BaseModel):
         return v
 
 
+class OpenCodeConfig(BaseModel):
+    """Knobs for the ``opencode`` backend (#286).
+
+    Its own block rather than reuse of ``agent.binary`` and
+    ``agent.default_timeout_seconds``: those are claude's, and most
+    deployed configs set ``agent.binary`` to the literal ``"claude"``.
+    Reading that field for a second backend would exec ``claude`` with
+    ``opencode``'s argv, and the failure would be blamed on the model.
+
+    ``model`` is ``provider/model`` as opencode spells it, e.g.
+    ``local/qwen3-coder:30b`` where ``local`` is a provider in
+    ``opencode.json`` whose ``baseURL`` points at a self-hosted
+    OpenAI-compatible endpoint. Leaving it unset is the sensible
+    default: the endpoint, the credential and the model list live in
+    opencode's own config, not here.
+    """
+
+    binary: str = "opencode"
+    model: str | None = None
+    # ``None`` falls back to ``agent.default_timeout_seconds``. A local
+    # model is usually slower per token than a hosted one, so this is
+    # here to be raised — see the throughput figures on #286.
+    default_timeout_seconds: int | None = Field(default=None, ge=1)
+
+
 class AgentConfig(BaseModel):
     """Headless coding-agent configuration.
 
     ``type`` selects which adapter the dispatcher uses to talk to the
-    agent CLI. Today only ``claude`` is implemented; the field exists
-    so future adapters (e.g. ``codex``, ``opencode``, ``hermes``) can
-    be plugged in without a config schema change. The other fields
-    (``binary``, ``default_timeout_seconds``, ``output_format``) are
-    common across most CLI-driven agents; adapters that need agent-
-    specific knobs can add a nested sub-model later.
+    agent CLI. ``claude`` and ``opencode`` are implemented; the field
+    exists so further adapters (e.g. ``codex``, ``hermes``) can be
+    plugged in without a config schema change. The common fields
+    (``binary``, ``default_timeout_seconds``, ``output_format``) belong
+    to the ``claude`` adapter and predate there being a second one; a
+    backend with its own knobs gets its own nested block, as
+    ``opencode`` does below.
+
+    ``type`` is the default for every repo. A single repo can opt into
+    another backend with ``repos[].agent_type`` — see
+    :class:`RepoConfig` — which is how #286 is scoped: ``claude``
+    everywhere unless a repo says otherwise.
     """
 
     type: str = "claude"
@@ -111,6 +142,9 @@ class AgentConfig(BaseModel):
         default_factory=lambda: list(DEFAULT_SANDBOX_READONLY_PATHS)
     )
     sandbox_cache_dir: str = DEFAULT_SANDBOX_CACHE_DIR
+    # Read only when a backend of this type is built, so it is inert on
+    # a claude-only deployment and harmless to leave in a config file.
+    opencode: OpenCodeConfig = Field(default_factory=OpenCodeConfig)
 
 
 # Backwards-compat alias. Older code and docs reference ``ClaudeConfig``;
@@ -466,6 +500,17 @@ class RepoConfig(BaseModel):
     deploy: DeployConfig | None = None
     code_review: CodeReviewConfig = Field(default_factory=CodeReviewConfig)
     dev_branch_template: str = "fix/issue-{n}"
+    # Which agent backend runs this repo's sessions (#286). ``None``
+    # means ``agent.type``, which is where every repo was before this
+    # existed and where every repo stays unless it says otherwise.
+    #
+    # Opt-in per repo on purpose. ctrlrelay runs unattended over issue
+    # and pull-request text from many repositories and opens pull
+    # requests, so a weaker model behind the whole daemon produces bad
+    # pull requests at machine speed with nobody watching. A value no
+    # adapter answers to stops the daemon at startup naming this repo,
+    # rather than quietly leaving it on the default.
+    agent_type: str | None = None
 
     @field_validator("name")
     @classmethod

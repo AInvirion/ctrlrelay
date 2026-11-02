@@ -70,6 +70,121 @@ paths:
 | `repo_root` | path | no | Convention root for repo clones. When set, `repos[].local_path` may be omitted and is derived as `${repo_root}/${owner.lower()}/${repo}` (since v0.4.0). Without `repo_root`, every repo entry must declare its own `local_path` (legacy behaviour). |
 | `owner_aliases` | object | no | **Deprecated since v0.4.0.** Pre-0.4.0 this remapped the on-disk folder name (e.g. `SemClone` -> `SEMCL.ONE`). The path resolver now always uses `owner.lower()`, so aliases are no longer consulted. Parsing is retained so 0.3.x configs still load; a `DeprecationWarning` is emitted when a non-empty mapping is supplied. To silence: drop the `owner_aliases` block, rename your on-disk folder to match `owner.lower()`, or set a per-repo `local_path` override for any that genuinely deviate. |
 
+## agent backends
+
+`agent.type` picks the adapter ctrlrelay uses to talk to a coding-agent
+CLI. Two are implemented:
+
+| `agent.type` | CLI it runs | notes |
+|---|---|---|
+| `claude` (default) | `claude -p --output-format stream-json --verbose --dangerously-skip-permissions` | Reads the subscription usage; supports `sandbox: "bwrap"`. |
+| `opencode` | `opencode run --format json --auto` | Can target a self-hosted OpenAI-compatible endpoint. No usage reading; no bwrap yet. |
+
+Anything else raises at startup with a message naming the type. That is
+deliberate: a typo must stop the daemon rather than silently fall back
+to claude.
+
+### Per-repo opt-in
+
+`agent.type` is the default for every repo. A single repo opts into
+another backend with `repos[].agent_type`:
+
+```yaml
+agent:
+  type: "claude"          # everything, unless a repo says otherwise
+  opencode:
+    model: "local/qwen3-coder:30b"
+
+repos:
+  - name: "your-org/important-service"      # claude
+  - name: "your-org/scratchpad"
+    agent_type: "opencode"                  # the local model
+```
+
+Per repo rather than globally, on purpose. ctrlrelay runs unattended
+over issue and pull-request text from many repositories and opens pull
+requests. A weaker model behind the whole daemon produces bad pull
+requests at machine speed with nobody watching, so the shape that is
+safe is claude everywhere plus an explicit opt-in for low-stakes work.
+
+Repo names are matched case-insensitively — GitHub treats `owner/repo`
+that way and the config, an issue payload and `gh` output do not
+reliably agree on the case.
+
+### agent.opencode
+
+```yaml
+agent:
+  type: "claude"
+  opencode:
+    binary: "opencode"
+    model: "local/qwen3-coder:30b"
+    default_timeout_seconds: 3600
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `binary` | string | `"opencode"` | The `opencode` executable. The bare name is resolved like every other tool (PATH, then `~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`), which matters under systemd where the unit's PATH is minimal. An absolute or relative path is used exactly as written. |
+| `model` | string | `null` | `provider/model` as opencode spells it, passed as `--model`. Unset leaves the choice to opencode's own config, which is usually right. |
+| `default_timeout_seconds` | int | `null` | Falls back to `agent.default_timeout_seconds`. A local model is usually slower per token than a hosted one. |
+
+This block is its own rather than a reuse of `agent.binary`: that field
+is claude's, most deployed configs set it to the literal `"claude"`, and
+a second backend reading it would exec `claude` with `opencode`'s
+arguments — a failure that looks like the model's fault.
+
+**The endpoint is configured in opencode, not here.** Point a provider
+at your self-hosted OpenAI-compatible server in
+`~/.config/opencode/opencode.json`:
+
+```json
+{
+  "provider": {
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:11434/v1" },
+      "models": { "qwen3-coder:30b": {} }
+    }
+  }
+}
+```
+
+and name it here as `local/qwen3-coder:30b`. The credential, if the
+endpoint needs one, lives there too.
+
+### What `opencode` does not do yet
+
+- **No usage reading.** A self-hosted model has no subscription window.
+  The adapter writes nothing to `usage.json` — not even "unknown" —
+  because marking it unknown after every run would erase a reading the
+  claude backend legitimately holds and un-pause a machine that is
+  genuinely at its limit. On a deployment with no claude backend at all,
+  `usage` stays empty and the idle probe does not run.
+- **No `sandbox: "bwrap"`.** The confinement binds `~/.claude/*`
+  writable and copies `~/.claude.json`: it is written for one CLI.
+  Combining `agent.sandbox: "bwrap"` with an `opencode` backend is
+  **refused at startup** rather than silently run unconfined. Set
+  `agent.sandbox: "none"` to use it. Credential stripping (#219) applies
+  to every backend either way.
+- **`ctrlrelay node check` skips the agent-login row** when the global
+  `agent.type` is not `claude`, because that check is a `claude` call
+  reading the claude subscription. Verify the other backend by running
+  its CLI once by hand. A *per-repo* `agent_type` does not skip the row.
+
+### Picking a model for `opencode`
+
+One result worth knowing before you choose, measured on an M1 Max on
+2026-11-01: **a model can advertise tool support and emit no tool calls
+at all.** `qwen2.5-coder:32b-instruct-q4_K_M` scored 0/3 on tool calling
+while declaring `tools` in its metadata and shipping a tool-aware
+template; `qwen3-coder:30b` scored 3/3.
+
+That matters more here than it looks. ctrlrelay's agents signal `DONE`,
+`BLOCKED_NEEDS_INPUT` and `FAILED` by **running a shell command that
+writes the checkpoint file** — so a model that cannot call tools cannot
+finish a session at all, however good its prose is. Test with a live
+call; a declared capability is not evidence.
+
 ## claude
 
 Controls how ctrlrelay invokes the `claude` CLI.
@@ -537,6 +652,7 @@ repos:
 | `name` | string | **yes** | — | GitHub `owner/repo` slug. Used for `gh` calls and bare-repo / worktree naming. |
 | `local_path` | path | conditional | derived | Where the repo is checked out on disk for human use. Optional when `paths.repo_root` is set (then derived as `${repo_root}/${owner.lower()}/${repo}`, since v0.4.0); required otherwise. An explicit value always wins as override. ctrlrelay itself uses bare mirrors under `paths.bare_repos`. |
 | `dev_branch_template` | string | no | `"fix/issue-{n}"` | Branch-name template for dev-pipeline runs. `{n}` is replaced by the issue number. |
+| `agent_type` | string | no | `null` | Which agent backend runs this repo's sessions. `null` means `agent.type`. See [agent backends](#agent-backends). A value no adapter answers to stops the daemon at startup, naming this repo. |
 | `automation` | object | no | (defaults) | See [automation](#repos-automation). |
 | `code_review` | object | no | (defaults) | Review run over an agent branch before its PR is handed over. See [code_review](#code_review). |
 | `deploy` | object | no | `null` | Reserved for deploy policy. Currently surfaced in `ctrlrelay config repos` but otherwise inert. |

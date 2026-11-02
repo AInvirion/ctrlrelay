@@ -137,9 +137,20 @@ async def run_checks(
     github_login: Callable[[], Awaitable[str]],
     agent_probe: Callable[[], Awaitable[Any]] | None,
     fetch: Callable[..., dict[str, Any]],
+    agent_skip_reason: str | None = None,
 ) -> list[Check]:
     """Each setup check, in order. ``agent_probe`` is ``None`` to skip the
-    agent check, which spends one tiny call on the subscription."""
+    agent check, which spends one tiny call on the subscription.
+
+    ``agent_skip_reason`` is what the skipped row says. It defaults to
+    ``--no-agent`` because that was the only reason to skip until #286
+    added a second one: the probe reads the CLAUDE subscription, so on
+    a deployment whose ``agent.type`` is another backend there is no
+    subscription to read. Reporting that as "skipped (--no-agent)"
+    would send an operator looking for a flag they did not pass;
+    reporting it as a FAILED agent login would send them to log in to
+    a CLI the deployment does not use.
+    """
     checks = [Check("node_id", True, f"{config.node_id} (named on claims, chat and the page)")]
 
     try:
@@ -154,7 +165,10 @@ async def run_checks(
         ))
 
     if agent_probe is None:
-        checks.append(Check("agent login", None, "skipped (--no-agent)"))
+        checks.append(Check(
+            "agent login", None,
+            agent_skip_reason or "skipped (--no-agent)",
+        ))
     else:
         started = time.monotonic()
         try:
