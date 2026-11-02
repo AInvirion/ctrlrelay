@@ -15,8 +15,15 @@
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>CTRLRELAY_TELEGRAM_TOKEN</key>
-        <string>${CTRLRELAY_TELEGRAM_TOKEN}</string>
+        <!-- The chat token. Both the key and its value are
+             substituted at install time: the key is whatever the
+             active transport's bot_token_env setting says, the value
+             comes from that variable in the installing shell's
+             environment. Naming one provider's variable here gave
+             every other transport a plist with no usable token in it,
+             so the bridge could not log in (#267). -->
+        <key>${TOKEN_ENV_VAR}</key>
+        <string>${TOKEN_ENV_VALUE}</string>
         <!-- ~/.local/bin first: uv tool and pipx put shims there,
              and a launchd job does not read ~/.bashrc. Omitting
              it is #197 on this platform too. NOT claimed to cover
