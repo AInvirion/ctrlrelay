@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Updating a repository's clone no longer deletes local branches GitHub does
+  not have. The fetch paired `--prune` with `refs/heads/*:refs/heads/*`, which
+  tells git to delete every local branch missing from origin: a branch made in
+  the clone went with `- [deleted]  (none)  -> held`, worktree and all. A
+  blocked session whose branch was never pushed therefore lost it the next
+  time any run touched that repo, leaving its commits reachable only from the
+  worktree's HEAD and one `git gc` from gone. The fetch is now two: the
+  `dependabot/*` branches, which never carry local work and are the refs that
+  actually pile up, are still pruned; every other branch is fetched without
+  `--prune`. The cost is that a branch GitHub deleted now lingers in the
+  clone, since a prune cannot tell it from one GitHub never had — the
+  branch-reuse path already recognises a local-only ref and decides whether
+  its commits are merged (#243).
+
 ## [0.16.4] - 2026-11-01
 
 Fixes for runs whose work could not be published. **No config edit is
