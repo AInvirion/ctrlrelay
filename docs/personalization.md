@@ -224,10 +224,14 @@ schedules:
 The poller registers an APScheduler job that runs `personalization pull`
 on this schedule. Two safety rails:
 
-- **Skip-on-dirty.** If the working tree has uncommitted changes, the
-  auto-pull skips with a `working tree dirty` summary. A daemon
-  rebasing under your unsaved edits is exactly the surprise we don't
-  want.
+- **Refuse-on-dirty, loudly.** If the working tree has uncommitted
+  changes, the auto-pull does not rebase (a daemon rebasing under your
+  unsaved edits is exactly the surprise we don't want) but it is **not**
+  a quiet success: the run fails, is logged at error level as
+  `auto-pull BLOCKED: working tree dirty (...)`, and names the dirty
+  entries. It still fetches, so the line carries `behind N`.
+  Every run reports `behind N`; a machine drifting is a number in the
+  log, not silence (#287: one machine sat 36 commits behind for weeks).
 - **No adoption.** Adoption is an init-time concern. The auto-pull
   re-wire phase runs with `adopt=False` so a background sync never
   silently moves files. New entries in `paths` that have no remote
@@ -293,9 +297,31 @@ unrelated, project-scoped feature.
 A write to `~/.claude/CLAUDE.md` is a write to
 `~/.ctrlrelay/personalization/global/CLAUDE.md`. After editing, run
 `ctrlrelay personalization push`. If you forget, the auto-pull's
-skip-on-dirty rail keeps things safe — the daemon won't rebase under
-your unsaved work — but your edit doesn't reach other machines until
-you push.
+refuse-on-dirty rail keeps things safe — the daemon won't rebase under
+your unsaved work and says so at error level — but your edit doesn't
+reach other machines until you push.
+
+### Files an app rewrites in place (`settings.json`)
+
+If a target such as `~/.claude/settings.json` is a symlink into the
+checkout, the app that owns it writes straight into a tracked file: any
+per-viewer preference it records (and a mere key reordering on rewrite)
+dirties the tree and blocks every later pull. **Decision:** do not
+commit app-written keys, and do not reset the file on a loop (the app
+rewrites it). Keep the synced file to fleet policy only (`model`,
+`outputStyle`, `hooks`, ...) and leave per-machine keys in
+`settings.local.json`, which is never synced. A machine whose live file
+carries keys the synced one lacks should keep a real file instead of the
+symlink. Until a machine is converged this way, the `BLOCKED` line above
+is the signal that it is stuck.
+
+### Git identity
+
+`push` pre-flights the author identity before staging: it falls back to a
+repo-local `ctrlrelay <ctrlrelay@local>` when none is configured, then
+asks git (`git var GIT_AUTHOR_IDENT`) and refuses with
+`git identity unresolvable` if it still cannot commit, rather than
+leaving a dirty tree behind.
 
 ### Allowlist enforcement
 

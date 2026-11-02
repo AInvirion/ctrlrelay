@@ -1516,7 +1516,7 @@ class TestAutoPull:
         assert "skipped" not in result.summary.lower()
         assert (b_checkout / "global" / "CLAUDE.md").read_text() == "from-a\n"
 
-    def test_auto_pull_skips_on_dirty_tree(
+    def test_auto_pull_blocks_loudly_on_dirty_tree(
         self, tmp_path: Path, remote_bare: Path
     ) -> None:
         a_checkout = tmp_path / "a" / "personalization"
@@ -1531,12 +1531,78 @@ class TestAutoPull:
         # Auto-pull MUST skip — rebase under operator edits is the
         # behavior we're explicitly trying to avoid.
         result = a_mgr.auto_pull()
-        assert result.success
-        assert "skipped" in result.summary.lower()
+        assert not result.success  # a sync that cannot run is a failure (#287)
+        assert "blocked" in result.summary.lower()
+        assert "behind 0" in result.summary
+        assert result.dirty_entries
         # Edit preserved.
         assert (
             a_checkout / "global" / "CLAUDE.md"
         ).read_text() == "uncommitted edit\n"
+
+    def test_dirty_tree_reports_how_far_behind(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        a_checkout = tmp_path / "a" / "personalization"
+        b_checkout = tmp_path / "b" / "personalization"
+        a_mgr = PersonalizationManager(_config_for(a_checkout, remote_bare, node_id="a"))
+        b_mgr = PersonalizationManager(_config_for(b_checkout, remote_bare, node_id="b"))
+        _patch_remote_url(a_mgr, str(remote_bare))
+        _patch_remote_url(b_mgr, str(remote_bare))
+        a_mgr.init()
+        b_mgr.init()
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "CLAUDE.md").write_text("from-a\n")
+        a_mgr.push(message="from-a")
+        (b_checkout / "stray.txt").write_text("dirty\n")
+
+        result = b_mgr.auto_pull()
+        assert not result.success
+        assert result.behind == 1
+        assert "behind 1" in result.summary
+        assert "stray.txt" in result.summary
+
+    def test_clean_pull_reports_behind(
+        self, tmp_path: Path, remote_bare: Path
+    ) -> None:
+        a_checkout = tmp_path / "a" / "personalization"
+        b_checkout = tmp_path / "b" / "personalization"
+        a_mgr = PersonalizationManager(_config_for(a_checkout, remote_bare, node_id="a"))
+        b_mgr = PersonalizationManager(_config_for(b_checkout, remote_bare, node_id="b"))
+        _patch_remote_url(a_mgr, str(remote_bare))
+        _patch_remote_url(b_mgr, str(remote_bare))
+        a_mgr.init()
+        b_mgr.init()
+        (a_checkout / "global").mkdir()
+        (a_checkout / "global" / "CLAUDE.md").write_text("from-a\n")
+        a_mgr.push(message="from-a")
+
+        result = b_mgr.auto_pull()
+        assert result.success
+        assert result.behind == 1
+        assert "behind 1" in result.summary
+
+    def test_unresolvable_identity_refuses_by_name(
+        self, tmp_path: Path, remote_bare: Path, monkeypatch
+    ) -> None:
+        """Negative control: with no resolvable identity the run must be
+        red and named, not quiet."""
+        a_checkout = tmp_path / "a" / "personalization"
+        a_mgr = PersonalizationManager(_config_for(a_checkout, remote_bare, node_id="a"))
+        _patch_remote_url(a_mgr, str(remote_bare))
+        a_mgr.init()
+        real = a_mgr._git_capturing
+
+        def fake(*args, check=True):
+            if args[:1] == ("var",):
+                return subprocess.CompletedProcess(
+                    args, 128, "", "fatal: unable to auto-detect email address"
+                )
+            return real(*args, check=check)
+
+        monkeypatch.setattr(a_mgr, "_git_capturing", fake)
+        with pytest.raises(PersonalizationError, match="identity unresolvable"):
+            a_mgr._ensure_local_identity()
 
     def test_auto_pull_no_checkout_returns_benign(
         self, tmp_path: Path, remote_bare: Path
