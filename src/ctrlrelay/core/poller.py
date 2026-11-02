@@ -109,6 +109,10 @@ class _Intake:
             raise found
         return list((found or {}).get(repo, []))
 
+    def failed_labels(self) -> list[str]:
+        """The trigger labels whose search failed this time."""
+        return sorted(k for k, v in self._labeled.items() if isinstance(v, BaseException))
+
     def has_candidates(
         self, repo: str, labels: list[str], fresh: Callable[[int], bool],
     ) -> bool:
@@ -730,7 +734,9 @@ class IssuePoller:
             added_by[wanted] = (
                 (matching[-1].get("actor") or {}).get("login") if matching else None
             )
-        if self.username in added_by.values():
+        # GitHub logins are not case-sensitive.
+        me = self.username.lower()
+        if any(isinstance(v, str) and v.lower() == me for v in added_by.values()):
             return True
         log_event(
             _logger, "poll.issue.foreign_label", repo=repo,
@@ -798,7 +804,8 @@ class IssuePoller:
         # than skip past it. One before it is overtaken and does not count.
         last_mine = max(
             (i for i, e in enumerate(events)
-             if (e.get("assignee") or {}).get("login") == self.username),
+             if str((e.get("assignee") or {}).get("login") or "").lower()
+             == self.username.lower()),
             default=-1,
         )
         if any(not (e.get("assignee") or {}).get("login")
@@ -815,7 +822,8 @@ class IssuePoller:
         relevant = [
             e
             for e in events
-            if (e.get("assignee") or {}).get("login") == self.username
+            if str((e.get("assignee") or {}).get("login") or "").lower()
+            == self.username.lower()
         ]
         if not relevant:
             log_event(
@@ -835,7 +843,7 @@ class IssuePoller:
         # ``assigner`` is treated as foreign.
         latest = relevant[-1]
         assigner_login = (latest.get("assigner") or {}).get("login")
-        if assigner_login == self.username:
+        if isinstance(assigner_login, str) and assigner_login.lower() == self.username.lower():
             return True
 
         log_event(
@@ -1065,15 +1073,25 @@ class IssuePoller:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # Could not look. Nothing is seeded; as before for a repo whose
-            # lookup failed, the next poll treats what it finds as new.
+            # Could not look. Nothing is seeded, and the seed stays pending:
+            # the next poll seeds first and polls only once that worked, so
+            # what was already there is never read as new.
             log_event(
                 _logger, "poll.seed.search_failed",
                 reason=type(e).__name__, error=str(e)[:200],
             )
             self._seed_pending = True
             return
-        self._seed_pending = False
+        # A trigger label whose search failed could not be seeded: an issue
+        # already wearing it would read as new once the search works. What
+        # could be seeded is seeded below, and the seed stays pending so the
+        # next poll finishes it before polling.
+        failed_labels = intake.failed_labels()
+        if failed_labels:
+            log_event(
+                _logger, "poll.seed.label_search_failed", labels=failed_labels,
+            )
+        self._seed_pending = bool(failed_labels)
         for repo in self.repos:
             if repo in self._issues_disabled_repos:
                 continue

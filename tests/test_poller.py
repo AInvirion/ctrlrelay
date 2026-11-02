@@ -1431,6 +1431,9 @@ class TestIncludeLabelsFilter:
         # failing — pre-existing self-assigned work doesn't get
         # treated as new on the first poll.
         assert 11 in poller.seen_issues["owner/repo-a"]
+        # ...and the seed stays pending, so the next poll finishes the label
+        # part before it polls (#282).
+        assert poller._seed_pending is True
 
     @pytest.mark.asyncio
     async def test_assignee_query_result_trusted_even_with_sparse_json(

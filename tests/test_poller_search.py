@@ -234,3 +234,41 @@ class TestRoundOneFixes:
         poller.mark_seen("o/a", 1)
         assert await poller.poll() == []
         gh.repo_is_archived.assert_not_awaited()
+
+
+class TestRoundTwoFixes:
+    @pytest.mark.asyncio
+    async def test_an_issue_labelled_before_a_failed_label_seed_is_not_new_later(
+        self, tmp_path: Path,
+    ) -> None:
+        labeled = {"go": GitHubError("gh failed: HTTP 502")}
+        gh = _gh({}, labeled)
+        poller = _poller(gh, tmp_path, ["o/a"], include_labels_by_repo={"o/a": ["go"]})
+        with patch("ctrlrelay.core.poller._SEED_LABEL_RETRY_SLEEP_SECONDS", 0):
+            await poller.seed_current()
+            labeled["go"] = {"o/a": [_issue(4, labels=["go"], assignees=())]}
+            assert await poller.poll() == []
+        assert 4 in poller.seen_issues["o/a"]
+
+    @pytest.mark.asyncio
+    async def test_logins_match_whatever_their_case(self, tmp_path: Path) -> None:
+        gh = _gh({}, {"go": {"o/a": [_issue(1, labels=["go"], assignees=())]}},
+                 label_by="ALICE")
+        poller = _poller(gh, tmp_path, ["o/a"], include_labels_by_repo={"o/a": ["go"]})
+        assert [x["issue"]["number"] for x in await poller.poll()] == [1]
+
+    @pytest.mark.asyncio
+    async def test_many_owners_split_into_few_short_queries(self) -> None:
+        from ctrlrelay.core.github import _SEARCH_QUERY_MAX, GitHubCLI
+
+        owners = [f"owner-with-a-long-name-{i:02d}" for i in range(40)]
+        page = json.dumps({"incomplete": False, "total": 0, "items": []})
+        with patch.object(GitHubCLI, "_run_gh", AsyncMock(return_value=page)) as run:
+            await GitHubCLI().search_open_issues(
+                repos=[f"{o}/r{j}" for o in owners for j in range(3)], assignee="alice",
+            )
+        queries = [c.args[c.args.index("-f") + 1][2:] for c in run.await_args_list]
+        assert all(len(q) <= _SEARCH_QUERY_MAX for q in queries)
+        assert 1 < len(queries) < 40  # by owner, never by repo
+        named = {t[5:] for q in queries for t in q.split() if t.startswith("user:")}
+        assert named == set(owners)
