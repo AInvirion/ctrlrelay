@@ -141,30 +141,96 @@ class TestWhoAddedTheLabel:
 
 
 class TestTheSearchCall:
+    def _page(self, rows, *, total=None, incomplete=False) -> str:
+        return json.dumps({"incomplete": incomplete,
+                           "total": len(rows) if total is None else total,
+                           "items": rows})
+
     @pytest.mark.asyncio
     async def test_scoped_to_owners_kept_to_configured_repos_case_blind(self) -> None:
         from ctrlrelay.core.github import GitHubCLI
 
-        rows = [
-            {"number": 1, "repository": {"nameWithOwner": "Org/Repo"}},
-            {"number": 2, "repository": {"nameWithOwner": "org/other"}},
-        ]
-        with patch.object(GitHubCLI, "_run_gh", AsyncMock(return_value=json.dumps(rows))) as run:
+        rows = [{"number": 1, "repo": "Org/Repo"}, {"number": 2, "repo": "org/other"}]
+        with patch.object(GitHubCLI, "_run_gh",
+                          AsyncMock(return_value=self._page(rows))) as run:
             out = await GitHubCLI().search_open_issues(
                 repos=["org/repo", "me/x"], assignee="alice",
             )
         assert out == {"org/repo": [rows[0]], "me/x": []}
         args = run.await_args.args
-        assert args[:2] == ("search", "issues")
-        owners = [args[i + 1] for i, a in enumerate(args) if a == "--owner"]
-        assert owners == ["me", "org"]
-        assert args[args.index("--assignee") + 1] == "alice"
+        assert args[:4] == ("api", "-X", "GET", "search/issues")
+        q = args[args.index("q=is:issue is:open assignee:alice user:me user:org")]
+        assert q
 
     @pytest.mark.asyncio
-    async def test_a_full_page_is_refused_as_maybe_cut_short(self) -> None:
+    @pytest.mark.parametrize("output", [
+        "", "not json\n",
+        json.dumps({"incomplete": True, "total": 1, "items": [{"number": 1, "repo": "o/a"}]}),
+        json.dumps({"incomplete": False, "total": 1500, "items": [{"number": 1, "repo": "o/a"}]}),
+    ])
+    async def test_an_answer_that_may_be_partial_is_refused(self, output) -> None:
         from ctrlrelay.core.github import GitHubCLI
 
-        rows = [{"number": i, "repository": {"nameWithOwner": "o/a"}} for i in range(5)]
-        with patch.object(GitHubCLI, "_run_gh", AsyncMock(return_value=json.dumps(rows))):
-            with pytest.raises(GitHubError, match="incomplete"):
-                await GitHubCLI().search_open_issues(repos=["o/a"], label="go", limit=5)
+        with patch.object(GitHubCLI, "_run_gh", AsyncMock(return_value=output)):
+            with pytest.raises((GitHubError, ValueError)):
+                await GitHubCLI().search_open_issues(repos=["o/a"], label="go")
+
+    @pytest.mark.asyncio
+    async def test_pages_are_joined(self) -> None:
+        from ctrlrelay.core.github import GitHubCLI
+
+        p1 = self._page([{"number": 1, "repo": "o/a"}], total=2)
+        p2 = self._page([{"number": 2, "repo": "o/a"}], total=2)
+        with patch.object(GitHubCLI, "_run_gh", AsyncMock(return_value=p1 + "\n" + p2)):
+            out = await GitHubCLI().search_open_issues(repos=["o/a"], assignee="alice")
+        assert [r["number"] for r in out["o/a"]] == [1, 2]
+
+
+class TestRoundOneFixes:
+    @pytest.mark.asyncio
+    async def test_a_failed_startup_seed_is_finished_before_any_poll(
+        self, tmp_path: Path,
+    ) -> None:
+        gh = _gh(GitHubError("gh failed: HTTP 502"))
+        poller = _poller(gh, tmp_path, ["o/a"])
+        with patch("ctrlrelay.core.poller._SEED_LABEL_RETRY_SLEEP_SECONDS", 0):
+            await poller.seed_current()
+            with pytest.raises(RuntimeError, match="seed"):
+                await poller.poll()
+            # GitHub answers again: the poll seeds first, so the issue that
+            # was already there is not new.
+            gh.search_open_issues.side_effect = None
+            gh.search_open_issues.return_value = {"o/a": [_issue(1)]}
+            assert await poller.poll() == []
+        assert 1 in poller.seen_issues["o/a"]
+
+    @pytest.mark.asyncio
+    async def test_any_trigger_label_the_operator_added_counts(self, tmp_path: Path) -> None:
+        gh = _gh({}, {"go": {"o/a": [_issue(1, labels=["go", "now"], assignees=())]},
+                      "now": {"o/a": [_issue(1, labels=["go", "now"], assignees=())]}})
+        gh.list_label_events.return_value = [
+            {"event": "labeled", "actor": {"login": "mallory"}, "label": {"name": "go"}},
+            {"event": "labeled", "actor": {"login": ME}, "label": {"name": "now"}},
+        ]
+        poller = _poller(gh, tmp_path, ["o/a"], include_labels_by_repo={"o/a": ["go", "now"]})
+        assert [x["issue"]["number"] for x in await poller.poll()] == [1]
+
+    @pytest.mark.asyncio
+    async def test_accepting_foreign_assignments_does_not_accept_foreign_labels(
+        self, tmp_path: Path,
+    ) -> None:
+        gh = _gh({}, {"go": {"o/a": [_issue(1, labels=["go"], assignees=())]}},
+                 label_by="mallory")
+        poller = _poller(gh, tmp_path, ["o/a"], include_labels_by_repo={"o/a": ["go"]},
+                         accept_foreign_assignments={"o/a"})
+        assert await poller.poll() == []
+
+    @pytest.mark.asyncio
+    async def test_no_archive_probe_when_every_issue_is_already_handled(
+        self, tmp_path: Path,
+    ) -> None:
+        gh = _gh({"o/a": [_issue(1)]})
+        poller = _poller(gh, tmp_path, ["o/a"])
+        poller.mark_seen("o/a", 1)
+        assert await poller.poll() == []
+        gh.repo_is_archived.assert_not_awaited()

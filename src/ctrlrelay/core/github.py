@@ -96,6 +96,18 @@ def _find_gh() -> str:
     return "gh"
 
 
+
+# One page of ``search/issues`` as one JSON line, with the rows in
+# ``gh issue list``'s field names (#282).
+_SEARCH_PAGE_JQ = (
+    "{incomplete: .incomplete_results, total: .total_count, items: [.items[] | "
+    "{number, title, state, body, labels: [.labels[] | {name}], "
+    "assignees: [.assignees[] | {login}], createdAt: .created_at, "
+    "updatedAt: .updated_at, "
+    "repo: (.repository_url | sub(\"^https://api.github.com/repos/\"; \"\"))}]}"
+    " | tojson"
+)
+
 @dataclass
 class GitHubCLI:
     """Async wrapper around the gh CLI."""
@@ -372,46 +384,52 @@ class GitHubCLI:
         repos: Sequence[str],
         assignee: str | None = None,
         label: str | None = None,
-        limit: int = 1000,
     ) -> dict[str, list[dict[str, Any]]]:
         """Open issues in ``repos`` assigned to ``assignee`` or carrying
-        ``label``, in ONE ``gh search issues`` call rather than one call per
-        repo (#282): the poller's intake, whatever the number of repos.
+        ``label``, in ONE search rather than one call per repo (#282): the
+        poller's intake, whatever the number of repos.
 
-        The search is scoped to the owners of ``repos`` and the rows are
-        then kept only for ``repos`` (matched without regard to case), keyed
-        by the configured name. Every configured repo is a key, with ``[]``
-        when nothing matched, so a caller can tell "looked, found nothing"
-        from "did not look": a failed search raises ``GitHubError`` and
-        returns nothing. A result of exactly ``limit`` rows may have been
-        cut short, so it raises too rather than pass for complete.
+        GitHub's search API directly (``gh api search/issues``), because
+        it says when an answer is partial: a page marked
+        ``incomplete_results`` (the search timed out on GitHub's side), or
+        fewer rows than ``total_count`` (more than search returns), raises
+        ``GitHubError`` rather than pass for complete, and so do empty or
+        unreadable output. Scoped to the owners of ``repos``; rows are kept
+        only for ``repos`` (matched without regard to case) and keyed by
+        the configured name. Every configured repo is a key, with ``[]``
+        when nothing matched, so "looked, found nothing" differs from "did
+        not look", which raises. Rows use ``gh issue list``'s field names.
         """
         if (assignee is None) == (label is None):
             raise ValueError("pass exactly one of assignee or label")
         by_name = {r.lower(): r for r in repos}
         owners = sorted({r.split("/", 1)[0] for r in repos if "/" in r})
-        args = [
-            "search", "issues", "--state", "open", "--limit", str(limit),
-            "--json",
-            "repository,number,title,state,body,labels,assignees,createdAt,updatedAt",
-        ]
+        terms = ["is:issue", "is:open"]
         if assignee is not None:
-            args += ["--assignee", assignee]
+            terms.append(f"assignee:{assignee}")
         else:
-            args += ["--label", label]
-        for owner in owners:
-            args += ["--owner", owner]
-        output = await self._run_gh(*args)
-        rows = json.loads(output) if output.strip() else []
-        if len(rows) >= limit:
+            terms.append('label:"' + label.replace('"', "") + '"')
+        terms += [f"user:{o}" for o in owners]
+        output = await self._run_gh(
+            "api", "-X", "GET", "search/issues", "--paginate",
+            "-f", "q=" + " ".join(terms), "-f", "per_page=100",
+            "--jq", _SEARCH_PAGE_JQ,
+        )
+        pages = [json.loads(line) for line in output.splitlines() if line.strip()]
+        if not pages or not all(isinstance(p, dict) and "items" in p for p in pages):
+            raise GitHubError("gh api search/issues gave no readable answer")
+        if any(p.get("incomplete") for p in pages):
+            raise GitHubError("GitHub marked the search incomplete")
+        rows = [row for p in pages for row in p["items"]]
+        total = pages[0].get("total")
+        if not isinstance(total, int) or len(rows) < total:
             raise GitHubError(
-                f"gh search issues returned {len(rows)} rows, the most it "
-                "returns, so the answer may be incomplete"
+                f"the search returned {len(rows)} of {total} issues, so the "
+                "answer may be incomplete"
             )
         out: dict[str, list[dict[str, Any]]] = {r: [] for r in repos}
         for row in rows:
-            name = (row.get("repository") or {}).get("nameWithOwner", "")
-            repo = by_name.get(str(name).lower())
+            repo = by_name.get(str(row.get("repo", "")).lower())
             if repo is not None:
                 out[repo].append(row)
         return out

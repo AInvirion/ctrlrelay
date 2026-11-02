@@ -109,15 +109,24 @@ class _Intake:
             raise found
         return list((found or {}).get(repo, []))
 
-    def has_candidates(self, repo: str, labels: list[str]) -> bool:
-        """Whether this poll found anything to look at in ``repo``; a
-        failed label search counts as something, so the repo's own
-        failure path still runs."""
-        if self._assigned.get(repo):
-            return True
+    def has_candidates(
+        self, repo: str, labels: list[str], fresh: Callable[[int], bool],
+    ) -> bool:
+        """Whether this poll found anything new to look at in ``repo``:
+        an issue ``fresh`` says is not yet handled. A failed label search
+        counts as something, so the repo's own failure path still runs."""
+        rows = list(self._assigned.get(repo, []))
         for label in labels:
             found = self._labeled.get(label.lower())
-            if isinstance(found, BaseException) or (found or {}).get(repo):
+            if isinstance(found, BaseException):
+                return True
+            rows += (found or {}).get(repo, [])
+        for row in rows:
+            try:
+                number = int(row["number"])
+            except Exception:
+                return True  # malformed: let the repo's own guard log it
+            if fresh(number):
                 return True
         return False
 
@@ -203,6 +212,9 @@ class IssuePoller:
     # Resets on daemon restart so a fresh detection still runs if the repo
     # re-enables issues in the meantime.
     _issues_disabled_repos: set[str] = field(default_factory=set, repr=False)
+    # True after a startup seed that could not look (#282): until a seed
+    # succeeds, a poll would treat every issue already there as new.
+    _seed_pending: bool = field(default=False, init=False, repr=False)
     # Archived-repo detection (#163). Shared with the secops sweep when the
     # daemon passes one in, so a single confirmation covers both paths;
     # built from ``github`` when absent. Same cache lifetime as
@@ -370,6 +382,13 @@ class IssuePoller:
         # One search for every repo, not one call per repo (#282). If it
         # fails this raises: the poll could not look, which is not the
         # same as finding nothing, and no state changes.
+        if self._seed_pending:
+            await self.seed_current()
+            if self._seed_pending:
+                raise RuntimeError(
+                    "the startup seed could not look yet, so every issue "
+                    "already there would read as new; not polling"
+                )
         intake = await self._fetch_intake()
 
         for repo in self.repos:
@@ -378,8 +397,12 @@ class IssuePoller:
             if repo in self._issues_disabled_repos:
                 continue
             # Nothing found for this repo: no archive probe, no work.
+            seen_now = self.seen_issues.get(repo, set())
             if not intake.has_candidates(
                 repo, self.include_labels_by_repo.get(repo, []),
+                lambda n, seen_now=seen_now, repo=repo: (
+                    n not in seen_now and self._recheck_due(repo, n)
+                ),
             ):
                 self._clear_repo_failure(repo)
                 continue
@@ -604,7 +627,10 @@ class IssuePoller:
                     # issue the operator also self-assigned is still
                     # taken; otherwise it is left unmarked, so a later
                     # label from the operator surfaces it.
-                    if await self._label_added_by_self(repo, number, label_match):
+                    if await self._label_added_by_self(
+                        repo, number,
+                        self._matched_include_labels(issue, include_lowered),
+                    ):
                         # Mark seen so the same label-triggered issue
                         # isn't re-surfaced on every poll.
                         seen_for_repo.add(number)
@@ -675,16 +701,15 @@ class IssuePoller:
         return new_issues
 
     async def _label_added_by_self(
-        self, repo: str, issue_number: int, label: str,
+        self, repo: str, issue_number: int, labels: list[str],
     ) -> bool:
-        """Whether the operator added ``label`` to the issue: the latest
-        ``labeled`` event for that label, whose ``actor`` is the account
-        that added it. Repos in ``accept_foreign_assignments`` accept a
-        label from anyone, as they accept an assignment. A failed lookup
-        is not a yes; it is logged and the issue is looked at again next
-        poll."""
-        if repo in self.accept_foreign_assignments:
-            return True
+        """Whether the operator added any of ``labels`` (the trigger labels
+        the issue carries) to it: for each, the latest ``labeled`` event,
+        whose ``actor`` is the account that added it. No repo setting
+        widens this: ``accept_foreign_assignments`` is about assignments
+        only. A failed lookup is not a yes; it is logged and the issue is
+        looked at again next poll."""
+        label = ", ".join(labels)
         try:
             events = await self.github.list_label_events(repo, issue_number)
         except asyncio.CancelledError:
@@ -696,17 +721,21 @@ class IssuePoller:
                 reason=type(e).__name__, error=str(e)[:200],
             )
             return False
-        wanted = label.lower()
-        matching = [
-            e for e in events
-            if str(((e.get("label") or {}).get("name")) or "").lower() == wanted
-        ]
-        added_by = ((matching[-1].get("actor") or {}).get("login")) if matching else None
-        if added_by == self.username:
+        added_by: dict[str, str | None] = {}
+        for wanted in (x.lower() for x in labels):
+            matching = [
+                e for e in events
+                if str(((e.get("label") or {}).get("name")) or "").lower() == wanted
+            ]
+            added_by[wanted] = (
+                (matching[-1].get("actor") or {}).get("login") if matching else None
+            )
+        if self.username in added_by.values():
             return True
         log_event(
             _logger, "poll.issue.foreign_label", repo=repo,
-            issue_number=issue_number, label=label, added_by=added_by,
+            issue_number=issue_number, label=label,
+            added_by=sorted({str(v) for v in added_by.values()}),
         )
         return False
 
@@ -839,6 +868,19 @@ class IssuePoller:
             if name and name.lower() in exclude_lowered:
                 return name
         return None
+
+    @staticmethod
+    def _matched_include_labels(
+        issue: dict[str, Any], include_lowered: set[str],
+    ) -> list[str]:
+        """Every configured trigger label the issue carries, as named on
+        the issue."""
+        found: list[str] = []
+        for label in issue.get("labels") or []:
+            name = label.get("name") if isinstance(label, dict) else label
+            if isinstance(name, str) and name.lower() in include_lowered:
+                found.append(name)
+        return found
 
     @staticmethod
     def _matched_include_label(
@@ -1029,12 +1071,17 @@ class IssuePoller:
                 _logger, "poll.seed.search_failed",
                 reason=type(e).__name__, error=str(e)[:200],
             )
+            self._seed_pending = True
             return
+        self._seed_pending = False
         for repo in self.repos:
             if repo in self._issues_disabled_repos:
                 continue
             include_labels = self.include_labels_by_repo.get(repo, [])
-            if not intake.has_candidates(repo, include_labels):
+            seen_now = self.seen_issues.get(repo, set())
+            if not intake.has_candidates(
+                repo, include_labels, lambda n, seen_now=seen_now: n not in seen_now,
+            ):
                 continue
             if await self._archived.is_archived(repo):
                 continue

@@ -25,6 +25,8 @@ and an unarchived repo recovers on its own.
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,6 +39,10 @@ _logger = get_logger("core.archived")
 # cycle, and a hung lookup would delay every repo behind it. Timing out
 # just means "unknown" — the repo is polled as normal.
 ARCHIVED_PROBE_TIMEOUT_SECONDS = 20
+# How long a confirmed "not archived" answer is kept (#282). Each probe is a
+# GitHub call on an account several machines share, and a repo is archived
+# rarely; a repo archived meanwhile is noticed within this long.
+ACTIVE_ANSWER_SECONDS = 6 * 3600
 
 
 @dataclass
@@ -62,6 +68,10 @@ class ArchivedRepoTracker:
     # the cache miss before either awaits, so the "one probe, one log"
     # contract in the docstring above is only true single-threaded.
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
+    # Repo -> monotonic time until which a confirmed "not archived" answer
+    # stands (#282). Only a definite answer is kept; an error never is.
+    _active_until: dict[str, float] = field(default_factory=dict, repr=False)
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
 
     async def is_archived(self, repo: str) -> bool:
         """Return True only for a confirmed-archived repo.
@@ -73,6 +83,8 @@ class ArchivedRepoTracker:
         """
         if repo in self.archived_repos:
             return True
+        if self._active_until.get(repo, 0.0) > self.clock():
+            return False
 
         lock = self._locks.setdefault(repo, asyncio.Lock())
         async with lock:
@@ -108,6 +120,10 @@ class ArchivedRepoTracker:
         # `is True` on purpose: a truthy non-boolean (a Mock, a "true"
         # string from a future gh format change) must not skip a repo.
         if result is not True:
+            if result is False:
+                # A definite "not archived": kept for a while (#282). A
+                # truthy non-boolean is not definite and is not kept.
+                self._active_until[repo] = self.clock() + ACTIVE_ANSWER_SECONDS
             return False
 
         self.archived_repos.add(repo)

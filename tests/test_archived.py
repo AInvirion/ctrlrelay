@@ -46,18 +46,24 @@ class TestArchivedRepoTracker:
         assert archived_logs[0].repo == "owner/old"
 
     @pytest.mark.asyncio
-    async def test_active_repo_is_rechecked_and_not_cached(self) -> None:
-        """A confirmed ``isArchived: false`` must not be cached — a repo
-        archived while the daemon runs still gets detected on a later
-        cycle."""
+    async def test_active_repo_is_kept_for_a_while_then_rechecked(self) -> None:
+        """#282: a confirmed ``isArchived: false`` is kept for
+        ``ACTIVE_ANSWER_SECONDS`` (every probe is a GitHub call), and a
+        repo archived while the daemon runs is still detected after it."""
+        from ctrlrelay.core.archived import ACTIVE_ANSWER_SECONDS
+
+        now = [1000.0]
         github = MagicMock()
-        github.repo_is_archived = AsyncMock(side_effect=[False, False, True])
-        tracker = ArchivedRepoTracker(github=github)
+        github.repo_is_archived = AsyncMock(side_effect=[False, True])
+        tracker = ArchivedRepoTracker(github=github, clock=lambda: now[0])
 
         assert await tracker.is_archived("owner/live") is False
+        now[0] += ACTIVE_ANSWER_SECONDS - 1
         assert await tracker.is_archived("owner/live") is False
+        assert github.repo_is_archived.await_count == 1
+        now[0] += 2
         assert await tracker.is_archived("owner/live") is True
-        assert github.repo_is_archived.await_count == 3
+        assert github.repo_is_archived.await_count == 2
 
     @pytest.mark.asyncio
     async def test_lookup_failure_treats_repo_as_active(
@@ -104,11 +110,14 @@ class TestArchivedRepoTracker:
                 GitHubError("boom again"),
             ]
         )
-        tracker = ArchivedRepoTracker(github=github)
+        now = [0.0]
+        tracker = ArchivedRepoTracker(github=github, clock=lambda: now[0])
 
         with caplog.at_level(logging.INFO, logger=LOGGER):
             await tracker.is_archived("owner/flaky")
             await tracker.is_archived("owner/flaky")
+            # Past the kept "not archived" answer, so it is asked again.
+            now[0] += 10 * 24 * 3600
             await tracker.is_archived("owner/flaky")
 
         failures = [
