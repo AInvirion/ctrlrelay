@@ -1455,15 +1455,20 @@ class WorktreeManager:
         """Point the clone's HEAD at origin's default branch when origin
         changed it. The fetch no longer prunes branches (#243), so a
         renamed default's old branch stays here, and without this the
-        clone would keep cutting sessions from it. Best effort: a failed
-        lookup leaves HEAD as it was, and a new default this clone does
-        not hold yet is left for the next update."""
+        clone would keep cutting sessions from it. HEAD moves only when
+        the new default is here at the commit origin reports, so a stale
+        or diverged local branch is never adopted; anything else is left
+        for the next update and logged, never silent."""
         try:
             out = await self._run_git(
                 "ls-remote", "--symref", "origin", "HEAD",
                 cwd=bare_path, timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
             )
-        except WorktreeError:
+        except WorktreeError as exc:
+            log_event(
+                _logger, "worktree.default_branch_unchecked", repo=repo,
+                reason=str(exc)[:200],
+            )
             return
         prefix, suffix = "ref: refs/heads/", "\tHEAD"
         new = next(
@@ -1471,13 +1476,28 @@ class WorktreeManager:
              if line.startswith(prefix) and line.endswith(suffix)),
             "",
         )
+        remote_sha = next(
+            (line.split("\t", 1)[0] for line in out.splitlines()
+             if line.endswith("\tHEAD") and not line.startswith("ref: ")),
+            "",
+        )
         if not new or new == default_branch:
             return
         try:
-            await self._run_git(
+            local_sha = (await self._run_git(
                 "rev-parse", "--verify", "--quiet", f"refs/heads/{new}",
                 cwd=bare_path,
+            )).strip()
+        except WorktreeError:
+            local_sha = ""
+        if not remote_sha or local_sha != remote_sha:
+            log_event(
+                _logger, "worktree.default_branch_not_followed", repo=repo,
+                old=default_branch or None, new=new,
+                reason="not here yet" if not local_sha else "not current",
             )
+            return
+        try:
             await self._run_git(
                 "symbolic-ref", "HEAD", f"refs/heads/{new}", cwd=bare_path,
             )
