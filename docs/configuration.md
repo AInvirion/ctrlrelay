@@ -623,21 +623,25 @@ repos:
 - An issue is accepted when **either** (a) it's assigned to the configured
   user (subject to the self-assignment filter from #79 and
   `accept_foreign_assignments`) **or** (b) it carries any label in
-  `include_labels`. A label match **skips** the self-assignment check — the
-  operator's config choice is the trust boundary.
+  `include_labels` **that the configured user added** (the latest
+  `labeled` event for that label names that account; `accept_foreign_assignments`
+  does not widen this). A label someone else added does not start a run;
+  the issue is still taken if the user also assigned it to themselves.
 - Dedup: an issue that is **both** labeled and assigned is picked up exactly
   once per poll cycle — no duplicate entries in `seen_issues` and no double
   pipeline spawn.
 - `exclude_labels` always wins over `include_labels` on the same issue: an
   explicit "not for the agent" opt-OUT beats the generic label opt-IN.
-- When a repo configures `include_labels`, the poller runs **targeted**
-  queries per cycle: the existing `gh issue list --assignee <user>` plus
-  one `gh issue list --label <L>` call per configured label. Results merge
-  by issue number. This keeps the label path scale-safe on busy repos
-  where an unfiltered fetch would silently cap at gh's `--limit` and miss
-  labeled issues on later pages. Repos without `include_labels` run only
-  the cheap `--assignee` query, so enabling the feature on one repo does
-  not add API calls on the others.
+- Each poll asks GitHub's search **once** for open issues assigned to the
+  user across all configured repos, plus **once per distinct
+  `include_labels` label** across the repos using it, whatever the number
+  of repos (split by owner only if the owner list is too long for one
+  query). A search GitHub marks incomplete, or that returns fewer rows
+  than its total, fails the poll as "could not look": nothing is marked
+  seen and nothing is treated as new. After that, only issues not yet
+  handled cost a call each (who assigned it, or who added the label), and
+  a repo is asked whether it is archived only when it has such an issue,
+  at most once every 6 hours.
 - The event log entry for a label-triggered acceptance is
   `poll.issue.included_by_label`, alongside the existing
   `poll.issue.excluded_by_label` for exclusions.
