@@ -83,6 +83,58 @@ def _read_failure_counts(raw: object) -> dict[str, dict[int, int]]:
     return out
 
 
+class _Intake:
+    """What one poll learned from GitHub, read once for every repo (#282).
+
+    ``assigned`` maps each polled repo to its open issues assigned to the
+    operator. ``labeled`` maps a trigger label (lower case) to the same
+    shape, or to the exception its search raised: a failed label search
+    is "could not look" for the repos using that label, never "none".
+    """
+
+    def __init__(
+        self,
+        assigned: dict[str, list[dict[str, Any]]],
+        labeled: dict[str, dict[str, list[dict[str, Any]]] | BaseException],
+    ) -> None:
+        self._assigned = assigned
+        self._labeled = labeled
+
+    def assigned(self, repo: str) -> list[dict[str, Any]]:
+        return list(self._assigned.get(repo, []))
+
+    def labeled(self, repo: str, label: str) -> list[dict[str, Any]]:
+        found = self._labeled.get(label.lower())
+        if isinstance(found, BaseException):
+            raise found
+        return list((found or {}).get(repo, []))
+
+    def failed_labels(self) -> list[str]:
+        """The trigger labels whose search failed this time."""
+        return sorted(k for k, v in self._labeled.items() if isinstance(v, BaseException))
+
+    def has_candidates(
+        self, repo: str, labels: list[str], fresh: Callable[[int], bool],
+    ) -> bool:
+        """Whether this poll found anything new to look at in ``repo``:
+        an issue ``fresh`` says is not yet handled. A failed label search
+        counts as something, so the repo's own failure path still runs."""
+        rows = list(self._assigned.get(repo, []))
+        for label in labels:
+            found = self._labeled.get(label.lower())
+            if isinstance(found, BaseException):
+                return True
+            rows += (found or {}).get(repo, [])
+        for row in rows:
+            try:
+                number = int(row["number"])
+            except Exception:
+                return True  # malformed: let the repo's own guard log it
+            if fresh(number):
+                return True
+        return False
+
+
 @dataclass
 class IssuePoller:
     """Polls GitHub repos for newly assigned issues.
@@ -164,6 +216,9 @@ class IssuePoller:
     # Resets on daemon restart so a fresh detection still runs if the repo
     # re-enables issues in the meantime.
     _issues_disabled_repos: set[str] = field(default_factory=set, repr=False)
+    # True after a startup seed that could not look (#282): until a seed
+    # succeeds, a poll would treat every issue already there as new.
+    _seed_pending: bool = field(default=False, init=False, repr=False)
     # Archived-repo detection (#163). Shared with the secops sweep when the
     # daemon passes one in, so a single confirmation covers both paths;
     # built from ``github`` when absent. Same cache lifetime as
@@ -328,16 +383,37 @@ class IssuePoller:
         will still surface them. See #80.
         """
         new_issues: list[dict[str, Any]] = []
+        # One search for every repo, not one call per repo (#282). If it
+        # fails this raises: the poll could not look, which is not the
+        # same as finding nothing, and no state changes.
+        if self._seed_pending:
+            await self.seed_current()
+            if self._seed_pending:
+                raise RuntimeError(
+                    "the startup seed could not look yet, so every issue "
+                    "already there would read as new; not polling"
+                )
+        intake = await self._fetch_intake()
 
         for repo in self.repos:
             # Repos with GitHub Issues disabled will never return issues; skip
             # before the `gh` call so we don't log the same error every cycle.
             if repo in self._issues_disabled_repos:
                 continue
-            # An archived repo accepts no new work — skip it before the
-            # `gh` call. Only a confirmed archive skips; an unknown
-            # answer falls through and the repo is polled as normal
-            # (see ctrlrelay.core.archived).
+            # Nothing found for this repo: no archive probe, no work.
+            seen_now = self.seen_issues.get(repo, set())
+            if not intake.has_candidates(
+                repo, self.include_labels_by_repo.get(repo, []),
+                lambda n, seen_now=seen_now, repo=repo: (
+                    n not in seen_now and self._recheck_due(repo, n)
+                ),
+            ):
+                self._clear_repo_failure(repo)
+                continue
+            # An archived repo accepts no new work. Only a confirmed
+            # archive skips; an unknown answer falls through and the repo
+            # is polled as normal (see ctrlrelay.core.archived). Asked only
+            # for a repo the search found something in.
             if await self._archived.is_archived(repo):
                 continue
             # Per-repo include-labels controls the fetch strategy. With
@@ -368,9 +444,7 @@ class IssuePoller:
                     # below are isolated per-label so one flaky
                     # label filter doesn't starve the assignee
                     # path (codex P2 round-4).
-                    assignee_issues = await self.github.list_assigned_issues(
-                        repo, assignee=self.username,
-                    )
+                    assignee_issues = intake.assigned(repo)
                     for i in assignee_issues:
                         try:
                             num = int(i["number"])
@@ -380,9 +454,7 @@ class IssuePoller:
                         assignee_trigger_numbers.add(num)
                     for label in include_labels:
                         try:
-                            labeled = await self.github.list_issues_by_label(
-                                repo, label=label,
-                            )
+                            labeled = intake.labeled(repo, label)
                         except asyncio.CancelledError:
                             raise
                         except Exception as label_e:
@@ -409,9 +481,7 @@ class IssuePoller:
                                 pass
                     issues = list(by_number.values())
                 else:
-                    issues = await self.github.list_assigned_issues(
-                        repo, assignee=self.username,
-                    )
+                    issues = intake.assigned(repo)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -554,20 +624,31 @@ class IssuePoller:
                     is_assigned = True
 
                 if label_match is not None:
-                    # Label match bypasses the self-assignment check; the
-                    # operator's config choice is the trust boundary.
-                    # Mark seen so the same label-triggered issue isn't
-                    # re-surfaced on every poll.
-                    seen_for_repo.add(number)
-                    log_event(
-                        _logger,
-                        "poll.issue.included_by_label",
-                        repo=repo,
-                        issue_number=number,
-                        matched_label=label_match,
-                    )
-                    new_issues.append({"repo": repo, "issue": issue})
-                    continue
+                    # The label is a trigger only when the operator added
+                    # it (#282): anyone who can label an issue could
+                    # otherwise start a run. A label added by somebody
+                    # else falls through to the assignment check, so an
+                    # issue the operator also self-assigned is still
+                    # taken; otherwise it is left unmarked, so a later
+                    # label from the operator surfaces it.
+                    if await self._label_added_by_self(
+                        repo, number,
+                        self._matched_include_labels(issue, include_lowered),
+                    ):
+                        # Mark seen so the same label-triggered issue
+                        # isn't re-surfaced on every poll.
+                        seen_for_repo.add(number)
+                        log_event(
+                            _logger,
+                            "poll.issue.included_by_label",
+                            repo=repo,
+                            issue_number=number,
+                            matched_label=label_match,
+                        )
+                        new_issues.append({"repo": repo, "issue": issue})
+                        continue
+                    if not is_assigned:
+                        continue
 
                 # Assignment-only path: run the self-assignment event
                 # check exactly as before.
@@ -623,6 +704,89 @@ class IssuePoller:
         self._save_state_best_effort()
         return new_issues
 
+    async def _label_added_by_self(
+        self, repo: str, issue_number: int, labels: list[str],
+    ) -> bool:
+        """Whether the operator added any of ``labels`` (the trigger labels
+        the issue carries) to it: for each, the latest ``labeled`` event,
+        whose ``actor`` is the account that added it. No repo setting
+        widens this: ``accept_foreign_assignments`` is about assignments
+        only. A failed lookup is not a yes; it is logged and the issue is
+        looked at again next poll."""
+        label = ", ".join(labels)
+        try:
+            events = await self.github.list_label_events(repo, issue_number)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event(
+                _logger, "poll.issue.label_check_failed", repo=repo,
+                issue_number=issue_number, label=label,
+                reason=type(e).__name__, error=str(e)[:200],
+            )
+            return False
+        added_by: dict[str, str | None] = {}
+        for wanted in (x.lower() for x in labels):
+            matching = [
+                e for e in events
+                if str(((e.get("label") or {}).get("name")) or "").lower() == wanted
+            ]
+            added_by[wanted] = (
+                (matching[-1].get("actor") or {}).get("login") if matching else None
+            )
+        # GitHub logins are not case-sensitive.
+        me = self.username.lower()
+        if any(isinstance(v, str) and v.lower() == me for v in added_by.values()):
+            return True
+        log_event(
+            _logger, "poll.issue.foreign_label", repo=repo,
+            issue_number=issue_number, label=label,
+            added_by=sorted({str(v) for v in added_by.values()}),
+        )
+        return False
+
+    async def _fetch_intake(self, *, attempts: int = 1) -> _Intake:
+        """Run the poll's searches: one for issues assigned to the operator
+        across every polled repo, one per distinct trigger label across the
+        repos using it (#282). Each is tried ``attempts`` times. A failed
+        assignee search raises; a failed label search is kept, so only the
+        repos using that label see it."""
+        repos = [r for r in self.repos if r not in self._issues_disabled_repos]
+        assigned = await self._search_with_retry(
+            attempts, repos=repos, assignee=self.username,
+        )
+        by_label: dict[str, list[str]] = {}
+        names: dict[str, str] = {}
+        for repo in repos:
+            for label in self.include_labels_by_repo.get(repo, []):
+                by_label.setdefault(label.lower(), []).append(repo)
+                names.setdefault(label.lower(), label)
+        labeled: dict[str, Any] = {}
+        for key, label_repos in by_label.items():
+            try:
+                labeled[key] = await self._search_with_retry(
+                    attempts, repos=label_repos, label=names[key],
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                labeled[key] = e
+        return _Intake(assigned, labeled)
+
+    async def _search_with_retry(self, attempts: int, **kwargs: Any) -> Any:
+        last: Exception | None = None
+        for attempt in range(max(1, attempts)):
+            try:
+                return await self.github.search_open_issues(**kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last = e
+                if attempt < attempts - 1:
+                    await asyncio.sleep(_SEED_LABEL_RETRY_SLEEP_SECONDS)
+        assert last is not None
+        raise last
+
     async def _is_self_assigned(self, repo: str, issue_number: int) -> bool:
         """Check if the most recent ``assigned`` event naming ``self.username``
         was performed by ``self.username`` themselves.
@@ -640,7 +804,8 @@ class IssuePoller:
         # than skip past it. One before it is overtaken and does not count.
         last_mine = max(
             (i for i, e in enumerate(events)
-             if (e.get("assignee") or {}).get("login") == self.username),
+             if str((e.get("assignee") or {}).get("login") or "").lower()
+             == self.username.lower()),
             default=-1,
         )
         if any(not (e.get("assignee") or {}).get("login")
@@ -657,7 +822,8 @@ class IssuePoller:
         relevant = [
             e
             for e in events
-            if (e.get("assignee") or {}).get("login") == self.username
+            if str((e.get("assignee") or {}).get("login") or "").lower()
+            == self.username.lower()
         ]
         if not relevant:
             log_event(
@@ -677,7 +843,7 @@ class IssuePoller:
         # ``assigner`` is treated as foreign.
         latest = relevant[-1]
         assigner_login = (latest.get("assigner") or {}).get("login")
-        if assigner_login == self.username:
+        if isinstance(assigner_login, str) and assigner_login.lower() == self.username.lower():
             return True
 
         log_event(
@@ -710,6 +876,19 @@ class IssuePoller:
             if name and name.lower() in exclude_lowered:
                 return name
         return None
+
+    @staticmethod
+    def _matched_include_labels(
+        issue: dict[str, Any], include_lowered: set[str],
+    ) -> list[str]:
+        """Every configured trigger label the issue carries, as named on
+        the issue."""
+        found: list[str] = []
+        for label in issue.get("labels") or []:
+            name = label.get("name") if isinstance(label, dict) else label
+            if isinstance(name, str) and name.lower() in include_lowered:
+                found.append(name)
+        return found
 
     @staticmethod
     def _matched_include_label(
@@ -887,18 +1066,47 @@ class IssuePoller:
         next poll, any currently-assigned issues on the skipped repo will be
         treated as new and picked up — that's safer than crashing first-run.
         """
+        try:
+            intake = await self._fetch_intake(
+                attempts=_SEED_LABEL_RETRY_ATTEMPTS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Could not look. Nothing is seeded, and the seed stays pending:
+            # the next poll seeds first and polls only once that worked, so
+            # what was already there is never read as new.
+            log_event(
+                _logger, "poll.seed.search_failed",
+                reason=type(e).__name__, error=str(e)[:200],
+            )
+            self._seed_pending = True
+            return
+        # A trigger label whose search failed could not be seeded: an issue
+        # already wearing it would read as new once the search works. What
+        # could be seeded is seeded below, and the seed stays pending so the
+        # next poll finishes it before polling.
+        failed_labels = intake.failed_labels()
+        if failed_labels:
+            log_event(
+                _logger, "poll.seed.label_search_failed", labels=failed_labels,
+            )
+        self._seed_pending = bool(failed_labels)
         for repo in self.repos:
             if repo in self._issues_disabled_repos:
                 continue
+            include_labels = self.include_labels_by_repo.get(repo, [])
+            seen_now = self.seen_issues.get(repo, set())
+            if not intake.has_candidates(
+                repo, include_labels, lambda n, seen_now=seen_now: n not in seen_now,
+            ):
+                continue
             if await self._archived.is_archived(repo):
                 continue
-            include_labels = self.include_labels_by_repo.get(repo, [])
             try:
                 if include_labels:
                     by_number: dict[int, dict[str, Any]] = {}
-                    assignee_issues = await self.github.list_assigned_issues(
-                        repo, assignee=self.username,
-                    )
+                    assignee_issues = intake.assigned(repo)
                     for i in assignee_issues:
                         try:
                             by_number[int(i["number"])] = i
@@ -917,9 +1125,7 @@ class IssuePoller:
                         label_err: Exception | None = None
                         for attempt in range(_SEED_LABEL_RETRY_ATTEMPTS):
                             try:
-                                labeled = await self.github.list_issues_by_label(
-                                    repo, label=label,
-                                )
+                                labeled = intake.labeled(repo, label)
                                 label_err = None
                                 break
                             except asyncio.CancelledError:
@@ -955,9 +1161,7 @@ class IssuePoller:
                                 pass
                     issues = list(by_number.values())
                 else:
-                    issues = await self.github.list_assigned_issues(
-                        repo, assignee=self.username,
-                    )
+                    issues = intake.assigned(repo)
             except asyncio.CancelledError:
                 raise
             except _TRANSIENT_POLL_ERRORS as e:

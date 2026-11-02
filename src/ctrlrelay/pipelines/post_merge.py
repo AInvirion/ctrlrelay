@@ -86,7 +86,7 @@ async def watch_and_handle_merge(
     issue_number: int,
     github: GitHubCLI,
     transport: Transport | None = None,
-    poll_interval: int = 60,
+    poll_interval: int = 300,
     timeout: int = DEFAULT_PR_WATCH_TIMEOUT,
 ) -> bool:
     """Watch for PR merge and handle post-merge actions."""
@@ -253,7 +253,7 @@ async def pr_watch_task(
     session_id: str | None,
     github: GitHubCLI,
     transport_factory: Callable[[], Awaitable[Transport | None]] | None = None,
-    poll_interval: int = 60,
+    poll_interval: int = 300,
     timeout: int = DEFAULT_PR_WATCH_TIMEOUT,
     state_db: StateDB | None = None,
 ) -> dict[str, Any]:

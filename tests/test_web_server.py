@@ -619,7 +619,7 @@ def test_web_config_defaults(tmp_path: Path) -> None:
     assert config.web.port == 8787
     assert config.web.history_days == 7
     assert config.web.refresh_seconds == 5
-    assert config.web.github_check_seconds == 60
+    assert config.web.github_check_seconds == 300
     assert config.web.stale_after_minutes == 15
 
 

@@ -33,7 +33,9 @@ class PRWatcher:
     """Watches PRs for merge events."""
 
     github: GitHubCLI
-    poll_interval: int = 60
+    # Seconds between checks of a watched PR. 300 (#282): every check is a
+    # GitHub call on an account several machines share.
+    poll_interval: int = 300
 
     async def check_merged(self, repo: str, pr_number: int) -> bool:
         """Check if a PR has been merged.
