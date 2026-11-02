@@ -484,7 +484,7 @@ daemon with any of it.
   rewind even when every other ref applied. `ensure_bare_repo` read that
   exit code as failure and aborted the session.
 
-  Observed on `AInvirion/zzsites`, whose sweep died reporting
+  Observed on one of the swept repositories, whose sweep died reporting
   `WorktreeError: git failed: ... ! [rejected] ... (non-fast-forward)`
   in the same fetch that had just advanced `main`. Twelve bare repos
   were holding a `dependabot/*` ref at the time, each one primed to fail
@@ -515,8 +515,7 @@ daemon with any of it.
   `✅ Scheduled secops sweep done: N/M ok`, which fires once every repo
   has been swept. On the 2026-09-09 sweep that was hours after the reply
   and named no repo: four answers merged 20 Dependabot PRs across
-  `ai-miner`, `kenos-orchestrator`, `prompt-injection-benchmark` and
-  `aiproxyguard-promptest`, and not one outbound message went back to
+  four repositories, and not one outbound message went back to
   the operator. Answering looked indistinguishable from being ignored.
 
   The inline path now reports the same three outcomes the sweeper
@@ -1052,7 +1051,7 @@ during the dogfood validation:
 
 - **`setup` no longer lists the personalization repo under
   `repos:`.** When the operator's personalization repo lives under
-  one of the configured owners (e.g. `alice/dotclaude` while `alice`
+  one of the configured owners (e.g. `alice/agent-config` while `alice`
   is also an enumerated owner), it was being added to the dev
   pipeline's monitored set — the poller would have polled it for
   issues and worktree-cloned it. The repo is the cross-machine sync
@@ -1214,7 +1213,7 @@ personalization flow.
 ### Docs
 
 - **[Personalization sync](docs/personalization.md)** (#125). New
-  page (nav order 8) covering setup, the dotclaude repo layout, the
+  page (nav order 8) covering setup, the personalization repo layout, the
   init/status/push/pull lifecycle, `--no-adopt`, auto-pull cron,
   multi-machine bootstrap, and the gotchas (worktrees, edit-through-
   symlink semantics, allowlist enforcement, conflict handling, strict
