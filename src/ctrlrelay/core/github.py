@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -364,6 +365,71 @@ class GitHubCLI:
         for issue in issues:
             issue["repo"] = (issue.get("repository") or {}).get("nameWithOwner", "")
         return issues
+
+    async def search_open_issues(
+        self,
+        *,
+        repos: Sequence[str],
+        assignee: str | None = None,
+        label: str | None = None,
+        limit: int = 1000,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Open issues in ``repos`` assigned to ``assignee`` or carrying
+        ``label``, in ONE ``gh search issues`` call rather than one call per
+        repo (#282): the poller's intake, whatever the number of repos.
+
+        The search is scoped to the owners of ``repos`` and the rows are
+        then kept only for ``repos`` (matched without regard to case), keyed
+        by the configured name. Every configured repo is a key, with ``[]``
+        when nothing matched, so a caller can tell "looked, found nothing"
+        from "did not look": a failed search raises ``GitHubError`` and
+        returns nothing. A result of exactly ``limit`` rows may have been
+        cut short, so it raises too rather than pass for complete.
+        """
+        if (assignee is None) == (label is None):
+            raise ValueError("pass exactly one of assignee or label")
+        by_name = {r.lower(): r for r in repos}
+        owners = sorted({r.split("/", 1)[0] for r in repos if "/" in r})
+        args = [
+            "search", "issues", "--state", "open", "--limit", str(limit),
+            "--json",
+            "repository,number,title,state,body,labels,assignees,createdAt,updatedAt",
+        ]
+        if assignee is not None:
+            args += ["--assignee", assignee]
+        else:
+            args += ["--label", label]
+        for owner in owners:
+            args += ["--owner", owner]
+        output = await self._run_gh(*args)
+        rows = json.loads(output) if output.strip() else []
+        if len(rows) >= limit:
+            raise GitHubError(
+                f"gh search issues returned {len(rows)} rows, the most it "
+                "returns, so the answer may be incomplete"
+            )
+        out: dict[str, list[dict[str, Any]]] = {r: [] for r in repos}
+        for row in rows:
+            name = (row.get("repository") or {}).get("nameWithOwner", "")
+            repo = by_name.get(str(name).lower())
+            if repo is not None:
+                out[repo].append(row)
+        return out
+
+    async def list_label_events(
+        self,
+        repo: str,
+        issue_number: int,
+    ) -> list[dict[str, Any]]:
+        """``labeled`` events for an issue, oldest first, every page. On a
+        ``labeled`` event ``actor`` is the account that added the label
+        (unlike an ``assigned`` event, where it is the assignee, #274)."""
+        output = await self._run_gh(
+            "api", "--paginate",
+            f"/repos/{repo}/issues/{issue_number}/events",
+            "--jq", '.[] | select(.event=="labeled")',
+        )
+        return [json.loads(line) for line in output.splitlines() if line.strip()]
 
     async def current_login(self) -> str:
         """The login ``gh`` is authenticated as (``gh api user``).

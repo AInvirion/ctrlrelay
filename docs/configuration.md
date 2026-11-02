@@ -404,7 +404,7 @@ web:
   port: 8787
   history_days: 7
   refresh_seconds: 5
-  github_check_seconds: 60
+  github_check_seconds: 300
   stale_after_minutes: 15
   allowed_hosts: []          # e.g. ["mybox", "mybox.lan"]
 ```
@@ -415,7 +415,7 @@ web:
 | `port` | int (1-65535) | `8787` | Port to listen on. |
 | `history_days` | int (>= 1) | `7` | Days of feed the page shows, and what `/api/events` returns without `?since=`. |
 | `refresh_seconds` | int (>= 1) | `5` | How often the page asks `/api/status` again. |
-| `github_check_seconds` | int (>= 15) | `60` | How often the waiting line asks GitHub (one search, plus one query per `include_labels` label). |
+| `github_check_seconds` | int (>= 15) | `300` | How often the waiting line asks GitHub (one search, plus one query per `include_labels` label). Every check spends from the GitHub account's budget, which machines on the account share. |
 | `stale_after_minutes` | int (>= 1) | `15` | A running card is marked "looks stuck" after this long with no new agent step, unless ctrlrelay itself has a CI wait or review open for it. |
 | `allowed_hosts` | list of strings | `[]` | Extra names the page may be opened by. A request is served only when its `Host` header is `localhost`, `127.0.0.1`, `[::1]`, `host` (unless it is `0.0.0.0`/`::`), this machine's hostname, the hostname plus `.local`, or one of these, alone or followed by `:port`. Anything else, or no `Host`, gets `421`. Matching ignores case and a trailing dot. This stops a web page on another site from pointing its own name at this server (DNS rebinding) and reading it. |
 
