@@ -51,6 +51,13 @@ _GIT_TRANSFER_TIMEOUT_SECONDS = 1800
 # a non-fast-forward rejection.
 _BOT_BRANCH_REFSPEC = "+refs/heads/dependabot/*:refs/heads/dependabot/*"
 
+# ...and the same pattern as a negative refspec, so the fetch that
+# carries every other branch leaves them alone. Keeping the two fetches
+# disjoint is what lets only one of them prune (#243), and it also
+# removes the ordering dependency that made a rebased bot branch a
+# tolerated rejection under the plain refspec.
+_NOT_BOT_BRANCHES_REFSPEC = "^refs/heads/dependabot/*"
+
 
 def _rejections_are_only_non_fast_forward(stderr: str) -> list[str]:
     """Return the refs a fetch declined to rewind, or ``[]`` if the
@@ -1335,23 +1342,36 @@ class WorktreeManager:
           gets to inspect divergence and decide.
         - Local and origin equal: no-op.
 
-        ``--prune`` drops refs that no longer exist on origin so
-        deleted branches don't linger forever.
+        Two fetches, not one, and only the first prunes (#243).
+        ``--prune`` is per command and scoped to that command's
+        refspecs, so ``--prune`` paired with ``refs/heads/*`` deletes
+        every local branch origin does not have — measured on 31 Oct,
+        a branch made in the clone went with
+        ``- [deleted]  (none)  -> held``. A blocked session whose
+        branch was never pushed lost it the next time any run touched
+        that repo, and its commits were then reachable only from the
+        worktree's HEAD, one ``git gc`` from gone. So:
 
-        Two things keep that non-force refspec from failing the
-        caller, both learned from a secops sweep that died on
-        ``AInvirion/zzsites`` with ``main`` already updated:
-
-        - ``dependabot/*`` is fetched with a force refspec first.
+        - ``dependabot/*`` with a force refspec **and** ``--prune``.
           Dependabot rebases its branches, which rewrites their tips,
-          so under a plain refspec every rebase is a rejection. These
-          branches are bot-authored and never carry local work, so
-          rewinding one destroys nothing. Twelve bare repos were
-          holding such a ref when this was found.
-        - Any rejection that survives is tolerated rather than raised.
-          Git exits 1 on a declined rewind even when every other ref
-          applied, and that exit code was aborting the whole session
-          for a branch it had correctly protected.
+          so under a plain refspec every rebase is a rejection — a
+          secops sweep died on ``AInvirion/zzsites`` that way with
+          ``main`` already updated, and twelve bare repos were holding
+          such a ref. These branches are bot-authored, never carry
+          local work, and are the ones that actually pile up, so this
+          is where pruning belongs.
+        - Everything else with the plain refspec and **no** ``--prune``,
+          with ``dependabot/*`` excluded by a negative refspec so the
+          two never overlap. A branch origin deleted therefore lingers
+          here; that is the trade, and the branch-reuse path in
+          :meth:`create_worktree_with_new_branch` already has to
+          recognise a local-only ref and decide whether its commits
+          are already merged.
+
+        Any rejection that survives either fetch is tolerated rather
+        than raised. Git exits 1 on a declined rewind even when every
+        other ref applied, and that exit code was aborting the whole
+        session for a branch it had correctly protected.
 
         The default branch is the exception: tolerating a rejection
         there would swap a loud failure for work done quietly on a stale
@@ -1391,11 +1411,26 @@ class WorktreeManager:
                 for branch in await self._checked_out_branches(bare_path)
                 if branch != default_branch
             ] if default_branch else []
+            # The bot branches: force refspec, and the only --prune.
+            # `skip` applies here too — git refuses the WHOLE fetch over
+            # a checked-out branch, and a secops run can have a
+            # dependabot branch checked out. Excluding one also spares
+            # it the prune, which is the answer we want anyway.
+            await self._run_git(
+                "fetch", "--prune", "origin",
+                _BOT_BRANCH_REFSPEC,
+                *skip,
+                cwd=bare_path,
+                timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+                tolerate_non_fast_forward=True,
+            )
+            # Every other branch: no --prune, so a local-only branch
+            # survives (#243).
             try:
                 await self._run_git(
-                    "fetch", "--prune", "origin",
-                    _BOT_BRANCH_REFSPEC,
+                    "fetch", "origin",
                     "refs/heads/*:refs/heads/*",
+                    _NOT_BOT_BRANCHES_REFSPEC,
                     *skip,
                     cwd=bare_path,
                     timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
@@ -1407,10 +1442,71 @@ class WorktreeManager:
                 )
             except DefaultBranchDivergedError as e:
                 await self._set_aside_and_reclone(repo, bare_path, e)
+            else:
+                await self._follow_origin_default(repo, bare_path, default_branch)
         else:
             await self._clone_bare(repo, bare_path)
 
         return bare_path
+
+    async def _follow_origin_default(
+        self, repo: str, bare_path: Path, default_branch: str,
+    ) -> None:
+        """Point the clone's HEAD at origin's default branch when origin
+        changed it. The fetch no longer prunes branches (#243), so a
+        renamed default's old branch stays here, and without this the
+        clone would keep cutting sessions from it. HEAD moves only when
+        the new default is here at the commit origin reports, so a stale
+        or diverged local branch is never adopted; anything else is left
+        for the next update and logged, never silent."""
+        try:
+            out = await self._run_git(
+                "ls-remote", "--symref", "origin", "HEAD",
+                cwd=bare_path, timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+            )
+        except WorktreeError as exc:
+            log_event(
+                _logger, "worktree.default_branch_unchecked", repo=repo,
+                reason=str(exc)[:200],
+            )
+            return
+        prefix, suffix = "ref: refs/heads/", "\tHEAD"
+        new = next(
+            (line[len(prefix):-len(suffix)] for line in out.splitlines()
+             if line.startswith(prefix) and line.endswith(suffix)),
+            "",
+        )
+        remote_sha = next(
+            (line.split("\t", 1)[0] for line in out.splitlines()
+             if line.endswith("\tHEAD") and not line.startswith("ref: ")),
+            "",
+        )
+        if not new or new == default_branch:
+            return
+        try:
+            local_sha = (await self._run_git(
+                "rev-parse", "--verify", "--quiet", f"refs/heads/{new}",
+                cwd=bare_path,
+            )).strip()
+        except WorktreeError:
+            local_sha = ""
+        if not remote_sha or local_sha != remote_sha:
+            log_event(
+                _logger, "worktree.default_branch_not_followed", repo=repo,
+                old=default_branch or None, new=new,
+                reason="not here yet" if not local_sha else "not current",
+            )
+            return
+        try:
+            await self._run_git(
+                "symbolic-ref", "HEAD", f"refs/heads/{new}", cwd=bare_path,
+            )
+        except WorktreeError:
+            return
+        log_event(
+            _logger, "worktree.default_branch_changed", repo=repo,
+            old=default_branch or None, new=new,
+        )
 
     async def _checked_out_branches(self, bare_path: Path) -> list[str]:
         """Branches checked out in this clone's linked worktrees."""
@@ -1444,8 +1540,9 @@ class WorktreeManager:
 
         The old clone is never deleted here, and the operator is told
         where it went so they can delete it. It holds what the failed
-        fetch left: that fetch's ``--prune`` may already have dropped
-        local branches origin does not have, as every fetch here does.
+        fetch left: the bot-branch fetch that ran before it prunes
+        ``dependabot/*`` refs origin no longer has. Branches outside
+        that namespace are not pruned by any fetch here (#243).
 
         Refused, re-raising ``cause``, while any worktree is registered
         in the clone: a BLOCKED session keeps its worktree for the
