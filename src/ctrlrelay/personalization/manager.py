@@ -401,7 +401,14 @@ class PersonalizationManager:
         #      committed by them manually after push completes. This
         #      pairs with the pathspec-scoped commit (Codex pass 12)
         #      to make the allowlist a hard guarantee.
-        self._git("reset", "--mixed")
+        try:
+            self._git("reset", "--mixed")
+        except _GitError as e:
+            # Ensure that any git reset failures are made visible - 
+            # they might cause the silent failure described in issue #287
+            raise PersonalizationError(
+                f"Failed to reset working tree: {e.stderr.strip() or e.stdout.strip()}"
+            )
 
         # Stage and commit once up-front; the commit object stays the
         # same across retries, only the rebase base shifts.
@@ -432,16 +439,21 @@ class PersonalizationManager:
                 # mode-bit churn). Treat as a no-op so push is
                 # idempotent.
                 if "nothing to commit" not in (e.stdout + e.stderr).lower():
-                    raise
+                    # Properly surface other git commit errors that could cause silent failures - 
+                    # this addresses issue #287 where app-written settings keys cause silent failures
+                    raise PersonalizationError(
+                        f"Failed to commit personalization changes: {e.stderr.strip() or e.stdout.strip()}"
+                    )
 
         last_summary = ""
         for attempt in range(1, self._PUSH_MAX_ATTEMPTS + 1):
             try:
                 self._git("fetch", "origin", "--prune")
             except _GitError as e:
-                return PushResult(
-                    success=False,
-                    summary=f"fetch failed: {e.stderr.strip() or e.stdout.strip()}",
+                # Enhance error reporting for fetch failures - they could cause silent failures
+                # where the system reports success but doesn't actually synchronize changes 
+                raise PersonalizationError(
+                    f"Failed to fetch from origin: {e.stderr.strip() or e.stdout.strip()}"
                 )
 
             rebase = self._git_capturing(
