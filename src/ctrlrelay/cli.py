@@ -5052,6 +5052,12 @@ def setup(
         console.print("  daemon unit files:")
         for p in result.daemon_units:
             console.print(f"    - {p}")
+        if result.daemon_unresolved:
+            console.print(
+                "  [yellow]warning:[/yellow] the units still carry "
+                f"{', '.join('${'+v+'}' for v in result.daemon_unresolved)}; "
+                "export it and re-run with --force, or edit the files by hand."
+            )
         console.print(
             "\n[bold]Next:[/bold] bootstrap the daemons via:\n"
             "  launchctl bootstrap gui/$(id -u) <plist>"

@@ -894,6 +894,48 @@ class TestSetupCli:
         assert 'Environment="CTRLRELAY_TELEGRAM_TOKEN' not in text
         assert "<key>CTRLRELAY_TELEGRAM_TOKEN</key>" not in text
 
+    def test_install_daemons_without_the_token_says_so(
+        self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A unit written with the token still a placeholder must be
+        reported, not listed as if it were ready to start."""
+        from ctrlrelay import install as install_mod
+        from ctrlrelay import setup as setup_mod
+
+        tmp_config_out = tmp_path / "cfg.yaml"
+        monkeypatch.setattr(setup_mod, "DEFAULT_CONFIG_OUT", tmp_config_out)
+        monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+        monkeypatch.delenv("CTRLRELAY_MATTERMOST_TOKEN", raising=False)
+        monkeypatch.delenv("CTRLRELAY_TELEGRAM_TOKEN", raising=False)
+        target_dir = tmp_path / "units"
+        for name in ("render_launchd", "render_systemd"):
+            original = getattr(install_mod, name)
+
+            def to_tmp(_orig=original, **kwargs):  # type: ignore[no-untyped-def]
+                kwargs["target_dir"] = target_dir
+                return _orig(**kwargs)
+
+            monkeypatch.setattr(install_mod, name, to_tmp)
+
+        fake_gh["repos_by_owner"] = {"alice": []}
+        result = runner.invoke(
+            app,
+            [
+                "setup",
+                "--yes",
+                "--repo-root", str(tmp_path / "Projects"),
+                "--config-out", str(tmp_config_out),
+                "--no-personalization",
+                "--transport", "mattermost",
+                "--mattermost-url", "https://chat.example.test",
+                "--mattermost-channel-id", "c" * 26,
+                "--install-daemons",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "${CTRLRELAY_MATTERMOST_TOKEN}" in result.output
+        assert "warning" in result.output
+
     def test_clone_failure_surfaces_nonzero_exit_even_with_daemons(
         self, fake_gh: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

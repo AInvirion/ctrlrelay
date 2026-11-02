@@ -135,6 +135,9 @@ class SetupResult:
     personalization_summary: str | None = None
     personalization_failed: bool = False
     daemon_units: list[Path] = field(default_factory=list)
+    # Template variables the written units still carry as placeholders,
+    # e.g. a token variable that was not set when setup ran.
+    daemon_unresolved: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -597,8 +600,9 @@ def run_setup(options: SetupOptions) -> SetupResult:
             personalization_failed = True
 
     daemon_units: list[Path] = []
+    daemon_unresolved: list[str] = []
     if options.install_daemons:
-        daemon_units = _install_daemons(options, config)
+        daemon_units, daemon_unresolved = _install_daemons(options, config)
 
     return SetupResult(
         config_out=options.config_out,
@@ -610,10 +614,13 @@ def run_setup(options: SetupOptions) -> SetupResult:
         personalization_summary=personalization_summary,
         personalization_failed=personalization_failed,
         daemon_units=daemon_units,
+        daemon_unresolved=daemon_unresolved,
     )
 
 
-def _install_daemons(options: SetupOptions, config: Config) -> list[Path]:
+def _install_daemons(
+    options: SetupOptions, config: Config,
+) -> tuple[list[Path], list[str]]:
     """Render and write launchd or systemd unit files based on platform.
 
     Exports the chosen transport's token so the rendered unit doesn't
@@ -680,4 +687,5 @@ def _install_daemons(options: SetupOptions, config: Config) -> list[Path]:
             else:
                 os.environ[var] = prior
 
-    return written
+    unresolved = sorted({v for u in units for v in u.unresolved})
+    return written, unresolved

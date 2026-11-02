@@ -300,8 +300,8 @@ def write_units(
     when the directory is missing; combined with ``Restart=always``
     that's an immediate crash-loop (#137).
 
-    Unit files are chmod'd ``0600`` after writing since they embed the
-    chat token as plaintext.
+    Unit files are owner-only (``0600``) before the content is written,
+    since they embed the chat token as plaintext.
     """
     (Path.home() / ".ctrlrelay" / "logs").mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -312,7 +312,12 @@ def write_units(
                 f"refusing to overwrite {unit.target_path}; "
                 "pass --force to replace it"
             )
-        unit.target_path.write_text(unit.content, encoding="utf-8")
-        unit.target_path.chmod(0o600)
+        # Owner-only before a byte of the token is written: a new file is
+        # created 0600, and an existing one is narrowed before truncating.
+        fd = os.open(unit.target_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            os.fchmod(fd, 0o600)
+            fh.truncate(0)
+            fh.write(unit.content)
         written.append(unit.target_path)
     return written

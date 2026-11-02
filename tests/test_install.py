@@ -852,3 +852,19 @@ def test_a_token_named_like_a_variable_the_unit_sets_is_refused(tmp_path, name) 
 
     with pytest.raises(ValueError, match="already set"):
         render_systemd(workdir=tmp_path, target_dir=tmp_path, token_env_var=name)
+
+
+def test_an_existing_open_unit_is_made_owner_only(tmp_path, monkeypatch) -> None:
+    from ctrlrelay.install import RenderedUnit, write_units
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    target = tmp_path / "u.service"
+    target.write_text("old")
+    target.chmod(0o644)
+    unit = RenderedUnit(
+        platform="systemd", service="bridge", target_path=target,
+        content="Environment=X=secret\n", unresolved=[], token_env_var="X",
+    )
+    write_units([unit], overwrite=True)
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert target.read_text() == "Environment=X=secret\n"
