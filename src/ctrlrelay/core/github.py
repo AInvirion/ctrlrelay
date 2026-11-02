@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -94,6 +95,21 @@ def _find_gh() -> str:
             return path
     return "gh"
 
+
+
+# GitHub refuses search queries longer than 256 characters; kept below it.
+_SEARCH_QUERY_MAX = 240
+
+# One page of ``search/issues`` as one JSON line, with the rows in
+# ``gh issue list``'s field names (#282).
+_SEARCH_PAGE_JQ = (
+    "{incomplete: .incomplete_results, total: .total_count, items: [.items[] | "
+    "{number, title, state, body, labels: [.labels[] | {name}], "
+    "assignees: [.assignees[] | {login}], createdAt: .created_at, "
+    "updatedAt: .updated_at, "
+    "repo: (.repository_url | sub(\"^https://api.github.com/repos/\"; \"\"))}]}"
+    " | tojson"
+)
 
 @dataclass
 class GitHubCLI:
@@ -364,6 +380,96 @@ class GitHubCLI:
         for issue in issues:
             issue["repo"] = (issue.get("repository") or {}).get("nameWithOwner", "")
         return issues
+
+    async def search_open_issues(
+        self,
+        *,
+        repos: Sequence[str],
+        assignee: str | None = None,
+        label: str | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Open issues in ``repos`` assigned to ``assignee`` or carrying
+        ``label``, in ONE search rather than one call per repo (#282): the
+        poller's intake, whatever the number of repos.
+
+        GitHub's search API directly (``gh api search/issues``), because
+        it says when an answer is partial: a page marked
+        ``incomplete_results`` (the search timed out on GitHub's side), or
+        fewer rows than ``total_count`` (more than search returns), raises
+        ``GitHubError`` rather than pass for complete, and so do empty or
+        unreadable output. Scoped to the owners of ``repos``; rows are kept
+        only for ``repos`` (matched without regard to case) and keyed by
+        the configured name. Every configured repo is a key, with ``[]``
+        when nothing matched, so "looked, found nothing" differs from "did
+        not look", which raises. Rows use ``gh issue list``'s field names.
+        """
+        if (assignee is None) == (label is None):
+            raise ValueError("pass exactly one of assignee or label")
+        by_name = {r.lower(): r for r in repos}
+        owners = sorted({r.split("/", 1)[0] for r in repos if "/" in r})
+        base = ["is:issue", "is:open"]
+        if assignee is not None:
+            base.append(f"assignee:{assignee}")
+        else:
+            base.append('label:"' + label.replace('"', "") + '"')
+        # GitHub caps a search query's length, so owners are split across
+        # as few queries as fit: the count grows with the number of
+        # owners, never with the number of repos.
+        queries: list[list[str]] = [[]]
+        for owner in owners:
+            term = f"user:{owner}"
+            if queries[-1] and len(" ".join(base + queries[-1] + [term])) > _SEARCH_QUERY_MAX:
+                queries.append([])
+            queries[-1].append(term)
+        rows: list[dict[str, Any]] = []
+        for owner_terms in queries:
+            rows += await self._search_issue_pages(" ".join(base + owner_terms))
+        out: dict[str, list[dict[str, Any]]] = {r: [] for r in repos}
+        for row in rows:
+            repo = by_name.get(str(row.get("repo", "")).lower())
+            if repo is not None:
+                out[repo].append(row)
+        return out
+
+    async def _search_issue_pages(self, query: str) -> list[dict[str, Any]]:
+        """Every row of one search, or ``GitHubError`` when the answer
+        could be partial or could not be read."""
+        output = await self._run_gh(
+            "api", "-X", "GET", "search/issues", "--paginate",
+            "-f", "q=" + query, "-f", "per_page=100",
+            "--jq", _SEARCH_PAGE_JQ,
+        )
+        pages = [json.loads(line) for line in output.splitlines() if line.strip()]
+        if not pages or not all(isinstance(p, dict) and "items" in p for p in pages):
+            raise GitHubError("gh api search/issues gave no readable answer")
+        if any(p.get("incomplete") for p in pages):
+            raise GitHubError("GitHub marked the search incomplete")
+        rows = [row for p in pages for row in p["items"]]
+        totals = {p.get("total") for p in pages}
+        # Every page must agree on the total: one that changed mid-way means
+        # the result set moved while it was being read.
+        total = totals.pop() if len(totals) == 1 else None
+        if not isinstance(total, int) or len(rows) < total:
+            raise GitHubError(
+                f"the search returned {len(rows)} of {total} issues, so the "
+                "answer may be incomplete"
+            )
+        return rows
+
+    async def list_label_events(
+        self,
+        repo: str,
+        issue_number: int,
+    ) -> list[dict[str, Any]]:
+        """``labeled`` events for an issue, oldest first, every page. On a
+        ``labeled`` event ``actor`` is the account that added the label
+        (unlike an ``assigned`` event, where it is the assignee, #274)."""
+        output = await self._run_gh(
+            "api", "--paginate",
+            f"/repos/{repo}/issues/{issue_number}/events",
+            "--jq", '.[] | select(.event=="labeled")',
+        )
+        return [json.loads(line) for line in output.splitlines() if line.strip()]
 
     async def current_login(self) -> str:
         """The login ``gh`` is authenticated as (``gh api user``).

@@ -142,3 +142,27 @@ def _fresh_relay_alert_registries():
     yield
     cli_module._RELAY_ALERT_TASKS.clear()
     cli_module._RELAY_ALERT_SENDS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _poller_search_from_per_repo_fakes(monkeypatch):
+    """#282: the poller asks GitHub once per poll (``search_open_issues``).
+    A test whose fake GitHub does not define that call gets it answered from
+    its per-repo ``list_assigned_issues`` / ``list_issues_by_label`` fakes
+    (see ``tests/_poller_fakes.py``). A test that defines it keeps its own."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from ctrlrelay.core.poller import IssuePoller
+    from tests._poller_fakes import wire_search
+
+    original = IssuePoller.__post_init__
+
+    def post_init(self) -> None:
+        gh = self.github
+        if isinstance(gh, (MagicMock, AsyncMock)) and (
+            "search_open_issues" not in gh._mock_children
+        ):
+            wire_search(gh, operator=self.username)
+        original(self)
+
+    monkeypatch.setattr(IssuePoller, "__post_init__", post_init)

@@ -23,6 +23,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   branch-reuse path already recognises a local-only ref and decides whether
   its commits are merged (#243).
 
+## [0.17.0] - 2026-11-01
+
+Polling costs one GitHub search instead of one call per repo. **No config
+edit is required.** Check one thing if you use `include_labels`: a trigger
+label now starts a run only when the configured user added it.
+
+### Changed
+
+- Each poll asks GitHub's search once for open issues assigned to the user
+  across all configured repos, plus once per distinct `include_labels`
+  label, instead of one `gh issue list` per repo and one "is it archived"
+  probe per repo. Measured on 87 repos: 1 call per poll, down from about
+  174. A repo is probed for "archived" only when it has an issue not yet
+  handled, and a "not archived" answer is kept for 6 hours (#283, closes
+  #282)
+- A search GitHub marks incomplete, or that returns fewer rows than its
+  total, fails the poll as "could not look": nothing is marked seen or
+  treated as new. A startup seed that could not look is finished before
+  the next poll, so issues already there are never read as new (#283)
+- A trigger label (`include_labels`) starts a run only when the configured
+  user added it, whatever `accept_foreign_assignments` says; the issue is
+  still taken if the user also assigned it to themselves. Before, anyone
+  who could label an issue could start a run (#283)
+- The post-merge PR watcher and the status page's GitHub check
+  (`web.github_check_seconds`) default to 300 s, from 60 s (#283)
+- GitHub logins compare without regard to case in the assignment and label
+  checks (#283)
+
 ## [0.16.4] - 2026-11-01
 
 Fixes for runs whose work could not be published. **No config edit is
@@ -2064,7 +2092,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.4...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.4...v0.17.0
 [0.16.4]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.1...v0.16.2
