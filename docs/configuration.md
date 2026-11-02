@@ -404,7 +404,7 @@ web:
   port: 8787
   history_days: 7
   refresh_seconds: 5
-  github_check_seconds: 60
+  github_check_seconds: 300
   stale_after_minutes: 15
   allowed_hosts: []          # e.g. ["mybox", "mybox.lan"]
 ```
@@ -415,7 +415,7 @@ web:
 | `port` | int (1-65535) | `8787` | Port to listen on. |
 | `history_days` | int (>= 1) | `7` | Days of feed the page shows, and what `/api/events` returns without `?since=`. |
 | `refresh_seconds` | int (>= 1) | `5` | How often the page asks `/api/status` again. |
-| `github_check_seconds` | int (>= 15) | `60` | How often the waiting line asks GitHub (one search, plus one query per `include_labels` label). |
+| `github_check_seconds` | int (>= 15) | `300` | How often the waiting line asks GitHub (one search, plus one query per `include_labels` label). Every check spends from the GitHub account's budget, which machines on the account share. |
 | `stale_after_minutes` | int (>= 1) | `15` | A running card is marked "looks stuck" after this long with no new agent step, unless ctrlrelay itself has a CI wait or review open for it. |
 | `allowed_hosts` | list of strings | `[]` | Extra names the page may be opened by. A request is served only when its `Host` header is `localhost`, `127.0.0.1`, `[::1]`, `host` (unless it is `0.0.0.0`/`::`), this machine's hostname, the hostname plus `.local`, or one of these, alone or followed by `:port`. Anything else, or no `Host`, gets `421`. Matching ignores case and a trailing dot. This stops a web page on another site from pointing its own name at this server (DNS rebinding) and reading it. |
 
@@ -623,21 +623,25 @@ repos:
 - An issue is accepted when **either** (a) it's assigned to the configured
   user (subject to the self-assignment filter from #79 and
   `accept_foreign_assignments`) **or** (b) it carries any label in
-  `include_labels`. A label match **skips** the self-assignment check — the
-  operator's config choice is the trust boundary.
+  `include_labels` **that the configured user added** (the latest
+  `labeled` event for that label names that account; `accept_foreign_assignments`
+  does not widen this). A label someone else added does not start a run;
+  the issue is still taken if the user also assigned it to themselves.
 - Dedup: an issue that is **both** labeled and assigned is picked up exactly
   once per poll cycle — no duplicate entries in `seen_issues` and no double
   pipeline spawn.
 - `exclude_labels` always wins over `include_labels` on the same issue: an
   explicit "not for the agent" opt-OUT beats the generic label opt-IN.
-- When a repo configures `include_labels`, the poller runs **targeted**
-  queries per cycle: the existing `gh issue list --assignee <user>` plus
-  one `gh issue list --label <L>` call per configured label. Results merge
-  by issue number. This keeps the label path scale-safe on busy repos
-  where an unfiltered fetch would silently cap at gh's `--limit` and miss
-  labeled issues on later pages. Repos without `include_labels` run only
-  the cheap `--assignee` query, so enabling the feature on one repo does
-  not add API calls on the others.
+- Each poll asks GitHub's search **once** for open issues assigned to the
+  user across all configured repos, plus **once per distinct
+  `include_labels` label** across the repos using it, whatever the number
+  of repos (split by owner only if the owner list is too long for one
+  query). A search GitHub marks incomplete, or that returns fewer rows
+  than its total, fails the poll as "could not look": nothing is marked
+  seen and nothing is treated as new. After that, only issues not yet
+  handled cost a call each (who assigned it, or who added the label), and
+  a repo is asked whether it is archived only when it has such an issue,
+  at most once every 6 hours.
 - The event log entry for a label-triggered acceptance is
   `poll.issue.included_by_label`, alongside the existing
   `poll.issue.excluded_by_label` for exclusions.

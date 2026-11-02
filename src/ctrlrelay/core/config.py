@@ -349,7 +349,7 @@ class WebConfig(BaseModel):
     refresh_seconds: int = Field(default=5, ge=1)
     # How often the waiting line asks GitHub. One search per check, plus
     # one query per include label; below 15 s that spends the rate limit.
-    github_check_seconds: int = Field(default=60, ge=15)
+    github_check_seconds: int = Field(default=300, ge=15)
     # A running card with no new agent step for this long, and no CI wait
     # or review open, is marked "looks stuck".
     stale_after_minutes: int = Field(default=15, ge=1)
