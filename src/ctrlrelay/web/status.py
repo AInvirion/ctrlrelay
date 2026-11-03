@@ -41,7 +41,14 @@ Contract (keys exactly; every timestamp is ``<name>_ts`` epoch seconds plus
      "feed_total": int | null,       # events in the history window
      "feed_truncated": bool,         # feed_total > len(feed)
      "feed_limit": int,              # the most events feed can hold
+     "numbers": {"windows": [<window>, ...]} | null,   # see web.numbers
      "errors": [str]}
+
+``numbers`` (#230) is how this node's runs went over the last 7 and 30
+days; every field is defined in :mod:`ctrlrelay.web.numbers`. It is
+``null`` (and ``errors`` says why) when the sessions cannot be read; when
+only the events cannot, the times inside it are ``null`` and each window's
+``unavailable`` says why.
 
 ``feed`` holds at most ``feed_limit`` (``FEED_LIMIT``) events. ``feed_total`` counts every
 event in the history window, read in the same transaction; it is ``null``
@@ -94,6 +101,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
+from ctrlrelay.web import numbers as run_numbers
 from ctrlrelay.web.fleet import node_activity
 from ctrlrelay.web.links import github_url
 from ctrlrelay.web.transcript import Phase, furthest_of, read_activity
@@ -661,6 +669,7 @@ def build_status(
     day_start, day_end = _local_day(now)
     feed_since = now - history_days * 86_400
     feed_limit = FEED_LIMIT
+    numbers_since = run_numbers.window_start(now, max(run_numbers.WINDOWS))
 
     def read_all(conn: sqlite3.Connection) -> dict[str, Any]:
         section_errors: list[str] = []
@@ -683,6 +692,18 @@ def build_status(
             "feed": _section(
                 section_errors, "events", lambda: _read_feed(conn, feed_since, feed_limit)
             ),
+            "runs": _section(
+                section_errors, "sessions",
+                lambda: run_numbers.read_runs(conn, numbers_since, now),
+            ),
+            "came_back": _section(
+                section_errors, "sessions",
+                lambda: run_numbers.read_came_back(conn, numbers_since, now),
+            ),
+            "pr_times": _section(
+                section_errors, "events",
+                lambda: run_numbers.read_pr_times(conn, numbers_since),
+            ),
             "errors": section_errors,
         }
 
@@ -697,6 +718,7 @@ def build_status(
     feed: list[dict[str, Any]] | None = None
     feed_total: int | None = None
     today: dict[str, int | None] = dict.fromkeys(_TODAY.values())
+    numbers: dict[str, Any] | None = None
     if snap is not None:
         for err in snap["errors"]:
             if err not in errors:
@@ -731,6 +753,16 @@ def build_status(
             today = dict(snap["today"])
         if not isinstance(snap["feed"], _Missing):
             feed, feed_total = snap["feed"]
+        if not isinstance(snap["runs"], _Missing) and not isinstance(
+            snap["came_back"], _Missing
+        ):
+            pr_times = snap["pr_times"]
+            got = _section(errors, "numbers", lambda: run_numbers.build_numbers(
+                now=now, runs=snap["runs"], came_back=snap["came_back"],
+                pr_times=None if isinstance(pr_times, _Missing) else pr_times,
+                history_days=history_days,
+            ))
+            numbers = None if isinstance(got, _Missing) else got
 
     if node_block is not None:
         try:
@@ -772,6 +804,7 @@ def build_status(
         "feed_truncated": feed is not None and feed_total is not None
         and feed_total > len(feed),
         "feed_limit": feed_limit,
+        "numbers": numbers,
         "errors": errors,
     }
 

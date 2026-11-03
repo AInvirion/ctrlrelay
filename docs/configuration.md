@@ -413,7 +413,7 @@ web:
 |---|---|---|---|
 | `host` | string | `"127.0.0.1"` | Address to listen on, exactly. Loopback by default so a fresh install is never reachable from other machines. Set it to this machine's LAN address to open the page from the home network. `0.0.0.0` listens on every interface and is warned about at startup. |
 | `port` | int (1-65535) | `8787` | Port to listen on. |
-| `history_days` | int (>= 1) | `7` | Days of feed the page shows, and what `/api/events` returns without `?since=`. |
+| `history_days` | int (>= 1) | `7` | Days of feed the page shows, and what `/api/events` returns without `?since=`. Events older than this are deleted, so the run numbers' time to PR and time to merge are shown only for windows no longer than this (the 30-day ones need at least `30`). |
 | `refresh_seconds` | int (>= 1) | `5` | How often the page asks `/api/status` again. |
 | `github_check_seconds` | int (>= 15) | `300` | How often the waiting line asks GitHub (one search, plus one query per `include_labels` label). Every check spends from the GitHub account's budget, which machines on the account share. |
 | `stale_after_minutes` | int (>= 1) | `15` | A running card is marked "looks stuck" after this long with no new agent step, unless ctrlrelay itself has a CI wait or review open for it. |

@@ -134,6 +134,12 @@ details > summary {
   color: var(--muted); margin: 0 0 8px; font-weight: 700;
 }
 details > summary .count { font-weight: 400; margin-left: 6px; }
+.numbers-wrap { overflow-x: auto; }
+table.numbers { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+table.numbers th, table.numbers td { text-align: right; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.numbers th:first-child, table.numbers td:first-child { text-align: left; white-space: normal; }
+#numbers details { margin-top: 10px; }
+#numbers .gaps { margin: 8px 0 0; padding-left: 18px; }
 </style>
 </head>
 <body data-refresh-seconds="__REFRESH_SECONDS__">
@@ -176,6 +182,10 @@ details > summary .count { font-weight: 400; margin-left: 6px; }
       <h2>Today</h2>
       <div id="today"><p class="unknown">loading…</p></div>
       <div id="today-list" aria-live="polite"></div>
+    </section>
+    <section>
+      <h2>Numbers</h2>
+      <div id="numbers"><p class="unknown">loading…</p></div>
     </section>
   </div>
   <div>
@@ -976,6 +986,98 @@ function renderTodayList(data) {
   put(target, note ? [note, list] : [list]);
 }
 
+// #230: the columns of a Numbers row, and the text of one cell each.
+var NUMBER_COLUMNS = [
+  "runs", "done", "failed", "blocked", "running", "success", "time to PR",
+  "time to merge", "came back", "cost / run"
+];
+
+function medianText(m) {
+  if (!m || typeof m !== "object") { return "unknown"; }
+  if (typeof m.median !== "number") { return "none yet"; }
+  return duration(m.median) + " (n=" + m.n + ")";
+}
+
+function countText(v) { return typeof v === "number" ? String(v) : "unknown"; }
+
+// One row's cells, from a window's overall or per-repo counts. A null is
+// "unknown" (or "not recorded" for cost), never 0 or blank.
+function numberCells(c) {
+  return [
+    countText(c.started), countText(c.done), countText(c.failed),
+    countText(c.blocked), countText(c.running),
+    typeof c.success_rate === "number" ? Math.round(c.success_rate * 100) + "%" :
+      (typeof c.started === "number" ? "none finished" : "unknown"),
+    medianText(c.time_to_pr_s), medianText(c.time_to_merge_s),
+    countText(c.came_back),
+    typeof c.cost_per_run === "number" ? String(c.cost_per_run) : "not recorded"
+  ];
+}
+
+function numbersTable(rows) {
+  var table = el("table", "numbers");
+  var head = el("tr");
+  head.appendChild(el("th", null, ""));
+  NUMBER_COLUMNS.forEach(function (c) { head.appendChild(el("th", null, c)); });
+  table.appendChild(head);
+  rows.forEach(function (r) {
+    var tr = el("tr");
+    tr.appendChild(el("td", null, r[0]));
+    numberCells(r[1]).forEach(function (t) { tr.appendChild(el("td", null, t)); });
+    table.appendChild(tr);
+  });
+  var wrap = el("div", "numbers-wrap");
+  wrap.appendChild(table);
+  return wrap;
+}
+
+function renderNumbers(data) {
+  var target = document.getElementById("numbers");
+  var n = data.numbers;
+  if (!n || !Array.isArray(n.windows)) {
+    put(target, [unknown("unknown: the runs could not be read")]);
+    return;
+  }
+  var parts = [numbersTable(n.windows.map(function (w) {
+    return ["last " + w.days + " days", w.overall || {}];
+  }))];
+  n.windows.forEach(function (w) {
+    var more = el("details");
+    more.appendChild(el("summary", null, "by repo, last " + w.days + " days"));
+    var repos = Array.isArray(w.by_repo) ? w.by_repo : [];
+    if (repos.length === 0) { more.appendChild(empty("no runs")); }
+    else {
+      more.appendChild(numbersTable(repos.map(function (r) { return [r.repo, r]; })));
+    }
+    var back = Array.isArray(w.came_back_issues) ? w.came_back_issues : [];
+    if (back.length) {
+      var list = el("ul", "plain");
+      back.forEach(function (i) {
+        var li = el("li");
+        li.appendChild(el("span", "muted", "came back: "));
+        li.appendChild(ghLink(i.url, i.repo + "#" + i.issue_number, "repo"));
+        list.appendChild(li);
+      });
+      more.appendChild(list);
+    }
+    parts.push(more);
+  });
+  var gaps = el("ul", "gaps muted");
+  var seen = {};
+  n.windows.forEach(function (w) {
+    var u = w.unavailable || {};
+    Object.keys(u).forEach(function (k) {
+      var line = k.replace(/_s$/, "").replace(/_/g, " ") + " (" + w.days + " days): " + u[k];
+      if (k === "cost_per_run" || k === "stuck") {
+        line = k.replace(/_/g, " ") + ": " + u[k];
+      }
+      if (!seen[line]) { seen[line] = true; gaps.appendChild(el("li", null, line)); }
+    });
+  });
+  if (gaps.firstChild) { parts.push(gaps); }
+  put(target, parts);
+}
+
 function detailText(detail) {
   if (detail === null || detail === undefined) { return ""; }
   if (typeof detail !== "object") { return String(detail); }
@@ -1044,6 +1146,7 @@ function render(data) {
   renderSkipped(data);
   renderToday(data);
   loadTodayList();
+  renderNumbers(data);
   renderFleet(data, now);
   renderUsage(data, now);
   renderServer(data);

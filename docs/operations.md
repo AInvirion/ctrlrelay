@@ -331,6 +331,23 @@ Added in #249:
 | `node.open_questions` | How many questions are waiting for an answer. |
 | `fleet` | `{peers: [...]}` with one item per `fleet.peers` URL: `url`, `name`, `reachable`, `checked_at`, `error`, `state`, `node` (that peer's `node` block), `last_known` (its last block while it does not answer) and `needs_you`. `null` when no peers are configured. |
 
+Added in #230: `numbers` is how this machine's runs went, for the last 7 and
+the last 30 days (`numbers.windows`, each with `days`, `since`/`since_ts`,
+`until`/`until_ts`). The page shows it in the **Numbers** box, with a table
+per repo under it. Numbers across machines are not here; they belong to the
+control plane. Every field is defined in `src/ctrlrelay/web/numbers.py`.
+
+| Field (in `overall` and in each `by_repo` item) | What |
+|---|---|
+| `started` | Runs (rows in the sessions table) started in the window, both ends included. A blocked run resumed after an answer is still one run. |
+| `done`, `failed`, `blocked`, `running`, `other` | How many of those runs have that status now. `running` includes a run left behind by a daemon that stopped mid-run. The five add up to `started`. |
+| `success_rate` | `done / (done + failed + blocked)`, 0 to 1; `null` when none has finished. |
+| `time_to_pr_s`, `time_to_merge_s` | `{median, n}`: seconds from the run's start to its first `pr_opened` (or `merged`) event, over the `n` runs that have one. `null` when events cannot be read, or when events are kept for fewer days than the window (`web.history_days`, 7 by default, so the 30-day times are `null` unless it is at least 30). |
+| `came_back` | Distinct issues dispatched again in the window after an earlier run on the same issue had ended `done`. The window's `came_back_issues` lists them (`repo`, `issue_number`, `url`; at most 50). An issue reopened on GitHub and not picked up again is not counted: ctrlrelay does not record reopening. |
+| `cost_per_run`, `stuck` | Always `null` for now: cost per run is not recorded yet (#223), and no run records that it was stuck (#224). The window's `unavailable` says this, and why any other field is `null`. |
+
+`numbers` is `null`, with a line in `errors`, when the sessions cannot be read.
+
 **The page with peers.** A **Machines** strip shows one card per machine,
 this one first: state, slots, 5-hour and 7-day usage, heartbeat age. A card is
 red when the machine is paused, silent, unknown, not reachable, or not read
