@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mode: merge` for a personalization path keeps the live file real and, on
+  pull, writes only the top-level JSON keys listed in the local
+  `merge_keys`, so `~/.claude/settings.json` can carry fleet policy while
+  the keys the app writes on its own stay on that machine and no longer
+  dirty the checkout. The synced file cannot widen the list; it must be a
+  JSON object; links, non-regular and foreign-owned files at the live path
+  are refused; writes are atomic at mode 0600 or stricter; logs name keys,
+  never values, and a change to `hooks`, `env`, `permissions`,
+  `apiKeyHelper` or `skipDangerousModePermissionPrompt` logs a warning.
+  `ctrlrelay personalization migrate` converts the old symlink once, on
+  request; pull and auto-pull refuse it instead (#287).
 - A third agent backend: `agent.type: "opencode"` runs sessions through
   `opencode run --format json --dangerously-skip-permissions` — the spelling
   every opencode from 1.4 to 2.x accepts; its `--auto` alias exists only from

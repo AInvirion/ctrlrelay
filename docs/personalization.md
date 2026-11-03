@@ -301,20 +301,91 @@ refuse-on-dirty rail keeps things safe — the daemon won't rebase under
 your unsaved work and says so at error level — but your edit doesn't
 reach other machines until you push.
 
-### Files an app rewrites in place (`settings.json`)
+### Files an app rewrites in place (`settings.json`): `mode: merge`
 
 If a target such as `~/.claude/settings.json` is a symlink into the
 checkout, the app that owns it writes straight into a tracked file: any
 per-viewer preference it records (and a mere key reordering on rewrite)
-dirties the tree and blocks every later pull.
+dirties the tree and blocks every later pull. Committing those keys is
+wrong too, because one machine's preference would reach every machine
+as if it were policy.
 
-**How to handle this is not decided yet** (#287). Two things are known
-not to work: committing the app-written keys (one machine's preference
-would reach every machine as if it were policy), and resetting the file
-on a loop (the app writes it again). One way out is for a machine whose
-live file carries keys the synced one lacks to keep a real file instead
-of the symlink. Until a decision lands, the `BLOCKED` line above is the
-signal that a machine is stuck this way.
+So for such a file, declare the entry with `mode: merge` and list the
+top-level keys the fleet owns:
+
+```yaml
+personalization:
+  paths:
+    - source: "global/settings.json"
+      target: "~/.claude/settings.json"
+      mode: merge
+      merge_keys: [model, outputStyle, hooks, teammateMode,
+                   remoteControlAtStartup, skipDangerousModePermissionPrompt,
+                   idleCompaction]
+```
+
+The live file is then a **real file on this machine**, never a symlink.
+On `init`, `pull` and the daemon's auto-pull, ctrlrelay writes into it
+only the listed keys that the synced file carries, and reports what it
+did on the same line as the pull: `settings: wrote model, outputStyle`,
+or `settings: in-sync`. Everything else in the live file, including
+whatever the app wrote on its own, is left as it is and never reaches
+the checkout.
+
+The rules, all enforced and tested:
+
+- **The key list is local.** `merge_keys` lives in `orchestrator.yaml`
+  on each machine, not in the synced repo, so a push to that repo cannot
+  widen what it controls. A key in the synced file that is not listed
+  is not written. (Keep `orchestrator.yaml` itself out of the synced
+  repo, or this guarantee is gone.)
+- **An owned key missing upstream is left alone**, not deleted: absent
+  is not the same as "remove it". To change a value fleet-wide, set it.
+- **Bad input is refused.** The synced file must parse as a JSON object,
+  and so must the live file (an empty live file counts as `{}`).
+  Anything else leaves the live file untouched and logs an error.
+- **Links and odd files are refused.** Both files are opened without
+  following a link at the path (`O_NOFOLLOW`) and must be regular files
+  owned by you. A symlink, FIFO or someone else's file at the live path
+  is refused and its target is never opened. The live path must also
+  sit outside the checkout.
+- **Writes are atomic.** Temp file in the same directory, fsync, rename
+  over the live path; mode `0600`, or the existing mode if it is
+  stricter. If the live path changes between the read and the rename,
+  nothing is renamed.
+- **Nothing flows back.** The live file is outside the checkout, so
+  `push` cannot stage it. While a merge entry's live path is still the
+  old symlink into the checkout, `push` does not stage that checkout
+  file either.
+- **Logs name keys, never values** (a value can be a secret under
+  `env`). A pull that changes `hooks`, `env`, `permissions`,
+  `apiKeyHelper` or `skipDangerousModePermissionPrompt` logs a
+  **warning** naming the key, so a surprise change is visible.
+
+A refusal makes the pull fail (`settings: REFUSED (...)`), so a machine
+that cannot apply fleet settings says so rather than looking synced.
+
+#### Moving off the old symlink: `personalization migrate`
+
+A machine wired before this has `~/.claude/settings.json` as a symlink
+into the checkout. `pull` and auto-pull **refuse** that link and say so;
+they never convert it themselves. Convert it once, explicitly:
+
+```bash
+ctrlrelay personalization migrate
+```
+
+This replaces the link with a real file holding the same content (so
+anything the app wrote through it stays on this machine), then merges.
+It does not touch git: if the checkout copy differs from `HEAD` because
+the app wrote through the link, the output names the differing keys and
+the `git checkout -- global/settings.json` that discards them from the
+checkout. Their values are already in the new live file. A link that
+points anywhere other than this checkout's source is refused.
+
+Anything outside ctrlrelay that recreates the symlink (a converge
+script, a dotfiles installer) must stop doing so for this file, or the
+next pull will refuse again.
 
 ### Git identity
 
