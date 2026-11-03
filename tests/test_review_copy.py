@@ -92,6 +92,19 @@ def _trapped_worktree(tmp_path: Path, mgr: WorktreeManager) -> tuple[Path, str, 
     return wt, sha, marks
 
 
+async def _copy(mgr: WorktreeManager, sha: str) -> Path:
+    """A review copy based on the clone's own `main`, as GitHub would name
+    it in these tests."""
+    bare = mgr._get_bare_repo_path(REPO)
+    try:
+        base = _git("rev-parse", "main", cwd=bare).strip()
+    except subprocess.CalledProcessError:
+        base = "0" * 40
+    return await mgr.make_review_copy(
+        REPO, sha, base_branch="main", base_sha=base,
+    )
+
+
 def _fired_after(cmds: list[list[str]], cwd: Path, marks: Path) -> list[str]:
     for p in marks.iterdir():
         p.unlink()
@@ -115,7 +128,7 @@ async def test_the_trap_fires_in_the_agent_worktree_and_not_in_the_copy(
     # Control: the plant works where the reviewer used to run.
     assert _fired_after(READS, wt, marks), "control: the trap did not fire"
 
-    copy = await mgr.make_review_copy(REPO, sha)
+    copy = await _copy(mgr, sha)
     try:
         assert _git("rev-parse", "HEAD", cwd=copy).strip() == sha
         assert _fired_after(READS, copy, marks) == []
@@ -147,7 +160,7 @@ async def test_the_copy_writes_nothing_to_the_bare_clone(
     )
 
     objects = sorted(p.name for p in (bare / "objects").rglob("*"))
-    copy = await mgr.make_review_copy(REPO, sha)
+    copy = await _copy(mgr, sha)
     try:
         # Control: a copy was really made, at the pushed commit.
         assert _git("rev-parse", "HEAD", cwd=copy).strip() == sha
@@ -169,7 +182,7 @@ async def test_a_sha_that_is_not_a_commit_id_is_refused(tmp_path: Path) -> None:
     mgr._get_bare_repo_path(REPO).mkdir(parents=True)
     for bad in ("main", "--upload-pack=x", "HEAD~1", "c0ffee"):
         with pytest.raises(WorktreeError, match="not a commit id"):
-            await mgr.make_review_copy(REPO, bad)
+            await _copy(mgr, bad)
     assert not (tmp_path / "review").exists() or not any(
         (tmp_path / "review").iterdir()
     )
@@ -184,11 +197,11 @@ async def test_a_failed_copy_leaves_no_directory(
     )
     _wt, sha, _marks = _trapped_worktree(tmp_path, mgr)
     # Control: the directory does get used, so empty-after means cleaned.
-    ok = await mgr.make_review_copy(REPO, sha)
+    ok = await _copy(mgr, sha)
     assert ok.parent.parent == tmp_path / "review"
     await mgr.remove_review_copy(ok)
     with pytest.raises(WorktreeError):
-        await mgr.make_review_copy(REPO, "f" * 40)  # no such commit
+        await _copy(mgr, "f" * 40)  # no such commit
     assert list((tmp_path / "review").iterdir()) == []
 
 
@@ -219,7 +232,7 @@ async def test_the_copy_keeps_the_clones_origin(
     _wt, sha, _marks = _trapped_worktree(tmp_path, mgr)
     bare = mgr._get_bare_repo_path(REPO)
     _git("remote", "set-url", "origin", "https://github.com/o/r.git", cwd=bare)
-    copy = await mgr.make_review_copy(REPO, sha)
+    copy = await _copy(mgr, sha)
     try:
         assert _git("remote", "get-url", "origin", cwd=copy).strip() == (
             "https://github.com/o/r.git"
@@ -294,7 +307,9 @@ async def test_the_reviewer_is_started_in_the_copy_of_the_pushed_commit(
     )
 
     assert result.success, result
-    worktree.make_review_copy.assert_awaited_once_with(REPO, "c0ffee")
+    worktree.make_review_copy.assert_awaited_once_with(
+        REPO, "c0ffee", base_branch="main", base_sha="b" * 40,
+    )
     assert seen == [copy_path]
     assert tmp_path / "wt" not in seen
     worktree.remove_review_copy.assert_awaited_once_with(copy_path)
@@ -373,7 +388,7 @@ async def test_the_operators_own_filters_and_textconv_do_not_run_on_agent_files(
 
     for p in marks.iterdir():
         p.unlink()
-    copy = await mgr.make_review_copy(REPO, sha)
+    copy = await _copy(mgr, sha)
     try:
         assert sorted(p.name for p in marks.iterdir()) == [], "checkout ran a driver"
         assert _fired_after(diff, copy, marks) == []
@@ -396,7 +411,7 @@ async def test_a_copy_that_cannot_be_deleted_says_so(
         worktrees_dir=tmp_path / "worktrees", bare_repos_dir=tmp_path / "bare",
     )
     _wt, sha, _marks = _trapped_worktree(tmp_path, mgr)
-    copy = await mgr.make_review_copy(REPO, sha)
+    copy = await _copy(mgr, sha)
     copy.chmod(0o500)
     try:
         with pytest.raises(PermissionError):
