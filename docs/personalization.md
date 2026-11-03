@@ -374,20 +374,30 @@ The rules, all enforced and tested:
   taking a lock.
 - **Values too deep to handle are refused**, whether the parser rejects
   them or they parse but are too deep to compare or write back.
-- **Nothing flows back.** The live file is outside the checkout, so
-  `push` cannot stage it. And `push` never commits a merge entry's
-  checkout copy from local state, however it got staged (an enclosing
-  `global/` entry, `git add -f`, a different-case spelling): after all
-  staging it unstages every merge-mode file, checks the index (ignoring
-  case where git does) and **refuses the push** if one is still there,
-  then commits from the index. A modified checkout copy is stashed
-  across the rebase and put back, so it neither blocks nor rides along.
-- **Fleet edits are yours, and they go everywhere.** To change fleet
-  settings, edit `global/settings.json` in the checkout and `git commit`
-  it there yourself; `push` then publishes that commit like any other.
-  ctrlrelay does not inspect such a commit: **whatever you commit to that
-  file reaches every machine** (within each machine's `merge_keys`), so
-  never commit a value that belongs to one machine.
+- **What keeps app-written keys out of the repo, exactly.** The live
+  file is a real file **outside the checkout**, so nothing the app
+  writes to it is in the git working tree at all. That is the guarantee.
+- **Push refuses a changed checkout copy.** If a merge entry's checkout
+  copy differs from `HEAD` in any way (modified, staged, deleted,
+  renamed away, or present but untracked), `push` refuses before
+  staging anything and leaves the file alone:
+  `refusing to push: global/settings.json in the checkout differs from
+  HEAD. This file is fleet policy; to change it for every machine,
+  commit it yourself with git in the checkout; to drop the local change,
+  run ctrlrelay personalization migrate --reset-copy`.
+  After staging, push also unstages every merge-mode file and checks the
+  index (ignoring case where git does), refusing if one is still staged.
+  These push checks are a **backstop against accidental staging**. They
+  do not stop deliberate local edits in the checkout: a copy of the file
+  under another name, or anything you commit there by hand, is pushed.
+- **Whatever is committed in the checkout goes to every machine.** To
+  change fleet settings, edit `global/settings.json` in the checkout and
+  `git commit` it yourself; `push` publishes that commit like any other,
+  and every machine applies it within its own `merge_keys`. ctrlrelay
+  does not inspect such a commit, so never commit a value that belongs
+  to one machine.
+- **Without merge entries nothing changes.** A configuration with no
+  `mode: merge` entry pushes exactly as before.
 - **Logs name keys, never values** (a value can be a secret under
   `env`). A pull that changes `hooks`, `env`, `permissions`,
   `apiKeyHelper` or `skipDangerousModePermissionPrompt` logs a
@@ -413,6 +423,12 @@ the new live file is confirmed to match, it resets the checkout copy to
 can never be pushed; the output names the keys it reset, never their
 values. Then it merges. A link that points anywhere other than this
 checkout's source is refused.
+
+`ctrlrelay personalization migrate --reset-copy` additionally drops any
+remaining local change to a merge entry's checkout copy (resetting it to
+`HEAD`; the output names the keys, never the values). It is the way out
+of a push refused because that copy changed. It refuses while the live
+path is still the old symlink, since the copy is then the live file.
 
 Anything outside ctrlrelay that recreates the symlink (a converge
 script, a dotfiles installer) must stop doing so for this file, or the

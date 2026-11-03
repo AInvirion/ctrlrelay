@@ -4748,6 +4748,15 @@ def personalization_migrate(
         "-c",
         help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
+    reset_copy: bool = typer.Option(
+        False,
+        "--reset-copy",
+        help=(
+            "Also drop any local change to a merge entry's checkout copy, "
+            "resetting it to HEAD (the fleet's version). The way out of a "
+            "push refused because that copy changed."
+        ),
+    ),
 ) -> None:
     """Turn each `mode: merge` live path that is still the old symlink
     into this checkout into a real file, keeping its current content.
@@ -4759,7 +4768,7 @@ def personalization_migrate(
 
     mgr = _make_personalization_manager(config_path)
     try:
-        outcomes = mgr.migrate()
+        outcomes = mgr.migrate(reset_copy=reset_copy)
     except PersonalizationError as e:
         console.print(f"[red]Migrate failed:[/red] {e}")
         raise typer.Exit(1)

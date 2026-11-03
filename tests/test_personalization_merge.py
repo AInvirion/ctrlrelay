@@ -32,6 +32,9 @@ from tests.test_personalization import (
 )
 
 SECRET = "sk-live-DO-NOT-LOG-4f2a9c"
+REFUSED_CHANGED_COPY = (
+    "refusing to push: global/settings.json in the checkout differs from HEAD"
+)
 
 
 def _write_json(path: Path, obj: object) -> None:
@@ -958,30 +961,57 @@ class TestManagerMerge:
         assert _git("status", "--porcelain", cwd=checkout).strip() == ""
         assert _read(checkout / "global" / "settings.json") == {"model": "opus"}
 
-    def test_after_migrate_app_keys_never_reach_a_push(
+    def test_after_migrate_a_changed_checkout_copy_refuses_the_push(
         self, tmp_path, remote_bare
     ) -> None:
-        """P1: once migrated, neither the live file nor a dirty or even
-        ``git add``-ed checkout copy is pushed."""
+        """Once migrated, a local change to the checkout copy (here: the
+        live content copied in and staged) is refused before staging,
+        and the copy is left as it is."""
         _publish_settings(tmp_path, remote_bare, {"model": "opus"})
         old, checkout, live = _machine(tmp_path, remote_bare, "b", mode="symlink")
         old.init()
         live.write_text(json.dumps({"model": "opus", "appKey": SECRET}))
         mgr, _, _ = _machine(tmp_path, remote_bare, "b")
         mgr.migrate()
-
-        # The app keeps writing the live file; someone also copies its
-        # content into the checkout and stages it.
-        _write_json(live, {**_read(live), "later": SECRET})
         copy = checkout / "global" / "settings.json"
         copy.write_text(live.read_text())
         _git("add", "global/settings.json", cwd=checkout)
 
         result = mgr.push(message="must not carry live keys")
 
-        assert result.success, result.summary
+        assert not result.success
+        assert REFUSED_CHANGED_COPY in result.summary
+        assert "this file is fleet policy" in result.summary.lower()
+        assert "migrate --reset-copy" in result.summary
+        assert SECRET in copy.read_text()  # not modified
         assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
         assert SECRET not in _git("log", "-p", "--all", cwd=checkout)
+
+        # The way out the message names: drop the change, push succeeds.
+        outcomes = mgr.migrate(reset_copy=True)
+        assert [o.action for o in outcomes] == ["nothing-to-migrate", "reset-copy"]
+        assert "keys: appKey" in outcomes[1].detail
+        assert SECRET not in copy.read_text()
+        assert mgr.push(message="clean").success
+
+    def test_app_writes_to_the_live_file_never_reach_the_remote(
+        self, tmp_path, remote_bare
+    ) -> None:
+        """The main guarantee: the live file is not in the checkout."""
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        live = tmp_path / "b" / "home" / ".claude" / "settings.json"
+        assert not live.is_symlink()
+        _write_json(live, {**_read(live), "appKey": SECRET, "theme": SECRET})
+        (checkout / "global" / "notes.md").write_text("fleet note\n")
+
+        result = mgr.push(message="notes")
+
+        assert result.success, result.summary
+        remote_log = _git("log", "-p", "--all", cwd=remote_bare)
+        assert "fleet note" in remote_log
+        assert SECRET not in remote_log
+        assert "appKey" not in remote_log and "theme" not in remote_log
 
     def test_control_explicit_fleet_commit_is_pushed(
         self, tmp_path, remote_bare
@@ -1014,9 +1044,8 @@ class TestManagerMerge:
 
         result = mgr.push(message="should not carry the app key")
 
-        # The push succeeds (the dirty merge copy is stashed across the
-        # rebase), the remote never sees the key, and it is still on disk.
-        assert result.success, result.summary
+        assert not result.success
+        assert REFUSED_CHANGED_COPY in result.summary
         assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
         assert SECRET in live.read_text()
 
@@ -1118,7 +1147,7 @@ class TestPushOutcomeCheck:
     """Round-2 P1: whatever route stages a merge-mode file, push takes it
     out of the index, proves it is out, and commits from the index."""
 
-    def test_enclosing_symlink_dir_entry_cannot_carry_the_merge_file(
+    def test_changed_copy_under_an_enclosing_dir_entry_refuses_the_push(
         self, tmp_path, remote_bare
     ) -> None:
         _publish_settings(tmp_path, remote_bare, {"model": "opus"})
@@ -1129,28 +1158,62 @@ class TestPushOutcomeCheck:
 
         result = mgr.push(message="notes only")
 
-        assert result.success, result.summary
-        remote_log = _git("log", "-p", "--all", cwd=remote_bare)
-        assert "fleet note" in remote_log  # the legitimate change went out
-        assert SECRET not in remote_log
-        assert SECRET in copy.read_text()  # still on disk, not committed
+        assert not result.success
+        assert REFUSED_CHANGED_COPY in result.summary
+        assert SECRET in copy.read_text()
+        assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
+        assert _git("diff", "--cached", "--name-only", cwd=checkout) == ""
 
-    def test_git_add_force_is_unstaged_too(self, tmp_path, remote_bare) -> None:
+    def test_renamed_copy_under_an_enclosing_dir_refuses_the_push(
+        self, tmp_path, remote_bare
+    ) -> None:
+        """Round-3 P1: renaming the merge file inside a configured dir.
+        Unstaging the old name would leave the new name to be pushed."""
         _publish_settings(tmp_path, remote_bare, {"model": "opus"})
         mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
         copy = checkout / "global" / "settings.json"
         copy.write_text(json.dumps({"model": "opus", "appKey": SECRET}))
+        copy.rename(checkout / "global" / "renamed.json")
+
+        result = mgr.push(message="x")
+
+        assert not result.success
+        assert REFUSED_CHANGED_COPY in result.summary
+        assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
+        assert SECRET not in _git("log", "-p", "--all", cwd=checkout)
+
+    @staticmethod
+    def _accidental_stage(mgr, checkout: Path) -> None:
+        """After the pre-check passed (copy == HEAD), something stages a
+        changed copy during staging: the case the backstop is for."""
         real_stage = mgr._stage_configured_paths
 
-        def stage_then_force_add():
+        def stage_then_accident():
             out = real_stage()
+            (checkout / "global" / "settings.json").write_text(
+                json.dumps({"model": "opus", "appKey": SECRET})
+            )
             _git("add", "-f", "global/settings.json", cwd=checkout)
             return out
 
-        mgr._stage_configured_paths = stage_then_force_add  # type: ignore[method-assign]
-        result = mgr.push(message="x")
+        mgr._stage_configured_paths = stage_then_accident  # type: ignore[method-assign]
 
-        assert result.success, result.summary
+    def test_backstop_unstages_an_accidental_git_add_force(
+        self, tmp_path, remote_bare
+    ) -> None:
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        (checkout / "global" / "notes.md").write_text("fleet note\n")
+        self._accidental_stage(mgr, checkout)
+
+        mgr.push(message="x")
+
+        # The commit was made (the legitimate file is in it) and the
+        # accidentally staged copy is not. (The push then stops on the
+        # dirty copy at rebase; that is not what is under test.)
+        local_log = _git("log", "-p", "--all", cwd=checkout)
+        assert "fleet note" in local_log
+        assert SECRET not in local_log
         assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
 
     def test_case_variant_on_case_insensitive_checkout_is_kept_out(
@@ -1240,15 +1303,69 @@ class TestPushOutcomeCheck:
     ) -> None:
         _publish_settings(tmp_path, remote_bare, {"model": "opus"})
         mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
-        copy = checkout / "global" / "settings.json"
-        copy.write_text(json.dumps({"model": "opus", "appKey": SECRET}))
+        self._accidental_stage(mgr, checkout)
         self._disable_unstaging(mgr)
+
         result = mgr.push(message="x")
 
         assert not result.success
-        assert "global/settings.json" in result.summary
+        assert "still staged after unstaging: global/settings.json" in result.summary
         assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
         assert SECRET not in _git("log", "-p", "--all", cwd=checkout)
+
+
+class TestNoMergeEntriesPushAsOnMain:
+    """Round-3 item 3: without merge entries push takes main's commit
+    path (``git commit -- <pathspecs>``) unchanged."""
+
+    def test_delete_add_and_rename_under_a_configured_dir(
+        self, tmp_path, remote_bare
+    ) -> None:
+        checkout = tmp_path / "a" / "personalization"
+        home = tmp_path / "a" / "home"
+        paths = [{"source": "global/", "target": str(home / "global-dir") + "/"}]
+        mgr = PersonalizationManager(
+            _config_for(checkout, remote_bare, node_id="a", paths=paths)
+        )
+        _patch_remote_url(mgr, str(remote_bare))
+        mgr.init()
+        g = checkout / "global"
+        g.mkdir(exist_ok=True)
+        for name in ("gone.md", "old-name.md", "kept.md"):
+            (g / name).write_text(f"{name}\n")
+        assert mgr.push(message="seed").success
+
+        (g / "gone.md").unlink()
+        (g / "new.md").write_text("new.md\n")
+        (g / "old-name.md").rename(g / "new-name.md")
+        calls: list[tuple[str, ...]] = []
+        real = mgr._git
+
+        def spy(*args):
+            calls.append(args)
+            return real(*args)
+
+        mgr._git = spy  # type: ignore[method-assign]
+        result = mgr.push(message="changes")
+
+        assert result.success, result.summary
+        # main's commit: pathspec-scoped, no backstop.
+        assert ("commit", "-m", "changes", "--", "global") in calls
+        tree = _git(
+            "ls-tree", "-r", "--name-only", "origin/main", cwd=checkout
+        ).split()
+        assert "global/gone.md" not in tree
+        assert "global/new.md" in tree
+        assert "global/new-name.md" in tree
+        assert "global/old-name.md" not in tree
+        assert "global/kept.md" in tree
+        status = _git(
+            "show", "--name-status", "--format=", "-M", "origin/main", cwd=checkout
+        )
+        assert "D\tglobal/gone.md" in status
+        assert "A\tglobal/new.md" in status
+        assert "R100\tglobal/old-name.md\tglobal/new-name.md" in status
+        assert _git("status", "--porcelain", cwd=checkout).strip() == ""
 
 
 class TestMigrateCLI:

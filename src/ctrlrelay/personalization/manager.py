@@ -457,6 +457,29 @@ class PersonalizationManager:
         self._require_checkout()
         self._ensure_working_branch()
 
+        # mode: merge (#287): a merge entry's checkout copy is fleet
+        # policy. If it differs from HEAD in any way (modified, staged,
+        # deleted, renamed away, untracked), refuse before staging
+        # anything, and leave it as it is.
+        merge_rels = self._merge_source_rels()
+        changed = [rel for rel in merge_rels if self._copy_differs(rel)]
+        if changed:
+            logger.error(
+                "push refused: mode: merge checkout copy changed: %s",
+                ", ".join(changed),
+            )
+            return PushResult(
+                success=False,
+                summary=(
+                    f"refusing to push: {', '.join(changed)} in the checkout "
+                    "differs from HEAD. This file is fleet policy; to change "
+                    "it for every machine, commit it yourself with git in "
+                    f"the checkout ({self.checkout_path}); to drop the local "
+                    "change, run `ctrlrelay personalization migrate "
+                    "--reset-copy`"
+                ),
+            )
+
         # Reset the index to HEAD before staging. This unstages any
         # ad-hoc ``git add`` the operator (or an interrupted previous
         # run) left in the index, ensuring:
@@ -473,25 +496,13 @@ class PersonalizationManager:
         # Stage and commit once up-front; the commit object stays the
         # same across retries, only the rebase base shifts.
         configured_pathspecs = self._stage_configured_paths()
-        # Outcome check (#287): however a merge-mode source got into the
-        # index (an enclosing symlink-mode directory, ``git add -f``, a
-        # case variant), take it out again and prove it is out. Then
-        # commit FROM THE INDEX: ``git commit -- <pathspecs>`` would
-        # take the working-tree copy of every tracked file under the
-        # pathspecs, staged or not.
-        merge_rels = self._merge_source_rels()
-        leaked = self._unstage_merge_sources(merge_rels, configured_pathspecs)
-        if leaked:
-            return PushResult(
-                success=False,
-                summary=(
-                    "refusing to push: mode: merge file(s) still staged "
-                    f"after unstaging: {', '.join(leaked)}. Nothing was "
-                    f"committed; run `git -C {self.checkout_path} reset` "
-                    "and retry"
-                ),
+        if merge_rels:
+            refused = self._commit_with_merge_backstop(
+                merge_rels, configured_pathspecs, message
             )
-        if self._staged_paths():
+            if refused is not None:
+                return refused
+        elif configured_pathspecs:
             # ``git commit`` errors with "Author identity unknown" if
             # neither global nor local user.email/user.name is set.
             # Bootstrap already does this for the empty-repo path;
@@ -501,8 +512,16 @@ class PersonalizationManager:
             commit_msg = message or "personalization: sync from {}".format(
                 self.working_branch
             )
+            # ``-- <pathspecs>`` constrains the commit to ONLY the
+            # allowlisted paths. Anything an operator manually staged
+            # outside the allowlist (Codex pass 12 finding — e.g.
+            # interrupted run, ad-hoc ``git add``) stays in the
+            # index but does NOT enter the personalization repo's
+            # history.
             try:
-                self._git("commit", "-m", commit_msg)
+                self._git(
+                    "commit", "-m", commit_msg, "--", *configured_pathspecs
+                )
             except _GitError as e:
                 # ``git commit`` exits 1 with "nothing to commit" when
                 # the staged set turns out to be a no-op (e.g. only
@@ -510,13 +529,6 @@ class PersonalizationManager:
                 # idempotent.
                 if "nothing to commit" not in (e.stdout + e.stderr).lower():
                     raise
-        # A modified merge-mode checkout copy is never committed, and
-        # would otherwise make the rebase refuse the dirty tree; stash
-        # it across the rebase and put it back.
-        autostash = any(
-            self._git_capturing("diff", "--quiet", "--", rel, check=False).returncode
-            for rel in merge_rels
-        )
 
         last_summary = ""
         for attempt in range(1, self._PUSH_MAX_ATTEMPTS + 1):
@@ -529,9 +541,7 @@ class PersonalizationManager:
                 )
 
             rebase = self._git_capturing(
-                "rebase",
-                *(("--autostash",) if autostash else ()),
-                f"origin/{self.main_branch}",
+                "rebase", f"origin/{self.main_branch}",
                 check=False,
             )
             if rebase.returncode != 0:
@@ -713,7 +723,7 @@ class PersonalizationManager:
             )
         return out
 
-    def migrate(self) -> list[MergeOutcome]:
+    def migrate(self, *, reset_copy: bool = False) -> list[MergeOutcome]:
         """Explicit, operator-run: replace each merge-mode live path that
         is still the old symlink into this checkout with a real file
         holding the same content, then merge.
@@ -724,6 +734,10 @@ class PersonalizationManager:
         ``HEAD`` (the fleet's version), so it can never carry those
         local keys into a push; the outcome names the keys reset, never
         their values.
+
+        ``reset_copy`` also drops any remaining local change to a merge
+        entry's checkout copy (see :meth:`reset_copies`): the way out of
+        a push refused because that copy differs from HEAD.
         """
         self._require_checkout()
         out: list[MergeOutcome] = []
@@ -750,6 +764,13 @@ class PersonalizationManager:
                 )
                 if merged.action != "in-sync":
                     out.append(merged)
+        if reset_copy:
+            resets = self.reset_copies()
+            out.extend(resets)
+            if any(r.action == "reset-copy" for r in resets):
+                out.extend(
+                    m for m in self.apply_merges() if m.action != "in-sync"
+                )
         return out
 
     def _plan_merges(self) -> list[tuple[PersonalizationPath, SymlinkPlan]]:
@@ -1264,27 +1285,9 @@ class PersonalizationManager:
                 except ValueError:
                     continue
                 if entry.mode == "merge":
-                    # Never staged from local state (#287): the checkout
-                    # copy is the fleet's version, and before ``migrate``
-                    # it IS the live file. ``reset --mixed`` above has
-                    # already unstaged any copy someone ``git add``-ed,
-                    # and the commit pathspec excludes it. A fleet edit
-                    # is an explicit ``git commit`` in the checkout,
-                    # which push then publishes as any other commit.
-                    if self._git_capturing(
-                        "diff", "--quiet", "HEAD", "--", str(rel),
-                        check=False,
-                    ).returncode != 0:
-                        hint = (
-                            f"; {MIGRATE_HINT}"
-                            if is_link_into(plan.target, plan.source)
-                            else ""
-                        )
-                        logger.warning(
-                            "push: not staging %s (mode: merge); to change "
-                            "fleet settings, commit it yourself with git in "
-                            "the checkout%s", rel, hint,
-                        )
+                    # Never staged (#287): ``push`` refuses outright when
+                    # this copy differs from HEAD, and unstages it again
+                    # after all staging as a backstop.
                     continue
                 rels.append(str(rel))
         if not rels:
@@ -1326,6 +1329,102 @@ class PersonalizationManager:
             "diff", "--cached", "--name-only", "--", *matched
         ).strip()
         return matched if diff else []
+
+    def _commit_with_merge_backstop(
+        self,
+        merge_rels: list[str],
+        allowlist: list[str],
+        message: str | None,
+    ) -> PushResult | None:
+        """Commit step for a checkout with merge entries.
+
+        A backstop against ACCIDENTAL staging of a merge-mode copy (an
+        enclosing symlink-mode directory, ``git add -f``, a case
+        variant); the pre-check in ``push`` has already refused any
+        local change to it. Unstage every merge source, prove none is
+        left, then commit from the index: ``git commit -- <pathspecs>``
+        would read the working tree and ignore the index, so the check
+        would not bind it. Returns a refusal, or ``None`` to go on.
+        """
+        leaked = self._unstage_merge_sources(merge_rels, allowlist)
+        if leaked:
+            return PushResult(
+                success=False,
+                summary=(
+                    "refusing to push: mode: merge file(s) still staged "
+                    f"after unstaging: {', '.join(leaked)}. Nothing was "
+                    f"committed; run `git -C {self.checkout_path} reset` "
+                    "and retry"
+                ),
+            )
+        if not self._staged_paths():
+            return None
+        self._ensure_local_identity()
+        commit_msg = message or "personalization: sync from {}".format(
+            self.working_branch
+        )
+        try:
+            self._git("commit", "-m", commit_msg)
+        except _GitError as e:
+            if "nothing to commit" not in (e.stdout + e.stderr).lower():
+                raise
+        return None
+
+    def _copy_differs(self, rel: str) -> bool:
+        """True if the checkout copy at ``rel`` is not exactly HEAD's:
+        modified, staged, deleted or renamed away, or present while
+        HEAD has no such file."""
+        in_head = self._git_capturing(
+            "cat-file", "-e", f"HEAD:{rel}", check=False
+        ).returncode == 0
+        if in_head:
+            return self._git_capturing(
+                "diff", "--quiet", "HEAD", "--", rel, check=False
+            ).returncode != 0
+        in_index = self._git_capturing(
+            "ls-files", "--error-unmatch", "--", rel, check=False
+        ).returncode == 0
+        return in_index or os.path.lexists(self.checkout_path / rel)
+
+    def reset_copies(self) -> list[MergeOutcome]:
+        """Drop local changes to each merge entry's checkout copy (the
+        explicit ``migrate --reset-copy``). Skips an entry whose live
+        path is still the old symlink into the checkout: the copy IS the
+        live file there, and ``migrate`` saves it first."""
+        out: list[MergeOutcome] = []
+        for _entry, plan in self._plan_merges():
+            label = self._merge_label(plan)
+            rel = str(plan.source.relative_to(self.checkout_path))
+            if not self._copy_differs(rel):
+                continue
+            if is_link_into(plan.target, plan.source):
+                out.append(MergeOutcome(
+                    label, "refused",
+                    detail=f"{plan.target} is still a symlink to {rel}; not "
+                    "resetting it (migrate did not convert it)",
+                ))
+                continue
+            keys: list[str] = []
+            head = self._git_capturing("show", f"HEAD:{rel}", check=False)
+            try:
+                now_obj, _ = read_json_object(plan.source, what="synced file")
+                head_obj = json.loads(head.stdout) if head.returncode == 0 else {}
+                if isinstance(head_obj, dict):
+                    keys = differing_keys(head_obj, now_obj)
+            except (ValueError, RecursionError, MergeRefusedError, OSError):
+                keys = []
+            self._git_capturing("reset", "-q", "--", rel, check=False)
+            if head.returncode == 0:
+                self._git("checkout", "HEAD", "--", rel)
+            elif os.path.lexists(plan.source):
+                plan.source.unlink()
+            named = f" (keys: {', '.join(keys)})" if keys else ""
+            logger.info("%s: dropped local change to checkout copy %s%s", label, rel, named)
+            out.append(MergeOutcome(
+                label, "reset-copy",
+                detail=f"checkout copy {rel} reset to HEAD{named}",
+            ))
+        return out
 
     def _merge_source_rels(self) -> list[str]:
         rels: list[str] = []
