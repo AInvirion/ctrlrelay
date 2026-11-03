@@ -450,18 +450,21 @@ and its token on GitHub; the others carry on.
 
 ## Open questions for Oscar
 
-1. **Outage default: hold, or fall back to standalone?** Recommended: `hold`
+Questions 1, 3 and 4 were decided on 2026-11-03 (see #251). The rest are
+still open, with the recommended answer shown.
+
+1. **Outage default: hold, or fall back to standalone?** **Decided:** `hold`
    by default, `standalone` opt-in per node. Holding is the quiet failure you
    can see; falling back is safe for double work but ignores routing.
 2. **Request signing or mutual TLS?** Recommended: signed requests (RFC 9421,
    Ed25519). They pass through proxies and load balancers, and rotation needs
    no certificate authority.
 3. **Must an issue still be marked by you (assignment or trigger label) before
-   a node will take it from the control plane?** Recommended: yes, for now.
+   a node will take it from the control plane?** **Decided:** yes, for now.
    It is the check that keeps a compromised control plane to issues you
    already chose. Revisit when the control plane has its own permission model.
 4. **Webhook work: may a node open the issue and run it without your
-   assignment?** Recommended: the node opens it, only for opted-in repos, and
+   assignment?** **Decided:** no. The node opens it, only for opted-in repos, and
    it waits for your assignment or for #227's triage to mark it ready.
 5. **Where does shared per-repo learning live?** Recommended: in the repository
    on GitHub, not on the control plane, because it is prompt input.
