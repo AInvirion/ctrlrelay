@@ -1284,11 +1284,6 @@ class PersonalizationManager:
                     rel = plan.source.relative_to(self.checkout_path)
                 except ValueError:
                     continue
-                if entry.mode == "merge":
-                    # Never staged (#287): ``push`` refuses outright when
-                    # this copy differs from HEAD, and unstages it again
-                    # after all staging as a backstop.
-                    continue
                 rels.append(str(rel))
         if not rels:
             return []
