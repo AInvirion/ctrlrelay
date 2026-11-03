@@ -866,7 +866,9 @@ pull request), **verify** (wait for CI and mergeability, asking the agent to
 fix what fails, up to `max_fix_attempts` rounds) and **review** (the
 configured reviewer reads the pushed commit and posts its findings). The order
 is not configurable. `steps` says how strict each step is for this repo.
-Only the dev pipeline reads it so far; the task and secops pipelines ignore it.
+Only the dev pipeline reads it. The task and secops pipelines have no
+switchable steps (see [below](#task-and-secops-have-no-step-switches)), so
+`steps` never changes how a `task`-labelled issue or a secops sweep runs.
 
 ```yaml
 repos:
@@ -938,6 +940,26 @@ A resumed session (an answer that arrived after the run stopped to ask) goes
 through the same publish and verify steps. It did not run the review before
 these switches, and with `review` unset or `on` it still does not; with
 `review: required` it does.
+
+#### Task and secops have no step switches
+
+Each of their steps already behaves as `required` or as a best-effort side
+effect, and neither `off` nor `on` would mean something the relay can honour:
+
+- **Task, the agent run.** A task run without it has nothing to report.
+  Only `required` would make sense, and that is what it already does.
+- **Task, posting the report.** A DONE with no report, or a report the relay
+  cannot post, fails the run today. `off` would lose the report: chat gets
+  only the one-line summary. `on` would announce `✅ Task done` and keep the
+  claim on an issue with no report, which looks the same as a crash.
+- **Secops, the sweep.** One agent session reads the alerts and pull requests
+  and merges what the policy allows. The merges happen inside that session,
+  not in a relay step, so a switch could not hold them back. The switch for
+  them already exists: `automation.dependabot_patch`, `dependabot_minor` and
+  `dependabot_major` (`auto`, `ask` or `never`).
+- **Secops, reading earlier answers.** If the 30-day decision history cannot
+  be read, the sweep runs without it. `off` would drop the operator's answers
+  and let the policy merge a pull request they said to leave open.
 
 ## schedules
 
