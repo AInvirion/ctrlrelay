@@ -12,9 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A third agent backend: `agent.type: "opencode"` runs sessions through
   `opencode run --format json --dangerously-skip-permissions` — the spelling
   every opencode from 1.4 to 2.x accepts; its `--auto` alias exists only from
-  1.17.12 — which can target a self-hosted OpenAI-compatible endpoint (ollama, llama.cpp, LM Studio, MLX) and so lets
-  the dev pipeline run on a local model instead of a hosted API. The endpoint,
-  its credential and the model list stay in opencode's own config; ctrlrelay
+  1.17.12 — which can target a self-hosted OpenAI-compatible endpoint
+  (ollama, llama.cpp, LM Studio, MLX) and so lets the dev pipeline run on a
+  local model instead of a hosted API. The endpoint, its credential and the model list stay in opencode's own config; ctrlrelay
   names the model with `agent.opencode.model` (`provider/model`) and the
   binary with `agent.opencode.binary` — its own block, because `agent.binary`
   is claude's and most configs set it to the literal `"claude"`.
@@ -42,6 +42,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a CLI the deployment does not use; with even one repo still on
   `claude` it runs, so an expired login shows up there and not as that repo's
   next failed job.
+
+### Fixed
+
+- The code review no longer runs in the agent's worktree. It runs in a
+  fresh clone of the commit the relay pushed, in a new temporary
+  directory, removed afterwards. Before, a nested repository the agent
+  left in its worktree (a gitlink with its own `.git` and config) made a
+  plain `git status` or `git diff` there run a program the agent chose,
+  in the reviewer's process, outside the agent sandbox. The copy also
+  switches off filter and diff drivers from the operator's own git
+  config (for example git-lfs or a textconv), so a committed
+  `.gitattributes` cannot point agent files at them. If no clean copy can
+  be made, the PR is announced as not reviewed (`copy_failed`); it never
+  falls back to the worktree (#263)
+- Personalization auto-pull no longer reports success when it could not
+  sync. A dirty working tree now fails the run, logged at error level with
+  the dirty entries; every run reports `behind N` (a dirty tree still
+  fetches to measure it). `push` pre-flights the git identity and refuses
+  with `git identity unresolvable` instead of leaving a dirty tree.
+  `docs/personalization.md` describes the open question of app-rewritten
+  files such as `settings.json` (refs #287)
 
 ### Known limits
 
@@ -539,7 +560,7 @@ daemon with any of it.
   rewind even when every other ref applied. `ensure_bare_repo` read that
   exit code as failure and aborted the session.
 
-  Observed on `AInvirion/zzsites`, whose sweep died reporting
+  Observed on one of the swept repositories, whose sweep died reporting
   `WorktreeError: git failed: ... ! [rejected] ... (non-fast-forward)`
   in the same fetch that had just advanced `main`. Twelve bare repos
   were holding a `dependabot/*` ref at the time, each one primed to fail
@@ -570,8 +591,7 @@ daemon with any of it.
   `✅ Scheduled secops sweep done: N/M ok`, which fires once every repo
   has been swept. On the 2026-09-09 sweep that was hours after the reply
   and named no repo: four answers merged 20 Dependabot PRs across
-  `ai-miner`, `kenos-orchestrator`, `prompt-injection-benchmark` and
-  `aiproxyguard-promptest`, and not one outbound message went back to
+  four repositories, and not one outbound message went back to
   the operator. Answering looked indistinguishable from being ignored.
 
   The inline path now reports the same three outcomes the sweeper
@@ -1107,7 +1127,7 @@ during the dogfood validation:
 
 - **`setup` no longer lists the personalization repo under
   `repos:`.** When the operator's personalization repo lives under
-  one of the configured owners (e.g. `alice/dotclaude` while `alice`
+  one of the configured owners (e.g. `alice/agent-config` while `alice`
   is also an enumerated owner), it was being added to the dev
   pipeline's monitored set — the poller would have polled it for
   issues and worktree-cloned it. The repo is the cross-machine sync
@@ -1269,7 +1289,7 @@ personalization flow.
 ### Docs
 
 - **[Personalization sync](docs/personalization.md)** (#125). New
-  page (nav order 8) covering setup, the dotclaude repo layout, the
+  page (nav order 8) covering setup, the personalization repo layout, the
   init/status/push/pull lifecycle, `--no-adopt`, auto-pull cron,
   multi-machine bootstrap, and the gotchas (worktrees, edit-through-
   symlink semantics, allowlist enforcement, conflict handling, strict

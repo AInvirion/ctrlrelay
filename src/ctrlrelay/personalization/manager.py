@@ -97,6 +97,12 @@ class PullResult:
     success: bool
     summary: str
     conflict_files: tuple[str, ...] = ()
+    # Commits on origin/<main> that the local branch did not have when
+    # the run started. ``None`` = could not be measured (no fetch).
+    behind: int | None = None
+    # Dirty entries (``git status --porcelain`` lines) that blocked the
+    # sync; empty when the tree was clean.
+    dirty_entries: tuple[str, ...] = ()
 
 
 class PersonalizationManager:
@@ -278,6 +284,35 @@ class PersonalizationManager:
             "config", "--get", "user.name", check=False
         ).stdout.strip():
             self._git("config", "user.name", "ctrlrelay")
+        # Pre-flight (#287): prove git can build an author/committer
+        # identity before anything is staged. An identity can also come
+        # from GIT_AUTHOR_* env vars, so ask git itself rather than
+        # re-deriving. A failed commit later leaves the tree dirty and
+        # silently blocks every following pull; refuse here, by name.
+        for var in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+            ident = self._git_capturing("var", var, check=False)
+            if ident.returncode != 0:
+                raise PersonalizationError(
+                    f"git identity unresolvable ({var}): "
+                    f"{(ident.stderr or ident.stdout).strip()}; set "
+                    "user.name and user.email (git config --global) so "
+                    "personalization commits can be made"
+                )
+
+    def behind_count(self) -> int | None:
+        """Commits on ``origin/<main>`` missing from the working branch,
+        or ``None`` if the ref cannot be resolved. Call after a fetch."""
+        r = self._git_capturing(
+            "rev-list", "--count",
+            f"HEAD..origin/{self.main_branch}",
+            check=False,
+        )
+        if r.returncode != 0:
+            return None
+        try:
+            return int(r.stdout.strip())
+        except ValueError:
+            return None
 
     def status(self) -> str:
         """Return a human-readable summary of working-tree state +
@@ -554,6 +589,7 @@ class PersonalizationManager:
                 summary=f"fetch failed: {e.stderr.strip() or e.stdout.strip()}",
             )
 
+        behind = self.behind_count()
         rebase = self._git_capturing(
             "rebase", f"origin/{self.main_branch}",
             check=False,
@@ -565,10 +601,16 @@ class PersonalizationManager:
             return PullResult(
                 success=False,
                 summary=(
-                    "rebase onto origin/{main} hit conflicts; aborted. "
-                    "Resolve in the checkout, then re-run pull."
-                ).format(main=self.main_branch),
+                    "rebase onto origin/{main} hit conflicts; aborted "
+                    "(behind {behind}). Resolve in the checkout, then "
+                    "re-run pull. git: {err}"
+                ).format(
+                    main=self.main_branch,
+                    behind=behind,
+                    err=(rebase.stderr or rebase.stdout).strip(),
+                ),
                 conflict_files=files,
+                behind=behind,
             )
 
         # FF local main if it's a strict ancestor of origin/main.
@@ -588,8 +630,9 @@ class PersonalizationManager:
             success=True,
             summary=(
                 f"pulled and rebased {self.working_branch} onto "
-                f"origin/{self.main_branch}{ff_note}"
+                f"origin/{self.main_branch}{ff_note} (behind {behind})"
             ),
+            behind=behind,
         )
 
     def auto_pull(self) -> PullResult:
@@ -620,12 +663,34 @@ class PersonalizationManager:
         # tree; non-empty means there are uncommitted changes.
         porcelain = self._git("status", "--porcelain").strip()
         if porcelain:
+            # A dirty tree means the sync CANNOT run. Reporting that as
+            # success is how a machine sat 36 commits behind for weeks
+            # (#287): the failure looked identical to "nothing to do".
+            # Fetch (touches no working-tree file) so the staleness is
+            # a number, and fail loudly with the offending entries.
+            entries = tuple(porcelain.splitlines())
+            behind: int | None = None
+            fetch_err = ""
+            try:
+                self._git("fetch", "origin", "--prune")
+                behind = self.behind_count()
+            except _GitError as e:
+                fetch_err = (
+                    f"; fetch failed: {e.stderr.strip() or e.stdout.strip()}"
+                )
+            shown = "; ".join(entries[:5])
+            more = f" (+{len(entries) - 5} more)" if len(entries) > 5 else ""
             return PullResult(
-                success=True,
+                success=False,
                 summary=(
-                    "auto-pull skipped: working tree dirty "
-                    f"({len(porcelain.splitlines())} entries)"
+                    "auto-pull BLOCKED: working tree dirty "
+                    f"({len(entries)} entries: {shown}{more}); behind "
+                    f"{behind if behind is not None else 'unknown'}"
+                    f"{fetch_err}. Commit, revert or move the listed "
+                    "files, or run `ctrlrelay personalization push`."
                 ),
+                behind=behind,
+                dirty_entries=entries,
             )
         return self.pull(adopt=False)
 
