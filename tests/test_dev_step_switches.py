@@ -402,6 +402,11 @@ def test_the_pipeline_refuses_a_mode_the_config_would_refuse(
 # --- code -------------------------------------------------------------------
 
 
+# For code and publish, "required" is the only mode accepted and it is
+# what unset already does; the "required" case only shows that writing it
+# out changes nothing. The refusal tests above are what pin these steps.
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [None, "required"])
 async def test_code_failure_stops_the_run(tmp_path: Path, mode) -> None:
@@ -489,6 +494,81 @@ async def test_verify_off_waits_for_no_ci_and_still_reviews(
     )
 
 
+def _pr_opened(state_db: StateDB) -> list[dict]:
+    return [
+        e for e in state_db.list_events(limit=1000) if e["kind"] == "pr_opened"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_verify_off_still_records_the_pr_opened_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The status page counts PRs and time-to-PR from ``pr_opened``. With
+    no CI wait the event comes from the publish step's answer, once."""
+    _reviewer(monkeypatch, REVIEWED)
+    state_db = StateDB(tmp_path / "s.db")
+    result, *_ = await _run(
+        tmp_path, repo=_repo(steps={"verify": "off"}), state_db=state_db,
+    )
+    assert result.success, result
+    events = _pr_opened(state_db)
+    assert len(events) == 1, events
+    assert events[0]["session_id"] == result.session_id
+    assert events[0]["detail"] == {
+        "pr_number": PR, "pr_url": "https://github.com/owner/repo/pull/42",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [None, "required"])
+async def test_a_waiting_verify_records_pr_opened_once_as_before(
+    tmp_path: Path, monkeypatch, mode
+) -> None:
+    """Control: where CI is waited on, the event still comes from the CI
+    wait, once, however many verify rounds run."""
+    _reviewer(monkeypatch, REVIEWED)
+    state_db = StateDB(tmp_path / "s.db")
+    result, *_ = await _run(
+        tmp_path, repo=_repo(steps={"verify": mode} if mode else {}),
+        verifier=_verifier(RED, GREEN), state_db=state_db,
+    )
+    assert result.success, result
+    kinds = [e["kind"] for e in reversed(state_db.list_events(limit=1000))]
+    assert kinds.count("pr_opened") == 1
+    # Recorded inside the first CI wait, as on main.
+    assert kinds.index("pr_opened") == kinds.index("ci_started") + 1
+
+
+@pytest.mark.asyncio
+async def test_verify_off_on_a_resumed_session_does_not_record_it_twice(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A session that recorded ``pr_opened`` before it blocked, resumed
+    with verify off, still has one."""
+    _reviewer(monkeypatch, REVIEWED)
+    worktree, github = _fakes(tmp_path)
+    state_db = StateDB(tmp_path / "s.db")
+    session_id = "dev-owner-repo-123-abcdef01"
+    _blocked_row(state_db, session_id)
+    for _ in range(2):
+        state_db.execute(
+            "UPDATE sessions SET status='blocked' WHERE id=?", (session_id,)
+        )
+        state_db.commit()
+        result = await dev.resume_dev_from_pending(
+            session_id=session_id, repo="owner/repo", answer="go",
+            branch_template="fix/issue-{n}", dispatcher=_dispatcher(),
+            github=github, worktree=worktree, dashboard=None,
+            state_db=state_db, transport=None,
+            contexts_dir=tmp_path / "contexts",
+            pr_verifier=_verifier(GREEN),
+            steps=DevStepsConfig(verify="off"),
+        )
+        assert result.success, result
+    assert len(_pr_opened(state_db)) == 1
+
+
 @pytest.mark.asyncio
 async def test_verify_required_green_hands_over(
     tmp_path: Path, monkeypatch
@@ -542,14 +622,19 @@ async def test_verify_required_fails_when_ci_times_out_after_a_fix(
 
 
 @pytest.mark.asyncio
-async def test_verify_required_fails_when_the_verifier_raises(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize("mode", [None, "required"])
+async def test_a_verifier_exception_fails_the_run_in_every_mode_that_waits(
+    tmp_path: Path, monkeypatch, mode
 ) -> None:
+    """Not something ``required`` adds: checks that cannot be read at all
+    raise into the frame's exception path, which fails the run whatever
+    the mode. Pinned so a later change cannot make it mode-dependent."""
     reviewer = _reviewer(monkeypatch, REVIEWED)
     verifier = AsyncMock()
     verifier.verify.side_effect = RuntimeError("every checks read failed")
     result, *_ = await _run(
-        tmp_path, repo=_repo(steps={"verify": "required"}), verifier=verifier,
+        tmp_path, repo=_repo(steps={"verify": mode} if mode else {}),
+        verifier=verifier,
     )
     assert not result.success
     reviewer.assert_not_awaited()

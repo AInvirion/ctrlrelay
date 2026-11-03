@@ -1912,6 +1912,27 @@ async def _step_verify(run: _DevRun) -> None:
     if run.verify_mode == "off":
         # Switched off for this repo: no CI wait and no fix rounds. The
         # review step still runs, because it reads the pushed commit.
+        #
+        # `pr_opened` is otherwise recorded inside the CI wait, the first
+        # point GitHub answers about the PR. With no CI wait, the publish
+        # step's answer (it opened or found the PR) is that point. The
+        # status page's PR counts and time-to-PR read this event, so a
+        # repo with verify off would otherwise show no PRs at all. Once
+        # per session and PR, as on the CI path.
+        pr_url = run.result.outputs.get("pr_url")
+        pr_number = run.pr_number_for_review
+        emit_event_once(
+            run.state_db, EventKind.PR_OPENED,
+            lambda: {
+                "repo": run.repo,
+                "issue_number": run.issue_number,
+                "session_id": run.session_id,
+                "detail": {
+                    "pr_number": pr_number,
+                    "pr_url": pr_url if isinstance(pr_url, str) else None,
+                },
+            },
+        )
         log_event(
             _logger,
             "dev.verify.off",

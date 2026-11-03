@@ -899,9 +899,13 @@ Unknown step names (a typo such as `verfy`) are refused as well. A bare `on`
 or `off` works unquoted.
 
 **`verify: required`** also fails the run when the CI wait times out, before
-or after a fix round, and when the checks cannot be read at all.
+or after a fix round. (Checks that cannot be read at all fail the run in every
+mode that waits on CI, not only under `required`.)
 **`verify: off`** skips the CI wait and the fix rounds; the review still runs.
-The status page then has no CI or `pr_opened` event for the run.
+The PR is announced as ready without anyone having looked at its CI — the
+same thing `verify: on` is refused for, chosen deliberately here by turning
+verify off. The status page has no CI events for the run; `pr_opened` is
+still recorded, once, when the PR is published.
 
 **`review: required`** passes only when the review's findings were posted on
 the PR. A reviewer that cannot start, one that ran without reading the diff, a
