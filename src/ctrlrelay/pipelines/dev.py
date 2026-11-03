@@ -10,7 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.claims import (
@@ -1672,6 +1672,359 @@ async def _verify_and_fix_pr(
     )
 
 
+# ---------------------------------------------------------------------------
+# Work steps (#226)
+#
+# `run_dev_issue` is two things: a FRAME (lock, claim, worktree, the
+# session row, cleanup, claim reconciliation, and the exception path) and
+# the WORK done inside it. The frame carries the invariants from #29, #51,
+# #204, #245 and #253 and stays written out by hand in `run_dev_issue`,
+# because making it data would let a configuration switch off the thing
+# that stops two machines working one issue.
+#
+# The work is the ordered list below. Every step runs, in this order, on
+# every run; each one decides from the run's state whether it has
+# anything to do, exactly as the inline code it replaced did. The order
+# is fixed in code (the owner's decision on #226): a later change may let
+# a repository switch a step off or make it required, never reorder it.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _DevRun:
+    """What the work steps read and write for one `run_dev_issue` call.
+
+    The frame builds it once the worktree, the session row and the agent
+    pipeline exist, and reads it back afterwards. The exception path reads
+    it too, which is why the two fields below that it depends on live here
+    rather than in a step's locals: a step that raises must leave them
+    exactly as far as it got.
+    """
+
+    repo: str
+    issue_number: int
+    session_id: str
+    branch_name: str
+    issue: dict[str, Any]
+    ctx: PipelineContext
+    worktree_path: Path
+    pipeline: DevPipeline
+    github: GitHubCLI
+    worktree: WorktreeManager
+    state_db: StateDB
+    transport: Transport | None
+    lock: _RepoLockHandle
+    max_fix_attempts: int
+    max_blocked_rounds: int
+    pr_verifier: PRVerifier | None
+    code_review: Any
+
+    # The current outcome. None only until the code step has run.
+    result: PipelineResult | None = None
+
+    # The last exit code a worker actually reported, for the exception
+    # path's reconciliation comment. The exception path used to pass
+    # `None` unconditionally under a comment claiming no exit code was
+    # available — false whenever `pipeline.run` had already returned
+    # one and a later step (verification, review, cleanup, a `gh` call)
+    # raised. The comment then told a reader "not recorded" about a
+    # number that was sitting in the result.
+    last_exit_code: int | None = None
+
+    # The relay's publisher, once the agent has run: it knows the pull
+    # request number as soon as the PR exists (#253). The exception path
+    # reads it so a failure after the PR opened says so, instead of "no
+    # pull request was opened ... free to pick up", which invites a
+    # second run and a duplicate PR.
+    publisher: _Publisher | None = None
+
+    # Set by the verify step when it had a pull request to verify. The
+    # review step runs only then, and the frame attaches a review outcome
+    # to the result only then.
+    pr_number_for_review: int | None = None
+    # What the review step found, or None when it did not get as far as
+    # an outcome (the PR stopped being fine during verification). The
+    # frame, not the step, turns None into REVIEW_NOT_REPORTED.
+    review_report: ReviewReport | None = None
+
+
+async def _step_code(run: _DevRun) -> None:
+    """Run the agent, then answer its questions until it stops asking."""
+    run.result = await run.pipeline.run(run.ctx)
+    run.last_exit_code = run.result.exit_code
+
+    # BLOCKED loop: if Claude needs input, post the question to the
+    # transport (Telegram), wait for the operator's reply, and resume
+    # the session. Loop until Claude signals DONE/FAILED or we run out
+    # of trips. Each round-trip is capped at the transport's own
+    # timeout (see Transport.ask signature — default 300s); the total
+    # is bounded by max_blocked_rounds.
+    rounds = 0
+    while (
+        run.result.blocked
+        and run.transport is not None
+        and rounds < run.max_blocked_rounds
+    ):
+        question = (run.result.question or "").strip() or (
+            f"Session {run.session_id} is blocked but did not include a "
+            "question. Reply with guidance to resume."
+        )
+        try:
+            answer = await run.transport.ask(
+                question,
+                session_id=run.session_id,
+                repo=run.repo,
+                issue_number=run.issue_number,
+            )
+        except Exception as e:
+            # Transport failed (bridge down, timeout, etc.). The
+            # session IS still blocked — we just couldn't reach the
+            # operator. Preserve blocked=True so the outer
+            # persistence-on-blocked branch fires and writes a
+            # pending_resumes row. Operator replying later via
+            # Telegram then routes through the sweeper. Setting
+            # blocked=False here (the prior behavior) wedged the
+            # session permanently.
+            run.result = PipelineResult(
+                success=False,
+                blocked=True,
+                session_id=run.session_id,
+                summary=f"Blocked session deferred (transport): {e}",
+                error=str(e),
+                question=question,
+                outputs=run.result.outputs,
+            )
+            break
+        rounds += 1
+        run.result = await run.pipeline.resume(run.ctx, answer)
+        # A resumed worker is the one whose exit code the failure
+        # comment should name. Assigned once before this loop, a
+        # late exception reported the FIRST worker's code for a
+        # session that had since been resumed several times.
+        run.last_exit_code = run.result.exit_code
+
+
+async def _step_publish(run: _DevRun) -> None:
+    """Push the branch and open the pull request, if the agent finished."""
+    assert run.result is not None
+    # #219: the agent only committed. The relay pushes the branch and
+    # opens the pull request with its own credentials, after the
+    # agent has exited, and refuses main/master/the default branch.
+    #
+    # Built on every run, not only a successful one, so the exception
+    # path always has a publisher to ask for the PR number.
+    run.publisher = _Publisher(
+        github=run.github,
+        worktree=run.worktree,
+        state_db=run.state_db,
+        repo=run.repo,
+        branch=run.branch_name,
+        issue_number=run.issue_number,
+        issue_title=run.issue.get("title", ""),
+        session_id=run.session_id,
+    )
+    if run.result.success:
+        run.result = await run.publisher.publish(run.result)
+
+
+async def _step_verify(run: _DevRun) -> None:
+    """Wait for CI and mergeability, asking the agent to fix what fails."""
+    assert run.result is not None
+    assert run.publisher is not None
+    # Verify PR is green & conflict-free before handing off. Resume the
+    # session with a fix request if either is broken, up to max_fix_attempts.
+    #
+    # Issue #29: the lock handle is passed in so the verifier releases
+    # the repo lock during its CI-polling window (can be up to 30 min)
+    # and reacquires before any request_fix. Peer sessions targeting
+    # the same repo can now run their own git-op phases while we wait.
+    if not (
+        run.result.success and run.result.outputs.get("pr_number") is not None
+    ):
+        return
+    run.pr_number_for_review = int(run.result.outputs["pr_number"])
+    verifier = run.pr_verifier or PRVerifier(github=run.github)
+    run.result = await _verify_and_fix_pr(
+        pipeline=run.pipeline,
+        ctx=run.ctx,
+        result=run.result,
+        verifier=verifier,
+        max_attempts=run.max_fix_attempts,
+        state_db=run.state_db,
+        publisher=run.publisher,
+        lock_handle=run.lock,
+    )
+
+
+async def _step_review(run: _DevRun) -> None:
+    """Review the pushed commit and record what the review found."""
+    assert run.result is not None
+    assert run.publisher is not None
+    # Review before handover: after verification so a PR still
+    # being fixed is not reviewed mid-flight, before cleanup
+    # while the worktree the reviewer reads still exists.
+    #
+    # pr_number is taken from the PRE-fix result: a fix round
+    # returns the agent's own outputs, which need not carry it.
+    # The whole call is guarded — a review must never fail a PR
+    # whose code and CI are fine.
+    if run.pr_number_for_review is None or not run.result.success:
+        return
+    pr_number_for_review = run.pr_number_for_review
+    repo = run.repo
+    session_id = run.session_id
+    worktree = run.worktree
+    code_review = run.code_review
+    # Starts as a failure, not as "fine". Every branch below
+    # overwrites it; this value is what survives if a new
+    # branch is ever added that forgets to.
+    review_report = REVIEW_NOT_REPORTED
+    try:
+        review_base = await worktree.get_default_branch(repo)
+    except Exception as e:
+        review_base = None
+        review_report = ReviewReport(
+            posted=False,
+            status="base_unknown",
+            detail=(
+                "could not resolve the base branch "
+                f"({type(e).__name__})"
+            ),
+        )
+        log_event(
+            _logger,
+            "dev.code_review.base_unknown",
+            session_id=session_id,
+            repo=repo,
+            error_type=type(e).__name__,
+        )
+    # The reviewer reads a fresh copy of the commit the relay
+    # pushed, never the agent's worktree (#263): files the
+    # agent left there that git follows (a nested repository
+    # with its own config) would run as code in the
+    # reviewer's process, outside the agent sandbox. No
+    # pushed commit means nothing fixed to review, which is
+    # reported as not reviewed rather than reviewed.
+    review_sha = run.publisher.last_pushed_sha
+    review_path: Path | None = None
+    # Switched off: nothing is read, so no copy is made, and
+    # the wrapper reports it as the operator's own choice.
+    review_off = getattr(code_review, "method", "cli") == "off"
+    if review_base is not None and review_off:
+        review_report = await _review_and_comment(
+            github=run.github,
+            repo=repo,
+            session_id=session_id,
+            pr_number=pr_number_for_review,
+            worktree_path=run.worktree_path,
+            base_branch=review_base,
+            config=code_review,
+            state_db=run.state_db,
+            issue_number=run.issue_number,
+        )
+    elif review_base is not None and review_sha is None:
+        review_report = ReviewReport(
+            posted=False,
+            status="no_pushed_head",
+            detail="no record of the commit the relay pushed",
+        )
+    elif review_base is not None:
+        try:
+            review_path = await worktree.make_review_copy(
+                repo, review_sha
+            )
+        except Exception as e:
+            review_report = ReviewReport(
+                posted=False,
+                status="copy_failed",
+                detail=(
+                    "could not make a clean copy to review "
+                    f"({type(e).__name__}: {str(e)[:160]})"
+                ),
+            )
+            log_event(
+                _logger,
+                "dev.code_review.copy_failed",
+                session_id=session_id,
+                repo=repo,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
+    if review_path is not None:
+        try:
+            review_report = await _review_and_comment(
+                github=run.github,
+                repo=repo,
+                session_id=session_id,
+                pr_number=pr_number_for_review,
+                worktree_path=review_path,
+                base_branch=review_base,
+                config=code_review,
+                state_db=run.state_db,
+                issue_number=run.issue_number,
+            )
+        except Exception as e:
+            review_report = ReviewReport(
+                posted=False,
+                status="errored",
+                detail=f"{type(e).__name__}: {str(e)[:200]}",
+            )
+            log_event(
+                _logger,
+                "dev.code_review.errored",
+                session_id=session_id,
+                repo=repo,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
+        finally:
+            try:
+                await worktree.remove_review_copy(review_path)
+            except Exception as e:
+                log_event(
+                    _logger,
+                    "dev.code_review.copy_cleanup_failed",
+                    session_id=session_id,
+                    repo=repo,
+                    error_type=type(e).__name__,
+                )
+    run.review_report = review_report
+
+
+@dataclass(frozen=True)
+class DevWorkStep:
+    """One named step of the dev pipeline's work, run in list order."""
+
+    name: str
+    run: Callable[[_DevRun], Awaitable[None]]
+
+
+# The dev pipeline's work, in the order it runs. The order is fixed (see
+# the block comment above `_DevRun`). Names are the ones the design on
+# #226 uses, so a later per-repository setting can name them.
+DEV_WORK_STEPS: tuple[DevWorkStep, ...] = (
+    DevWorkStep("code", _step_code),
+    DevWorkStep("publish", _step_publish),
+    DevWorkStep("verify", _step_verify),
+    DevWorkStep("review", _step_review),
+)
+
+
+async def _run_work_steps(run: _DevRun) -> PipelineResult:
+    """Run each work step in order and return the outcome they leave.
+
+    No step is skipped here and nothing is caught: a step that raises
+    propagates to `run_dev_issue`'s exception path, exactly as the inline
+    code did, with `run.last_exit_code` and `run.publisher` as far as the
+    step got. The list is read when the run starts, not bound when this
+    module loads.
+    """
+    for step in DEV_WORK_STEPS:
+        await step.run(run)
+    assert run.result is not None
+    return run.result
+
+
 async def run_dev_issue(
     repo: str,
     issue_number: int,
@@ -1760,21 +2113,10 @@ async def run_dev_issue(
     keeper: ClaimKeeper | None = None
     claim_id: str | None = None
 
-    # The last exit code a worker actually reported, for the exception
-    # path's reconciliation comment. The exception path used to pass
-    # `None` unconditionally under a comment claiming no exit code was
-    # available — false whenever `pipeline.run` had already returned
-    # one and a later step (verification, review, cleanup, a `gh` call)
-    # raised. The comment then told a reader "not recorded" about a
-    # number that was sitting in the result.
-    last_exit_code: int | None = None
-
-    # The relay's publisher, once the agent has run: it knows the pull
-    # request number as soon as the PR exists (#253). The exception path
-    # reads it so a failure after the PR opened says so, instead of "no
-    # pull request was opened ... free to pick up", which invites a
-    # second run and a duplicate PR.
-    publisher: _Publisher | None = None
+    # The work steps' state, once the agent pipeline exists. The
+    # exception path reads the last exit code and the publisher from it
+    # (see `_DevRun`); before it exists neither has a value.
+    run: _DevRun | None = None
 
     # Whether this run's `sessions` row exists. An event for a session
     # that was never recorded would name a session nothing else knows.
@@ -1905,219 +2247,38 @@ async def run_dev_issue(
             state_db=state_db,
             transport=transport,
         )
-        dispatched = True
-        result = await pipeline.run(ctx)
-        last_exit_code = result.exit_code
-
-        # BLOCKED loop: if Claude needs input, post the question to the
-        # transport (Telegram), wait for the operator's reply, and resume
-        # the session. Loop until Claude signals DONE/FAILED or we run out
-        # of trips. Each round-trip is capped at the transport's own
-        # timeout (see Transport.ask signature — default 300s); the total
-        # is bounded by max_blocked_rounds.
-        rounds = 0
-        while (
-            result.blocked
-            and transport is not None
-            and rounds < max_blocked_rounds
-        ):
-            question = (result.question or "").strip() or (
-                f"Session {session_id} is blocked but did not include a "
-                "question. Reply with guidance to resume."
-            )
-            try:
-                answer = await transport.ask(
-                    question,
-                    session_id=session_id,
-                    repo=repo,
-                    issue_number=issue_number,
-                )
-            except Exception as e:
-                # Transport failed (bridge down, timeout, etc.). The
-                # session IS still blocked — we just couldn't reach the
-                # operator. Preserve blocked=True so the outer
-                # persistence-on-blocked branch fires and writes a
-                # pending_resumes row. Operator replying later via
-                # Telegram then routes through the sweeper. Setting
-                # blocked=False here (the prior behavior) wedged the
-                # session permanently — codex P1.
-                result = PipelineResult(
-                    success=False,
-                    blocked=True,
-                    session_id=session_id,
-                    summary=f"Blocked session deferred (transport): {e}",
-                    error=str(e),
-                    question=question,
-                    outputs=result.outputs,
-                )
-                break
-            rounds += 1
-            result = await pipeline.resume(ctx, answer)
-            # A resumed worker is the one whose exit code the failure
-            # comment should name. Assigned once before this loop, a
-            # late exception reported the FIRST worker's code for a
-            # session that had since been resumed several times.
-            last_exit_code = result.exit_code
-
-        # #219: the agent only committed. The relay pushes the branch and
-        # opens the pull request with its own credentials, after the
-        # agent has exited, and refuses main/master/the default branch.
-        publisher = _Publisher(
+        run = _DevRun(
+            repo=repo,
+            issue_number=issue_number,
+            session_id=session_id,
+            branch_name=branch_name,
+            issue=issue,
+            ctx=ctx,
+            worktree_path=worktree_path,
+            pipeline=pipeline,
             github=github,
             worktree=worktree,
             state_db=state_db,
-            repo=repo,
-            branch=branch_name,
-            issue_number=issue_number,
-            issue_title=issue.get("title", ""),
-            session_id=session_id,
+            transport=transport,
+            lock=lock,
+            max_fix_attempts=max_fix_attempts,
+            max_blocked_rounds=max_blocked_rounds,
+            pr_verifier=pr_verifier,
+            code_review=code_review,
         )
-        if result.success:
-            result = await publisher.publish(result)
+        dispatched = True
+        # The work: code, publish, verify, review (DEV_WORK_STEPS). Everything
+        # before this line and after it is the frame.
+        result = await _run_work_steps(run)
 
-        # Verify PR is green & conflict-free before handing off. Resume the
-        # session with a fix request if either is broken, up to max_fix_attempts.
-        #
-        # Issue #29: the lock handle is passed in so the verifier releases
-        # the repo lock during its CI-polling window (can be up to 30 min)
-        # and reacquires before any request_fix. Peer sessions targeting
-        # the same repo can now run their own git-op phases while we wait.
-        if result.success and result.outputs.get("pr_number") is not None:
-            pr_number_for_review = int(result.outputs["pr_number"])
-            # Starts as a failure, not as "fine". Every branch below
-            # overwrites it; this value is what survives if a new
-            # branch is ever added that forgets to.
+        if run.pr_number_for_review is not None:
+            # Starts as a failure, not as "fine". The review step
+            # overwrites it when it reached an outcome; this value is
+            # what survives a run that did not, and any step added later
+            # that forgets to report.
             review_report = REVIEW_NOT_REPORTED
-            verifier = pr_verifier or PRVerifier(github=github)
-            result = await _verify_and_fix_pr(
-                pipeline=pipeline,
-                ctx=ctx,
-                result=result,
-                verifier=verifier,
-                max_attempts=max_fix_attempts,
-                state_db=state_db,
-                publisher=publisher,
-                lock_handle=lock,
-            )
-
-            # Review before handover: after verification so a PR still
-            # being fixed is not reviewed mid-flight, before cleanup
-            # while the worktree the reviewer reads still exists.
-            #
-            # pr_number is taken from the PRE-fix result: a fix round
-            # returns the agent's own outputs, which need not carry it.
-            # The whole call is guarded — a review must never fail a PR
-            # whose code and CI are fine.
-            if result.success and pr_number_for_review is not None:
-                try:
-                    review_base = await worktree.get_default_branch(repo)
-                except Exception as e:
-                    review_base = None
-                    review_report = ReviewReport(
-                        posted=False,
-                        status="base_unknown",
-                        detail=(
-                            "could not resolve the base branch "
-                            f"({type(e).__name__})"
-                        ),
-                    )
-                    log_event(
-                        _logger,
-                        "dev.code_review.base_unknown",
-                        session_id=session_id,
-                        repo=repo,
-                        error_type=type(e).__name__,
-                    )
-                # The reviewer reads a fresh copy of the commit the relay
-                # pushed, never the agent's worktree (#263): files the
-                # agent left there that git follows (a nested repository
-                # with its own config) would run as code in the
-                # reviewer's process, outside the agent sandbox. No
-                # pushed commit means nothing fixed to review, which is
-                # reported as not reviewed rather than reviewed.
-                review_sha = publisher.last_pushed_sha
-                review_path: Path | None = None
-                # Switched off: nothing is read, so no copy is made, and
-                # the wrapper reports it as the operator's own choice.
-                review_off = getattr(code_review, "method", "cli") == "off"
-                if review_base is not None and review_off:
-                    review_report = await _review_and_comment(
-                        github=github,
-                        repo=repo,
-                        session_id=session_id,
-                        pr_number=pr_number_for_review,
-                        worktree_path=worktree_path,
-                        base_branch=review_base,
-                        config=code_review,
-                        state_db=state_db,
-                        issue_number=issue_number,
-                    )
-                elif review_base is not None and review_sha is None:
-                    review_report = ReviewReport(
-                        posted=False,
-                        status="no_pushed_head",
-                        detail="no record of the commit the relay pushed",
-                    )
-                elif review_base is not None:
-                    try:
-                        review_path = await worktree.make_review_copy(
-                            repo, review_sha
-                        )
-                    except Exception as e:
-                        review_report = ReviewReport(
-                            posted=False,
-                            status="copy_failed",
-                            detail=(
-                                "could not make a clean copy to review "
-                                f"({type(e).__name__}: {str(e)[:160]})"
-                            ),
-                        )
-                        log_event(
-                            _logger,
-                            "dev.code_review.copy_failed",
-                            session_id=session_id,
-                            repo=repo,
-                            error_type=type(e).__name__,
-                            error=str(e)[:200],
-                        )
-                if review_path is not None:
-                    try:
-                        review_report = await _review_and_comment(
-                            github=github,
-                            repo=repo,
-                            session_id=session_id,
-                            pr_number=pr_number_for_review,
-                            worktree_path=review_path,
-                            base_branch=review_base,
-                            config=code_review,
-                            state_db=state_db,
-                            issue_number=issue_number,
-                        )
-                    except Exception as e:
-                        review_report = ReviewReport(
-                            posted=False,
-                            status="errored",
-                            detail=f"{type(e).__name__}: {str(e)[:200]}",
-                        )
-                        log_event(
-                            _logger,
-                            "dev.code_review.errored",
-                            session_id=session_id,
-                            repo=repo,
-                            error_type=type(e).__name__,
-                            error=str(e)[:200],
-                        )
-                    finally:
-                        try:
-                            await worktree.remove_review_copy(review_path)
-                        except Exception as e:
-                            log_event(
-                                _logger,
-                                "dev.code_review.copy_cleanup_failed",
-                                session_id=session_id,
-                                repo=repo,
-                                error_type=type(e).__name__,
-                            )
+            if run.review_report is not None:
+                review_report = run.review_report
 
             # Carry the outcome out on the result's own field so
             # whoever announces the pull request can say whether it was
@@ -2131,11 +2292,11 @@ async def run_dev_issue(
             # `core.code_review`'s docstring is about, reaching the
             # announcement instead of the label.
             #
-            # Outside the inner `if` as well, so every path that got as
-            # far as having a pull request carries an outcome. The
-            # branches above all set `review_report`; this line is what
-            # makes "written on every path" true rather than a claim
-            # about the paths I happened to look at.
+            # In the frame rather than the review step, so every path
+            # that got as far as having a pull request carries an
+            # outcome whatever the steps did. This line is what makes
+            # "written on every path" true rather than a claim about
+            # the paths I happened to look at.
             #
             # `replace` rather than re-listing the fields: a field
             # added to PipelineResult later is carried by construction
@@ -2320,6 +2481,7 @@ async def run_dev_issue(
         return result
 
     except Exception as e:
+        last_exit_code = run.last_exit_code if run is not None else None
         if keeper is not None:
             await keeper.stop()
         state_db.execute(
@@ -2431,7 +2593,11 @@ async def run_dev_issue(
             session_id=session_id,
             reason=f"{type(e).__name__}: {str(e)[:200]}",
             exit_code=last_exit_code,
-            pr_number=publisher.pr_number if publisher is not None else None,
+            pr_number=(
+                run.publisher.pr_number
+                if run is not None and run.publisher is not None
+                else None
+            ),
             claim_posted=claim_may_stand,
             claim_id=claim_id,
         )
