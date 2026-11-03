@@ -764,12 +764,18 @@ class TestRoundTwo:
         _write_json(source, {})
         target.symlink_to(source)
 
-        def eio(*a, **kw):
-            raise OSError(errno.EIO, "Input/output error")
+        real_stat = os.stat
 
-        monkeypatch.setattr(merge_mod, "_atomic_write_at", eio)
+        def stat_eio(*a, **kw):
+            if "dir_fd" in kw:  # the first look at the live path
+                raise OSError(errno.EIO, "Input/output error")
+            return real_stat(*a, **kw)
+
+        monkeypatch.setattr(merge_mod.os, "stat", stat_eio)
         out = migrate_link(source, target, label="settings")
+        monkeypatch.undo()
         assert out.refused
+        assert "Input/output error" in out.detail
         assert target.is_symlink()
 
 
