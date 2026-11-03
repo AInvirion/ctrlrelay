@@ -59,6 +59,7 @@ from ctrlrelay.personalization.merge import (
     merge_into_live,
     migrate_link,
     read_json_object,
+    resolved_parent,
 )
 from ctrlrelay.personalization.paths import (
     TemplateContext,
@@ -698,10 +699,12 @@ class PersonalizationManager:
         is still the old symlink into this checkout with a real file
         holding the same content, then merge.
 
-        Does not touch git. If the checkout copy differs from HEAD
-        (whatever the app wrote through the link), the outcome names
-        the differing keys and how to discard them; their values are
-        kept in the new live file either way.
+        The new live file gets the link's content as it is now, so
+        whatever the app or the operator wrote through the link is kept
+        on this machine. Only then is the checkout copy reset to
+        ``HEAD`` (the fleet's version), so it can never carry those
+        local keys into a push; the outcome names the keys reset, never
+        their values.
         """
         self._require_checkout()
         out: list[MergeOutcome] = []
@@ -714,11 +717,13 @@ class PersonalizationManager:
                 continue
             result = migrate_link(plan.source, plan.target, label=label)
             if result.action == "migrated":
-                note = self._checkout_drift_note(plan)
-                if note:
-                    result = MergeOutcome(
-                        label, result.action, result.keys, note
-                    )
+                note = self._reset_checkout_copy(plan)
+                result = MergeOutcome(
+                    label,
+                    "refused" if note.startswith("REFUSED") else result.action,
+                    result.keys,
+                    note.removeprefix("REFUSED: "),
+                )
             out.append(result)
             if not result.refused:
                 merged = merge_into_live(
@@ -743,8 +748,12 @@ class PersonalizationManager:
         """A live path inside the checkout would be a tracked file the
         app writes: the exact problem merge mode exists to remove, and a
         way for live keys to flow back into the repo on push."""
-        checkout = Path(os.path.abspath(self.checkout_path))
-        target = Path(os.path.abspath(plan.target))
+        # Resolved, so a symlinked directory on the way cannot place the
+        # live file inside the checkout. The last component is not
+        # resolved: a link there is refused by O_NOFOLLOW (or is the old
+        # link ``migrate`` converts).
+        checkout = Path(os.path.realpath(self.checkout_path))
+        target = resolved_parent(Path(os.path.abspath(plan.target)))
         if target == checkout or checkout in target.parents:
             return (
                 f"live path {plan.target} is inside the personalization "
@@ -753,29 +762,42 @@ class PersonalizationManager:
             )
         return ""
 
-    def _checkout_drift_note(self, plan: SymlinkPlan) -> str:
-        try:
-            rel = str(plan.source.relative_to(self.checkout_path))
-        except ValueError:
-            return ""
-        diff = self._git_capturing("diff", "--quiet", "--", rel, check=False)
-        if diff.returncode == 0:
-            return ""
-        keys: list[str] = []
+    def _reset_checkout_copy(self, plan: SymlinkPlan) -> str:
+        """After a migration, put the checkout copy back to ``HEAD``.
+
+        Runs only once the live file is confirmed to hold the same
+        object as the checkout copy, so nothing is lost. Returns a note
+        naming the keys reset, or ``"REFUSED: ..."``.
+        """
+        rel = str(plan.source.relative_to(self.checkout_path))
         head = self._git_capturing("show", f"HEAD:{rel}", check=False)
+        if head.returncode != 0:
+            return f"{rel} is not tracked in HEAD; left as is"
+        if self._git_capturing(
+            "diff", "--quiet", "HEAD", "--", rel, check=False
+        ).returncode == 0:
+            return ""
         try:
-            head_obj = json.loads(head.stdout) if head.returncode == 0 else {}
             now_obj, _ = read_json_object(plan.source, what="synced file")
-            if isinstance(head_obj, dict):
-                keys = differing_keys(head_obj, now_obj)
-        except (ValueError, MergeRefusedError, OSError):
+            live_obj, _ = read_json_object(plan.target, what="live file")
+        except (MergeRefusedError, OSError) as e:
+            return f"REFUSED: checkout copy {rel} not reset: {e}"
+        if differing_keys(now_obj, live_obj):
+            return (
+                f"REFUSED: checkout copy {rel} not reset: the new live file "
+                "does not match it"
+            )
+        try:
+            head_obj = json.loads(head.stdout)
+            keys = differing_keys(head_obj, now_obj) if isinstance(head_obj, dict) else []
+        except (ValueError, RecursionError):
             keys = []
+        self._git("checkout", "HEAD", "--", rel)
         named = f" (keys: {', '.join(keys)})" if keys else ""
+        logger.info("%s: reset checkout copy %s to HEAD%s", self._merge_label(plan), rel, named)
         return (
-            f"checkout copy {rel} differs from HEAD{named}; those values "
-            "are kept in the live file. To unblock pull, discard them with "
-            f"`git -C {self.checkout_path} checkout -- {rel}`, or push them "
-            "if they are a deliberate fleet change"
+            f"checkout copy {rel} reset to HEAD{named}; this machine's "
+            "values are kept in the live file"
         )
 
     def _inspect_merge(self, plan: SymlinkPlan) -> str:
@@ -1222,16 +1244,28 @@ class PersonalizationManager:
                     rel = plan.source.relative_to(self.checkout_path)
                 except ValueError:
                     continue
-                if entry.mode == "merge" and is_link_into(
-                    plan.target, plan.source
-                ):
-                    # The live file is still the old symlink, so the
-                    # checkout copy IS the live file and holds whatever
-                    # the app wrote. Live keys never flow back (#287).
-                    logger.warning(
-                        "push: not staging %s; %s is still a symlink to "
-                        "it (%s)", rel, plan.target, MIGRATE_HINT,
-                    )
+                if entry.mode == "merge":
+                    # Never staged from local state (#287): the checkout
+                    # copy is the fleet's version, and before ``migrate``
+                    # it IS the live file. ``reset --mixed`` above has
+                    # already unstaged any copy someone ``git add``-ed,
+                    # and the commit pathspec excludes it. A fleet edit
+                    # is an explicit ``git commit`` in the checkout,
+                    # which push then publishes as any other commit.
+                    if self._git_capturing(
+                        "diff", "--quiet", "HEAD", "--", str(rel),
+                        check=False,
+                    ).returncode != 0:
+                        hint = (
+                            f"; {MIGRATE_HINT}"
+                            if is_link_into(plan.target, plan.source)
+                            else ""
+                        )
+                        logger.warning(
+                            "push: not staging %s (mode: merge); to change "
+                            "fleet settings, commit it yourself with git in "
+                            "the checkout%s", rel, hint,
+                        )
                     continue
                 rels.append(str(rel))
         if not rels:

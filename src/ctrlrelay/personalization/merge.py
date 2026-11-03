@@ -10,16 +10,22 @@ The guards, each of which has a test that fails without it:
 
 * The key list is an argument from the local config. Nothing read from
   the synced file can add a key to it.
-* Both files must parse as a JSON object, or the live file is left alone.
-* Both files are opened with ``O_NOFOLLOW`` and must be regular files
-  owned by the current user. A symlink at the live path is refused and
-  its target is never opened; the one exception is :func:`migrate_link`,
-  which an operator runs explicitly to replace the old link into this
-  checkout with a real file.
+* Both files must parse as a JSON object with no duplicate keys, or the
+  live file is left alone.
+* Directories are walked one component at a time with
+  ``O_DIRECTORY | O_NOFOLLOW`` from ``$HOME`` (or ``/`` for a path
+  outside it), and the file is read, the temp file created and the
+  rename done relative to that directory fd. So a symlink at the file
+  or at any directory below the anchor is refused, and a directory
+  swapped after the walk cannot redirect the write. The files must be
+  regular and owned by the current user. The one exception is
+  :func:`migrate_link`, which an operator runs explicitly to replace the
+  old link into this checkout with a real file.
 * Writes go to a temp file in the same directory, are fsynced and then
   renamed over the live path, mode 0600 or the existing mode if stricter.
   Just before the rename the live path is checked to still be the file
-  that was read, so a swap in between is refused rather than followed.
+  that was read (device, inode, size, mtime). If it changed, the merge
+  is redone once from the new content, then refused.
 * Logs and summaries carry key names, never values: a value can be a
   secret (``env``).
 """
@@ -30,8 +36,8 @@ import errno
 import json
 import logging
 import os
+import secrets
 import stat
-import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,10 +60,17 @@ MAX_BYTES = 1 << 20
 
 MIGRATE_HINT = "run `ctrlrelay personalization migrate` once to make it a real file"
 
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _CLOEXEC
+
 
 class MergeRefusedError(Exception):
     """The merge would be unsafe; nothing was written. The message
-    names paths and reasons, never file contents."""
+    names paths, keys and reasons, never file contents."""
+
+
+class _LiveChangedError(Exception):
+    """The live path is no longer what was read; nothing was renamed."""
 
 
 @dataclass(frozen=True)
@@ -91,22 +104,75 @@ def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False)
 
 
-def _read_regular(path: Path, *, what: str) -> tuple[bytes, os.stat_result]:
-    """Read ``path`` without following a link at its last component.
+# ----- directories ------------------------------------------------------------
+
+
+def open_dir_nofollow(path: Path, *, create: bool = False) -> int:
+    """Return an fd for directory ``path`` such that no component below
+    the anchor is a symlink.
+
+    The anchor is ``$HOME`` when ``path`` is under it, else ``/``; the
+    anchor itself is trusted. Each later component is opened relative
+    to the previous fd with ``O_NOFOLLOW``. ``create`` makes missing
+    components (mode 0700). Raises ``FileNotFoundError`` for a missing
+    component when not creating, :class:`MergeRefusedError` otherwise.
+    """
+    path = Path(os.path.abspath(path))
+    home = Path(os.path.abspath(Path.home()))
+    anchor = home if (path == home or home in path.parents) else Path(path.anchor)
+    parts = path.relative_to(anchor).parts
+    fd = os.open(anchor, _DIR_FLAGS)
+    try:
+        for part in parts:
+            flags = _DIR_FLAGS | os.O_NOFOLLOW
+            try:
+                nfd = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=fd)
+                nfd = os.open(part, flags, dir_fd=fd)
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise MergeRefusedError(
+                        f"{path}: component {part!r} is a symbolic link or "
+                        "not a directory"
+                    ) from None
+                raise MergeRefusedError(
+                    f"cannot open directory {path}: {e.strerror}"
+                ) from None
+            os.close(fd)
+            fd = nfd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def resolved_parent(path: Path) -> Path:
+    """``path`` with its directory resolved and its last component kept
+    as is (the last component is guarded by ``O_NOFOLLOW`` instead)."""
+    return Path(os.path.realpath(path.parent)) / path.name
+
+
+# ----- reading ----------------------------------------------------------------
+
+
+def _read_at(
+    dfd: int, name: str, path: Path, *, what: str
+) -> tuple[bytes, os.stat_result]:
+    """Read ``name`` in directory ``dfd`` without following a link.
 
     Raises ``FileNotFoundError`` if it does not exist, and
-    :class:`MergeRefusedError` for a link, a non-regular file, a file owned
-    by someone else or an oversized file. ``O_NONBLOCK`` keeps a planted
-    FIFO from hanging the open.
+    :class:`MergeRefusedError` for a link, a non-regular file, a file
+    owned by someone else or an oversized file. ``O_NONBLOCK`` keeps a
+    planted FIFO from hanging the open.
     """
     flags = (
-        os.O_RDONLY
-        | os.O_NOFOLLOW
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NONBLOCK", 0)
+        os.O_RDONLY | os.O_NOFOLLOW | _CLOEXEC | getattr(os, "O_NONBLOCK", 0)
     )
     try:
-        fd = os.open(path, flags)
+        fd = os.open(name, flags, dir_fd=dfd)
     except FileNotFoundError:
         raise
     except OSError as e:
@@ -139,6 +205,20 @@ def _read_regular(path: Path, *, what: str) -> tuple[bytes, os.stat_result]:
     return b"".join(chunks), st
 
 
+def _no_duplicates(path: Path, what: str):
+    def hook(pairs: list[tuple[str, object]]) -> dict:
+        obj: dict = {}
+        for key, value in pairs:
+            if key in obj:
+                raise MergeRefusedError(
+                    f"{what} {path} has duplicate key {key!r}"
+                )
+            obj[key] = value
+        return obj
+
+    return hook
+
+
 def _parse_object(
     raw: bytes, path: Path, *, what: str, allow_empty: bool
 ) -> tuple[dict, str]:
@@ -149,7 +229,7 @@ def _parse_object(
     if allow_empty and not text.strip():
         return {}, text
     try:
-        obj = json.loads(text)
+        obj = json.loads(text, object_pairs_hook=_no_duplicates(path, what))
     except json.JSONDecodeError as e:
         # Message and position only: ``e.doc`` holds the whole file and
         # must never reach a log.
@@ -157,6 +237,8 @@ def _parse_object(
             f"{what} {path} is not valid JSON ({e.msg}, line {e.lineno} "
             f"column {e.colno})"
         ) from None
+    except RecursionError:
+        raise MergeRefusedError(f"{what} {path} is nested too deeply") from None
     if not isinstance(obj, dict):
         raise MergeRefusedError(
             f"{what} {path} is a JSON {type(obj).__name__}, not an object"
@@ -164,13 +246,24 @@ def _parse_object(
     return obj, text
 
 
+def _load(
+    path: Path, *, what: str, allow_empty: bool = False
+) -> tuple[dict, str, os.stat_result]:
+    dfd = open_dir_nofollow(path.parent)
+    try:
+        raw, st = _read_at(dfd, path.name, path, what=what)
+    finally:
+        os.close(dfd)
+    obj, text = _parse_object(raw, path, what=what, allow_empty=allow_empty)
+    return obj, text, st
+
+
 def read_json_object(
     path: Path, *, what: str, allow_empty: bool = False
 ) -> tuple[dict, os.stat_result]:
-    """Read ``path`` (see :func:`_read_regular`) and require a JSON
-    object. ``allow_empty`` treats a blank file as ``{}``."""
-    raw, st = _read_regular(path, what=what)
-    obj, _ = _parse_object(raw, path, what=what, allow_empty=allow_empty)
+    """Read ``path`` with every guard above and require a JSON object.
+    ``allow_empty`` treats a blank file as ``{}``."""
+    obj, _, st = _load(path, what=what, allow_empty=allow_empty)
     return obj, st
 
 
@@ -184,74 +277,77 @@ def is_link_into(target: Path, source: Path) -> bool:
         return False
 
 
-def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
-    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+# ----- writing ----------------------------------------------------------------
 
 
-def _check_unchanged(target: Path, expected: os.stat_result | None) -> None:
-    """Refuse if the live path is no longer what was read."""
+def _fingerprint(st: os.stat_result) -> tuple:
+    return (
+        st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), st.st_size,
+        st.st_mtime_ns,
+    )
+
+
+def _check_unchanged_at(
+    dfd: int, name: str, expected: os.stat_result | None
+) -> None:
     try:
-        now = os.lstat(target)
+        now = os.stat(name, dir_fd=dfd, follow_symlinks=False)
     except FileNotFoundError:
         if expected is None:
             return
-        raise MergeRefusedError(f"live file {target} disappeared during the merge") from None
-    if expected is None or not _same_file(now, expected) or (
-        stat.S_IFMT(now.st_mode) != stat.S_IFMT(expected.st_mode)
-    ):
-        raise MergeRefusedError(f"live file {target} changed during the merge")
+        raise _LiveChangedError from None
+    if expected is None or _fingerprint(now) != _fingerprint(expected):
+        raise _LiveChangedError
 
 
-def atomic_write(
-    target: Path, text: str, *, mode: int, expected: os.stat_result | None
+def _atomic_write_at(
+    dfd: int, name: str, text: str, *, mode: int,
+    expected: os.stat_result | None,
 ) -> None:
-    """Write ``text`` to ``target`` via temp + fsync + rename.
+    """Write ``text`` to ``name`` in ``dfd`` via temp + fsync + rename.
 
-    ``expected`` is the ``lstat`` of what was at ``target`` when it was
-    read (``None`` if nothing was). If the path changed since, nothing
-    is renamed. The rename replaces the directory entry and never
-    follows a link at ``target``. On any failure the temp file is
-    removed and ``target`` is as it was.
+    ``expected`` is the ``lstat`` of what was at ``name`` when it was
+    read (``None`` if nothing was). If it changed since, raises
+    :class:`_LiveChangedError` and nothing is renamed. On any failure
+    the temp file is removed and ``name`` is as it was.
     """
-    parent = target.parent
-    fd, tmp_name = tempfile.mkstemp(
-        dir=parent, prefix=f".{target.name}.", suffix=".ctrlrelay-tmp"
+    tmp = f".{name}.{secrets.token_hex(6)}.ctrlrelay-tmp"
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _CLOEXEC,
+        mode,
+        dir_fd=dfd,
     )
-    tmp = Path(tmp_name)
     try:
         try:
             os.fchmod(fd, mode)
-            data = text.encode("utf-8")
-            view = memoryview(data)
+            view = memoryview(text.encode("utf-8"))
             while view:
                 n = os.write(fd, view)
                 view = view[n:]
             os.fsync(fd)
         finally:
             os.close(fd)
-        _check_unchanged(target, expected)
-        os.replace(tmp, target)
+        _check_unchanged_at(dfd, name, expected)
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
     except BaseException:
         try:
-            tmp.unlink()
+            os.unlink(tmp, dir_fd=dfd)
         except FileNotFoundError:
             pass
         raise
     try:
-        dfd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return
-    try:
         os.fsync(dfd)
     except OSError:
         pass
-    finally:
-        os.close(dfd)
 
 
 def _refuse(label: str, reason: str) -> MergeOutcome:
     logger.error("%s: merge refused, live file left untouched: %s", label, reason)
     return MergeOutcome(label=label, action="refused", detail=reason)
+
+
+# ----- merge ------------------------------------------------------------------
 
 
 def merge_into_live(
@@ -266,11 +362,13 @@ def merge_into_live(
     """
     owned = list(keys)
     try:
-        upstream, _ = read_json_object(source, what="synced file")
+        upstream, _, _ = _load(source, what="synced file")
     except FileNotFoundError:
         return MergeOutcome(label=label, action="skipped-source-missing")
     except MergeRefusedError as e:
         return _refuse(label, str(e))
+    except OSError as e:
+        return _refuse(label, f"cannot read synced file {source}: {e.strerror}")
 
     if is_link_into(target, source):
         return _refuse(
@@ -279,35 +377,56 @@ def merge_into_live(
             f"checkout; {MIGRATE_HINT}",
         )
     try:
-        live, live_st = read_json_object(
-            target, what="live file", allow_empty=True
-        )
-    except FileNotFoundError:
-        live, live_st = {}, None
+        dfd = open_dir_nofollow(target.parent, create=True)
     except MergeRefusedError as e:
         return _refuse(label, str(e))
+    except OSError as e:
+        return _refuse(label, f"cannot open {target.parent}: {e.strerror}")
 
-    changed = [
-        k for k in owned
-        if k in upstream
-        and (k not in live or _canonical(live[k]) != _canonical(upstream[k]))
-    ]
-    if not changed:
-        return MergeOutcome(label=label, action="in-sync")
-
-    merged = dict(live)
-    for k in changed:
-        merged[k] = upstream[k]
-    text = json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
-    mode = 0o600 if live_st is None else stat.S_IMODE(live_st.st_mode) & 0o600
-    if live_st is None:
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    changed: list[str] = []
     try:
-        atomic_write(target, text, mode=mode, expected=live_st)
+        for attempt in (1, 2):
+            try:
+                raw, live_st = _read_at(dfd, target.name, target, what="live file")
+                live, _ = _parse_object(
+                    raw, target, what="live file", allow_empty=True
+                )
+            except FileNotFoundError:
+                live, live_st = {}, None
+            changed = [
+                k for k in owned
+                if k in upstream
+                and (k not in live or _canonical(live[k]) != _canonical(upstream[k]))
+            ]
+            if not changed:
+                return MergeOutcome(label=label, action="in-sync")
+            merged = dict(live)
+            for k in changed:
+                merged[k] = upstream[k]
+            text = json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
+            mode = 0o600 if live_st is None else stat.S_IMODE(live_st.st_mode) & 0o600
+            try:
+                _atomic_write_at(
+                    dfd, target.name, text, mode=mode, expected=live_st
+                )
+                break
+            except _LiveChangedError:
+                if attempt == 2:
+                    return _refuse(
+                        label,
+                        f"live file {target} changed during the merge twice; "
+                        "try again",
+                    )
+                logger.info(
+                    "%s: live file changed during the merge; redoing it once",
+                    label,
+                )
     except MergeRefusedError as e:
         return _refuse(label, str(e))
     except OSError as e:
         return _refuse(label, f"write to {target} failed: {e.strerror}")
+    finally:
+        os.close(dfd)
 
     logger.info("%s: wrote %s", label, ", ".join(changed))
     for k in changed:
@@ -325,40 +444,53 @@ def migrate_link(source: Path, target: Path, *, label: str) -> MergeOutcome:
     """Replace the old symlink ``target -> source`` with a real file.
 
     Explicit, operator-run only; no pull path calls this. The new file
-    gets the source's bytes as they are now (so whatever the app wrote
-    through the link is kept on this machine), mode 0600 or stricter.
-    A link pointing anywhere else is refused and not followed.
+    gets the source's bytes as they are now (so whatever the app or the
+    operator wrote through the link is kept on this machine), mode 0600
+    or stricter. A link pointing anywhere else is refused and not
+    followed.
     """
     try:
-        link_st = os.lstat(target)
+        dfd = open_dir_nofollow(target.parent)
     except FileNotFoundError:
         return MergeOutcome(
             label=label, action="nothing-to-migrate", detail="live path missing"
         )
-    if not stat.S_ISLNK(link_st.st_mode):
-        return MergeOutcome(
-            label=label, action="nothing-to-migrate", detail="already a real file"
-        )
-    if not is_link_into(target, source):
-        return _refuse(
-            label,
-            f"live file {target} is a symlink to somewhere other than "
-            f"{source}; not migrating it",
-        )
-    try:
-        raw, src_st = _read_regular(source, what="synced file")
-        _, text = _parse_object(raw, source, what="synced file", allow_empty=False)
-    except FileNotFoundError:
-        return _refuse(label, f"synced file {source} is missing")
     except MergeRefusedError as e:
         return _refuse(label, str(e))
-    mode = stat.S_IMODE(src_st.st_mode) & 0o600
     try:
-        atomic_write(target, text, mode=mode, expected=link_st)
-    except MergeRefusedError as e:
-        return _refuse(label, str(e))
-    except OSError as e:
-        return _refuse(label, f"write to {target} failed: {e.strerror}")
+        try:
+            link_st = os.stat(target.name, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return MergeOutcome(
+                label=label, action="nothing-to-migrate",
+                detail="live path missing",
+            )
+        if not stat.S_ISLNK(link_st.st_mode):
+            return MergeOutcome(
+                label=label, action="nothing-to-migrate",
+                detail="already a real file",
+            )
+        if not is_link_into(target, source):
+            return _refuse(
+                label,
+                f"live file {target} is a symlink to somewhere other than "
+                f"{source}; not migrating it",
+            )
+        try:
+            _, text, src_st = _load(source, what="synced file")
+        except FileNotFoundError:
+            return _refuse(label, f"synced file {source} is missing")
+        except MergeRefusedError as e:
+            return _refuse(label, str(e))
+        mode = stat.S_IMODE(src_st.st_mode) & 0o600
+        try:
+            _atomic_write_at(dfd, target.name, text, mode=mode, expected=link_st)
+        except _LiveChangedError:
+            return _refuse(label, f"live path {target} changed during the migration")
+        except OSError as e:
+            return _refuse(label, f"write to {target} failed: {e.strerror}")
+    finally:
+        os.close(dfd)
     logger.info("%s: migrated %s from a symlink to a real file", label, target)
     return MergeOutcome(label=label, action="migrated")
 

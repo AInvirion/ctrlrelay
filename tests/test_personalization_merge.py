@@ -259,16 +259,100 @@ class TestMergeIntoLive:
     def test_live_file_owned_by_someone_else_is_refused(
         self, pair, monkeypatch
     ) -> None:
+        """Only the LIVE file looks foreign-owned; the synced file is
+        ours, so only the live-file guard can refuse here."""
         source, target = pair
         _write_json(source, {"model": "opus"})
         _write_json(target, {"model": "old"})
-        real_uid = os.getuid()
-        monkeypatch.setattr(merge_mod.os, "getuid", lambda: real_uid + 1)
+        live_id = (os.stat(target).st_dev, os.stat(target).st_ino)
+        real_fstat = os.fstat
+
+        def fstat(fd: int) -> os.stat_result:
+            st = real_fstat(fd)
+            if (st.st_dev, st.st_ino) != live_id:
+                return st
+            fields = list(st)
+            fields[stat.ST_UID] = st.st_uid + 1
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(merge_mod.os, "fstat", fstat)
         out = merge_into_live(source, target, ["model"], label="settings")
-        assert out.refused
-        assert "owned by uid" in out.detail
         monkeypatch.undo()
+
+        assert out.refused
+        assert f"live file {target} is owned by uid" in out.detail
         assert _read(target) == {"model": "old"}
+
+    def test_control_synced_file_ownership_alone_passes(self, pair) -> None:
+        source, target = pair
+        _write_json(source, {"model": "opus"})
+        _write_json(target, {"model": "old"})
+        assert merge_into_live(source, target, ["model"], label="s").action == "wrote"
+
+    # --- P2: symlinked directories on the way --------------------------------
+
+    def test_symlinked_parent_dir_is_refused(self, pair, tmp_path) -> None:
+        source, target = pair
+        _write_json(source, {"model": "opus"})
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "settings.json").write_text('{"keep": 1}\n')
+        linked = tmp_path / "home2" / ".claude"
+        linked.parent.mkdir()
+        linked.symlink_to(elsewhere)
+
+        out = merge_into_live(
+            source, linked / "settings.json", ["model"], label="settings"
+        )
+
+        assert out.refused
+        assert "symbolic link or not a directory" in out.detail
+        assert (elsewhere / "settings.json").read_text() == '{"keep": 1}\n'
+
+    def test_symlinked_ancestor_dir_is_refused(self, pair, tmp_path) -> None:
+        source, target = pair
+        _write_json(source, {"model": "opus"})
+        real_home = tmp_path / "real-home"
+        (real_home / ".claude").mkdir(parents=True)
+        (real_home / ".claude" / "settings.json").write_text('{"keep": 1}\n')
+        link_home = tmp_path / "link-home"
+        link_home.symlink_to(real_home)
+
+        out = merge_into_live(
+            source, link_home / ".claude" / "settings.json", ["model"],
+            label="settings",
+        )
+
+        assert out.refused
+        assert "'link-home'" in out.detail
+        assert (real_home / ".claude" / "settings.json").read_text() == '{"keep": 1}\n'
+
+    def test_control_real_ancestors_are_written(self, pair, tmp_path) -> None:
+        source, _ = pair
+        _write_json(source, {"model": "opus"})
+        real_home = tmp_path / "real-home"
+        (real_home / ".claude").mkdir(parents=True)
+        live = real_home / ".claude" / "settings.json"
+        live.write_text('{"keep": 1}\n')
+        out = merge_into_live(source, live, ["model"], label="settings")
+        assert out.action == "wrote"
+        assert _read(live) == {"keep": 1, "model": "opus"}
+
+    def test_symlinked_synced_dir_is_refused(self, pair, tmp_path) -> None:
+        # git can track a symlinked directory in the checkout.
+        _, target = pair
+        outside = tmp_path / "outside"
+        _write_json(outside / "settings.json", {"model": "opus"})
+        checkout = tmp_path / "co"
+        checkout.mkdir()
+        (checkout / "global").symlink_to(outside)
+        _write_json(target, {})
+        out = merge_into_live(
+            checkout / "global" / "settings.json", target, ["model"],
+            label="settings",
+        )
+        assert out.refused
+        assert _read(target) == {}
 
     # --- req 2: bad input ----------------------------------------------------
 
@@ -293,6 +377,50 @@ class TestMergeIntoLive:
         target.write_text('{"keep": true}\n')
         out = merge_into_live(source, target, ["model"], label="settings")
         assert out.action == "wrote"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"model": "a", "model": "b"}',
+            '{"env": {"K": "1", "K": "2"}}',
+        ],
+    )
+    @pytest.mark.parametrize("side", ["synced", "live"])
+    def test_duplicate_keys_are_refused(self, pair, content: str, side: str) -> None:
+        source, target = pair
+        source.parent.mkdir(parents=True)
+        if side == "synced":
+            source.write_text(content)
+            target.write_text('{"keep": true}\n')
+        else:
+            _write_json(source, {"model": "opus", "env": {}})
+            target.write_text(content)
+        before = target.read_text()
+
+        out = merge_into_live(source, target, ["model", "env"], label="settings")
+
+        assert out.refused
+        assert "duplicate key" in out.detail
+        assert target.read_text() == before
+
+    @pytest.mark.parametrize("side", ["synced", "live"])
+    def test_deeply_nested_json_is_refused_not_raised(self, pair, side: str) -> None:
+        source, target = pair
+        deep = '{"a": ' + "[" * 200_000 + "]" * 200_000 + "}"
+        source.parent.mkdir(parents=True)
+        if side == "synced":
+            source.write_text(deep)
+            target.write_text("{}\n")
+        else:
+            _write_json(source, {"model": "opus"})
+            target.write_text(deep)
+        before = target.read_text()
+
+        out = merge_into_live(source, target, ["model", "a"], label="settings")
+
+        assert out.refused
+        assert "nested too deeply" in out.detail
+        assert target.read_text() == before
 
     def test_non_object_live_json_is_refused(self, pair) -> None:
         source, target = pair
@@ -350,10 +478,61 @@ class TestMergeIntoLive:
         out = merge_into_live(source, target, ["model"], label="settings")
         monkeypatch.undo()
 
+        # Changed once -> redone once -> the redo meets the link and refuses.
         assert out.refused
-        assert "changed during the merge" in out.detail
         assert target.is_symlink()
         assert victim.read_text() == "victim\n"
+
+    @staticmethod
+    def _app_writes_during(monkeypatch, target: Path, *, times: int) -> list[int]:
+        """Make the app rewrite the live file IN PLACE (same inode) while
+        our temp file is being fsynced, ``times`` times."""
+        real_fsync = os.fsync
+        done = [0]
+
+        def fsync(fd: int) -> None:
+            if done[0] < times and stat.S_ISREG(os.fstat(fd).st_mode):
+                done[0] += 1
+                live = json.loads(target.read_text())
+                live[f"appKey{done[0]}"] = "x" * done[0]
+                with open(target, "r+") as f:  # same inode, new size/mtime
+                    f.write(json.dumps(live))
+                    f.truncate()
+            real_fsync(fd)
+
+        monkeypatch.setattr(merge_mod.os, "fsync", fsync)
+        return done
+
+    def test_concurrent_app_write_is_kept_by_redoing_once(
+        self, pair, monkeypatch
+    ) -> None:
+        source, target = pair
+        _write_json(source, {"model": "opus"})
+        _write_json(target, {"model": "old"})
+        done = self._app_writes_during(monkeypatch, target, times=1)
+
+        out = merge_into_live(source, target, ["model"], label="settings")
+        monkeypatch.undo()
+
+        assert done[0] == 1
+        assert out.action == "wrote"
+        assert _read(target) == {"model": "opus", "appKey1": "x"}
+
+    def test_live_file_changing_every_attempt_is_refused(
+        self, pair, monkeypatch
+    ) -> None:
+        source, target = pair
+        _write_json(source, {"model": "opus"})
+        _write_json(target, {"model": "old"})
+        self._app_writes_during(monkeypatch, target, times=99)
+
+        out = merge_into_live(source, target, ["model"], label="settings")
+        monkeypatch.undo()
+
+        assert out.refused
+        assert "changed during the merge twice" in out.detail
+        # The app's own latest write survives; ours was never renamed in.
+        assert _read(target) == {"model": "old", "appKey1": "x", "appKey2": "xx"}
 
     @pytest.mark.parametrize(
         "existing, expected", [(0o644, 0o600), (0o600, 0o600), (0o400, 0o400)]
@@ -520,7 +699,8 @@ def _machine(tmp_path: Path, remote_bare: Path, name: str, *, mode: str = "merge
 
 def _publish_settings(tmp_path: Path, remote_bare: Path, obj: dict) -> None:
     """A separate machine edits the synced file in its checkout and pushes."""
-    mgr, checkout, _ = _machine(tmp_path, remote_bare, "publisher")
+    # Symlink mode: in merge mode push never stages the synced file.
+    mgr, checkout, _ = _machine(tmp_path, remote_bare, "publisher", mode="symlink")
     if not (checkout / ".git").exists():
         mgr.init()
     else:
@@ -594,7 +774,7 @@ class TestManagerMerge:
         assert not result.success
         assert live.is_symlink()
 
-    def test_migrate_names_app_written_keys_left_in_checkout(
+    def test_migrate_keeps_live_content_and_resets_checkout_copy(
         self, tmp_path, remote_bare
     ) -> None:
         _publish_settings(tmp_path, remote_bare, {"model": "opus"})
@@ -609,10 +789,54 @@ class TestManagerMerge:
         outcomes = mgr.migrate()
 
         assert outcomes[0].action == "migrated"
-        assert "promptSuggestionEnabled" in outcomes[0].detail
+        assert "reset to HEAD (keys: promptSuggestionEnabled)" in outcomes[0].detail
         assert "False" not in outcomes[0].detail and "false" not in outcomes[0].detail
+        assert "git" not in outcomes[0].detail  # no discard advice to follow
+        # This machine's content is in the live file...
         assert _read(live) == {"model": "opus", "promptSuggestionEnabled": False}
         assert not live.is_symlink()
+        # ...and the checkout copy is the fleet's again: clean tree.
+        assert _git("status", "--porcelain", cwd=checkout).strip() == ""
+        assert _read(checkout / "global" / "settings.json") == {"model": "opus"}
+
+    def test_after_migrate_app_keys_never_reach_a_push(
+        self, tmp_path, remote_bare
+    ) -> None:
+        """P1: once migrated, neither the live file nor a dirty or even
+        ``git add``-ed checkout copy is pushed."""
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        old, checkout, live = _machine(tmp_path, remote_bare, "b", mode="symlink")
+        old.init()
+        live.write_text(json.dumps({"model": "opus", "appKey": SECRET}))
+        mgr, _, _ = _machine(tmp_path, remote_bare, "b")
+        mgr.migrate()
+
+        # The app keeps writing the live file; someone also copies its
+        # content into the checkout and stages it.
+        _write_json(live, {**_read(live), "later": SECRET})
+        copy = checkout / "global" / "settings.json"
+        copy.write_text(live.read_text())
+        _git("add", "global/settings.json", cwd=checkout)
+
+        mgr.push(message="must not carry live keys")
+
+        assert SECRET not in _git("log", "-p", "--all", cwd=checkout)
+
+    def test_control_explicit_fleet_commit_is_pushed(
+        self, tmp_path, remote_bare
+    ) -> None:
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout, live = _machine(tmp_path, remote_bare, "b")
+        mgr.init()
+        _write_json(checkout / "global" / "settings.json", {"model": "fable"})
+        _git("commit", "-q", "-am", "fleet: model fable", cwd=checkout)
+
+        result = mgr.push(message="unused")
+
+        assert result.success, result.summary
+        assert '"fable"' in _git(
+            "show", "origin/main:global/settings.json", cwd=checkout
+        )
 
     def test_push_never_stages_a_symlinked_merge_live_file(
         self, tmp_path, remote_bare
@@ -641,6 +865,36 @@ class TestManagerMerge:
         live.write_text(json.dumps({"model": "opus", "appKey": SECRET}))
         assert old.push(message="symlink mode pushes it").success
         assert SECRET in _git("log", "-p", "--all", cwd=checkout)
+
+    def test_target_inside_checkout_via_symlinked_dir_is_refused(
+        self, tmp_path, remote_bare
+    ) -> None:
+        """P2: the lexical path is outside the checkout, the resolved one
+        is inside."""
+        checkout = tmp_path / "b" / "personalization"
+        door = tmp_path / "b" / "door"
+        paths = [{
+            "source": "global/settings.json",
+            "target": str(door / "settings.json"),
+            "mode": "merge",
+            "merge_keys": ["model"],
+        }]
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr = PersonalizationManager(
+            _config_for(checkout, remote_bare, node_id="b", paths=paths)
+        )
+        _patch_remote_url(mgr, str(remote_bare))
+        mgr.init()  # writes a real door/settings.json; replace door by a link
+        (door / "settings.json").unlink()
+        door.rmdir()
+        (checkout / "sub").mkdir()
+        door.symlink_to(checkout / "sub")
+
+        outcomes = mgr.apply_merges()
+
+        assert outcomes[0].refused
+        assert "inside the personalization checkout" in outcomes[0].detail
+        assert not (checkout / "sub" / "settings.json").exists()
 
     def test_target_inside_checkout_is_refused(self, tmp_path, remote_bare) -> None:
         checkout = tmp_path / "b" / "personalization"
