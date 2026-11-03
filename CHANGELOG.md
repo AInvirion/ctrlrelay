@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `repos[].steps` sets each dev pipeline work step (`code`, `publish`,
+  `verify`, `review`) to `off`, `on` or `required`, and `repos[].max_fix_attempts`
+  caps the CI fix rounds. `required` stops the run on a failure, including a
+  reviewer that cannot run or CI that never finished; the PR stays open and the
+  run is announced as failed. Unset keys keep today's behaviour, and settings
+  the pipeline could not honour (`code: off`, `verify: on`, a review switch
+  that disagrees with `code_review.method`) are refused at load (#226).
+
 ## [0.18.0] - 2026-11-03
 
 ### Added

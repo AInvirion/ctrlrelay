@@ -658,6 +658,8 @@ repos:
 | `agent_type` | string | no | `null` | Which agent backend runs this repo's sessions. `null` means `agent.type`. See [agent backends](#agent-backends). A value no adapter answers to stops the daemon at startup, naming this repo. |
 | `automation` | object | no | (defaults) | See [automation](#repos-automation). |
 | `code_review` | object | no | (defaults) | Review run over an agent branch before its PR is handed over. See [code_review](#code_review). |
+| `steps` | object | no | (all unset) | How strict each dev pipeline work step is. See [steps](#repossteps). |
+| `max_fix_attempts` | integer ≥ 0 | no | `3` | Fix rounds the dev pipeline asks for when a PR's CI is red or its branch conflicts, before the run fails. `0` means none. See [steps](#repossteps). |
 | `deploy` | object | no | `null` | Reserved for deploy policy. Currently surfaced in `ctrlrelay config repos` but otherwise inert. |
 
 ### repos[].automation
@@ -855,6 +857,83 @@ repos:
   to treat that as acceptable and hand off rather than loop.
 - This does not change the overall session timeout (`agent.default_timeout_seconds`,
   default 1800s) — it only bounds the one `ci wait` call.
+
+### repos[].steps
+
+The dev pipeline does its work in a fixed order: **code** (the agent run and
+any questions it asks), **publish** (the relay pushes the branch and opens the
+pull request), **verify** (wait for CI and mergeability, asking the agent to
+fix what fails, up to `max_fix_attempts` rounds) and **review** (the
+configured reviewer reads the pushed commit and posts its findings). The order
+is not configurable. `steps` says how strict each step is for this repo.
+Only the dev pipeline reads it so far; the task and secops pipelines ignore it.
+
+```yaml
+repos:
+  - name: "your-org/your-repo"
+    steps:
+      verify: required
+      review: required
+    max_fix_attempts: 2
+```
+
+| Mode | Meaning |
+|---|---|
+| `off` | The step does not run. |
+| `on` | A failure is reported and the run continues: the PR is handed over. |
+| `required` | A failure stops the run, and no route skips the step. A step that cannot run has not passed. |
+| (unset) | What the pipeline did before these switches. See the table below. |
+
+| Step | Accepts | Unset means |
+|---|---|---|
+| `code` | `required` | A failed or crashed agent run stops the run. Same as `required`. |
+| `publish` | `required` | A refused or failed push stops the run (the branch is kept). Same as `required`. |
+| `verify` | `off`, `required` | CI still red after the fix rounds stops the run. CI that is still pending when the wait times out hands the PR over. |
+| `review` | `off`, `on`, `required` | `on`: a review that did not post is announced as `NO REVIEW ON THIS PR` and the PR is handed over. |
+
+`code` and `publish` cannot be `off` or `on`: a dev run without them has
+nothing to hand over, so the config refuses those values at load instead of
+accepting and ignoring them. `verify: on` is refused too: it would announce a
+PR as ready while its CI is red, with no line in the announcement saying so.
+Unknown step names (a typo such as `verfy`) are refused as well. A bare `on`
+or `off` works unquoted.
+
+**`verify: required`** also fails the run when the CI wait times out, before
+or after a fix round, and when the checks cannot be read at all.
+**`verify: off`** skips the CI wait and the fix rounds; the review still runs.
+The status page then has no CI or `pr_opened` event for the run.
+
+**`review: required`** passes only when the review's findings were posted on
+the PR. A reviewer that cannot start, one that ran without reading the diff, a
+comment that failed to post, a copy of the commit that could not be made, and
+an exception inside the review are all failures. It is about the review
+having happened, not about what it found. **`review: off`** is the same as
+`code_review.method: off`, and loads as that.
+
+Two settings for one reviewer must agree, or the config refuses to load:
+
+- `code_review.method: off` with `steps.review: on` or `required`;
+- `steps.review: off` with an explicit `code_review.method: cli`;
+- `steps.review: required` with `code_review.comment_on_pr: false`, since the
+  findings would never reach the PR.
+
+`code_review.method: off` on its own keeps working as before.
+
+**What the operator sees when a required step stops a run after the PR
+exists.** The ordinary failure path, unchanged:
+
+- the PR stays open on GitHub, and the relay keeps watching it for a merge;
+- the session is marked `failed`; the worktree is removed and the pushed
+  branch kept;
+- the claim on the issue is retracted with a comment that names the PR and
+  the reason (for example `PR #42 not handed over: review is required for
+  your-org/your-repo and did not pass`);
+- chat gets `❌ Failed on #N: …`, never `✅ PR ready`.
+
+A resumed session (an answer that arrived after the run stopped to ask) goes
+through the same publish and verify steps. It did not run the review before
+these switches, and with `review` unset or `on` it still does not; with
+`review: required` it does.
 
 ## schedules
 

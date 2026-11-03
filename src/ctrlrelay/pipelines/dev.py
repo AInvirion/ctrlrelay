@@ -28,6 +28,7 @@ from ctrlrelay.core.code_review import (
     format_review_comment,
     run_code_review,
 )
+from ctrlrelay.core.config import check_dev_step_mode
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.events import (
     EventKind,
@@ -1482,8 +1483,14 @@ async def _verify_and_fix_pr(
     state_db: StateDB | None,
     publisher: _Publisher,
     lock_handle: _RepoLockHandle | None = None,
+    ci_timeout_fails: bool = False,
 ) -> PipelineResult:
     """Loop: verify CI+mergeability, ask Claude to fix, re-verify.
+
+    ``ci_timeout_fails`` is ``steps.verify: required`` (#226): a CI wait
+    that times out has not passed, so the run fails with the pull request
+    open instead of handing it over. Off by default, which is the
+    behaviour before the switch: slow CI hands the pull request over.
 
     ``publisher`` pushes each fix round (#219): the agent commits
     locally and the relay pushes, so a fix the relay did not push would
@@ -1573,11 +1580,27 @@ async def _verify_and_fix_pr(
                 },
             )
 
+    def _timed_out(current: PipelineResult) -> PipelineResult:
+        if not ci_timeout_fails:
+            return current
+        return PipelineResult(
+            success=False,
+            session_id=current.session_id,
+            summary=(
+                f"PR #{pr_number} not handed over: verify is required for "
+                f"{ctx.repo} and CI did not finish"
+            ),
+            error=verification.reason or "CI wait timed out",
+            outputs={**reported_outputs, **current.outputs},
+            exit_code=current.exit_code,
+        )
+
     verification = await _run_verify()
     # If CI is simply slow (timed_out) we hand the PR off rather than asking
-    # Claude to "fix" something that isn't broken.
+    # Claude to "fix" something that isn't broken — unless verify is
+    # required, where an unanswered CI is not a pass.
     if verification.timed_out:
-        return result
+        return _timed_out(result)
     attempts = 0
     while not verification.ready and attempts < max_attempts:
         # Reacquire before request_fix — claude spawns inside the
@@ -1655,7 +1678,7 @@ async def _verify_and_fix_pr(
         verification = await _run_verify()
         if verification.timed_out:
             # Same rule after a fix round: slow CI isn't a Claude task.
-            return result
+            return _timed_out(result)
 
     if verification.ready:
         return result
@@ -1746,6 +1769,44 @@ class _DevRun:
     # an outcome (the PR stopped being fine during verification). The
     # frame, not the step, turns None into REVIEW_NOT_REPORTED.
     review_report: ReviewReport | None = None
+
+    # How strict the verify and review steps are for this repo (#226):
+    # "off", "on", "required", or None for the behaviour before the
+    # switches. code and publish accept only "required", which is what
+    # they always did, so they carry no field.
+    verify_mode: str | None = None
+    review_mode: str | None = None
+
+
+def _fail_required_step(run: _DevRun, step: str, reason: str) -> None:
+    """Stop the run because a required step did not pass.
+
+    The result becomes an ordinary failure, so everything after it is the
+    existing failure path: the session is marked failed, the worktree is
+    removed and a pushed branch kept, the claim is retracted naming the
+    pull request, and the announcement is the failure line rather than
+    "PR ready". The outputs are kept so all of those can name the PR.
+    """
+    assert run.result is not None
+    pr = run.result.outputs.get("pr_number")
+    where = f"PR #{pr} not handed over" if pr is not None else "Not handed over"
+    log_event(
+        _logger,
+        "dev.step.required_failed",
+        session_id=run.session_id,
+        repo=run.repo,
+        issue_number=run.issue_number,
+        step=step,
+        reason=reason[:200],
+    )
+    run.result = dataclasses.replace(
+        run.result,
+        success=False,
+        blocked=False,
+        question=None,
+        summary=f"{where}: {step} is required for {run.repo} and did not pass",
+        error=reason,
+    )
 
 
 async def _step_code(run: _DevRun) -> None:
@@ -1841,8 +1902,24 @@ async def _step_verify(run: _DevRun) -> None:
     if not (
         run.result.success and run.result.outputs.get("pr_number") is not None
     ):
+        if run.verify_mode == "required" and run.result.success:
+            # A success with no pull request to verify has not passed a
+            # required verify (#226). Unreachable while publish always
+            # names the PR it opened; kept so it stays true if not.
+            _fail_required_step(run, "verify", "no pull request to verify")
         return
     run.pr_number_for_review = int(run.result.outputs["pr_number"])
+    if run.verify_mode == "off":
+        # Switched off for this repo: no CI wait and no fix rounds. The
+        # review step still runs, because it reads the pushed commit.
+        log_event(
+            _logger,
+            "dev.verify.off",
+            session_id=run.session_id,
+            repo=run.repo,
+            pr_number=run.pr_number_for_review,
+        )
+        return
     verifier = run.pr_verifier or PRVerifier(github=run.github)
     run.result = await _verify_and_fix_pr(
         pipeline=run.pipeline,
@@ -1853,6 +1930,7 @@ async def _step_verify(run: _DevRun) -> None:
         state_db=run.state_db,
         publisher=run.publisher,
         lock_handle=run.lock,
+        ci_timeout_fails=run.verify_mode == "required",
     )
 
 
@@ -1869,6 +1947,19 @@ async def _step_review(run: _DevRun) -> None:
     # The whole call is guarded — a review must never fail a PR
     # whose code and CI are fine.
     if run.pr_number_for_review is None or not run.result.success:
+        if run.review_mode == "required" and run.result.success:
+            # Same rule as verify: nothing reviewed is not a pass.
+            _fail_required_step(run, "review", "no pull request to review")
+        return
+    if run.review_mode == "off":
+        # Switched off with steps.review. The config also turns the
+        # reviewer off, so this is for a caller that passed only one.
+        run.review_report = ReviewReport(
+            posted=False,
+            status="skipped",
+            detail="steps.review is 'off' for this repo",
+            deliberate=True,
+        )
         return
     pr_number_for_review = run.pr_number_for_review
     repo = run.repo
@@ -1989,6 +2080,15 @@ async def _step_review(run: _DevRun) -> None:
                     error_type=type(e).__name__,
                 )
     run.review_report = review_report
+    if run.review_mode == "required" and not review_report.posted:
+        # Required means findings reached the pull request. Every other
+        # outcome — a reviewer that could not run, one that read nothing,
+        # a comment that failed to post, findings kept in the log — is
+        # not a pass (#226).
+        reason = review_report.detail.strip() or review_report.status
+        _fail_required_step(
+            run, "review", f"the review did not post ({reason})"
+        )
 
 
 @dataclass(frozen=True)
@@ -2008,6 +2108,21 @@ DEV_WORK_STEPS: tuple[DevWorkStep, ...] = (
     DevWorkStep("verify", _step_verify),
     DevWorkStep("review", _step_review),
 )
+
+
+def _resolve_step_modes(steps: Any) -> tuple[str | None, str | None]:
+    """``(verify, review)`` modes from a repo's ``steps``, checked.
+
+    Read with ``getattr`` like ``code_review``, so ``None`` (every step
+    unset) and test doubles work. Checked against the same table the
+    config uses: a mode the config would refuse raises here too, rather
+    than being accepted and ignored by a caller that bypassed the config.
+    """
+    modes = {
+        name: check_dev_step_mode(name, getattr(steps, name, None))
+        for name in ("code", "publish", "verify", "review")
+    }
+    return modes["verify"], modes["review"]
 
 
 async def _run_work_steps(run: _DevRun) -> PipelineResult:
@@ -2043,13 +2158,19 @@ async def run_dev_issue(
     code_review: Any = None,
     *,
     claims: ClaimSettings | None,
+    steps: Any = None,
 ) -> PipelineResult:
     """Run dev pipeline for a single issue.
 
     ``claims`` is required so no caller drops the shared-account claim
     by omission (#245). ``None`` is the single-machine behaviour: the
     unnamed claim, with no race check.
+
+    ``steps`` is the repo's ``DevStepsConfig`` (#226); ``None`` leaves
+    every step as it was before the switches existed.
     """
+    # Before the lock: a refused mode is a caller error, not a run.
+    verify_mode, review_mode = _resolve_step_modes(steps)
     session_id = f"dev-{repo.replace('/', '-')}-{issue_number}-{uuid.uuid4().hex[:8]}"
     branch_name = branch_template.replace("{n}", str(issue_number))
 
@@ -2265,6 +2386,8 @@ async def run_dev_issue(
             max_blocked_rounds=max_blocked_rounds,
             pr_verifier=pr_verifier,
             code_review=code_review,
+            verify_mode=verify_mode,
+            review_mode=review_mode,
         )
         dispatched = True
         # The work: code, publish, verify, review (DEV_WORK_STEPS). Everything
@@ -2640,9 +2763,17 @@ async def resume_dev_from_pending(
     max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
     max_fix_attempts: int = DEFAULT_MAX_FIX_ATTEMPTS,
     pr_verifier: PRVerifier | None = None,
+    code_review: Any = None,
+    steps: Any = None,
 ) -> PipelineResult:
     """Resume a BLOCKED dev session using an answer that arrived via
     Telegram after ``run_dev_issue`` exited.
+
+    ``steps`` as in ``run_dev_issue`` (#226). Publish and verify run here
+    as they do there. Review did not run on this path before the
+    switches, and with ``review`` unset or ``on`` it still does not; with
+    ``review: required`` it runs, because a required step has no route
+    around it.
 
     Unlike secops, the dev pipeline keeps its worktree + branch alive on
     BLOCKED exits (so resume doesn't have to re-clone/re-apply). We try
@@ -2680,6 +2811,7 @@ async def resume_dev_from_pending(
         )
 
     branch_name = branch_template.replace("{n}", str(issue_number))
+    verify_mode, review_mode = _resolve_step_modes(steps)
 
     lock = _RepoLockHandle(state_db, repo, session_id)
     if not state_db.acquire_lock(repo, session_id):
@@ -2810,37 +2942,44 @@ async def resume_dev_from_pending(
             rounds += 1
             result = await pipeline.resume(ctx, next_answer)
 
-        # Publish exactly as run_dev_issue does (#219). The pull request
-        # may already exist from before this session blocked; the
-        # publisher finds it by head branch instead of opening another.
-        publisher = _Publisher(
+        # Publish and verify through the same steps run_dev_issue uses
+        # (#219, #226). The pull request may already exist from before
+        # this session blocked; the publisher finds it by head branch
+        # instead of opening another. The lock handle goes in so the
+        # verifier releases the repo lock while it polls CI (#29).
+        run = _DevRun(
+            repo=repo,
+            issue_number=int(issue_number),
+            session_id=session_id,
+            branch_name=branch_name,
+            issue=issue,
+            ctx=ctx,
+            worktree_path=worktree_path,
+            pipeline=pipeline,
             github=github,
             worktree=worktree,
             state_db=state_db,
-            repo=repo,
-            branch=branch_name,
-            issue_number=int(issue_number),
-            issue_title=issue.get("title", ""),
-            session_id=session_id,
+            transport=transport,
+            lock=lock,
+            max_fix_attempts=max_fix_attempts,
+            max_blocked_rounds=max_blocked_rounds,
+            pr_verifier=pr_verifier,
+            code_review=code_review,
+            result=result,
+            verify_mode=verify_mode,
+            review_mode=review_mode,
         )
-        if result.success:
-            result = await publisher.publish(result)
-
-        # Verify PR once the agent says DONE, matching run_dev_issue.
-        # The lock handle is threaded through so the verifier releases
-        # the repo lock during its CI-polling window (issue #29).
-        if result.success and result.outputs.get("pr_number") is not None:
-            verifier = pr_verifier or PRVerifier(github=github)
-            result = await _verify_and_fix_pr(
-                pipeline=pipeline,
-                ctx=ctx,
-                result=result,
-                verifier=verifier,
-                max_attempts=max_fix_attempts,
-                state_db=state_db,
-                publisher=publisher,
-                lock_handle=lock,
-            )
+        await _step_publish(run)
+        await _step_verify(run)
+        if review_mode == "required":
+            await _step_review(run)
+            if run.pr_number_for_review is not None:
+                run.result = dataclasses.replace(
+                    run.result,
+                    review=run.review_report or REVIEW_NOT_REPORTED,
+                )
+        assert run.result is not None
+        result = run.result
 
         status = "done" if result.success else (
             "blocked" if result.blocked else "failed"
