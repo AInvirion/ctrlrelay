@@ -486,6 +486,105 @@ class AutomationConfig(BaseModel):
 
 _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
+# The modes each dev work step accepts (#226). The order of the steps is
+# fixed in code; a repository only says how strict each one is.
+#
+# - ``off``: the step does not run.
+# - ``on``: a failure is reported and the run continues.
+# - ``required``: a failure stops the run, and no route skips the step. A
+#   step that cannot run has not passed.
+#
+# ``code`` and ``publish`` accept only ``required``: a dev run without an
+# agent run, or without the pull request, has nothing to hand over, and a
+# switch the pipeline would have to ignore is refused instead.
+#
+# ``verify: on`` is refused too. It would mean announcing a pull request
+# as ready while its CI is red, and the announcement path has no line
+# that says so.
+#
+# Unset is not the same as any of the three: it is what the pipeline did
+# before the switches existed (see ``DevStepsConfig``). The pipeline
+# reads this table as well, so a caller that bypasses the config cannot
+# get a mode accepted and ignored.
+DEV_STEP_MODES: dict[str, tuple[str, ...]] = {
+    "code": ("required",),
+    "publish": ("required",),
+    "verify": ("off", "required"),
+    "review": ("off", "on", "required"),
+}
+
+_STEP_REFUSALS: dict[str, str] = {
+    "code": (
+        "a dev run without the agent run has nothing to publish"
+    ),
+    "publish": (
+        "a dev run that does not push and open the pull request has "
+        "nothing to hand over"
+    ),
+    "verify": (
+        "'on' would announce a pull request as ready while its CI is red; "
+        "use 'required' (CI must pass), 'off' (no CI wait), or leave it "
+        "unset for the default"
+    ),
+    "review": "",
+}
+
+
+def check_dev_step_mode(step: str, mode: Any) -> str | None:
+    """Return ``mode`` if ``step`` accepts it, else raise ``ValueError``.
+
+    ``None`` is unset and always accepted. YAML 1.1 reads a bare ``on`` or
+    ``off`` as a boolean, so ``True``/``False`` are read back as the word
+    the operator wrote.
+    """
+    if step not in DEV_STEP_MODES:
+        raise ValueError(
+            f"steps.{step} is not a dev work step; the steps are "
+            f"{', '.join(DEV_STEP_MODES)}"
+        )
+    if mode is None:
+        return None
+    if mode is True:
+        mode = "on"
+    elif mode is False:
+        mode = "off"
+    allowed = DEV_STEP_MODES[step]
+    if mode not in allowed:
+        why = _STEP_REFUSALS[step]
+        raise ValueError(
+            f"steps.{step} cannot be {mode!r}: it accepts "
+            f"{' or '.join(repr(a) for a in allowed)}"
+            + (f" ({why})" if why else "")
+        )
+    return mode
+
+
+class DevStepsConfig(BaseModel):
+    """How strict each of the dev pipeline's work steps is for a repo.
+
+    Every key unset reproduces the pipeline as it was before these
+    switches: ``code`` and ``publish`` stop the run when they fail;
+    ``verify`` stops it when CI is still red after the fix rounds, but
+    hands the pull request over when the CI wait times out; ``review``
+    reports a review that did not post and hands the pull request over
+    anyway (``on``).
+
+    Unknown keys are refused, so a typo such as ``verfy: required``
+    cannot load as "unset".
+    """
+
+    model_config = {"extra": "forbid"}
+
+    code: str | None = None
+    publish: str | None = None
+    verify: str | None = None
+    review: str | None = None
+
+    @field_validator("code", "publish", "verify", "review", mode="before")
+    @classmethod
+    def _known_mode(cls, v: Any, info: Any) -> str | None:
+        return check_dev_step_mode(info.field_name, v)
+
 
 class RepoConfig(BaseModel):
     """Configuration for a single repository."""
@@ -511,6 +610,49 @@ class RepoConfig(BaseModel):
     # adapter answers to stops the daemon at startup naming this repo,
     # rather than quietly leaving it on the default.
     agent_type: str | None = None
+    # Per-step strictness for the dev pipeline (#226). See DevStepsConfig.
+    steps: DevStepsConfig = Field(default_factory=DevStepsConfig)
+    # How many times the dev pipeline asks the agent to fix a pull request
+    # whose CI is red or whose branch conflicts, before the run fails. The
+    # default is the pipeline's own (DEFAULT_MAX_FIX_ATTEMPTS in
+    # pipelines/dev.py; a test keeps the two equal). 0 means no fix round.
+    max_fix_attempts: int = Field(default=3, ge=0)
+
+    @model_validator(mode="after")
+    def _review_settings_agree(self) -> RepoConfig:
+        """``code_review.method`` and ``steps.review`` must not disagree.
+
+        ``code_review.method: off`` predates the step switches and keeps
+        working alone. Set together with ``steps.review``, the two have to
+        say the same thing; picking one silently would leave the operator
+        believing the other.
+        """
+        review = self.steps.review
+        method = self.code_review.method
+        method_set = "method" in self.code_review.model_fields_set
+        if method == "off" and review in ("on", "required"):
+            raise ValueError(
+                f"repo {self.name}: code_review.method is 'off' but "
+                f"steps.review is {review!r}; set one of them, or make "
+                "them agree"
+            )
+        if review == "off" and method_set and method != "off":
+            raise ValueError(
+                f"repo {self.name}: steps.review is 'off' but "
+                f"code_review.method is {method!r}; set one of them, or "
+                "make them agree"
+            )
+        if review == "required" and not self.code_review.comment_on_pr:
+            raise ValueError(
+                f"repo {self.name}: steps.review is 'required' but "
+                "code_review.comment_on_pr is false, so the findings could "
+                "never reach the pull request"
+            )
+        if review == "off":
+            # Off in one place is off everywhere that reads the reviewer,
+            # including the startup probe for the reviewer's binary.
+            self.code_review.method = "off"
+        return self
 
     @field_validator("name")
     @classmethod

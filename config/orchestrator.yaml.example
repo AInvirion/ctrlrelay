@@ -254,3 +254,20 @@ repos: []
   #     # generated while blocked in this call, so a slow default here
   #     # just adds idle wall-clock time. Defaults to 600 (10 minutes).
   #     ci_wait_timeout_seconds: 600
+  #   # How strict each dev pipeline work step is for this repo. The
+  #   # order (code, publish, verify, review) is fixed. Each key is
+  #   # off, on or required; leave a key out for today's behaviour.
+  #   #   required: a failure stops the run, and nothing skips the step
+  #   #             (a reviewer that cannot run is not a pass, and CI
+  #   #             that never finished is not a pass)
+  #   #   on:       a failure is reported and the PR is handed over
+  #   #   off:      the step does not run
+  #   # code and publish accept only required. verify accepts off or
+  #   # required. review: off is the same as code_review.method: off;
+  #   # set both only if they agree.
+  #   steps:
+  #     verify: required
+  #     review: required
+  #   # Fix rounds for a PR whose CI is red or whose branch conflicts,
+  #   # before the run fails. Defaults to 3; 0 means none.
+  #   max_fix_attempts: 3

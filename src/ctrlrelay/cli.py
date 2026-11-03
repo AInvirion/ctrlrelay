@@ -2512,6 +2512,8 @@ def run_dev(
             contexts_dir=config.paths.contexts,
             ci_wait_timeout_seconds=repo_config.automation.ci_wait_timeout_seconds,
             code_review=repo_config.code_review,
+            max_fix_attempts=repo_config.max_fix_attempts,
+            steps=repo_config.steps,
         )
 
     try:
@@ -3263,6 +3265,8 @@ def poller_start(
                         contexts_dir=config.paths.contexts,
                         ci_wait_timeout_seconds=repo_config.automation.ci_wait_timeout_seconds,
                         code_review=repo_config.code_review,
+                        max_fix_attempts=repo_config.max_fix_attempts,
+                        steps=repo_config.steps,
                         claims=claims,
                     )
 
@@ -3814,6 +3818,9 @@ def poller_start(
                                 state_db=state_db,
                                 transport=sweeper_transport,
                                 contexts_dir=config.paths.contexts,
+                                max_fix_attempts=repo_cfg.max_fix_attempts,
+                                code_review=repo_cfg.code_review,
+                                steps=repo_cfg.steps,
                             )
                         elif pipeline_name == "task":
                             result = await resume_task_from_pending(
