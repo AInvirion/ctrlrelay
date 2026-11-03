@@ -1951,16 +1951,6 @@ async def _step_review(run: _DevRun) -> None:
             # Same rule as verify: nothing reviewed is not a pass.
             _fail_required_step(run, "review", "no pull request to review")
         return
-    if run.review_mode == "off":
-        # Switched off with steps.review. The config also turns the
-        # reviewer off, so this is for a caller that passed only one.
-        run.review_report = ReviewReport(
-            posted=False,
-            status="skipped",
-            detail="steps.review is 'off' for this repo",
-            deliberate=True,
-        )
-        return
     pr_number_for_review = run.pr_number_for_review
     repo = run.repo
     session_id = run.session_id
@@ -2110,18 +2100,35 @@ DEV_WORK_STEPS: tuple[DevWorkStep, ...] = (
 )
 
 
-def _resolve_step_modes(steps: Any) -> tuple[str | None, str | None]:
+def _resolve_step_modes(
+    steps: Any, code_review: Any
+) -> tuple[str | None, str | None]:
     """``(verify, review)`` modes from a repo's ``steps``, checked.
 
     Read with ``getattr`` like ``code_review``, so ``None`` (every step
     unset) and test doubles work. Checked against the same table the
     config uses: a mode the config would refuse raises here too, rather
     than being accepted and ignored by a caller that bypassed the config.
+
+    ``review: off`` is carried by ``code_review.method: off``, which the
+    config sets from it; the review step has one way to be switched off,
+    not two. A caller passing ``review: off`` with a reviewer still on
+    is refused, as the config refuses the same pair.
     """
     modes = {
         name: check_dev_step_mode(name, getattr(steps, name, None))
         for name in ("code", "publish", "verify", "review")
     }
+    method = getattr(code_review, "method", "cli")
+    if modes["review"] == "off" and method != "off":
+        raise ValueError(
+            f"steps.review is 'off' but code_review.method is {method!r}"
+        )
+    if modes["review"] in ("on", "required") and method == "off":
+        raise ValueError(
+            f"steps.review is {modes['review']!r} but code_review.method "
+            "is 'off'"
+        )
     return modes["verify"], modes["review"]
 
 
@@ -2170,7 +2177,7 @@ async def run_dev_issue(
     every step as it was before the switches existed.
     """
     # Before the lock: a refused mode is a caller error, not a run.
-    verify_mode, review_mode = _resolve_step_modes(steps)
+    verify_mode, review_mode = _resolve_step_modes(steps, code_review)
     session_id = f"dev-{repo.replace('/', '-')}-{issue_number}-{uuid.uuid4().hex[:8]}"
     branch_name = branch_template.replace("{n}", str(issue_number))
 
@@ -2811,7 +2818,7 @@ async def resume_dev_from_pending(
         )
 
     branch_name = branch_template.replace("{n}", str(issue_number))
-    verify_mode, review_mode = _resolve_step_modes(steps)
+    verify_mode, review_mode = _resolve_step_modes(steps, code_review)
 
     lock = _RepoLockHandle(state_db, repo, session_id)
     if not state_db.acquire_lock(repo, session_id):

@@ -612,21 +612,23 @@ async def test_review_off_runs_no_reviewer_and_warns_nobody(
     ]
 
 
-@pytest.mark.asyncio
-async def test_review_off_from_the_pipeline_side_alone(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize(
+    ("steps", "code_review"),
+    [
+        (SimpleNamespace(review="off"), CodeReviewConfig()),
+        (SimpleNamespace(review="on"), CodeReviewConfig(method="off")),
+        (SimpleNamespace(review="required"), CodeReviewConfig(method="off")),
+    ],
+)
+def test_the_pipeline_refuses_review_settings_that_disagree(
+    tmp_path: Path, steps, code_review
 ) -> None:
-    """A caller that passes ``steps.review: off`` with a reviewer config
-    that still says cli gets no review either."""
-    reviewer = _reviewer(monkeypatch, CANNOT_RUN)
-    result, *_ = await _run(
-        tmp_path,
-        steps=SimpleNamespace(review="off"),
-        code_review=CodeReviewConfig(),
-    )
-    assert result.success, result
-    reviewer.assert_not_awaited()
-    assert not result.review.is_failure
+    """A caller that bypasses the config cannot have one switch say off
+    and the other on; the run refuses before it takes the lock."""
+    import asyncio
+
+    with pytest.raises(ValueError, match="code_review.method"):
+        asyncio.run(_run(tmp_path, steps=steps, code_review=code_review))
 
 
 @pytest.mark.asyncio
