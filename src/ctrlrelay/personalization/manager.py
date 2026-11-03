@@ -38,6 +38,8 @@ Design choices that are easy to miss in review:
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 import shutil
@@ -48,6 +50,16 @@ from pathlib import Path
 
 from ctrlrelay.core.config import Config, Personalization, PersonalizationPath
 from ctrlrelay.gh_protocol import detect_git_protocol, github_clone_url
+from ctrlrelay.personalization.merge import (
+    MIGRATE_HINT,
+    MergeOutcome,
+    MergeRefusedError,
+    differing_keys,
+    is_link_into,
+    merge_into_live,
+    migrate_link,
+    read_json_object,
+)
 from ctrlrelay.personalization.paths import (
     TemplateContext,
     project_slug,
@@ -103,6 +115,11 @@ class PullResult:
     # Dirty entries (``git status --porcelain`` lines) that blocked the
     # sync; empty when the tree was clean.
     dirty_entries: tuple[str, ...] = ()
+    # One per ``mode: merge`` entry (#287); also folded into ``summary``.
+    merges: tuple[MergeOutcome, ...] = ()
+
+
+logger = logging.getLogger("ctrlrelay.personalization")
 
 
 class PersonalizationManager:
@@ -178,14 +195,18 @@ class PersonalizationManager:
                 self._bootstrap_main_if_empty()
                 self._ensure_working_branch()
                 results = self.wire_symlinks(adopt=adopt)
-                return self._format_init_summary(results, cloned=False)
+                merges = self.apply_merges()
+                return self._format_init_summary(
+                    results, cloned=False, merges=merges
+                )
 
         self.checkout_path.parent.mkdir(parents=True, exist_ok=True)
         self._git_global("clone", self.repo_url, str(self.checkout_path))
         self._bootstrap_main_if_empty()
         self._ensure_working_branch()
         results = self.wire_symlinks(adopt=adopt)
-        return self._format_init_summary(results, cloned=True)
+        merges = self.apply_merges()
+        return self._format_init_summary(results, cloned=True, merges=merges)
 
     def _bootstrap_main_if_empty(self) -> None:
         """Create an initial commit on ``main_branch`` ONLY if the
@@ -378,6 +399,16 @@ class PersonalizationManager:
                 lines.append(f"  [{state}] {plan.target} -> {plan.source}")
         else:
             lines.append("no symlinks configured")
+
+        merge_plans = self._plan_merges()
+        if merge_plans:
+            lines.append(f"merged files ({len(merge_plans)} entries):")
+            for entry, plan in merge_plans:
+                state = self._inspect_merge(plan)
+                lines.append(
+                    f"  [{state}] {plan.target} <- {plan.source} "
+                    f"(keys: {', '.join(entry.merge_keys)})"
+                )
 
         return "\n".join(lines)
 
@@ -621,19 +652,149 @@ class PersonalizationManager:
         )
         # Re-wire (config may have changed; harmless if not).
         self.wire_symlinks(adopt=adopt)
+        # Merge-mode entries never migrate here: an old symlink at the
+        # live path is refused and reported, on ``pull`` and on the
+        # daemon's ``auto_pull`` alike. Migration is ``migrate()`` only.
+        merges = tuple(self.apply_merges())
 
         ff_note = "" if ff.returncode == 0 else (
             f" (local {self.main_branch} not fast-forwarded — diverged "
             "from origin)"
         )
+        merge_note = "".join(f"; {m.describe()}" for m in merges)
         return PullResult(
-            success=True,
+            success=not any(m.refused for m in merges),
             summary=(
                 f"pulled and rebased {self.working_branch} onto "
                 f"origin/{self.main_branch}{ff_note} (behind {behind})"
+                f"{merge_note}"
             ),
             behind=behind,
+            merges=merges,
         )
+
+    # ----- merge-mode entries (#287) ------------------------------------------
+
+    def apply_merges(self) -> list[MergeOutcome]:
+        """Write the owned keys of every ``mode: merge`` entry into its
+        live file. Never migrates a symlink; see :meth:`migrate`."""
+        out: list[MergeOutcome] = []
+        for entry, plan in self._plan_merges():
+            label = self._merge_label(plan)
+            problem = self._merge_target_problem(plan)
+            if problem:
+                logger.error("%s: merge refused: %s", label, problem)
+                out.append(MergeOutcome(label, "refused", detail=problem))
+                continue
+            out.append(
+                merge_into_live(
+                    plan.source, plan.target, entry.merge_keys, label=label
+                )
+            )
+        return out
+
+    def migrate(self) -> list[MergeOutcome]:
+        """Explicit, operator-run: replace each merge-mode live path that
+        is still the old symlink into this checkout with a real file
+        holding the same content, then merge.
+
+        Does not touch git. If the checkout copy differs from HEAD
+        (whatever the app wrote through the link), the outcome names
+        the differing keys and how to discard them; their values are
+        kept in the new live file either way.
+        """
+        self._require_checkout()
+        out: list[MergeOutcome] = []
+        for entry, plan in self._plan_merges():
+            label = self._merge_label(plan)
+            problem = self._merge_target_problem(plan)
+            if problem:
+                logger.error("%s: migrate refused: %s", label, problem)
+                out.append(MergeOutcome(label, "refused", detail=problem))
+                continue
+            result = migrate_link(plan.source, plan.target, label=label)
+            if result.action == "migrated":
+                note = self._checkout_drift_note(plan)
+                if note:
+                    result = MergeOutcome(
+                        label, result.action, result.keys, note
+                    )
+            out.append(result)
+            if not result.refused:
+                merged = merge_into_live(
+                    plan.source, plan.target, entry.merge_keys, label=label
+                )
+                if merged.action != "in-sync":
+                    out.append(merged)
+        return out
+
+    def _plan_merges(self) -> list[tuple[PersonalizationPath, SymlinkPlan]]:
+        return [
+            (entry, self._plan_global(entry))
+            for entry in self.cfg.paths
+            if entry.mode == "merge"
+        ]
+
+    @staticmethod
+    def _merge_label(plan: SymlinkPlan) -> str:
+        return plan.target.stem or plan.target.name
+
+    def _merge_target_problem(self, plan: SymlinkPlan) -> str:
+        """A live path inside the checkout would be a tracked file the
+        app writes: the exact problem merge mode exists to remove, and a
+        way for live keys to flow back into the repo on push."""
+        checkout = Path(os.path.abspath(self.checkout_path))
+        target = Path(os.path.abspath(plan.target))
+        if target == checkout or checkout in target.parents:
+            return (
+                f"live path {plan.target} is inside the personalization "
+                f"checkout {self.checkout_path}; a merge target must be "
+                "outside it"
+            )
+        return ""
+
+    def _checkout_drift_note(self, plan: SymlinkPlan) -> str:
+        try:
+            rel = str(plan.source.relative_to(self.checkout_path))
+        except ValueError:
+            return ""
+        diff = self._git_capturing("diff", "--quiet", "--", rel, check=False)
+        if diff.returncode == 0:
+            return ""
+        keys: list[str] = []
+        head = self._git_capturing("show", f"HEAD:{rel}", check=False)
+        try:
+            head_obj = json.loads(head.stdout) if head.returncode == 0 else {}
+            now_obj, _ = read_json_object(plan.source, what="synced file")
+            if isinstance(head_obj, dict):
+                keys = differing_keys(head_obj, now_obj)
+        except (ValueError, MergeRefusedError, OSError):
+            keys = []
+        named = f" (keys: {', '.join(keys)})" if keys else ""
+        return (
+            f"checkout copy {rel} differs from HEAD{named}; those values "
+            "are kept in the live file. To unblock pull, discard them with "
+            f"`git -C {self.checkout_path} checkout -- {rel}`, or push them "
+            "if they are a deliberate fleet change"
+        )
+
+    def _inspect_merge(self, plan: SymlinkPlan) -> str:
+        problem = self._merge_target_problem(plan)
+        if problem:
+            return "refused: target inside checkout"
+        if is_link_into(plan.target, plan.source):
+            return f"symlink-into-checkout: {MIGRATE_HINT}"
+        if plan.target.is_symlink():
+            return "refused: symlink"
+        if not plan.target.exists():
+            return "missing (next pull creates it)"
+        try:
+            read_json_object(plan.target, what="live file", allow_empty=True)
+        except MergeRefusedError as e:
+            return f"refused: {e}"
+        except OSError:
+            return "unreadable"
+        return "real-file"
 
     def auto_pull(self) -> PullResult:
         """Pull variant for the daemon scheduler.
@@ -708,6 +869,9 @@ class PersonalizationManager:
         have is a no-op until the project arrives).
         """
         for entry in self.cfg.paths:
+            if entry.mode == "merge":
+                # Never symlinked; see ``apply_merges``.
+                continue
             if entry.project_scoped:
                 yield from self._plan_project_scoped(entry)
             else:
@@ -1058,6 +1222,17 @@ class PersonalizationManager:
                     rel = plan.source.relative_to(self.checkout_path)
                 except ValueError:
                     continue
+                if entry.mode == "merge" and is_link_into(
+                    plan.target, plan.source
+                ):
+                    # The live file is still the old symlink, so the
+                    # checkout copy IS the live file and holds whatever
+                    # the app wrote. Live keys never flow back (#287).
+                    logger.warning(
+                        "push: not staging %s; %s is still a symlink to "
+                        "it (%s)", rel, plan.target, MIGRATE_HINT,
+                    )
+                    continue
                 rels.append(str(rel))
         if not rels:
             return []
@@ -1142,7 +1317,11 @@ class PersonalizationManager:
     # ----- formatting --------------------------------------------------------
 
     def _format_init_summary(
-        self, results: list[SymlinkResult], *, cloned: bool
+        self,
+        results: list[SymlinkResult],
+        *,
+        cloned: bool,
+        merges: list[MergeOutcome] | None = None,
     ) -> str:
         lines: list[str] = []
         if cloned:
@@ -1160,6 +1339,8 @@ class PersonalizationManager:
                 lines.append(f"  {action}: {n}")
         else:
             lines.append("  (no symlinks configured)")
+        for m in merges or ():
+            lines.append(f"  {m.describe()}")
         return "\n".join(lines)
 
 
