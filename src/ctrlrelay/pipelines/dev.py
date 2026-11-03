@@ -1597,7 +1597,7 @@ async def _verify_and_fix_pr(
 
     verification = await _run_verify()
     # If CI is simply slow (timed_out) we hand the PR off rather than asking
-    # Claude to "fix" something that isn't broken — unless verify is
+    # the agent to "fix" something that isn't broken — unless verify is
     # required, where an unanswered CI is not a pass.
     if verification.timed_out:
         return _timed_out(result)
