@@ -1182,6 +1182,20 @@ class TestPushOutcomeCheck:
         assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
         assert SECRET not in _git("log", "-p", "--all", cwd=checkout)
 
+    def test_untracked_copy_absent_from_head_refuses_the_push(
+        self, tmp_path, remote_bare
+    ) -> None:
+        # Nothing published: HEAD has no global/settings.json.
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        (checkout / "global").mkdir(exist_ok=True)
+        (checkout / "global" / "settings.json").write_text(json.dumps({"k": SECRET}))
+
+        result = mgr.push(message="x")
+
+        assert not result.success
+        assert REFUSED_CHANGED_COPY in result.summary
+        assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
+
     @staticmethod
     def _accidental_stage(mgr, checkout: Path) -> None:
         """After the pre-check passed (copy == HEAD), something stages a
