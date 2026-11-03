@@ -976,6 +976,10 @@ personalization:
       target: "~/.claude/CLAUDE.md"
     - source: "global/skills/"
       target: "~/.claude/skills/"
+    - source: "global/settings.json"
+      target: "~/.claude/settings.json"
+      mode: merge
+      merge_keys: [model, outputStyle, hooks]
     - source: "claude-memory/${PROJECT}/"
       target: "~/.claude/projects/${PROJECT_ENCODED}/memory/"
       project_scoped: true
@@ -1004,6 +1008,8 @@ agree.
 | `source` | string | **yes** | Path inside the personalization repo. Trailing slash means directory. |
 | `target` | string | **yes** | On-disk path the symlink will be created at. Supports `${HOME}` and (when `project_scoped`) `${PROJECT}`, `${PROJECT_ENCODED}`, `${PROJECT_LOCAL}`, `${PROJECT_PARENT}`. |
 | `project_scoped` | bool | no (default `false`) | When `true`, the entry expands once per repo in `repos:`, with the `${PROJECT_*}` placeholders resolved against that repo's `local_path`. |
+| `mode` | string | no (default `"symlink"`) | `symlink` links the target into the checkout. `merge` keeps the target a real file and, on pull, writes into it only the top-level JSON keys in `merge_keys`; for files an app also rewrites, such as `~/.claude/settings.json`. A single file only, not `project_scoped`. See [Files an app rewrites in place]({{ '/personalization/' | relative_url }}). |
+| `merge_keys` | list of strings | with `mode: merge` | The top-level keys the fleet owns in that file. Local config only: the synced file cannot add to it. Required and non-empty for `merge`; not allowed for `symlink`. |
 
 The `${PROJECT}` slug uses **`<owner>--<repo>`** with a double
 hyphen so `a-b/c` and `a/b-c` produce different slugs. `${PROJECT_ENCODED}`

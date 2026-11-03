@@ -301,20 +301,152 @@ refuse-on-dirty rail keeps things safe — the daemon won't rebase under
 your unsaved work and says so at error level — but your edit doesn't
 reach other machines until you push.
 
-### Files an app rewrites in place (`settings.json`)
+### Files an app rewrites in place (`settings.json`): `mode: merge`
 
 If a target such as `~/.claude/settings.json` is a symlink into the
 checkout, the app that owns it writes straight into a tracked file: any
 per-viewer preference it records (and a mere key reordering on rewrite)
-dirties the tree and blocks every later pull.
+dirties the tree and blocks every later pull. Committing those keys is
+wrong too, because one machine's preference would reach every machine
+as if it were policy.
 
-**How to handle this is not decided yet** (#287). Two things are known
-not to work: committing the app-written keys (one machine's preference
-would reach every machine as if it were policy), and resetting the file
-on a loop (the app writes it again). One way out is for a machine whose
-live file carries keys the synced one lacks to keep a real file instead
-of the symlink. Until a decision lands, the `BLOCKED` line above is the
-signal that a machine is stuck this way.
+So for such a file, declare the entry with `mode: merge` and list the
+top-level keys the fleet owns:
+
+```yaml
+personalization:
+  paths:
+    - source: "global/settings.json"
+      target: "~/.claude/settings.json"
+      mode: merge
+      merge_keys: [model, outputStyle, hooks, teammateMode,
+                   remoteControlAtStartup, skipDangerousModePermissionPrompt,
+                   idleCompaction]
+```
+
+The live file is then a **real file on this machine**, never a symlink.
+On `init`, `pull` and the daemon's auto-pull, ctrlrelay writes into it
+only the listed keys that the synced file carries, and reports what it
+did on the same line as the pull: `settings: wrote model, outputStyle`,
+or `settings: in-sync`. Everything else in the live file, including
+whatever the app wrote on its own, is left as it is and never reaches
+the checkout.
+
+The rules, all enforced and tested:
+
+- **The key list is local.** `merge_keys` lives in `orchestrator.yaml`
+  on each machine, not in the synced repo, so a push to that repo cannot
+  widen what it controls. A key in the synced file that is not listed
+  is not written. (Keep `orchestrator.yaml` itself out of the synced
+  repo, or this guarantee is gone.)
+- **An owned key missing upstream is left alone**, not deleted: absent
+  is not the same as "remove it". To change a value fleet-wide, set it.
+- **Bad input is refused.** The synced file must parse as a JSON object
+  with no duplicate keys, at any depth, and so must the live file (an
+  empty live file counts as `{}`). Nesting too deep to parse is refused
+  the same way. Anything else leaves the live file untouched and logs an
+  error.
+- **Everything stays under `$HOME`.** The live file **and the
+  personalization checkout** must both be under your home directory; a
+  path outside it is refused with `is not under $HOME`. (The default
+  checkout, `~/.ctrlrelay/personalization`, is.)
+- **Links and odd files are refused.** Directories are opened one
+  component at a time without following links (`O_DIRECTORY |
+  O_NOFOLLOW`), starting at the resolved `$HOME`, so a home reached
+  through an alias (macOS `/var` -> `/private/var`) works. The read, the
+  temp file and the rename all go through that directory handle. So a symlink at the file **or at any directory under `$HOME`
+  on the way to it** is refused, and its target is never opened. A
+  symlinked `~/.claude` is therefore refused too. Both files must be
+  regular files owned by you, so a FIFO or someone else's file is
+  refused as well. The live path, with its directories resolved, must sit outside
+  the checkout.
+- **Writes are atomic.** Temp file in the same directory, fsync, rename
+  over the live path; mode `0600`, or the existing mode if it is
+  stricter.
+- **A concurrent app write is not lost silently.** Just before the
+  rename, the live file is checked to still be what was read (device,
+  inode, size, mtime). If the app wrote it in between, the merge is
+  redone once from the new content; if it changed again, the pull
+  refuses and the app's write stands. Known limit: a write landing in
+  the few instructions between that last check and the rename itself
+  can still be overwritten, as can one that changes neither size nor
+  mtime. No user-space check can close that window without the app
+  taking a lock.
+- **Values too deep to handle are refused**, whether the parser rejects
+  them or they parse but are too deep to compare or write back.
+- **What keeps app-written keys out of the repo, exactly.** The live
+  file is a real file **outside the checkout**, so nothing the app
+  writes to it is in the git working tree at all. That is the guarantee.
+- **Push refuses a changed checkout copy.** If a merge entry's checkout
+  copy differs from `HEAD` in any way (modified, staged, deleted,
+  renamed away, or present but untracked), `push` refuses before
+  staging anything and leaves the file alone:
+  `refusing to push: global/settings.json in the checkout differs from
+  HEAD. This file is fleet policy; to change it for every machine,
+  commit it yourself with git in the checkout; to drop the local change,
+  run ctrlrelay personalization migrate --reset-copy`.
+  After staging, push also unstages every merge-mode file and checks the
+  index (ignoring case where git does), refusing if one is still staged.
+  These push checks are a **backstop against accidental staging**.
+- **What this does not cover: deliberate local edits in the checkout.**
+  Anyone who can write the checkout can already publish anything from
+  it, so these are out of scope by design, not gaps to close:
+  - renaming the copy (`git mv global/settings.json ...` and committing);
+  - copying it elsewhere in a synced directory (`cp global/settings.json
+    global/other.json`), which pushes the copy as an ordinary file;
+  - hiding a change from git with `git update-index --assume-unchanged`
+    or `--skip-worktree` on the copy;
+  - committing to the checkout by hand (`git commit`), which `push` then
+    publishes like any other commit.
+- **Whatever is committed in the checkout goes to every machine.** To
+  change fleet settings, edit `global/settings.json` in the checkout and
+  `git commit` it yourself; `push` publishes that commit like any other,
+  and every machine applies it within its own `merge_keys`. ctrlrelay
+  does not inspect such a commit, so never commit a value that belongs
+  to one machine.
+- **Only HEAD's fleet values reach the live file.** A merge (on pull,
+  `init` or `migrate`) is refused while the checkout copy differs from
+  `HEAD`, and `migrate --reset-copy` resets the copy *before* merging,
+  so a local edit to a fleet key is never applied to the live file.
+  If git cannot answer whether the copy differs, push and merge refuse
+  (`could not check global/settings.json: ...`) rather than assume.
+- **Without merge entries nothing changes.** A configuration with no
+  `mode: merge` entry stages and commits on `push` exactly as before.
+- **Logs name keys, never values** (a value can be a secret under
+  `env`). A pull that changes `hooks`, `env`, `permissions`,
+  `apiKeyHelper` or `skipDangerousModePermissionPrompt` logs a
+  **warning** naming the key, so a surprise change is visible.
+
+A refusal makes the pull fail (`settings: REFUSED (...)`), so a machine
+that cannot apply fleet settings says so rather than looking synced.
+
+#### Moving off the old symlink: `personalization migrate`
+
+A machine wired before this has `~/.claude/settings.json` as a symlink
+into the checkout. `pull` and auto-pull **refuse** that link and say so;
+they never convert it themselves. Convert it once, explicitly:
+
+```bash
+ctrlrelay personalization migrate
+```
+
+This replaces the link with a real file holding the same content (so
+anything the app or you wrote through it stays on this machine). Once
+the new live file is confirmed to match, it resets the checkout copy to
+`HEAD`, the fleet's version, so the tree is clean and those local keys
+can never be pushed; the output names the keys it reset, never their
+values. Then it merges. A link that points anywhere other than this
+checkout's source is refused.
+
+`ctrlrelay personalization migrate --reset-copy` additionally drops any
+remaining local change to a merge entry's checkout copy (resetting it to
+`HEAD`; the output names the keys, never the values). It is the way out
+of a push refused because that copy changed. It refuses while the live
+path is still the old symlink, since the copy is then the live file.
+
+Anything outside ctrlrelay that recreates the symlink (a converge
+script, a dotfiles installer) must stop doing so for this file, or the
+next pull will refuse again.
 
 ### Git identity
 

@@ -38,6 +38,8 @@ Design choices that are easy to miss in review:
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 import shutil
@@ -48,6 +50,17 @@ from pathlib import Path
 
 from ctrlrelay.core.config import Config, Personalization, PersonalizationPath
 from ctrlrelay.gh_protocol import detect_git_protocol, github_clone_url
+from ctrlrelay.personalization.merge import (
+    MIGRATE_HINT,
+    MergeOutcome,
+    MergeRefusedError,
+    differing_keys,
+    is_link_into,
+    merge_into_live,
+    migrate_link,
+    read_json_object,
+    resolved_parent,
+)
 from ctrlrelay.personalization.paths import (
     TemplateContext,
     project_slug,
@@ -103,6 +116,11 @@ class PullResult:
     # Dirty entries (``git status --porcelain`` lines) that blocked the
     # sync; empty when the tree was clean.
     dirty_entries: tuple[str, ...] = ()
+    # One per ``mode: merge`` entry (#287); also folded into ``summary``.
+    merges: tuple[MergeOutcome, ...] = ()
+
+
+logger = logging.getLogger("ctrlrelay.personalization")
 
 
 class PersonalizationManager:
@@ -178,14 +196,18 @@ class PersonalizationManager:
                 self._bootstrap_main_if_empty()
                 self._ensure_working_branch()
                 results = self.wire_symlinks(adopt=adopt)
-                return self._format_init_summary(results, cloned=False)
+                merges = self.apply_merges()
+                return self._format_init_summary(
+                    results, cloned=False, merges=merges
+                )
 
         self.checkout_path.parent.mkdir(parents=True, exist_ok=True)
         self._git_global("clone", self.repo_url, str(self.checkout_path))
         self._bootstrap_main_if_empty()
         self._ensure_working_branch()
         results = self.wire_symlinks(adopt=adopt)
-        return self._format_init_summary(results, cloned=True)
+        merges = self.apply_merges()
+        return self._format_init_summary(results, cloned=True, merges=merges)
 
     def _bootstrap_main_if_empty(self) -> None:
         """Create an initial commit on ``main_branch`` ONLY if the
@@ -379,6 +401,16 @@ class PersonalizationManager:
         else:
             lines.append("no symlinks configured")
 
+        merge_plans = self._plan_merges()
+        if merge_plans:
+            lines.append(f"merged files ({len(merge_plans)} entries):")
+            for entry, plan in merge_plans:
+                state = self._inspect_merge(plan)
+                lines.append(
+                    f"  [{state}] {plan.target} <- {plan.source} "
+                    f"(keys: {', '.join(entry.merge_keys)})"
+                )
+
         return "\n".join(lines)
 
     def wire_symlinks(self, *, adopt: bool = True) -> list[SymlinkResult]:
@@ -425,6 +457,33 @@ class PersonalizationManager:
         self._require_checkout()
         self._ensure_working_branch()
 
+        # mode: merge (#287): a merge entry's checkout copy is fleet
+        # policy. If it differs from HEAD in any way (modified, staged,
+        # deleted, renamed away, untracked), refuse before staging
+        # anything, and leave it as it is.
+        merge_rels = self._merge_source_rels()
+        try:
+            changed = [rel for rel in merge_rels if self._copy_differs(rel)]
+        except PersonalizationError as e:
+            logger.error("push refused: %s", e)
+            return PushResult(success=False, summary=f"refusing to push: {e}")
+        if changed:
+            logger.error(
+                "push refused: mode: merge checkout copy changed: %s",
+                ", ".join(changed),
+            )
+            return PushResult(
+                success=False,
+                summary=(
+                    f"refusing to push: {', '.join(changed)} in the checkout "
+                    "differs from HEAD. This file is fleet policy; to change "
+                    "it for every machine, commit it yourself with git in "
+                    f"the checkout ({self.checkout_path}); to drop the local "
+                    "change, run `ctrlrelay personalization migrate "
+                    "--reset-copy`"
+                ),
+            )
+
         # Reset the index to HEAD before staging. This unstages any
         # ad-hoc ``git add`` the operator (or an interrupted previous
         # run) left in the index, ensuring:
@@ -441,7 +500,13 @@ class PersonalizationManager:
         # Stage and commit once up-front; the commit object stays the
         # same across retries, only the rebase base shifts.
         configured_pathspecs = self._stage_configured_paths()
-        if configured_pathspecs:
+        if merge_rels:
+            refused = self._commit_with_merge_backstop(
+                merge_rels, configured_pathspecs, message
+            )
+            if refused is not None:
+                return refused
+        elif configured_pathspecs:
             # ``git commit`` errors with "Author identity unknown" if
             # neither global nor local user.email/user.name is set.
             # Bootstrap already does this for the empty-repo path;
@@ -621,19 +686,202 @@ class PersonalizationManager:
         )
         # Re-wire (config may have changed; harmless if not).
         self.wire_symlinks(adopt=adopt)
+        # Merge-mode entries never migrate here: an old symlink at the
+        # live path is refused and reported, on ``pull`` and on the
+        # daemon's ``auto_pull`` alike. Migration is ``migrate()`` only.
+        merges = tuple(self.apply_merges())
 
         ff_note = "" if ff.returncode == 0 else (
             f" (local {self.main_branch} not fast-forwarded — diverged "
             "from origin)"
         )
+        merge_note = "".join(f"; {m.describe()}" for m in merges)
         return PullResult(
-            success=True,
+            success=not any(m.refused for m in merges),
             summary=(
                 f"pulled and rebased {self.working_branch} onto "
                 f"origin/{self.main_branch}{ff_note} (behind {behind})"
+                f"{merge_note}"
             ),
             behind=behind,
+            merges=merges,
         )
+
+    # ----- merge-mode entries (#287) ------------------------------------------
+
+    def apply_merges(self) -> list[MergeOutcome]:
+        """Write the owned keys of every ``mode: merge`` entry into its
+        live file. Never migrates a symlink; see :meth:`migrate`."""
+        out: list[MergeOutcome] = []
+        for entry, plan in self._plan_merges():
+            label = self._merge_label(plan)
+            problem = self._merge_target_problem(plan)
+            if problem:
+                logger.error("%s: merge refused: %s", label, problem)
+                out.append(MergeOutcome(label, "refused", detail=problem))
+                continue
+            out.append(self._merge_entry(entry, plan, label))
+        return out
+
+    def _merge_entry(
+        self, entry: PersonalizationPath, plan: SymlinkPlan, label: str
+    ) -> MergeOutcome:
+        """Merge one entry, only from the fleet's committed version: if
+        the checkout copy differs from HEAD (a local edit), nothing is
+        written, so the live file only ever receives HEAD's values."""
+        rel = str(plan.source.relative_to(self.checkout_path))
+        try:
+            differs = self._copy_differs(rel)
+        except PersonalizationError as e:
+            logger.error("%s: merge refused: %s", label, e)
+            return MergeOutcome(label, "refused", detail=str(e))
+        if differs:
+            detail = (
+                f"checkout copy {rel} differs from HEAD; not merged, so only "
+                "the fleet's committed values reach the live file. Commit "
+                "it yourself with git, or run `ctrlrelay personalization "
+                "migrate --reset-copy`"
+            )
+            logger.error("%s: merge refused: %s", label, detail)
+            return MergeOutcome(label, "refused", detail=detail)
+        return merge_into_live(
+            plan.source, plan.target, entry.merge_keys, label=label
+        )
+
+    def migrate(self, *, reset_copy: bool = False) -> list[MergeOutcome]:
+        """Explicit, operator-run: replace each merge-mode live path that
+        is still the old symlink into this checkout with a real file
+        holding the same content, then merge.
+
+        The new live file gets the link's content as it is now, so
+        whatever the app or the operator wrote through the link is kept
+        on this machine. Only then is the checkout copy reset to
+        ``HEAD`` (the fleet's version), so it can never carry those
+        local keys into a push; the outcome names the keys reset, never
+        their values.
+
+        ``reset_copy`` also drops any remaining local change to a merge
+        entry's checkout copy (see :meth:`reset_copies`): the way out of
+        a push refused because that copy differs from HEAD.
+        """
+        self._require_checkout()
+        out: list[MergeOutcome] = []
+        for entry, plan in self._plan_merges():
+            label = self._merge_label(plan)
+            problem = self._merge_target_problem(plan)
+            if problem:
+                logger.error("%s: migrate refused: %s", label, problem)
+                out.append(MergeOutcome(label, "refused", detail=problem))
+                continue
+            result = migrate_link(plan.source, plan.target, label=label)
+            if result.action == "migrated":
+                note = self._reset_checkout_copy(plan)
+                result = MergeOutcome(
+                    label,
+                    "refused" if note.startswith("REFUSED") else result.action,
+                    result.keys,
+                    note.removeprefix("REFUSED: "),
+                )
+            out.append(result)
+            if result.refused:
+                continue
+            # Reset BEFORE merging, so a locally changed fleet key in the
+            # copy is never applied to the live file, not even briefly.
+            if reset_copy:
+                reset = self._reset_copy(plan, label)
+                if reset is not None:
+                    out.append(reset)
+                    if reset.refused:
+                        continue
+            merged = self._merge_entry(entry, plan, label)
+            if merged.action != "in-sync":
+                out.append(merged)
+        return out
+
+    def _plan_merges(self) -> list[tuple[PersonalizationPath, SymlinkPlan]]:
+        return [
+            (entry, self._plan_global(entry))
+            for entry in self.cfg.paths
+            if entry.mode == "merge"
+        ]
+
+    @staticmethod
+    def _merge_label(plan: SymlinkPlan) -> str:
+        return plan.target.stem or plan.target.name
+
+    def _merge_target_problem(self, plan: SymlinkPlan) -> str:
+        """A live path inside the checkout would be a tracked file the
+        app writes: the exact problem merge mode exists to remove, and a
+        way for live keys to flow back into the repo on push."""
+        # Resolved, so a symlinked directory on the way cannot place the
+        # live file inside the checkout. The last component is not
+        # resolved: a link there is refused by O_NOFOLLOW (or is the old
+        # link ``migrate`` converts).
+        checkout = Path(os.path.realpath(self.checkout_path))
+        target = resolved_parent(Path(os.path.abspath(plan.target)))
+        if target == checkout or checkout in target.parents:
+            return (
+                f"live path {plan.target} is inside the personalization "
+                f"checkout {self.checkout_path}; a merge target must be "
+                "outside it"
+            )
+        return ""
+
+    def _reset_checkout_copy(self, plan: SymlinkPlan) -> str:
+        """After a migration, put the checkout copy back to ``HEAD``.
+
+        Runs only once the live file is confirmed to hold the same
+        object as the checkout copy, so nothing is lost. Returns a note
+        naming the keys reset, or ``"REFUSED: ..."``.
+        """
+        rel = str(plan.source.relative_to(self.checkout_path))
+        head = self._git_capturing("show", f"HEAD:{rel}", check=False)
+        if head.returncode != 0:
+            return f"{rel} is not tracked in HEAD; left as is"
+        if self._git_capturing(
+            "diff", "--quiet", "HEAD", "--", rel, check=False
+        ).returncode == 0:
+            return ""
+        try:
+            now_obj, _ = read_json_object(plan.source, what="synced file")
+            live_obj, _ = read_json_object(plan.target, what="live file")
+        except (MergeRefusedError, OSError) as e:
+            return f"REFUSED: checkout copy {rel} not reset: {e}"
+        if differing_keys(now_obj, live_obj):
+            return (
+                f"REFUSED: checkout copy {rel} not reset: the new live file "
+                "does not match it"
+            )
+        try:
+            head_obj = json.loads(head.stdout)
+            keys = differing_keys(head_obj, now_obj) if isinstance(head_obj, dict) else []
+        except (ValueError, RecursionError):
+            keys = []
+        self._git("checkout", "HEAD", "--", rel)
+        named = f" (keys: {', '.join(keys)})" if keys else ""
+        logger.info("%s: reset checkout copy %s to HEAD%s", self._merge_label(plan), rel, named)
+        return (
+            f"checkout copy {rel} reset to HEAD{named}; this machine's "
+            "values are kept in the live file"
+        )
+
+    def _inspect_merge(self, plan: SymlinkPlan) -> str:
+        problem = self._merge_target_problem(plan)
+        if problem:
+            return "refused: target inside checkout"
+        if is_link_into(plan.target, plan.source):
+            return f"symlink-into-checkout: {MIGRATE_HINT}"
+        if plan.target.is_symlink():
+            return "refused: symlink"
+        if not plan.target.exists():
+            return "missing (next pull creates it)"
+        try:
+            read_json_object(plan.target, what="live file", allow_empty=True)
+        except MergeRefusedError as e:
+            return f"refused: {e}"
+        except OSError:
+            return "unreadable"
+        return "real-file"
 
     def auto_pull(self) -> PullResult:
         """Pull variant for the daemon scheduler.
@@ -708,6 +956,9 @@ class PersonalizationManager:
         have is a no-op until the project arrives).
         """
         for entry in self.cfg.paths:
+            if entry.mode == "merge":
+                # Never symlinked; see ``apply_merges``.
+                continue
             if entry.project_scoped:
                 yield from self._plan_project_scoped(entry)
             else:
@@ -1099,6 +1350,179 @@ class PersonalizationManager:
         ).strip()
         return matched if diff else []
 
+    def _commit_with_merge_backstop(
+        self,
+        merge_rels: list[str],
+        allowlist: list[str],
+        message: str | None,
+    ) -> PushResult | None:
+        """Commit step for a checkout with merge entries.
+
+        A backstop against ACCIDENTAL staging of a merge-mode copy (an
+        enclosing symlink-mode directory, ``git add -f``, a case
+        variant); the pre-check in ``push`` has already refused any
+        local change to it. Unstage every merge source, prove none is
+        left, then commit from the index: ``git commit -- <pathspecs>``
+        would read the working tree and ignore the index, so the check
+        would not bind it. Returns a refusal, or ``None`` to go on.
+        """
+        leaked = self._unstage_merge_sources(merge_rels, allowlist)
+        if leaked:
+            return PushResult(
+                success=False,
+                summary=(
+                    "refusing to push: mode: merge file(s) still staged "
+                    f"after unstaging: {', '.join(leaked)}. Nothing was "
+                    f"committed; run `git -C {self.checkout_path} reset` "
+                    "and retry"
+                ),
+            )
+        if not self._staged_paths():
+            return None
+        self._ensure_local_identity()
+        commit_msg = message or "personalization: sync from {}".format(
+            self.working_branch
+        )
+        try:
+            self._git("commit", "-m", commit_msg)
+        except _GitError as e:
+            if "nothing to commit" not in (e.stdout + e.stderr).lower():
+                raise
+        return None
+
+    def _copy_differs(self, rel: str) -> bool:
+        """True if the checkout copy at ``rel`` is not exactly HEAD's:
+        modified, staged, deleted or renamed away, or present while
+        HEAD has no such file.
+
+        Any git error raises ``PersonalizationError("could not check
+        ...")``: an answer git could not give is never read as "clean"
+        or "absent"."""
+        if self._in_head(rel):
+            return self._git_checked(
+                rel, "diff", "--quiet", "HEAD", "--", rel, ok=(0, 1)
+            ).returncode == 1
+        in_index = bool(self._git_checked(rel, "ls-files", "-z", "--", rel).stdout)
+        return in_index or os.path.lexists(self.checkout_path / rel)
+
+    def _git_checked(
+        self, rel: str, *args: str, ok: tuple[int, ...] = (0,)
+    ) -> subprocess.CompletedProcess:
+        r = self._git_capturing(*args, check=False)
+        if r.returncode not in ok:
+            err = (r.stderr or r.stdout).strip() or (
+                f"git {args[0]} exited {r.returncode}"
+            )
+            raise PersonalizationError(f"could not check {rel}: {err}")
+        return r
+
+    def _in_head(self, rel: str) -> bool:
+        return bool(
+            self._git_checked(rel, "ls-tree", "-z", "HEAD", "--", rel).stdout
+        )
+
+    def reset_copies(self) -> list[MergeOutcome]:
+        """Drop local changes to every merge entry's checkout copy."""
+        out: list[MergeOutcome] = []
+        for _entry, plan in self._plan_merges():
+            reset = self._reset_copy(plan, self._merge_label(plan))
+            if reset is not None:
+                out.append(reset)
+        return out
+
+    def _reset_copy(self, plan: SymlinkPlan, label: str) -> MergeOutcome | None:
+        """Drop a local change to one merge entry's checkout copy (the
+        explicit ``migrate --reset-copy``); ``None`` if it has none.
+        Refuses while the live path is still the old symlink into the
+        checkout (the copy IS the live file there) and on any git error."""
+        rel = str(plan.source.relative_to(self.checkout_path))
+        try:
+            if not self._copy_differs(rel):
+                return None
+            in_head = self._in_head(rel)
+            head_text = (
+                self._git_checked(rel, "show", f"HEAD:{rel}").stdout
+                if in_head else ""
+            )
+        except PersonalizationError as e:
+            return MergeOutcome(label, "refused", detail=str(e))
+        if is_link_into(plan.target, plan.source):
+            return MergeOutcome(
+                label, "refused",
+                detail=f"{plan.target} is still a symlink to {rel}; not "
+                "resetting it (migrate did not convert it)",
+            )
+        keys: list[str] = []
+        try:
+            now_obj, _ = read_json_object(plan.source, what="synced file")
+            head_obj = json.loads(head_text) if in_head else {}
+            if isinstance(head_obj, dict):
+                keys = differing_keys(head_obj, now_obj)
+        except (ValueError, RecursionError, MergeRefusedError, OSError):
+            keys = []
+        self._git_capturing("reset", "-q", "--", rel, check=False)
+        if in_head:
+            self._git("checkout", "HEAD", "--", rel)
+        elif os.path.lexists(plan.source):
+            plan.source.unlink()
+        named = f" (keys: {', '.join(keys)})" if keys else ""
+        logger.info(
+            "%s: dropped local change to checkout copy %s%s", label, rel, named
+        )
+        return MergeOutcome(
+            label, "reset-copy", detail=f"checkout copy {rel} reset to HEAD{named}"
+        )
+
+    def _merge_source_rels(self) -> list[str]:
+        rels: list[str] = []
+        for _entry, plan in self._plan_merges():
+            try:
+                rels.append(str(plan.source.relative_to(self.checkout_path)))
+            except ValueError:
+                continue
+        return rels
+
+    def _staged_paths(self) -> list[str]:
+        out = self._git("diff", "--cached", "--name-only", "-z")
+        return [p for p in out.split("\0") if p]
+
+    def _ignorecase(self) -> bool:
+        r = self._git_capturing(
+            "config", "--bool", "core.ignorecase", check=False
+        )
+        return r.stdout.strip() == "true"
+
+    def _unstage_merge_sources(
+        self, merge_rels: list[str], allowlist: list[str]
+    ) -> list[str]:
+        """Unstage every merge-mode source, and anything outside the
+        allowlist, then return any merge-mode source still staged
+        (compared case-insensitively on a case-insensitive checkout).
+        Empty means the index is safe to commit."""
+        for rel in merge_rels:
+            self._git_capturing("reset", "-q", "--", rel, check=False)
+
+        def within(path: str) -> bool:
+            for rel in allowlist:
+                base = rel.rstrip("/")
+                if path == base or path.startswith(base + "/"):
+                    return True
+            return False
+
+        for path in self._staged_paths():
+            if not within(path):
+                self._git_capturing("reset", "-q", "--", path, check=False)
+
+        fold = (lambda x: x.casefold()) if self._ignorecase() else (lambda x: x)
+        wanted = {fold(r) for r in merge_rels}
+        leaked = [p for p in self._staged_paths() if fold(p) in wanted]
+        if leaked:
+            logger.error(
+                "push refused: mode: merge file(s) still staged: %s",
+                ", ".join(leaked),
+            )
+        return leaked
+
     def _plan_for_entry(self, entry: PersonalizationPath) -> list[SymlinkPlan]:
         if entry.project_scoped:
             return list(self._plan_project_scoped(entry))
@@ -1142,7 +1566,11 @@ class PersonalizationManager:
     # ----- formatting --------------------------------------------------------
 
     def _format_init_summary(
-        self, results: list[SymlinkResult], *, cloned: bool
+        self,
+        results: list[SymlinkResult],
+        *,
+        cloned: bool,
+        merges: list[MergeOutcome] | None = None,
     ) -> str:
         lines: list[str] = []
         if cloned:
@@ -1160,6 +1588,8 @@ class PersonalizationManager:
                 lines.append(f"  {action}: {n}")
         else:
             lines.append("  (no symlinks configured)")
+        for m in merges or ():
+            lines.append(f"  {m.describe()}")
         return "\n".join(lines)
 
 

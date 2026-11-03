@@ -4747,6 +4747,46 @@ def personalization_pull(
         raise typer.Exit(1)
 
 
+@personalization_app.command("migrate")
+def personalization_migrate(
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+    reset_copy: bool = typer.Option(
+        False,
+        "--reset-copy",
+        help=(
+            "Also drop any local change to a merge entry's checkout copy, "
+            "resetting it to HEAD (the fleet's version). The way out of a "
+            "push refused because that copy changed."
+        ),
+    ),
+) -> None:
+    """Turn each `mode: merge` live path that is still the old symlink
+    into this checkout into a real file, keeping its current content.
+
+    One-time and explicit: `pull` and the daemon's auto-pull refuse a
+    symlinked merge target and never migrate it themselves.
+    """
+    from ctrlrelay.personalization.manager import PersonalizationError
+
+    mgr = _make_personalization_manager(config_path)
+    try:
+        outcomes = mgr.migrate(reset_copy=reset_copy)
+    except PersonalizationError as e:
+        console.print(f"[red]Migrate failed:[/red] {e}")
+        raise typer.Exit(1)
+    if not outcomes:
+        console.print("no `mode: merge` entries configured")
+    for o in outcomes:
+        console.print(o.describe(), markup=False)
+    if any(o.refused for o in outcomes):
+        raise typer.Exit(1)
+
+
 @app.command("setup")
 def setup(
     owner: list[str] = typer.Option(

@@ -737,11 +737,21 @@ class PersonalizationPath(BaseModel):
     ``project_scoped: true`` makes the entry iterate over ``config.repos``
     at wire-time. A non-project-scoped entry that references project
     placeholders is rejected: it would resolve to garbage.
+
+    ``mode`` picks how the entry reaches the live path. ``symlink`` (the
+    default) links the target into the checkout. ``merge`` keeps the
+    target a real file and, on pull, writes into it only the top-level
+    JSON keys named in ``merge_keys`` (#287): for a file an app also
+    rewrites, such as ``~/.claude/settings.json``. The key list lives
+    here, in the operator's local config, and never in the synced repo,
+    so a push to that repo cannot widen what it controls on a machine.
     """
 
     source: str
     target: str
     project_scoped: bool = False
+    mode: Literal["symlink", "merge"] = "symlink"
+    merge_keys: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_placeholders_and_shape(self) -> "PersonalizationPath":
@@ -813,6 +823,44 @@ class PersonalizationPath(BaseModel):
                 f"{self.target!r} disagree on directory vs file (trailing "
                 "slash must match on both)"
             )
+
+        if self.mode == "symlink":
+            if self.merge_keys:
+                raise ValueError(
+                    f"personalization path {self.source!r} sets merge_keys "
+                    "but mode is 'symlink'; set mode: merge or drop merge_keys"
+                )
+            return self
+        # mode == "merge"
+        if src_is_dir:
+            raise ValueError(
+                f"personalization path {self.source!r}: mode 'merge' takes "
+                "a single JSON file, not a directory"
+            )
+        if self.project_scoped:
+            raise ValueError(
+                f"personalization path {self.source!r}: mode 'merge' cannot "
+                "be project_scoped"
+            )
+        if not self.merge_keys:
+            raise ValueError(
+                f"personalization path {self.source!r}: mode 'merge' needs a "
+                "non-empty merge_keys list (the top-level keys the fleet owns)"
+            )
+        seen: set[str] = set()
+        for key in self.merge_keys:
+            if not key or key != key.strip():
+                raise ValueError(
+                    f"personalization path {self.source!r}: merge_keys entry "
+                    f"{key!r} must be a non-empty key with no surrounding "
+                    "whitespace"
+                )
+            if key in seen:
+                raise ValueError(
+                    f"personalization path {self.source!r}: merge_keys lists "
+                    f"{key!r} twice"
+                )
+            seen.add(key)
         return self
 
 
