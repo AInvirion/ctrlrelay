@@ -829,6 +829,8 @@ class TestManagerMerge:
         mgr, checkout, live = _machine(tmp_path, remote_bare, "b")
         mgr.init()
         _write_json(checkout / "global" / "settings.json", {"model": "fable"})
+        _git("config", "user.email", "test@example.com", cwd=checkout)
+        _git("config", "user.name", "Test", cwd=checkout)
         _git("commit", "-q", "-am", "fleet: model fable", cwd=checkout)
 
         result = mgr.push(message="unused")
