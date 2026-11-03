@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resets the checkout copy to the fleet's version; pull and auto-pull refuse
   the symlink instead (#287).
 
+### Fixed
+
+- A personalization pull on a machine still wired the old way (`~/.claude/settings.json`
+  a symlink into the checkout, with the app having written through it) failed
+  with "rebase hit conflicts" and never mentioned the fix. Pull and auto-pull
+  now add: run `ctrlrelay personalization migrate` (#287)
+
 ## [0.18.0] - 2026-11-03
 
 ### Added
