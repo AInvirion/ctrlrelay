@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Personalization auto-pull no longer reports success when it could not
+  sync. A dirty working tree now fails the run, logged at error level with
+  the dirty entries; every run reports `behind N` (a dirty tree still
+  fetches to measure it). `push` pre-flights the git identity and refuses
+  with `git identity unresolvable` instead of leaving a dirty tree.
+  `docs/personalization.md` describes the open question of app-rewritten
+  files such as `settings.json` (refs #287)
+
 ## [0.17.1] - 2026-11-01
 
 ### Fixed

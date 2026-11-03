@@ -3938,6 +3938,7 @@ def poller_start(
                 if config.personalization is None:
                     return
                 import asyncio
+                import logging
 
                 from ctrlrelay.personalization import PersonalizationManager
                 from ctrlrelay.personalization.manager import (
@@ -3948,16 +3949,21 @@ def poller_start(
                     mgr = PersonalizationManager(config)
                     result = await asyncio.to_thread(mgr.auto_pull)
                 except PersonalizationError as e:
-                    console.print(
-                        f"[yellow]Auto-pull failed: {e}[/yellow]"
+                    logging.getLogger("ctrlrelay.personalization").error(
+                        "auto-pull failed: %s", e
                     )
+                    console.print(f"[red]Auto-pull failed: {e}[/red]")
                     return
                 if result.success:
                     console.print(f"[dim]Auto-pull: {result.summary}[/dim]")
                 else:
-                    console.print(
-                        f"[yellow]Auto-pull: {result.summary}[/yellow]"
+                    # Error level, not a yellow aside: a sync that
+                    # cannot sync must be distinguishable from one with
+                    # nothing to do (#287).
+                    logging.getLogger("ctrlrelay.personalization").error(
+                        "auto-pull: %s", result.summary
                     )
+                    console.print(f"[red]Auto-pull: {result.summary}[/red]")
                     if result.conflict_files:
                         for f in result.conflict_files:
                             console.print(f"[yellow]  conflict: {f}[/yellow]")
