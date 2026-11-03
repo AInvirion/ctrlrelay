@@ -306,14 +306,15 @@ reach other machines until you push.
 If a target such as `~/.claude/settings.json` is a symlink into the
 checkout, the app that owns it writes straight into a tracked file: any
 per-viewer preference it records (and a mere key reordering on rewrite)
-dirties the tree and blocks every later pull. **Decision:** do not
-commit app-written keys, and do not reset the file on a loop (the app
-rewrites it). Keep the synced file to fleet policy only (`model`,
-`outputStyle`, `hooks`, ...) and leave per-machine keys in
-`settings.local.json`, which is never synced. A machine whose live file
-carries keys the synced one lacks should keep a real file instead of the
-symlink. Until a machine is converged this way, the `BLOCKED` line above
-is the signal that it is stuck.
+dirties the tree and blocks every later pull.
+
+**How to handle this is not decided yet** (#287). Two things are known
+not to work: committing the app-written keys (one machine's preference
+would reach every machine as if it were policy), and resetting the file
+on a loop (the app writes it again). One way out is for a machine whose
+live file carries keys the synced one lacks to keep a real file instead
+of the symlink. Until a decision lands, the `BLOCKED` line above is the
+signal that a machine is stuck this way.
 
 ### Git identity
 

@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dirty entries; every run reports `behind N` (a dirty tree still
   fetches to measure it). `push` pre-flights the git identity and refuses
   with `git identity unresolvable` instead of leaving a dirty tree.
-  `docs/personalization.md` records how app-rewritten files such as
-  `settings.json` are handled (refs #287)
+  `docs/personalization.md` describes the open question of app-rewritten
+  files such as `settings.json` (refs #287)
 
 ## [0.17.1] - 2026-11-01
 
