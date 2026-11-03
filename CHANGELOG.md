@@ -10,8 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - A third agent backend: `agent.type: "opencode"` runs sessions through
-  `opencode run --format json --auto`, which can target a self-hosted
-  OpenAI-compatible endpoint (ollama, llama.cpp, LM Studio, MLX) and so lets
+  `opencode run --format json --dangerously-skip-permissions` — the spelling
+  every opencode from 1.4 to 2.x accepts; its `--auto` alias exists only from
+  1.17.12 — which can target a self-hosted OpenAI-compatible endpoint (ollama, llama.cpp, LM Studio, MLX) and so lets
   the dev pipeline run on a local model instead of a hosted API. The endpoint,
   its credential and the model list stay in opencode's own config; ctrlrelay
   names the model with `agent.opencode.model` (`provider/model`) and the
@@ -34,10 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report on every exit path — moved from `ClaudeDispatcher` to a
   `CliAgentAdapter` base both adapters inherit. A second copy of it is how the
   next backend gets dispatch failures that nothing counts.
-- `ctrlrelay node check` skips its agent-login row, and says why, when the
-  global `agent.type` is not `claude`. That check is a `claude -p` call reading
+- `ctrlrelay node check` skips its agent-login row, and says why, when no
+  repository routes to `claude` — the global `agent.type` is not `claude` and
+  no `repos[].agent_type` names it. That check is a `claude -p` call reading
   the claude subscription, so on another backend it reported a failed login
-  against a CLI the deployment does not use.
+  against a CLI the deployment does not use; with even one repo still on
+  `claude` it runs, so an expired login shows up there and not as that repo's
+  next failed job.
 
 ### Known limits
 

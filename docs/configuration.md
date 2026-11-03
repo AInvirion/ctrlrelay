@@ -78,7 +78,7 @@ CLI. Two are implemented:
 | `agent.type` | CLI it runs | notes |
 |---|---|---|
 | `claude` (default) | `claude -p --output-format stream-json --verbose --dangerously-skip-permissions` | Reads the subscription usage; supports `sandbox: "bwrap"`. |
-| `opencode` | `opencode run --format json --auto` | Can target a self-hosted OpenAI-compatible endpoint. No usage reading; no bwrap yet. |
+| `opencode` | `opencode run --format json --dangerously-skip-permissions` | Can target a self-hosted OpenAI-compatible endpoint. No usage reading; no bwrap yet. |
 
 Anything else raises at startup with a message naming the type. That is
 deliberate: a typo must stop the daemon rather than silently fall back
@@ -166,10 +166,13 @@ endpoint needs one, lives there too.
   **refused at startup** rather than silently run unconfined. Set
   `agent.sandbox: "none"` to use it. Credential stripping (#219) applies
   to every backend either way.
-- **`ctrlrelay node check` skips the agent-login row** when the global
-  `agent.type` is not `claude`, because that check is a `claude` call
-  reading the claude subscription. Verify the other backend by running
-  its CLI once by hand. A *per-repo* `agent_type` does not skip the row.
+- **`ctrlrelay node check` skips the agent-login row** when no
+  repository routes to `claude` — the global `agent.type` is not
+  `claude` and no `repos[].agent_type` names it — because that check is
+  a `claude` call reading the claude subscription. With a global
+  `opencode` and even one repo on `claude`, the row still runs. The check
+  never probes `opencode` itself: verify it by running its CLI once by
+  hand.
 
 ### Picking a model for `opencode`
 

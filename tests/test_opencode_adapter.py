@@ -172,10 +172,12 @@ class TestArgv:
         argv = list(ex.call_args.args)
         assert argv[0].endswith("opencode")
         assert argv[1] == "run"
-        # `--format json` is what carries the session id; `--auto`
-        # approves the tool calls an unattended run cannot answer.
+        # `--format json` is what carries the session id; the permission
+        # flag approves the tool calls an unattended run cannot answer.
         assert argv[argv.index("--format") + 1] == "json"
-        assert "--auto" in argv
+        assert "--dangerously-skip-permissions" in argv
+        # Whether opencode ACCEPTS this argv is asserted against its real
+        # option lists in TestTheRealParserAcceptsTheArgv, not here.
         # `opencode run [message..]` takes the message as a variadic
         # positional, so it has to be last or a flag swallows it.
         assert argv[-1] == "do the work"
@@ -809,3 +811,234 @@ class TestThePipelineConsumesIt:
         rows = state_db.execute("SELECT * FROM sessions").fetchall()
         assert [r["status"] for r in rows] == ["done"]
         state_db.close()
+
+
+# The `opencode run` option lists, copied from opencode's own source at
+# each tag (github.com/anomalyco/opencode):
+#
+# - 1.x: packages/opencode/src/cli/cmd/run.ts, a yargs builder, under a
+#   root parser that calls `.strict()` (packages/opencode/src/index.ts),
+#   so an option not on the list is "Unknown argument" and exit 1.
+# - 2.x: packages/cli/src/commands/commands.ts, `Spec.make("run", ...)`
+#   plus `PermissionParams` (`auto`, hidden `yolo`, hidden
+#   `dangerously-skip-permissions`).
+#
+# `--auto` first appears in 1.17.12; 1.17.11 has only
+# `--dangerously-skip-permissions`. That boundary is the reason these
+# lists exist: a test that asserts our argv contains a flag cannot tell
+# whether opencode has ever heard of it.
+_OPENCODE_RUN_OPTIONS: dict[str, dict[str, frozenset[str]]] = {
+    "1.4.11": {
+        "value": frozenset({
+            "command", "session", "s", "model", "m", "agent", "format",
+            "file", "f", "title", "attach", "password", "p", "dir", "port",
+            "variant",
+        }),
+        "flag": frozenset({
+            "continue", "c", "fork", "share", "thinking",
+            "dangerously-skip-permissions", "help", "h",
+        }),
+    },
+    "1.17.11": {
+        "value": frozenset({
+            "command", "session", "s", "model", "m", "agent", "format",
+            "file", "f", "title", "attach", "password", "p", "username",
+            "u", "dir", "port", "variant", "replay-limit",
+        }),
+        "flag": frozenset({
+            "continue", "c", "fork", "share", "thinking", "mini", "replay",
+            "dangerously-skip-permissions", "demo", "help", "h",
+        }),
+    },
+    "1.19.5": {
+        "value": frozenset({
+            "command", "session", "s", "model", "m", "agent", "format",
+            "file", "f", "title", "attach", "password", "p", "username",
+            "u", "dir", "port", "variant", "replay-limit",
+        }),
+        "flag": frozenset({
+            "continue", "c", "fork", "share", "thinking", "mini", "replay",
+            "interactive", "auto", "yolo", "dangerously-skip-permissions",
+            "demo", "help", "h",
+        }),
+    },
+    "2.2.5": {
+        "value": frozenset({
+            "session", "s", "model", "m", "agent", "format", "file", "f",
+            "title",
+        }),
+        "flag": frozenset({
+            "continue", "c", "fork", "thinking", "auto", "yolo",
+            "dangerously-skip-permissions", "help", "h",
+        }),
+    },
+}
+
+# A stand-in `opencode` that parses `run` the way the real one does:
+# strictly, against one version's option list. Only if the argv parses
+# does it behave like an agent — write the checkpoint the prompt asks
+# for and print a json event carrying its session id. Anything it does
+# not know exits 1 with yargs' own wording, which is what a real
+# dispatch would get back.
+_FAKE_OPENCODE = r"""
+import json, os, sys
+spec = json.loads(os.environ["FAKE_OPENCODE_SPEC"])
+value, flag = set(spec["value"]), set(spec["flag"])
+args = sys.argv[1:]
+if not args or args[0] != "run":
+    sys.stderr.write("fake opencode: expected the run subcommand\n")
+    sys.exit(2)
+args = args[1:]
+message, opts, i = [], {}, 0
+while i < len(args):
+    a = args[i]
+    if a == "--":
+        message += args[i + 1:]
+        break
+    if a.startswith("-") and len(a) > 1:
+        name = a.lstrip("-")
+        name, eq, inline = name.partition("=")
+        if name in value:
+            if eq:
+                opts[name] = inline
+            else:
+                if i + 1 >= len(args):
+                    sys.stderr.write("Not enough arguments following: %s\n" % name)
+                    sys.exit(1)
+                opts[name] = args[i + 1]
+                i += 1
+        elif name in flag:
+            opts[name] = True
+        else:
+            sys.stderr.write("Unknown argument: %s\n" % name)
+            sys.exit(1)
+    else:
+        message.append(a)
+    i += 1
+if opts.get("format", "default") not in ("default", "json"):
+    sys.stderr.write("Invalid values: format\n")
+    sys.exit(1)
+if not message:
+    sys.stderr.write("You must provide a message\n")
+    sys.exit(1)
+approved = any(opts.get(k) for k in ("auto", "yolo", "dangerously-skip-permissions"))
+if not approved:
+    # What `run` does with a permission request nobody is there to
+    # answer: reject it. The agent's checkpoint write is a tool call,
+    # so no checkpoint.
+    sys.stderr.write("permission requested: bash; auto-rejecting\n")
+    sys.exit(0)
+with open(os.environ["CTRLRELAY_STATE_FILE"], "w") as fh:
+    json.dump({
+        "version": "1",
+        "status": "DONE",
+        "session_id": os.environ["CTRLRELAY_SESSION_ID"],
+        "timestamp": "2026-11-02T12:00:00Z",
+        "summary": " ".join(message)[:40],
+        "outputs": {},
+    }, fh)
+print(json.dumps({"type": "step_finish", "sessionID": "ses_fake1"}))
+"""
+
+
+class TestTheRealParserAcceptsTheArgv:
+    """The adapter's argv, run through a REAL subprocess, against each
+    opencode release's actual `run` option list.
+
+    The argv tests above mock `create_subprocess_exec` and assert which
+    flags are present, which is how an option `opencode run` rejects
+    could ship green: nothing in them knows what opencode accepts. Here
+    the child is a real executable on disk that parses the way opencode
+    does, so an unknown option fails the session exactly as it would in
+    production — no checkpoint, `success` False.
+    """
+
+    def _fake(self, tmp_path: Path) -> Path:
+        import sys
+
+        exe = tmp_path / "bin" / "opencode"
+        exe.parent.mkdir()
+        exe.write_text(f"#!{sys.executable}\n{_FAKE_OPENCODE}")
+        exe.chmod(0o755)
+        return exe
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("version", sorted(_OPENCODE_RUN_OPTIONS))
+    @pytest.mark.parametrize("resume", [None, "ses_prev"])
+    @pytest.mark.parametrize("model", [None, "local/qwen3-coder:30b"])
+    async def test_every_supported_release_runs_the_session_to_done(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        version: str,
+        resume: str | None,
+        model: str | None,
+    ) -> None:
+        from ctrlrelay.core.checkpoint import CheckpointStatus
+
+        spec = _OPENCODE_RUN_OPTIONS[version]
+        monkeypatch.setenv("FAKE_OPENCODE_SPEC", json.dumps(
+            {k: sorted(v) for k, v in spec.items()}
+        ))
+        adapter = _adapter(
+            opencode_binary=str(self._fake(tmp_path)), model=model,
+        )
+        work = tmp_path / "wt"
+        work.mkdir()
+        state_file = tmp_path / "state.json"
+
+        result = await adapter.spawn_session(
+            session_id="dev-o-r-1-aa",
+            prompt="You are working on issue #1. Write the checkpoint when done.",
+            working_dir=work,
+            state_file=state_file,
+            resume_session_id=resume,
+            timeout=60,
+            github_access=False,
+        )
+
+        assert result.exit_code == 0, result.stderr
+        assert "Unknown argument" not in result.stderr
+        assert result.state is not None, result.stderr
+        assert result.state.status is CheckpointStatus.DONE
+        assert result.success is True
+        assert result.agent_session_id == "ses_fake1"
+
+    @pytest.mark.asyncio
+    async def test_the_fake_rejects_what_the_real_parser_rejects(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative control: without this, a fake that accepted anything
+        would make the test above pass for every argv. `--auto` is the
+        case that matters — on 1.17.11 it is not an option at all."""
+        monkeypatch.setenv("FAKE_OPENCODE_SPEC", json.dumps(
+            {k: sorted(v) for k, v in _OPENCODE_RUN_OPTIONS["1.17.11"].items()}
+        ))
+        import os
+        import subprocess
+
+        exe = self._fake(tmp_path)
+        env = {
+            **os.environ,
+            "CTRLRELAY_STATE_FILE": str(tmp_path / "s"),
+            "CTRLRELAY_SESSION_ID": "x",
+        }
+        accepted = subprocess.run(
+            [str(exe), "run", "--format", "json",
+             "--dangerously-skip-permissions", "hello"],
+            capture_output=True, text=True, env=env,
+        )
+        # The control's other half: the same fake, same version, takes
+        # the spelling 1.17.11 does have. A fake that rejected
+        # everything would pass the assertions below on its own.
+        assert accepted.returncode == 0, accepted.stderr
+        assert (tmp_path / "s").exists()
+        (tmp_path / "s").unlink()
+
+        proc = subprocess.run(
+            [str(exe), "run", "--format", "json", "--auto", "hello"],
+            capture_output=True, text=True, env=env,
+        )
+        assert proc.returncode == 1
+        assert "Unknown argument: auto" in proc.stderr
+        assert not (tmp_path / "s").exists()

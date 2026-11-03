@@ -1025,11 +1025,21 @@ class OpenCodeDispatcher(CliAgentAdapter):
 
         cmd = [self.opencode_binary, "run"]
         # `--format json` is the only output that carries the session id
-        # the resume needs. `--auto` approves the tool calls an
-        # unattended run has nobody to answer for; the guard is that the
-        # process holds no GitHub credential, not what it may type —
-        # same reasoning as `--dangerously-skip-permissions` upstream.
-        cmd += ["--format", "json", "--auto"]
+        # the resume needs. `--dangerously-skip-permissions` approves the
+        # tool calls an unattended run has nobody to answer for; without
+        # it `opencode run` auto-REJECTS every permission request, so the
+        # agent could not even write its checkpoint. The guard is that
+        # the process holds no GitHub credential, not what it may type —
+        # the same reasoning as the claude adapter's flag of that name.
+        #
+        # Not `--auto`, although it means the same thing: `run` gained
+        # `--auto` only in 1.17.12, and its parser is strict, so on any
+        # earlier opencode `--auto` is "Unknown argument" and every
+        # dispatch dies before the prompt is read. This spelling is
+        # accepted from 1.4 through 2.x (a hidden alias of `--auto`
+        # since 1.17.12). The option lists it was checked against are
+        # in tests/test_opencode_adapter.py.
+        cmd += ["--format", "json", "--dangerously-skip-permissions"]
         if self.model:
             cmd += ["--model", self.model]
         if resume_session_id:

@@ -100,11 +100,22 @@ class TestNodeCheck:
         [row] = [c for c in checks if c.name == "agent login"]
         assert row.detail == "skipped (--no-agent)"
 
-    def _config_file(self, tmp_path: Path, agent_type: str) -> Path:
+    def _config_file(
+        self, tmp_path: Path, agent_type: str,
+        repo_agent_types: tuple[str | None, ...] = (),
+    ) -> Path:
         cfg = tmp_path / "orchestrator.yaml"
+        repos = ""
+        if repo_agent_types:
+            repos = "repos:\n"
+            for i, t in enumerate(repo_agent_types):
+                repos += f'  - name: "owner/repo{i}"\n    local_path: "{tmp_path}/r{i}"\n'
+                if t is not None:
+                    repos += f"    agent_type: {t}\n"
         cfg.write_text(
             'version: "1"\nnode_id: "node-a"\n'
             f"agent: {{type: {agent_type}}}\n"
+            + repos +
             f'paths: {{state_db: "{tmp_path}/s.db", worktrees: "{tmp_path}/w", '
             f'bare_repos: "{tmp_path}/r", contexts: "{tmp_path}/c", '
             f'skills: "{tmp_path}/k"}}\n'
@@ -160,6 +171,68 @@ class TestNodeCheck:
             ["node", "check", "-c", str(self._config_file(tmp_path, "claude"))],
         )
         assert result.exit_code == 0, result.output
+        assert seen["agent_probe"] is not None
+        assert seen["agent_skip_reason"] is None
+
+    def _seen_for(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        agent_type: str, repo_agent_types: tuple[str | None, ...],
+    ) -> dict:
+        from typer.testing import CliRunner
+
+        import ctrlrelay.core.node_check as nc
+        from ctrlrelay.cli import app
+
+        seen: dict = {}
+
+        async def fake_run_checks(config, **kw):
+            seen.update(kw)
+            seen["repo_count"] = len(config.repos)
+            return [nc.Check("node_id", True, "node-a")]
+
+        monkeypatch.setattr(nc, "run_checks", fake_run_checks)
+        path = self._config_file(tmp_path, agent_type, repo_agent_types)
+        result = CliRunner().invoke(app, ["node", "check", "-c", str(path)])
+        assert result.exit_code == 0, result.output
+        # The repos reached the command: a config the loader dropped
+        # them from would make every assertion below about the global
+        # type alone.
+        assert seen["repo_count"] == len(repo_agent_types)
+        return seen
+
+    def test_global_opencode_with_a_repo_on_claude_still_probes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Global opencode, one repo on claude: that repo dispatches
+        through claude, so its login must be checked here. Skipping on
+        the global type alone hid an expired login until that repo's
+        next job failed."""
+        seen = self._seen_for(
+            tmp_path, monkeypatch, "opencode", (None, "claude"),
+        )
+        assert seen["agent_probe"] is not None
+        assert seen["agent_skip_reason"] is None
+
+    def test_repos_that_all_stay_off_claude_still_skip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The sibling of the case above, so the pair says which
+        behaviour belongs to which: repos present, none naming claude,
+        and the skip still happens and says so."""
+        seen = self._seen_for(
+            tmp_path, monkeypatch, "opencode", (None, "opencode"),
+        )
+        assert seen["agent_probe"] is None
+        assert "no repository routes to claude" in seen["agent_skip_reason"]
+
+    def test_global_claude_with_a_repo_on_opencode_still_probes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reverse mix: every repo but one is on claude, so the
+        claude login matters and the probe runs."""
+        seen = self._seen_for(
+            tmp_path, monkeypatch, "claude", (None, "opencode"),
+        )
         assert seen["agent_probe"] is not None
         assert seen["agent_skip_reason"] is None
 

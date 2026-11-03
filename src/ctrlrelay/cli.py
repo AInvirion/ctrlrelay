@@ -2207,20 +2207,30 @@ def node_check(
         return await probe_usage(binary, UsageStore.beside(config.paths.state_db))
 
     # The probe is a `claude -p` call with claude's flags and it reads
-    # the claude subscription. On a deployment whose `agent.type` is
-    # another backend (#286) there is nothing for it to read, and
-    # running it anyway reports a FAILED "agent login" telling the
-    # operator to log in to a CLI they are not using. Skip it, and say
-    # why: a skip with the wrong reason costs the same search as a
-    # failure with the wrong cause.
+    # the claude subscription. On a deployment where NO repository runs
+    # on claude (#286) there is nothing for it to read, and running it
+    # anyway reports a FAILED "agent login" telling the operator to log
+    # in to a CLI they are not using. Skip it, and say why: a skip with
+    # the wrong reason costs the same search as a failure with the
+    # wrong cause.
+    #
+    # "No repository" is decided by the routing, not by `agent.type`
+    # alone: a global opencode with one repo whose `agent_type` is
+    # claude still dispatches that repo through claude, and an expired
+    # claude login there must show up here rather than as that repo's
+    # next failed job. Same rule as `make_repo_agent_dispatcher`: an
+    # unset or empty `agent_type` means the global one.
+    routed_types = {config.agent.type} | {
+        r.agent_type for r in config.repos if r.agent_type
+    }
     agent_skip_reason: str | None = None
-    if config.agent.type != "claude":
+    if "claude" not in routed_types:
         agent_skip_reason = (
-            f"skipped: agent.type is {config.agent.type!r}, and this "
-            "check reads the claude subscription. Verify that backend "
-            "by hand by running its CLI once in a repo. A per-repo "
-            "agent_type does not skip this check; only the global "
-            "agent.type does"
+            f"skipped: no repository routes to claude (agent.type is "
+            f"{config.agent.type!r} and no repos[].agent_type names "
+            "claude), and this check reads the claude subscription. "
+            "Verify the other backend by hand by running its CLI once "
+            "in a repo"
         )
 
     checks = asyncio.run(run_checks(
