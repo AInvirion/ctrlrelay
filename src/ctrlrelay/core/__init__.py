@@ -18,8 +18,12 @@ from ctrlrelay.core.config import (
 from ctrlrelay.core.dispatcher import (
     AgentAdapter,
     ClaudeDispatcher,
+    CliAgentAdapter,
+    OpenCodeDispatcher,
+    RepoAgentRouter,
     SessionResult,
     make_agent_dispatcher,
+    make_repo_agent_dispatcher,
 )
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.poller import IssuePoller
@@ -34,7 +38,11 @@ __all__ = [
     "CheckpointStatus",
     "AgentAdapter",
     "ClaudeDispatcher",
+    "CliAgentAdapter",
+    "OpenCodeDispatcher",
+    "RepoAgentRouter",
     "make_agent_dispatcher",
+    "make_repo_agent_dispatcher",
     "Config",
     "ConfigError",
     "GitHubCLI",

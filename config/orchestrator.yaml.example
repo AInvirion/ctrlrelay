@@ -21,15 +21,51 @@ paths:
   #   AInvirion: AINVIRION       # GitHub owner -> on-disk folder name
   #   SemClone: SEMCL.ONE
 
-# Headless coding agent. `type` selects the adapter (currently only
-# "claude" is implemented; other backends — codex, opencode, hermes,
-# kiro — are planned). Legacy `claude:` key is still accepted as an
-# alias for backwards compatibility but is deprecated.
+# Headless coding agent. `type` selects the adapter: "claude" and
+# "opencode" are implemented, and codex/hermes/kiro are still planned.
+# An unimplemented value stops the daemon at startup rather than falling
+# back to claude, so a typo here is loud. Legacy `claude:` key is still
+# accepted as an alias for backwards compatibility but is deprecated.
+#
+# `type` is the DEFAULT for every repo. A single repo can opt into
+# another backend with `repos[].agent_type` — see the repos block at the
+# bottom of this file. That is the intended shape: claude everywhere,
+# one low-stakes repo on a self-hosted model, rather than a global flip.
 agent:
   type: "claude"
+  # claude's own binary and nothing else's. The opencode block below has
+  # its own, because most configs set this to the literal "claude" and
+  # a second backend reading it would exec the wrong program.
   binary: "claude"
   default_timeout_seconds: 1800
   output_format: "json"
+
+  # Read only when a backend of type "opencode" is built, so this block
+  # is inert on a claude-only deployment and harmless to leave in place.
+  #
+  # `model` is "provider/model" as opencode spells it. Point a provider
+  # at a self-hosted OpenAI-compatible endpoint in opencode's own config
+  # (~/.config/opencode/opencode.json), e.g.
+  #
+  #   {"provider": {"local": {"npm": "@ai-sdk/openai-compatible",
+  #     "options": {"baseURL": "http://127.0.0.1:11434/v1"},
+  #     "models": {"qwen3-coder:30b": {}}}}}
+  #
+  # and name it here as "local/qwen3-coder:30b". The endpoint, its
+  # credential and the model list live there, not in ctrlrelay — leaving
+  # `model` unset lets opencode pick, which is usually what you want.
+  #
+  # One measured caveat before choosing a model: a model can advertise
+  # tool support and emit no tool calls at all. ctrlrelay's agents
+  # signal DONE / BLOCKED / FAILED by RUNNING A SHELL COMMAND that
+  # writes the checkpoint file, so a model that cannot call tools cannot
+  # finish a session however good its prose is. Test with a live call.
+  # opencode:
+  #   binary: "opencode"
+  #   model: "local/qwen3-coder:30b"
+  #   # Falls back to agent.default_timeout_seconds when unset. A local
+  #   # model is usually slower per token than a hosted one.
+  #   default_timeout_seconds: 3600
 
 # EXACTLY ONE transport is active, and it is the one named by `type`.
 # The other blocks below are inert: they may stay in the file, but nothing
@@ -184,6 +220,16 @@ repos: []
   # - name: "owner/repo"
   #   # Optional when paths.repo_root is set; otherwise required.
   #   local_path: "~/Projects/repo"
+  #   # Which agent backend runs THIS repo. Omit for agent.type, which
+  #   # is where every repo is unless it says otherwise. A value no
+  #   # adapter answers to stops the daemon at startup naming this repo.
+  #   #
+  #   # Opt in per repo rather than globally. ctrlrelay works unattended
+  #   # over issue and pull-request text and opens pull requests, so a
+  #   # weaker model behind the whole daemon produces bad pull requests
+  #   # at machine speed with nobody watching. Put a low-stakes repo
+  #   # here; leave the ones that matter on claude.
+  #   agent_type: "opencode"
   #   automation:
   #     dependabot_patch: auto
   #     dependabot_minor: ask

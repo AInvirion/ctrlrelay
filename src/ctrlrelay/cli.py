@@ -2206,9 +2206,38 @@ def node_check(
         binary = config.agent.binary if config.agent.binary != "claude" else _find_claude()
         return await probe_usage(binary, UsageStore.beside(config.paths.state_db))
 
+    # The probe is a `claude -p` call with claude's flags and it reads
+    # the claude subscription. On a deployment where NO repository runs
+    # on claude (#286) there is nothing for it to read, and running it
+    # anyway reports a FAILED "agent login" telling the operator to log
+    # in to a CLI they are not using. Skip it, and say why: a skip with
+    # the wrong reason costs the same search as a failure with the
+    # wrong cause.
+    #
+    # "No repository" is decided by the routing, not by `agent.type`
+    # alone: a global opencode with one repo whose `agent_type` is
+    # claude still dispatches that repo through claude, and an expired
+    # claude login there must show up here rather than as that repo's
+    # next failed job. Same rule as `make_repo_agent_dispatcher`: an
+    # unset or empty `agent_type` means the global one.
+    routed_types = {config.agent.type} | {
+        r.agent_type for r in config.repos if r.agent_type
+    }
+    agent_skip_reason: str | None = None
+    if "claude" not in routed_types:
+        agent_skip_reason = (
+            f"skipped: no repository routes to claude (agent.type is "
+            f"{config.agent.type!r} and no repos[].agent_type names "
+            "claude), and this check reads the claude subscription. "
+            "Verify the other backend by hand by running its CLI once "
+            "in a repo"
+        )
+
     checks = asyncio.run(run_checks(
         config, github_login=github.get_login,
-        agent_probe=None if no_agent else probe, fetch=fetch_peer,
+        agent_probe=None if (no_agent or agent_skip_reason) else probe,
+        fetch=fetch_peer,
+        agent_skip_reason=agent_skip_reason,
     ))
     for c in checks:
         mark = "[green]✓[/green]" if c.ok else ("[dim]–[/dim]" if c.ok is None else "[red]✗[/red]")
@@ -2240,7 +2269,7 @@ def run_secops(
     import asyncio
 
     from ctrlrelay.core.archived import ArchivedRepoTracker
-    from ctrlrelay.core.dispatcher import make_agent_dispatcher
+    from ctrlrelay.core.dispatcher import make_repo_agent_dispatcher
     from ctrlrelay.core.github import GitHubCLI
     from ctrlrelay.core.state import StateDB
     from ctrlrelay.core.worktree import WorktreeManager
@@ -2272,8 +2301,13 @@ def run_secops(
     # and a relay-health alert about their own single run would be
     # noise. The keyword is required, so choosing None is explicit
     # rather than inherited by omission (#204).
-    dispatcher = make_agent_dispatcher(
-        config.agent, outcome_hook=None,
+    # `make_repo_agent_dispatcher`, not `make_agent_dispatcher`: a repo
+    # with its own `agent_type` (#286) must run on the same backend when
+    # an operator drives it by hand as when the daemon does. Two
+    # different answers to "which agent runs this repo" is how a session
+    # gets resumed with another backend's session id.
+    dispatcher = make_repo_agent_dispatcher(
+        config, outcome_hook=None,
         usage_store=UsageStore.beside(config.paths.state_db),
     )
     github = GitHubCLI()
@@ -2391,7 +2425,7 @@ def run_dev(
     """Run dev pipeline for a GitHub issue."""
     import asyncio
 
-    from ctrlrelay.core.dispatcher import make_agent_dispatcher
+    from ctrlrelay.core.dispatcher import make_repo_agent_dispatcher
     from ctrlrelay.core.github import GitHubCLI
     from ctrlrelay.core.state import StateDB
     from ctrlrelay.core.worktree import WorktreeManager
@@ -2432,8 +2466,13 @@ def run_dev(
     # and a relay-health alert about their own single run would be
     # noise. The keyword is required, so choosing None is explicit
     # rather than inherited by omission (#204).
-    dispatcher = make_agent_dispatcher(
-        config.agent, outcome_hook=None,
+    # `make_repo_agent_dispatcher`, not `make_agent_dispatcher`: a repo
+    # with its own `agent_type` (#286) must run on the same backend when
+    # an operator drives it by hand as when the daemon does. Two
+    # different answers to "which agent runs this repo" is how a session
+    # gets resumed with another backend's session id.
+    dispatcher = make_repo_agent_dispatcher(
+        config, outcome_hook=None,
         usage_store=UsageStore.beside(config.paths.state_db),
     )
     github = GitHubCLI()
@@ -2711,7 +2750,7 @@ def poller_start(
 
     pid_file.write_text(str(os.getpid()))
     try:
-        from ctrlrelay.core.dispatcher import make_agent_dispatcher
+        from ctrlrelay.core.dispatcher import make_repo_agent_dispatcher
         from ctrlrelay.core.github import GitHubCLI
         from ctrlrelay.core.poller import IssuePoller, run_poll_loop
         from ctrlrelay.core.scheduler import make_scheduler
@@ -2830,8 +2869,8 @@ def poller_start(
         # so every spawn's exit code and output tail are recorded and
         # a run of failures raises one alert.
         usage_store = UsageStore.beside(config.paths.state_db)
-        dispatcher = make_agent_dispatcher(
-            config.agent,
+        dispatcher = make_repo_agent_dispatcher(
+            config,
             outcome_hook=make_dispatch_outcome_hook(config, state_db),
             usage_store=usage_store,
         )
