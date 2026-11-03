@@ -39,10 +39,12 @@ A token copied between machines is revoked for all of them at once.
 
 ## 3. Its own agent login
 
-Log the agent CLI in on this machine. Each machine can use its own
-subscription; it pauses on its own when its usage nears the limit
-(`usage.pause_at`). Two machines on one subscription share one set of usage
-numbers and pause together, which is correct.
+Log the agent CLI in on this machine — whichever your repos use (`claude`,
+`opencode` or both, per `agent.type` and `repos[].agent_type`). For Claude Code, each
+machine can use its own subscription; it pauses on its own when its usage
+nears the limit (`usage.pause_at`). Two machines on one subscription share one
+set of usage numbers and pause together, which is correct. OpenCode has no
+usage reading of its own.
 
 ## 4. A config with its own `node_id`
 
@@ -103,8 +105,9 @@ ctrlrelay node check
 ✓ peer http://node-a:8787: reachable, node-a
 ```
 
-`--no-agent` skips the agent check, which makes one tiny call on the
-subscription. A peer that answers with this machine's own name means two
+`--no-agent` skips the agent check, which makes one tiny `claude` call on the
+subscription. The row is skipped when no repo routes to `claude`, and it never
+checks `opencode`: run that CLI once by hand. A peer that answers with this machine's own name means two
 machines share a `node_id` (or the URL points back here).
 
 ## 8. Start it

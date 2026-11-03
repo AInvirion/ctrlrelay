@@ -110,18 +110,17 @@ bundle exec jekyll serve
 ctrlrelay/
 ├── src/ctrlrelay/                # Python package (orchestrator core)
 │   ├── cli.py                   # Typer CLI entry point
-│   ├── core/                    # Dispatcher, worktree, state, config, ...
-│   ├── pipelines/               # dev, secops, post_merge
+│   ├── core/                    # Dispatcher (claude, opencode), worktree, state, config, ...
+│   ├── pipelines/               # dev, secops, task, post_merge
 │   ├── bridge/                  # chat bridge daemon (Telegram, Mattermost)
 │   ├── transports/              # SocketTransport, FileMockTransport
+│   ├── web/                     # Read-only status page and JSON API
+│   ├── personalization/         # Cross-machine sync of operator state
+│   ├── templates/               # launchd / systemd unit templates
 │   └── dashboard/               # Optional dashboard push client
 ├── tests/                       # pytest suites (one file per module)
 ├── config/                      # Example orchestrator.yaml
-├── docs/                        # This Jekyll site
-├── scripts/                     # Shell helpers (./sync wrapper, manifest)
-├── claude-config/               # Git-tracked Claude Code config (export/import)
-├── codex-config/                # Git-tracked Codex CLI config
-└── mcp-servers/                 # MCP servers (codex-reviewer, ...)
+└── docs/                        # This Jekyll site
 ```
 
 ## Contributing
@@ -140,17 +139,21 @@ ctrlrelay/
    and lets the post-merge handler keep the issue / PR / branch lifecycle
    clean.
 6. **Don't commit secrets.** Bot tokens and dashboard tokens belong in
-   environment variables — `transport.telegram.bot_token_env` and
-   `dashboard.auth_token_env` only hold the variable _name_.
+   environment variables — `transport.telegram.bot_token_env`,
+   `transport.mattermost.bot_token_env` and `dashboard.auth_token_env` only
+   hold the variable _name_.
 
 ## CI
 
-Two GitHub Actions workflows live under `.github/workflows/`:
+Workflows under `.github/workflows/`:
 
-- **`build.yml`** — runs on push to `main`, on tag pushes (`v*`), and on PRs.
-  Builds the sdist and wheel via `uv build`. On tags / releases, attaches the
-  artifacts to the GitHub release.
+- **`test.yml`** — runs on push to `main` and on PRs: `ruff check src/ tests/`
+  and `pytest tests/`.
+- **`build.yml`** — runs on push to `main`, on tag pushes (`v*`), on PRs and
+  on published releases. Builds the sdist and wheel via `uv build`. On tags /
+  releases, attaches the artifacts to the GitHub release.
+- **`publish.yml`** — runs when a release is published, and publishes the
+  package to PyPI.
 - **`pages.yml`** — runs on push to `main` when anything under `docs/`
   changes. Builds the Jekyll site and deploys to GitHub Pages.
-
-Both must pass before a PR is mergeable.
+- **`cla.yml`** — the contributor licence agreement check on PRs.

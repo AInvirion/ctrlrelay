@@ -2,61 +2,88 @@
 title: Home
 layout: default
 nav_order: 1
-description: "ctrlrelay — local-first orchestrator that turns assigned GitHub issues into reviewed PRs by driving Claude Code in the background."
+description: "ctrlrelay turns your coding agent into a teammate that works your GitHub backlog in the background — and asks you on Telegram or Mattermost when it needs you."
 permalink: /
 ---
 
-# ctrlrelay
+# Assign an issue. Get a reviewed pull request.
 {: .fs-9 }
 
-Local-first orchestrator that drives headless Claude Code (`claude -p`) across
-your GitHub repos. Watches for assigned issues, runs the dev pipeline in an
-isolated git worktree, opens a PR, and asks you on Telegram when it gets stuck.
+ctrlrelay turns the coding agent you already use into a teammate that works
+your GitHub backlog in the background — and asks you on Telegram or
+Mattermost only when it needs you.
 {: .fs-6 .fw-300 }
 
 [Get started]({{ '/getting-started/' | relative_url }}){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
-[Configure]({{ '/configuration/' | relative_url }}){: .btn .fs-5 .mb-4 .mb-md-0 .mr-2 }
-[Set up the bridge]({{ '/bridge/' | relative_url }}){: .btn .fs-5 .mb-4 .mb-md-0 }
+[Set up chat]({{ '/bridge/' | relative_url }}){: .btn .fs-5 .mb-4 .mb-md-0 .mr-2 }
+[View on GitHub](https://github.com/AInvirion/ctrlrelay){: .btn .fs-5 .mb-4 .mb-md-0 }
 
 ---
 
-## Use it
+## How it works
 
-- **[Getting started]({{ '/getting-started/' | relative_url }})** — install,
-  write your first config, run the dev pipeline against an issue.
-- **[Configuration]({{ '/configuration/' | relative_url }})** — every key in
-  `orchestrator.yaml`, with defaults and what they actually do.
-- **[Chat bridge]({{ '/bridge/' | relative_url }})** — setting up Telegram or
-  Mattermost, starting the bridge, troubleshooting delivery.
-- **[Feedback loop]({{ '/feedback-loop/' | relative_url }})** — how
-  `BLOCKED_NEEDS_INPUT` checkpoints reach you and how your reply resumes the
-  paused Claude session.
-- **[CLI reference]({{ '/cli/' | relative_url }})** — every subcommand and
-  flag.
-- **[Operations]({{ '/operations/' | relative_url }})** — running the bridge
-  and poller under launchd (macOS) or systemd (Linux), tailing logs, reading
-  the state DB.
-- **[Personalization sync]({{ '/personalization/' | relative_url }})** —
-  cross-machine sync of Claude config, per-project memory, and spec
-  outputs through a private GitHub repo.
+```mermaid
+flowchart LR
+    GH[("GitHub<br/>issues")] -->|new issue| CR["ctrlrelay<br/>on your machine"]
+    CR -->|works in a clean branch| AG["Coding agent<br/>Claude Code · OpenCode"]
+    AG -->|stuck?| CH["Your chat<br/>Telegram · Mattermost"]
+    CH -->|your answer| AG
+    AG -->|opens| PR["Pull request"]
+    PR -->|CI + review| YOU(["You merge"])
+```
 
-## Build on it
+1. **You assign an issue** to yourself, or add a label you pick.
+2. **ctrlrelay starts the agent** in a fresh, isolated copy of the repo.
+3. **If the agent has a question**, it lands in your chat. Your reply goes
+   straight back to the same session — no restart, no lost context.
+4. **A pull request opens.** ctrlrelay waits for CI, fixes what fails, and
+   posts an independent review.
+5. **You merge** — or ask for changes, like with any teammate.
 
-- **[Architecture]({{ '/architecture/' | relative_url }})** — layered
-  overview, dispatcher ↔ Claude contract, state DB shape, worktree lifecycle.
-- **[Development]({{ '/development/' | relative_url }})** — local dev setup,
-  tests, ruff, contributing.
+## Why ctrlrelay
 
-## What is this?
+Coding agents are great when you sit and watch them. ctrlrelay is for the
+work you don't want to sit and watch.
 
-ctrlrelay sits between GitHub and your laptop's `claude` install. The poller
-checks each configured repo for issues newly assigned to you. When it sees one,
-it acquires a per-repo lock, creates a worktree on a fresh branch, spawns
-`claude -p` with the issue title and body in the prompt, and lets the agent
-work TDD-style toward a PR. When the agent gets stuck, it writes a
-checkpoint, the orchestrator routes the question to your Telegram chat, and
-your reply resumes the same Claude session.
+| You want… | ctrlrelay gives you… |
+|---|---|
+| No new tool for the team | Work starts from a GitHub issue and ends as a normal pull request. |
+| Your code to stay with you | It runs on your laptop or server. No hosted service, no extra platform fee on top of your agent subscription. |
+| Fewer wrong guesses | When the agent is stuck it asks you in chat, and your answer resumes the same session. |
+| Changes you can trust | One isolated copy of the repo per issue, one job per repo at a time, an optional Linux sandbox that hides your secrets. |
+| Pull requests that are ready to read | CI is waited on, failing checks get fixed, and every PR carries a review comment. |
+| Freedom to choose the model | Claude Code, or OpenCode with a local model — chosen per repo. |
+| Room to grow | Start on one machine; add more later and they split the work without collisions. |
+| To see what runs on your machine | Open source, Apache 2.0. |
 
-Everything runs locally. State lives in a SQLite file. Bridge state lives in
-a Unix socket. The Telegram bot is the only outbound dependency, and it's
-optional — `ctrlrelay` will run without it for local testing.
+## What's included
+
+- **Dev pipeline** — issue to pull request, end to end.
+- **Task pipeline** — issues with a task label get a written report instead of a pull request.
+- **Chat bridge** — [Telegram or Mattermost]({{ '/bridge/' | relative_url }}),
+  one at a time.
+- **Automatic review** — a second-opinion review comment on every agent PR.
+- **Daily security sweep** — Dependabot alerts and PRs, every morning.
+- **Status page** — what each agent is doing, what is waiting, what needs you.
+- **Several machines** — [one account, many machines]({{ '/adding-a-machine/' | relative_url }}),
+  one chat.
+- **Personalization sync** — [your agent setup on every machine]({{ '/personalization/' | relative_url }}).
+
+## Where to go next
+
+**Use it**
+
+- [Getting started]({{ '/getting-started/' | relative_url }}) — prerequisites, install, first run.
+- [Chat bridge]({{ '/bridge/' | relative_url }}) — connect Telegram or Mattermost.
+- [Configuration]({{ '/configuration/' | relative_url }}) — every setting, with defaults.
+- [Feedback loop]({{ '/feedback-loop/' | relative_url }}) — how a question reaches you and your answer gets back.
+- [Operations]({{ '/operations/' | relative_url }}) — background services, status page, logs.
+- [Adding a machine]({{ '/adding-a-machine/' | relative_url }}) — share the work across machines.
+- [CLI reference]({{ '/cli/' | relative_url }}) — every command and flag.
+
+**Build on it**
+
+- [Architecture]({{ '/architecture/' | relative_url }}) — how the pieces fit.
+- [Development]({{ '/development/' | relative_url }}) — local setup, tests, contributing.
+
+Using an AI assistant? Point it at [`llms.txt`]({{ '/llms.txt' | relative_url }}).

@@ -1,7 +1,8 @@
 title: ctrlrelay
 description: >-
-  Local-first orchestrator for headless coding agents across multiple GitHub
-  repos — operator guides and architecture reference.
+  Assign a GitHub issue, get a reviewed pull request. ctrlrelay runs your
+  coding agent in the background and asks you on Telegram or Mattermost
+  when it needs you.
 url: "https://ainvirion.github.io"
 baseurl: "/ctrlrelay"
 
@@ -25,6 +26,10 @@ search:
   button: false
 
 heading_anchors: true
+
+# Render ```mermaid fences as diagrams
+mermaid:
+  version: "10.9.1"
 
 # Aux links appear in the top right of the layout
 aux_links:

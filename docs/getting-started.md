@@ -8,23 +8,33 @@ permalink: /getting-started/
 
 # Getting started
 
-This page walks through installing ctrlrelay, writing a minimal `orchestrator.yaml`,
-and running the dev pipeline against a real GitHub issue. Allow about 15 minutes.
+In about 15 minutes you will install ctrlrelay, point it at your repos, and
+watch it turn a real GitHub issue into a pull request.
 
-## Requirements
+## Before you start
 
-- **Python 3.12+** — the package targets `requires-python = ">=3.12"`.
-- **`claude` CLI** — Claude Code installed and authenticated. ctrlrelay shells out
-  to `claude -p ...`. See [Claude Code installation](https://docs.anthropic.com/claude/docs/claude-code).
-- **`gh` CLI** — GitHub CLI installed and authenticated (`gh auth login`). ctrlrelay
-  uses `gh` for all GitHub API calls.
-- **`git` 2.20+** — for `git worktree add`.
-- A unix-like shell (macOS or Linux). Windows is not supported.
+You need:
 
-Optional:
+- **macOS or Linux.** Windows is not supported.
+- **Python 3.12 or newer.**
+- **git 2.20 or newer** — ctrlrelay gives every issue its own `git worktree`.
+- **The [GitHub CLI](https://cli.github.com/) (`gh`)**, logged in with
+  `gh auth login`. ctrlrelay makes every GitHub call through it.
+- **A coding agent CLI**, logged in:
+  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) — the default, or
+  - [OpenCode](https://opencode.ai) (`opencode`) — can point at a local model.
+    Pick it per repo with `repos[].agent_type`; see
+    [Configuration]({{ '/configuration/' | relative_url }}).
 
+Nice to have:
+
+- **A chat for questions** — a Telegram bot, or a bot account on your
+  Mattermost server. Without one, ctrlrelay still runs, but a blocked agent
+  cannot get your answer. See [Chat bridge]({{ '/bridge/' | relative_url }}).
+- **A reviewer CLI** for the automatic pull request review. Turn it off with
+  `code_review.method: "off"` if you don't want it; see
+  [Configuration]({{ '/configuration/' | relative_url }}).
 - [`uv`](https://github.com/astral-sh/uv) for faster installs.
-- A Telegram bot or a Mattermost server if you want the human-in-the-loop bridge — see [Chat bridge]({{ '/bridge/' | relative_url }}).
 
 ## Install
 
@@ -69,9 +79,10 @@ ctrlrelay setup --yes \
   --install-daemons
 ```
 
-`--yes` accepts every default and never prompts. The Telegram bot token is
-read from `$CTRLRELAY_TELEGRAM_TOKEN`; export it before running setup if you
-want it baked into the rendered launchd plist.
+`--yes` accepts every default and never prompts. The chat token is read from
+the variable your transport names — `$CTRLRELAY_TELEGRAM_TOKEN` for Telegram,
+`$CTRLRELAY_MATTERMOST_TOKEN` for Mattermost. Export it before running setup if
+you want it baked into the rendered launchd or systemd unit.
 
 After setup completes, validate:
 
@@ -101,8 +112,8 @@ the hostname is meaningless (CI runners, containers).
 
 ## Your first dev-pipeline run
 
-The dev pipeline takes a GitHub issue, spawns Claude Code in an isolated git
-worktree, and opens a PR. Pick a small issue assigned to you (or create one to
+The dev pipeline takes a GitHub issue, starts your coding agent in an isolated
+git worktree, and opens a PR. Pick a small issue assigned to you (or create one to
 test against), then:
 
 ```bash

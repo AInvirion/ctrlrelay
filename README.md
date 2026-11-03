@@ -1,222 +1,123 @@
 # ctrlrelay
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Tests and lint](https://github.com/AInvirion/ctrlrelay/actions/workflows/test.yml/badge.svg)](https://github.com/AInvirion/ctrlrelay/actions/workflows/test.yml)
-[![Build](https://github.com/AInvirion/ctrlrelay/actions/workflows/build.yml/badge.svg)](https://github.com/AInvirion/ctrlrelay/actions/workflows/build.yml)
+[![PyPI](https://img.shields.io/pypi/v/ctrlrelay.svg)](https://pypi.org/project/ctrlrelay/)
 [![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-blue)](https://pypi.org/project/ctrlrelay/)
-[![GitHub Issues](https://img.shields.io/github/issues/AInvirion/ctrlrelay.svg)](https://github.com/AInvirion/ctrlrelay/issues)
-[![GitHub Pull Requests](https://img.shields.io/github/issues-pr/AInvirion/ctrlrelay.svg)](https://github.com/AInvirion/ctrlrelay/pulls)
+[![Tests and lint](https://github.com/AInvirion/ctrlrelay/actions/workflows/test.yml/badge.svg)](https://github.com/AInvirion/ctrlrelay/actions/workflows/test.yml)
 
-> Local-first orchestrator for headless coding agents across your GitHub
-> repos. Watches for assigned issues, runs a dev pipeline in an isolated
-> git worktree, opens a PR, and asks you on Telegram or Mattermost when it
-> gets stuck.
+**Assign an issue. Get a reviewed pull request. Answer questions from your phone.**
 
-## Table of Contents
+ctrlrelay turns the coding agent you already use into a teammate that works
+your GitHub backlog in the background. It picks up issues, writes the code in
+a clean branch, opens a pull request, waits for CI, gets the change reviewed,
+and pings you on **Telegram** or **Mattermost** only when it truly needs you.
 
-- [About](#about)
-- [Features](#features)
-- [How it works](#how-it-works)
-- [Getting started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-  - [Quick start](#quick-start)
-- [Documentation](#documentation)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-- [Security](#security)
-- [License](#license)
+It runs on your own machine. Your code, your credentials, your agent
+subscription. No hosted service in the middle.
 
-## About
+**[Documentation](https://ainvirion.github.io/ctrlrelay/)** ·
+**[Get started](https://ainvirion.github.io/ctrlrelay/getting-started/)** ·
+**[Why ctrlrelay](https://ainvirion.github.io/ctrlrelay/#why-ctrlrelay)**
 
-Headless coding agents are great interactively. Running them across half
-a dozen repos without staring at a terminal is a different problem: who
-schedules the runs, who watches for new work, who hands you the "I'm
-blocked, what do you want?" question, who tracks the PR until it merges.
+## Why ctrlrelay
 
-`ctrlrelay` is a small daemon that does all of that on your laptop. It
-is local-first on purpose: no server, no queue, no multi-tenant anything.
-Your agent credentials, your GitHub credentials, your repos, your
-machine.
+Coding agents are great when you sit and watch them. ctrlrelay is for the
+work you don't want to sit and watch.
 
-Today `ctrlrelay` ships with a Claude Code (`claude -p`) backend. The
-orchestrator layer — worktrees, state DB, scheduler, chat bridge —
-is agent-agnostic, and plug-in backends for other headless coding agents
-are on the roadmap (see [Roadmap](#roadmap)).
+- **Your backlog is the to-do list.** No new tool to learn. Assign an issue
+  (or add a label) and the work starts. The result is a normal pull request
+  your team already knows how to review.
+- **Runs where your code already lives.** ctrlrelay is a small program on your
+  laptop or server — not a cloud service. Nothing leaves your machine except
+  the calls your agent and GitHub already make. No per-seat platform fee on
+  top of the agent you already pay for.
+- **It asks instead of guessing.** When the agent is stuck, you get the
+  question in chat. You reply from your phone and the *same* session picks up
+  where it stopped.
+- **Safe by default.** Every issue gets its own isolated copy of the repo.
+  One job per repo at a time. Optional Linux sandbox that hides your secrets
+  from the agent. Nothing merges without your rules allowing it.
+- **Done means done.** It waits for CI, fixes failing checks, and posts an
+  independent review on the pull request — so what reaches you is ready to
+  read, not a first draft.
+- **Pick your agent per repo.** Claude Code today, or OpenCode — which can
+  run on a local model — for the repos where that fits.
+- **Grows with you.** Start on one laptop. Add more machines later; they share
+  the work without stepping on each other.
+- **Open source.** Apache 2.0. Read every line of what runs on your machine.
 
-## Features
+## What it does
 
-- **Issue poller.** Detects issues across every configured repo
-  (either assigned to you, or carrying a configurable opt-in label like
-  `ctrlrelay:auto`), spawns a dev session in a dedicated git worktree,
-  and opens a PR. Label triggers let a teammate without rights on your
-  account flag an issue as safe for the bot to pick up —
-  see [`include_labels`][docs-config].
-- **Chat bridge.** When a session hits a blocking question, the bridge
-  relays it to you and resumes the session once you reply. Choose
-  **Telegram** (a DM from a bot) or **Mattermost** (a channel on your own
-  server) with one `transport.type` setting. Exactly one is active at a
-  time; running both at once is not supported and not planned
-  ([#176](https://github.com/AInvirion/ctrlrelay/issues/176), closed
-  won't-do). See [configuration][docs-config].
-- **PR watcher.** Tracks the opened PR to merge and closes the loop
-  with a notification on whichever chat transport is configured.
-- **In-process scheduler** (APScheduler). Runs periodic jobs inside
-  the poller daemon. Ships with a `secops` job that reviews Dependabot
-  alerts and PRs daily at 6am; cron expressions follow standard Vixie
-  5-field semantics (Sun=0, DOM-OR-DOW).
-- **Checkpoint protocol.** The agent writes a structured state file
-  at the end of every session so the orchestrator knows whether it
-  succeeded, failed, or is blocked on input. Agent backends implement
-  this protocol to integrate.
-- **Cross-platform supervision.** launchd (macOS) and systemd (Linux)
-  examples in `docs/operations.md`. One codebase, identical behavior.
+- **Issues → pull requests.** Watches every repo you choose and works each new
+  issue end to end.
+- **Questions in your chat.** Telegram (a private bot) or Mattermost (a channel
+  on your own server).
+- **Automatic review.** Every agent pull request gets a second-opinion review
+  comment before you look at it.
+- **Daily security sweep.** Reviews Dependabot alerts and pull requests across
+  your repos every morning.
+- **Status page.** See what each agent is doing, what is waiting, and what
+  needs you — at a glance.
+- **Many machines, one account.** Spread work across machines, with one chat
+  and one status page.
+- **Settings follow you.** Optional sync of your agent setup across machines
+  through a private GitHub repo.
 
 ## How it works
 
-```
-             ┌───────────────┐
-             │  GitHub API   │
-             └───────┬───────┘
-                     │ (poll: issues assigned to me)
-             ┌───────▼───────┐         ┌──────────────┐
-             │ poller daemon │◄────────┤   APScheduler│
-             │  (launchd /   │         │ (secops cron)│
-             │   systemd)    │         └──────────────┘
-             └───┬───────┬───┘
-      new issue  │       │  blocked session
-                 │       │
-      ┌──────────▼──┐  ┌─▼───────────────────┐
-      │ dev pipeline│  │ chat bridge         │
-      │ in worktree │  │ (socket ↔ chat API) │
-      │ agent CLI   │  └──────────┬──────────┘
-      └──────┬──────┘             │
-             │ PR opened          │ asks you
-             ▼                    ▼
-      ┌────────────┐         ┌─────────┐
-      │ PR watcher │         │   You   │
-      └────────────┘         └─────────┘
+```mermaid
+flowchart LR
+    GH[("GitHub<br/>issues")] -->|new issue| CR["ctrlrelay<br/>on your machine"]
+    CR -->|works in a clean branch| AG["Coding agent<br/>Claude Code · OpenCode"]
+    AG -->|stuck?| CH["Your chat<br/>Telegram · Mattermost"]
+    CH -->|your answer| AG
+    AG -->|opens| PR["Pull request"]
+    PR -->|CI + review| YOU(["You merge"])
 ```
 
-Under the hood it's Python + `asyncio` + `sqlite` for state. The agent
-is invoked as a subprocess (today: `claude -p`), and GitHub is accessed
-via the `gh` CLI. No web server, no queue, no database dependency — just
-a launchd/systemd-supervised daemon.
+1. **You assign an issue** to yourself, or add a label you pick.
+2. **ctrlrelay starts the agent** in a fresh, isolated copy of the repo.
+3. **If the agent has a question**, it lands in your chat. Your reply goes
+   straight back to the same session.
+4. **A pull request opens.** ctrlrelay waits for CI, fixes what fails, and
+   posts a review.
+5. **You merge** — or ask for changes, like with any teammate.
 
-## Getting started
-
-### Prerequisites
-
-- **Python 3.12+**
-- **git 2.20+**
-- The **[`gh` CLI][gh-cli]**, authenticated (`gh auth login`) — used for
-  all GitHub API calls.
-- A **headless coding agent backend.** Today that means the
-  **[`claude` CLI][claude-cli]**, authenticated (`claude auth login`).
-  Future backends will document their own setup.
-- *(Optional, for the `secops` pipeline)* the **[`codex` CLI][codex-cli]**,
-  authenticated. The secops pipeline invokes `codex review` as an
-  independent reviewer for the agent's output; you can disable it by
-  setting `code_review.method: "none"` in your config if you prefer to
-  skip the review step.
-- *(Optional)* if you want the bridge, credentials for one chat
-  transport: a **Telegram** bot token, or a **Mattermost** server URL,
-  bot token and channel ID — see [bridge docs][docs-bridge] and
-  [configuration][docs-config].
-
-### Installation
-
-**From PyPI** (once published):
+## Quick start
 
 ```bash
-pip install ctrlrelay
-# or: uv pip install ctrlrelay
+pipx install ctrlrelay
+ctrlrelay setup          # finds your repos and writes your config
+ctrlrelay poller start   # starts working assigned issues
 ```
 
-**From source** (current path while in alpha):
-
-```bash
-git clone https://github.com/AInvirion/ctrlrelay.git
-cd ctrlrelay
-uv pip install -e .   # or: pip install -e .
-```
-
-### Quick start
-
-```bash
-# Copy and edit the example config:
-cp config/orchestrator.yaml.example config/orchestrator.yaml
-
-# Validate it:
-ctrlrelay config validate
-
-# Run the dev pipeline against an issue you're assigned:
-ctrlrelay run dev --issue 42 --repo your-org/your-repo
-
-# Or start the poller to auto-process newly assigned issues + run the
-# scheduled secops sweep daily at 6am:
-ctrlrelay poller start      # daemonizes; returns the terminal
-ctrlrelay poller status     # verify it's running
-```
-
-Run as a supervised daemon (launchd on macOS / systemd on Linux) — see
-[Operations][ops-docs].
+You need Python 3.12+, the GitHub CLI, and a coding agent CLI. The
+**[getting started guide](https://ainvirion.github.io/ctrlrelay/getting-started/)**
+covers prerequisites, chat setup and running it as a background service.
 
 ## Documentation
 
-- [Getting started][docs-start]
-- [Configuration][docs-config]
-- [Chat bridge (Telegram or Mattermost)][docs-bridge]
-- [Feedback loop][docs-feedback]
-- [CLI reference][docs-cli]
-- [Operations (launchd / systemd / scheduled jobs)][ops-docs]
-- [Architecture][docs-arch]
-- [Development][docs-dev]
+Everything lives at **[ainvirion.github.io/ctrlrelay](https://ainvirion.github.io/ctrlrelay/)**:
 
-## Roadmap
-
-- **Multi-agent backend support.** The agent dispatcher is the seam we
-  intend to widen so `ctrlrelay` can drive alternative headless coding
-  agents (e.g. OpenAI Codex CLI, OpenCode, Hermes) alongside Claude
-  Code. Each backend will implement the same checkpoint protocol and
-  be selectable per repo via config.
-- **Additional scheduled jobs.** The in-process scheduler already has
-  `secops`; follow-ups include a weekly activity summary and a stale-
-  session reaper.
-- **Dashboard mode.** An optional, opt-in heartbeat push to a hosted
-  dashboard for operators running the daemon across many machines.
+- [Getting started](https://ainvirion.github.io/ctrlrelay/getting-started/) — install and first run
+- [Chat bridge](https://ainvirion.github.io/ctrlrelay/bridge/) — set up Telegram or Mattermost
+- [Configuration](https://ainvirion.github.io/ctrlrelay/configuration/) — every setting
+- [Operations](https://ainvirion.github.io/ctrlrelay/operations/) — background services, status page, several machines
+- [CLI reference](https://ainvirion.github.io/ctrlrelay/cli/) — every command
 
 ## Contributing
 
-We welcome contributions from the community! Please read our
-[Contributing Guidelines](CONTRIBUTING.md) before submitting a pull
-request, and abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
-
-First-time contributors will be prompted by the CLA Assistant bot to
-sign the Contributor Assignment Agreement in-PR — it's a one-time,
-one-comment step.
+Contributions are welcome. Read the [contributing guide](CONTRIBUTING.md) and
+the [code of conduct](CODE_OF_CONDUCT.md). First-time contributors sign a
+one-time Contributor Assignment Agreement in the pull request.
 
 ## Security
 
-If you discover a security vulnerability, please follow our
-[Security Policy](SECURITY.md). Please do not file public GitHub issues
-for security reports — open a private advisory instead.
+Found a vulnerability? Please follow the [security policy](SECURITY.md) and open
+a private advisory — not a public issue.
 
 ## License
 
-This project is licensed under the Apache License 2.0 — see the
-[LICENSE](LICENSE) file for details.
+Apache License 2.0 — see [LICENSE](LICENSE).
 
 Copyright (c) 2026 AInvirion LLC. All Rights Reserved.
-
-[claude-cli]: https://docs.anthropic.com/claude/docs/claude-cli
-[gh-cli]: https://cli.github.com/
-[codex-cli]: https://github.com/openai/codex
-[docs-start]: https://ainvirion.github.io/ctrlrelay/getting-started/
-[docs-config]: https://ainvirion.github.io/ctrlrelay/configuration/
-[docs-bridge]: https://ainvirion.github.io/ctrlrelay/bridge/
-[docs-feedback]: https://ainvirion.github.io/ctrlrelay/feedback-loop/
-[docs-cli]: https://ainvirion.github.io/ctrlrelay/cli/
-[ops-docs]: https://ainvirion.github.io/ctrlrelay/operations/
-[docs-arch]: https://ainvirion.github.io/ctrlrelay/architecture/
-[docs-dev]: https://ainvirion.github.io/ctrlrelay/development/

@@ -31,12 +31,17 @@ ctrlrelay [--version] <command> ...
 | `ctrlrelay run ...` | Run a pipeline interactively. |
 | `ctrlrelay ci ...` | CI helpers used by the dev pipeline prompt. |
 | `ctrlrelay poller ...` | Manage the issue-poller daemon. |
+| `ctrlrelay setup` | Interactive first-run setup: writes `orchestrator.yaml`. |
+| `ctrlrelay install ...` | Generate launchd / systemd unit files. |
+| `ctrlrelay web ...` | Read-only status page and JSON API. |
+| `ctrlrelay node ...` | Check this machine's setup. |
+| `ctrlrelay repos ...` | Bulk repo operations across the configured repos. |
+| `ctrlrelay personalization ...` | Cross-machine sync of operator state. |
 
-> **Note:** the `repos`, `export`, `import`, `team-export`, `team-import`,
-> `setup`, `manifest`, `codex-export`, `codex-import`, and `codex-install`
-> commands are **shell-script** subcommands of the legacy `./sync` wrapper, not
-> the Python `ctrlrelay` CLI. See the [README](https://github.com/AInvirion/ctrlrelay#readme)
-> for those.
+`setup`, `personalization`, `status` and `version` are described below;
+`install` and `web` in [Operations]({{ '/operations/' | relative_url }}),
+`node` in [Adding a machine]({{ '/adding-a-machine/' | relative_url }}).
+For `repos`, see `ctrlrelay repos --help`.
 
 Every command that reads config accepts `--config` / `-c` to point at a
 non-default `orchestrator.yaml` (default: `config/orchestrator.yaml`).
@@ -64,8 +69,10 @@ Key flags:
 | `--repo-root PATH` | `~/Projects` | Where repos land — `~/Projects/<owner.lower()>/<repo>`. |
 | `--config-out PATH` | `~/.config/ctrlrelay/orchestrator.yaml` | Where to write the generated config. |
 | `--timezone TZ` | `UTC` | IANA zone for cron schedules. |
-| `--transport TRANSPORT` | `file_mock` | `telegram` or `file_mock`. |
+| `--transport TRANSPORT` | `file_mock` | `file_mock`, `telegram` or `mattermost`. Exactly one is active; there is no fallback between them. |
 | `--telegram-chat-id ID` | none | Required for `--transport=telegram`. |
+| `--mattermost-url URL` | none | Server URL, e.g. `https://chat.example.com`. Required for `--transport=mattermost`. |
+| `--mattermost-channel-id ID` | none | The channel's 26-character ID, not its name. Required for `--transport=mattermost`. |
 | `--personalization-repo OWNER/REPO` | none | Adds a personalization block. |
 | `--no-personalization` | off | Skip the personalization prompt entirely. |
 | `--install-daemons` | (prompted) | Render and write launchd/systemd unit files. Reads the token variable the chosen transport names (`$CTRLRELAY_TELEGRAM_TOKEN`, `$CTRLRELAY_MATTERMOST_TOKEN`) so the rendered unit isn't a placeholder. |
@@ -136,16 +143,19 @@ See [Chat bridge]({{ '/bridge/' | relative_url }}) for the full setup walkthroug
 ctrlrelay bridge start [-c PATH] [-F|--foreground]
 ```
 
-Starts the bridge listening on `transport.telegram.socket_path`. Reads the
-bot token from the env var named in `transport.telegram.bot_token_env`
-(default `CTRLRELAY_TELEGRAM_TOKEN`). Daemonizes by default — forks a
+Starts the bridge for the active transport (`transport.type`, Telegram or
+Mattermost), listening on that block's `socket_path`. Reads the bot token from
+the env var named in that block's `bot_token_env` (default
+`CTRLRELAY_TELEGRAM_TOKEN` or `CTRLRELAY_MATTERMOST_TOKEN`). Daemonizes by default — forks a
 detached process, writes a PID file alongside the socket, and returns to
 the shell. Pass `--foreground` / `-F` under launchd/systemd or when
 debugging interactively; the process runs in the foreground and still
 writes its PID file so `ctrlrelay bridge status` works.
 
-Fails if `transport.type` is not `telegram`, the token env var is unset, or a
-PID file already exists for a live process.
+Fails if `transport.type` is not `telegram` or `mattermost`, the token env var
+is unset, the chat handler cannot be built from the config, or a PID file
+already exists for a live process. On Mattermost it also refuses to start until
+the bot is a member of the configured channel.
 
 ### `bridge stop`
 
@@ -174,8 +184,8 @@ ctrlrelay bridge test [-m "MESSAGE"] [-c PATH]
 ```
 
 Connects to the bridge socket as a client and sends a one-off message. Useful
-for confirming end-to-end delivery to your Telegram chat without waiting for a
-real pipeline run.
+for confirming end-to-end delivery to your chat (Telegram or Mattermost)
+without waiting for a real pipeline run.
 
 ## `ctrlrelay run`
 
@@ -191,10 +201,11 @@ ctrlrelay run dev -i ISSUE [-r REPO] [-c PATH]
 | `--repo` / `-r` | when more than one repo is configured | — | Limit to a single `owner/repo`. |
 | `--config` / `-c` | no | `config/orchestrator.yaml` | Config path. |
 
-Acquires the per-repo lock, creates the worktree, spawns Claude with the
-issue's title/body in the prompt, and reports the result. If Claude blocks and
-the Telegram transport is configured, posts the question to your chat and
-waits for a reply (up to `DEFAULT_MAX_BLOCKED_ROUNDS` rounds).
+Acquires the per-repo lock, creates the worktree, spawns the repo's agent
+(Claude Code or OpenCode, per `agent.type` / `repos[].agent_type`) with the
+issue's title/body in the prompt, and reports the result. If the agent blocks
+and a chat transport (Telegram or Mattermost) is configured, posts the question
+to your chat and waits for a reply (up to `DEFAULT_MAX_BLOCKED_ROUNDS` rounds).
 
 ### `run secops`
 
@@ -229,7 +240,7 @@ hard timeout is hit), then exits with:
 - **1** — at least one check failed / cancelled / timed_out
 - **2** — hard timeout while checks were still pending
 
-Exists specifically so the dev pipeline's prompt can point Claude at one
+Exists specifically so the dev pipeline's prompt could point the agent at one
 correct command instead of asking it to improvise a bash `until` / `while`
 loop — every attempt at improvising those has been inverted-semantics or
 pipe-swallowed the exit code (see [issue #85][issue-85]).
@@ -255,8 +266,8 @@ via `gh api user --jq .login`). On the first run, seeds the seen-issue set
 with current assignments so it does not replay your existing backlog.
 
 For each newly assigned issue, runs `run_dev_issue(...)` (i.e. the dev pipeline)
-in-process. If `transport.type: telegram` is configured and the bridge socket
-exists, sends notifications: `🔔 New issue` on detection, `⏸️ Blocked` on
+in-process. If a chat transport (`telegram` or `mattermost`) is configured and
+the bridge socket exists, sends notifications: `🔔 New issue` on detection, `⏸️ Blocked` on
 question, `✅ PR ready` on success, `❌ Failed` otherwise.
 
 State is persisted to `<state_db_dir>/poller_state.json`.

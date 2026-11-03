@@ -2,7 +2,7 @@
 title: Chat bridge
 layout: default
 nav_order: 4
-description: "Set up the chat bridge — Telegram or Mattermost — that delivers BLOCKED questions to a human and routes their answers back to a paused Claude session."
+description: "Set up the chat bridge — Telegram or Mattermost — that delivers BLOCKED questions to a human and routes their answers back to a paused agent session."
 permalink: /bridge/
 ---
 
@@ -43,23 +43,31 @@ question you mean. On Telegram that is Telegram's reply; on Mattermost it is
 only routable when exactly one question is waiting — otherwise the bridge
 refuses and tells you what is outstanding, rather than guessing.
 
-Pipelines use it as the human-in-the-loop channel: when Claude writes a
-`BLOCKED_NEEDS_INPUT` checkpoint, the dev pipeline calls `transport.ask(question)`,
-which travels socket → bridge → Telegram → user → Telegram → bridge → socket
-and returns as a string back into the resume call.
+Pipelines use it as the human-in-the-loop channel: when the agent (Claude Code
+or OpenCode) writes a `BLOCKED_NEEDS_INPUT` checkpoint, the pipeline calls
+`transport.ask(question)`, which travels socket → bridge → chat → you → chat →
+bridge → socket and returns as a string back into the resume call.
 
 The bridge is implemented in
 [`src/ctrlrelay/bridge/`](https://github.com/AInvirion/ctrlrelay/tree/main/src/ctrlrelay/bridge).
 
 ## Prerequisites
 
-- A Telegram account.
-- A registered bot (next section).
-- Your numeric chat ID (next section).
-- The bridge socket directory must exist and be writable. Default is
-  `~/.ctrlrelay/`.
+Pick one transport and follow its setup section; both end at
+[Start the bridge](#start-the-bridge).
 
-## 1 — Create a bot via BotFather
+| | Telegram | Mattermost |
+|---|---|---|
+| Account | a Telegram account | a self-hosted Mattermost server, with System Console access to enable bot accounts |
+| Bot | a bot registered with BotFather | a bot account and its token |
+| Destination | your numeric chat ID | the 26-character ID of a channel the bot is a member of |
+
+Either way, the bridge socket directory must exist and be writable. Default is
+`~/.ctrlrelay/`.
+
+## Telegram setup
+
+### 1. Create a bot via BotFather
 
 1. Open Telegram and message [`@BotFather`](https://t.me/botfather).
 2. Send `/newbot`.
@@ -68,7 +76,7 @@ The bridge is implemented in
 5. BotFather replies with an **HTTP API token** that looks like
    `123456:ABCdef-...`. Save this — it's your bot token.
 
-## 2 — Get your chat ID
+### 2. Get your chat ID
 
 1. Open the chat with your new bot and send any message (e.g. `hello`).
    Telegram won't deliver bot messages until the chat exists.
@@ -84,7 +92,7 @@ The bridge is implemented in
 If you'd rather use a Telegram group, add the bot to the group and use the
 group's chat ID instead.
 
-## 3 — Configure ctrlrelay
+### 3. Configure ctrlrelay
 
 Set the bot token in your environment (the bridge reads it from the env var
 named in `transport.telegram.bot_token_env`):
@@ -110,38 +118,11 @@ Validate:
 ctrlrelay config validate
 ```
 
-## 4 — Start the bridge
+Then go to [Start the bridge](#start-the-bridge).
 
-Foreground (handy when wiring up for the first time — Ctrl+C to stop):
+## Mattermost setup
 
-```bash
-ctrlrelay bridge start
-```
-
-Background (writes a PID file alongside the socket):
-
-```bash
-ctrlrelay bridge start --daemon
-```
-
-Check it's alive:
-
-```bash
-ctrlrelay bridge status
-```
-
-Stop it:
-
-```bash
-ctrlrelay bridge stop
-```
-
-## Mattermost instead of Telegram
-
-Steps 1–2 above are Telegram-specific. For Mattermost, do this instead and
-then rejoin at step 4.
-
-### M1 — Enable bot accounts
+### 1. Enable bot accounts
 
 **System Console → Integrations → Bot Accounts → Enable Bot Account Creation
 = true.**
@@ -160,7 +141,7 @@ curl -s "https://<your-server>/api/v4/config/client?format=old" \
 personal access tokens; bot account tokens are managed separately. Leaving it
 off avoids letting every user mint long-lived full-access tokens.
 
-### M2 — Create the bot and its token
+### 2. Create the bot and its token
 
 1. **Integrations → Bot Accounts → Add Bot Account.**
 2. Username `ctrlrelay`, role **Member**. Leave `post:all` and `post:channels`
@@ -168,7 +149,7 @@ off avoids letting every user mint long-lived full-access tokens.
    beyond it is a smaller problem if it leaks.
 3. **Create New Token** and copy it immediately. Mattermost shows it once.
 
-### M3 — A channel, and put the bot in it
+### 3. A channel, and put the bot in it
 
 Create a channel for orchestrator questions, then invite the bot:
 
@@ -185,7 +166,7 @@ before it binds its socket and refuses to start until the bot is invited.
 The bot must also be on the team. If `/invite` complains, add it via the
 team's **Invite People** first.
 
-### M4 — Find the channel id
+### 4. Find the channel id
 
 The id, not the name: a name is only unique within a team and can be renamed
 under you, while the id is stable. From the channel's **View Info**, or:
@@ -196,7 +177,7 @@ curl -s -H "Authorization: Bearer $CTRLRELAY_MATTERMOST_TOKEN" \
   | jq -r .id
 ```
 
-### M5 — Configure
+### 5. Configure
 
 ```bash
 export CTRLRELAY_MATTERMOST_TOKEN="your-bot-token"
@@ -213,15 +194,49 @@ transport:
     ask_timeout_seconds: 900
 ```
 
-Then `ctrlrelay config validate`, and continue from step 4 above —
-`ctrlrelay bridge start` is the same command for either transport.
+Validate:
+
+```bash
+ctrlrelay config validate
+```
 
 **Editions.** Everything here works on free self-hosted Mattermost. The REST
 API, the WebSocket, bot accounts and bot tokens are core features, not
 licensed ones; the paid tiers cover SSO/SAML/LDAP, compliance export and high
 availability, none of which the bridge touches.
 
-## 5 — Send a test message
+## Start the bridge
+
+`ctrlrelay bridge start` is the same command for either transport; it reads
+`transport.type` and starts that one.
+
+Foreground (handy when wiring up for the first time — Ctrl+C to stop; also
+what launchd/systemd units use):
+
+```bash
+ctrlrelay bridge start --foreground
+```
+
+Background — the default: forks, writes a PID file alongside the socket and
+returns to the shell:
+
+```bash
+ctrlrelay bridge start
+```
+
+Check it's alive:
+
+```bash
+ctrlrelay bridge status
+```
+
+Stop it:
+
+```bash
+ctrlrelay bridge stop
+```
+
+## Send a test message
 
 Once the bridge is running and reachable on its socket, send a one-off message
 through it:
@@ -230,18 +245,19 @@ through it:
 ctrlrelay bridge test --message "hello from ctrlrelay"
 ```
 
-You should see the message appear in your Telegram chat almost immediately. If
-you don't, see [Troubleshooting](#troubleshooting).
+You should see the message appear in your Telegram chat or Mattermost channel
+almost immediately. If you don't, see [Troubleshooting](#troubleshooting).
 
 ## How it integrates with pipelines
 
-When you run `ctrlrelay poller start` (or `run dev`) with `transport.type:
-telegram` configured, the pipeline auto-connects to the bridge socket if it
-exists. Messages it sends:
+When you run `ctrlrelay poller start` (or `run dev`) with `transport.type` set
+to `telegram` or `mattermost`, the pipeline auto-connects to the bridge socket
+if it exists. Messages it sends:
 
 - `🔔 New issue #123 in your-org/your-app: ...` — when the poller picks up an issue.
-- `⏸️ Blocked on #123: ...` — Claude wrote a `BLOCKED_NEEDS_INPUT` checkpoint;
-  the next reply you send becomes the answer.
+- `⏸️ Blocked on #123: ...` — the agent wrote a `BLOCKED_NEEDS_INPUT`
+  checkpoint; reply to that message (Telegram) or in its thread (Mattermost)
+  to answer it.
 - `✅ PR ready: ...` — pipeline finished green.
 - `❌ Failed on #123: ...` — pipeline failed.
 
@@ -287,10 +303,10 @@ The bridge speaks newline-delimited JSON over the Unix socket. Defined in
 
 | `op` | Direction | Purpose |
 |---|---|---|
-| `send` | client → bridge | Fire-and-forget message into Telegram. |
-| `ask` | client → bridge | Question that expects a reply. Optional `options[]` renders as a Telegram keyboard. |
+| `send` | client → bridge | Fire-and-forget message into the chat. |
+| `ask` | client → bridge | Question that expects a reply. Optional `options[]` renders as a Telegram reply keyboard, or a numbered list on Mattermost. |
 | `ack` | bridge → client | Acknowledges receipt of `send`/`ask`. |
-| `answer` | bridge → client | Reply text from the Telegram user, returned to the original `ask` caller. |
+| `answer` | bridge → client | Reply text from the operator, returned to the original `ask` caller. |
 | `ping` / `pong` | both | Liveness check. |
 | `error` | bridge → client | Error envelope (`error` and `message` fields). |
 
@@ -300,29 +316,38 @@ You generally don't need to speak the protocol directly — use
 ## Troubleshooting
 
 **"Bridge not running" when calling `bridge test`** — start the bridge first with
-`ctrlrelay bridge start --daemon`. Confirm with `bridge status`.
+`ctrlrelay bridge start`. Confirm with `bridge status`.
 
-**No reply arrives in Telegram** — check the bot token: `curl
+**Nothing arrives in Telegram** — check the bot token: `curl
 https://api.telegram.org/bot<TOKEN>/getMe` should return your bot. If it returns
 `401`, the token is wrong or the bot was deleted.
 
-**Replies don't reach the pipeline** — make sure you're replying _in the same
-chat_ as `chat_id` in your config. If you're using a group chat, replying via
-Telegram's "reply" gesture (long-press → Reply) helps the bridge match your
-answer to the right pending question.
+**Nothing arrives in Mattermost** — `ctrlrelay bridge start` checks the token
+and the bot's channel membership before it binds the socket, and says which
+failed. Check `url` has its scheme (`https://`), `channel_id` is the
+26-character id rather than the name, and the bot was invited to the channel.
 
-**`PID file exists` on start** — a previous run died without cleaning up. Run
-`ctrlrelay bridge stop` to clear the stale PID, then start again.
+**Replies don't reach the pipeline** — make sure you're replying in the
+configured chat (`chat_id`) or channel (`channel_id`). With more than one
+question outstanding, answer by replying to the question — Telegram's reply
+gesture (long-press → Reply) or a reply in the Mattermost thread. A loose
+message is refused when the bridge cannot tell which question it answers.
 
-**Rate limits** — Telegram caps individual chats at ~20 messages/minute. The
-bridge does not implement client-side rate limiting; if you saturate the chat
+**`Bridge already running (PID n)` on start** — the PID file names a live
+process. Stop it with `ctrlrelay bridge stop` first. A PID file left by a run
+that died is removed automatically on the next start.
+
+**Rate limits (Telegram)** — Telegram caps individual chats at ~20
+messages/minute. The bridge does not implement client-side rate limiting; if you saturate the chat
 you'll see HTTP 429 in the bridge logs and the affected `send`/`ask` calls
 will fail. Slow your pipelines down or split notifications across chats.
 
-**Bridge crashes when network is offline** — the bridge requires Telegram API
-access. If the network is down at startup, the long-poll task will fail and the
-process exits. Restart the bridge once connectivity is restored. (When run under
-launchd / systemd with `KeepAlive`/`Restart=always`, this is automatic.)
+**Bridge crashes when network is offline** — the bridge requires access to the
+chat server. If the network is down at startup, the Telegram long-poll fails,
+or the Mattermost WebSocket does not authenticate within 30 seconds, and the
+process exits. Restart the bridge once connectivity is restored. (When run
+under launchd / systemd with `KeepAlive`/`Restart=always`, this is automatic.)
+Once running, the Mattermost handler reconnects its WebSocket with backoff.
 
 **Socket exists but no process** — if `bridge status` reports "socket exists but
 no running process", remove the orphan socket file (`rm
@@ -330,16 +355,18 @@ no running process", remove the orphan socket file (`rm
 
 ## Sequence: BLOCKED question round-trip
 
-```
-   pipeline                bridge               chat app          user
-      │                      │                      │               │
-      │── ask("Which?") ────>│                      │               │
-      │                      │─ post question ─────>│               │
-      │                      │                      │── push ──────>│
-      │                      │                      │               │
-      │                      │                      │<── reply ─────│
-      │                      │<─ reply + post id ───│               │
-      │<── answer("the b") ──│                      │               │
+```mermaid
+sequenceDiagram
+    participant P as Pipeline
+    participant B as Bridge
+    participant C as Chat (Telegram or Mattermost)
+    participant U as Operator
+    P->>B: ask("Which?")
+    B->>C: post question
+    C->>U: notification
+    U->>C: reply
+    C-->>B: reply + id of the post it answers
+    B-->>P: answer("the b")
 ```
 
 The bridge remembers the id of every question it posts, so the reply's
@@ -348,6 +375,7 @@ thread `root_id` — names the session exactly. That is also how an answer
 arriving *after* the pipeline stopped waiting still drives a resume, via the
 `pending_resumes` table.
 
-The pipeline's `transport.ask()` call blocks (with the configured timeout) until
-the bridge returns the answer. The pipeline then resumes the Claude session via
-`claude --resume <session_id>` with a prompt of the form "User answered: …".
+The pipeline's `transport.ask()` call blocks (up to `ask_timeout_seconds`) until
+the bridge returns the answer. The pipeline then resumes the agent session —
+`claude --resume <id>` or `opencode run --session <id>` — with a prompt of the
+form "User answered: …".
