@@ -668,11 +668,12 @@ class PersonalizationManager:
                 summary=(
                     "rebase onto origin/{main} hit conflicts; aborted "
                     "(behind {behind}). Resolve in the checkout, then "
-                    "re-run pull. git: {err}"
+                    "re-run pull. git: {err}{hint}"
                 ).format(
                     main=self.main_branch,
                     behind=behind,
                     err=(rebase.stderr or rebase.stdout).strip(),
+                    hint=self._old_link_hint(),
                 ),
                 conflict_files=files,
                 behind=behind,
@@ -936,6 +937,7 @@ class PersonalizationManager:
                     f"{behind if behind is not None else 'unknown'}"
                     f"{fetch_err}. Commit, revert or move the listed "
                     "files, or run `ctrlrelay personalization push`."
+                    f"{self._old_link_hint()}"
                 ),
                 behind=behind,
                 dirty_entries=entries,
@@ -1471,6 +1473,38 @@ class PersonalizationManager:
         )
         return MergeOutcome(
             label, "reset-copy", detail=f"checkout copy {rel} reset to HEAD{named}"
+        )
+
+    def _old_link_hint(self) -> str:
+        """A sentence for a failed pull when a ``mode: merge`` live path
+        is still the old symlink into this checkout, else "".
+
+        That is the state a machine wired before merge mode is in, and
+        the app writing through the link is usually WHY the tree is
+        dirty, so the pull fails at the rebase before it reaches the
+        merge step that would name the link. Without this the operator
+        is told to "resolve conflicts" and never hears the actual fix.
+        """
+        # Runs on failure paths: it must never replace the failure being
+        # reported with an exception of its own.
+        rels: list[str] = []
+        try:
+            plans = self._plan_merges()
+        except Exception:
+            return ""
+        for _entry, plan in plans:
+            try:
+                if is_link_into(plan.target, plan.source):
+                    rels.append(str(plan.source.relative_to(self.checkout_path)))
+            except (OSError, ValueError):
+                continue
+        if not rels:
+            return ""
+        return (
+            f" Note: {', '.join(rels)} is still the old symlink target "
+            "(the app writes into the checkout through it); run "
+            "`ctrlrelay personalization migrate` once to make the live "
+            "file a real file and reset the checkout copy."
         )
 
     def _merge_source_rels(self) -> list[str]:

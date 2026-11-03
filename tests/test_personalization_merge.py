@@ -937,6 +937,68 @@ class TestManagerMerge:
         assert not result.success
         assert live.is_symlink()
 
+    def _old_link_written_by_app(self, tmp_path, remote_bare):
+        """The state a machine wired before merge mode is really in: the
+        old symlink, and the app has already written through it, so the
+        checkout is dirty and a rebase cannot run."""
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        old, checkout, live = _machine(tmp_path, remote_bare, "b", mode="symlink")
+        old.init()
+        live.write_text(json.dumps({"model": "opus", "promptSuggestionEnabled": False}))
+        assert _git("status", "--porcelain", cwd=checkout).strip() != ""
+        mgr, _, _ = _machine(tmp_path, remote_bare, "b")
+        return mgr, live
+
+    def test_pull_on_a_dirty_old_link_says_run_migrate(self, tmp_path, remote_bare) -> None:
+        mgr, live = self._old_link_written_by_app(tmp_path, remote_bare)
+        result = mgr.pull()
+        assert not result.success
+        assert "ctrlrelay personalization migrate" in result.summary
+        assert "global/settings.json" in result.summary
+        assert live.is_symlink()
+
+    def test_auto_pull_on_a_dirty_old_link_says_run_migrate(self, tmp_path, remote_bare) -> None:
+        mgr, live = self._old_link_written_by_app(tmp_path, remote_bare)
+        result = mgr.auto_pull()
+        assert not result.success
+        assert "BLOCKED" in result.summary
+        assert "ctrlrelay personalization migrate" in result.summary
+        assert live.is_symlink()
+        # Control: the advice is the way out. A fleet change published
+        # after the migration really arrives.
+        assert mgr.migrate()[0].action == "migrated"
+        _publish_settings(tmp_path, remote_bare, {"model": "sonnet"})
+        after = mgr.auto_pull()
+        assert after.success, after.summary
+        assert _read(live)["model"] == "sonnet"
+
+    def test_the_hint_never_hides_the_failure(self, tmp_path, remote_bare, monkeypatch) -> None:
+        mgr, _live = self._old_link_written_by_app(tmp_path, remote_bare)
+
+        def boom():
+            raise RuntimeError("planning broke")
+
+        monkeypatch.setattr(mgr, "_plan_merges", boom)
+        result = mgr.auto_pull()
+        assert not result.success
+        assert "BLOCKED" in result.summary
+
+    def test_a_dirty_tree_without_an_old_link_gets_no_migrate_hint(
+        self, tmp_path, remote_bare
+    ) -> None:
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout, live = _machine(tmp_path, remote_bare, "b")
+        mgr.init()
+        assert not live.is_symlink()
+        # A tracked file with an unstaged change: the rebase cannot run.
+        (checkout / "notes.txt").write_text("v1\n")
+        _git("add", "notes.txt", cwd=checkout)
+        _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "notes", cwd=checkout)
+        (checkout / "notes.txt").write_text("v2\n")
+        for result in (mgr.pull(), mgr.auto_pull()):
+            assert not result.success
+            assert "migrate" not in result.summary
+
     def test_migrate_keeps_live_content_and_resets_checkout_copy(
         self, tmp_path, remote_bare
     ) -> None:
