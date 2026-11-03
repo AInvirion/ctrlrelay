@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The status page and `/api/status` show how this node's runs went over
+  the last 7 and 30 days, overall and per repo: runs started, done,
+  failed, blocked and still running, success rate, median time to PR and
+  to merge, and issues dispatched again after a done run. Cost per run and
+  stuck runs are shown as not recorded yet (refs #230)
+
 ### Fixed
 
 - The code review no longer runs in the agent's worktree. It runs in a
