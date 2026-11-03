@@ -14,12 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `merge_keys`, so `~/.claude/settings.json` can carry fleet policy while
   the keys the app writes on its own stay on that machine and no longer
   dirty the checkout. The synced file cannot widen the list; it must be a
-  JSON object; links, non-regular and foreign-owned files at the live path
-  are refused; writes are atomic at mode 0600 or stricter; logs name keys,
-  never values, and a change to `hooks`, `env`, `permissions`,
-  `apiKeyHelper` or `skipDangerousModePermissionPrompt` logs a warning.
-  `ctrlrelay personalization migrate` converts the old symlink once, on
-  request; pull and auto-pull refuse it instead (#287).
+  JSON object without duplicate keys; links (at the file or any directory
+  under `$HOME` on the way), non-regular and foreign-owned files are
+  refused; writes are atomic at mode 0600 or stricter and are redone once
+  if the app writes the file meanwhile; push never stages the checkout
+  copy; logs name keys, never values, and a change to `hooks`, `env`,
+  `permissions`, `apiKeyHelper` or `skipDangerousModePermissionPrompt`
+  logs a warning. `ctrlrelay personalization migrate` converts the old
+  symlink once, on request, and resets the checkout copy to the fleet's
+  version; pull and auto-pull refuse the symlink instead (#287).
 
 ## [0.18.0] - 2026-11-03
 

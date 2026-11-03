@@ -341,22 +341,39 @@ The rules, all enforced and tested:
   repo, or this guarantee is gone.)
 - **An owned key missing upstream is left alone**, not deleted: absent
   is not the same as "remove it". To change a value fleet-wide, set it.
-- **Bad input is refused.** The synced file must parse as a JSON object,
-  and so must the live file (an empty live file counts as `{}`).
-  Anything else leaves the live file untouched and logs an error.
-- **Links and odd files are refused.** Both files are opened without
-  following a link at the path (`O_NOFOLLOW`) and must be regular files
-  owned by you. A symlink, FIFO or someone else's file at the live path
-  is refused and its target is never opened. The live path must also
-  sit outside the checkout.
+- **Bad input is refused.** The synced file must parse as a JSON object
+  with no duplicate keys, at any depth, and so must the live file (an
+  empty live file counts as `{}`). Nesting too deep to parse is refused
+  the same way. Anything else leaves the live file untouched and logs an
+  error.
+- **Links and odd files are refused.** Directories are opened one
+  component at a time without following links (`O_DIRECTORY |
+  O_NOFOLLOW`), starting at `$HOME` (or `/` for a path outside it), and
+  the read, the temp file and the rename all go through that directory
+  handle. So a symlink at the file **or at any directory under `$HOME`
+  on the way to it** is refused, and its target is never opened. A
+  symlinked `~/.claude` is therefore refused too. Both files must be
+  regular files owned by you, so a FIFO or someone else's file is
+  refused as well. The live path, with its directories resolved, must sit outside
+  the checkout.
 - **Writes are atomic.** Temp file in the same directory, fsync, rename
   over the live path; mode `0600`, or the existing mode if it is
-  stricter. If the live path changes between the read and the rename,
-  nothing is renamed.
+  stricter.
+- **A concurrent app write is not lost silently.** Just before the
+  rename, the live file is checked to still be what was read (device,
+  inode, size, mtime). If the app wrote it in between, the merge is
+  redone once from the new content; if it changed again, the pull
+  refuses and the app's write stands. Known limit: a write landing in
+  the few instructions between that last check and the rename itself
+  can still be overwritten, as can one that changes neither size nor
+  mtime. No user-space check can close that window without the app
+  taking a lock.
 - **Nothing flows back.** The live file is outside the checkout, so
-  `push` cannot stage it. While a merge entry's live path is still the
-  old symlink into the checkout, `push` does not stage that checkout
-  file either.
+  `push` cannot stage it. And `push` never stages a merge entry's
+  checkout copy from local state, whether modified or already
+  `git add`-ed: that copy is the fleet's version. To change fleet
+  settings, edit `global/settings.json` in the checkout and `git commit`
+  it there yourself; `push` then publishes that commit like any other.
 - **Logs name keys, never values** (a value can be a secret under
   `env`). A pull that changes `hooks`, `env`, `permissions`,
   `apiKeyHelper` or `skipDangerousModePermissionPrompt` logs a
@@ -376,12 +393,12 @@ ctrlrelay personalization migrate
 ```
 
 This replaces the link with a real file holding the same content (so
-anything the app wrote through it stays on this machine), then merges.
-It does not touch git: if the checkout copy differs from `HEAD` because
-the app wrote through the link, the output names the differing keys and
-the `git checkout -- global/settings.json` that discards them from the
-checkout. Their values are already in the new live file. A link that
-points anywhere other than this checkout's source is refused.
+anything the app or you wrote through it stays on this machine). Once
+the new live file is confirmed to match, it resets the checkout copy to
+`HEAD`, the fleet's version, so the tree is clean and those local keys
+can never be pushed; the output names the keys it reset, never their
+values. Then it merges. A link that points anywhere other than this
+checkout's source is refused.
 
 Anything outside ctrlrelay that recreates the symlink (a converge
 script, a dotfiles installer) must stop doing so for this file, or the
