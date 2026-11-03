@@ -884,3 +884,36 @@ async def test_resume_with_verify_off_waits_for_no_ci(
     )
     assert result.success, result
     verifier.verify.assert_not_awaited()
+
+
+# --- wiring -----------------------------------------------------------------
+
+
+def test_every_dev_entry_point_in_the_cli_passes_the_repos_switches() -> None:
+    """The daemon, the one-shot command and the resume sweeper must all
+    hand the repo's settings to the pipeline. A call that drops one runs
+    that repo on the defaults while its config says otherwise.
+
+    Structural, because these calls sit inside Typer commands and
+    closures that no test drives end to end. It shows each call passes
+    the keyword; the tests above show what the pipeline does with it.
+    """
+    import ast
+
+    import ctrlrelay.cli as cli_module
+
+    tree = ast.parse(Path(cli_module.__file__).read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ("run_dev_issue", "resume_dev_from_pending")
+    ]
+    # Two run_dev_issue calls (the command and the poller), one resume.
+    assert len(calls) == 3, [ast.unparse(c.func) for c in calls]
+    for call in calls:
+        passed = {k.arg: ast.unparse(k.value) for k in call.keywords}
+        for key in ("steps", "max_fix_attempts", "code_review"):
+            assert key in passed, (call.func.id, key)
+            assert passed[key].endswith(f".{key}"), (call.func.id, passed[key])
