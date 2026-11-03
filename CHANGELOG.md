@@ -15,9 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1.17.12 — which can target a self-hosted OpenAI-compatible endpoint
   (ollama, llama.cpp, LM Studio, MLX) and so lets the dev pipeline run on a
   local model instead of a hosted API. The endpoint, its credential and the
-  model list stay in opencode's own config; ctrlrelay names the model with `agent.opencode.model` (`provider/model`) and the
-  binary with `agent.opencode.binary` — its own block, because `agent.binary`
-  is claude's and most configs set it to the literal `"claude"`.
+  model list stay in opencode's own config; ctrlrelay names the model with
+  `agent.opencode.model` (`provider/model`) and the binary with
+  `agent.opencode.binary` — its own block, because `agent.binary` is claude's
+  and most configs set it to the literal `"claude"`.
 - `repos[].agent_type` opts a single repository into another backend, with
   `agent.type` the default for every other one. Per repo rather than global on
   purpose: ctrlrelay works unattended over issue and pull-request text from
