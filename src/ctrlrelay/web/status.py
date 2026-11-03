@@ -702,7 +702,7 @@ def build_status(
             ),
             "pr_times": _section(
                 section_errors, "events",
-                lambda: run_numbers.read_pr_times(conn, numbers_since),
+                lambda: run_numbers.read_pr_times(conn, numbers_since, now),
             ),
             "errors": section_errors,
         }
@@ -759,8 +759,7 @@ def build_status(
             pr_times = snap["pr_times"]
             got = _section(errors, "numbers", lambda: run_numbers.build_numbers(
                 now=now, runs=snap["runs"], came_back=snap["came_back"],
-                pr_times=None if isinstance(pr_times, _Missing) else pr_times,
-                history_days=history_days,
+                events=None if isinstance(pr_times, _Missing) else pr_times,
             ))
             numbers = None if isinstance(got, _Missing) else got
 

@@ -102,13 +102,9 @@ def test_an_empty_database_is_zero_runs_not_unknown(tmp_path: Path) -> None:
         assert "#223" in w["unavailable"]["cost_per_run"]
         assert w["overall"]["stuck"] is None
         assert "#224" in w["unavailable"]["stuck"]
-    # Events are kept 7 days: the 7-day times are known (and empty) ...
-    assert w7["overall"]["time_to_pr_s"] == {"median": None, "n": 0}
-    assert "time_to_pr_s" not in w7["unavailable"]
-    # ... and the 30-day ones are unknown, with why.
-    assert w30["overall"]["time_to_pr_s"] is None
-    assert w30["overall"]["time_to_merge_s"] is None
-    assert "web.history_days" in w30["unavailable"]["time_to_pr_s"]
+        # No runs: no PR time is missing, there are none.
+        assert w["overall"]["time_to_pr_s"] == {"median": None, "n": 0}
+        assert "time_to_pr_s" not in w["unavailable"]
     assert w7["since_ts"] == SINCE_7 and w30["since_ts"] == SINCE_30
     assert w7["until_ts"] == NOW
 
@@ -169,6 +165,10 @@ def test_time_to_pr_and_merge_are_medians_from_the_run_start(tmp_path: Path) -> 
     _run(db, "s2", started_at=t, issue_number=2)
     _run(db, "s3", started_at=t, issue_number=3)
     _run(db, "s4", started_at=t, issue_number=4)  # no PR recorded
+    # Each run's dispatch, as the pipelines record it: the events reach
+    # back to the runs' start, so nothing they need can have been pruned.
+    for sid in ("s1", "s2", "s3", "s4"):
+        db.record_event("dispatched", session_id=sid, repo=ALPHA, ts=t)
     db.record_event("pr_opened", session_id="s1", repo=ALPHA, ts=t + 100,
                     detail={"pr_number": 10})
     # The first pr_opened counts, not a later one for the same run.
@@ -194,21 +194,82 @@ def test_time_to_pr_and_merge_are_medians_from_the_run_start(tmp_path: Path) -> 
     assert _repo(_window(out, 7), ALPHA)["time_to_pr_s"] == {"median": 300, "n": 3}
 
 
-def test_a_30_day_median_over_7_days_of_events_is_unknown(tmp_path: Path) -> None:
+def _pruned_at_7_days(tmp_path: Path) -> None:
+    """Runs 1 and 20 days ago, each with a PR, then the daemon's prune at
+    7 days: the older run's events are gone, its session row is not."""
     db = _db(tmp_path)
-    _run(db, "s1", started_at=NOW - DAY)
-    db.record_event("pr_opened", session_id="s1", ts=NOW - DAY + 60)
+    for sid, age, n in (("recent", DAY, 1), ("old", 20 * DAY, 2)):
+        _run(db, sid, started_at=NOW - age, issue_number=n)
+        db.record_event("dispatched", session_id=sid, ts=NOW - age)
+        db.record_event("pr_opened", session_id=sid, ts=NOW - age + 60)
+    assert db.prune_events(NOW - 7 * DAY) == 2
     db.close()
 
-    out = _numbers(tmp_path, history_days=7)
+
+@pytest.mark.parametrize("history_days", [7, 30])
+def test_raising_history_days_does_not_make_pruned_times_known(
+    tmp_path: Path, history_days: int,
+) -> None:
+    _pruned_at_7_days(tmp_path)
+
+    # Raising web.history_days to 30 brings no deleted event back.
+    out = _numbers(tmp_path, history_days=history_days)
 
     assert _window(out, 7)["overall"]["time_to_pr_s"] == {"median": 60, "n": 1}
     w30 = _window(out, 30)
     assert w30["overall"]["time_to_pr_s"] is None
+    assert w30["overall"]["time_to_merge_s"] is None
     assert _repo(w30, ALPHA)["time_to_pr_s"] is None
-    assert "7 days" in w30["unavailable"]["time_to_pr_s"]
+    reason = w30["unavailable"]["time_to_pr_s"]
+    assert "1 of these runs" in reason and "web.history_days" in reason
     # The counts do not need events and are still there.
-    assert w30["overall"]["started"] == 1
+    assert w30["overall"]["started"] == 2
+
+
+def test_a_young_node_whose_runs_all_follow_its_first_event_is_known(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    # Nothing was ever pruned: the first event is the first run's dispatch.
+    _run(db, "s1", started_at=NOW - 3 * DAY)
+    db.record_event("dispatched", session_id="s1", ts=NOW - 3 * DAY)
+    db.record_event("pr_opened", session_id="s1", ts=NOW - 3 * DAY + 90)
+    db.close()
+
+    out = _numbers(tmp_path)
+
+    for days in (7, 30):
+        assert _window(out, days)["overall"]["time_to_pr_s"] == {"median": 90, "n": 1}
+
+
+def test_runs_with_no_events_kept_have_unknown_times(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _run(db, "s1", started_at=NOW - DAY)
+    db.close()
+
+    out = _numbers(tmp_path)
+
+    w7 = _window(out, 7)
+    assert w7["overall"]["time_to_pr_s"] is None
+    assert "no events are kept" in w7["unavailable"]["time_to_pr_s"]
+
+
+def test_an_event_stamped_after_now_is_not_read(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    t = NOW - DAY
+    _run(db, "s1", started_at=t)
+    _run(db, "s2", started_at=t, issue_number=2)
+    db.record_event("dispatched", session_id="s1", ts=t)
+    db.record_event("pr_opened", session_id="s1", ts=t + 100)
+    # A clock that was ahead, since corrected: the only PR event s2 has.
+    db.record_event("pr_opened", session_id="s2", ts=NOW + 3_600)
+    db.record_event("merged", session_id="s2", ts=NOW + 7_200)
+    db.close()
+
+    o = _window(_numbers(tmp_path), 7)["overall"]
+
+    assert o["time_to_pr_s"] == {"median": 100, "n": 1}
+    assert o["time_to_merge_s"] == {"median": None, "n": 0}
 
 
 def test_without_an_events_table_the_times_are_unknown_and_counts_stay(
@@ -324,16 +385,19 @@ def _page_number_cells(counts: dict) -> list[str]:
 
 
 def test_page_shows_unknowns_as_unknown_never_zero(tmp_path: Path) -> None:
-    _db(tmp_path).close()
+    _pruned_at_7_days(tmp_path)
     out = _numbers(tmp_path)
     cells_30 = _page_number_cells(_window(out, 30)["overall"])
     # runs, done, failed, blocked, running, success, PR, merge, back, cost
     assert cells_30 == [
-        "0", "0", "0", "0", "0", "none finished", "unknown", "unknown", "0",
+        "2", "2", "0", "0", "0", "100%", "unknown", "unknown", "0",
         "not recorded",
     ]
-    assert _page_number_cells(_window(out, 7)["overall"])[6:8] == [
-        "none yet", "none yet",
+    (tmp_path / "state.db").unlink()
+    _db(tmp_path).close()
+    empty_7 = _window(_numbers(tmp_path), 7)["overall"]
+    assert _page_number_cells(empty_7)[5:8] == [
+        "none finished", "none yet", "none yet",
     ]
     assert _page_number_cells({}) == ["unknown"] * 9 + ["not recorded"]
 

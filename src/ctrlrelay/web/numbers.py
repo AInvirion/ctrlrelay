@@ -39,9 +39,17 @@ Per window, overall and per repo:
 - ``stuck``: always ``null``; no run records that it was stuck (#224). A
   stuck run that is still marked running is in ``running``.
 - ``time_to_pr_s``/``time_to_merge_s``: ``null`` when the events table
-  cannot be read, or when events are kept for fewer days than the window
-  (the daemon prunes them after ``web.history_days``), since a 30-day median
-  over 7 days of events would be a confident wrong answer.
+  cannot be read, or when the events it still holds cannot cover every run
+  in the window. The daemon deletes events older than ``web.history_days``
+  (oldest first), so every event at or after the oldest one left is still
+  there, and a run that started at or after it has all its events. A run
+  that started before it may have lost its ``pr_opened``. So the times are
+  shown only when no run in the window started before the oldest event
+  kept (and, with runs in the window, at least one event is kept). This is
+  decided from the database, never from the setting: raising
+  ``web.history_days`` does not bring deleted events back.
+
+Events stamped after ``now`` (a clock that was corrected) are not read.
 """
 
 from __future__ import annotations
@@ -100,20 +108,43 @@ def read_came_back(conn: Any, since: int, now: int) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def read_pr_times(conn: Any, since: int) -> dict[str, dict[str, int]]:
-    """Per session, the first ``pr_opened`` and ``merged`` event time at or
-    after ``since``."""
+def read_pr_times(conn: Any, since: int, now: int) -> dict[str, Any]:
+    """``{"times", "oldest_ts"}``: per session, the first ``pr_opened`` and
+    ``merged`` event time in ``[since, now]``, and the time of the oldest
+    event the table still holds (``None`` when it holds none)."""
     marks = ",".join("?" for _ in _PR_KINDS)
     rows = conn.execute(
         f"""SELECT session_id, kind, MIN(ts) AS ts FROM events
-            WHERE session_id IS NOT NULL AND ts >= ? AND kind IN ({marks})
+            WHERE session_id IS NOT NULL AND ts >= ? AND ts <= ?
+              AND kind IN ({marks})
             GROUP BY session_id, kind""",
-        (int(since), *_PR_KINDS),
+        (int(since), int(now), *_PR_KINDS),
     ).fetchall()
-    out: dict[str, dict[str, int]] = {}
+    times: dict[str, dict[str, int]] = {}
     for r in rows:
-        out.setdefault(r["session_id"], {})[r["kind"]] = int(r["ts"])
-    return out
+        times.setdefault(r["session_id"], {})[r["kind"]] = int(r["ts"])
+    (oldest,) = conn.execute("SELECT MIN(ts) FROM events").fetchone()
+    return {"times": times, "oldest_ts": None if oldest is None else int(oldest)}
+
+
+def _coverage_gap(
+    runs: list[dict[str, Any]], oldest_ts: int | None, days: int,
+) -> str | None:
+    """Why the kept events cannot give these runs' PR times, or ``None``
+    when they can (see the module docstring)."""
+    if not runs:
+        return None
+    if oldest_ts is None:
+        return "no events are kept, so these runs' PR times cannot be read"
+    early = sum(1 for r in runs if r["started_at"] < oldest_ts)
+    if not early:
+        return None
+    kept = datetime.fromtimestamp(oldest_ts, UTC).isoformat()
+    return (
+        f"the oldest event kept is from {kept}, after {early} of these runs "
+        f"started, so their PR times may have been deleted; keep events for "
+        f"at least {days} days (web.history_days) to show this"
+    )
 
 
 # --- shaping -------------------------------------------------------------------
@@ -176,8 +207,8 @@ def _window(
     runs: list[dict[str, Any]],
     came_back: list[dict[str, Any]],
     pr_times: dict[str, dict[str, int]] | None,
+    oldest_ts: int | None,
     events_reason: str | None,
-    history_days: int,
 ) -> dict[str, Any]:
     since = window_start(now, days)
     runs = [r for r in runs if r["started_at"] >= since]
@@ -186,11 +217,8 @@ def _window(
     unavailable = {"cost_per_run": COST_GAP, "stuck": STUCK_GAP}
     times = pr_times
     reason = events_reason
-    if reason is None and history_days < days:
-        reason = (
-            f"events are kept for {history_days} days (web.history_days), "
-            f"fewer than this window's {days}"
-        )
+    if reason is None:
+        reason = _coverage_gap(runs, oldest_ts, days)
     if reason is not None or times is None:
         times = None
         reason = reason or EVENTS_GAP
@@ -225,21 +253,22 @@ def build_numbers(
     now: int,
     runs: list[dict[str, Any]],
     came_back: list[dict[str, Any]],
-    pr_times: dict[str, dict[str, int]] | None,
-    history_days: int,
+    events: dict[str, Any] | None,
     events_reason: str | None = None,
 ) -> dict[str, Any]:
     """``{"windows": [<7 days>, <30 days>]}`` from rows read for the longest
-    window. ``pr_times`` is ``None`` when the events could not be read
-    (``events_reason`` says why)."""
-    if pr_times is None and events_reason is None:
+    window. ``events`` is :func:`read_pr_times`'s answer, or ``None`` when
+    the events could not be read (``events_reason`` says why)."""
+    if events is None and events_reason is None:
         events_reason = EVENTS_GAP
+    pr_times = None if events is None else events["times"]
+    oldest_ts = None if events is None else events["oldest_ts"]
     return {
         "windows": [
             _window(
                 days, now=now, runs=runs, came_back=came_back,
-                pr_times=pr_times, events_reason=events_reason,
-                history_days=history_days,
+                pr_times=pr_times, oldest_ts=oldest_ts,
+                events_reason=events_reason,
             )
             for days in WINDOWS
         ],
