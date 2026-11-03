@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Internal, no behaviour change: the dev pipeline's work (code, publish,
+  verify, review) runs as a fixed, ordered list of steps inside a frame that
+  keeps the lock, claim, worktree, cleanup and claim reconciliation as they
+  were. Groundwork for per-repo step switches (refs #226)
 - The subprocess machinery every CLI-driven adapter shares — the timeout, the
   kill on cancel, the replacing decode, the checkpoint read and #204's outcome
   report on every exit path — moved from `ClaudeDispatcher` to a
