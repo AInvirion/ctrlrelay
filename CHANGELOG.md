@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The code review no longer runs in the agent's worktree. It runs in a
+  fresh clone of the commit the relay pushed, in a new temporary
+  directory, removed afterwards. Before, a nested repository the agent
+  left in its worktree (a gitlink with its own `.git` and config) made a
+  plain `git status` or `git diff` there run a program the agent chose,
+  in the reviewer's process, outside the agent sandbox. The copy also
+  switches off filter and diff drivers from the operator's own git
+  config (for example git-lfs or a textconv), so a committed
+  `.gitattributes` cannot point agent files at them. If no clean copy can
+  be made, the PR is announced as not reviewed (`copy_failed`); it never
+  falls back to the worktree (#263)
 - Personalization auto-pull no longer reports success when it could not
   sync. A dirty working tree now fails the run, logged at error level with
   the dirty entries; every run reports `behind N` (a dirty tree still
