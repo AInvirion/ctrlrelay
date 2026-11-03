@@ -40,6 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with "rebase hit conflicts" and never mentioned the fix. Pull and auto-pull
   now add: run `ctrlrelay personalization migrate` (#287)
 
+### Security
+
+- The relay's own git touches of agent-written trees no longer reach past
+  the agent sandbox (#263). Every `git worktree add` the relay runs reads no
+  global or system config and runs no hook, so a committed or planted
+  attributes file cannot select the operator's filter drivers; a repository
+  using git-lfs now gets pointer files in the agent's worktree. The
+  `CLAUDE.md` exclude line is not written through a link. The reviewer's base
+  branch and its commit come from GitHub rather than the bare clone, are
+  pinned in the review copy, and are named in the review comment.
+
 ## [0.18.0] - 2026-11-03
 
 ### Added

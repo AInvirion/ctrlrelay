@@ -160,22 +160,36 @@ def _dedupe_trailing_echo(text: str) -> str:
 
 
 def format_review_comment(
-    outcome: CodeReviewOutcome, *, worktree_path: Path | None = None
+    outcome: CodeReviewOutcome,
+    *,
+    worktree_path: Path | None = None,
+    head_sha: str | None = None,
+    base_branch: str | None = None,
+    base_sha: str | None = None,
 ) -> str:
     """Render findings for a PR comment.
 
     Absolute worktree paths are stripped: they name a directory on the
     orchestrator's disk that means nothing to a reader and will not exist
     by the time anyone clicks.
+
+    When the commits are known they are named, so a reader can tell what
+    was diffed against what: the base is taken from GitHub, and a later
+    push or a moved base is visible as a mismatch.
     """
     body = _dedupe_trailing_echo(extract_verdict(outcome.output))
     if worktree_path is not None:
         body = body.replace(f"{worktree_path}/", "").replace(str(worktree_path), "")
+    scope = ""
+    if head_sha and base_branch and base_sha:
+        scope = (
+            f"Commit `{head_sha}` against `{base_branch}` at `{base_sha}`.\n\n"
+        )
     return (
         "## Automated code review\n\n"
         "_Unverified: this is automated output over the branch, not a "
         "confirmation that anything was reviewed. Weigh it as one "
-        "opinion._\n\n" + (body or "_No findings reported._")
+        "opinion._\n\n" + scope + (body or "_No findings reported._")
     )
 
 

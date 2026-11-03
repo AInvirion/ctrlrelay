@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock
 
 def fake_relay_publish(github, *, pr_number: int = 42, repo: str = "owner/repo"):
     github.get_default_branch = AsyncMock(return_value="main")
+    # The review base's head, as GitHub names it (#263).
+    github.get_ref_sha = AsyncMock(return_value="b" * 40)
     github.list_prs = AsyncMock(return_value=[])
     github.create_pr = AsyncMock(
         return_value={

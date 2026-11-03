@@ -778,7 +778,7 @@ async def test_review_required_fails_on_every_way_a_review_does_not_post(
     if case == "copy_failed":
         worktree.make_review_copy.side_effect = RuntimeError("disk full")
     if case == "base_unknown":
-        worktree.get_default_branch.side_effect = RuntimeError("no remote")
+        github.get_ref_sha.side_effect = RuntimeError("no remote")
     state_db = StateDB(tmp_path / "s.db")
     result, *_ = await _run(
         tmp_path, repo=_repo(steps={"review": "required"}),

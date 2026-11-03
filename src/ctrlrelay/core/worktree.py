@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -272,6 +273,16 @@ _HEX_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SAFE_BRANCH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*$")
 
 
+def _is_safe_branch(branch: str) -> bool:
+    return bool(
+        _SAFE_BRANCH.match(branch)
+        and ".." not in branch
+        and "//" not in branch
+        and not any(part.startswith(".") or part.endswith(".lock")
+                    for part in branch.split("/"))
+    )
+
+
 def _safe_repo_file(repo_real: str, rel: str) -> str | None:
     """Path of ``rel`` inside ``repo_real`` if it is safe to read.
 
@@ -326,13 +337,7 @@ def _read_branch_head(bare_path: Path, branch: str) -> str:
     """
     from ctrlrelay.core.publish import PushRefusedError
 
-    if (
-        not _SAFE_BRANCH.match(branch)
-        or ".." in branch
-        or "//" in branch
-        or any(part.startswith(".") or part.endswith(".lock")
-               for part in branch.split("/"))
-    ):
+    if not _is_safe_branch(branch):
         raise PushRefusedError(f"push refused: {branch!r} is not a safe ref name")
     repo_real = os.path.realpath(bare_path)
     ref = f"refs/heads/{branch}"
@@ -357,6 +362,62 @@ def _read_branch_head(bare_path: Path, branch: str) -> str:
             f"push refused: {ref} does not hold a plain commit id"
         )
     return value
+
+
+class _UnsafeExcludeError(Exception):
+    """``info/exclude`` is there but is not a plain file reached without
+    a link."""
+
+
+def _add_exclude_line(gitdir: Path, line: str) -> None:
+    """Append ``line`` to ``<gitdir>/info/exclude`` if the file exists and
+    lacks it, without following a link at ``info`` or at ``exclude`` (#263).
+
+    A linked worktree's git directory is writable by the agent under the
+    sandbox, and this runs outside it on resume. ``git worktree add``
+    makes no ``info/`` there, so a file found at that path was put there
+    by someone else, and a link would turn this write into one anywhere
+    the relay can write. Nothing there is not an error; something there
+    that is a link, or not a regular file, raises
+    :class:`_UnsafeExcludeError` and nothing is written.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        info_fd = os.open(
+            gitdir / "info", os.O_RDONLY | os.O_DIRECTORY | nofollow,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        raise _UnsafeExcludeError(
+            f"{gitdir / 'info'} is not a directory reached without a link "
+            f"({type(e).__name__})"
+        ) from e
+    try:
+        try:
+            fd = os.open(
+                "exclude", os.O_RDWR | nofollow | os.O_NONBLOCK, dir_fd=info_fd,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            raise _UnsafeExcludeError(
+                f"{gitdir / 'info' / 'exclude'} is not a plain file "
+                f"({type(e).__name__})"
+            ) from e
+        with os.fdopen(fd, "r+") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                raise _UnsafeExcludeError(
+                    f"{gitdir / 'info' / 'exclude'} is not a regular file"
+                )
+            content = f.read()
+            if line in content:
+                return
+            f.seek(0)
+            f.truncate()
+            f.write(content.rstrip() + f"\n{line}\n")
+    finally:
+        os.close(info_fd)
 
 
 def _relay_push_gitconfig() -> str:
@@ -509,6 +570,32 @@ class WorktreeManager:
 
         return stdout.decode()
 
+    async def _worktree_add(self, bare_path: Path, *args: str) -> None:
+        """``git worktree add <args>`` in the bare clone, as the relay runs
+        every checkout for an agent (#263).
+
+        The checkout runs outside the agent sandbox, on a tree the agent
+        can choose: a reused branch holds the previous agent's commits,
+        and ``<bare>/info/attributes`` (which the agent can write) applies
+        to every checkout from the clone. Either can select a filter
+        driver by name, and the operator's own global or system config
+        defines the program behind it (``git lfs install`` writes
+        ``filter.lfs.*`` there). So this checkout reads no global or
+        system config: no driver is defined, and every file is written
+        as committed. For a repository using LFS that means the agent
+        gets the pointer files. Hooks and fsmonitor are off as for every
+        other relay call. The clone's own config still applies; the
+        sandbox keeps it read-only.
+        """
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        await self._run_git(
+            *_RELAY_GIT_FLAGS, "worktree", "add", *args,
+            cwd=bare_path, env=env,
+        )
+
     def _get_bare_repo_path(self, repo: str) -> Path:
         """Get path to bare repo clone."""
         repo_name = repo.replace("/", "-")
@@ -541,12 +628,7 @@ class WorktreeManager:
         if branch is None:
             branch = await self.get_default_branch(repo)
 
-        await self._run_git(
-            "worktree", "add",
-            str(worktree_path),
-            branch,
-            cwd=bare_path,
-        )
+        await self._worktree_add(bare_path, str(worktree_path), branch)
 
         return worktree_path
 
@@ -701,12 +783,8 @@ class WorktreeManager:
             base_branch = await self.get_default_branch(repo)
 
         try:
-            await self._run_git(
-                "worktree", "add",
-                "-b", new_branch,
-                str(worktree_path),
-                base_branch,
-                cwd=bare_path,
+            await self._worktree_add(
+                bare_path, "-b", new_branch, str(worktree_path), base_branch,
             )
         except Exception as e:
             # If we destroyed the old stale-merged ref on the way here,
@@ -809,10 +887,7 @@ class WorktreeManager:
         minimal.
         """
         try:
-            await self._run_git(
-                "worktree", "add", str(worktree_path), branch,
-                cwd=bare_path,
-            )
+            await self._worktree_add(bare_path, str(worktree_path), branch)
             return
         except WorktreeError as e:
             if "already checked out" not in str(e):
@@ -859,10 +934,7 @@ class WorktreeManager:
                 except OSError:
                     pass
             # Retry the add; if it fails again, let the error surface.
-            await self._run_git(
-                "worktree", "add", str(worktree_path), branch,
-                cwd=bare_path,
-            )
+            await self._worktree_add(bare_path, str(worktree_path), branch)
 
     def _resolve_admin_dir(
         self, bare_path: Path, worktree_dir: str,
@@ -1598,7 +1670,9 @@ class WorktreeManager:
                     repo=repo, reason=type(e).__name__,
                 )
 
-    async def make_review_copy(self, repo: str, sha: str) -> Path:
+    async def make_review_copy(
+        self, repo: str, sha: str, *, base_branch: str, base_sha: str,
+    ) -> Path:
         """A fresh clone of the bare repo checked out at ``sha``, for the
         reviewer (#263).
 
@@ -1628,6 +1702,15 @@ class WorktreeManager:
         Filter and diff drivers from the operator's own config are
         switched off in the copy for the same reason (see below).
 
+        The base the reviewer diffs against is pinned too.
+        ``base_branch`` and ``base_sha`` come from GitHub, not from the
+        bare clone, whose ``HEAD`` and branch refs the agent can write:
+        moving ``main`` onto its own earlier commit, or ``HEAD`` onto its
+        own branch, would narrow the diff to what it chose. In the copy,
+        ``refs/heads/<base_branch>`` and ``refs/remotes/origin/<base_branch>``
+        are both set to ``base_sha``, which is fetched from GitHub if the
+        clone does not have it.
+
         This covers what the reviewer finds on disk. It does not stop
         the reviewer running the committed code itself (see
         ``CodeReviewConfig.cli_command``), and it is not on the path of
@@ -1635,6 +1718,14 @@ class WorktreeManager:
         """
         if not _HEX_SHA.match(sha):
             raise WorktreeError(f"review copy refused: {sha!r} is not a commit id")
+        if not _HEX_SHA.match(base_sha):
+            raise WorktreeError(
+                f"review copy refused: base {base_sha!r} is not a commit id"
+            )
+        if not _is_safe_branch(base_branch):
+            raise WorktreeError(
+                f"review copy refused: {base_branch!r} is not a safe branch name"
+            )
         bare_path = self._get_bare_repo_path(repo)
         if not bare_path.exists():
             raise WorktreeError(f"review copy: no clone of {repo} at {bare_path}")
@@ -1679,6 +1770,9 @@ class WorktreeManager:
                     "-C", str(dest), "remote", "set-url", "origin", origin,
                     env=env,
                 )
+            await self._pin_review_base(
+                repo, dest, base_branch, base_sha, env=env, flags=flags,
+            )
             if head != sha:
                 raise WorktreeError(
                     f"review copy is at {head[:12]}, expected {sha[:12]}"
@@ -1687,6 +1781,61 @@ class WorktreeManager:
             shutil.rmtree(holder, ignore_errors=True)
             raise
         return dest
+
+    async def _pin_review_base(
+        self,
+        repo: str,
+        dest: Path,
+        base_branch: str,
+        base_sha: str,
+        *,
+        env: dict[str, str],
+        flags: tuple[str, ...],
+    ) -> None:
+        """Point the copy's ``base_branch`` (local and ``origin/``) at
+        ``base_sha``, whatever the bare clone said (#263)."""
+        commit = f"{base_sha}^{{commit}}"
+
+        async def have() -> bool:
+            try:
+                await self._run_git(
+                    "-C", str(dest), "cat-file", "-e", commit, env=env,
+                )
+                return True
+            except WorktreeError:
+                return False
+
+        if not await have():
+            # Into the copy's own object store, from GitHub by URL: the
+            # clone's `remote.origin.url` is shared with the agent.
+            await self._run_git(
+                *flags, "-C", str(dest), "fetch", "--quiet", "--no-tags",
+                "--no-write-fetch-head", self._clone_url(repo), base_sha,
+                env=env, timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+            )
+            if not await have():
+                raise WorktreeError(
+                    f"review copy: base {base_sha[:12]} is not a commit here"
+                )
+        for ref in (
+            f"refs/heads/{base_branch}",
+            f"refs/remotes/origin/{base_branch}",
+        ):
+            await self._run_git(
+                "-C", str(dest), "update-ref", "--no-deref", ref, base_sha,
+                env=env,
+            )
+        await self._run_git(
+            "-C", str(dest), "symbolic-ref", "refs/remotes/origin/HEAD",
+            f"refs/remotes/origin/{base_branch}", env=env,
+        )
+        for key, value in (
+            ("remote", "origin"), ("merge", f"refs/heads/{base_branch}"),
+        ):
+            await self._run_git(
+                "-C", str(dest), "config", f"branch.{base_branch}.{key}",
+                value, env=env,
+            )
 
     def _review_root(self) -> Path:
         """Where review copies are made: beside the bare clones."""
@@ -1787,11 +1936,15 @@ class WorktreeManager:
         target.symlink_to(context_path.resolve())
 
         gitdir = self._get_gitdir(worktree_path)
-        exclude_file = gitdir / "info" / "exclude"
-        if exclude_file.exists():
-            content = exclude_file.read_text()
-            if "CLAUDE.md" not in content:
-                exclude_file.write_text(content.rstrip() + "\nCLAUDE.md\n")
+        try:
+            _add_exclude_line(gitdir, "CLAUDE.md")
+        except _UnsafeExcludeError as e:
+            # Refused, not followed: the line only keeps the link out of
+            # `git status`, so the run carries on without it.
+            log_event(
+                _logger, "worktree.context.exclude_refused",
+                worktree=str(worktree_path), reason=str(e),
+            )
 
     def remove_context_symlink(self, worktree_path: Path) -> None:
         """Remove CLAUDE.md symlink before git operations."""

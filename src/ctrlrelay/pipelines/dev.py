@@ -1081,6 +1081,9 @@ async def _failed_check_logs(
 # evidence a pull request exists, and the PR text is consumed here.
 _RELAY_OWNED_OUTPUTS = ("pr_number", "pr_url", "pr_title", "pr_body")
 
+# A full commit id, as GitHub names the head of the review base.
+_BASE_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
 
 @dataclass
 class _Publisher:
@@ -1354,6 +1357,8 @@ async def _review_and_comment(
     config: Any = None,
     state_db: StateDB | None = None,
     issue_number: int | None = None,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
 ) -> ReviewReport:
     """Run the configured review and post what it found.
 
@@ -1446,7 +1451,10 @@ async def _review_and_comment(
         await github.comment_on_pr(
             repo,
             pr_number,
-            format_review_comment(outcome, worktree_path=worktree_path),
+            format_review_comment(
+                outcome, worktree_path=worktree_path,
+                head_sha=head_sha, base_branch=base_branch, base_sha=base_sha,
+            ),
         )
         log_event(
             _logger,
@@ -1983,8 +1991,23 @@ async def _step_review(run: _DevRun) -> None:
     # overwrites it; this value is what survives if a new
     # branch is ever added that forgets to.
     review_report = REVIEW_NOT_REPORTED
+    # The base comes from GitHub, never from the bare clone (#263): the
+    # agent can write that clone's HEAD and branch refs, and either one
+    # moved would narrow what the reviewer diffs. The sha is pinned in
+    # the copy and named in the comment.
+    review_base_sha: str | None = None
     try:
-        review_base = await worktree.get_default_branch(repo)
+        review_base = run.publisher.default_branch or (
+            await run.github.get_default_branch(repo)
+        )
+        review_base_sha = (await run.github.get_ref_sha(
+            repo, f"refs/heads/{review_base}",
+        )).strip()
+        if not _BASE_SHA.match(review_base_sha):
+            raise ValueError(
+                f"GitHub gave {review_base_sha[:50]!r} as the head of "
+                f"{review_base!r}"
+            )
     except Exception as e:
         review_base = None
         review_report = ReviewReport(
@@ -2035,7 +2058,8 @@ async def _step_review(run: _DevRun) -> None:
     elif review_base is not None:
         try:
             review_path = await worktree.make_review_copy(
-                repo, review_sha
+                repo, review_sha,
+                base_branch=review_base, base_sha=review_base_sha,
             )
         except Exception as e:
             review_report = ReviewReport(
@@ -2066,6 +2090,8 @@ async def _step_review(run: _DevRun) -> None:
                 config=code_review,
                 state_db=run.state_db,
                 issue_number=run.issue_number,
+                head_sha=review_sha,
+                base_sha=review_base_sha,
             )
         except Exception as e:
             review_report = ReviewReport(
