@@ -109,19 +109,31 @@ def _canonical(value: object) -> str:
 
 def open_dir_nofollow(path: Path, *, create: bool = False) -> int:
     """Return an fd for directory ``path`` such that no component below
-    the anchor is a symlink.
+    ``$HOME`` is a symlink.
 
-    The anchor is ``$HOME`` when ``path`` is under it, else ``/``; the
-    anchor itself is trusted. Each later component is opened relative
-    to the previous fd with ``O_NOFOLLOW``. ``create`` makes missing
-    components (mode 0700). Raises ``FileNotFoundError`` for a missing
-    component when not creating, :class:`MergeRefusedError` otherwise.
+    The walk starts at the RESOLVED ``$HOME`` (so a home reached through
+    an alias, such as macOS's ``/var`` -> ``/private/var``, works) and
+    ``path`` may be spelled under either form of it. Each later
+    component is opened relative to the previous fd with
+    ``O_NOFOLLOW``. A path outside ``$HOME`` is refused. ``create``
+    makes missing components (mode 0700). Raises ``FileNotFoundError``
+    for a missing component when not creating, :class:`MergeRefusedError`
+    otherwise.
     """
     path = Path(os.path.abspath(path))
-    home = Path(os.path.abspath(Path.home()))
-    anchor = home if (path == home or home in path.parents) else Path(path.anchor)
-    parts = path.relative_to(anchor).parts
-    fd = os.open(anchor, _DIR_FLAGS)
+    home_real = Path(os.path.realpath(Path.home()))
+    home_abs = Path(os.path.abspath(Path.home()))
+    for base in (home_real, home_abs):
+        if path == base or base in path.parents:
+            parts = path.relative_to(base).parts
+            break
+    else:
+        raise MergeRefusedError(
+            f"{path} is not under $HOME ({home_real}); mode: merge only reads "
+            "and writes inside the home directory, so the live file and the "
+            "personalization checkout must both be under it"
+        )
+    fd = os.open(home_real, _DIR_FLAGS)
     try:
         for part in parts:
             flags = _DIR_FLAGS | os.O_NOFOLLOW
@@ -331,9 +343,10 @@ def _atomic_write_at(
         _check_unchanged_at(dfd, name, expected)
         os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
     except BaseException:
+        # Never let a failing cleanup replace the error that matters.
         try:
             os.unlink(tmp, dir_fd=dfd)
-        except FileNotFoundError:
+        except OSError:
             pass
         raise
     try:
@@ -423,6 +436,11 @@ def merge_into_live(
                 )
     except MergeRefusedError as e:
         return _refuse(label, str(e))
+    except RecursionError:
+        # Parsed, but too deep to compare or serialise (the pure-Python
+        # ``json.dumps(indent=...)`` recurses far less deep than the C
+        # parser).
+        return _refuse(label, "a value is nested too deeply to merge")
     except OSError as e:
         return _refuse(label, f"write to {target} failed: {e.strerror}")
     finally:
@@ -457,40 +475,52 @@ def migrate_link(source: Path, target: Path, *, label: str) -> MergeOutcome:
         )
     except MergeRefusedError as e:
         return _refuse(label, str(e))
+    except OSError as e:
+        return _refuse(label, f"cannot open {target.parent}: {e.strerror}")
     try:
-        try:
-            link_st = os.stat(target.name, dir_fd=dfd, follow_symlinks=False)
-        except FileNotFoundError:
-            return MergeOutcome(
-                label=label, action="nothing-to-migrate",
-                detail="live path missing",
-            )
-        if not stat.S_ISLNK(link_st.st_mode):
-            return MergeOutcome(
-                label=label, action="nothing-to-migrate",
-                detail="already a real file",
-            )
-        if not is_link_into(target, source):
-            return _refuse(
-                label,
-                f"live file {target} is a symlink to somewhere other than "
-                f"{source}; not migrating it",
-            )
-        try:
-            _, text, src_st = _load(source, what="synced file")
-        except FileNotFoundError:
-            return _refuse(label, f"synced file {source} is missing")
-        except MergeRefusedError as e:
-            return _refuse(label, str(e))
-        mode = stat.S_IMODE(src_st.st_mode) & 0o600
-        try:
-            _atomic_write_at(dfd, target.name, text, mode=mode, expected=link_st)
-        except _LiveChangedError:
-            return _refuse(label, f"live path {target} changed during the migration")
-        except OSError as e:
-            return _refuse(label, f"write to {target} failed: {e.strerror}")
+        return _migrate_at(dfd, source, target, label=label)
+    except OSError as e:
+        return _refuse(label, f"migration of {target} failed: {e.strerror}")
     finally:
         os.close(dfd)
+
+
+def _migrate_at(
+    dfd: int, source: Path, target: Path, *, label: str
+) -> MergeOutcome:
+    try:
+        link_st = os.stat(target.name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return MergeOutcome(
+            label=label, action="nothing-to-migrate",
+            detail="live path missing",
+        )
+    if not stat.S_ISLNK(link_st.st_mode):
+        return MergeOutcome(
+            label=label, action="nothing-to-migrate",
+            detail="already a real file",
+        )
+    if not is_link_into(target, source):
+        return _refuse(
+            label,
+            f"live file {target} is a symlink to somewhere other than "
+            f"{source}; not migrating it",
+        )
+    try:
+        _, text, src_st = _load(source, what="synced file")
+    except FileNotFoundError:
+        return _refuse(label, f"synced file {source} is missing")
+    except MergeRefusedError as e:
+        return _refuse(label, str(e))
+    except OSError as e:
+        return _refuse(label, f"cannot read synced file {source}: {e.strerror}")
+    mode = stat.S_IMODE(src_st.st_mode) & 0o600
+    try:
+        _atomic_write_at(dfd, target.name, text, mode=mode, expected=link_st)
+    except _LiveChangedError:
+        return _refuse(label, f"live path {target} changed during the migration")
+    except OSError as e:
+        return _refuse(label, f"write to {target} failed: {e.strerror}")
     logger.info("%s: migrated %s from a symlink to a real file", label, target)
     return MergeOutcome(label=label, action="migrated")
 

@@ -9,6 +9,7 @@ input, which must take the other branch.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -40,6 +41,14 @@ def _write_json(path: Path, obj: object) -> None:
 
 def _read(path: Path) -> dict:
     return json.loads(path.read_text())
+
+
+@pytest.fixture(autouse=True)
+def _home_is_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Merge mode only works under $HOME; every test's files are under
+    its tmp dir, so that is $HOME here (and the real one is never
+    touched)."""
+    monkeypatch.setenv("HOME", os.path.realpath(tmp_path))
 
 
 @pytest.fixture
@@ -620,6 +629,150 @@ class TestMergeIntoLive:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
+def _max_parse_depth() -> int:
+    lo, hi = 1, 1_000_000
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        try:
+            json.loads("[" * mid + "]" * mid)
+            lo = mid
+        except RecursionError:
+            hi = mid - 1
+    return lo
+
+
+class TestRoundTwo:
+    def test_path_outside_home_is_refused(self, tmp_path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        source = home / "co" / "settings.json"
+        _write_json(source, {"model": "opus"})
+        target = tmp_path / "elsewhere" / "settings.json"
+        _write_json(target, {})
+        out = merge_into_live(source, target, ["model"], label="settings")
+        assert out.refused
+        assert "is not under $HOME" in out.detail
+        assert _read(target) == {}
+
+    @pytest.mark.parametrize("spelling", ["alias", "real"])
+    def test_home_reached_through_an_alias_works(
+        self, tmp_path, monkeypatch, spelling: str
+    ) -> None:
+        """macOS-style: $HOME (or the path) goes through an aliased
+        directory like /var -> /private/var. The walk starts at the
+        resolved home, so either spelling of a path under it works."""
+        real = tmp_path / "private" / "home"
+        (real / ".claude").mkdir(parents=True)
+        alias = tmp_path / "home-alias"
+        alias.symlink_to(real)
+        monkeypatch.setenv("HOME", str(alias))
+        base = alias if spelling == "alias" else real
+        _write_json(base / "co" / "settings.json", {"model": "opus"})
+        _write_json(base / ".claude" / "settings.json", {"keep": 1})
+
+        out = merge_into_live(
+            base / "co" / "settings.json", base / ".claude" / "settings.json",
+            ["model"], label="settings",
+        )
+
+        assert out.action == "wrote", out.detail
+        assert _read(real / ".claude" / "settings.json") == {"keep": 1, "model": "opus"}
+
+    @pytest.mark.parametrize("side", ["synced", "live"])
+    def test_parseable_but_too_deep_to_merge_is_refused(
+        self, pair, side: str
+    ) -> None:
+        """Nested just under the parser's limit: it parses, but the
+        comparison or ``json.dumps(indent=2)`` recurses far less deep."""
+        source, target = pair
+        depth = _max_parse_depth() - 5
+        deep = "[" * depth + "]" * depth
+        json.loads('{"x": ' + deep + "}")  # precondition: it parses
+        source.parent.mkdir(parents=True)
+        if side == "synced":
+            source.write_text('{"model": ' + deep + "}")
+            target.write_text('{"keep": true}\n')
+        else:
+            _write_json(source, {"model": "opus"})
+            target.write_text('{"deep": ' + deep + "}")
+        before = target.read_text()
+
+        out = merge_into_live(source, target, ["model"], label="settings")
+
+        assert out.refused
+        assert "nested too deeply" in out.detail
+        assert target.read_text() == before
+
+    def test_failed_cleanup_does_not_hide_the_original_error(
+        self, pair, monkeypatch
+    ) -> None:
+        source, target = pair
+        _write_json(source, {"model": "opus"})
+        target.write_text('{"model": "old"}\n')
+
+        def fsync(fd: int) -> None:
+            raise OSError(errno.EIO, "Input/output error")
+
+        def unlink(*a, **kw) -> None:
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(merge_mod.os, "fsync", fsync)
+        monkeypatch.setattr(merge_mod.os, "unlink", unlink)
+        out = merge_into_live(source, target, ["model"], label="settings")
+        monkeypatch.undo()
+
+        assert out.refused
+        assert "Input/output error" in out.detail
+        assert target.read_text() == '{"model": "old"}\n'
+
+    def test_migrate_returns_a_refusal_when_the_dir_cannot_be_opened(
+        self, pair, monkeypatch
+    ) -> None:
+        source, target = pair
+        _write_json(source, {})
+        target.symlink_to(source)
+
+        def deny(*a, **kw):
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(merge_mod, "open_dir_nofollow", deny)
+        out = migrate_link(source, target, label="settings")
+        assert out.refused
+        assert "Permission denied" in out.detail
+
+    def test_migrate_returns_a_refusal_when_the_source_cannot_be_read(
+        self, pair, monkeypatch
+    ) -> None:
+        source, target = pair
+        _write_json(source, {})
+        target.symlink_to(source)
+
+        def eio(*a, **kw):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(merge_mod, "_load", eio)
+        out = migrate_link(source, target, label="settings")
+        assert out.refused
+        assert "Input/output error" in out.detail
+        assert target.is_symlink()
+
+    def test_migrate_returns_a_refusal_for_an_oserror_inside(
+        self, pair, monkeypatch
+    ) -> None:
+        source, target = pair
+        _write_json(source, {})
+        target.symlink_to(source)
+
+        def eio(*a, **kw):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(merge_mod, "_atomic_write_at", eio)
+        out = migrate_link(source, target, label="settings")
+        assert out.refused
+        assert target.is_symlink()
+
+
 # ---------- migrate_link ------------------------------------------------------
 
 
@@ -818,8 +971,10 @@ class TestManagerMerge:
         copy.write_text(live.read_text())
         _git("add", "global/settings.json", cwd=checkout)
 
-        mgr.push(message="must not carry live keys")
+        result = mgr.push(message="must not carry live keys")
 
+        assert result.success, result.summary
+        assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
         assert SECRET not in _git("log", "-p", "--all", cwd=checkout)
 
     def test_control_explicit_fleet_commit_is_pushed(
@@ -851,11 +1006,12 @@ class TestManagerMerge:
         live.write_text(json.dumps({"model": "opus", "appKey": SECRET}))
         mgr, _, _ = _machine(tmp_path, remote_bare, "b")
 
-        mgr.push(message="should not carry the app key")
+        result = mgr.push(message="should not carry the app key")
 
-        # Not in any commit (the push itself then stops on the dirty
-        # tree, which is the pre-existing behaviour), and still on disk.
-        assert SECRET not in _git("log", "-p", "--all", cwd=checkout)
+        # The push succeeds (the dirty merge copy is stashed across the
+        # rebase), the remote never sees the key, and it is still on disk.
+        assert result.success, result.summary
+        assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
         assert SECRET in live.read_text()
 
     def test_control_symlink_mode_does_push_the_same_edit(
@@ -927,6 +1083,166 @@ class TestManagerMerge:
         assert "symlink-into-checkout" in text
         mgr.migrate()
         assert "[real-file]" in mgr.status()
+
+
+def _enclosing_dir_machine(tmp_path: Path, remote_bare: Path):
+    """A symlink-mode entry for the whole ``global/`` directory plus a
+    merge entry for the file inside it: staging the directory would
+    stage the merge file too."""
+    checkout = tmp_path / "b" / "personalization"
+    home = tmp_path / "b" / "home"
+    paths = [
+        {"source": "global/", "target": str(home / "global-dir") + "/"},
+        {
+            "source": "global/settings.json",
+            "target": str(home / ".claude" / "settings.json"),
+            "mode": "merge",
+            "merge_keys": ["model"],
+        },
+    ]
+    mgr = PersonalizationManager(
+        _config_for(checkout, remote_bare, node_id="b", paths=paths)
+    )
+    _patch_remote_url(mgr, str(remote_bare))
+    mgr.init()
+    return mgr, checkout
+
+
+class TestPushOutcomeCheck:
+    """Round-2 P1: whatever route stages a merge-mode file, push takes it
+    out of the index, proves it is out, and commits from the index."""
+
+    def test_enclosing_symlink_dir_entry_cannot_carry_the_merge_file(
+        self, tmp_path, remote_bare
+    ) -> None:
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        copy = checkout / "global" / "settings.json"
+        copy.write_text(json.dumps({"model": "opus", "appKey": SECRET}))
+        (checkout / "global" / "notes.md").write_text("fleet note\n")
+
+        result = mgr.push(message="notes only")
+
+        assert result.success, result.summary
+        remote_log = _git("log", "-p", "--all", cwd=remote_bare)
+        assert "fleet note" in remote_log  # the legitimate change went out
+        assert SECRET not in remote_log
+        assert SECRET in copy.read_text()  # still on disk, not committed
+
+    def test_git_add_force_is_unstaged_too(self, tmp_path, remote_bare) -> None:
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        copy = checkout / "global" / "settings.json"
+        copy.write_text(json.dumps({"model": "opus", "appKey": SECRET}))
+        real_stage = mgr._stage_configured_paths
+
+        def stage_then_force_add():
+            out = real_stage()
+            _git("add", "-f", "global/settings.json", cwd=checkout)
+            return out
+
+        mgr._stage_configured_paths = stage_then_force_add  # type: ignore[method-assign]
+        result = mgr.push(message="x")
+
+        assert result.success, result.summary
+        assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
+
+    def test_case_variant_on_case_insensitive_checkout_is_kept_out(
+        self, tmp_path, remote_bare
+    ) -> None:
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        _git("config", "core.ignorecase", "true", cwd=checkout)
+        if not (checkout / "global" / "SETTINGS.json").exists():
+            # Case-sensitive filesystem: a distinct file stands in for
+            # the alias a case-insensitive one would resolve it to.
+            (checkout / "global" / "Settings.json").write_text(SECRET)
+
+        result = mgr.push(message="x")
+
+        assert result.success, result.summary
+        assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
+
+    @staticmethod
+    def _disable_unstaging(mgr: PersonalizationManager) -> None:
+        real = mgr._git_capturing
+
+        def no_reset(*args, check=True):
+            if args[:2] == ("reset", "-q"):
+                return real("status", check=check)  # unstaging does nothing
+            return real(*args, check=check)
+
+        mgr._git_capturing = no_reset  # type: ignore[method-assign]
+
+    @staticmethod
+    def _stage_variant_name(mgr, checkout: Path, content: str) -> None:
+        """Put an index entry named ``global/Settings.json`` in place
+        after staging, the way a case-insensitive filesystem's alias
+        spelling would arrive."""
+        variant = checkout / "global" / "Settings.json"
+        if not (checkout / "global" / "SETTINGS.json").exists():
+            variant.write_text(content)  # case-sensitive fs: its own file
+        blob = _git("hash-object", "-w", str(variant), cwd=checkout).strip()
+        real_stage = mgr._stage_configured_paths
+
+        def stage_then_variant():
+            out = real_stage()
+            _git(
+                "update-index", "--add", "--cacheinfo",
+                f"100644,{blob},global/Settings.json", cwd=checkout,
+            )
+            return out
+
+        mgr._stage_configured_paths = stage_then_variant  # type: ignore[method-assign]
+
+    def test_verify_compares_case_insensitively_when_git_says_so(
+        self, tmp_path, remote_bare
+    ) -> None:
+        """Only the final check stands: unstaging is disabled and the
+        staged name differs from the merge path only by case."""
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        _git("config", "core.ignorecase", "true", cwd=checkout)
+        self._stage_variant_name(mgr, checkout, SECRET)
+        self._disable_unstaging(mgr)
+
+        result = mgr.push(message="x")
+
+        assert not result.success
+        assert "refusing to push" in result.summary
+        assert "global/Settings.json" in result.summary
+        assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
+
+    def test_control_case_sensitive_checkout_pushes_the_variant(
+        self, tmp_path, remote_bare
+    ) -> None:
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        if (checkout / "global" / "SETTINGS.json").exists():
+            pytest.skip("case-insensitive filesystem")
+        _git("config", "core.ignorecase", "false", cwd=checkout)
+        self._stage_variant_name(mgr, checkout, "a different file\n")
+        self._disable_unstaging(mgr)
+
+        result = mgr.push(message="x")
+
+        assert result.success, result.summary
+        assert "a different file" in _git("log", "-p", "--all", cwd=remote_bare)
+
+    def test_a_staged_copy_that_survives_unstaging_refuses_the_push(
+        self, tmp_path, remote_bare
+    ) -> None:
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        copy = checkout / "global" / "settings.json"
+        copy.write_text(json.dumps({"model": "opus", "appKey": SECRET}))
+        self._disable_unstaging(mgr)
+        result = mgr.push(message="x")
+
+        assert not result.success
+        assert "global/settings.json" in result.summary
+        assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
+        assert SECRET not in _git("log", "-p", "--all", cwd=checkout)
 
 
 class TestMigrateCLI:

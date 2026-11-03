@@ -473,7 +473,25 @@ class PersonalizationManager:
         # Stage and commit once up-front; the commit object stays the
         # same across retries, only the rebase base shifts.
         configured_pathspecs = self._stage_configured_paths()
-        if configured_pathspecs:
+        # Outcome check (#287): however a merge-mode source got into the
+        # index (an enclosing symlink-mode directory, ``git add -f``, a
+        # case variant), take it out again and prove it is out. Then
+        # commit FROM THE INDEX: ``git commit -- <pathspecs>`` would
+        # take the working-tree copy of every tracked file under the
+        # pathspecs, staged or not.
+        merge_rels = self._merge_source_rels()
+        leaked = self._unstage_merge_sources(merge_rels, configured_pathspecs)
+        if leaked:
+            return PushResult(
+                success=False,
+                summary=(
+                    "refusing to push: mode: merge file(s) still staged "
+                    f"after unstaging: {', '.join(leaked)}. Nothing was "
+                    f"committed; run `git -C {self.checkout_path} reset` "
+                    "and retry"
+                ),
+            )
+        if self._staged_paths():
             # ``git commit`` errors with "Author identity unknown" if
             # neither global nor local user.email/user.name is set.
             # Bootstrap already does this for the empty-repo path;
@@ -483,16 +501,8 @@ class PersonalizationManager:
             commit_msg = message or "personalization: sync from {}".format(
                 self.working_branch
             )
-            # ``-- <pathspecs>`` constrains the commit to ONLY the
-            # allowlisted paths. Anything an operator manually staged
-            # outside the allowlist (Codex pass 12 finding — e.g.
-            # interrupted run, ad-hoc ``git add``) stays in the
-            # index but does NOT enter the personalization repo's
-            # history.
             try:
-                self._git(
-                    "commit", "-m", commit_msg, "--", *configured_pathspecs
-                )
+                self._git("commit", "-m", commit_msg)
             except _GitError as e:
                 # ``git commit`` exits 1 with "nothing to commit" when
                 # the staged set turns out to be a no-op (e.g. only
@@ -500,6 +510,13 @@ class PersonalizationManager:
                 # idempotent.
                 if "nothing to commit" not in (e.stdout + e.stderr).lower():
                     raise
+        # A modified merge-mode checkout copy is never committed, and
+        # would otherwise make the rebase refuse the dirty tree; stash
+        # it across the rebase and put it back.
+        autostash = any(
+            self._git_capturing("diff", "--quiet", "--", rel, check=False).returncode
+            for rel in merge_rels
+        )
 
         last_summary = ""
         for attempt in range(1, self._PUSH_MAX_ATTEMPTS + 1):
@@ -512,7 +529,9 @@ class PersonalizationManager:
                 )
 
             rebase = self._git_capturing(
-                "rebase", f"origin/{self.main_branch}",
+                "rebase",
+                *(("--autostash",) if autostash else ()),
+                f"origin/{self.main_branch}",
                 check=False,
             )
             if rebase.returncode != 0:
@@ -1307,6 +1326,56 @@ class PersonalizationManager:
             "diff", "--cached", "--name-only", "--", *matched
         ).strip()
         return matched if diff else []
+
+    def _merge_source_rels(self) -> list[str]:
+        rels: list[str] = []
+        for _entry, plan in self._plan_merges():
+            try:
+                rels.append(str(plan.source.relative_to(self.checkout_path)))
+            except ValueError:
+                continue
+        return rels
+
+    def _staged_paths(self) -> list[str]:
+        out = self._git("diff", "--cached", "--name-only", "-z")
+        return [p for p in out.split("\0") if p]
+
+    def _ignorecase(self) -> bool:
+        r = self._git_capturing(
+            "config", "--bool", "core.ignorecase", check=False
+        )
+        return r.stdout.strip() == "true"
+
+    def _unstage_merge_sources(
+        self, merge_rels: list[str], allowlist: list[str]
+    ) -> list[str]:
+        """Unstage every merge-mode source, and anything outside the
+        allowlist, then return any merge-mode source still staged
+        (compared case-insensitively on a case-insensitive checkout).
+        Empty means the index is safe to commit."""
+        for rel in merge_rels:
+            self._git_capturing("reset", "-q", "--", rel, check=False)
+
+        def within(path: str) -> bool:
+            for rel in allowlist:
+                base = rel.rstrip("/")
+                if path == base or path.startswith(base + "/"):
+                    return True
+            return False
+
+        for path in self._staged_paths():
+            if not within(path):
+                self._git_capturing("reset", "-q", "--", path, check=False)
+
+        fold = (lambda x: x.casefold()) if self._ignorecase() else (lambda x: x)
+        wanted = {fold(r) for r in merge_rels}
+        leaked = [p for p in self._staged_paths() if fold(p) in wanted]
+        if leaked:
+            logger.error(
+                "push refused: mode: merge file(s) still staged: %s",
+                ", ".join(leaked),
+            )
+        return leaked
 
     def _plan_for_entry(self, entry: PersonalizationPath) -> list[SymlinkPlan]:
         if entry.project_scoped:

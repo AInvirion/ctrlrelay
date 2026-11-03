@@ -346,11 +346,15 @@ The rules, all enforced and tested:
   empty live file counts as `{}`). Nesting too deep to parse is refused
   the same way. Anything else leaves the live file untouched and logs an
   error.
+- **Everything stays under `$HOME`.** The live file **and the
+  personalization checkout** must both be under your home directory; a
+  path outside it is refused with `is not under $HOME`. (The default
+  checkout, `~/.ctrlrelay/personalization`, is.)
 - **Links and odd files are refused.** Directories are opened one
   component at a time without following links (`O_DIRECTORY |
-  O_NOFOLLOW`), starting at `$HOME` (or `/` for a path outside it), and
-  the read, the temp file and the rename all go through that directory
-  handle. So a symlink at the file **or at any directory under `$HOME`
+  O_NOFOLLOW`), starting at the resolved `$HOME`, so a home reached
+  through an alias (macOS `/var` -> `/private/var`) works. The read, the
+  temp file and the rename all go through that directory handle. So a symlink at the file **or at any directory under `$HOME`
   on the way to it** is refused, and its target is never opened. A
   symlinked `~/.claude` is therefore refused too. Both files must be
   regular files owned by you, so a FIFO or someone else's file is
@@ -368,12 +372,22 @@ The rules, all enforced and tested:
   can still be overwritten, as can one that changes neither size nor
   mtime. No user-space check can close that window without the app
   taking a lock.
+- **Values too deep to handle are refused**, whether the parser rejects
+  them or they parse but are too deep to compare or write back.
 - **Nothing flows back.** The live file is outside the checkout, so
-  `push` cannot stage it. And `push` never stages a merge entry's
-  checkout copy from local state, whether modified or already
-  `git add`-ed: that copy is the fleet's version. To change fleet
+  `push` cannot stage it. And `push` never commits a merge entry's
+  checkout copy from local state, however it got staged (an enclosing
+  `global/` entry, `git add -f`, a different-case spelling): after all
+  staging it unstages every merge-mode file, checks the index (ignoring
+  case where git does) and **refuses the push** if one is still there,
+  then commits from the index. A modified checkout copy is stashed
+  across the rebase and put back, so it neither blocks nor rides along.
+- **Fleet edits are yours, and they go everywhere.** To change fleet
   settings, edit `global/settings.json` in the checkout and `git commit`
   it there yourself; `push` then publishes that commit like any other.
+  ctrlrelay does not inspect such a commit: **whatever you commit to that
+  file reaches every machine** (within each machine's `merge_keys`), so
+  never commit a value that belongs to one machine.
 - **Logs name keys, never values** (a value can be a secret under
   `env`). A pull that changes `hooks`, `env`, `permissions`,
   `apiKeyHelper` or `skipDangerousModePermissionPrompt` logs a
