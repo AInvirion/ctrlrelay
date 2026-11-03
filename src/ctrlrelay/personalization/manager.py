@@ -462,7 +462,11 @@ class PersonalizationManager:
         # deleted, renamed away, untracked), refuse before staging
         # anything, and leave it as it is.
         merge_rels = self._merge_source_rels()
-        changed = [rel for rel in merge_rels if self._copy_differs(rel)]
+        try:
+            changed = [rel for rel in merge_rels if self._copy_differs(rel)]
+        except PersonalizationError as e:
+            logger.error("push refused: %s", e)
+            return PushResult(success=False, summary=f"refusing to push: {e}")
         if changed:
             logger.error(
                 "push refused: mode: merge checkout copy changed: %s",
@@ -716,12 +720,33 @@ class PersonalizationManager:
                 logger.error("%s: merge refused: %s", label, problem)
                 out.append(MergeOutcome(label, "refused", detail=problem))
                 continue
-            out.append(
-                merge_into_live(
-                    plan.source, plan.target, entry.merge_keys, label=label
-                )
-            )
+            out.append(self._merge_entry(entry, plan, label))
         return out
+
+    def _merge_entry(
+        self, entry: PersonalizationPath, plan: SymlinkPlan, label: str
+    ) -> MergeOutcome:
+        """Merge one entry, only from the fleet's committed version: if
+        the checkout copy differs from HEAD (a local edit), nothing is
+        written, so the live file only ever receives HEAD's values."""
+        rel = str(plan.source.relative_to(self.checkout_path))
+        try:
+            differs = self._copy_differs(rel)
+        except PersonalizationError as e:
+            logger.error("%s: merge refused: %s", label, e)
+            return MergeOutcome(label, "refused", detail=str(e))
+        if differs:
+            detail = (
+                f"checkout copy {rel} differs from HEAD; not merged, so only "
+                "the fleet's committed values reach the live file. Commit "
+                "it yourself with git, or run `ctrlrelay personalization "
+                "migrate --reset-copy`"
+            )
+            logger.error("%s: merge refused: %s", label, detail)
+            return MergeOutcome(label, "refused", detail=detail)
+        return merge_into_live(
+            plan.source, plan.target, entry.merge_keys, label=label
+        )
 
     def migrate(self, *, reset_copy: bool = False) -> list[MergeOutcome]:
         """Explicit, operator-run: replace each merge-mode live path that
@@ -758,19 +783,19 @@ class PersonalizationManager:
                     note.removeprefix("REFUSED: "),
                 )
             out.append(result)
-            if not result.refused:
-                merged = merge_into_live(
-                    plan.source, plan.target, entry.merge_keys, label=label
-                )
-                if merged.action != "in-sync":
-                    out.append(merged)
-        if reset_copy:
-            resets = self.reset_copies()
-            out.extend(resets)
-            if any(r.action == "reset-copy" for r in resets):
-                out.extend(
-                    m for m in self.apply_merges() if m.action != "in-sync"
-                )
+            if result.refused:
+                continue
+            # Reset BEFORE merging, so a locally changed fleet key in the
+            # copy is never applied to the live file, not even briefly.
+            if reset_copy:
+                reset = self._reset_copy(plan, label)
+                if reset is not None:
+                    out.append(reset)
+                    if reset.refused:
+                        continue
+            merged = self._merge_entry(entry, plan, label)
+            if merged.action != "in-sync":
+                out.append(merged)
         return out
 
     def _plan_merges(self) -> list[tuple[PersonalizationPath, SymlinkPlan]]:
@@ -1368,58 +1393,85 @@ class PersonalizationManager:
     def _copy_differs(self, rel: str) -> bool:
         """True if the checkout copy at ``rel`` is not exactly HEAD's:
         modified, staged, deleted or renamed away, or present while
-        HEAD has no such file."""
-        in_head = self._git_capturing(
-            "cat-file", "-e", f"HEAD:{rel}", check=False
-        ).returncode == 0
-        if in_head:
-            return self._git_capturing(
-                "diff", "--quiet", "HEAD", "--", rel, check=False
-            ).returncode != 0
-        in_index = self._git_capturing(
-            "ls-files", "--error-unmatch", "--", rel, check=False
-        ).returncode == 0
+        HEAD has no such file.
+
+        Any git error raises ``PersonalizationError("could not check
+        ...")``: an answer git could not give is never read as "clean"
+        or "absent"."""
+        if self._in_head(rel):
+            return self._git_checked(
+                rel, "diff", "--quiet", "HEAD", "--", rel, ok=(0, 1)
+            ).returncode == 1
+        in_index = bool(self._git_checked(rel, "ls-files", "-z", "--", rel).stdout)
         return in_index or os.path.lexists(self.checkout_path / rel)
 
+    def _git_checked(
+        self, rel: str, *args: str, ok: tuple[int, ...] = (0,)
+    ) -> subprocess.CompletedProcess:
+        r = self._git_capturing(*args, check=False)
+        if r.returncode not in ok:
+            err = (r.stderr or r.stdout).strip() or (
+                f"git {args[0]} exited {r.returncode}"
+            )
+            raise PersonalizationError(f"could not check {rel}: {err}")
+        return r
+
+    def _in_head(self, rel: str) -> bool:
+        return bool(
+            self._git_checked(rel, "ls-tree", "-z", "HEAD", "--", rel).stdout
+        )
+
     def reset_copies(self) -> list[MergeOutcome]:
-        """Drop local changes to each merge entry's checkout copy (the
-        explicit ``migrate --reset-copy``). Skips an entry whose live
-        path is still the old symlink into the checkout: the copy IS the
-        live file there, and ``migrate`` saves it first."""
+        """Drop local changes to every merge entry's checkout copy."""
         out: list[MergeOutcome] = []
         for _entry, plan in self._plan_merges():
-            label = self._merge_label(plan)
-            rel = str(plan.source.relative_to(self.checkout_path))
-            if not self._copy_differs(rel):
-                continue
-            if is_link_into(plan.target, plan.source):
-                out.append(MergeOutcome(
-                    label, "refused",
-                    detail=f"{plan.target} is still a symlink to {rel}; not "
-                    "resetting it (migrate did not convert it)",
-                ))
-                continue
-            keys: list[str] = []
-            head = self._git_capturing("show", f"HEAD:{rel}", check=False)
-            try:
-                now_obj, _ = read_json_object(plan.source, what="synced file")
-                head_obj = json.loads(head.stdout) if head.returncode == 0 else {}
-                if isinstance(head_obj, dict):
-                    keys = differing_keys(head_obj, now_obj)
-            except (ValueError, RecursionError, MergeRefusedError, OSError):
-                keys = []
-            self._git_capturing("reset", "-q", "--", rel, check=False)
-            if head.returncode == 0:
-                self._git("checkout", "HEAD", "--", rel)
-            elif os.path.lexists(plan.source):
-                plan.source.unlink()
-            named = f" (keys: {', '.join(keys)})" if keys else ""
-            logger.info("%s: dropped local change to checkout copy %s%s", label, rel, named)
-            out.append(MergeOutcome(
-                label, "reset-copy",
-                detail=f"checkout copy {rel} reset to HEAD{named}",
-            ))
+            reset = self._reset_copy(plan, self._merge_label(plan))
+            if reset is not None:
+                out.append(reset)
         return out
+
+    def _reset_copy(self, plan: SymlinkPlan, label: str) -> MergeOutcome | None:
+        """Drop a local change to one merge entry's checkout copy (the
+        explicit ``migrate --reset-copy``); ``None`` if it has none.
+        Refuses while the live path is still the old symlink into the
+        checkout (the copy IS the live file there) and on any git error."""
+        rel = str(plan.source.relative_to(self.checkout_path))
+        try:
+            if not self._copy_differs(rel):
+                return None
+            in_head = self._in_head(rel)
+            head_text = (
+                self._git_checked(rel, "show", f"HEAD:{rel}").stdout
+                if in_head else ""
+            )
+        except PersonalizationError as e:
+            return MergeOutcome(label, "refused", detail=str(e))
+        if is_link_into(plan.target, plan.source):
+            return MergeOutcome(
+                label, "refused",
+                detail=f"{plan.target} is still a symlink to {rel}; not "
+                "resetting it (migrate did not convert it)",
+            )
+        keys: list[str] = []
+        try:
+            now_obj, _ = read_json_object(plan.source, what="synced file")
+            head_obj = json.loads(head_text) if in_head else {}
+            if isinstance(head_obj, dict):
+                keys = differing_keys(head_obj, now_obj)
+        except (ValueError, RecursionError, MergeRefusedError, OSError):
+            keys = []
+        self._git_capturing("reset", "-q", "--", rel, check=False)
+        if in_head:
+            self._git("checkout", "HEAD", "--", rel)
+        elif os.path.lexists(plan.source):
+            plan.source.unlink()
+        named = f" (keys: {', '.join(keys)})" if keys else ""
+        logger.info(
+            "%s: dropped local change to checkout copy %s%s", label, rel, named
+        )
+        return MergeOutcome(
+            label, "reset-copy", detail=f"checkout copy {rel} reset to HEAD{named}"
+        )
 
     def _merge_source_rels(self) -> list[str]:
         rels: list[str] = []

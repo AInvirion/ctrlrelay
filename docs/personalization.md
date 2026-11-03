@@ -387,17 +387,31 @@ The rules, all enforced and tested:
   run ctrlrelay personalization migrate --reset-copy`.
   After staging, push also unstages every merge-mode file and checks the
   index (ignoring case where git does), refusing if one is still staged.
-  These push checks are a **backstop against accidental staging**. They
-  do not stop deliberate local edits in the checkout: a copy of the file
-  under another name, or anything you commit there by hand, is pushed.
+  These push checks are a **backstop against accidental staging**.
+- **What this does not cover: deliberate local edits in the checkout.**
+  Anyone who can write the checkout can already publish anything from
+  it, so these are out of scope by design, not gaps to close:
+  - renaming the copy (`git mv global/settings.json ...` and committing);
+  - copying it elsewhere in a synced directory (`cp global/settings.json
+    global/other.json`), which pushes the copy as an ordinary file;
+  - hiding a change from git with `git update-index --assume-unchanged`
+    or `--skip-worktree` on the copy;
+  - committing to the checkout by hand (`git commit`), which `push` then
+    publishes like any other commit.
 - **Whatever is committed in the checkout goes to every machine.** To
   change fleet settings, edit `global/settings.json` in the checkout and
   `git commit` it yourself; `push` publishes that commit like any other,
   and every machine applies it within its own `merge_keys`. ctrlrelay
   does not inspect such a commit, so never commit a value that belongs
   to one machine.
+- **Only HEAD's fleet values reach the live file.** A merge (on pull,
+  `init` or `migrate`) is refused while the checkout copy differs from
+  `HEAD`, and `migrate --reset-copy` resets the copy *before* merging,
+  so a local edit to a fleet key is never applied to the live file.
+  If git cannot answer whether the copy differs, push and merge refuse
+  (`could not check global/settings.json: ...`) rather than assume.
 - **Without merge entries nothing changes.** A configuration with no
-  `mode: merge` entry pushes exactly as before.
+  `mode: merge` entry stages and commits on `push` exactly as before.
 - **Logs name keys, never values** (a value can be a secret under
   `env`). A pull that changes `hooks`, `env`, `permissions`,
   `apiKeyHelper` or `skipDangerousModePermissionPrompt` logs a

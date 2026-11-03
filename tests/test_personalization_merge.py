@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -1326,6 +1327,128 @@ class TestPushOutcomeCheck:
         assert "still staged after unstaging: global/settings.json" in result.summary
         assert SECRET not in _git("log", "-p", "--all", cwd=remote_bare)
         assert SECRET not in _git("log", "-p", "--all", cwd=checkout)
+
+
+class TestRoundFour:
+    @staticmethod
+    def _record_writes(monkeypatch) -> list[str]:
+        """Every text the merge code ever writes to a live file."""
+        written: list[str] = []
+        real = merge_mod._atomic_write_at
+
+        def recording(dfd, name, text, **kw):
+            written.append(text)
+            return real(dfd, name, text, **kw)
+
+        monkeypatch.setattr(merge_mod, "_atomic_write_at", recording)
+        return written
+
+    def _changed_copy_machine(self, tmp_path, remote_bare):
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout, live = _machine(tmp_path, remote_bare, "b")
+        mgr.init()
+        _write_json(live, {"model": "stale", "appKey": 1})  # HEAD's value is due
+        copy = checkout / "global" / "settings.json"
+        _write_json(copy, {"model": "LOCAL-ONLY-VALUE"})  # hand edit, uncommitted
+        return mgr, copy, live
+
+    def test_reset_copy_resets_before_merging(
+        self, tmp_path, remote_bare, monkeypatch
+    ) -> None:
+        mgr, copy, live = self._changed_copy_machine(tmp_path, remote_bare)
+        written = self._record_writes(monkeypatch)
+
+        outcomes = mgr.migrate(reset_copy=True)
+
+        assert [o.action for o in outcomes] == [
+            "nothing-to-migrate", "reset-copy", "wrote",
+        ]
+        assert "keys: model" in outcomes[1].detail
+        # The live file never saw the local value, not even briefly ...
+        assert written and all("LOCAL-ONLY-VALUE" not in t for t in written)
+        # ... and ends with HEAD's fleet value, app key kept.
+        assert _read(live) == {"model": "opus", "appKey": 1}
+        assert _read(copy) == {"model": "opus"}
+
+    def test_plain_migrate_never_merges_a_changed_copy(
+        self, tmp_path, remote_bare, monkeypatch
+    ) -> None:
+        mgr, copy, live = self._changed_copy_machine(tmp_path, remote_bare)
+        written = self._record_writes(monkeypatch)
+
+        outcomes = mgr.migrate()
+
+        assert outcomes[-1].refused
+        assert "differs from HEAD; not merged" in outcomes[-1].detail
+        assert written == []
+        assert _read(live) == {"model": "stale", "appKey": 1}
+        assert _read(copy) == {"model": "LOCAL-ONLY-VALUE"}  # left alone
+
+    def test_pull_merge_never_applies_a_changed_copy(
+        self, tmp_path, remote_bare, monkeypatch
+    ) -> None:
+        mgr, _copy, live = self._changed_copy_machine(tmp_path, remote_bare)
+        written = self._record_writes(monkeypatch)
+        outcomes = mgr.apply_merges()
+        assert outcomes[0].refused
+        assert written == []
+
+    @staticmethod
+    def _fail_git(mgr, verb: str) -> None:
+        real = mgr._git_capturing
+
+        def failing(*args, check=True):
+            if args and args[0] == verb:
+                return subprocess.CompletedProcess(
+                    ["git", *args], 128, "", "fatal: injected failure\n"
+                )
+            return real(*args, check=check)
+
+        mgr._git_capturing = failing  # type: ignore[method-assign]
+
+    @pytest.mark.parametrize("verb", ["ls-tree", "diff", "ls-files"])
+    def test_a_git_error_in_the_pre_push_check_refuses(
+        self, tmp_path, remote_bare, verb: str
+    ) -> None:
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        if verb == "ls-files":
+            # ls-files is only asked when HEAD has no such file.
+            _git("config", "user.email", "test@example.com", cwd=checkout)
+            _git("config", "user.name", "Test", cwd=checkout)
+            _git("rm", "-q", "global/settings.json", cwd=checkout)
+            _git("commit", "-qm", "drop", cwd=checkout)
+            (checkout / "global").mkdir(exist_ok=True)
+        (checkout / "global" / "notes.md").write_text("fleet note\n")
+        self._fail_git(mgr, verb)
+
+        result = mgr.push(message="x")
+
+        assert not result.success
+        assert (
+            "refusing to push: could not check global/settings.json: "
+            "fatal: injected failure"
+        ) in result.summary
+        assert "fleet note" not in _git("log", "-p", "--all", cwd=remote_bare)
+
+    def test_control_no_git_error_pushes(self, tmp_path, remote_bare) -> None:
+        _publish_settings(tmp_path, remote_bare, {"model": "opus"})
+        mgr, checkout = _enclosing_dir_machine(tmp_path, remote_bare)
+        (checkout / "global" / "notes.md").write_text("fleet note\n")
+        assert mgr.push(message="x").success
+        assert "fleet note" in _git("log", "-p", "--all", cwd=remote_bare)
+
+    def test_a_git_error_in_reset_copy_refuses_and_keeps_the_copy(
+        self, tmp_path, remote_bare
+    ) -> None:
+        mgr, copy, _live = self._changed_copy_machine(tmp_path, remote_bare)
+        self._fail_git(mgr, "show")
+
+        outcomes = mgr.migrate(reset_copy=True)
+
+        assert outcomes[1].refused
+        assert "could not check global/settings.json" in outcomes[1].detail
+        assert _read(copy) == {"model": "LOCAL-ONLY-VALUE"}
 
 
 class TestNoMergeEntriesPushAsOnMain:
