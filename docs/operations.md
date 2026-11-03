@@ -19,7 +19,7 @@ ctrlrelay generates platform-appropriate service unit files for you with
 
 | Service | Command | Why you want it running |
 |---|---|---|
-| Bridge | `ctrlrelay bridge start` | Delivers BLOCKED questions to Telegram and routes answers back. |
+| Bridge | `ctrlrelay bridge start` | Delivers BLOCKED questions to your chat (Telegram or Mattermost) and routes answers back. |
 | Poller | `ctrlrelay poller start --interval 300` | Watches GitHub for newly assigned issues and runs the dev pipeline. |
 | Status page (optional) | `ctrlrelay web start` | Read-only page and JSON API of what ctrlrelay is doing. See [Status page](#status-page). |
 
@@ -64,7 +64,9 @@ list` output is unambiguous. Pass `--dry-run` first to see what would
 be written; pass `--force` to overwrite a previously installed plist.
 
 If you'd rather hand-write the plists, here are the full templates the
-installer uses.
+installer uses. They show `CTRLRELAY_TELEGRAM_TOKEN`; on a Mattermost config
+use the variable your `transport.mattermost.bot_token_env` names
+(`CTRLRELAY_MATTERMOST_TOKEN` by default).
 
 `~/Library/LaunchAgents/com.example.ctrlrelay-bridge.plist`:
 
@@ -607,9 +609,9 @@ from an older plist/unit that didn't set these, add them and reload.
 
 | You changed... | Restart... |
 |---|---|
-| `transport.*` (Telegram token, chat ID, socket path) | bridge **and** poller |
+| `transport.*` (type, token env var, chat or channel ID, socket path) | bridge **and** poller |
 | `repos[]` (added/removed/renamed) | poller |
-| `claude.*` (binary path, timeout) | poller |
+| `agent.*` or `repos[].agent_type` (backend, binary path, timeout) | poller |
 | `paths.*` | both |
 | Anything in `dashboard.*` | poller |
 | `schedules.*` (cron expressions) | poller |
@@ -637,7 +639,8 @@ tail -f ~/.ctrlrelay/logs/web.log      # if the status page is installed
 ```
 
 The poller prints one line per detected issue and one line per pipeline outcome.
-The bridge prints connection events and Telegram API errors.
+The bridge prints connection events and chat API errors (Telegram Bot API or
+Mattermost REST/WebSocket).
 
 ### Tracing one agent session
 
@@ -661,7 +664,7 @@ The events it emits:
 | `dispatcher.session.cancelled` | INFO | Daemon shutdown killed the child mid-run. |
 | `dispatcher.checkpoint.missing` | WARNING | The session ended without writing a checkpoint. |
 | `dispatcher.checkpoint.read_failed` | ERROR | A checkpoint file existed but would not parse. |
-| `dispatcher.binary.fallback` | WARNING | `claude` was not on `PATH`; a well-known path was used instead. Expect this when the unit's `PATH` is minimal. |
+| `dispatcher.binary.fallback` | WARNING | The agent binary (`claude` or `opencode`) was not on `PATH`; a well-known path was used instead. Expect this when the unit's `PATH` is minimal. |
 | `dispatcher.binary.unresolved` | WARNING | Not on `PATH` and not at any known path — sessions are about to start failing to spawn. |
 
 Prompts and agent output never appear in plaintext: only a short SHA-256
@@ -674,7 +677,7 @@ their own record:
 
 | Event | When |
 |---|---|
-| `dev.question.posted` | The question reached the operator. The transport emits it on the bridge's ACK; the bridge emits it once the Telegram API has accepted the message, and adds `telegram_msg_id`. |
+| `dev.question.posted` | The question reached the operator. The transport emits it on the bridge's ACK; the bridge emits it once the chat server (Telegram or Mattermost) has accepted the message, and adds its `post_id`. |
 | `dev.question.post_failed` | Delivery failed. Carries `reason` (`send_failed`, `bridge_error`, or the exception class on the bridge side) and a truncated `error`. |
 | `dev.answer.received` | The operator's reply came back. |
 
@@ -720,12 +723,16 @@ Tables (defined in
 
 - **`sessions`** — every pipeline run. Columns: `id`, `pipeline`, `repo`,
   `issue_number`, `worktree_path`, `status`, `blocked_question`, `started_at`,
-  `ended_at`, `claude_exit_code`, `summary`.
+  `ended_at`, `claude_exit_code` (the worker's exit code, whichever backend),
+  `summary`, `agent_session_id`, `output_tail`.
 - **`repo_locks`** — currently held per-repo locks. PK on `repo`.
 - **`github_cursor`** — last-seen issue/PR timestamps per repo (used by the
   poller to bound API calls).
-- **`telegram_pending`** — outstanding bridge questions awaiting an operator
-  reply.
+- **`pending_resumes`** — one row per BLOCKED session's question, whichever
+  chat it went to: open until answered or expired, then kept for
+  `question_retention_days`. (`telegram_pending` still exists in the schema
+  but is unused.)
+- **`pr_watches`** — PRs the poller is watching for merge; survives restarts.
 - **`automation_decisions`** — operator decisions on `ask`-policy automation
   prompts.
 

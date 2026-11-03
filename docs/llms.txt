@@ -1,0 +1,36 @@
+# ctrlrelay
+
+> ctrlrelay is an open-source (Apache 2.0) Python daemon that runs on your own machine and turns a headless coding agent (Claude Code or OpenCode) into a background teammate for your GitHub repositories. It picks up assigned or labelled issues, works each one in an isolated git worktree, opens a pull request, waits for CI, posts an automated review, and asks a human on Telegram or Mattermost when the agent is blocked. The human's reply resumes the same agent session.
+
+Key facts:
+
+- Install: `pipx install ctrlrelay` (Python 3.12+, macOS or Linux; Windows is not supported). Requires `git` 2.20+ and the GitHub CLI `gh`, logged in.
+- First run: `ctrlrelay setup` writes `~/.config/ctrlrelay/orchestrator.yaml`; `ctrlrelay config validate` checks it; `ctrlrelay poller start` begins working issues; `ctrlrelay run dev --issue N --repo owner/name` runs one issue by hand.
+- Agent backend: `agent.type` is `"claude"` (default) or `"opencode"`; `repos[].agent_type` overrides it per repository. OpenCode can target a self-hosted OpenAI-compatible endpoint (a local model).
+- Chat: `transport.type` is `"telegram"`, `"mattermost"` or `"file_mock"` (no chat, for testing). Exactly one is active; running both at once is not supported. The bridge runs as its own daemon: `ctrlrelay bridge start`.
+- Tokens are never stored in the config file; the config names the environment variable (for example `CTRLRELAY_TELEGRAM_TOKEN`, `CTRLRELAY_MATTERMOST_TOKEN`).
+- Pipelines: `dev` (issue to pull request), `task` (issue with a task label, written report, no pull request), `secops` (scheduled Dependabot alert and pull request review), `post_merge`.
+- Automatic review: `code_review.method` is `"cli"` (default) or `"off"`.
+- Status page: `ctrlrelay web start`. Read-only, no login; never expose it to the internet.
+- Several machines can share one GitHub account and one chat; see Adding a machine.
+- State is a local SQLite file. There is no hosted service.
+
+## Docs
+
+- [Home](https://ainvirion.github.io/ctrlrelay/): what ctrlrelay is, how it works, why to use it
+- [Getting started](https://ainvirion.github.io/ctrlrelay/getting-started/): prerequisites, install, first run
+- [Configuration](https://ainvirion.github.io/ctrlrelay/configuration/): every key in `orchestrator.yaml`, with defaults
+- [Chat bridge](https://ainvirion.github.io/ctrlrelay/bridge/): setting up Telegram or Mattermost
+- [Feedback loop](https://ainvirion.github.io/ctrlrelay/feedback-loop/): how a blocked agent's question reaches you and your answer resumes the session
+- [CLI reference](https://ainvirion.github.io/ctrlrelay/cli/): every command and flag
+- [Operations](https://ainvirion.github.io/ctrlrelay/operations/): launchd and systemd services, status page, scheduled jobs, logs, state
+- [Adding a machine](https://ainvirion.github.io/ctrlrelay/adding-a-machine/): running several machines on one account
+- [Personalization sync](https://ainvirion.github.io/ctrlrelay/personalization/): syncing agent configuration across machines through a private GitHub repo
+
+## Optional
+
+- [Architecture](https://ainvirion.github.io/ctrlrelay/architecture/): components, dispatcher contract, state database, worktree lifecycle
+- [Development](https://ainvirion.github.io/ctrlrelay/development/): local development, tests, linting
+- [Registered mode (design)](https://ainvirion.github.io/ctrlrelay/registered-mode/): design notes, not a shipped feature
+- [Source code](https://github.com/AInvirion/ctrlrelay)
+- [Changelog](https://github.com/AInvirion/ctrlrelay/blob/main/CHANGELOG.md)

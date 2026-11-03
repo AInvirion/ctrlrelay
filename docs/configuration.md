@@ -23,7 +23,7 @@ node_id: "node-a"
 timezone: "America/New_York"
 
 paths:        { ... }
-claude:       { ... }
+agent:        { ... }
 transport:    { ... }
 dashboard:    { ... }
 web:          { ... }
@@ -36,7 +36,7 @@ repos:        [ ... ]
 | `node_id` | string | no | `socket.gethostname()` | Free-form identifier for this machine. Surfaces in dashboard heartbeats, session logs, and the claim comment on every issue it takes, so machines sharing one account must each have a different one. `unknown` is reserved (it names claims from older versions). Defaults to the OS hostname when omitted, null, or blank — set explicitly only if the hostname is meaningless (CI runners, ephemeral containers). |
 | `timezone` | string | no | `"UTC"` | IANA timezone (e.g. `America/Santiago`). Used for scheduling. |
 | `paths` | object | **yes** | — | See [paths](#paths). |
-| `claude` | object | no | (defaults) | See [claude](#claude). |
+| `agent` | object | no | (defaults) | Which coding agent runs sessions and how. See [agent backends](#agent-backends) and [agent](#agent). The legacy name `claude:` is still accepted, with a deprecation warning. |
 | `transport` | object | **yes** | — | See [transport](#transport). |
 | `dashboard` | object | no | (defaults) | See [dashboard](#dashboard). |
 | `web` | object | no | (defaults) | The read-only status page. See [web](#web). |
@@ -62,7 +62,7 @@ paths:
 
 | Key | Type | Required | Description |
 |---|---|---|---|
-| `state_db` | path | **yes** | SQLite database for sessions, locks, telegram_pending, automation_decisions. |
+| `state_db` | path | **yes** | SQLite database for sessions, locks, outstanding questions (`pending_resumes`), PR watches, automation decisions and the status-page event feed. |
 | `worktrees` | path | **yes** | Where ctrlrelay creates per-session `git worktree` directories. |
 | `bare_repos` | path | **yes** | Where ctrlrelay clones bare mirrors of each configured repo. |
 | `contexts` | path | **yes** | Per-repo context directory (looked up as `<contexts>/<owner-repo>/CLAUDE.md`). If a `CLAUDE.md` exists, it is symlinked into the worktree at session start. |
@@ -188,19 +188,24 @@ writes the checkpoint file** — so a model that cannot call tools cannot
 finish a session at all, however good its prose is. Test with a live
 call; a declared capability is not evidence.
 
-## claude
+## agent
 
-Controls how ctrlrelay invokes the `claude` CLI.
+The common keys of the `agent` block. They control how ctrlrelay invokes the
+`claude` CLI (the default backend); `opencode` has its own block, above. The
+block was called `claude:` before a second backend existed — that top-level
+name still loads, with a deprecation warning, and `agent:` wins if both are
+present.
 
 ```yaml
-claude:
+agent:
+  type: "claude"
   binary: "claude"
   default_timeout_seconds: 1800
-  output_format: "json"
 ```
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `type` | string | `"claude"` | Default backend for every repo: `"claude"` or `"opencode"`. See [agent backends](#agent-backends). |
 | `binary` | string | `"claude"` | Path to the `claude` executable. The bare name `"claude"` is auto-resolved at startup using `shutil.which("claude")`, then `~/.local/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude`. Set an absolute path to skip lookup (useful under launchd/systemd where PATH is minimal). |
 | `default_timeout_seconds` | int | `1800` | Per-session timeout passed to `asyncio.wait_for`. Sessions that exceed this are killed and reported as failed. |
 | `output_format` | string | `"json"` | Not used. The relay always runs `claude -p --output-format stream-json --verbose`, because only that output carries the subscription usage it reads (see [usage](#usage)). Kept so existing configs still load. |
@@ -682,7 +687,7 @@ and ask the operator), or `never` (skip).
 | `ci_wait_timeout_seconds` | `600` | Unused since #219 (the agent no longer waits on CI; ctrlrelay does). Still accepted so existing configs load. See [ci_wait_timeout_seconds](#reposautomationci_wait_timeout_seconds) below. |
 
 The current secops and dev pipelines read these settings to bias their prompts
-to Claude — they're not enforced by hard-coded checks.
+to the agent — they're not enforced by hard-coded checks.
 
 ### repos[].automation.exclude_labels
 
@@ -800,7 +805,7 @@ replayed into the dev pipeline the first time the poller sees the repo (or
 after any config change that clears `poller_state.json` for it). Some of
 those issues aren't code tasks at all — "create an account with a
 third-party service", "look into pricing" — and shouldn't go anywhere near
-an unsupervised `claude -p ... --dangerously-skip-permissions` run.
+an unsupervised agent run with `--dangerously-skip-permissions`.
 
 `require_labels` closes that gap: when configured, bare assignment is no
 longer sufficient by itself. An issue must be **both** assigned to the
@@ -835,7 +840,7 @@ access, so it no longer waits on CI: ctrlrelay pushes the branch after the
 agent exits and its own PR verifier waits on CI. The key is still accepted so
 existing configs load. What follows describes the earlier behaviour.
 
-The dev pipeline prompt told Claude to run `ctrlrelay ci wait --pr <PR>
+The dev pipeline prompt told the agent to run `ctrlrelay ci wait --pr <PR>
 --repo <repo> --timeout <N>` before signaling DONE — a single blocking call
 that polls GitHub every 15s until CI finishes, fails, or the timeout hits.
 No tokens get generated while it's blocked; on a repo with a slow CI suite,
@@ -853,7 +858,7 @@ repos:
 - Lower it to match how long the repo's CI actually takes — a repo with a
   2-minute CI suite gains nothing from a 10-minute cap.
 - A timeout here isn't a failure: `ctrlrelay ci wait` exits 2 (not 1) when
-  the deadline hits with checks still pending, and the prompt tells Claude
+  the deadline hits with checks still pending, and the prompt told the agent
   to treat that as acceptable and hand off rather than loop.
 - This does not change the overall session timeout (`agent.default_timeout_seconds`,
   default 1800s) — it only bounds the one `ci wait` call.
@@ -1038,7 +1043,7 @@ hyphen so `a-b/c` and `a/b-c` produce different slugs. `${PROJECT_ENCODED}`
 matches Claude Code's own path encoding rule (`/Users/foo/Projects/bar`
 → `-Users-foo-Projects-bar`).
 
-## Example: telegram-enabled config
+## Example: a full config
 
 ```yaml
 version: "1"
@@ -1052,13 +1057,13 @@ paths:
   contexts:    "~/.ctrlrelay/contexts"
   skills:      "~/.claude/skills"
 
-claude:
+agent:
+  type: "claude"
   binary: "/opt/homebrew/bin/claude"
   default_timeout_seconds: 3600
-  output_format: "json"
 
 transport:
-  type: "telegram"
+  type: "telegram"          # or "mattermost" with a mattermost: block
   telegram:
     bot_token_env: "CTRLRELAY_TELEGRAM_TOKEN"
     chat_id: 987654321
