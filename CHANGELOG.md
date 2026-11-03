@@ -56,9 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     clones have `filter=lfs` in HEAD's `.gitattributes`.
   - The bare clone's own config is still read. The relay writes it, and the
     sandbox keeps it read-only.
-  - The `CLAUDE.md` exclude line is written only inside the relay's own
-    clone (`<clone>.git/worktrees/<name>`, whose back-pointer must name this
-    worktree), opened without following any link.
+  - The `CLAUDE.md` exclude line is written only to the worktree's git
+    directory found from the path the relay made (never from the
+    worktree's `.git` file): `<clone>.git/worktrees/<basename>[N]`, whose
+    back-pointer must name this worktree. It is opened without following
+    any link, a hard-linked file is refused, and every refusal is logged
+    and skipped rather than failing the resume.
   - The reviewer's base branch and its commit come from GitHub rather than
     the bare clone, are pinned in the review copy, and are named in the
     review comment.
