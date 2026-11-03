@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.18.0] - 2026-11-03
-
 ### Added
 
 - `mode: merge` for a personalization path keeps the live file real and, on
@@ -22,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `apiKeyHelper` or `skipDangerousModePermissionPrompt` logs a warning.
   `ctrlrelay personalization migrate` converts the old symlink once, on
   request; pull and auto-pull refuse it instead (#287).
+
+## [0.18.0] - 2026-11-03
+
+### Added
+
 - A third agent backend: `agent.type: "opencode"` runs sessions through
   `opencode run --format json --dangerously-skip-permissions` — the spelling
   every opencode from 1.4 to 2.x accepts; its `--auto` alias exists only from
