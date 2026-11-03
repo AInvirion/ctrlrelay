@@ -7,16 +7,15 @@ as ``core.fsmonitor`` or as a clean filter. A plain ``git status`` or
 ``git diff`` in the worktree recurses into it and runs that program. The
 reviewer ran in that worktree, outside the agent sandbox.
 
-The control in each real-git test plants the trap and shows it fires in
-the agent's worktree, so a copy that stays quiet is quiet because the
-trap is gone, not because the trap never worked.
+Each test that asserts a trap stays quiet in the copy first shows it
+fires in the agent's worktree, so quiet means the trap is gone, not that
+it never worked.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -49,7 +48,6 @@ def git_home(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     (home / ".gitconfig").write_text(
         "[user]\n\tname = t\n\temail = t@t\n[init]\n\tdefaultBranch = main\n"
-        "[protocol \"file\"]\n\tallow = always\n"
     )
     return home
 
@@ -148,12 +146,16 @@ async def test_the_copy_writes_nothing_to_the_bare_clone(
         _git("for-each-ref", cwd=bare),
     )
 
+    objects = sorted(p.name for p in (bare / "objects").rglob("*"))
     copy = await mgr.make_review_copy(REPO, sha)
     try:
+        # Control: a copy was really made, at the pushed commit.
+        assert _git("rev-parse", "HEAD", cwd=copy).strip() == sha
         after = (
             _git("worktree", "list", "--porcelain", cwd=bare),
             _git("for-each-ref", cwd=bare),
         )
+        assert sorted(p.name for p in (bare / "objects").rglob("*")) == objects
     finally:
         await mgr.remove_review_copy(copy)
     assert after == before
@@ -165,11 +167,12 @@ async def test_a_sha_that_is_not_a_commit_id_is_refused(tmp_path: Path) -> None:
         worktrees_dir=tmp_path / "worktrees", bare_repos_dir=tmp_path / "bare",
     )
     mgr._get_bare_repo_path(REPO).mkdir(parents=True)
-    held = set(Path(tempfile.gettempdir()).glob("ctrlrelay-review-*"))
     for bad in ("main", "--upload-pack=x", "HEAD~1", "c0ffee"):
         with pytest.raises(WorktreeError, match="not a commit id"):
             await mgr.make_review_copy(REPO, bad)
-    assert set(Path(tempfile.gettempdir()).glob("ctrlrelay-review-*")) == held
+    assert not (tmp_path / "review").exists() or not any(
+        (tmp_path / "review").iterdir()
+    )
 
 
 @pytest.mark.asyncio
@@ -179,11 +182,14 @@ async def test_a_failed_copy_leaves_no_directory(
     mgr = WorktreeManager(
         worktrees_dir=tmp_path / "worktrees", bare_repos_dir=tmp_path / "bare",
     )
-    _trapped_worktree(tmp_path, mgr)
-    held = set(Path(tempfile.gettempdir()).glob("ctrlrelay-review-*"))
+    _wt, sha, _marks = _trapped_worktree(tmp_path, mgr)
+    # Control: the directory does get used, so empty-after means cleaned.
+    ok = await mgr.make_review_copy(REPO, sha)
+    assert ok.parent.parent == tmp_path / "review"
+    await mgr.remove_review_copy(ok)
     with pytest.raises(WorktreeError):
         await mgr.make_review_copy(REPO, "f" * 40)  # no such commit
-    assert set(Path(tempfile.gettempdir()).glob("ctrlrelay-review-*")) == held
+    assert list((tmp_path / "review").iterdir()) == []
 
 
 @pytest.mark.asyncio
@@ -193,8 +199,33 @@ async def test_remove_touches_only_a_review_copy(tmp_path: Path) -> None:
     )
     victim = tmp_path / "keep" / "repo"
     victim.mkdir(parents=True)
-    await mgr.remove_review_copy(victim)
-    assert victim.exists()
+    lookalike = tmp_path / "elsewhere" / "ctrlrelay-review-x" / "repo"
+    lookalike.mkdir(parents=True)
+    for path in (victim, lookalike):
+        with pytest.raises(WorktreeError, match="not a review copy"):
+            await mgr.remove_review_copy(path)
+        assert path.exists()
+
+
+@pytest.mark.asyncio
+async def test_the_copy_keeps_the_clones_origin(
+    tmp_path: Path, git_home: Path,
+) -> None:
+    """A reviewer that asks the forge about the branch must find the same
+    remote it found in the worktree, not the bare clone's local path."""
+    mgr = WorktreeManager(
+        worktrees_dir=tmp_path / "worktrees", bare_repos_dir=tmp_path / "bare",
+    )
+    _wt, sha, _marks = _trapped_worktree(tmp_path, mgr)
+    bare = mgr._get_bare_repo_path(REPO)
+    _git("remote", "set-url", "origin", "https://github.com/o/r.git", cwd=bare)
+    copy = await mgr.make_review_copy(REPO, sha)
+    try:
+        assert _git("remote", "get-url", "origin", cwd=copy).strip() == (
+            "https://github.com/o/r.git"
+        )
+    finally:
+        await mgr.remove_review_copy(copy)
 
 
 # --- through the dev pipeline, where the path is chosen ------------------
@@ -350,4 +381,26 @@ async def test_the_operators_own_filters_and_textconv_do_not_run_on_agent_files(
         out = _git("diff", "HEAD~1", "HEAD", "--", "t.txt", cwd=copy)
         assert "+two" in out
     finally:
+        await mgr.remove_review_copy(copy)
+
+
+@pytest.mark.asyncio
+async def test_a_copy_that_cannot_be_deleted_says_so(
+    tmp_path: Path, git_home: Path,
+) -> None:
+    """A leaked copy must reach the caller's log line, not vanish into an
+    ignored error."""
+    if os.geteuid() == 0:
+        pytest.skip("root can delete a read-only directory")
+    mgr = WorktreeManager(
+        worktrees_dir=tmp_path / "worktrees", bare_repos_dir=tmp_path / "bare",
+    )
+    _wt, sha, _marks = _trapped_worktree(tmp_path, mgr)
+    copy = await mgr.make_review_copy(REPO, sha)
+    copy.chmod(0o500)
+    try:
+        with pytest.raises(PermissionError):
+            await mgr.remove_review_copy(copy)
+    finally:
+        copy.chmod(0o700)
         await mgr.remove_review_copy(copy)

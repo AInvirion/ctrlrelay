@@ -1615,7 +1615,12 @@ class WorktreeManager:
         come across, and a gitlink checks out as an empty directory.
 
         The clone is made in a new directory from ``mkdtemp`` (0700,
-        created by this call), so nothing can be planted there first.
+        created by this call) under :meth:`_review_root`, beside the
+        bare clones and not in the system temp dir (which can be a small
+        tmpfs), so nothing can be planted there first. Its ``origin`` is
+        set to the bare clone's own ``origin`` URL, so a reviewer that
+        asks the forge about the branch finds the same remote it did in
+        the worktree.
         It reads the bare repo and writes nothing to it, so it needs no
         repo lock: the review can run while the lock is released for the
         CI wait.
@@ -1633,7 +1638,9 @@ class WorktreeManager:
         bare_path = self._get_bare_repo_path(repo)
         if not bare_path.exists():
             raise WorktreeError(f"review copy: no clone of {repo} at {bare_path}")
-        holder = Path(tempfile.mkdtemp(prefix="ctrlrelay-review-"))
+        root = self._review_root()
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        holder = Path(tempfile.mkdtemp(prefix="ctrlrelay-review-", dir=root))
         dest = holder / "repo"
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         env["GIT_TERMINAL_PROMPT"] = "0"
@@ -1660,6 +1667,18 @@ class WorktreeManager:
             head = (await self._run_git(
                 "-C", str(dest), "rev-parse", "HEAD", env=env,
             )).strip()
+            try:
+                origin = (await self._run_git(
+                    "config", "--get", "remote.origin.url",
+                    cwd=bare_path, env=env,
+                )).strip()
+            except WorktreeError:
+                origin = ""
+            if origin:
+                await self._run_git(
+                    "-C", str(dest), "remote", "set-url", "origin", origin,
+                    env=env,
+                )
             if head != sha:
                 raise WorktreeError(
                     f"review copy is at {head[:12]}, expected {sha[:12]}"
@@ -1669,17 +1688,26 @@ class WorktreeManager:
             raise
         return dest
 
+    def _review_root(self) -> Path:
+        """Where review copies are made: beside the bare clones."""
+        return self.bare_repos_dir.parent / "review"
+
     async def remove_review_copy(self, path: Path) -> None:
-        """Delete a copy made by :meth:`make_review_copy`. Only a path
-        that looks like one is removed, so a wrong argument cannot
-        delete something else."""
+        """Delete a copy made by :meth:`make_review_copy`.
+
+        Raises rather than returning quietly, so the caller's log line
+        fires and a copy that is left behind is visible: a path that is
+        not one of these copies is refused (a wrong argument cannot
+        delete something else), and a failed delete propagates.
+        """
         holder = Path(path).parent
-        if (
+        if not (
             Path(path).name == "repo"
             and holder.name.startswith("ctrlrelay-review-")
-            and holder.parent == Path(tempfile.gettempdir())
+            and holder.parent == self._review_root()
         ):
-            shutil.rmtree(holder, ignore_errors=True)
+            raise WorktreeError(f"not a review copy: {path}")
+        shutil.rmtree(holder)
 
     async def remove_worktree(self, repo: str, session_id: str) -> None:
         """Remove a worktree and clean up."""
