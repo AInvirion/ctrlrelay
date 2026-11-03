@@ -1485,8 +1485,14 @@ class PersonalizationManager:
         merge step that would name the link. Without this the operator
         is told to "resolve conflicts" and never hears the actual fix.
         """
+        # Runs on failure paths: it must never replace the failure being
+        # reported with an exception of its own.
         rels: list[str] = []
-        for _entry, plan in self._plan_merges():
+        try:
+            plans = self._plan_merges()
+        except Exception:
+            return ""
+        for _entry, plan in plans:
             try:
                 if is_link_into(plan.target, plan.source):
                     rels.append(str(plan.source.relative_to(self.checkout_path)))

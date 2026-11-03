@@ -964,9 +964,24 @@ class TestManagerMerge:
         assert "BLOCKED" in result.summary
         assert "ctrlrelay personalization migrate" in result.summary
         assert live.is_symlink()
-        # Control: the advice is the way out.
+        # Control: the advice is the way out. A fleet change published
+        # after the migration really arrives.
         assert mgr.migrate()[0].action == "migrated"
-        assert mgr.auto_pull().success
+        _publish_settings(tmp_path, remote_bare, {"model": "sonnet"})
+        after = mgr.auto_pull()
+        assert after.success, after.summary
+        assert _read(live)["model"] == "sonnet"
+
+    def test_the_hint_never_hides_the_failure(self, tmp_path, remote_bare, monkeypatch) -> None:
+        mgr, _live = self._old_link_written_by_app(tmp_path, remote_bare)
+
+        def boom():
+            raise RuntimeError("planning broke")
+
+        monkeypatch.setattr(mgr, "_plan_merges", boom)
+        result = mgr.auto_pull()
+        assert not result.success
+        assert "BLOCKED" in result.summary
 
     def test_a_dirty_tree_without_an_old_link_gets_no_migrate_hint(
         self, tmp_path, remote_bare
