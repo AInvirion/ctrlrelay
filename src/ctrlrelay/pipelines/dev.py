@@ -1994,7 +1994,10 @@ async def _step_review(run: _DevRun) -> None:
     # The base comes from GitHub, never from the bare clone (#263): the
     # agent can write that clone's HEAD and branch refs, and either one
     # moved would narrow what the reviewer diffs. The sha is pinned in
-    # the copy and named in the comment.
+    # the copy and named in the comment. The default branch is the right
+    # base because it is the only one the relay opens pull requests
+    # against (`_Publisher.publish`, and `_check_reusable` refuses to
+    # adopt a PR aimed anywhere else).
     review_base_sha: str | None = None
     try:
         review_base = run.publisher.default_branch or (

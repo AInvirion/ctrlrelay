@@ -369,9 +369,10 @@ class _UnsafeExcludeError(Exception):
     a link."""
 
 
-def _add_exclude_line(gitdir: Path, line: str) -> None:
-    """Append ``line`` to ``<gitdir>/info/exclude`` if the file exists and
-    lacks it, without following a link at ``info`` or at ``exclude`` (#263).
+def _add_exclude_line(admin_fd: int, where: Path, line: str) -> None:
+    """Append ``line`` to ``info/exclude`` under the directory open at
+    ``admin_fd`` if the file exists and lacks it, without following a link
+    at ``info`` or at ``exclude`` (#263).
 
     A linked worktree's git directory is writable by the agent under the
     sandbox, and this runs outside it on resume. ``git worktree add``
@@ -379,18 +380,19 @@ def _add_exclude_line(gitdir: Path, line: str) -> None:
     by someone else, and a link would turn this write into one anywhere
     the relay can write. Nothing there is not an error; something there
     that is a link, or not a regular file, raises
-    :class:`_UnsafeExcludeError` and nothing is written.
+    :class:`_UnsafeExcludeError` and nothing is written. ``where`` is the
+    directory's path, for messages only.
     """
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
         info_fd = os.open(
-            gitdir / "info", os.O_RDONLY | os.O_DIRECTORY | nofollow,
+            "info", os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=admin_fd,
         )
     except FileNotFoundError:
         return
     except OSError as e:
         raise _UnsafeExcludeError(
-            f"{gitdir / 'info'} is not a directory reached without a link "
+            f"{where / 'info'} is not a directory reached without a link "
             f"({type(e).__name__})"
         ) from e
     try:
@@ -402,13 +404,13 @@ def _add_exclude_line(gitdir: Path, line: str) -> None:
             return
         except OSError as e:
             raise _UnsafeExcludeError(
-                f"{gitdir / 'info' / 'exclude'} is not a plain file "
+                f"{where / 'info' / 'exclude'} is not a plain file "
                 f"({type(e).__name__})"
             ) from e
         with os.fdopen(fd, "r+") as f:
             if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
                 raise _UnsafeExcludeError(
-                    f"{gitdir / 'info' / 'exclude'} is not a regular file"
+                    f"{where / 'info' / 'exclude'} is not a regular file"
                 )
             content = f.read()
             if line in content:
@@ -1935,9 +1937,8 @@ class WorktreeManager:
 
         target.symlink_to(context_path.resolve())
 
-        gitdir = self._get_gitdir(worktree_path)
         try:
-            _add_exclude_line(gitdir, "CLAUDE.md")
+            self._add_context_exclude(worktree_path)
         except _UnsafeExcludeError as e:
             # Refused, not followed: the line only keeps the link out of
             # `git status`, so the run carries on without it.
@@ -1945,6 +1946,88 @@ class WorktreeManager:
                 _logger, "worktree.context.exclude_refused",
                 worktree=str(worktree_path), reason=str(e),
             )
+
+    def _add_context_exclude(self, worktree_path: Path) -> None:
+        """Add ``CLAUDE.md`` to the worktree's ``info/exclude``, reached only
+        inside one of the relay's own clones (#263).
+
+        The worktree's ``.git`` file names its git directory, and that
+        file is the agent's to rewrite when there is no sandbox. So the
+        name it gives is only accepted when it is
+        ``<bare_repos_dir>/<clone>.git/worktrees/<name>``, each part is
+        opened from ``bare_repos_dir`` down without following a link, and
+        that directory's own ``gitdir`` file points back at this worktree
+        (which a planted pointer to another session's directory fails).
+        Anything else raises :class:`_UnsafeExcludeError`.
+        """
+        dot_git = worktree_path / ".git"
+        if not os.path.lexists(dot_git):
+            return
+        try:
+            gitdir = self._get_gitdir(worktree_path)
+        except (OSError, UnicodeDecodeError) as e:
+            raise _UnsafeExcludeError(
+                f"cannot read {dot_git} ({type(e).__name__})"
+            ) from e
+        if not gitdir.is_absolute():
+            gitdir = worktree_path / gitdir
+        gitdir = Path(os.path.normpath(gitdir))
+        roots = {
+            Path(os.path.normpath(os.path.abspath(self.bare_repos_dir))),
+            Path(os.path.realpath(self.bare_repos_dir)),
+        }
+        parts: tuple[str, ...] | None = None
+        for root in roots:
+            try:
+                rel = gitdir.relative_to(root).parts
+            except ValueError:
+                continue
+            if (
+                len(rel) == 3
+                and rel[0].endswith(".git")
+                and rel[1] == "worktrees"
+                and rel[2] not in ("", ".", "..")
+            ):
+                parts = rel
+                break
+        if parts is None:
+            raise _UnsafeExcludeError(
+                f"{dot_git} names {gitdir}, which is not a worktree directory "
+                f"of a clone under {self.bare_repos_dir}"
+            )
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.bare_repos_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in parts:
+                try:
+                    nxt = os.open(
+                        part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd,
+                    )
+                except OSError as e:
+                    raise _UnsafeExcludeError(
+                        f"{gitdir} is not reached without a link "
+                        f"({type(e).__name__})"
+                    ) from e
+                os.close(fd)
+                fd = nxt
+            try:
+                pfd = os.open("gitdir", os.O_RDONLY | nofollow, dir_fd=fd)
+                with os.fdopen(pfd, "r") as f:
+                    pointer = f.read().strip()
+            except OSError as e:
+                raise _UnsafeExcludeError(
+                    f"{gitdir}/gitdir cannot be read without a link "
+                    f"({type(e).__name__})"
+                ) from e
+            if not os.path.isabs(pointer):
+                pointer = os.path.join(gitdir, pointer)
+            if os.path.realpath(pointer) != os.path.realpath(dot_git):
+                raise _UnsafeExcludeError(
+                    f"{gitdir} belongs to another worktree"
+                )
+            _add_exclude_line(fd, gitdir, "CLAUDE.md")
+        finally:
+            os.close(fd)
 
     def remove_context_symlink(self, worktree_path: Path) -> None:
         """Remove CLAUDE.md symlink before git operations."""

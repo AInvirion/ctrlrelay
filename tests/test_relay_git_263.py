@@ -249,6 +249,7 @@ def test_a_link_at_info_is_not_followed(tmp_path: Path, git_home) -> None:
 
 
 def test_no_exclude_file_creates_none(tmp_path: Path, git_home) -> None:
+    """Behaviour kept from before, not a guard: no plant is involved."""
     mgr, wt, gitdir = _linked_worktree(tmp_path)
     mgr.symlink_context(wt, _context(tmp_path))
     assert not (gitdir / "info").exists()
@@ -457,3 +458,84 @@ async def test_a_base_github_cannot_name_is_not_reviewed(
     assert seen == []
     worktree.make_review_copy.assert_not_awaited()
     assert result.review.status == "base_unknown"
+
+
+def _pre_fix_exclude_write(worktree_path: Path) -> None:
+    """The exclude write as it was before #263, for the controls below."""
+    dot_git = worktree_path / ".git"
+    gitdir = Path(dot_git.read_text().strip()[len("gitdir: "):])
+    exclude_file = gitdir / "info" / "exclude"
+    if exclude_file.exists():
+        content = exclude_file.read_text()
+        if "CLAUDE.md" not in content:
+            exclude_file.write_text(content.rstrip() + "\nCLAUDE.md\n")
+
+
+def _decoy(tmp_path: Path, name: str) -> Path:
+    decoy = tmp_path / name
+    (decoy / "info").mkdir(parents=True)
+    (decoy / "info" / "exclude").write_text("decoy\n")
+    return decoy
+
+
+def test_a_rewritten_dot_git_pointer_is_not_followed(
+    tmp_path: Path, git_home,
+) -> None:
+    """Without the sandbox the agent can rewrite the worktree's `.git`
+    file to name any directory."""
+    mgr, wt, _gitdir = _linked_worktree(tmp_path)
+    ctl = _decoy(tmp_path, "control-decoy")
+    (wt / ".git").write_text(f"gitdir: {ctl}\n")
+    _pre_fix_exclude_write(wt)
+    assert (ctl / "info" / "exclude").read_text() == "decoy\nCLAUDE.md\n", (
+        "control"
+    )
+
+    decoy = _decoy(tmp_path, "decoy")
+    (wt / ".git").write_text(f"gitdir: {decoy}\n")
+    mgr.symlink_context(wt, _context(tmp_path))
+    assert (decoy / "info" / "exclude").read_text() == "decoy\n"
+    assert (wt / "CLAUDE.md").is_symlink()
+
+
+def test_a_pointer_to_another_sessions_git_dir_is_not_followed(
+    tmp_path: Path, git_home,
+) -> None:
+    """Inside the clone's `worktrees/`, but not this worktree's: its own
+    `gitdir` file points at the other worktree."""
+    mgr, wt, _gitdir = _linked_worktree(tmp_path)
+    bare = mgr._get_bare_repo_path(REPO)
+    other = tmp_path / "other"
+    _git("worktree", "add", "-q", "-b", "other", str(other), cwd=bare)
+    other_dir = mgr._get_gitdir(other)
+    (other_dir / "info").mkdir()
+    (other_dir / "info" / "exclude").write_text("other\n")
+    (wt / ".git").write_text(f"gitdir: {other_dir}\n")
+    _pre_fix_exclude_write(wt)
+    assert (other_dir / "info" / "exclude").read_text() == "other\nCLAUDE.md\n", (
+        "control"
+    )
+    (other_dir / "info" / "exclude").write_text("other\n")
+
+    mgr.symlink_context(wt, _context(tmp_path))
+    assert (other_dir / "info" / "exclude").read_text() == "other\n"
+
+
+def test_a_link_at_the_worktree_git_dir_is_not_followed(
+    tmp_path: Path, git_home,
+) -> None:
+    """The name is right but the directory at it is a link elsewhere."""
+    mgr, wt, gitdir = _linked_worktree(tmp_path)
+    moved = tmp_path / "moved-admin"
+    gitdir.rename(moved)
+    gitdir.symlink_to(moved)
+    (moved / "info").mkdir()
+    (moved / "info" / "exclude").write_text("moved\n")
+    _pre_fix_exclude_write(wt)
+    assert (moved / "info" / "exclude").read_text() == "moved\nCLAUDE.md\n", (
+        "control"
+    )
+    (moved / "info" / "exclude").write_text("moved\n")
+
+    mgr.symlink_context(wt, _context(tmp_path))
+    assert (moved / "info" / "exclude").read_text() == "moved\n"
