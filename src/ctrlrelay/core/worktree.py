@@ -408,9 +408,15 @@ def _add_exclude_line(admin_fd: int, where: Path, line: str) -> None:
                 f"({type(e).__name__})"
             ) from e
         with os.fdopen(fd, "r+") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode):
                 raise _UnsafeExcludeError(
                     f"{where / 'info' / 'exclude'} is not a regular file"
+                )
+            # A hard link would send the append to the other name's file.
+            if st.st_nlink != 1:
+                raise _UnsafeExcludeError(
+                    f"{where / 'info' / 'exclude'} has {st.st_nlink} links"
                 )
             content = f.read()
             if line in content:
@@ -1939,95 +1945,99 @@ class WorktreeManager:
 
         try:
             self._add_context_exclude(worktree_path)
-        except _UnsafeExcludeError as e:
-            # Refused, not followed: the line only keeps the link out of
-            # `git status`, so the run carries on without it.
+        except (_UnsafeExcludeError, OSError, ValueError) as e:
+            # Refused, not followed, and never raised out of a resume: the
+            # line only keeps the link out of `git status`, so the run
+            # carries on without it. ValueError covers a back-pointer
+            # that is not UTF-8.
             log_event(
                 _logger, "worktree.context.exclude_refused",
-                worktree=str(worktree_path), reason=str(e),
+                worktree=str(worktree_path),
+                reason=f"{type(e).__name__}: {e}"[:300],
             )
 
     def _add_context_exclude(self, worktree_path: Path) -> None:
-        """Add ``CLAUDE.md`` to the worktree's ``info/exclude``, reached only
-        inside one of the relay's own clones (#263).
+        """Add ``CLAUDE.md`` to the worktree's ``info/exclude``, found from
+        the relay's own data only (#263).
 
-        The worktree's ``.git`` file names its git directory, and that
-        file is the agent's to rewrite when there is no sandbox. So the
-        name it gives is only accepted when it is
-        ``<bare_repos_dir>/<clone>.git/worktrees/<name>``, each part is
+        The worktree's ``.git`` file is never read: the agent can rewrite
+        it when there is no sandbox. Git names a worktree's directory
+        after the basename of the path the relay gave ``worktree add``,
+        with a number appended on a collision. So the candidates are
+        ``<bare_repos_dir>/<clone>.git/worktrees/<basename>[N]``, each
         opened from ``bare_repos_dir`` down without following a link, and
-        that directory's own ``gitdir`` file points back at this worktree
-        (which a planted pointer to another session's directory fails).
-        Anything else raises :class:`_UnsafeExcludeError`.
+        the one used is the single candidate whose own ``gitdir``
+        back-pointer resolves to this worktree's ``.git``. None, or more
+        than one, raises :class:`_UnsafeExcludeError`.
         """
-        dot_git = worktree_path / ".git"
-        if not os.path.lexists(dot_git):
-            return
-        try:
-            gitdir = self._get_gitdir(worktree_path)
-        except (OSError, UnicodeDecodeError) as e:
-            raise _UnsafeExcludeError(
-                f"cannot read {dot_git} ({type(e).__name__})"
-            ) from e
-        if not gitdir.is_absolute():
-            gitdir = worktree_path / gitdir
-        gitdir = Path(os.path.normpath(gitdir))
-        roots = {
-            Path(os.path.normpath(os.path.abspath(self.bare_repos_dir))),
-            Path(os.path.realpath(self.bare_repos_dir)),
-        }
-        parts: tuple[str, ...] | None = None
-        for root in roots:
-            try:
-                rel = gitdir.relative_to(root).parts
-            except ValueError:
-                continue
-            if (
-                len(rel) == 3
-                and rel[0].endswith(".git")
-                and rel[1] == "worktrees"
-                and rel[2] not in ("", ".", "..")
-            ):
-                parts = rel
-                break
-        if parts is None:
-            raise _UnsafeExcludeError(
-                f"{dot_git} names {gitdir}, which is not a worktree directory "
-                f"of a clone under {self.bare_repos_dir}"
-            )
         nofollow = getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(self.bare_repos_dir, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            for part in parts:
-                try:
-                    nxt = os.open(
-                        part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd,
-                    )
-                except OSError as e:
-                    raise _UnsafeExcludeError(
-                        f"{gitdir} is not reached without a link "
-                        f"({type(e).__name__})"
-                    ) from e
-                os.close(fd)
-                fd = nxt
+        dflags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+        base = worktree_path.name
+        want = os.path.realpath(worktree_path / ".git")
+
+        def is_candidate(name: str) -> bool:
+            return name == base or (
+                name.startswith(base) and name[len(base):].isdigit()
+            )
+
+        def points_here(admin_fd: int, admin: Path) -> bool:
             try:
-                pfd = os.open("gitdir", os.O_RDONLY | nofollow, dir_fd=fd)
-                with os.fdopen(pfd, "r") as f:
-                    pointer = f.read().strip()
-            except OSError as e:
-                raise _UnsafeExcludeError(
-                    f"{gitdir}/gitdir cannot be read without a link "
-                    f"({type(e).__name__})"
-                ) from e
+                pfd = os.open("gitdir", os.O_RDONLY | nofollow, dir_fd=admin_fd)
+            except OSError:
+                return False
+            with os.fdopen(pfd, "rb") as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    return False
+                # Strict: a pointer that is not UTF-8 raises, and the
+                # caller logs it as a refusal.
+                pointer = f.read().decode("utf-8").strip()
             if not os.path.isabs(pointer):
-                pointer = os.path.join(gitdir, pointer)
-            if os.path.realpath(pointer) != os.path.realpath(dot_git):
+                pointer = os.path.join(admin, pointer)
+            return os.path.realpath(pointer) == want
+
+        root_fd = os.open(self.bare_repos_dir, os.O_RDONLY | os.O_DIRECTORY)
+        matches: list[tuple[int, Path]] = []
+        try:
+            for clone in sorted(os.listdir(root_fd)):
+                if not clone.endswith(".git"):
+                    continue
+                try:
+                    clone_fd = os.open(clone, dflags, dir_fd=root_fd)
+                except OSError:
+                    continue
+                try:
+                    try:
+                        wts_fd = os.open("worktrees", dflags, dir_fd=clone_fd)
+                    except OSError:
+                        continue
+                    try:
+                        for name in sorted(os.listdir(wts_fd)):
+                            if not is_candidate(name):
+                                continue
+                            try:
+                                admin_fd = os.open(name, dflags, dir_fd=wts_fd)
+                            except OSError:
+                                continue
+                            admin = self.bare_repos_dir / clone / "worktrees" / name
+                            if points_here(admin_fd, admin):
+                                matches.append((admin_fd, admin))
+                            else:
+                                os.close(admin_fd)
+                    finally:
+                        os.close(wts_fd)
+                finally:
+                    os.close(clone_fd)
+            if len(matches) != 1:
                 raise _UnsafeExcludeError(
-                    f"{gitdir} belongs to another worktree"
+                    f"{len(matches)} git directories in {self.bare_repos_dir} "
+                    f"point back at {worktree_path}"
                 )
-            _add_exclude_line(fd, gitdir, "CLAUDE.md")
+            admin_fd, admin = matches[0]
+            _add_exclude_line(admin_fd, admin, "CLAUDE.md")
         finally:
-            os.close(fd)
+            os.close(root_fd)
+            for fd, _ in matches:
+                os.close(fd)
 
     def remove_context_symlink(self, worktree_path: Path) -> None:
         """Remove CLAUDE.md symlink before git operations."""

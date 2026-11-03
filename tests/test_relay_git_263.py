@@ -19,6 +19,7 @@ the relay's guard, so quiet means guarded, not broken.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -516,9 +517,13 @@ def test_a_pointer_to_another_sessions_git_dir_is_not_followed(
         "control"
     )
     (other_dir / "info" / "exclude").write_text("other\n")
+    # This worktree's own directory, found from the path the relay made.
+    (_gitdir / "info").mkdir()
+    (_gitdir / "info" / "exclude").write_text("own\n")
 
     mgr.symlink_context(wt, _context(tmp_path))
     assert (other_dir / "info" / "exclude").read_text() == "other\n"
+    assert (_gitdir / "info" / "exclude").read_text() == "own\nCLAUDE.md\n"
 
 
 def test_a_link_at_the_worktree_git_dir_is_not_followed(
@@ -539,3 +544,78 @@ def test_a_link_at_the_worktree_git_dir_is_not_followed(
 
     mgr.symlink_context(wt, _context(tmp_path))
     assert (moved / "info" / "exclude").read_text() == "moved\n"
+
+
+def test_a_hard_linked_exclude_is_not_appended_to(
+    tmp_path: Path, git_home,
+) -> None:
+    mgr, wt, gitdir = _linked_worktree(tmp_path)
+    victim = tmp_path / "victim"
+    victim.write_text("operator file\n")
+    (gitdir / "info").mkdir()
+    os.link(victim, gitdir / "info" / "exclude")
+    _pre_fix_exclude_write(wt)
+    assert victim.read_text() == "operator file\nCLAUDE.md\n", "control"
+    victim.write_text("operator file\n")
+
+    mgr.symlink_context(wt, _context(tmp_path))
+    assert victim.read_text() == "operator file\n"
+    assert (wt / "CLAUDE.md").is_symlink()
+
+
+def test_only_the_back_pointer_stops_a_same_named_git_dir(
+    tmp_path: Path, git_home,
+) -> None:
+    """A directory with this worktree's name in another clone's
+    `worktrees/`: a real directory, no links, a readable pointer. Only
+    the pointer's target differs."""
+    mgr, wt, gitdir = _linked_worktree(tmp_path)
+    shutil.rmtree(gitdir)  # this worktree's own directory is gone
+    other_bare = tmp_path / "bare" / "o-other.git"
+    _git("clone", "-q", "--bare", str(tmp_path / "src"), str(other_bare),
+         cwd=tmp_path)
+    twin = tmp_path / "elsewhere" / wt.name
+    twin.parent.mkdir()
+    _git("worktree", "add", "-q", "-b", "twin", str(twin), cwd=other_bare)
+    twin_dir = other_bare / "worktrees" / wt.name
+    assert twin_dir.is_dir() and not twin_dir.is_symlink()
+    (twin_dir / "info").mkdir()
+    (twin_dir / "info" / "exclude").write_text("twin\n")
+    # Control: reached by name, the plant is written.
+    (wt / ".git").write_text(f"gitdir: {twin_dir}\n")
+    _pre_fix_exclude_write(wt)
+    assert (twin_dir / "info" / "exclude").read_text() == "twin\nCLAUDE.md\n", (
+        "control"
+    )
+    (twin_dir / "info" / "exclude").write_text("twin\n")
+
+    mgr.symlink_context(wt, _context(tmp_path))
+    assert (twin_dir / "info" / "exclude").read_text() == "twin\n"
+
+
+def test_a_missing_clone_dir_is_logged_not_raised(
+    tmp_path: Path, git_home, caplog,
+) -> None:
+    mgr, wt, _gitdir = _linked_worktree(tmp_path)
+    mgr.bare_repos_dir = tmp_path / "no-such-dir"
+    # Control: the open really fails.
+    with pytest.raises(OSError):
+        os.open(mgr.bare_repos_dir, os.O_RDONLY | os.O_DIRECTORY)
+    caplog.set_level("INFO")
+    mgr.symlink_context(wt, _context(tmp_path))
+    assert (wt / "CLAUDE.md").is_symlink()
+    assert "worktree.context.exclude_refused" in caplog.text
+
+
+def test_a_back_pointer_that_is_not_utf8_is_logged_not_raised(
+    tmp_path: Path, git_home, caplog,
+) -> None:
+    mgr, wt, gitdir = _linked_worktree(tmp_path)
+    (gitdir / "gitdir").write_bytes(b"\xff\xfe/not utf-8\n")
+    # Control: strict decoding of it fails.
+    with pytest.raises(UnicodeDecodeError):
+        (gitdir / "gitdir").read_bytes().decode("utf-8")
+    caplog.set_level("INFO")
+    mgr.symlink_context(wt, _context(tmp_path))
+    assert (wt / "CLAUDE.md").is_symlink()
+    assert "worktree.context.exclude_refused" in caplog.text
