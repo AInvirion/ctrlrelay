@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-03
+
 ### Added
 
 - `repos[].steps` sets each dev pipeline work step (`code`, `publish`,
@@ -2255,7 +2257,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.16.4...v0.17.0
