@@ -1919,20 +1919,22 @@ async def _step_verify(run: _DevRun) -> None:
         # status page's PR counts and time-to-PR read this event, so a
         # repo with verify off would otherwise show no PRs at all. Once
         # per session and PR, as on the CI path.
-        pr_url = run.result.outputs.get("pr_url")
-        pr_number = run.pr_number_for_review
-        emit_event_once(
-            run.state_db, EventKind.PR_OPENED,
-            lambda: {
+        # Everything is read inside the builder, which runs under the
+        # event guard: an event write must never fail the run.
+        def _pr_published() -> dict[str, Any]:
+            pr_url = run.result.outputs.get("pr_url")
+            return {
                 "repo": run.repo,
                 "issue_number": run.issue_number,
                 "session_id": run.session_id,
                 "detail": {
-                    "pr_number": pr_number,
+                    "pr_number": run.pr_number_for_review,
                     "pr_url": pr_url if isinstance(pr_url, str) else None,
                 },
-            },
-        )
+            }
+
+        state_db = run.state_db
+        emit_event_once(state_db, EventKind.PR_OPENED, _pr_published)
         log_event(
             _logger,
             "dev.verify.off",
