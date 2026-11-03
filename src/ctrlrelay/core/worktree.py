@@ -1598,6 +1598,89 @@ class WorktreeManager:
                     repo=repo, reason=type(e).__name__,
                 )
 
+    async def make_review_copy(self, repo: str, sha: str) -> Path:
+        """A fresh clone of the bare repo checked out at ``sha``, for the
+        reviewer (#263).
+
+        The reviewer used to run in the agent's own worktree, after the
+        agent had exited. Anything the agent left there that git follows
+        was then followed by a process outside the agent sandbox. The
+        measured case: a nested repository (a gitlink plus its own
+        ``.git``) whose config sets ``core.fsmonitor`` or a clean filter.
+        A plain ``git status`` or ``git diff`` in the worktree recurses
+        into it, reads that config and runs the program it names.
+
+        A clone carries only committed content. A commit cannot hold a
+        ``.git`` path, so no nested repository or planted config can
+        come across, and a gitlink checks out as an empty directory.
+
+        The clone is made in a new directory from ``mkdtemp`` (0700,
+        created by this call), so nothing can be planted there first.
+        It reads the bare repo and writes nothing to it, so it needs no
+        repo lock: the review can run while the lock is released for the
+        CI wait.
+
+        Filter and diff drivers from the operator's own config are
+        switched off in the copy for the same reason (see below).
+
+        This covers what the reviewer finds on disk. It does not stop
+        the reviewer running the committed code itself (see
+        ``CodeReviewConfig.cli_command``), and it is not on the path of
+        the agent's own git calls, which run inside its sandbox.
+        """
+        if not _HEX_SHA.match(sha):
+            raise WorktreeError(f"review copy refused: {sha!r} is not a commit id")
+        bare_path = self._get_bare_repo_path(repo)
+        if not bare_path.exists():
+            raise WorktreeError(f"review copy: no clone of {repo} at {bare_path}")
+        holder = Path(tempfile.mkdtemp(prefix="ctrlrelay-review-"))
+        dest = holder / "repo"
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        flags = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+        try:
+            await self._run_git(
+                *flags, "clone", "--quiet", "--no-checkout", "--shared",
+                "--", str(bare_path), str(dest), env=env,
+            )
+            # Before the checkout: a committed `.gitattributes` can point
+            # a file at any filter or diff driver the operator's own
+            # config defines (git-lfs, a textconv), which would then run
+            # on agent-written content here, outside the sandbox. This
+            # file outranks every `.gitattributes` in the tree, and `!`
+            # puts both back to unspecified: no driver, and git's own
+            # binary detection. The reviewer's diffs read it too.
+            info = dest / ".git" / "info"
+            info.mkdir(parents=True, exist_ok=True)
+            (info / "attributes").write_text("* !filter !diff\n")
+            await self._run_git(
+                *flags, "-C", str(dest), "checkout", "--quiet", "--detach",
+                sha, env=env,
+            )
+            head = (await self._run_git(
+                "-C", str(dest), "rev-parse", "HEAD", env=env,
+            )).strip()
+            if head != sha:
+                raise WorktreeError(
+                    f"review copy is at {head[:12]}, expected {sha[:12]}"
+                )
+        except BaseException:
+            shutil.rmtree(holder, ignore_errors=True)
+            raise
+        return dest
+
+    async def remove_review_copy(self, path: Path) -> None:
+        """Delete a copy made by :meth:`make_review_copy`. Only a path
+        that looks like one is removed, so a wrong argument cannot
+        delete something else."""
+        holder = Path(path).parent
+        if (
+            Path(path).name == "repo"
+            and holder.name.startswith("ctrlrelay-review-")
+            and holder.parent == Path(tempfile.gettempdir())
+        ):
+            shutil.rmtree(holder, ignore_errors=True)
+
     async def remove_worktree(self, repo: str, session_id: str) -> None:
         """Remove a worktree and clean up."""
         bare_path = self._get_bare_repo_path(repo)

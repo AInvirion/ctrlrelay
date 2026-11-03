@@ -2028,14 +2028,66 @@ async def run_dev_issue(
                         repo=repo,
                         error_type=type(e).__name__,
                     )
-                if review_base is not None:
+                # The reviewer reads a fresh copy of the commit the relay
+                # pushed, never the agent's worktree (#263): files the
+                # agent left there that git follows (a nested repository
+                # with its own config) would run as code in the
+                # reviewer's process, outside the agent sandbox. No
+                # pushed commit means nothing fixed to review, which is
+                # reported as not reviewed rather than reviewed.
+                review_sha = publisher.last_pushed_sha
+                review_path: Path | None = None
+                # Switched off: nothing is read, so no copy is made, and
+                # the wrapper reports it as the operator's own choice.
+                review_off = getattr(code_review, "method", "cli") == "off"
+                if review_base is not None and review_off:
+                    review_report = await _review_and_comment(
+                        github=github,
+                        repo=repo,
+                        session_id=session_id,
+                        pr_number=pr_number_for_review,
+                        worktree_path=worktree_path,
+                        base_branch=review_base,
+                        config=code_review,
+                        state_db=state_db,
+                        issue_number=issue_number,
+                    )
+                elif review_base is not None and review_sha is None:
+                    review_report = ReviewReport(
+                        posted=False,
+                        status="no_pushed_head",
+                        detail="no record of the commit the relay pushed",
+                    )
+                elif review_base is not None:
+                    try:
+                        review_path = await worktree.make_review_copy(
+                            repo, review_sha
+                        )
+                    except Exception as e:
+                        review_report = ReviewReport(
+                            posted=False,
+                            status="copy_failed",
+                            detail=(
+                                "could not make a clean copy to review "
+                                f"({type(e).__name__}: {str(e)[:160]})"
+                            ),
+                        )
+                        log_event(
+                            _logger,
+                            "dev.code_review.copy_failed",
+                            session_id=session_id,
+                            repo=repo,
+                            error_type=type(e).__name__,
+                            error=str(e)[:200],
+                        )
+                if review_path is not None:
                     try:
                         review_report = await _review_and_comment(
                             github=github,
                             repo=repo,
                             session_id=session_id,
                             pr_number=pr_number_for_review,
-                            worktree_path=worktree_path,
+                            worktree_path=review_path,
                             base_branch=review_base,
                             config=code_review,
                             state_db=state_db,
@@ -2055,6 +2107,17 @@ async def run_dev_issue(
                             error_type=type(e).__name__,
                             error=str(e)[:200],
                         )
+                    finally:
+                        try:
+                            await worktree.remove_review_copy(review_path)
+                        except Exception as e:
+                            log_event(
+                                _logger,
+                                "dev.code_review.copy_cleanup_failed",
+                                session_id=session_id,
+                                repo=repo,
+                                error_type=type(e).__name__,
+                            )
 
             # Carry the outcome out on the result's own field so
             # whoever announces the pull request can say whether it was
