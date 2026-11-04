@@ -4203,6 +4203,28 @@ def poller_start(
                         skip_initial_persist=True,
                     )
 
+            # Runs whose process died with them (#312): settle them before
+            # the first poll, so the issues they held are taken again by
+            # that poll rather than skipped as already seen.
+            from ctrlrelay.core.orphans import reap_orphaned_sessions
+            reaped = await reap_orphaned_sessions(
+                state_db, poller=poller, github=github, worktree=worktree,
+            )
+            for r in reaped:
+                where = (
+                    f"#{r['issue_number']} in {r['repo']}"
+                    if r["issue_number"] is not None else r["repo"]
+                )
+                kept = (
+                    f" Its worktree is kept at {r['worktree_path']}."
+                    if r["worktree_path"]
+                    and Path(r["worktree_path"]).exists() else ""
+                )
+                console.print(
+                    f"[yellow]Run {r['session_id']} for {where} stopped "
+                    f"when the relay did; marked failed.{kept}[/yellow]"
+                )
+
             try:
                 await github_budget.refresh()
                 await run_poll_loop(

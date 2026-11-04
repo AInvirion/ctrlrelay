@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without criteria is a failed plan: `on` reports it and codes without one,
   `required` fails the run (#220).
 
+### Fixed
+
+- A run whose relay process died mid-run (the machine ran out of memory, or
+  the service was stopped) no longer stays `running` for ever. Sessions now
+  record the process running them (`owner_pid`, `owner_run`) and their claim
+  id. When the poller starts, it finds `running` sessions whose process is
+  gone, and in whose worktree no process is still working, and marks them
+  failed, dropping any repo lock they held. A dev or
+  task issue goes back to the next poll unless an open pull request was
+  found for its branch. Where the run had claimed the issue, the relay
+  posts a comment that names the worktree and releases the claim. The relay deletes nothing in the worktree. It detaches the
+  worktree's HEAD, when that can be done safely, so the next run can check
+  the issue's branch out. Rows written by an older version name no process
+  and are left alone (#312).
+
 ## [0.19.1] - 2026-11-03
 
 ### Fixed

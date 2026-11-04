@@ -40,7 +40,22 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- the text — the only durable evidence of why 163 dispatches failed
     -- was that each took about two seconds. See
     -- `ctrlrelay.core.redact` for what is removed before it is stored.
-    output_tail TEXT
+    output_tail TEXT,
+    -- The process that runs this session (#312). A session's status is
+    -- only ever moved off 'running' by that process, so when it dies
+    -- without moving it the row says 'running' for ever. The next poller
+    -- start finds such rows by asking whether this process still exists.
+    -- NULL on rows from versions before #312: those are left alone,
+    -- because nothing then says which process owned them.
+    owner_pid INTEGER,
+    -- A random id of that process (``claims.PROCESS_RUN``). It tells the
+    -- reaping process its own rows apart from an earlier process's that
+    -- had the same pid. Another live ctrlrelay process that reused the pid
+    -- still reads as the owner, and its row is left as it is.
+    owner_run TEXT,
+    -- The id of this machine's claim on the issue (#245), so a run that
+    -- died can still have its claim released by id afterwards (#312).
+    claim_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS repo_locks (
@@ -299,6 +314,18 @@ class StateDB:
             self._conn.execute(
                 "ALTER TABLE sessions ADD COLUMN output_tail TEXT"
             )
+        if "owner_pid" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN owner_pid INTEGER"
+            )
+        if "owner_run" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN owner_run TEXT"
+            )
+        if "claim_id" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN claim_id TEXT"
+            )
 
         pr_watches_cols = {
             row[1]
@@ -513,6 +540,43 @@ class StateDB:
             (session_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    def list_running_sessions(self) -> list[dict[str, Any]]:
+        """Every ``sessions`` row whose status is still ``running``."""
+        rows = self._conn.execute(
+            "SELECT * FROM sessions WHERE status = 'running'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def fail_orphaned_session(self, session_id: str, summary: str) -> bool:
+        """Mark a ``running`` session whose process is gone as failed, and
+        drop any repo lock it still holds (#312).
+
+        One transaction, so a reader never sees the row failed while its
+        lock still wedges the repo. Guarded on ``status = 'running'``: if
+        anything moved the row in the meantime, nothing is touched and
+        ``False`` comes back. The lock is deleted only for this session
+        id, never by repo, so a live run's lock is never taken.
+        """
+        ours = not self._conn.in_transaction
+        try:
+            cursor = self._conn.execute(
+                "UPDATE sessions SET status = 'failed', summary = ?, "
+                "ended_at = ? WHERE id = ? AND status = 'running'",
+                (summary, int(time.time()), session_id),
+            )
+            if cursor.rowcount > 0:
+                self._conn.execute(
+                    "DELETE FROM repo_locks WHERE session_id = ?",
+                    (session_id,),
+                )
+            if ours:
+                self._conn.commit()
+        except BaseException:
+            if ours and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return cursor.rowcount > 0
 
     def record_session_outcome(
         self,

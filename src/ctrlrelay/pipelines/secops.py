@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import time
 import uuid
@@ -12,6 +13,7 @@ from typing import Any
 
 from ctrlrelay.core.archived import ArchivedRepoTracker
 from ctrlrelay.core.checkpoint import CheckpointStatus
+from ctrlrelay.core.claims import PROCESS_RUN
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.events import EventKind, emit_event, emit_outcome
 from ctrlrelay.core.github import GitHubCLI
@@ -798,9 +800,14 @@ async def run_secops_all(
             )
 
             state_db.execute(
-                """INSERT INTO sessions (id, pipeline, repo, worktree_path, status, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (session_id, "secops", repo, str(worktree_path), "running", int(time.time())),
+                """INSERT INTO sessions
+                   (id, pipeline, repo, worktree_path, status, started_at,
+                    owner_pid, owner_run)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id, "secops", repo, str(worktree_path),
+                    "running", int(time.time()), os.getpid(), PROCESS_RUN,
+                ),
             )
             state_db.commit()
             session_row_inserted = True

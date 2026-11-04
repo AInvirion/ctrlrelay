@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import os
 import shlex
 import time
 import uuid
@@ -32,7 +33,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ctrlrelay.core.checkpoint import CheckpointStatus
-from ctrlrelay.core.claims import ClaimKeeper, ClaimSettings, acquire_claim
+from ctrlrelay.core.claims import (
+    PROCESS_RUN,
+    ClaimKeeper,
+    ClaimSettings,
+    acquire_claim,
+)
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
 from ctrlrelay.core.events import EventKind, emit_event, emit_outcome
 from ctrlrelay.core.github import GitHubCLI
@@ -496,11 +502,12 @@ async def run_task_issue(
         state_db.execute(
             """INSERT INTO sessions
                (id, pipeline, repo, worktree_path, status, started_at,
-                issue_number)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                issue_number, owner_pid, owner_run, claim_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id, "task", repo, str(worktree_path),
                 "running", int(time.time()), issue_number,
+                os.getpid(), PROCESS_RUN, claim_id,
             ),
         )
         state_db.commit()
