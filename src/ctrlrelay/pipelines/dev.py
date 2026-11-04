@@ -652,6 +652,36 @@ def _question_for_persist(session_id: str, result: PipelineResult) -> str:
     )
 
 
+_NO_GITHUB_ACCESS = """## No GitHub access
+
+This session has no GitHub credentials. `git push`, `git fetch`, `gh pr
+create`, `gh pr view` and every other `gh` command will fail; do not try
+them and do not look for credentials. Commit locally and let the
+orchestrator push and open the pull request."""
+
+
+def _blocked_and_failed_blocks(
+    quoted_dir: str, quoted_path: str, session_id: str
+) -> str:
+    """The BLOCKED and FAILED checkpoint snippets, shared by the code and
+    plan contracts (#220). Their DONE blocks differ; these do not."""
+    return f"""**BLOCKED** (need input):
+```bash
+mkdir -p -- {quoted_dir}
+printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
+'"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > {quoted_path}
+```
+
+**FAILED**:
+```bash
+mkdir -p -- {quoted_dir}
+printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
+'"timestamp":"%s","error":"%s"}}' \\
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > {quoted_path}
+```"""
+
+
 @dataclass
 class DevPipeline:
     """Dev pipeline for implementing issues and opening PRs."""
@@ -720,6 +750,134 @@ class DevPipeline:
         result = await self._spawn(ctx, fix_instructions, resume=True)
         return self._session_to_result(result)
 
+    async def plan(self, ctx: PipelineContext) -> PipelineResult:
+        """Run the planning session (#220): read, change nothing, write a
+        plan. The plan comes back in the checkpoint's ``plan`` output; the
+        relay saves it, because the sandbox lets the agent write only
+        inside the worktree and the plan must stay out of it."""
+        prompt = self._build_plan_prompt(
+            ctx.repo, ctx.issue_number, ctx.extra,
+            session_id=ctx.session_id,
+            state_file=ctx.state_file,
+        )
+        result = await self._spawn(ctx, prompt, resume=False)
+        return self._session_to_result(result)
+
+    async def resume_plan(
+        self, ctx: PipelineContext, answer: str
+    ) -> PipelineResult:
+        """Resume a planning session that asked a question. Restates the
+        plan contract, not the code one: a plan session told only
+        "continue" with the code contract would start writing code."""
+        contract = self._plan_checkpoint_contract(
+            str(ctx.state_file), ctx.session_id
+        )
+        prompt = (
+            f"User answered: {answer}\n\n"
+            "Continue planning from where you left off. Still change no "
+            "files.\n\n"
+            f"{contract}"
+        )
+        result = await self._spawn(ctx, prompt, resume=True)
+        return self._session_to_result(result)
+
+    def _build_plan_prompt(
+        self,
+        repo: str,
+        issue_number: int | None,
+        extra: dict[str, Any],
+        session_id: str = "",
+        state_file: Path | None = None,
+    ) -> str:
+        """The planning session's prompt (#220)."""
+        issue_title = extra.get("issue_title", "")
+        issue_body = extra.get("issue_body", "")
+        issue_comments = extra.get("issue_comments") or "_No comments._"
+        state_file_path = str(state_file) if state_file else "/tmp/state.json"
+
+        return f"""You are planning issue #{issue_number} in repository {repo}.
+Another session writes the code later, from your plan.
+
+**Issue Title:** {issue_title}
+
+**Issue Body:**
+{issue_body}
+
+**Discussion:**
+{issue_comments}
+
+The body is the issue as first filed; the discussion is newer. Where a
+comment narrows, redirects or rejects what the body asks for, the comment
+wins.
+
+Read the issue and the repository. **Change no files**: do not edit,
+create, delete or commit anything in this worktree, and do not write the
+plan to a file. The plan goes in the checkpoint below.
+
+Write the plan in markdown with exactly these headings:
+
+## Change
+What will change and why, in a few sentences.
+
+## Files
+The files you expect to change or add.
+
+## Risks
+What could break, and anything the coding session must be careful with.
+
+## Acceptance criteria
+A numbered list (`1.`, `2.`, ...). Each item must be checkable, either by
+running a command or by reading the diff. These are what "done" means.
+
+If the issue is too vague to plan, do not guess: signal BLOCKED with
+**one** clear question.
+
+{self._plan_checkpoint_contract(state_file_path, session_id)}"""
+
+    def _plan_checkpoint_contract(
+        self, state_file_path: str, session_id: str
+    ) -> str:
+        """How the planning session signals how it stopped (#220). Same
+        BLOCKED and FAILED blocks as the code contract; DONE carries the
+        plan instead of a pull request."""
+        quoted_path = shlex.quote(state_file_path)
+        quoted_dir = shlex.quote(str(Path(state_file_path).parent))
+        return f"""## No GitHub access
+
+This session has no GitHub credentials, and needs none: it only reads.
+
+## Signaling Completion
+
+**CRITICAL**: Before exiting, you MUST write a checkpoint file to signal completion.
+
+STATE_FILE: {state_file_path}
+SESSION_ID: {session_id}
+
+**DONE** (the plan is written). The plan goes inside a Python raw
+triple-quoted string, so it must not contain three single quotes in a row:
+```bash
+mkdir -p -- {quoted_dir}
+python3 - {quoted_path} <<'CTRLRELAY_DONE'
+import datetime, json, sys
+state = {{
+    "version": "1",
+    "status":"DONE",
+    "session_id": "{session_id}",
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    ),
+    "summary": "<ONE-LINE SUMMARY>",
+    "outputs": {{
+        "plan": r'''<THE PLAN, WITH THE FOUR HEADINGS>''',
+    }},
+}}
+with open(sys.argv[1], "w") as f:
+    json.dump(state, f)
+CTRLRELAY_DONE
+```
+
+{_blocked_and_failed_blocks(quoted_dir, quoted_path, session_id)}"""
+
     async def _spawn(
         self,
         ctx: PipelineContext,
@@ -774,6 +932,25 @@ class DevPipeline:
         issue_comments = extra.get("issue_comments") or "_No comments._"
         branch_name = extra.get("branch_name", "")
         state_file_path = str(state_file) if state_file else "/tmp/state.json"
+        plan = (extra.get("plan") or "").strip()
+        # The plan step's output (#220), only when it produced one. No
+        # plan means no heading: a repo without the step gets the prompt
+        # it always got.
+        plan_section = (
+            f"""## Plan
+
+A planning session read this issue and the repository before you and
+wrote the plan below. Its acceptance criteria are what "done" means for
+this issue: the work is finished when every one of them holds. If the
+code shows a criterion is wrong, say so in the pull request description
+rather than quietly dropping it.
+
+{plan}
+
+"""
+            if plan
+            else ""
+        )
 
         return f"""You are working on issue #{issue_number} in repository {repo}.
 
@@ -793,7 +970,7 @@ reconcile, signal BLOCKED and ask rather than picking one.
 
 **Branch:** {branch_name} (already checked out in this worktree)
 
-Execute the following workflow:
+{plan_section}Execute the following workflow:
 
 1. Validate the issue still applies to the current codebase
 2. If anything is unclear, signal BLOCKED (see below) to ask for clarification
@@ -848,12 +1025,7 @@ it resumes this session with the details.
         # the shell takes the word after `>` as a filename.
         quoted_path = shlex.quote(state_file_path)
         quoted_dir = shlex.quote(str(Path(state_file_path).parent))
-        return f"""## No GitHub access
-
-This session has no GitHub credentials. `git push`, `git fetch`, `gh pr
-create`, `gh pr view` and every other `gh` command will fail; do not try
-them and do not look for credentials. Commit locally and let the
-orchestrator push and open the pull request.
+        return f"""{_NO_GITHUB_ACCESS}
 
 ## Signaling Completion
 
@@ -888,21 +1060,7 @@ with open(sys.argv[1], "w") as f:
 CTRLRELAY_DONE
 ```
 
-**BLOCKED** (need input):
-```bash
-mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
-'"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > {quoted_path}
-```
-
-**FAILED**:
-```bash
-mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
-'"timestamp":"%s","error":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > {quoted_path}
-```"""
+{_blocked_and_failed_blocks(quoted_dir, quoted_path, session_id)}"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
         """Convert SessionResult to PipelineResult."""
@@ -1785,6 +1943,238 @@ class _DevRun:
     verify_mode: str | None = None
     review_mode: str | None = None
 
+    # The plan step (#220). ``plan_mode`` None or "off" means the step
+    # does not run. ``plan_text`` is the accepted plan, once there is one;
+    # the code step's prompt carries it. ``plan_path`` is where it is
+    # saved, under the contexts directory and so outside the worktree.
+    plan_mode: str | None = None
+    plan_text: str | None = None
+    plan_path: Path | None = None
+
+
+def plan_path_for(contexts_dir: Path, repo: str, issue_number: int) -> Path:
+    """``<paths.contexts>/<owner>-<repo>/plans/issue-<n>.md`` (#220)."""
+    return (
+        contexts_dir / repo.replace("/", "-") / "plans"
+        / f"issue-{issue_number}.md"
+    )
+
+
+def _plan_pending_marker(plan_path: Path) -> Path:
+    """Next to the plan: names the session whose plan is waiting on an
+    answer, so a resume that arrives after the run stopped resumes the
+    PLAN session rather than treating it as a coding one."""
+    return plan_path.with_suffix(".pending")
+
+
+_CRITERIA_HEADING = re.compile(
+    r"^#{2,}\s*acceptance criteria\s*$", re.IGNORECASE | re.MULTILINE
+)
+_NUMBERED_ITEM = re.compile(r"^\s*\d+[.)]\s+\S", re.MULTILINE)
+
+
+def plan_criteria(plan: str) -> str | None:
+    """The ``## Acceptance criteria`` section of ``plan``, or None when it
+    has no numbered item. A plan without criteria is a failed plan, never
+    an empty pass (#220)."""
+    match = _CRITERIA_HEADING.search(plan)
+    if match is None:
+        return None
+    rest = plan[match.end():]
+    following = re.search(r"^#{1,2}\s", rest, re.MULTILINE)
+    section = (rest[: following.start()] if following else rest).strip()
+    if not _NUMBERED_ITEM.search(section):
+        return None
+    return section
+
+
+def _plan_comment(criteria: str) -> str:
+    return (
+        "**Plan for this issue: acceptance criteria**\n\n"
+        f"{criteria}\n\n"
+        "_The coding session works to these. The full plan is kept by the "
+        "relay, outside the repository._"
+    )
+
+
+async def _answer_while_blocked(
+    run: _DevRun,
+    result: PipelineResult,
+    resume: Callable[[PipelineContext, str], Awaitable[PipelineResult]],
+    deferred: str = "Blocked session deferred",
+) -> PipelineResult:
+    """Ask the operator each question the agent asks, resuming it with
+    the answer, until it stops asking or the rounds run out.
+
+    Shared by the plan and code steps (#220). ``resume`` is how the
+    session is resumed, because a plan session resumes with the plan
+    contract and a code session with the code one. ``deferred`` starts
+    the summary when the transport cannot be reached.
+
+    Each round-trip is capped at the transport's own timeout (see
+    Transport.ask); the total is bounded by max_blocked_rounds.
+    """
+    run.last_exit_code = result.exit_code
+    rounds = 0
+    while (
+        result.blocked
+        and run.transport is not None
+        and rounds < run.max_blocked_rounds
+    ):
+        question = (result.question or "").strip() or (
+            f"Session {run.session_id} is blocked but did not include a "
+            "question. Reply with guidance to resume."
+        )
+        try:
+            answer = await run.transport.ask(
+                question,
+                session_id=run.session_id,
+                repo=run.repo,
+                issue_number=run.issue_number,
+            )
+        except Exception as e:
+            # Transport failed (bridge down, timeout, etc.). The
+            # session IS still blocked — we just couldn't reach the
+            # operator. Preserve blocked=True so the outer
+            # persistence-on-blocked branch fires and writes a
+            # pending_resumes row. Operator replying later via
+            # Telegram then routes through the sweeper. Setting
+            # blocked=False here (the prior behavior) wedged the
+            # session permanently.
+            return PipelineResult(
+                success=False,
+                blocked=True,
+                session_id=run.session_id,
+                summary=f"{deferred} (transport): {e}",
+                error=str(e),
+                question=question,
+                outputs=result.outputs,
+            )
+        rounds += 1
+        result = await resume(run.ctx, answer)
+        # A resumed worker is the one whose exit code the failure
+        # comment should name. Assigned once before this loop, a
+        # late exception reported the FIRST worker's code for a
+        # session that had since been resumed several times.
+        run.last_exit_code = result.exit_code
+    return result
+
+
+async def _step_plan(run: _DevRun) -> None:
+    """Plan before any code is written (#220), when the repo asks for it."""
+    if run.plan_mode in (None, "off"):
+        return
+    result = await run.pipeline.plan(run.ctx)
+    await _finish_plan(run, result)
+
+
+async def _finish_plan(run: _DevRun, result: PipelineResult) -> None:
+    """Take a planning session's result to an accepted or failed plan.
+
+    Also the resume path's entry, for a plan whose question was answered
+    after the run had stopped.
+
+    - Still blocked: that is the run's result. No code session runs and
+      no pull request is opened; the frame keeps the worktree and records
+      the question for a later answer.
+    - A plan with acceptance criteria: saved under the contexts directory,
+      its criteria posted on the issue, and handed to the code step.
+    - Anything else is a failed plan. ``on`` reports it and lets the code
+      step run without one; ``required`` stops the run.
+    """
+    assert run.plan_path is not None
+    marker = _plan_pending_marker(run.plan_path)
+    result = await _answer_while_blocked(run, result, run.pipeline.resume_plan)
+    if result.blocked:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(run.session_id)
+        except OSError as e:
+            log_event(
+                _logger, "dev.plan.marker_write_failed",
+                session_id=run.session_id, repo=run.repo,
+                issue_number=run.issue_number, error=str(e)[:200],
+            )
+        run.result = result
+        return
+    marker.unlink(missing_ok=True)
+
+    reason: str | None = None
+    plan = ""
+    criteria: str | None = None
+    if not result.success:
+        reason = (
+            (result.error or "").strip()
+            or result.summary
+            or "the planning session failed"
+        )
+    else:
+        raw = result.outputs.get("plan")
+        plan = raw.strip() if isinstance(raw, str) else ""
+        if not plan:
+            reason = "the planning session returned no plan"
+        else:
+            criteria = plan_criteria(plan)
+            if criteria is None:
+                reason = "the plan has no numbered acceptance criteria"
+    if reason is None:
+        try:
+            run.plan_path.parent.mkdir(parents=True, exist_ok=True)
+            run.plan_path.write_text(plan + "\n")
+        except OSError as e:
+            reason = f"the plan could not be saved: {e}"
+
+    if reason is not None:
+        log_event(
+            _logger, "dev.plan.failed",
+            session_id=run.session_id, repo=run.repo,
+            issue_number=run.issue_number, mode=run.plan_mode,
+            reason=reason[:200],
+        )
+        if run.plan_mode == "required":
+            run.result = PipelineResult(
+                success=False,
+                session_id=run.session_id,
+                summary="Planning failed",
+                error=reason,
+                exit_code=result.exit_code,
+            )
+            _fail_required_step(run, "plan", reason)
+            return
+        # `on`: reported where the operator and the issue's readers look,
+        # and the code step runs without a plan.
+        await _comment_best_effort(
+            run,
+            f"Planning did not produce a usable plan ({reason}). The "
+            "relay is going ahead without one.",
+        )
+        return
+
+    assert criteria is not None
+    run.plan_text = plan
+    run.ctx.extra["plan"] = plan
+    log_event(
+        _logger, "dev.plan.accepted",
+        session_id=run.session_id, repo=run.repo,
+        issue_number=run.issue_number, plan_path=str(run.plan_path),
+    )
+    await _comment_best_effort(run, _plan_comment(criteria))
+
+
+async def _comment_best_effort(run: _DevRun, body: str) -> None:
+    """A comment on the issue that must not fail the run if `gh` does."""
+    try:
+        await run.github.comment_on_issue(
+            repo=run.repo, issue_number=run.issue_number, body=body,
+        )
+    except Exception as e:
+        log_event(
+            _logger, "dev.plan.comment_failed",
+            session_id=run.session_id, repo=run.repo,
+            issue_number=run.issue_number,
+            error_type=type(e).__name__, error=str(e)[:200],
+        )
+
 
 def _fail_required_step(run: _DevRun, step: str, reason: str) -> None:
     """Stop the run because a required step did not pass.
@@ -1819,58 +2209,12 @@ def _fail_required_step(run: _DevRun, step: str, reason: str) -> None:
 
 async def _step_code(run: _DevRun) -> None:
     """Run the agent, then answer its questions until it stops asking."""
-    run.result = await run.pipeline.run(run.ctx)
-    run.last_exit_code = run.result.exit_code
-
-    # BLOCKED loop: if Claude needs input, post the question to the
-    # transport (Telegram), wait for the operator's reply, and resume
-    # the session. Loop until Claude signals DONE/FAILED or we run out
-    # of trips. Each round-trip is capped at the transport's own
-    # timeout (see Transport.ask signature — default 300s); the total
-    # is bounded by max_blocked_rounds.
-    rounds = 0
-    while (
-        run.result.blocked
-        and run.transport is not None
-        and rounds < run.max_blocked_rounds
-    ):
-        question = (run.result.question or "").strip() or (
-            f"Session {run.session_id} is blocked but did not include a "
-            "question. Reply with guidance to resume."
-        )
-        try:
-            answer = await run.transport.ask(
-                question,
-                session_id=run.session_id,
-                repo=run.repo,
-                issue_number=run.issue_number,
-            )
-        except Exception as e:
-            # Transport failed (bridge down, timeout, etc.). The
-            # session IS still blocked — we just couldn't reach the
-            # operator. Preserve blocked=True so the outer
-            # persistence-on-blocked branch fires and writes a
-            # pending_resumes row. Operator replying later via
-            # Telegram then routes through the sweeper. Setting
-            # blocked=False here (the prior behavior) wedged the
-            # session permanently.
-            run.result = PipelineResult(
-                success=False,
-                blocked=True,
-                session_id=run.session_id,
-                summary=f"Blocked session deferred (transport): {e}",
-                error=str(e),
-                question=question,
-                outputs=run.result.outputs,
-            )
-            break
-        rounds += 1
-        run.result = await run.pipeline.resume(run.ctx, answer)
-        # A resumed worker is the one whose exit code the failure
-        # comment should name. Assigned once before this loop, a
-        # late exception reported the FIRST worker's code for a
-        # session that had since been resumed several times.
-        run.last_exit_code = run.result.exit_code
+    if run.result is not None:
+        # The plan step already ended the run: it is waiting on a
+        # question, or a required plan failed (#220). No code is written.
+        return
+    result = await run.pipeline.run(run.ctx)
+    run.result = await _answer_while_blocked(run, result, run.pipeline.resume)
 
 
 async def _step_publish(run: _DevRun) -> None:
@@ -2145,6 +2489,7 @@ class DevWorkStep:
 # the block comment above `_DevRun`). Names are the ones the design on
 # #226 uses, so a later per-repository setting can name them.
 DEV_WORK_STEPS: tuple[DevWorkStep, ...] = (
+    DevWorkStep("plan", _step_plan),
     DevWorkStep("code", _step_code),
     DevWorkStep("publish", _step_publish),
     DevWorkStep("verify", _step_verify),
@@ -2154,8 +2499,8 @@ DEV_WORK_STEPS: tuple[DevWorkStep, ...] = (
 
 def _resolve_step_modes(
     steps: Any, code_review: Any
-) -> tuple[str | None, str | None]:
-    """``(verify, review)`` modes from a repo's ``steps``, checked.
+) -> tuple[str | None, str | None, str | None]:
+    """``(plan, verify, review)`` modes from a repo's ``steps``, checked.
 
     Read with ``getattr`` like ``code_review``, so ``None`` (every step
     unset) and test doubles work. Checked against the same table the
@@ -2169,7 +2514,7 @@ def _resolve_step_modes(
     """
     modes = {
         name: check_dev_step_mode(name, getattr(steps, name, None))
-        for name in ("code", "publish", "verify", "review")
+        for name in ("plan", "code", "publish", "verify", "review")
     }
     method = getattr(code_review, "method", "cli")
     if modes["review"] == "off" and method != "off":
@@ -2181,7 +2526,7 @@ def _resolve_step_modes(
             f"steps.review is {modes['review']!r} but code_review.method "
             "is 'off'"
         )
-    return modes["verify"], modes["review"]
+    return modes["plan"], modes["verify"], modes["review"]
 
 
 async def _run_work_steps(run: _DevRun) -> PipelineResult:
@@ -2229,7 +2574,9 @@ async def run_dev_issue(
     every step as it was before the switches existed.
     """
     # Before the lock: a refused mode is a caller error, not a run.
-    verify_mode, review_mode = _resolve_step_modes(steps, code_review)
+    plan_mode, verify_mode, review_mode = _resolve_step_modes(
+        steps, code_review
+    )
     session_id = f"dev-{repo.replace('/', '-')}-{issue_number}-{uuid.uuid4().hex[:8]}"
     branch_name = branch_template.replace("{n}", str(issue_number))
 
@@ -2447,9 +2794,11 @@ async def run_dev_issue(
             code_review=code_review,
             verify_mode=verify_mode,
             review_mode=review_mode,
+            plan_mode=plan_mode,
+            plan_path=plan_path_for(contexts_dir, repo, issue_number),
         )
         dispatched = True
-        # The work: code, publish, verify, review (DEV_WORK_STEPS). Everything
+        # The work: plan, code, publish, verify, review (DEV_WORK_STEPS). Everything
         # before this line and after it is the frame.
         result = await _run_work_steps(run)
 
@@ -2870,7 +3219,9 @@ async def resume_dev_from_pending(
         )
 
     branch_name = branch_template.replace("{n}", str(issue_number))
-    verify_mode, review_mode = _resolve_step_modes(steps, code_review)
+    plan_mode, verify_mode, review_mode = _resolve_step_modes(
+        steps, code_review
+    )
 
     lock = _RepoLockHandle(state_db, repo, session_id)
     if not state_db.acquire_lock(repo, session_id):
@@ -2955,51 +3306,23 @@ async def resume_dev_from_pending(
             transport=transport,
         )
 
-        # Feed the operator's answer as the resume prompt. If the agent
-        # re-blocks (common for multi-step decisions), the same
-        # in-process BLOCKED loop that run_dev_issue uses kicks in here
-        # — transport.ask() waits on the live socket — so the operator
-        # can have a back-and-forth exchange on the resume path too.
-        result = await pipeline.resume(ctx, answer)
-
-        rounds = 0
-        while (
-            result.blocked
-            and transport is not None
-            and rounds < max_blocked_rounds
-        ):
-            question = (result.question or "").strip() or (
-                f"Session {session_id} is blocked but did not include a "
-                "question. Reply with guidance to resume."
+        # A plan that was waiting on this answer (#220) resumes as a plan:
+        # the planning session gets the answer with the plan contract,
+        # then a fresh code session runs with the plan, as in
+        # run_dev_issue. Without this the planning session would be told
+        # to "continue" under the code contract and start coding with no
+        # plan, which would skip a required plan.
+        plan_path = plan_path_for(contexts_dir, repo, int(issue_number))
+        try:
+            plan_was_pending = (
+                _plan_pending_marker(plan_path).read_text().strip()
+                == session_id
             )
-            try:
-                next_answer = await transport.ask(
-                    question,
-                    session_id=session_id,
-                    repo=repo,
-                    issue_number=int(issue_number),
-                )
-            except Exception as e:
-                # Keep blocked=True so outer persistence branch fires
-                # and the sweeper can pick this up again when the
-                # operator's next Telegram reply arrives. Same
-                # reasoning as run_dev_issue's loop — transport
-                # failure is not the same as a resolved session.
-                result = PipelineResult(
-                    success=False,
-                    blocked=True,
-                    session_id=session_id,
-                    summary=(
-                        f"Blocked session deferred during resume "
-                        f"(transport): {e}"
-                    ),
-                    error=str(e),
-                    question=question,
-                    outputs=result.outputs,
-                )
-                break
-            rounds += 1
-            result = await pipeline.resume(ctx, next_answer)
+        except OSError:
+            plan_was_pending = False
+        if plan_was_pending and plan_mode not in ("on", "required"):
+            # The plan was asked for when the question was; finish it.
+            plan_mode = "on"
 
         # Publish and verify through the same steps run_dev_issue uses
         # (#219, #226). The pull request may already exist from before
@@ -3024,10 +3347,31 @@ async def resume_dev_from_pending(
             max_blocked_rounds=max_blocked_rounds,
             pr_verifier=pr_verifier,
             code_review=code_review,
-            result=result,
             verify_mode=verify_mode,
             review_mode=review_mode,
+            plan_mode=plan_mode,
+            plan_path=plan_path,
         )
+        if plan_was_pending:
+            await _finish_plan(run, await pipeline.resume_plan(ctx, answer))
+            await _step_code(run)
+            assert run.result is not None
+            result = run.result
+        else:
+            # Feed the operator's answer as the resume prompt. If the agent
+            # re-blocks (common for multi-step decisions), the same
+            # in-process BLOCKED loop that run_dev_issue uses kicks in here
+            # — transport.ask() waits on the live socket — so the operator
+            # can have a back-and-forth exchange on the resume path too.
+            # A transport failure keeps blocked=True so the sweeper picks
+            # the session up again on the operator's next reply.
+            result = await _answer_while_blocked(
+                run,
+                await pipeline.resume(ctx, answer),
+                pipeline.resume,
+                deferred="Blocked session deferred during resume",
+            )
+            run.result = result
         await _step_publish(run)
         await _step_verify(run)
         if review_mode == "required":

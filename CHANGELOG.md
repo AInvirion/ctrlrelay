@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `repos[].steps.plan` (`off`, `on`, `required`; unset is `off`) runs a
+  planning session before the dev pipeline's code session. It changes no
+  files and writes a plan with numbered acceptance criteria, saved under
+  `<paths.contexts>/<owner>-<repo>/plans/issue-<n>.md` (outside the worktree),
+  posted on the issue as the criteria list, and added to the code session's
+  prompt. A vague issue gets one question instead of a pull request. A plan
+  without criteria is a failed plan: `on` reports it and codes without one,
+  `required` fails the run (#220).
+
 ## [0.19.1] - 2026-11-03
 
 ### Fixed

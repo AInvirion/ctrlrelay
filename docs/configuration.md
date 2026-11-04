@@ -865,7 +865,8 @@ repos:
 
 ### repos[].steps
 
-The dev pipeline does its work in a fixed order: **code** (the agent run and
+The dev pipeline does its work in a fixed order: **plan** (an optional
+planning session, off unless asked for), **code** (the agent run and
 any questions it asks), **publish** (the relay pushes the branch and opens the
 pull request), **verify** (wait for CI and mergeability, asking the agent to
 fix what fails, up to `max_fix_attempts` rounds) and **review** (the
@@ -893,6 +894,7 @@ repos:
 
 | Step | Accepts | Unset means |
 |---|---|---|
+| `plan` | `off`, `on`, `required` | `off`: no planning session. |
 | `code` | `required` | A failed or crashed agent run stops the run. Same as `required`. |
 | `publish` | `required` | A refused or failed push stops the run (the branch is kept). Same as `required`. |
 | `verify` | `off`, `required` | CI still red after the fix rounds stops the run. CI that is still pending when the wait times out hands the PR over. |
@@ -904,6 +906,28 @@ accepting and ignoring them. `verify: on` is refused too: it would announce a
 PR as ready while its CI is red, with no line in the announcement saying so.
 Unknown step names (a typo such as `verfy`) are refused as well. A bare `on`
 or `off` works unquoted.
+
+**`plan: on`** or **`plan: required`** runs one planning session in the
+run's worktree before the code session. It is told to read the issue and the
+repo and change no files, and returns a plan with four headings: `## Change`,
+`## Files`, `## Risks` and `## Acceptance criteria`, a numbered list of items
+that can each be checked by a command or by reading the diff. The relay then:
+
+- saves the plan to `<paths.contexts>/<owner>-<repo>/plans/issue-<n>.md`,
+  outside the worktree, so it is never committed;
+- posts the criteria list as one comment on the issue;
+- adds the plan to the code session's prompt under `## Plan`, telling the
+  agent the criteria are what "done" means.
+
+If the issue is too vague to plan, the planning session asks one question,
+through the same chat loop the code session uses. No code session runs and no
+PR is opened until it is answered; an answer that arrives after the run
+stopped resumes the planning session, then codes with the plan.
+
+A plan with no numbered acceptance criteria is a failed plan, as is a
+planning session that fails or crashes. With `on` the failure is posted on the
+issue and the code session runs without a plan; with `required` the run fails
+and no code session runs.
 
 **`verify: required`** also fails the run when the CI wait times out, before
 or after a fix round. (Checks that cannot be read at all fail the run in every

@@ -272,7 +272,6 @@ def test_review_accepts_every_mode(mode) -> None:
     [
         {"verfy": "required"},  # a typo must not read as "unset"
         {"merge": "on"},  # not a dev work step (yet)
-        {"plan": "required"},
     ],
 )
 def test_an_unknown_step_name_is_refused(steps) -> None:
