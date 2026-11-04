@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import os
 import re
 import shlex
 import time
@@ -16,6 +17,7 @@ from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.claims import (
     CLAIM_MARKER_PREFIX,
     DISPATCH_FAILED_MARKER,
+    PROCESS_RUN,
     RELEASE_MARKER_PREFIX,
     ClaimKeeper,
     ClaimOutcome,
@@ -324,6 +326,7 @@ def claim_failure_comment(
     pr_number: int | None = None,
     claim_id: str | None = None,
     will_retry: bool = False,
+    pr_known: bool = True,
 ) -> str:
     """The comment that reconciles the claim with a failed outcome.
 
@@ -345,6 +348,10 @@ def claim_failure_comment(
     says so and asks for nothing. Otherwise it names the one route that
     works, which is NOT the re-assign / re-label route it used to
     advise — see ``MANUAL_RETRY_ROUTE``.
+
+    ``pr_known=False`` with no ``pr_number`` is for a caller that could
+    not find out whether a pull request exists (#312): the opening then
+    says nothing about one either way.
     """
     if pr_number is not None:
         opening = (
@@ -365,6 +372,9 @@ def claim_failure_comment(
             "⚠️ **CTRLRelay did not finish this run, and no pull request "
             "was opened.** This supersedes any claim above — nothing is "
             "working on this issue."
+            if pr_known else
+            "⚠️ **CTRLRelay did not finish this run.** This supersedes any "
+            "claim above — nothing is working on this issue."
         )
         next_step = (
             "When the relay's poller is running, it picks this issue up "
@@ -441,6 +451,7 @@ async def reconcile_claim_on_failure(
     claim_posted: bool = True,
     claim_id: str | None = None,
     will_retry: bool = False,
+    pr_known: bool = True,
 ) -> bool:
     """Post the retraction. Returns whether a comment was written.
 
@@ -469,6 +480,7 @@ async def reconcile_claim_on_failure(
                 pr_number=pr_number,
                 claim_id=claim_id,
                 will_retry=will_retry,
+                pr_known=pr_known,
             ),
         )
     except asyncio.CancelledError:
@@ -2746,11 +2758,13 @@ async def run_dev_issue(
         # Record session
         state_db.execute(
             """INSERT INTO sessions
-               (id, pipeline, repo, worktree_path, status, started_at, issue_number)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (id, pipeline, repo, worktree_path, status, started_at,
+                issue_number, owner_pid, owner_run, claim_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id, "dev", repo, str(worktree_path),
                 "running", int(time.time()), issue_number,
+                os.getpid(), PROCESS_RUN, claim_id,
             ),
         )
         state_db.commit()

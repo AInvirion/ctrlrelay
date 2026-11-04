@@ -815,3 +815,57 @@ class TestGhStderrIsNotParsedAsMarkup:
         from ctrlrelay.cli import _GH_PROBE_TIMEOUT_SECONDS
 
         assert _GH_PROBE_TIMEOUT_SECONDS > 0
+
+
+class TestPollerStartSettlesDeadRuns:
+    """#312: the poller settles runs whose process died before its first
+    poll, so the issues they held are taken by that poll."""
+
+    def test_reaps_before_the_poll_loop_starts(
+        self, telegram_config: Path, tmp_path: Path
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        cfg = yaml.safe_load(telegram_config.read_text())
+        cfg["repos"] = [{"name": "owner/repo",
+                         "local_path": str(tmp_path / "owner-repo")}]
+        telegram_config.write_text(yaml.dump(cfg))
+        # Not a first run: the seeding pass would otherwise call GitHub.
+        (tmp_path / "poller_state.json").write_text('{"seen_issues": {}}')
+        order: list[str] = []
+
+        async def fake_reap(state_db, *, poller, github, worktree, **kw):
+            order.append("reap")
+            assert state_db is not None and poller is not None
+            assert worktree is not None and github is not None
+            return []
+
+        async def fake_loop(**kw):
+            order.append("loop")
+
+        gh_user = subprocess.CompletedProcess(
+            args=["gh"], returncode=0, stdout="alice\n", stderr="",
+        )
+        with (
+            patch("ctrlrelay.core.github._find_gh", return_value="gh"),
+            patch("subprocess.run", return_value=gh_user),
+            patch(
+                "ctrlrelay.core.orphans.reap_orphaned_sessions",
+                side_effect=fake_reap,
+            ),
+            patch(
+                "ctrlrelay.core.poller.run_poll_loop",
+                side_effect=fake_loop,
+            ),
+            patch(
+                "ctrlrelay.core.github_budget.GitHubBudget.refresh",
+                new=AsyncMock(),
+                create=True,
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                ["poller", "start", "--foreground", "--config",
+                 str(telegram_config)],
+            )
+        assert order[:2] == ["reap", "loop"], (order, result.output)

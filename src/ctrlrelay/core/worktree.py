@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
+import secrets
 import shutil
 import stat
 import tempfile
@@ -317,9 +319,17 @@ def _safe_repo_file(repo_real: str, rel: str) -> str | None:
 
 
 def _read_nofollow(path: str) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # Non-blocking and a plain file only: the callers check for a plain
+    # file first, but a FIFO swapped in after that check would otherwise
+    # block the read for ever.
+    flags = (
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     fd = os.open(path, flags)
     with os.fdopen(fd, "r") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise OSError(f"{path} is not a plain file")
         return f.read()
 
 
@@ -943,6 +953,90 @@ class WorktreeManager:
                     pass
             # Retry the add; if it fails again, let the error surface.
             await self._worktree_add(bare_path, str(worktree_path), branch)
+
+    def detach_orphaned_worktree(
+        self, repo: str, worktree_path: Path | str,
+    ) -> str | None:
+        """Free the branch a dead run's worktree holds, keeping every file
+        in it (#312).
+
+        A worktree that still has the issue's branch checked out makes the
+        next run for that issue fail with "already checked out". Removing
+        the worktree would free the branch and throw away what the agent
+        wrote. Detaching its HEAD frees the branch and keeps the files, the
+        index and the commit they sit on, so the work can still be read
+        and recovered by hand.
+
+        No git process runs here. The worktree's config, and the bare
+        clone's that it shares, can be written by the agent, and a git
+        command in that tree would run whatever filters or hooks they name,
+        outside the agent's sandbox. So the detach rewrites the admin dir's
+        ``HEAD`` file directly. The bare clone and every path step below it
+        are opened relative to the one before with ``O_NOFOLLOW``, and
+        the new file is created and renamed through that directory's
+        descriptor, so a link planted inside the clone, before or during
+        this, cannot redirect the write. The directories above the clone
+        are the relay's own configured paths and are trusted as they are.
+
+        Returns the branch it freed, or ``None`` when there was nothing to
+        free (no admin dir, already detached) or anything was unsafe.
+        """
+        from ctrlrelay.core.publish import PushRefusedError
+
+        bare_path = self._get_bare_repo_path(repo)
+        admin_dir = self._resolve_admin_dir(bare_path, str(worktree_path))
+        if admin_dir is None:
+            return None
+        prefix = "ref: refs/heads/"
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+        fds: list[int] = []
+        try:
+            # The clone itself as well: a link in its place is refused.
+            fds.append(os.open(str(bare_path), dir_flags))
+            for part in ("worktrees", admin_dir.name):
+                fds.append(os.open(part, dir_flags, dir_fd=fds[-1]))
+            admin_fd = fds[-1]
+            # Non-blocking, then a plain file or nothing: a FIFO planted
+            # as HEAD would otherwise hold the poller's startup for ever.
+            head_fd = os.open(
+                "HEAD", os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=admin_fd,
+            )
+            with os.fdopen(head_fd, "r") as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    return None
+                content = f.read(4096).strip()
+            if not content.startswith(prefix):
+                return None
+            branch = content[len(prefix):]
+            # A plain commit id, or it raises: see `_read_branch_head`.
+            sha = _read_branch_head(bare_path, branch)
+            tmp = f".HEAD.ctrlrelay-{secrets.token_hex(8)}"
+            tmp_fd = os.open(
+                tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o644,
+                dir_fd=admin_fd,
+            )
+            try:
+                with os.fdopen(tmp_fd, "w") as f:
+                    f.write(sha + "\n")
+                os.replace(tmp, "HEAD", src_dir_fd=admin_fd, dst_dir_fd=admin_fd)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp, dir_fd=admin_fd)
+                raise
+        except (OSError, WorktreeError, PushRefusedError) as e:
+            log_event(
+                _logger, "worktree.orphan_detach_failed", repo=repo,
+                worktree_path=str(worktree_path),
+                reason=type(e).__name__, error=str(e)[:200],
+            )
+            return None
+        finally:
+            for fd in fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        return branch
 
     def _resolve_admin_dir(
         self, bare_path: Path, worktree_dir: str,

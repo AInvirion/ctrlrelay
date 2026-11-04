@@ -131,6 +131,10 @@ class TestDevIntegration:
         assert len(rows) == 1
         assert rows[0]["status"] == "done"
         assert rows[0]["issue_number"] == 123
+        # #312: the row names the process running it, so a later poller
+        # start can tell this run from one whose process died.
+        import os
+        assert rows[0]["owner_pid"] == os.getpid()
 
         state_db.close()
 
