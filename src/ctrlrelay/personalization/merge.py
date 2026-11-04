@@ -403,8 +403,10 @@ def merge_into_live(
 
     Only listed keys are written. A listed key absent from ``source`` is
     left as it is on this machine (absent is not a deletion). Keys not
-    listed are never read from ``source`` and never touched in
-    ``target``.
+    listed are never copied from ``source`` and never touched in
+    ``target``. Both files are still parsed and checked whole, so a
+    duplicate key or nesting past ``MAX_DEPTH`` anywhere in either one
+    refuses the merge.
     """
     owned = list(keys)
     try:
