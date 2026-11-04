@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A synced or live `settings.json` nested more than 64 levels deep is now
+  refused right after it is read. On Python 3.14 the parser accepts about
+  65,000 levels, and writing that back out used all the memory on the
+  machine instead of failing (#313).
+
 ## [0.19.0] - 2026-11-03
 
 ### Added

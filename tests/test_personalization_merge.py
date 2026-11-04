@@ -23,7 +23,7 @@ from pydantic import ValidationError
 from ctrlrelay.core.config import PersonalizationPath
 from ctrlrelay.personalization import PersonalizationManager
 from ctrlrelay.personalization import merge as merge_mod
-from ctrlrelay.personalization.merge import merge_into_live, migrate_link
+from ctrlrelay.personalization.merge import MAX_DEPTH, merge_into_live, migrate_link
 from tests.test_personalization import (
     _config_for,
     _git,
@@ -633,16 +633,11 @@ class TestMergeIntoLive:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-def _max_parse_depth() -> int:
-    lo, hi = 1, 1_000_000
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        try:
-            json.loads("[" * mid + "]" * mid)
-            lo = mid
-        except RecursionError:
-            hi = mid - 1
-    return lo
+def _nested(levels: int, key: str = "x") -> str:
+    """A JSON object nesting containers ``levels`` deep in all (the
+    object itself is level 1), the nesting under ``key``."""
+    inner = levels - 1
+    return "{" + json.dumps(key) + ": " + "[" * inner + "]" * inner + "}"
 
 
 class TestRoundTwo:
@@ -684,28 +679,51 @@ class TestRoundTwo:
         assert _read(real / ".claude" / "settings.json") == {"keep": 1, "model": "opus"}
 
     @pytest.mark.parametrize("side", ["synced", "live"])
-    def test_parseable_but_too_deep_to_merge_is_refused(
-        self, pair, side: str
-    ) -> None:
-        """Nested just under the parser's limit: it parses, but the
-        comparison or ``json.dumps(indent=2)`` recurses far less deep."""
+    def test_nesting_at_the_limit_merges(self, pair, side: str) -> None:
         source, target = pair
-        depth = _max_parse_depth() - 5
-        deep = "[" * depth + "]" * depth
-        json.loads('{"x": ' + deep + "}")  # precondition: it parses
+        deep = json.loads(_nested(MAX_DEPTH))["x"]
         source.parent.mkdir(parents=True)
         if side == "synced":
-            source.write_text('{"model": ' + deep + "}")
+            _write_json(source, {"model": deep})
             target.write_text('{"keep": true}\n')
         else:
             _write_json(source, {"model": "opus"})
-            target.write_text('{"deep": ' + deep + "}")
+            _write_json(target, {"x": deep})
+
+        out = merge_into_live(source, target, ["model"], label="settings")
+
+        assert out.action == "wrote", out.detail
+        if side == "synced":
+            assert _read(target) == {"keep": True, "model": deep}
+        else:
+            assert _read(target) == {"x": deep, "model": "opus"}
+
+    @pytest.mark.parametrize("side", ["synced", "live"])
+    @pytest.mark.parametrize("levels", [MAX_DEPTH + 1, 5_000])
+    def test_nesting_past_the_limit_is_refused_before_any_write(
+        self, pair, side: str, levels: int
+    ) -> None:
+        """5,000 levels is under the parser's limit on 3.12 to 3.14
+        (measured: about 10,000 on 3.12 and 3.13, about 65,000 on 3.14).
+        The synced side nests under the owned key, so without the check
+        the value would reach the indented write. The refusal must come
+        from the depth check, so the message names the limit."""
+        source, target = pair
+        deep = _nested(levels, key="model" if side == "synced" else "x")
+        json.loads(deep)  # precondition: the parser accepts it
+        source.parent.mkdir(parents=True)
+        if side == "synced":
+            source.write_text(deep)
+            target.write_text('{"keep": true}\n')
+        else:
+            _write_json(source, {"model": "opus"})
+            target.write_text(deep)
         before = target.read_text()
 
         out = merge_into_live(source, target, ["model"], label="settings")
 
         assert out.refused
-        assert "nested too deeply" in out.detail
+        assert f"nested too deeply (over {MAX_DEPTH} levels)" in out.detail
         assert target.read_text() == before
 
     def test_failed_cleanup_does_not_hide_the_original_error(
