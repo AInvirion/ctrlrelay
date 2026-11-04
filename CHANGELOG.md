@@ -25,13 +25,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record the process running them (`owner_pid`, `owner_run`) and their claim
   id. When the poller starts, it finds `running` sessions whose process is
   gone, and in whose worktree no process is still working, and marks them
-  failed, dropping any repo lock they held. A dev or
-  task issue goes back to the next poll unless an open pull request was
-  found for its branch. Where the run had claimed the issue, the relay
-  posts a comment that names the worktree and releases the claim. The relay deletes nothing in the worktree. It detaches the
-  worktree's HEAD, when that can be done safely, so the next run can check
-  the issue's branch out. Rows written by an older version name no process
-  and are left alone (#312).
+  failed, dropping any repo lock they held. A dev or task issue goes back to
+  the next poll unless an open pull request was found for its branch. Where
+  the run had claimed the issue, the relay posts a comment that names the
+  worktree and releases the claim. The relay deletes nothing in the
+  worktree. It detaches the worktree's HEAD, when that can be done safely,
+  so the next run can check the issue's branch out. Rows written by an older
+  version name no process and are left alone (#312).
+- A dev run whose agent session hits its time limit no longer throws away
+  the agent's work. Before the worktree is removed, the files on disk are
+  committed on top of the commit it sits on, and that commit, or the
+  unpushed commits alone, are pushed to a new `wip/issue-<n>-<run id>`
+  branch. The run's own branch is not pushed, no pull request is opened, and
+  the local run branch is kept, since it can hold commits the worktree's
+  HEAD does not reach. The failure comment on the issue names the wip branch
+  and, when it is known, how long the run took. If the work cannot be saved,
+  the worktree is kept on disk and the comment names it. A run with nothing
+  new loses only its worktree. Files the worktree's `.gitignore` ignores are
+  not saved; files that cannot be read are not saved either, and then the
+  worktree is kept and the comment says so. The files are read by a git with
+  a private git dir, index, config and attributes override, so filters,
+  hooks and attributes named by the agent do not take effect (#311).
 
 ## [0.19.1] - 2026-11-03
 

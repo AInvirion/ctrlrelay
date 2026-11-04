@@ -215,6 +215,16 @@ class GitCommandError(WorktreeError):
         self.stderr = stderr
 
 
+class PartialSaveError(WorktreeError):
+    """The wip branch was pushed, but some files could not be read and
+    are not in it (#311). ``sha`` is what was pushed; the caller keeps
+    the worktree, which still holds them."""
+
+    def __init__(self, message: str, *, sha: str) -> None:
+        super().__init__(message)
+        self.sha = sha
+
+
 class PushRejectedError(WorktreeError):
     """Git rejected the push for a ref, named with the reason it gave.
 
@@ -1037,6 +1047,220 @@ class WorktreeManager:
                 with contextlib.suppress(OSError):
                     os.close(fd)
         return branch
+
+    def _worktree_head_sha(self, repo: str, worktree_path: Path | str) -> str:
+        """The commit a worktree sits on, read from its admin dir's
+        ``HEAD`` file as data, with the same no-link, plain-file reads as
+        :meth:`detach_orphaned_worktree`. Raises :class:`WorktreeError` (or
+        ``PushRefusedError`` for an unsafe ref) when it cannot be read."""
+        bare_path = self._get_bare_repo_path(repo)
+        admin_dir = self._resolve_admin_dir(bare_path, str(worktree_path))
+        if admin_dir is None:
+            raise WorktreeError(f"no worktree entry for {worktree_path}")
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+        fds: list[int] = []
+        try:
+            fds.append(os.open(str(bare_path), dir_flags))
+            for part in ("worktrees", admin_dir.name):
+                fds.append(os.open(part, dir_flags, dir_fd=fds[-1]))
+            head_fd = os.open(
+                "HEAD", os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=fds[-1],
+            )
+            with os.fdopen(head_fd, "r") as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    raise WorktreeError("worktree HEAD is not a plain file")
+                content = f.read(4096).strip()
+        except OSError as e:
+            raise WorktreeError(f"cannot read worktree HEAD: {e}") from e
+        finally:
+            for fd in fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        prefix = "ref: refs/heads/"
+        if content.startswith(prefix):
+            return _read_branch_head(bare_path, content[len(prefix):])
+        if _HEX_SHA.match(content):
+            return content
+        raise WorktreeError("worktree HEAD holds neither a branch nor a commit")
+
+    async def save_unfinished_work(
+        self,
+        repo: str,
+        worktree_path: Path | str,
+        *,
+        wip_branch: str,
+        message: str,
+        default_branch: str | None,
+        relay_pushed_shas: frozenset[str],
+        session_id: str | None = None,
+    ) -> str | None:
+        """Push what a run left in its worktree to ``wip_branch`` (#311).
+
+        For a run that is being given up on, such as one that timed out:
+        the edits it had not committed and the commits it had not pushed
+        would otherwise go with the worktree. The worktree's files, as they
+        are on disk, are committed on top of the commit it sits on, and
+        that commit is pushed to ``wip_branch``, which must be ``wip/...``.
+        The push only creates it: a branch of that name already on GitHub
+        at another commit is refused, never moved. Nothing is pushed to the
+        run's own branch, and no pull request is opened.
+
+        What is not saved: files the work tree's ``.gitignore`` files
+        ignore (build output, virtualenvs, caches; a list the agent can
+        also edit), the contents of a nested git repository (recorded as
+        a link to its commit, as git does), and anything staged in the
+        agent's index that differs from the file on disk. The files on
+        disk are the agent's latest state.
+
+        Raises :class:`PartialSaveError`, after pushing, when some files
+        could not be read and so are not on the branch.
+
+        Returns the pushed SHA, or ``None`` when there is nothing to save:
+        no uncommitted change, and the commit the worktree sits on is on
+        ``default_branch`` already or was pushed by the relay. Raises
+        when the work could not be saved; the caller must then keep the
+        worktree.
+
+        Same trust boundary as :meth:`push_run_branch`. The worktree's
+        files are read by a git that uses a fresh git dir created here,
+        an index file created here, and a config written here: no system
+        config, a global config holding only the credential helper, no
+        inherited ``GIT_*`` variable, hooks and fsmonitor off. So the
+        filters, hooks and attributes file the agent could name in the
+        clone's or the worktree's config are never read. The work tree's
+        ``.gitattributes`` files are read, but this git dir's
+        ``info/attributes`` overrides every attribute that could run a
+        program or change the bytes.
+        The bare clone's objects are borrowed through
+        ``objects/info/alternates``, and its refs are read as files.
+        """
+        from ctrlrelay.core.publish import PushRefusedError, github_push_url
+
+        if not wip_branch.startswith("wip/") or not _is_safe_branch(wip_branch):
+            raise PushRefusedError(
+                f"push refused: {wip_branch!r} is not a wip/ branch name"
+            )
+        work_tree = Path(worktree_path)
+        if not work_tree.is_dir() or work_tree.is_symlink():
+            raise WorktreeError(f"worktree {work_tree} is not a directory")
+        head_sha = self._worktree_head_sha(repo, work_tree)
+        bare_path = self._get_bare_repo_path(repo)
+        base_sha: str | None = None
+        if default_branch:
+            with contextlib.suppress(WorktreeError, PushRefusedError, OSError):
+                base_sha = _read_branch_head(bare_path, default_branch)
+        url = github_push_url(repo)
+        push_root = self.bare_repos_dir.parent / "push"
+        push_root.mkdir(parents=True, exist_ok=True)
+        push_root.chmod(0o700)
+        workdir = Path(tempfile.mkdtemp(prefix="wip-", dir=push_root))
+        try:
+            gitdir = workdir / "repo.git"
+            global_cfg = workdir / "gitconfig"
+            global_cfg.write_text(_relay_push_gitconfig())
+            env = _relay_git_env(global_cfg)
+            env["GIT_INDEX_FILE"] = str(workdir / "index")
+            for who in ("AUTHOR", "COMMITTER"):
+                env[f"GIT_{who}_NAME"] = "ctrlrelay"
+                env[f"GIT_{who}_EMAIL"] = "ctrlrelay@localhost"
+
+            def git(*args: str, tree: bool = False) -> list[str]:
+                where = ["--work-tree", str(work_tree)] if tree else []
+                return ["--git-dir", str(gitdir), *where, *_RELAY_GIT_FLAGS,
+                        "-c", "core.excludesFile=/dev/null", *args]
+
+            await self._run_git("init", "-q", "--bare", str(gitdir), env=env)
+            (gitdir / "objects" / "info" / "alternates").write_text(
+                str((bare_path / "objects").resolve()) + "\n"
+            )
+            # `info/attributes` outranks every `.gitattributes` in the work
+            # tree, so the agent's attributes cannot change the bytes saved
+            # (end-of-line conversion, `ident`, re-encoding) or name a
+            # filter. Works on any git, unlike `--attr-source`.
+            (gitdir / "info").mkdir(exist_ok=True)
+            (gitdir / "info" / "attributes").write_text(
+                "* -text -ident -filter -working-tree-encoding !eol\n"
+            )
+            await self._run_git(
+                *git("read-tree", "--end-of-options", head_sha), env=env,
+            )
+            # A file it cannot read (a root-owned leftover, a socket) is
+            # skipped rather than failing the whole save: with
+            # --ignore-errors git adds the rest, writes the index, and
+            # exits 1 naming what it skipped.
+            add_failed = False
+            try:
+                await self._run_git(
+                    *git("add", "--all", "--ignore-errors", "--", ".",
+                         tree=True),
+                    cwd=work_tree, env=env,
+                )
+            except GitCommandError as e:
+                add_failed = True
+                log_event(
+                    _logger, "publish.wip.files_skipped", repo=repo,
+                    session_id=session_id, error=str(e)[:400],
+                )
+            tree = (await self._run_git(*git("write-tree"), env=env)).strip()
+            head_tree = (
+                await self._run_git(
+                    *git("rev-parse", "--verify", "--quiet", "--end-of-options",
+                         f"{head_sha}^{{tree}}"),
+                    env=env,
+                )
+            ).strip()
+            if tree == head_tree and add_failed:
+                # An add that failed can leave the index as HEAD's, which
+                # reads as "nothing changed". Not knowing is not nothing:
+                # the caller keeps the worktree.
+                raise WorktreeError(
+                    "could not read the worktree's files to save them"
+                )
+            if tree == head_tree:
+                if head_sha in relay_pushed_shas:
+                    return None
+                if base_sha is not None:
+                    try:
+                        await self._run_git(
+                            *git("merge-base", "--is-ancestor", head_sha,
+                                 base_sha),
+                            env=env,
+                        )
+                        return None
+                    except GitCommandError:
+                        pass
+                sha = head_sha
+            else:
+                sha = (
+                    await self._run_git(
+                        *git("commit-tree", tree, "-p", head_sha, "-m", message),
+                        env=env,
+                    )
+                ).strip()
+            # Create-only: an empty lease refuses a branch that exists.
+            await self._run_git(
+                *git(
+                    "push", "--no-verify", "--porcelain",
+                    f"--force-with-lease=refs/heads/{wip_branch}:",
+                    url, f"{sha}:refs/heads/{wip_branch}",
+                ),
+                env=env,
+                timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+            )
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        log_event(
+            _logger, "publish.wip.saved", repo=repo, session_id=session_id,
+            branch=wip_branch, sha=sha, partial=add_failed,
+        )
+        if add_failed:
+            raise PartialSaveError(
+                f"saved to {wip_branch}, but some files could not be read",
+                sha=sha,
+            )
+        return sha
 
     def _resolve_admin_dir(
         self, bare_path: Path, worktree_dir: str,

@@ -133,6 +133,9 @@ class SessionResult:
     stdout: str = ""
     stderr: str = ""
     agent_session_id: str | None = None
+    # The relay killed the agent at its time limit (#311). Set only by the
+    # relay's own timeout path, never parsed from anything the agent wrote.
+    timed_out: bool = False
 
     @property
     def success(self) -> bool:
@@ -352,6 +355,7 @@ class CliAgentAdapter:
                 exit_code=-1,
                 state=None,
                 stderr="Session timed out",
+                timed_out=True,
             )
         except asyncio.CancelledError as e:
             # Scheduler/shutdown cancel: kill the child BEFORE re-raising

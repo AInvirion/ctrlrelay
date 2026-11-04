@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import os
 import re
@@ -42,7 +43,7 @@ from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier, VerificationResult
 from ctrlrelay.core.state import StateDB
-from ctrlrelay.core.worktree import WorktreeManager
+from ctrlrelay.core.worktree import PartialSaveError, WorktreeManager
 from ctrlrelay.dashboard.client import DashboardClient, EventPayload
 from ctrlrelay.pipelines.base import (
     PipelineContext,
@@ -401,6 +402,141 @@ def claim_failure_comment(
         # one it is read as an old-version failure, which ends only the
         # old, unnamed claims above it.
         + (f"\n{release_marker(claim_id)}" if claim_id else "")
+    )
+
+
+def wip_branch_name(issue_number: int, session_id: str) -> str:
+    """Where a timed-out run's unfinished work is pushed (#311): never the
+    run's own branch. The run id is the session id's random tail, so the
+    name holds only characters a branch name may."""
+    return f"wip/issue-{issue_number}-{session_id.rsplit('-', 1)[-1]}"
+
+
+async def save_timed_out_work(
+    worktree: WorktreeManager,
+    github: GitHubCLI,
+    state_db: StateDB,
+    *,
+    repo: str,
+    issue_number: int,
+    session_id: str,
+    worktree_path: Path,
+    branch_name: str,
+) -> tuple[bool, str | None]:
+    """Push what a timed-out run left in its worktree to a wip branch.
+
+    Returns ``(keep_worktree, note)``. ``keep_worktree`` is True when the
+    work could not be saved, so the caller must not remove the worktree.
+    ``note`` is the sentence for the issue comment, or ``None`` when there
+    was nothing to save. Raises nothing but a cancellation (a shutdown,
+    which must stop the run): this runs on a failure path, and any other
+    exception here would replace the run's own failure.
+    """
+    try:
+        return await _save_timed_out_work(
+            worktree, github, state_db, repo=repo, issue_number=issue_number,
+            session_id=session_id, worktree_path=worktree_path,
+            branch_name=branch_name,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            log_event(
+                _logger, "dev.timeout.save_failed", repo=repo,
+                issue_number=issue_number, session_id=session_id,
+                reason=type(e).__name__, error=str(e)[:200],
+            )
+        return True, (
+            "The run timed out and its unfinished work could not be saved "
+            f"to a branch, so its worktree `{worktree_path}` was kept on the "
+            "machine that ran it."
+        )
+
+
+async def _save_timed_out_work(
+    worktree: WorktreeManager,
+    github: GitHubCLI,
+    state_db: StateDB,
+    *,
+    repo: str,
+    issue_number: int,
+    session_id: str,
+    worktree_path: Path,
+    branch_name: str,
+) -> tuple[bool, str | None]:
+    wip = wip_branch_name(issue_number, session_id)
+    if wip == branch_name:
+        raise ValueError(f"wip branch {wip!r} is the run's own branch")
+    minutes: int | None = None
+    try:
+        row = state_db.get_session_row(session_id)
+        if row and row.get("started_at"):
+            minutes = max(1, round((time.time() - int(row["started_at"])) / 60))
+    except Exception:
+        minutes = None
+    took = f"after about {minutes} minutes" if minutes else ""
+    try:
+        default_branch: str | None = await github.get_default_branch(repo)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        default_branch = None
+    try:
+        sha = await worktree.save_unfinished_work(
+            repo, worktree_path,
+            wip_branch=wip,
+            message=(
+                f"wip: run {session_id} timed out, not finished\n\n"
+                "Saved by ctrlrelay when the agent session hit its time "
+                "limit. Unreviewed and incomplete."
+            ),
+            default_branch=default_branch,
+            # The run's own branch: a commit the relay already pushed there
+            # is on GitHub, so it needs no wip copy.
+            relay_pushed_shas=state_db.relay_pushed_shas(
+                repo=repo, branch=branch_name,
+            ),
+            session_id=session_id,
+        )
+    except asyncio.CancelledError:
+        raise
+    except PartialSaveError:
+        log_event(
+            _logger, "dev.timeout.saved_partly", repo=repo,
+            issue_number=issue_number, session_id=session_id, branch=wip,
+            worktree_path=str(worktree_path),
+        )
+        return True, (
+            f"The run timed out{(' ' + took) if took else ''}. Its unfinished "
+            f"work was saved to branch `{wip}`, except for files that could "
+            f"not be read, so its worktree `{worktree_path}` was also kept on "
+            "the machine that ran it. Nothing on the branch is reviewed or "
+            "complete, and no pull request was opened from it."
+        )
+    except Exception as e:
+        log_event(
+            _logger, "dev.timeout.save_failed", repo=repo,
+            issue_number=issue_number, session_id=session_id,
+            worktree_path=str(worktree_path),
+            reason=type(e).__name__, error=str(e)[:200],
+        )
+        return True, (
+            f"The run timed out{(' ' + took) if took else ''} and its "
+            f"unfinished work could not be saved to a branch "
+            f"({type(e).__name__}), so its worktree `{worktree_path}` was "
+            "kept on the machine that ran it."
+        )
+    if sha is None:
+        return False, None
+    log_event(
+        _logger, "dev.timeout.saved", repo=repo, issue_number=issue_number,
+        session_id=session_id, branch=wip, sha=sha,
+    )
+    return False, (
+        f"The run timed out{(' ' + took) if took else ''}. Its unfinished "
+        f"work was saved to branch `{wip}`: not reviewed, not complete, and "
+        "no pull request was opened from it."
     )
 
 
@@ -1097,6 +1233,7 @@ CTRLRELAY_DONE
                 # AgentAdapter.
                 error=(result.stderr or "").strip() or None,
                 exit_code=result.exit_code,
+                timed_out=result.timed_out,
             )
 
         if result.state.status == CheckpointStatus.DONE:
@@ -1850,6 +1987,8 @@ async def _verify_and_fix_pr(
                 question=fix_result.question,
                 error=fix_result.error,
                 outputs=merged_outputs,
+                exit_code=fix_result.exit_code,
+                timed_out=fix_result.timed_out,
             )
 
         result = fix_result
@@ -2885,15 +3024,7 @@ async def run_dev_issue(
                 # next poller restart, which prunes stale worktrees).
                 merged_outputs = dict(result.outputs)
                 merged_outputs["cleanup_deferred"] = True
-                result = PipelineResult(
-                    success=result.success,
-                    session_id=result.session_id,
-                    summary=result.summary,
-                    blocked=result.blocked,
-                    question=result.question,
-                    error=result.error,
-                    outputs=merged_outputs,
-                )
+                result = dataclasses.replace(result, outputs=merged_outputs)
 
         # Update session status
         status = "done" if result.success else ("blocked" if result.blocked else "failed")
@@ -2967,24 +3098,51 @@ async def run_dev_issue(
         # refs) so it runs only when we hold the lock. If reacquire above
         # failed, skip it and let the next retry / operator reclaim — the
         # verified result is already final either way.
+        # A timed-out run's work is saved before the worktree goes (#311);
+        # `timeout_note` is added to the issue comment below.
+        timeout_note: str | None = None
         if lock.held:
             if result.success:
                 worktree.remove_context_symlink(worktree_path)
                 await worktree.remove_worktree(repo, session_id)
             elif not result.blocked:
-                worktree.remove_context_symlink(worktree_path)
-                await worktree.remove_worktree(repo, session_id)
+                keep_worktree = False
+                if result.timed_out:
+                    # The relay's own context link out first, or the save
+                    # would commit it (it is excluded only in the
+                    # worktree's own exclude file, which the save's
+                    # private git dir does not read).
+                    worktree.remove_context_symlink(worktree_path)
+                    keep_worktree, timeout_note = await save_timed_out_work(
+                        worktree, github, state_db,
+                        repo=repo, issue_number=issue_number,
+                        session_id=session_id, worktree_path=worktree_path,
+                        branch_name=branch_name,
+                    )
+                if not keep_worktree:
+                    worktree.remove_context_symlink(worktree_path)
+                    await worktree.remove_worktree(repo, session_id)
                 # A branch the relay failed to publish holds the agent's
                 # finished commits and exists nowhere else (#219), so it
-                # is kept for the operator rather than deleted.
+                # is kept for the operator rather than deleted. Kept too
+                # after a timeout: the save reads the commit the worktree
+                # sits on, and the branch can hold commits that one does
+                # not reach (an agent mid-rebase, or on another branch).
                 if (
                     created_fresh
+                    and not result.timed_out
                     and not result.outputs.get("publish_failed")
                     and not await worktree.branch_exists_on_remote(
                         repo, branch_name
                     )
                 ):
                     await worktree.delete_branch(repo, branch_name)
+        elif result.timed_out:
+            # No lock, so no cleanup at all: the worktree stays as it is.
+            timeout_note = (
+                "The run timed out; its worktree "
+                f"`{worktree_path}` was kept on the machine that ran it."
+            )
 
         # Reconcile the claim with the outcome (#204). BLOCKED is not a
         # failure — the operator is being asked something and the claim
@@ -3011,7 +3169,8 @@ async def run_dev_issue(
                 repo=repo,
                 issue_number=issue_number,
                 session_id=session_id,
-                reason=failure_text(result),
+                reason=failure_text(result)
+                + (f" {timeout_note}" if timeout_note else ""),
                 exit_code=result.exit_code,
                 pr_number=pr_for_comment,
                 claim_posted=claim_may_stand,

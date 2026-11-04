@@ -67,6 +67,8 @@ session_id="test-123",
 
             assert result.exit_code == -1
             assert "timed out" in result.stderr
+            # #311: the flag the dev pipeline saves the worktree on.
+            assert result.timed_out is True
             mock_proc.kill.assert_called_once()
 
     @pytest.mark.asyncio
