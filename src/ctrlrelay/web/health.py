@@ -3,9 +3,14 @@
 Read only, standard library only. Read from ``os.getloadavg``,
 ``os.cpu_count``, ``shutil.disk_usage``, and -- for memory and uptime --
 whichever source this platform has: ``/proc/meminfo`` and ``/proc/uptime``
-on Linux, ``sysctl`` and ``vm_stat`` on macOS. On every ``/api/status``
-request (each is a few microseconds; the macOS path runs two short
-commands).
+on Linux, ``sysctl`` and ``vm_stat`` on macOS.
+
+On every ``/api/status`` request. **The two paths do not cost the same**:
+reading ``/proc`` is a few microseconds, while the macOS path starts
+**three** processes -- ``sysctl hw.memsize``, ``vm_stat`` and
+``sysctl kern.boottime`` -- which is milliseconds at best. Each is bounded
+by ``_RUN_TIMEOUT_S``, so a pathological host holds a status request for
+three times that and no longer; the bound is small for that reason.
 
 Every number may be ``null``. A number that could not be read is ``null``,
 never ``0`` (which would read as "out of memory" or "no load"), and
@@ -19,17 +24,22 @@ does not fail quietly: the page prints
 which looks like a machine in trouble rather than a reader that cannot
 look (#321).
 
-**What ``available`` means on macOS.** There is no ``MemAvailable`` to
-read, so it is computed as ``free + inactive + speculative + purgeable``
-pages -- the pages the kernel can hand out without swapping. That is the
-analogue of Linux's ``MemAvailable``, which also counts reclaimable page
-cache rather than only free memory, so ``low`` means the same thing on both
-platforms. It is **more generous than Activity Monitor's "unused"**, which
-counts roughly ``free + speculative``: a Mac showing 19 GB unused can
-report ~36 GB available here, and both are true of different questions.
-``kern.memorystatus_level`` is the kernel's own pressure percentage and was
-not used, because it is undocumented and gives no byte count, which the
-panel needs.
+**What ``available`` means on macOS, and what it does not.** There is no
+``MemAvailable`` to read, so it is ``free + inactive`` pages -- the
+definition ``psutil`` uses for macOS, chosen because other tools already
+agree on it rather than because it was invented here.
+
+It is an **estimate and an upper bound**: inactive pages can hold dirty
+anonymous data that must be compressed or swapped before the memory is
+handed out, so some of what is counted is not free for the asking.
+``speculative`` and ``purgeable`` are deliberately **not** added -- purgeable
+pages are counted inside the other queues, so adding them double-counts.
+
+**The two platforms measure different estimates and this does not claim
+otherwise.** ``LOW_FRACTION`` is applied to each platform's own estimate:
+"less than 10% of what this kernel would call available". Useful on both,
+the same measurement on neither -- which matters to anyone comparing two
+machines' percentages side by side.
 
 Shape::
 
@@ -104,52 +114,92 @@ def _memory(proc: Path, unavailable: list[str]) -> dict[str, Any]:
 
 # The default macOS readers. Separate callables so a test can hand in the
 # text of a real `vm_stat` or `sysctl` run instead of needing a Mac.
+# Absolute paths, not names on PATH: these run on every status request and
+# their whole job is to report what THIS machine is doing, so a `sysctl`
+# earlier on somebody's PATH would be answering a different question,
+# plausibly. A path that is absent raises, which the callers already turn
+# into a gap with a reason.
+_SYSCTL = "/usr/sbin/sysctl"
+_VM_STAT = "/usr/bin/vm_stat"
+# Three commands run per request, so this is a third of the worst case a
+# status request can spend in here.
+_RUN_TIMEOUT_S = 2
+
+
 def _run(argv: Sequence[str]) -> str:
     """The output of ``argv``, or raise. Bounded, because a status-page
-    request waits on it."""
+    request waits on it.
+
+    ``subprocess.run`` kills and reaps the command it started; a command
+    that leaves descendants behind is not something this contains, which is
+    part of why the two it runs are named absolutely rather than found."""
     return subprocess.run(
-        list(argv), capture_output=True, text=True, timeout=5, check=True,
+        list(argv), capture_output=True, text=True, timeout=_RUN_TIMEOUT_S, check=True,
     ).stdout
 
 
 def default_sysctl(name: str) -> str:
-    return _run(["sysctl", "-n", name]).strip()
+    return _run([_SYSCTL, "-n", name]).strip()
 
 
 def default_vm_stat() -> str:
-    return _run(["vm_stat"])
+    return _run([_VM_STAT])
 
 
 _VM_STAT_PAGE_SIZE = re.compile(r"page size of (\d+) bytes")
 # "Pages free:   509239." -- the trailing full stop is vm_stat's, not a typo.
 _VM_STAT_LINE = re.compile(r"^(.+?):\s+(\d+)\.?\s*$")
 
-# The pages the kernel can hand out without swapping; see the module
-# docstring for why these four and not others.
-_AVAILABLE_PAGES = ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable")
+# `psutil`'s definition for macOS. See the module docstring for why not more.
+_AVAILABLE_PAGES = ("Pages free", "Pages inactive")
+# The page sizes a Darwin kernel actually uses. Accepting any number would
+# let a header reading "page size of 0 bytes" turn every count into zero
+# bytes available -- a gap reported as "out of memory", which is the one
+# answer this module must never give. A wrong-but-plausible size would
+# scale every number silently.
+_PAGE_SIZES = (4096, 16384)
+# Larger than any machine this runs on, and small enough that the arithmetic
+# below cannot overflow a float. A 400-digit `hw.memsize` parses as an int
+# and would otherwise raise OverflowError out of this module, taking the
+# whole status request with it rather than one row of one panel.
+_MAX_TOTAL_BYTES = 2**60
 
 
 def _vm_stat_pages(text: str) -> tuple[int, dict[str, int]]:
-    """``(page_size, {name: pages})`` from ``vm_stat`` output. Raises when
-    the header has no page size, since every count depends on it."""
-    head = _VM_STAT_PAGE_SIZE.search(text)
+    """``(page_size, {name: pages})`` from ``vm_stat`` output. Raises unless
+    the **first** line carries a page size this understands: every count is
+    multiplied by it, and a page size further down the output belongs to
+    something this does not understand."""
+    lines = text.splitlines()
+    head = _VM_STAT_PAGE_SIZE.search(lines[0]) if lines else None
     if not head:
         raise ValueError("no 'page size of <n> bytes' in the first line")
+    page_size = int(head.group(1))
+    if page_size not in _PAGE_SIZES:
+        raise ValueError(f"page size is {page_size}, not one of {_PAGE_SIZES}")
     counts = {}
-    for line in text.splitlines()[1:]:
+    for line in lines[1:]:
         found = _VM_STAT_LINE.match(line.strip())
         if found:
             counts[found.group(1).strip('"')] = int(found.group(2))
-    return int(head.group(1)), counts
+    return page_size, counts
 
 
 def _memory_darwin(
     sysctl: Callable[[str], str], vm_stat: Callable[[], str], unavailable: list[str],
 ) -> dict[str, Any]:
+    # Everything, the arithmetic included, inside the guard: a reading that
+    # parses and then cannot be divided must still be a gap, not an
+    # exception leaving this module and taking the request with it.
     try:
         total = int(sysctl("hw.memsize"))
-        if total <= 0:
-            raise ValueError("hw.memsize is 0")
+        if not 0 < total <= _MAX_TOTAL_BYTES:
+            # The number itself, only while it is short enough to be worth
+            # reading: `_why` truncates at 200 characters, and a 400-digit
+            # `hw.memsize` pushed the explanation off the end of its own
+            # message, which a test caught by looking for the explanation.
+            shown = str(total) if abs(total) <= _MAX_TOTAL_BYTES else f"{len(str(total))} digits"
+            raise ValueError(f"hw.memsize is {shown}, not a plausible size")
         page_size, counts = _vm_stat_pages(vm_stat())
         missing = [name for name in _AVAILABLE_PAGES if name not in counts]
         if missing:
@@ -157,21 +207,28 @@ def _memory_darwin(
             # not understand, and a partial sum would read as low memory.
             raise ValueError(f"vm_stat has no {', '.join(missing)} line")
         available = sum(counts[name] for name in _AVAILABLE_PAGES) * page_size
+        if available > total:
+            # The two commands disagree about one machine, so neither number
+            # is worth putting on a page.
+            raise ValueError(
+                f"vm_stat reports {available} bytes available of {total}, which cannot be"
+            )
+        return {
+            "total_bytes": total,
+            "available_bytes": available,
+            "available_pct": _pct(available, total),
+            "low": available < LOW_FRACTION * total,
+        }
     except Exception as exc:
         unavailable.append(f"memory (sysctl hw.memsize, vm_stat): {_why(exc)}")
         return dict.fromkeys(_MEMORY_KEYS)
-    return {
-        "total_bytes": total,
-        "available_bytes": available,
-        "available_pct": _pct(available, total),
-        "low": available < LOW_FRACTION * total,
-    }
 
 
-# `\b` and not just `sec`: `kern.boottime` prints `{ sec = …, usec = … }`, and without the
-# boundary a reading with no `sec` field takes the microseconds as seconds. A test plants
-# `{ usec = 1 }` for exactly that.
-_BOOTTIME_SEC = re.compile(r"\bsec\s*=\s*(\d+)")
+# `kern.boottime` prints `{ sec = 1790576331, usec = 490981 } Sun Sep 27 ...`.
+# The word boundary matters -- without it a reading with no `sec` field takes
+# the microseconds as seconds -- and so does the terminator: `sec = 100oops`
+# would otherwise read as 100. A test plants both.
+_BOOTTIME_SEC = re.compile(r"\bsec\s*=\s*(\d+)\s*(?=[,}]|$)")
 
 
 def _uptime_darwin(
@@ -179,13 +236,19 @@ def _uptime_darwin(
 ) -> int | None:
     try:
         text = sysctl("kern.boottime")
-        found = _BOOTTIME_SEC.search(text)
+        found = _BOOTTIME_SEC.findall(text)
         if not found:
             raise ValueError(f"no 'sec = <n>' in {text!r}")
-        seconds = int(now() - int(found.group(1)))
-        if seconds < 0:
+        if len(found) > 1:
+            # Two boot times is not a reading to pick the first of.
+            raise ValueError(f"{len(found)} 'sec =' fields in {text!r}")
+        # Compared as a float before truncating: `int()` of -0.5 is 0, so
+        # truncating first turns a boot time half a second in the future into
+        # a plausible zero-second uptime.
+        elapsed = now() - int(found[0])
+        if elapsed < 0:
             raise ValueError("boot time is in the future")
-        return seconds
+        return int(elapsed)
     except Exception as exc:
         unavailable.append(f"uptime (sysctl kern.boottime): {_why(exc)}")
         return None
@@ -286,11 +349,11 @@ def read_server_health(
         memory = _memory_darwin(sysctl, vm_stat, unavailable)
         uptime_s = _uptime_darwin(sysctl, now, unavailable)
     else:
-        # Named rather than silent: a reader on a platform nobody has
-        # taught this should see which two sources were looked for.
-        unavailable.append(
-            f"memory and uptime: {platform!r} has neither /proc nor sysctl support here"
-        )
+        # One line per reading, as every other gap here is, and worded as
+        # what it is: nothing was probed on this platform, so neither line
+        # claims to have looked and failed.
+        unavailable.append(f"memory: no reader for platform {platform!r}")
+        unavailable.append(f"uptime: no reader for platform {platform!r}")
         memory, uptime_s = dict.fromkeys(_MEMORY_KEYS), None
     return {
         "load_1m": one,

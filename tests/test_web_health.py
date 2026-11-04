@@ -117,28 +117,140 @@ def _mac(tmp_path: Path, **kw) -> dict:
 def test_macos_memory_and_uptime_come_from_sysctl_and_vm_stat(tmp_path: Path) -> None:
     out = _mac(tmp_path)
 
-    # free + inactive + speculative + purgeable, times the page size in the header.
-    pages = 509239 + 1093434 + 732215 + 11246
+    # free + inactive, times the page size in the header (see the module docstring
+    # for why speculative and purgeable are not added).
+    pages = 509239 + 1093434
     assert out["memory"]["total_bytes"] == 68719476736
     assert out["memory"]["available_bytes"] == pages * 16384
-    assert out["memory"]["available_pct"] == 55.9
+    assert out["memory"]["available_pct"] == round(100.0 * pages * 16384 / 68719476736, 1)
     assert out["memory"]["low"] is False
     assert out["uptime_s"] == int(NOW - 1790576331)
     # The point of the ticket: nothing is missing and nothing is explained away.
     assert out["unavailable"] == []
 
 
-def test_macos_low_memory_is_flagged_below_ten_percent(tmp_path: Path) -> None:
-    # 1 free page of a 16 GiB machine: everything reclaimable is gone.
-    one_page = VM_STAT.replace("509239.", "1.").replace("1093434.", "0.")
-    one_page = one_page.replace("732215.", "0.").replace("11246.", "0.")
-    out = _mac(
-        tmp_path, sysctl=_sysctl(**{"hw.memsize": str(16 * 2**30)}), vm_stat=lambda: one_page,
+def _vm_stat_for(total_bytes: int, available_bytes: int) -> str:
+    """A physically consistent `vm_stat` for a machine of ``total_bytes``
+    with ``available_bytes`` free+inactive, the rest active.
+
+    Built rather than edited by hand because the first version of the
+    low-memory fixture kept 1,665,080 active pages while declaring a 16 GiB
+    total -- more active memory than the machine had, which is not a state
+    any kernel reports and so not a case worth passing.
+    """
+    page = 16384
+    assert total_bytes % page == 0, "a machine is a whole number of pages"
+    assert available_bytes % page == 0, "use _pages() to round to a page"
+    free = available_bytes // page
+    active = (total_bytes - available_bytes) // page
+    return (
+        f"Mach Virtual Memory Statistics: (page size of {page} bytes)\n"
+        f"Pages free:                              {free}.\n"
+        f"Pages active:                           {active}.\n"
+        "Pages inactive:                                0.\n"
+        "Pages speculative:                             0.\n"
+        "Pages wired down:                              0.\n"
     )
 
-    assert out["memory"]["available_bytes"] == 16384
-    assert out["memory"]["low"] is True
-    assert out["memory"]["available_pct"] == 0.0
+
+# A machine of exactly 10,000 pages, so that 10% of it is exactly 1,000 pages
+# and the boundary can be landed on rather than rounded to. Choosing a 16 GiB
+# total instead put "exactly 10%" a fraction of a page under the threshold and
+# the case quietly tested 9.99% — found by it failing.
+PAGE = 16384
+TOTAL_PAGES = 10_000
+TOTAL = TOTAL_PAGES * PAGE
+
+
+@pytest.mark.parametrize(
+    ("name", "available_pages", "low"),
+    [
+        ("just under 10%", 999, True),
+        ("exactly 10%", 1_000, False),   # `low` is a strict <, so the boundary is not low
+        ("just over 10%", 1_001, False),
+        ("one page", 1, True),
+        ("half", 5_000, False),
+    ],
+)
+def test_macos_low_is_the_same_ten_percent_as_everywhere_else(
+    tmp_path: Path, name: str, available_pages: int, low: bool,
+) -> None:
+    available = available_pages * PAGE
+    out = _mac(
+        tmp_path,
+        sysctl=_sysctl(**{"hw.memsize": str(TOTAL)}),
+        vm_stat=lambda: _vm_stat_for(TOTAL, available),
+    )
+
+    assert out["memory"]["available_bytes"] == available, name
+    assert out["memory"]["low"] is low, name
+    # The expected percentage is computed here, not taken from the code.
+    assert out["memory"]["available_pct"] == round(100.0 * available / TOTAL, 1), name
+
+
+@pytest.mark.parametrize("missing", ["Pages free", "Pages inactive"])
+def test_macos_one_missing_counter_is_a_gap_not_a_partial_sum(
+    tmp_path: Path, missing: str,
+) -> None:
+    """Each summed counter, removed on its own.
+
+    The first version of this test removed every counter at once, so it
+    could not tell "rejects a vm_stat it does not fully understand" from
+    "rejects an empty one".
+    """
+    lines = [line for line in VM_STAT.splitlines(True) if not line.startswith(f"{missing}:")]
+    out = _mac(tmp_path, vm_stat=lambda: "".join(lines))
+
+    assert out["memory"] == dict.fromkeys(MEMORY_KEYS), missing
+    assert any(f"vm_stat has no {missing} line" in line for line in out["unavailable"])
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        (
+            "a page size of zero",
+            VM_STAT.replace("page size of 16384 bytes", "page size of 0 bytes"),
+        ),
+        ("a plausible wrong size", VM_STAT.replace("of 16384 bytes", "of 3 bytes")),
+        (
+            "the header further down instead of first",
+            "something else entirely\n" + VM_STAT,
+        ),
+    ],
+)
+def test_macos_a_page_size_it_cannot_trust_is_a_gap(tmp_path: Path, name: str, text: str) -> None:
+    """A page size of 0 would make every count zero bytes available — a gap
+    reported as "out of memory", which is the one answer this must not give.
+    """
+    out = _mac(tmp_path, vm_stat=lambda: text)
+
+    assert out["memory"] == dict.fromkeys(MEMORY_KEYS), name
+    assert out["memory"]["available_bytes"] is None, name
+
+
+def test_macos_an_implausible_total_is_a_gap_and_does_not_escape(tmp_path: Path) -> None:
+    """A 400-digit `hw.memsize` parses as an int, and `0.10 * that` raises
+    OverflowError. That used to happen outside the guard, so one unreadable
+    number took the whole status request with it."""
+    out = _mac(tmp_path, sysctl=_sysctl(**{"hw.memsize": "9" * 400}))
+
+    assert out["memory"] == dict.fromkeys(MEMORY_KEYS)
+    assert any("not a plausible size" in line for line in out["unavailable"])
+    # The rest of the panel still arrived, which is the invariant at stake.
+    assert out["uptime_s"] is not None and out["disks"][0]["free_pct"] == 40.0
+
+
+def test_macos_more_available_than_installed_is_a_gap(tmp_path: Path) -> None:
+    """The two commands disagreeing about one machine is not a measurement."""
+    out = _mac(
+        tmp_path,
+        sysctl=_sysctl(**{"hw.memsize": str(2 * 2**30)}),
+        vm_stat=lambda: _vm_stat_for(64 * 2**30, 32 * 2**30),
+    )
+
+    assert out["memory"] == dict.fromkeys(MEMORY_KEYS)
+    assert any("which cannot be" in line for line in out["unavailable"])
 
 
 @pytest.mark.parametrize(
@@ -192,11 +304,31 @@ def test_macos_an_unreadable_boot_time_is_unknown(tmp_path: Path, boottime: str)
     assert any(line.startswith("uptime (sysctl kern.boottime):") for line in out["unavailable"])
 
 
-def test_macos_a_boot_time_in_the_future_is_unknown_rather_than_negative(tmp_path: Path) -> None:
-    out = _mac(tmp_path, now=lambda: 1790576331.0 - 60)
+@pytest.mark.parametrize("ahead_s", [60.0, 0.5])
+def test_macos_a_boot_time_in_the_future_is_unknown_rather_than_zero(
+    tmp_path: Path, ahead_s: float,
+) -> None:
+    """Half a second ahead matters as much as a minute: `int(-0.5)` is 0, so
+    truncating before the comparison turned a future boot time into a
+    plausible zero-second uptime."""
+    out = _mac(tmp_path, now=lambda: 1790576331.0 - ahead_s)
 
-    assert out["uptime_s"] is None
+    assert out["uptime_s"] is None, ahead_s
     assert any("boot time is in the future" in line for line in out["unavailable"])
+
+
+@pytest.mark.parametrize(
+    ("name", "boottime"),
+    [
+        ("a number with a tail", "{ sec = 100oops, usec = 1 }"),
+        ("two records", "{ sec = 1 }\n{ sec = 100 }"),
+    ],
+)
+def test_macos_an_ambiguous_boot_time_is_unknown(tmp_path: Path, name: str, boottime: str) -> None:
+    out = _mac(tmp_path, sysctl=_sysctl(**{"kern.boottime": boottime}), now=lambda: 200.0)
+
+    assert out["uptime_s"] is None, name
+    assert any(line.startswith("uptime (sysctl kern.boottime):") for line in out["unavailable"])
 
 
 def test_a_platform_with_neither_source_says_which_two_it_looked_for(tmp_path: Path) -> None:
@@ -208,7 +340,8 @@ def test_a_platform_with_neither_source_says_which_two_it_looked_for(tmp_path: P
     assert out["memory"] == dict.fromkeys(MEMORY_KEYS)
     assert out["uptime_s"] is None
     assert out["unavailable"] == [
-        "memory and uptime: 'sunos5' has neither /proc nor sysctl support here"
+        "memory: no reader for platform 'sunos5'",
+        "uptime: no reader for platform 'sunos5'",
     ]
     # Everything that does not need a platform is still there.
     assert out["load_1m"] == 0.1 and out["cpu_count"] == 2 and out["disks"][0]["free_pct"] == 40.0
