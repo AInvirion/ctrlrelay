@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ctrlrelay.core.obs import get_logger, log_event
+from ctrlrelay.web.links import peer_page_url
 
 _logger = get_logger("web.fleet")
 
@@ -492,6 +493,10 @@ class PeerReader:
                     })
                 else:
                     peers.append(dict(entry))
+        for entry in peers:
+            # #319: where the machine's name links to, from this machine's
+            # own config only (see peer_page_url).
+            entry["page_url"] = peer_page_url(entry["url"])
         return {"peers": peers}
 
     def start(self) -> None:

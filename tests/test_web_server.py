@@ -970,9 +970,10 @@ def test_every_href_goes_through_one_helper() -> None:
     assert re.search(r'\.rel\s*=\s*"noopener noreferrer"', helper)
     assert re.search(r'\.target\s*=\s*"_blank"', helper)
     assert "textContent" in helper or "el(" in helper
-    # Nowhere else: no href, no setAttribute of a URL-bearing attribute.
-    outside = script.replace(helper, "")
-    assert not re.search(r"\.href\b", outside), "href set outside ghLink"
+    # Nowhere else but peerLink (#319, tested below): no href, no
+    # setAttribute of a URL-bearing attribute.
+    outside = script.replace(helper, "").replace(_js_function(script, "peerLink"), "")
+    assert not re.search(r"\.href\b", outside), "href set outside ghLink and peerLink"
     assert not re.search(r"""setAttribute\(\s*["'](href|src|action|formaction)""", script)
     assert not re.search(r"""\[\s*["']href["']\s*\]""", script)
     # And the links are used: one call per section that links.
@@ -983,6 +984,68 @@ def test_every_href_goes_through_one_helper() -> None:
         assert "ghLink(" in _js_function(script, renderer), renderer
     assert "needCard(" in _js_function(script, "renderNeeds")
     assert "questionParts(" in _js_function(script, "needCard")
+
+
+@pytest.mark.parametrize("url", [
+    "http://node-a:8787/",
+    "https://node-b.example/",
+    "http://192.168.1.20:8787/",
+    "http://node-b:65535/",
+])
+def test_page_accepts_a_peer_page_url(url: str) -> None:
+    assert _run_js(["safePeerUrl"], f"safePeerUrl({json.dumps(url)})") == url
+
+
+@pytest.mark.parametrize("url", [
+    "javascript:alert(1)",
+    "http://node-a:8787",            # the server always sends the root
+    "http://node-a:8787/api/status",
+    "http://node-a:8787/?x",
+    "http://node-a:8787/#x",
+    "http://u:p@node-a:8787/",
+    "http://evil.example@node-a/",
+    "//node-a:8787/",
+    "http://node..b/",
+    "http://-node/",
+    "http://node-b:0/",
+    "http://node-b:99999/",
+    "http://node-b:65536/",
+    "http://node-a:8787/\n",
+    "https://github.com/a/b/issues/5",
+    "",
+    None,
+    5,
+])
+def test_page_refuses_any_other_peer_url(url: object) -> None:
+    assert _run_js(["safePeerUrl"], f"safePeerUrl({json.dumps(url)})") is None
+
+
+def test_peer_names_link_only_through_peer_link() -> None:
+    """#319: ``peerLink`` sets an href only to what ``safePeerUrl``
+    returned, in the same tab, and each place a peer's name appears uses
+    it with the server's ``page_url``."""
+    script = _script()
+    helper = _js_function(script, "peerLink")
+    assert len(re.findall(r"\.href\s*=", helper)) == 1
+    assert re.search(r"\.href\s*=\s*safe\s*;", helper), helper
+    assert re.search(r"var safe\s*=\s*safePeerUrl\(url\)\s*;", helper), helper
+    assert re.search(r'\.rel\s*=\s*"noopener noreferrer"', helper)
+    assert "_blank" not in helper
+    # Each place passes the address it was handed, not a literal or a
+    # field of its own choosing.
+    calls = {
+        "machineCard": 'peerLink(pageUrl, name || "unknown", null)',
+        "needCard": "peerLink(pageUrl, machine, null)",
+        "renderWho": "peerLink(r.pageUrl, r.machine, null)",
+    }
+    for fn, call in calls.items():
+        body = _js_function(script, fn)
+        assert body.count("peerLink(") == 1 and call in body, fn
+    assert script.count("peerLink(") == len(calls) + 1   # + its definition
+    # The address handed in is the server's page_url, never p.url or a
+    # field of the peer's own answer.
+    assert script.count("p.page_url") == 4, script.count("p.page_url")
+    assert "pageUrl: p.page_url" in _js_function(script, "peerNeeds")
 
 
 def test_no_server_value_reaches_html_parsing() -> None:
