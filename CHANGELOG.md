@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt. A vague issue gets one question instead of a pull request. A plan
   without criteria is a failed plan: `on` reports it and codes without one,
   `required` fails the run (#220).
+- On the status page, a peer machine's name links to that machine's own
+  page: in the machine strip, in "Who has what" and on a "Needs you" card.
+  The address is the `fleet.peers` entry from this machine's config, cut to
+  `<scheme>://<host>[:port]/`; nothing a peer answers changes it, and an
+  entry with userinfo or a non-http scheme gives plain text (#319).
 
 ### Fixed
 

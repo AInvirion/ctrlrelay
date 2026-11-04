@@ -230,6 +230,9 @@ var KIND_LABEL = {
 // A github.com issue or pull request address and nothing else: no query,
 // no fragment, no segment of dots (a URL resolves those away).
 var GITHUB_URL = /^https:\/\/github\.com\/(?!\.+\/)[A-Za-z0-9_.-]+\/(?!\.+\/)[A-Za-z0-9_.-]+\/(issues|pull)\/[1-9][0-9]*$/;
+// #319: a peer's page, as the server built it from this machine's own
+// fleet.peers entry: http(s), a plain host, an optional port, the root.
+var PEER_URL = /^https?:\/\/[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[1-9][0-9]{0,4})?\/$/;
 
 var refreshSeconds = parseInt(document.body.getAttribute("data-refresh-seconds"), 10);
 if (!(refreshSeconds >= 1)) { refreshSeconds = 5; }
@@ -302,6 +305,24 @@ function ghLink(url, text, cls) {
   a.href = safe;
   a.rel = "noopener noreferrer";
   a.target = "_blank";
+  return a;
+}
+
+function safePeerUrl(url) {
+  if (typeof url !== "string" || !PEER_URL.test(url) || url.indexOf("..") !== -1) { return null; }
+  var port = /:([0-9]+)\/$/.exec(url);
+  return port && parseInt(port[1], 10) > 65535 ? null : url;
+}
+
+// #319: a peer machine's name, linked to that machine's own status page.
+// Same tab: it is this page on another machine. Plain text when the
+// server sent no usable address.
+function peerLink(url, text, cls) {
+  var safe = safePeerUrl(url);
+  if (safe === null) { return el("span", cls, text); }
+  var a = el("a", cls, text);
+  a.href = safe;
+  a.rel = "noopener noreferrer";
   return a;
 }
 
@@ -506,7 +527,7 @@ function renderNeeds(data, now) {
     unknownFrom.push(here);
   }
   var peers = peerNeeds(data);
-  peers.known.forEach(function (pq) { cards.push(needCard(pq.q, now, pq.name)); });
+  peers.known.forEach(function (pq) { cards.push(needCard(pq.q, now, pq.name, pq.pageUrl)); });
   unknownFrom = unknownFrom.concat(peers.unknown);
   // A count only when every machine's questions were read.
   if (unknownFrom.length) {
@@ -531,16 +552,18 @@ function peerNeeds(data) {
     var name = p.name || p.url;
     if (!Array.isArray(p.needs_you)) { out.unknown.push(name); return; }
     p.needs_you.forEach(function (q) {
-      if (q && typeof q === "object") { out.known.push({ q: q, name: name }); }
+      if (q && typeof q === "object") { out.known.push({ q: q, name: name, pageUrl: p.page_url }); }
     });
   });
   return out;
 }
 
-function needCard(q, now, machine) {
+function needCard(q, now, machine, pageUrl) {
     var box = el("div", "card");
     var top = el("div", "row");
-    top.appendChild(el("span", "tag", "on " + machine));
+    var on = el("span", "tag", "on ");
+    on.appendChild(peerLink(pageUrl, machine, null));
+    top.appendChild(on);
     top.appendChild(el("span", "repo", q.repo));
     if (typeof q.issue_number === "number") {
       top.appendChild(ghLink(q.url, issueText(q.repo, q.issue_number, q.title), "title"));
@@ -575,9 +598,13 @@ function usagePct(node, name) {
   return w && typeof w.used === "number" ? pct(w.used * 100) : "unknown";
 }
 
-function machineCard(name, node, state, bad, now, extra) {
+function machineCard(name, node, state, bad, now, extra, pageUrl) {
   var box = el("div", "machine" + (bad ? " bad" : ""));
-  if (name !== null) { box.appendChild(el("div", "name", name || "unknown")); }
+  if (name !== null) {
+    var label = el("div", "name");
+    label.appendChild(peerLink(pageUrl, name || "unknown", null));
+    box.appendChild(label);
+  }
   box.appendChild(el("div", "state", state || "unknown"));
   if (extra) { box.appendChild(el("div", "muted", extra)); }
   if (node && typeof node === "object") {
@@ -610,7 +637,8 @@ function renderFleet(data, now) {
   peers.forEach(function (p) {
     if (p.reachable === false) {
       var c = machineCard(p.name || p.url, null, "not reachable from here", true, now,
-        (p.error || "no answer") + (p.checked_at ? ", checked " + ago(p.checked_at, now) : ""));
+        (p.error || "no answer") + (p.checked_at ? ", checked " + ago(p.checked_at, now) : ""),
+        p.page_url);
       if (p.last_known) {
         var last = machineCard(null, p.last_known, "last known: " + (p.last_known.state || "unknown"),
           false, now, null);
@@ -621,7 +649,7 @@ function renderFleet(data, now) {
       cards.push(c);
     } else {
       cards.push(machineCard(p.name || p.url, p.node, p.state,
-        p.reachable !== true || isBad(p.state), now, null));
+        p.reachable !== true || isBad(p.state), now, null, p.page_url));
     }
   });
   put(document.getElementById("fleet-strip"), cards);
@@ -630,11 +658,11 @@ function renderFleet(data, now) {
 
 function renderWho(data, now, peers) {
   var rows = [];
-  var add = function (name, node) {
+  var add = function (name, node, pageUrl) {
     var claims = node && Array.isArray(node.claims) ? node.claims : null;
     if (claims === null) { return false; }
     claims.forEach(function (c) {
-      if (c && typeof c === "object") { rows.push({ machine: name, c: c }); }
+      if (c && typeof c === "object") { rows.push({ machine: name, c: c, pageUrl: pageUrl }); }
     });
     return true;
   };
@@ -643,7 +671,7 @@ function renderWho(data, now, peers) {
     unknownFrom.push((data.node && data.node.name) || data.host);
   }
   peers.forEach(function (p) {
-    if (!add(p.name || p.url, p.node)) { unknownFrom.push(p.name || p.url); }
+    if (!add(p.name || p.url, p.node, p.page_url)) { unknownFrom.push(p.name || p.url); }
   });
   var target = document.getElementById("who");
   var parts = [];
@@ -657,7 +685,9 @@ function renderWho(data, now, peers) {
     table.appendChild(head);
     rows.forEach(function (r) {
       var tr = el("tr");
-      tr.appendChild(el("td", null, r.machine));
+      var who = el("td");
+      who.appendChild(peerLink(r.pageUrl, r.machine, null));
+      tr.appendChild(who);
       var td = el("td");
       td.appendChild(ghLink(r.c.url, typeof r.c.issue_number === "number"
         ? r.c.repo + "#" + r.c.issue_number : r.c.repo + " (" + (r.c.kind || "run") + ")", "title"));
