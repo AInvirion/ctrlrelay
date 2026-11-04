@@ -507,6 +507,9 @@ _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 # reads this table as well, so a caller that bypasses the config cannot
 # get a mode accepted and ignored.
 DEV_STEP_MODES: dict[str, tuple[str, ...]] = {
+    # ``plan`` (#220) runs before ``code``. Unset is ``off``: a repo that
+    # does not ask for a plan runs exactly as it did before the step.
+    "plan": ("off", "on", "required"),
     "code": ("required",),
     "publish": ("required",),
     "verify": ("off", "required"),
@@ -514,6 +517,7 @@ DEV_STEP_MODES: dict[str, tuple[str, ...]] = {
 }
 
 _STEP_REFUSALS: dict[str, str] = {
+    "plan": "",
     "code": (
         "a dev run without the agent run has nothing to publish"
     ),
@@ -567,7 +571,7 @@ class DevStepsConfig(BaseModel):
     ``verify`` stops it when CI is still red after the fix rounds, but
     hands the pull request over when the CI wait times out; ``review``
     reports a review that did not post and hands the pull request over
-    anyway (``on``).
+    anyway (``on``); ``plan`` does not run (``off``).
 
     Unknown keys are refused, so a typo such as ``verfy: required``
     cannot load as "unset".
@@ -575,12 +579,15 @@ class DevStepsConfig(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    plan: str | None = None
     code: str | None = None
     publish: str | None = None
     verify: str | None = None
     review: str | None = None
 
-    @field_validator("code", "publish", "verify", "review", mode="before")
+    @field_validator(
+        "plan", "code", "publish", "verify", "review", mode="before"
+    )
     @classmethod
     def _known_mode(cls, v: Any, info: Any) -> str | None:
         return check_dev_step_mode(info.field_name, v)
