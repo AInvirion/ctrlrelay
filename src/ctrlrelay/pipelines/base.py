@@ -41,6 +41,11 @@ class PipelineResult:
     # that actually ran. `None` means "not applicable or not known" —
     # never 0, because exiting 0 and writing no checkpoint is the exact
     # case this field exists to make visible (#174).
+    # The agent session was killed at its time limit (#311). A field, not
+    # a key in `outputs`, for the same reason as `review` below: `outputs`
+    # is merged with the agent's own checkpoint, and this decides whether
+    # the relay saves the worktree before it removes it.
+    timed_out: bool = False
     exit_code: int | None = None
     # What happened to the automated review, when one was attempted.
     # A FIELD rather than a key in `outputs`, because `outputs` is
