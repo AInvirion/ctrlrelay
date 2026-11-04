@@ -1,14 +1,35 @@
 """The status page's server health (#232): load, memory, disk and uptime.
 
 Read only, standard library only. Read from ``os.getloadavg``,
-``os.cpu_count``, ``/proc/meminfo``, ``/proc/uptime`` and
-``shutil.disk_usage``, on every ``/api/status`` request (each is a few
-microseconds).
+``os.cpu_count``, ``shutil.disk_usage``, and -- for memory and uptime --
+whichever source this platform has: ``/proc/meminfo`` and ``/proc/uptime``
+on Linux, ``sysctl`` and ``vm_stat`` on macOS. On every ``/api/status``
+request (each is a few microseconds; the macOS path runs two short
+commands).
 
 Every number may be ``null``. A number that could not be read is ``null``,
 never ``0`` (which would read as "out of memory" or "no load"), and
-``unavailable`` says why, one line per thing that could not be read. Off
-Linux there is no ``/proc``, so memory and uptime are ``null`` there.
+``unavailable`` says why, one line per thing that could not be read, naming
+the source it tried.
+
+**Two of the four machines are Macs**, where there is no ``/proc`` at all,
+so a panel that reads only ``/proc`` is empty for half the fleet -- and it
+does not fail quietly: the page prints
+``memory (/proc/meminfo): FileNotFoundError`` to whoever is reading it,
+which looks like a machine in trouble rather than a reader that cannot
+look (#321).
+
+**What ``available`` means on macOS.** There is no ``MemAvailable`` to
+read, so it is computed as ``free + inactive + speculative + purgeable``
+pages -- the pages the kernel can hand out without swapping. That is the
+analogue of Linux's ``MemAvailable``, which also counts reclaimable page
+cache rather than only free memory, so ``low`` means the same thing on both
+platforms. It is **more generous than Activity Monitor's "unused"**, which
+counts roughly ``free + speculative``: a Mac showing 19 GB unused can
+report ~36 GB available here, and both are true of different questions.
+``kern.memorystatus_level`` is the kernel's own pressure percentage and was
+not used, because it is undocumented and gives no byte count, which the
+panel needs.
 
 Shape::
 
@@ -28,7 +49,11 @@ disk is available, ``null`` when that could not be measured.
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import subprocess
+import sys
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -75,6 +100,95 @@ def _memory(proc: Path, unavailable: list[str]) -> dict[str, Any]:
         "available_pct": _pct(available, total),
         "low": available < LOW_FRACTION * total,
     }
+
+
+# The default macOS readers. Separate callables so a test can hand in the
+# text of a real `vm_stat` or `sysctl` run instead of needing a Mac.
+def _run(argv: Sequence[str]) -> str:
+    """The output of ``argv``, or raise. Bounded, because a status-page
+    request waits on it."""
+    return subprocess.run(
+        list(argv), capture_output=True, text=True, timeout=5, check=True,
+    ).stdout
+
+
+def default_sysctl(name: str) -> str:
+    return _run(["sysctl", "-n", name]).strip()
+
+
+def default_vm_stat() -> str:
+    return _run(["vm_stat"])
+
+
+_VM_STAT_PAGE_SIZE = re.compile(r"page size of (\d+) bytes")
+# "Pages free:   509239." -- the trailing full stop is vm_stat's, not a typo.
+_VM_STAT_LINE = re.compile(r"^(.+?):\s+(\d+)\.?\s*$")
+
+# The pages the kernel can hand out without swapping; see the module
+# docstring for why these four and not others.
+_AVAILABLE_PAGES = ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable")
+
+
+def _vm_stat_pages(text: str) -> tuple[int, dict[str, int]]:
+    """``(page_size, {name: pages})`` from ``vm_stat`` output. Raises when
+    the header has no page size, since every count depends on it."""
+    head = _VM_STAT_PAGE_SIZE.search(text)
+    if not head:
+        raise ValueError("no 'page size of <n> bytes' in the first line")
+    counts = {}
+    for line in text.splitlines()[1:]:
+        found = _VM_STAT_LINE.match(line.strip())
+        if found:
+            counts[found.group(1).strip('"')] = int(found.group(2))
+    return int(head.group(1)), counts
+
+
+def _memory_darwin(
+    sysctl: Callable[[str], str], vm_stat: Callable[[], str], unavailable: list[str],
+) -> dict[str, Any]:
+    try:
+        total = int(sysctl("hw.memsize"))
+        if total <= 0:
+            raise ValueError("hw.memsize is 0")
+        page_size, counts = _vm_stat_pages(vm_stat())
+        missing = [name for name in _AVAILABLE_PAGES if name not in counts]
+        if missing:
+            # Not guessed at: a vm_stat without these lines is one this does
+            # not understand, and a partial sum would read as low memory.
+            raise ValueError(f"vm_stat has no {', '.join(missing)} line")
+        available = sum(counts[name] for name in _AVAILABLE_PAGES) * page_size
+    except Exception as exc:
+        unavailable.append(f"memory (sysctl hw.memsize, vm_stat): {_why(exc)}")
+        return dict.fromkeys(_MEMORY_KEYS)
+    return {
+        "total_bytes": total,
+        "available_bytes": available,
+        "available_pct": _pct(available, total),
+        "low": available < LOW_FRACTION * total,
+    }
+
+
+# `\b` and not just `sec`: `kern.boottime` prints `{ sec = …, usec = … }`, and without the
+# boundary a reading with no `sec` field takes the microseconds as seconds. A test plants
+# `{ usec = 1 }` for exactly that.
+_BOOTTIME_SEC = re.compile(r"\bsec\s*=\s*(\d+)")
+
+
+def _uptime_darwin(
+    sysctl: Callable[[str], str], now: Callable[[], float], unavailable: list[str],
+) -> int | None:
+    try:
+        text = sysctl("kern.boottime")
+        found = _BOOTTIME_SEC.search(text)
+        if not found:
+            raise ValueError(f"no 'sec = <n>' in {text!r}")
+        seconds = int(now() - int(found.group(1)))
+        if seconds < 0:
+            raise ValueError("boot time is in the future")
+        return seconds
+    except Exception as exc:
+        unavailable.append(f"uptime (sysctl kern.boottime): {_why(exc)}")
+        return None
 
 
 def _uptime(proc: Path, unavailable: list[str]) -> int | None:
@@ -141,11 +255,21 @@ def read_server_health(
     loadavg: Callable[[], Any] | None = None,
     cpu_count: Callable[[], Any] = os.cpu_count,
     disk_usage: Callable[[Path], Any] = shutil.disk_usage,
+    platform: str = sys.platform,
+    sysctl: Callable[[str], str] = default_sysctl,
+    vm_stat: Callable[[], str] = default_vm_stat,
+    now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     """This machine's health, read now. ``disks`` is ``(name, path)`` pairs
     to measure, in the order shown. ``loadavg`` defaults to
     ``os.getloadavg``, looked up here rather than at import because it
     does not exist on every system.
+
+    ``platform`` decides where memory and uptime are read from -- ``/proc``
+    under ``proc`` on Linux, ``sysctl`` and ``vm_stat`` on macOS -- and is a
+    parameter so that both paths are tested from fixture text on either
+    kind of host. A platform with neither source is not an error: its
+    numbers are ``null`` and ``unavailable`` says what was looked for.
 
     Never raises for anything a reading does: each reading is guarded on
     its own, so one that fails is ``null`` with a line in ``unavailable``
@@ -155,13 +279,26 @@ def read_server_health(
         loadavg = getattr(os, "getloadavg", None)
     one, five, fifteen = _load(loadavg, unavailable)
     cores = _cores(cpu_count, unavailable)
+    if platform.startswith("linux"):
+        memory = _memory(proc, unavailable)
+        uptime_s = _uptime(proc, unavailable)
+    elif platform == "darwin":
+        memory = _memory_darwin(sysctl, vm_stat, unavailable)
+        uptime_s = _uptime_darwin(sysctl, now, unavailable)
+    else:
+        # Named rather than silent: a reader on a platform nobody has
+        # taught this should see which two sources were looked for.
+        unavailable.append(
+            f"memory and uptime: {platform!r} has neither /proc nor sysctl support here"
+        )
+        memory, uptime_s = dict.fromkeys(_MEMORY_KEYS), None
     return {
         "load_1m": one,
         "load_5m": five,
         "load_15m": fifteen,
         "cpu_count": cores,
-        "memory": _memory(proc, unavailable),
+        "memory": memory,
         "disks": [_disk(n, Path(p), disk_usage, unavailable) for n, p in disks],
-        "uptime_s": _uptime(proc, unavailable),
+        "uptime_s": uptime_s,
         "unavailable": unavailable,
     }

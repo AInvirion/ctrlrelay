@@ -45,15 +45,173 @@ def _proc(tmp_path: Path, *, meminfo: str | None = MEMINFO,
 
 
 def _health(tmp_path: Path, **kw) -> dict:
+    """Health as the **Linux** reader sees it, from the /proc fixture.
+
+    ``platform`` is passed explicitly because memory and uptime now come
+    from whichever source the platform has (#321), and these cases are
+    about the ``/proc`` one. Before that they relied on ``proc=`` being
+    read on every host, which is how a suite full of Linux assumptions ran
+    green on two Macs for weeks.
+    """
     defaults = {
         "disks": [("home", tmp_path)],
         "proc": kw.pop("proc", None) or _proc(tmp_path),
         "loadavg": lambda: (0.5, 0.25, 0.125),
         "cpu_count": lambda: 12,
         "disk_usage": lambda p: Usage(1000, 600, 400),
+        "platform": "linux",
     }
     defaults.update(kw)
     return read_server_health(**defaults)
+
+
+# ---- the macOS reader (#321) ------------------------------------------------
+# Real `vm_stat` output, trimmed, from alkamax (macOS 14.2, arm64). The trailing
+# full stop on every count is vm_stat's own.
+VM_STAT = """\
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              509239.
+Pages active:                           1665080.
+Pages inactive:                         1093434.
+Pages speculative:                       732215.
+Pages throttled:                              0.
+Pages wired down:                        121301.
+Pages purgeable:                          11246.
+"Translation faults":                2549620058.
+File-backed pages:                      2853802.
+"""
+MEMSIZE = "68719476736"
+BOOTTIME = "{ sec = 1790576331, usec = 490981 } Sun Sep 27 23:18:51 2026"
+# 1790576331 + 3257709s -> the uptime the page showed when this was written.
+NOW = 1793834040.0
+
+
+def _sysctl(**overrides):
+    values = {"hw.memsize": MEMSIZE, "kern.boottime": BOOTTIME}
+    values.update(overrides)
+
+    def read(name: str) -> str:
+        value = values[name]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    return read
+
+
+def _mac(tmp_path: Path, **kw) -> dict:
+    defaults = {
+        "disks": [("home", tmp_path)],
+        "loadavg": lambda: (1.0, 1.0, 1.0),
+        "cpu_count": lambda: 10,
+        "disk_usage": lambda p: Usage(1000, 600, 400),
+        "platform": "darwin",
+        "sysctl": _sysctl(),
+        "vm_stat": lambda: VM_STAT,
+        "now": lambda: NOW,
+    }
+    defaults.update(kw)
+    return read_server_health(**defaults)
+
+
+def test_macos_memory_and_uptime_come_from_sysctl_and_vm_stat(tmp_path: Path) -> None:
+    out = _mac(tmp_path)
+
+    # free + inactive + speculative + purgeable, times the page size in the header.
+    pages = 509239 + 1093434 + 732215 + 11246
+    assert out["memory"]["total_bytes"] == 68719476736
+    assert out["memory"]["available_bytes"] == pages * 16384
+    assert out["memory"]["available_pct"] == 55.9
+    assert out["memory"]["low"] is False
+    assert out["uptime_s"] == int(NOW - 1790576331)
+    # The point of the ticket: nothing is missing and nothing is explained away.
+    assert out["unavailable"] == []
+
+
+def test_macos_low_memory_is_flagged_below_ten_percent(tmp_path: Path) -> None:
+    # 1 free page of a 16 GiB machine: everything reclaimable is gone.
+    one_page = VM_STAT.replace("509239.", "1.").replace("1093434.", "0.")
+    one_page = one_page.replace("732215.", "0.").replace("11246.", "0.")
+    out = _mac(
+        tmp_path, sysctl=_sysctl(**{"hw.memsize": str(16 * 2**30)}), vm_stat=lambda: one_page,
+    )
+
+    assert out["memory"]["available_bytes"] == 16384
+    assert out["memory"]["low"] is True
+    assert out["memory"]["available_pct"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("name", "broken"),
+    [
+        ("no page size", "Pages free: 1.\n"),
+        (
+            "no free line",
+            "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages active: 5.\n",
+        ),
+        ("a count that is not a number", VM_STAT.replace("509239.", "lots.")),
+    ],
+)
+def test_macos_vm_stat_it_cannot_read_is_unknown_not_a_partial_sum(
+    tmp_path: Path, name: str, broken: str,
+) -> None:
+    """A `vm_stat` missing a line it sums must not report the rest.
+
+    Summing what it recognised would under-report available memory, and the
+    panel's whole purpose is to say whether memory is low -- so a partial
+    read would be a false alarm rather than a gap.
+    """
+    out = _mac(tmp_path, vm_stat=lambda: broken)
+
+    assert out["memory"] == dict.fromkeys(MEMORY_KEYS), name
+    assert any(
+        line.startswith("memory (sysctl hw.memsize, vm_stat):") for line in out["unavailable"]
+    )
+
+
+def test_macos_a_failing_sysctl_is_unknown_with_the_source_named(tmp_path: Path) -> None:
+    out = _mac(tmp_path, sysctl=_sysctl(**{
+        "hw.memsize": OSError("sysctl: unknown oid"),
+        "kern.boottime": OSError("sysctl: unknown oid"),
+    }))
+
+    assert out["memory"] == dict.fromkeys(MEMORY_KEYS)
+    assert out["uptime_s"] is None
+    assert [line.split(":")[0] for line in out["unavailable"]] == [
+        "memory (sysctl hw.memsize, vm_stat)", "uptime (sysctl kern.boottime)",
+    ]
+    # The rest of the panel is still measured.
+    assert out["load_1m"] == 1.0 and out["cpu_count"] == 10
+
+
+@pytest.mark.parametrize("boottime", ["", "{ usec = 1 }", "{ sec = tomorrow }"])
+def test_macos_an_unreadable_boot_time_is_unknown(tmp_path: Path, boottime: str) -> None:
+    out = _mac(tmp_path, sysctl=_sysctl(**{"kern.boottime": boottime}))
+
+    assert out["uptime_s"] is None
+    assert any(line.startswith("uptime (sysctl kern.boottime):") for line in out["unavailable"])
+
+
+def test_macos_a_boot_time_in_the_future_is_unknown_rather_than_negative(tmp_path: Path) -> None:
+    out = _mac(tmp_path, now=lambda: 1790576331.0 - 60)
+
+    assert out["uptime_s"] is None
+    assert any("boot time is in the future" in line for line in out["unavailable"])
+
+
+def test_a_platform_with_neither_source_says_which_two_it_looked_for(tmp_path: Path) -> None:
+    out = read_server_health(
+        disks=[("home", tmp_path)], loadavg=lambda: (0.1, 0.1, 0.1), cpu_count=lambda: 2,
+        disk_usage=lambda p: Usage(1000, 600, 400), platform="sunos5",
+    )
+
+    assert out["memory"] == dict.fromkeys(MEMORY_KEYS)
+    assert out["uptime_s"] is None
+    assert out["unavailable"] == [
+        "memory and uptime: 'sunos5' has neither /proc nor sysctl support here"
+    ]
+    # Everything that does not need a platform is still there.
+    assert out["load_1m"] == 0.1 and out["cpu_count"] == 2 and out["disks"][0]["free_pct"] == 40.0
 
 
 def test_every_number_from_its_source(tmp_path: Path) -> None:
@@ -168,7 +326,7 @@ def test_a_system_without_getloadavg_imports_and_reports_load_unknown(
     reloaded = importlib.reload(health)
     try:
         out = reloaded.read_server_health(
-            disks=[], proc=_proc(tmp_path), cpu_count=lambda: 4,
+            disks=[], proc=_proc(tmp_path), cpu_count=lambda: 4, platform="linux",
         )
     finally:
         monkeypatch.undo()
@@ -226,3 +384,24 @@ def test_reads_this_machines_real_proc(tmp_path: Path) -> None:
     assert out["uptime_s"] > 0
     assert out["cpu_count"] == os.cpu_count()
     assert out["disks"][0]["total_bytes"] == shutil.disk_usage(tmp_path).total
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="reads this machine's real sysctl and vm_stat")
+def test_reads_this_machines_real_sysctl_and_vm_stat(tmp_path: Path) -> None:
+    """The real commands, with the real readers: nothing unavailable on macOS.
+
+    The counterpart of the real-/proc test above, and the one that catches a
+    format guessed wrong rather than a fixture copied wrong — which is the
+    whole reason #321 existed, since `/proc/meminfo` was never going to be
+    there to guess at.
+    """
+    out = read_server_health(disks=[("home", tmp_path)])
+
+    assert out["unavailable"] == []
+    memory = out["memory"]
+    # Sane rather than exact: these move between runs.
+    assert memory["total_bytes"] > 2 * 2**30
+    assert 0 < memory["available_bytes"] <= memory["total_bytes"]
+    assert 0.0 < memory["available_pct"] <= 100.0
+    assert memory["low"] is (memory["available_bytes"] < LOW_FRACTION * memory["total_bytes"])
+    assert out["uptime_s"] is not None and out["uptime_s"] > 0
