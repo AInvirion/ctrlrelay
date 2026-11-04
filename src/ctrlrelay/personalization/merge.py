@@ -58,6 +58,14 @@ SENSITIVE_KEYS = frozenset({
 # is not one, and reading it unbounded would let a planted file eat RAM.
 MAX_BYTES = 1 << 20
 
+# Bound on nesting. A settings file is a few levels deep. The C parser
+# accepts far deeper input (about 10,000 levels on 3.12 and, with its
+# stack-based limit, about 65,000 on 3.14), and on 3.14 writing that out
+# with ``json.dumps(indent=2)`` grew past 9 GB instead of raising
+# RecursionError. So depth is checked right after parsing, before
+# anything compares or serialises the value.
+MAX_DEPTH = 64
+
 MIGRATE_HINT = "run `ctrlrelay personalization migrate` once to make it a real file"
 
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
@@ -255,7 +263,32 @@ def _parse_object(
         raise MergeRefusedError(
             f"{what} {path} is a JSON {type(obj).__name__}, not an object"
         )
+    if _deeper_than(obj, MAX_DEPTH):
+        raise MergeRefusedError(
+            f"{what} {path} is nested too deeply (over {MAX_DEPTH} levels)"
+        )
     return obj, text
+
+
+def _deeper_than(value: object, limit: int) -> bool:
+    """Whether ``value`` nests containers more than ``limit`` levels deep.
+
+    Iterative, so it cannot itself run out of stack on the input it is
+    there to refuse. The top-level object is level 1.
+    """
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        item, level = stack.pop()
+        if isinstance(item, dict):
+            children: Iterable[object] = item.values()
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        if level > limit:
+            return True
+        stack.extend((child, level + 1) for child in children)
+    return False
 
 
 def _load(
