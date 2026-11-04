@@ -633,11 +633,11 @@ class TestMergeIntoLive:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-def _nested(levels: int) -> str:
+def _nested(levels: int, key: str = "x") -> str:
     """A JSON object nesting containers ``levels`` deep in all (the
-    object itself is level 1)."""
+    object itself is level 1), the nesting under ``key``."""
     inner = levels - 1
-    return '{"x": ' + "[" * inner + "]" * inner + "}"
+    return "{" + json.dumps(key) + ": " + "[" * inner + "]" * inner + "}"
 
 
 class TestRoundTwo:
@@ -703,12 +703,13 @@ class TestRoundTwo:
     def test_nesting_past_the_limit_is_refused_before_any_write(
         self, pair, side: str, levels: int
     ) -> None:
-        """5,000 levels parses on every supported Python, and is where
-        the indented write used to start (3.12: RecursionError; 3.14:
-        unbounded memory). The refusal must come from the depth check,
-        so the message names the limit."""
+        """5,000 levels is under the parser's limit on 3.12 to 3.14
+        (measured: about 10,000 on 3.12 and 3.13, about 65,000 on 3.14).
+        The synced side nests under the owned key, so without the check
+        the value would reach the indented write. The refusal must come
+        from the depth check, so the message names the limit."""
         source, target = pair
-        deep = _nested(levels)
+        deep = _nested(levels, key="model" if side == "synced" else "x")
         json.loads(deep)  # precondition: the parser accepts it
         source.parent.mkdir(parents=True)
         if side == "synced":
