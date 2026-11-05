@@ -1370,9 +1370,12 @@ async def _failed_check_logs(
     log cannot be read is NAMED as unreadable rather than left out, so
     the agent is not told "here are the logs" over an empty section.
 
-    Also returns each check's own log tail, or ``None`` when there was none
-    to read, so a round is sorted job by job (#224) rather than on the
-    joined, cut-down prompt text.
+    Also returns each fetched job's own log tail, or ``None`` when its
+    fetch failed, so a round is sorted job by job (#224) rather than on
+    the joined, cut-down prompt text. A check that is not an Actions job,
+    or one past the job limit, was never looked at and is left out of the
+    sorting: counting it as unknown would make an outage across many
+    matrix jobs read as a code failure.
     """
     sections: list[str] = []
     raw: list[str | None] = []
@@ -1385,11 +1388,9 @@ async def _failed_check_logs(
             sections.append(
                 f"### {name}\n(no GitHub Actions job log for this check: {link or 'no link'})"
             )
-            raw.append(None)
             continue
         if jobs >= _CI_LOG_MAX_JOBS:
             sections.append(f"### {name}\n(log not fetched: job limit reached)")
-            raw.append(None)
             continue
         jobs += 1
         try:

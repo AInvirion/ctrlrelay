@@ -630,15 +630,19 @@ A run that goes in circles is stopped early instead of running until
 
 - **While the agent works**, ctrlrelay reads its live transcript every 30
   seconds. If the agent runs the same command with the same input 5 times in
-  a row and gets the same result back each time (a command polled while its
-  output moves on is waiting, not a loop), or gets the same error back from the same command 5 times in a row
-  with no success of that command in between (edits in between do not
-  count), the agent is stopped. Only the `claude` backend writes a transcript
-  ctrlrelay knows how to read; other backends are not watched.
+  a row and gets the same result back each time, or gets the same error
+  back from the same command 5 times in a row with no success of that
+  command in between (edits in between do not count), the agent is stopped.
+  A command polled while its output moves on is waiting, not a loop; a poll
+  that gets the identical output back 5 times in a row is still treated as
+  one. Only the `claude` backend writes a transcript ctrlrelay knows how to
+  read; other backends are not watched.
 - **Between CI fix rounds**, each failed job's log is sorted on its own into
   one of three kinds. The round is *out of budget* if any job is,
   *infrastructure* only if every job is, and a *code failure* otherwise; a
-  job whose log could not be read counts as a code failure:
+  job whose log could not be fetched counts as a code failure, and a check
+  that is not an Actions job, or one past the first 3 jobs, is not sorted
+  at all:
   - *flaky infrastructure* (the runner was lost, the network failed, a
     registry answered 502/503, and no failing test is named): the failed
     GitHub Actions jobs are re-run once, without asking the agent. If they

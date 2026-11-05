@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A run going in circles is stopped early with a clear reason, instead of
   running until the session timeout (#224). The agent is stopped when its
   live transcript shows the same command 5 times in a row with the same
-  result each time (polling a job whose output moves on is not a loop), or
+  result each time (polling a job whose output moves on is not a loop,
+  though 5 identical polls in a row still are), or
   the same error from the same command 5 times in a row. Between CI fix
   rounds each failed job's log is sorted on its own, as flaky infrastructure (the failed jobs are re-run once, without
   the agent), out of budget (not retried), or a code failure (sent to the

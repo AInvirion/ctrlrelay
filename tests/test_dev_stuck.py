@@ -215,3 +215,30 @@ async def test_the_chat_message_says_stuck():
         ),
     )
     assert sent == ["🔁 Stuck on #7, stopped: the agent looped"]
+
+
+@pytest.mark.asyncio
+async def test_an_outage_across_more_jobs_than_are_read_is_still_infra():
+    from ctrlrelay.core.stuck import FailureKind, classify_failures
+
+    checks = [
+        {"name": f"matrix-{i}", "state": "FAILURE", "bucket": "fail",
+         "link": JOB.replace("/job/888", f"/job/{700 + i}")}
+        for i in range(5)
+    ] + [{"name": "cla", "state": "FAILURE", "bucket": "fail",
+          "link": "https://cla.example/check"}]
+    github = AsyncMock()
+    github.get_failed_job_log = AsyncMock(return_value=INFRA_LOG)
+    _, job_logs = await dev_mod._failed_check_logs(github, "owner/repo", checks)
+    # Three logs read; the jobs past the limit and the non-Actions check
+    # were never looked at, so they do not vote.
+    assert job_logs == [INFRA_LOG.rstrip("\n")] * 3
+    assert classify_failures(job_logs)[0] is FailureKind.INFRA
+
+
+@pytest.mark.asyncio
+async def test_a_log_that_could_not_be_fetched_is_unknown_so_code():
+    github = AsyncMock()
+    github.get_failed_job_log = AsyncMock(side_effect=RuntimeError("503"))
+    _, job_logs = await dev_mod._failed_check_logs(github, "owner/repo", FAILING)
+    assert job_logs == [None]
