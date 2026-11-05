@@ -1021,6 +1021,117 @@ class StateDB:
         )
         self._conn.commit()
 
+    def park_blocked_question(
+        self, session_id: str, pipeline: str, repo: str, question: str,
+    ) -> None:
+        """Record a question BEFORE the run waits on the chat answer (#324).
+
+        The session goes ``running`` -> ``blocked`` and its question gets a
+        ``pending_resumes`` row, in one commit. While the poller waits in
+        process, this is only a record; if the poller stops during the
+        wait, it is what the bridge routes a late answer to and what the
+        sweeper resumes. Without it, the only record of the question was a
+        coroutine, and a restart lost it with the session row left
+        ``running``.
+        """
+        try:
+            self._conn.execute(
+                "UPDATE sessions SET status = 'blocked' "
+                "WHERE id = ? AND status = 'running'",
+                (session_id,),
+            )
+            # Commits both statements.
+            self.add_pending_resume(
+                session_id=session_id, pipeline=pipeline, repo=repo,
+                question=question,
+            )
+        except BaseException:
+            # Never leave the half-done write open through the wait: it
+            # would hold the database's write lock against the bridge, and
+            # a later commit would keep only half of it.
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+
+    def take_parked_answer(self, session_id: str, answer: str) -> bool:
+        """The in-process wait got its answer (#324): mark the parked row
+        answered AND resumed, so neither the bridge nor the sweeper acts on
+        it again, and put the session back to ``running``. One commit.
+
+        Only an unanswered, open row is taken. Returns ``False`` when no
+        such row is there, and changes nothing: the row may have been
+        answered some other way first (a reply the bridge routed to the
+        saved question), expired, or be missing. The caller tells these
+        apart; only the first means another answer stands."""
+        now = int(time.time())
+        ours = not self._conn.in_transaction
+        try:
+            cursor = self._conn.execute(
+                "UPDATE pending_resumes SET answer = ?, answered_at = ?, "
+                "resumed_at = ? WHERE session_id = ? AND answered_at IS NULL "
+                "AND resumed_at IS NULL AND expired_at IS NULL",
+                (answer, now, now, session_id),
+            )
+            if cursor.rowcount > 0:
+                self._conn.execute(
+                    "UPDATE sessions SET status = 'running' "
+                    "WHERE id = ? AND status = 'blocked'",
+                    (session_id,),
+                )
+            if ours:
+                self._conn.commit()
+        except BaseException:
+            if ours and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return cursor.rowcount > 0
+
+    def mark_session_running(self, session_id: str) -> None:
+        """Put a ``blocked`` session back to ``running`` (#324): its run
+        resumed in process with an answer the saved question did not
+        record (that row expired or is missing)."""
+        self._conn.execute(
+            "UPDATE sessions SET status = 'running' "
+            "WHERE id = ? AND status = 'blocked'",
+            (session_id,),
+        )
+        self._conn.commit()
+
+    def has_open_pending_resume(self, session_id: str, question: str) -> bool:
+        """Whether this session already has a row for this same question
+        that is neither resumed nor expired. Re-writing such a row would
+        clear an answer already attached to it (#324)."""
+        row = self._conn.execute(
+            "SELECT 1 FROM pending_resumes WHERE session_id = ? "
+            "AND question = ? AND resumed_at IS NULL AND expired_at IS NULL",
+            (session_id, question),
+        ).fetchone()
+        return row is not None
+
+    def list_blocked_sessions_holding_locks(self) -> list[dict[str, Any]]:
+        """``blocked`` sessions that still hold a repo lock, with the
+        process that ran them (#324). A blocked run holds its lock only
+        while that process waits in memory for the answer; see
+        :func:`ctrlrelay.core.orphans.release_dead_blocked_locks`."""
+        rows = self._conn.execute(
+            "SELECT s.id, s.repo, s.owner_pid, s.owner_run "
+            "FROM repo_locks l JOIN sessions s ON s.id = l.session_id "
+            "WHERE s.status = 'blocked'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def release_blocked_session_lock(self, session_id: str) -> bool:
+        """Drop the lock of a session that is still ``blocked`` (#324).
+        Guarded on the status, so a session resumed in the meantime keeps
+        its lock."""
+        cursor = self._conn.execute(
+            "DELETE FROM repo_locks WHERE session_id = ? AND EXISTS ("
+            "SELECT 1 FROM sessions WHERE id = ? AND status = 'blocked')",
+            (session_id, session_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
     def get_oldest_unanswered_pending_resume(
         self,
         pipeline: str | None = None,
@@ -1186,7 +1297,12 @@ class StateDB:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def mark_pending_resume_resumed(self, session_id: str) -> bool:
+    def mark_pending_resume_resumed(
+        self,
+        session_id: str,
+        answered_at: int | None = None,
+        answer: str | None = None,
+    ) -> bool:
         """Mark a pending resume as executed so the sweeper doesn't pick
         it up again.
 
@@ -1201,12 +1317,27 @@ class StateDB:
         wedging the session. The guard makes this a no-op when the
         row has been refreshed.
 
+        ``answered_at`` and ``answer``, when given, are those of the row
+        the caller took (#324). Since the question is saved before the
+        wait, a resume that re-blocks can have its NEW question answered
+        (through the bridge) before this call; matching the answer and its
+        time keeps this call from marking that new answer resumed, which
+        would hide it for ever.
+
         Returns True iff a row was updated."""
-        cursor = self._conn.execute(
-            "UPDATE pending_resumes SET resumed_at = ? "
-            "WHERE session_id = ? AND answered_at IS NOT NULL",
-            (int(time.time()), session_id),
-        )
+        if answered_at is None:
+            cursor = self._conn.execute(
+                "UPDATE pending_resumes SET resumed_at = ? "
+                "WHERE session_id = ? AND answered_at IS NOT NULL",
+                (int(time.time()), session_id),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE pending_resumes SET resumed_at = ? "
+                "WHERE session_id = ? AND answered_at = ? "
+                "AND answer IS ?",
+                (int(time.time()), session_id, answered_at, answer),
+            )
         self._conn.commit()
         return cursor.rowcount > 0
 

@@ -386,3 +386,48 @@ async def reap_orphaned_sessions(
             "handed_back": handed_back,
         })
     return settled
+
+
+def release_dead_blocked_locks(
+    state_db: Any, *, is_alive: Callable[[int], bool] = owner_is_alive,
+) -> list[str]:
+    """Drop repo locks held by ``blocked`` runs whose process is gone (#324).
+
+    A run that asks a question is ``blocked`` with its question saved
+    while its process waits in memory for the answer, and it keeps its
+    repo lock for that wait. If the process stops, the lock only wedges
+    the repo until the answer comes, and the resume takes the lock again
+    itself. Runs this process started, runs whose process is alive (a
+    ``ctrlrelay run dev`` waiting in another terminal), and rows that name
+    no process are left alone, on the same terms as
+    :func:`reap_orphaned_sessions`. Returns the session ids released.
+    """
+    try:
+        rows = state_db.list_blocked_sessions_holding_locks()
+    except Exception as e:
+        log_event(
+            _logger, "orphans.blocked_locks_list_failed",
+            reason=type(e).__name__, error=str(e)[:200],
+        )
+        return []
+    released: list[str] = []
+    for row in rows:
+        pid = row.get("owner_pid")
+        if row.get("owner_run") == PROCESS_RUN or pid is None:
+            continue
+        if is_alive(int(pid)):
+            continue
+        try:
+            if state_db.release_blocked_session_lock(row["id"]):
+                released.append(row["id"])
+                log_event(
+                    _logger, "orphans.blocked_lock_released",
+                    session_id=row["id"], repo=row.get("repo"),
+                )
+        except Exception as e:
+            log_event(
+                _logger, "orphans.blocked_lock_release_failed",
+                session_id=row["id"], reason=type(e).__name__,
+                error=str(e)[:200],
+            )
+    return released

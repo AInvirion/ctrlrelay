@@ -393,3 +393,55 @@ def test_plan_accepts_its_three_modes(
 
 def test_plan_unset_is_none() -> None:
     assert DevStepsConfig().plan is None
+
+
+@pytest.mark.asyncio
+async def test_a_plan_question_cut_off_mid_wait_resumes_the_plan(
+    tmp_path,
+) -> None:
+    """The poller stops while the plan's question waits for its answer
+    (#324). The answer arriving later must resume the PLAN session, so the
+    marker naming it has to exist before the wait, not only after."""
+    import asyncio
+
+    agent = _Agent(_Agent.BLOCKED, GOOD_PLAN)
+    worktree, github = _fakes(tmp_path)
+    state_db = StateDB(tmp_path / "s.db")
+    asked = asyncio.Event()
+
+    class Hanging:
+        async def ask(self, question, **kwargs):
+            asked.set()
+            await asyncio.Event().wait()
+
+        async def send(self, *a, **kw):
+            return None
+
+    common = dict(
+        repo="owner/repo", dispatcher=agent.dispatcher, github=github,
+        worktree=worktree, dashboard=None, state_db=state_db,
+        contexts_dir=tmp_path / "contexts",
+        pr_verifier=_verifier(GREEN), code_review=REVIEW_OFF,
+        steps=DevStepsConfig(plan="required"),
+        branch_template="fix/issue-{n}",
+    )
+    task = asyncio.create_task(dev.run_dev_issue(
+        claims=None, issue_number=123, transport=Hanging(), **common,
+    ))
+    await asyncio.wait_for(asked.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert _plan_file(tmp_path).with_suffix(".pending").exists()
+    (row,) = state_db.list_unanswered_pending_resumes()
+    assert row["question"] == "Round or oval?"
+
+    second = await dev.resume_dev_from_pending(
+        session_id=row["session_id"], answer="Round.", transport=None,
+        **common,
+    )
+
+    assert second.success, second
+    assert "User answered: Round." in agent.plan_prompts[1]
+    assert agent.code_prompts and "## Plan" in agent.code_prompts[0]

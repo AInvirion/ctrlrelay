@@ -2148,6 +2148,70 @@ def _plan_comment(criteria: str) -> str:
     )
 
 
+def _park_question(run: _DevRun, question: str) -> bool:
+    """Save the question before waiting for its answer (#324); see
+    ``StateDB.park_blocked_question``. Best-effort: a failed write is
+    logged and the wait goes ahead, as it did before the row existed.
+    Returns whether it was saved."""
+    try:
+        run.state_db.park_blocked_question(
+            run.session_id, "dev", run.repo, question,
+        )
+        return True
+    except Exception as e:
+        log_event(
+            _logger, "dev.question.park_failed", session_id=run.session_id,
+            repo=run.repo, issue_number=run.issue_number,
+            error_type=type(e).__name__, error=str(e)[:200],
+        )
+        return False
+
+
+def _take_answer(run: _DevRun, answer: str) -> bool:
+    """The wait got its answer: close the saved question so nothing else
+    resumes the session with it, and mark the session running again.
+
+    Returns ``False`` only when the saved question was answered first
+    another way (a reply the bridge routed to it): that answer stands and
+    the sweeper resumes with it, so this one must not. A row that is
+    missing or expired is no other answer, so the run resumes with this
+    one. If the row cannot be closed, it is expired instead, so no later
+    reply can resume the session a second time; and if it turns out to be
+    answered already, that answer stands as above. When the database can
+    be neither written nor read, the run resumes as it did before the row
+    existed, and the row may stay open: a later reply could then resume
+    the session again."""
+    sid = run.session_id
+    try:
+        if run.state_db.take_parked_answer(sid, answer):
+            return True
+    except Exception as e:
+        log_event(
+            _logger, "dev.question.unpark_failed", session_id=sid,
+            repo=run.repo, issue_number=run.issue_number,
+            error_type=type(e).__name__, error=str(e)[:200],
+        )
+        try:
+            run.state_db.expire_pending_resume(
+                sid, "answered while the run waited",
+            )
+        except Exception:
+            pass
+    try:
+        row = run.state_db.get_pending_resume(sid)
+        if (
+            row is not None
+            and row.get("answered_at") is not None
+            and row.get("resumed_at") is None
+            and row.get("expired_at") is None
+        ):
+            return False
+        run.state_db.mark_session_running(sid)
+    except Exception:
+        pass
+    return True
+
+
 async def _answer_while_blocked(
     run: _DevRun,
     result: PipelineResult,
@@ -2176,6 +2240,9 @@ async def _answer_while_blocked(
             f"Session {run.session_id} is blocked but did not include a "
             "question. Reply with guidance to resume."
         )
+        # Saved first, so a poller that stops during the wait leaves the
+        # question answerable rather than lost (#324).
+        parked = _park_question(run, question)
         try:
             answer = await run.transport.ask(
                 question,
@@ -2198,6 +2265,35 @@ async def _answer_while_blocked(
                 session_id=run.session_id,
                 summary=f"{deferred} (transport): {e}",
                 error=str(e),
+                question=question,
+                outputs=result.outputs,
+            )
+        if parked and not _take_answer(run, answer):
+            # Answered first through the saved question (#324). That
+            # answer stands; the sweeper resumes with it once this run
+            # has let go of the repo lock.
+            log_event(
+                _logger, "dev.question.answered_elsewhere",
+                session_id=run.session_id, repo=run.repo,
+                issue_number=run.issue_number,
+            )
+            # Say so to whoever typed the second reply: it is not applied.
+            try:
+                await run.transport.send(
+                    f"Your reply for #{run.issue_number} in {run.repo} was "
+                    "not applied: an earlier reply had already answered "
+                    "that question, and the run resumes with it."
+                )
+            except Exception:
+                pass
+            return PipelineResult(
+                success=False,
+                blocked=True,
+                session_id=run.session_id,
+                summary=(
+                    f"{deferred}: answered through the saved question; "
+                    "the sweeper resumes it with that answer"
+                ),
                 question=question,
                 outputs=result.outputs,
             )
@@ -2235,8 +2331,8 @@ async def _finish_plan(run: _DevRun, result: PipelineResult) -> None:
     """
     assert run.plan_path is not None
     marker = _plan_pending_marker(run.plan_path)
-    result = await _answer_while_blocked(run, result, run.pipeline.resume_plan)
-    if result.blocked:
+
+    def write_marker() -> None:
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(run.session_id)
@@ -2246,6 +2342,14 @@ async def _finish_plan(run: _DevRun, result: PipelineResult) -> None:
                 session_id=run.session_id, repo=run.repo,
                 issue_number=run.issue_number, error=str(e)[:200],
             )
+
+    # Written before the wait too (#324): if the poller stops while the
+    # plan's question is open, the late answer must resume the PLAN.
+    if result.blocked:
+        write_marker()
+    result = await _answer_while_blocked(run, result, run.pipeline.resume_plan)
+    if result.blocked:
+        write_marker()
         run.result = result
         return
     marker.unlink(missing_ok=True)
@@ -3041,12 +3145,17 @@ async def run_dev_issue(
         # resume_dev_from_pending below.
         if result.blocked:
             try:
-                state_db.add_pending_resume(
-                    session_id=session_id,
-                    pipeline="dev",
-                    repo=repo,
-                    question=_question_for_persist(session_id, result),
-                )
+                question = _question_for_persist(session_id, result)
+                # The row written before the wait (#324) may already hold
+                # an answer the bridge attached; re-writing it would clear
+                # that answer.
+                if not state_db.has_open_pending_resume(session_id, question):
+                    state_db.add_pending_resume(
+                        session_id=session_id,
+                        pipeline="dev",
+                        repo=repo,
+                        question=question,
+                    )
             except Exception as e:
                 log_event(
                     _logger,
@@ -3569,12 +3678,17 @@ async def resume_dev_from_pending(
 
         if result.blocked:
             try:
-                state_db.add_pending_resume(
-                    session_id=session_id,
-                    pipeline="dev",
-                    repo=repo,
-                    question=_question_for_persist(session_id, result),
-                )
+                question = _question_for_persist(session_id, result)
+                # The row written before the wait (#324) may already hold
+                # an answer the bridge attached; re-writing it would clear
+                # that answer.
+                if not state_db.has_open_pending_resume(session_id, question):
+                    state_db.add_pending_resume(
+                        session_id=session_id,
+                        pipeline="dev",
+                        repo=repo,
+                        question=question,
+                    )
             except Exception as e:
                 log_event(
                     _logger,

@@ -869,3 +869,63 @@ class TestPollerStartSettlesDeadRuns:
                  str(telegram_config)],
             )
         assert order[:2] == ["reap", "loop"], (order, result.output)
+
+    def test_runs_the_blocked_lock_release_before_the_poll_loop_starts(
+        self, telegram_config: Path, tmp_path: Path
+    ) -> None:
+        """#324: the poller calls the release of dead blocked runs' locks
+        after the reaper and before its first poll. What that release
+        drops is tested in test_question_survives_restart.py."""
+        from unittest.mock import AsyncMock
+
+        cfg = yaml.safe_load(telegram_config.read_text())
+        cfg["repos"] = [{"name": "owner/repo",
+                         "local_path": str(tmp_path / "owner-repo")}]
+        telegram_config.write_text(yaml.dump(cfg))
+        (tmp_path / "poller_state.json").write_text('{"seen_issues": {}}')
+        order: list[str] = []
+        spared: list[object] = []
+
+        async def fake_reap(state_db, **kw):
+            order.append("reap")
+            return []
+
+        def fake_release(state_db, **kw):
+            order.append("locks")
+            spared.append(state_db)
+            return []
+
+        async def fake_loop(**kw):
+            order.append("loop")
+
+        gh_user = subprocess.CompletedProcess(
+            args=["gh"], returncode=0, stdout="alice\n", stderr="",
+        )
+        with (
+            patch("ctrlrelay.core.github._find_gh", return_value="gh"),
+            patch("subprocess.run", return_value=gh_user),
+            patch(
+                "ctrlrelay.core.orphans.reap_orphaned_sessions",
+                side_effect=fake_reap,
+            ),
+            patch(
+                "ctrlrelay.core.orphans.release_dead_blocked_locks",
+                side_effect=fake_release,
+            ),
+            patch(
+                "ctrlrelay.core.poller.run_poll_loop",
+                side_effect=fake_loop,
+            ),
+            patch(
+                "ctrlrelay.core.github_budget.GitHubBudget.refresh",
+                new=AsyncMock(),
+                create=True,
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                ["poller", "start", "--foreground", "--config",
+                 str(telegram_config)],
+            )
+        assert order[:3] == ["reap", "locks", "loop"], (order, result.output)
+        assert len(spared) == 1 and spared[0] is not None

@@ -3801,7 +3801,8 @@ def poller_start(
                                 )
                                 try:
                                     state_db.mark_pending_resume_resumed(
-                                        session_id
+                                        session_id, answered_at=row["answered_at"],
+                                        answer=row["answer"],
                                     )
                                 except Exception:
                                     pass
@@ -3844,7 +3845,8 @@ def poller_start(
                             )
                             try:
                                 state_db.mark_pending_resume_resumed(
-                                    session_id
+                                    session_id, answered_at=row["answered_at"],
+                                    answer=row["answer"],
                                 )
                             except Exception:
                                 pass
@@ -3862,7 +3864,10 @@ def poller_start(
                         # same broken row. Operator can inspect via the
                         # sessions table.
                         try:
-                            state_db.mark_pending_resume_resumed(session_id)
+                            state_db.mark_pending_resume_resumed(
+                                session_id, answered_at=row["answered_at"],
+                                answer=row["answer"],
+                            )
                         except Exception:
                             pass
                         continue
@@ -3926,7 +3931,10 @@ def poller_start(
                         continue
 
                     try:
-                        state_db.mark_pending_resume_resumed(session_id)
+                        state_db.mark_pending_resume_resumed(
+                            session_id, answered_at=row["answered_at"],
+                            answer=row["answer"],
+                        )
                     except Exception:
                         pass
 
@@ -4224,6 +4232,12 @@ def poller_start(
                     f"[yellow]Run {r['session_id']} for {where} stopped "
                     f"when the relay did; marked failed.{kept}[/yellow]"
                 )
+            # A run that stopped while waiting for an answer (#324) is
+            # `blocked` with its question saved, and is resumed when the
+            # answer comes; the repo lock it held would only wedge the
+            # repo until then.
+            from ctrlrelay.core.orphans import release_dead_blocked_locks
+            release_dead_blocked_locks(state_db)
 
             try:
                 await github_budget.refresh()
