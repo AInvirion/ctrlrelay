@@ -639,8 +639,9 @@ fleet:
 ### Config drift
 
 Each machine's status page publishes a fingerprint of its config in
-`node.config_fingerprint`, and compares each peer's with its own on every
-peer read. A difference shows on that peer's card, for example
+`node.config_fingerprint`. Each time the page or `/api/status` is built, it
+compares the latest fingerprint read from each peer with its own, so a change
+on a peer shows within one peer read. A difference shows on that peer's card, for example
 `config: 2 repos only here: org/a, org/b` or
 `config: automation.exclude_labels differs on 3 repos: …`, and marks the card.
 Identical configs show nothing.

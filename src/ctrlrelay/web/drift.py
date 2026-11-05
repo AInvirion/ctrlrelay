@@ -40,7 +40,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from ctrlrelay.core.config import Config
+from ctrlrelay.core.config import _REPO_NAME_RE, Config
 
 # 2: per-repo hashes deduplicated into profiles. A peer sending any other
 # version is unknown, not compared.
@@ -142,7 +142,7 @@ def clean_fingerprint(raw: Any) -> dict[str, Any] | None:
     if not isinstance(repos, dict) or len(repos) > _MAX_REPOS:
         return None
     for name, key in repos.items():
-        if not isinstance(name, str) or not 0 < len(name) <= 200:
+        if not isinstance(name, str) or len(name) > 200 or not _REPO_NAME_RE.fullmatch(name):
             return None
         if not _is_hash(key) or key not in clean_profiles:
             return None

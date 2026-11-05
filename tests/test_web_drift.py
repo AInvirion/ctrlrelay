@@ -404,8 +404,13 @@ MALFORMED = {
     "a profile edited, key kept": lambda fp: _profile(fp)["automation"].update(
         exclude_labels="0" * 16),
     "a profile missing a section": lambda fp: _profile(fp).pop("steps"),
-    "a hash that is not one": lambda fp: _profile(fp)["automation"].update(
-        exclude_labels="manual"),
+    # Rekeyed, so the profile key agrees and only the hash's shape is wrong.
+    "a hash that is not one, rekeyed": lambda fp: (
+        _profile(fp)["automation"].update(exclude_labels="manual"), _rekey(fp)),
+    # repos_hash recomputed, so only the name's shape is wrong.
+    "a repo name that is not owner/name": lambda fp: (
+        fp.update(repos={"not a repo": next(iter(fp["repos"].values()))}),
+        _rekey(fp)),
     "a schedule that is not a hash": lambda fp: fp["schedules"].update(secops_cron=7),
     "too many profiles": _many_profiles,
     "a schedule hash of 8 characters": lambda fp: fp["schedules"].update(
