@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import ipaddress
 import json
 import socket
@@ -435,14 +436,6 @@ class StatusServer(ThreadingHTTPServer):
         # The other machines' pages, read on their own timer (#249).
         self.peers = peers
         self.page = load_page(config.web.refresh_seconds)
-        # #307: the config this server was started with; it does not change
-        # while it runs, so it is fingerprinted once.
-        try:
-            self.config_fingerprint: dict[str, Any] | None = config_fingerprint(config)
-        except Exception as exc:
-            log_event(_logger, "web.config_fingerprint_failed",
-                      error=f"{type(exc).__name__}: {exc}"[:300])
-            self.config_fingerprint = None
         self.host_names = allowed_host_names(config.web)
         self._misdirected: set[str] = set()
         self._misdirected_lock = threading.Lock()
@@ -468,6 +461,18 @@ class StatusServer(ThreadingHTTPServer):
             ("home", Path.home()),
             ("worktrees", Path(self.config.paths.worktrees)),
         ])
+
+    @functools.cached_property
+    def config_fingerprint(self) -> dict[str, Any] | None:
+        """#307: the config this server was started with. It does not
+        change while the server runs, so it is fingerprinted once; ``None``
+        (every peer's drift unknown) if that fails."""
+        try:
+            return config_fingerprint(self.config)
+        except Exception as exc:
+            log_event(_logger, "web.config_fingerprint_failed",
+                      error=f"{type(exc).__name__}: {exc}"[:300])
+            return None
 
     def node(self) -> dict[str, Any]:
         """This machine's own block: its name and subscription usage
