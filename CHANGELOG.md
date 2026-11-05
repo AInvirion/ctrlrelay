@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the issue, and tells chat "finished, no change needed". A DONE with no
   commits and no declaration still fails as a forgotten commit. A
   declaration on a branch that has commits is ignored, and the commits are
-  published (#336).
+  published. So is a declaration from a run that has already pushed or has
+  an open PR, such as a fix round or a resumed session, since ending it
+  done would orphan that PR (#336).
 
 ### Added
 

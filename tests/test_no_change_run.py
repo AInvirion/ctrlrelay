@@ -159,3 +159,28 @@ def test_the_prompt_says_how_to_declare_no_change():
     )
     assert '"no_changes": True' in text
     assert "no_changes_reason" in text
+
+
+@pytest.mark.asyncio
+async def test_no_change_is_refused_once_this_run_has_pushed() -> None:
+    """A fix round or a resumed session with a pushed head or an open PR:
+    the declaration is not trusted, and the refusal stands."""
+    from ctrlrelay.pipelines.dev import _Publisher
+
+    for pr_number, pushed in ((42, "c0ffee"), (None, "c0ffee"), (42, None)):
+        worktree = AsyncMock()
+        worktree.push_run_branch.side_effect = NOTHING
+        state_db = MagicMock()
+        state_db.last_relay_push.return_value = pushed
+        publisher = _Publisher(
+            github=AsyncMock(), worktree=worktree, state_db=state_db,
+            repo=REPO, branch="fix/issue-853", issue_number=853,
+            issue_title="t", session_id="s", default_branch="main",
+            pr_number=pr_number, last_pushed_sha=pushed,
+        )
+        result = await publisher.publish(PipelineResult(
+            success=True, session_id="s", summary="done", outputs=NO_CHANGE,
+        ))
+        assert not result.success, (pr_number, pushed)
+        assert result.outputs.get("no_change") is not True
+        assert result.outputs["publish_refused"] is True

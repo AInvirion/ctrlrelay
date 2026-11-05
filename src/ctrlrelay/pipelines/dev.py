@@ -1722,7 +1722,16 @@ class _Publisher:
             from ctrlrelay.core.worktree import PushRejectedError
 
             no_change = _declared_no_change(agent_outputs)
-            if isinstance(e, NothingToPushError) and no_change is not None:
+            if (
+                isinstance(e, NothingToPushError)
+                and no_change is not None
+                # Only before this run published anything. A fix round
+                # or a resumed session whose branch already has a pushed
+                # head or an open PR is not "no change": ending it done
+                # would orphan that PR and say none was opened.
+                and self.pr_number is None
+                and self.last_pushed_sha is None
+            ):
                 # The agent said nothing should change, and the relay's own
                 # count agrees. The declaration alone is never trusted: a
                 # branch with commits got past this point and was pushed.
