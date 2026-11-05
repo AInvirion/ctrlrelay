@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plan) gets a normal PR with a comment saying it has not been reviewed
   yet. A reused PR that cannot be put back to draft gets the same comment.
 
+### Fixed
+
+- A run that correctly changes nothing is no longer recorded as a failed
+  publish. The agent can now finish with `"no_changes": True` and a one-line
+  `"no_changes_reason"`. When the relay's own check also finds no new
+  commits, it opens no pull request, ends the session `done`, says so on
+  the issue, and tells chat "finished, no change needed". A DONE with no
+  commits and no declaration still fails as a forgotten commit. A
+  declaration on a branch that has commits is ignored, and the commits are
+  published. So is a declaration from a run that has already pushed or has
+  an open PR, such as a fix round or a resumed session, since ending it
+  done would orphan that PR (#336).
+
 ## [0.21.0] - 2026-11-05
 
 ### Added

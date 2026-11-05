@@ -45,6 +45,14 @@ class PushRefusedError(Exception):
     """A push the relay will not make. The message names why."""
 
 
+class NothingToPushError(PushRefusedError):
+    """The run branch has no commit the default branch lacks (#336).
+
+    A refusal like any other, unless the agent declared that no change
+    was the right outcome: then the run finished, with nothing to push.
+    """
+
+
 def check_push_target(
     target: str,
     *,

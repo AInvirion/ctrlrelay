@@ -724,11 +724,13 @@ class TestThePushGuard:
     async def test_a_branch_with_no_new_commits_is_not_pushed(
         self, tmp_path: Path
     ) -> None:
-        from ctrlrelay.core.publish import PushRefusedError
+        from ctrlrelay.core.publish import NothingToPushError
 
         origin, bare, _ = _origin_and_bare(tmp_path)
         _git("branch", "fix/issue-7", "main", cwd=bare)
-        with pytest.raises(PushRefusedError, match="no commits"):
+        # Its own type (#336): a declared no-change run is told apart from
+        # every other refusal by it.
+        with pytest.raises(NothingToPushError, match="no commits"):
             await _manager(tmp_path).push_run_branch(
                 "owner/repo", "fix/issue-7", run_branch="fix/issue-7",
                 default_branch="main", expected_remote_sha=None,
