@@ -4512,7 +4512,13 @@ def web_start(
     pid_file.write_text(str(os.getpid()))
     try:
         from ctrlrelay.core.github import GitHubCLI
-        from ctrlrelay.web.server import WaitingRefresher, make_server
+        from ctrlrelay.web.server import (
+            AddressWatch,
+            Listeners,
+            WaitingRefresher,
+            make_loopback_twin,
+            make_server,
+        )
         from ctrlrelay.web.status import make_sessions_reader
         from ctrlrelay.web.waiting import WaitingTracker
 
@@ -4533,10 +4539,19 @@ def web_start(
             ) if fleet_cfg.peers else None
             httpd = make_server(config, waiting=tracker, peers=peers)
         except OSError as e:
-            console.print(
-                f"[red]Cannot listen on {config.web.host}:{config.web.port}:[/red] {e}"
+            # stderr, so a restart loop on an address this machine no longer
+            # has (#322) lands in web.error.log, not only beside web.started.
+            Console(stderr=True).print(
+                f"[red]Cannot listen on {config.web.host}:{config.web.port}:[/red] {e}",
+                soft_wrap=True,
             )
             raise typer.Exit(1)
+        # Answers on 127.0.0.1 too when web.host is one LAN address (#322).
+        twin = make_loopback_twin(config, waiting=tracker, peers=peers)
+        listeners = Listeners(
+            httpd, twin,
+            watch=AddressWatch(config.web.host, on_gone=lambda: None),
+        )
         from ctrlrelay.core.github_budget import LOW, OUT, BudgetStore
 
         budget_store = BudgetStore.beside(config.paths.state_db)
@@ -4561,12 +4576,21 @@ def web_start(
         if peers is not None:
             peers.start()
         try:
-            httpd.serve_forever()
+            address_gone = listeners.serve_forever()
         finally:
             if peers is not None:
                 peers.stop()
             refresher.stop()
-            httpd.server_close()
+            listeners.close()
+        if address_gone:
+            # Exit non-zero so the service manager restarts it (#322).
+            Console(stderr=True).print(
+                f"[red]{config.web.host} is no longer an address of this "
+                "machine; stopped the status page.[/red] Set web.host to the "
+                "new address, or it restarts and fails until the old one is back.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(1)
     finally:
         pid_file.unlink(missing_ok=True)
 

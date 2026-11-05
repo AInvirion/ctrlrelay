@@ -400,6 +400,23 @@ The first line in `web.log` is a `web.started` event naming the address it
 bound. If `web.host` is `0.0.0.0` it also logs a warning: that listens on
 every interface, which is rarely what you want.
 
+With `web.host` set to a LAN address the page also answers on
+`127.0.0.1:8787`, so a browser or health check on the machine itself is not
+refused, and `web.log` has a second `web.started` line for it. The LAN side
+still listens on `web.host` and nothing else. If that loopback port is taken
+by something else, `web.loopback_unavailable` is logged and the LAN page
+starts anyway.
+
+Every 30 seconds the server checks that `web.host` is still one of this
+machine's addresses. If it is not (a new DHCP lease, a router reboot,
+another network), it logs `web.address_gone` to `web.log`, prints why to
+`web.error.log` and exits 1. systemd (or launchd's `KeepAlive`) restarts it;
+on the old address that start fails with `Cannot listen on ...: Cannot
+assign requested address` in `web.error.log`, again every few seconds, until
+the address comes back or you set `web.host` to the new one. A check that
+cannot be made (a `web.host` name that does not resolve) is logged once as
+`web.address_unchecked` and the page keeps running.
+
 The page answers only to names it knows: `localhost`, `127.0.0.1`, `[::1]`,
 `web.host`, and this machine's own hostname (plus `.local`). A request whose
 `Host` header carries any other name gets `421 misdirected request`, and the
