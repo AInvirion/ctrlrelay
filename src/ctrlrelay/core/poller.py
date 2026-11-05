@@ -1009,7 +1009,11 @@ class IssuePoller:
             require_lowered = {
                 x.lower() for x in self.require_labels_by_repo.get(repo, [])
             }
-            assigned = self._issue_is_assigned_to(fresh, self.username) and (
+            # Logins compared without case, as the assignee search that
+            # admitted the issue does: a case-only mismatch would skip the
+            # issue on every poll and never start it.
+            me = (self.username or "").lower()
+            assigned = bool(me) and me in {n.lower() for n in assignees} and (
                 not require_lowered
                 or self._matched_require_label(fresh, require_lowered)
                 is not None

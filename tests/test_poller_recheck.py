@@ -223,3 +223,18 @@ async def test_a_label_triggered_issue_whose_label_is_removed_does_not_start(
 
     assert [i["number"] for i in handled] == [1]
     assert 2 not in poller.seen_issues.get(REPO, set())
+
+
+@pytest.mark.asyncio
+async def test_an_assignee_login_in_other_case_still_counts(tmp_path: Path) -> None:
+    """The assignee search that admitted the issue ignores case, so the
+    re-read must too, or the issue is skipped on every poll."""
+    live = _live()
+    gh = _github(live)
+    poller = _poller(gh, tmp_path)
+
+    handled = await _run_batch(
+        poller, lambda: live[2].update(assignees=["ALICE"]),
+    )
+
+    assert [i["number"] for i in handled] == [1, 2]
