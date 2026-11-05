@@ -1476,6 +1476,7 @@ def test_needs_you_refs_stop_at_twenty(tmp_path: Path) -> None:
 # --- #309: a command still running is not stuck -------------------------------
 
 POLLER = 4000
+AGENT = 4100
 
 
 def _ps(*rows: tuple[int, int, str, str]) -> str:
@@ -1484,27 +1485,34 @@ def _ps(*rows: tuple[int, int, str, str]) -> str:
                    for pid, ppid, etime, comm in rows)
 
 
-def _stuck_candidate(tmp_path: Path, owner_pid: int | None = POLLER) -> int:
-    """A running session whose last transcript step is 20 minutes old."""
+def _stuck_candidate(tmp_path: Path, agent_pid: int | None = AGENT) -> int:
+    """A running session whose last transcript step is 20 minutes old, with
+    its agent's pid recorded the way the dispatcher records it."""
     db = _db(tmp_path)
     wt = _worktree(tmp_path, "w1")
     _fixture_transcript(tmp_path, wt)
     _session(db, "s1", worktree=wt, started_at=FIXTURE_LAST_TS - 60)
-    db.execute("UPDATE sessions SET owner_pid = ? WHERE id = 's1'", (owner_pid,))
-    db.commit()
+    if agent_pid is not None:
+        (tmp_path / "agents").mkdir(exist_ok=True)
+        (tmp_path / "agents" / "s1.pid").write_text(f"{agent_pid}\n")
     return FIXTURE_LAST_TS + 1200
+
+
+BASE = (
+    (1, 0, "10-00:00:00", "/sbin/init"),
+    (POLLER, 1, "2-01:00:00", "python3"),
+    (AGENT, POLLER, "40:00", "bwrap"),          # the sandbox wrapper
+    (4105, AGENT, "40:00", "claude"),           # the agent CLI under it
+    (4106, 4105, "38:00", "node"),              # an MCP server, older
+)
 
 
 def test_an_agent_inside_one_long_command_is_not_stuck(tmp_path: Path) -> None:
     now = _stuck_candidate(tmp_path)
     ps = _ps(
-        (1, 0, "10-00:00:00", "/sbin/init"),
-        (POLLER, 1, "2-01:00:00", "python3"),
-        (4100, POLLER, "40:00", "claude"),                 # the agent
-        (4101, 4100, "38:00", "node"),                      # an MCP server, older
-        (4200, 4100, "19:58", "/usr/bin/bash"),             # the step's command
+        *BASE,
+        (4200, 4105, "19:58", "/usr/bin/bash"),             # the step's command
         (4201, 4200, "19:57", "/home/u/.venv/bin/pytest"),  # what it started
-        (4300, POLLER, "00:03", "gh"),                      # the poller's own call
     )
     card = _only(_status(tmp_path, now, processes=lambda: ps)["running"], "s1")
     assert card["looks_stuck"] is False
@@ -1513,27 +1521,42 @@ def test_an_agent_inside_one_long_command_is_not_stuck(tmp_path: Path) -> None:
 
 def test_an_idle_agent_is_still_stuck(tmp_path: Path) -> None:
     now = _stuck_candidate(tmp_path)
+    card = _only(
+        _status(tmp_path, now, processes=lambda: _ps(*BASE))["running"], "s1",
+    )
+    assert card["looks_stuck"] is True
+    assert card["running_command"] is None
+
+
+def test_another_runs_command_under_the_same_poller_does_not_count(
+    tmp_path: Path,
+) -> None:
+    """Several runs share the poller's pid (a secops run, the poller's own
+    git calls and their helpers): only this session's agent is searched."""
+    now = _stuck_candidate(tmp_path)
     ps = _ps(
-        (POLLER, 1, "2-01:00:00", "python3"),
-        (4100, POLLER, "40:00", "claude"),
-        (4101, 4100, "38:00", "node"),      # started before the last step
-        (4300, POLLER, "00:03", "gh"),      # a child of the poller, not the agent
+        *BASE,
+        (5100, POLLER, "05:00", "claude"),          # another session's agent
+        (5200, 5100, "01:00", "pytest"),            # its command
+        (5300, POLLER, "00:02", "git"),             # the poller's own git
+        (5301, 5300, "00:02", "git-remote-https"),  # and its helper
     )
     card = _only(_status(tmp_path, now, processes=lambda: ps)["running"], "s1")
     assert card["looks_stuck"] is True
     assert card["running_command"] is None
 
 
-@pytest.mark.parametrize("owner, reader, why", [
-    (POLLER, None, "no process reader"),
-    (POLLER, lambda: (_ for _ in ()).throw(OSError("ps missing")), "ps missing"),
-    (POLLER, lambda: "garbage\n", "no process lines"),
-    (None, lambda: _ps((POLLER, 1, "01:00", "python3")), "no owner process"),
+@pytest.mark.parametrize("agent, reader, why", [
+    (AGENT, None, "no process reader"),
+    (AGENT, lambda: (_ for _ in ()).throw(OSError("ps missing")), "ps missing"),
+    (AGENT, lambda: "garbage\n", "no process lines"),
+    (None, lambda: _ps(*BASE), "no agent pid recorded"),
+    (9999, lambda: _ps(*BASE), "the agent process is gone"),
 ])
 def test_could_not_look_stays_stuck_and_says_why(
-    tmp_path: Path, owner, reader, why,
+    tmp_path: Path, agent, reader, why,
 ) -> None:
-    now = _stuck_candidate(tmp_path, owner_pid=owner)
+    now = _stuck_candidate(tmp_path, agent_pid=agent)
     card = _only(_status(tmp_path, now, processes=reader)["running"], "s1")
     assert card["looks_stuck"] is True
     assert why in (card["reason"] or "")
@@ -1568,3 +1591,16 @@ def test_ps_elapsed_time(text: str, seconds: int | None) -> None:
             _etime_s(text)
     else:
         assert _etime_s(text) == seconds
+
+
+def test_the_dispatcher_records_the_agent_pid_where_the_page_reads_it(
+    tmp_path: Path,
+) -> None:
+    from ctrlrelay.core.dispatcher import CliAgentAdapter
+    from ctrlrelay.core.usage import UsageStore
+    from ctrlrelay.web.status import read_agent_pid
+
+    adapter = CliAgentAdapter.__new__(CliAgentAdapter)
+    adapter.usage_store = UsageStore.beside(tmp_path / "state.db")
+    adapter._record_agent_pid("dev-o-r-1-abc", 4242)
+    assert read_agent_pid(tmp_path / "agents", "dev-o-r-1-abc") == 4242

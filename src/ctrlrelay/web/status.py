@@ -269,12 +269,13 @@ def _section(errors: list[str], name: str, fn: Callable[[], T]) -> T | _Missing:
 
 # A tool call writes nothing to the transcript until it returns, so a long
 # test run reads exactly like an agent that stopped. Before calling a card
-# stuck, the process table is read: the agent is a child of the poller
-# (``sessions.owner_pid``) and the command it runs is a grandchild. A
-# grandchild that started at or after the transcript's last step is the
-# command that step launched. The poller's own short `gh`/`git` calls are
-# its children, not grandchildren, and processes the agent started before
-# its last step (an MCP server) are too old to count.
+# stuck, the process table is read under the session's own agent process,
+# whose pid the dispatcher writes to ``agents/<session_id>.pid`` beside the
+# state database. Several runs share the poller's pid, so only the agent's
+# own pid says which command belongs to which run. A process under it that
+# started at or after the transcript's last step is the command that step
+# launched; processes the agent started earlier (an MCP server, the agent
+# CLI itself under a sandbox wrapper) are too old to count.
 _PS_ARGV = ("ps", "-axo", "pid=,ppid=,etime=,comm=")
 _PS_TIMEOUT_S = 2
 # The tool_use row is written just before its command starts.
@@ -321,26 +322,42 @@ def _parse_ps(text: str) -> dict[int, tuple[int, int, str]]:
     return table
 
 
+def read_agent_pid(agents_dir: Path, session_id: str) -> int:
+    """The session's agent pid, as the dispatcher recorded it. Raises when
+    there is none, so a missing file reads as "could not look"."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)
+    text = (agents_dir / f"{safe}.pid").read_text().strip()
+    pid = int(text)
+    if pid <= 0:
+        raise ValueError(f"agent pid {pid}")
+    return pid
+
+
 def running_command(
-    ps_text: str, owner_pid: int, *, last_step_age_s: int,
+    ps_text: str, agent_pid: int, *, last_step_age_s: int,
 ) -> str | None:
     """The name of the command the agent is running, or ``None`` when it is
     running none. Only the program's own name (``pytest``, ``bash``) is
     returned, never its arguments. Raises when ``ps_text`` cannot be read,
     so "could not look" is never taken for "nothing running"."""
     table = _parse_ps(ps_text)
+    if agent_pid not in table:
+        raise ValueError("the agent process is gone")
     children: dict[int, list[int]] = {}
     for pid, (ppid, _, _) in table.items():
         children.setdefault(ppid, []).append(pid)
     found: list[tuple[int, str]] = []
-    for agent in children.get(owner_pid, []):
-        stack = list(children.get(agent, []))
-        while stack:
-            pid = stack.pop()
-            _, age, comm = table[pid]
-            if age <= last_step_age_s + _START_SLACK_S:
-                found.append((age, comm))
-            stack.extend(children.get(pid, []))
+    stack = list(children.get(agent_pid, []))
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        _, age, comm = table[pid]
+        if age <= last_step_age_s + _START_SLACK_S:
+            found.append((age, comm))
+        stack.extend(children.get(pid, []))
     if not found:
         return None
     # The oldest such process is the one the step launched; anything it
@@ -377,8 +394,7 @@ class _Processes:
 
 def _read_running(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """SELECT id, pipeline, repo, issue_number, worktree_path, started_at,
-                  owner_pid
+        """SELECT id, pipeline, repo, issue_number, worktree_path, started_at
            FROM sessions WHERE status = 'running'
            ORDER BY started_at ASC, id ASC"""
     ).fetchall()
@@ -627,6 +643,7 @@ def _card(
     stale_after_s: int,
     home: Path | None,
     processes: _Processes | None = None,
+    agents_dir: Path | None = None,
 ) -> dict[str, Any]:
     sid = row["id"]
     started = int(row["started_at"])
@@ -671,15 +688,18 @@ def _card(
         # Before calling it stuck, check for a command still running
         # (#309). Where that cannot be checked, the card stays stuck and
         # says why: "could not look" is not "not stuck".
-        owner = row.get("owner_pid")
-        text, error = processes.get()
         try:
-            if not isinstance(owner, int) or owner <= 0:
-                raise ValueError("the session records no owner process")
+            if agents_dir is None:
+                raise ValueError("no agent pid folder")
+            try:
+                agent = read_agent_pid(agents_dir, sid)
+            except (OSError, ValueError) as e:
+                raise ValueError(f"no agent pid recorded ({type(e).__name__})")
+            text, error = processes.get()
             if text is None:
                 raise ValueError(error or "process table unavailable")
             command = running_command(
-                text, owner, last_step_age_s=now - int(activity.last_step_ts),
+                text, agent, last_step_age_s=now - int(activity.last_step_ts),
             )
         except Exception as e:  # noqa: BLE001
             reasons.append(f"could not check for a running command: {e}"[:200])
@@ -889,6 +909,7 @@ def build_status(
                     titles=title_map,
                     stale_after_s=stale_after_s, home=home,
                     processes=proc_reader,
+                    agents_dir=Path(db_path).parent / "agents",
                 )
                 for row in snap["running"]
             ])
