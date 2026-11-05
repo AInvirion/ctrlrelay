@@ -48,6 +48,9 @@ def _config(tmp_path: Path) -> Path:
             },
         },
         "dashboard": {"enabled": False},
+        # Off: its startup check reads the bridge socket setting, which
+        # these tests use as the resume sweeper's first step.
+        "schedules": {"weekly_summary": {"enabled": False}},
         "repos": [{"name": "o/r", "local_path": str(tmp_path / "o-r")}],
     }
     path = tmp_path / "orchestrator.yaml"
