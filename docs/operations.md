@@ -756,7 +756,8 @@ human decision. In order:
 5. Waits up to two minutes for `/api/status` to report the new version,
    and up to two and a half for a new poller process to report it in its
    heartbeat (`heartbeat.json` now carries the poller's `pid`, `version`
-   and `started_at`) and to beat a second time. The status page's version
+   and `started_at`) and still be the one reporting at least one heartbeat
+   interval (30 s) after it started. The status page's version
    is the web server's own, and a restart command succeeds even when the
    unit then crash-loops, so neither alone shows the poller is up.
 

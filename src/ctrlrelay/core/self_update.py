@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ctrlrelay.core.heartbeat import HEARTBEAT_SECONDS
 from ctrlrelay.core.intake_hold import IntakeHold
 from ctrlrelay.core.obs import get_logger, log_event
 
@@ -84,8 +85,11 @@ class Limits:
     ack_interval: float = 2.0
     status_seconds: float = 120.0
     status_interval: float = 3.0
-    # The new poller has to beat twice from one pid: it writes every 30 s,
-    # so two beats show it stayed up rather than crash-looping.
+    # The new poller has to be seen still reporting at least one heartbeat
+    # interval (30 s) after it started. Two beats alone prove nothing: it
+    # writes one at start and another after its first poll a second later,
+    # so a poller that crashes after that poll would pass. The deadline
+    # leaves room for the restart, the interval, and a slow start.
     poller_seconds: float = 150.0
     poller_interval: float = 5.0
     command_seconds: float = 300.0
@@ -427,7 +431,9 @@ class SelfUpdate:
     def _verify_poller(
         self, version: str, *, old_pid: int | None, since: int, strict: bool,
     ) -> None:
-        first_beat: dict[int, int] = {}
+        # Per pid, when it started: its own ``started_at``, or for a poller
+        # from before #306 (no ``started_at``) the first beat seen from it.
+        started: dict[int, int] = {}
         last: list[dict[str, Any] | None] = [None]
 
         def up() -> bool:
@@ -438,8 +444,10 @@ class SelfUpdate:
             got = hb.get("version")
             if got != version and (strict or got is not None):
                 return False
-            first = first_beat.setdefault(hb["pid"], hb["heartbeat_at"])
-            return hb["heartbeat_at"] > first
+            since_start = started.setdefault(
+                hb["pid"], hb.get("started_at") or hb["heartbeat_at"],
+            )
+            return hb["heartbeat_at"] - since_start >= HEARTBEAT_SECONDS
 
         if not wait_until(up, seconds=self.limits.poller_seconds,
                           interval=self.limits.poller_interval,

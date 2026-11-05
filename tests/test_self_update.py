@@ -84,8 +84,11 @@ class FakeNode:
         self.poller_version: str | None = None
         self.poller_up = True
         # What a poller started on NEW does: "ok", "dead" (never writes a
-        # heartbeat) or "crashloop" (a new pid at every look).
+        # heartbeat), "crashloop" (a new pid at every look) or "flap" (each
+        # pid writes at start and after its first poll ~2 s later, then
+        # dies; it is restarted 10 s after it started).
         self.new_poller = "ok"
+        self.poller_started = 800
 
     def clock(self) -> float:
         return self.now
@@ -136,18 +139,29 @@ class FakeNode:
 
     def _start_poller(self) -> None:
         self.poller_pid += 1
+        self.poller_started = int(self.now)
         self.poller_version = NEW if self.installed == NEW else None
         self.poller_up = not (self.installed == NEW and self.new_poller == "dead")
 
     def poller_heartbeat(self) -> dict | None:
         if self.installed == NEW and self.new_poller == "crashloop":
+            # Each look finds a process that has only just started.
             self.poller_pid += 1
+            self.poller_started = int(self.now)
         if not self.poller_up:
             # Only the last heartbeat of the process that was stopped.
             return {"heartbeat_at": 900, "pid": 4000, "version": None,
                     "started_at": 800}
+        if self.installed == NEW and self.new_poller == "flap":
+            cycle = int(self.now - self.poller_started) // 10
+            started = self.poller_started + 10 * cycle
+            return {"heartbeat_at": started + min(2, int(self.now) - started),
+                    "pid": self.poller_pid + cycle, "version": NEW,
+                    "started_at": started}
+        # A poller from before #306 writes neither version nor start time.
         return {"heartbeat_at": int(self.now), "pid": self.poller_pid,
-                "version": self.poller_version, "started_at": int(self.now)}
+                "version": self.poller_version,
+                "started_at": self.poller_started if self.poller_version else None}
 
     def status(self) -> dict:
         return {"host": "alka", "version": self.running_version}
@@ -515,7 +529,7 @@ def test_restart_command_on_systemd() -> None:
 # --- the poller, not just the web server, has to come up on the new version --
 
 
-@pytest.mark.parametrize("mode", ["dead", "crashloop"])
+@pytest.mark.parametrize("mode", ["dead", "crashloop", "flap"])
 def test_a_new_poller_that_does_not_stay_up_is_rolled_back(node, tmp_path, mode) -> None:
     """The web server reports the new version and every restart command
     returned 0, yet no new poller process kept beating."""
@@ -607,3 +621,18 @@ def test_the_heartbeat_names_its_process_and_version(tmp_path) -> None:
     assert Heartbeat(path).read_process() == {
         "heartbeat_at": 1_800_000_000, "pid": 12, "version": None, "started_at": None,
     }
+
+
+def test_the_new_poller_must_be_up_a_heartbeat_interval(node, tmp_path) -> None:
+    """Accepted only once the pid that is still reporting has been up for
+    at least one heartbeat interval since it started."""
+    starts: list[float] = []
+    real_start = node._start_poller
+
+    def start() -> None:
+        real_start()
+        starts.append(node.now)
+
+    node._start_poller = start
+    _updater(node, tmp_path).run(NEW)
+    assert node.now - starts[0] >= 30

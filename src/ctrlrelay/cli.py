@@ -5546,7 +5546,13 @@ def self_update(
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         raise SystemExit(128 + signum)
 
+    # Ctrl-C rolls back too, and a SIGTERM during that must not cut it short.
+    def _on_int(_signum, _frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise KeyboardInterrupt
+
     previous = signal.signal(signal.SIGTERM, _on_term)
+    previous_int = signal.signal(signal.SIGINT, _on_int)
     try:
         outcome = updater.run(version_)
     except SelfUpdateError as e:
@@ -5554,6 +5560,7 @@ def self_update(
         raise typer.Exit(1)
     finally:
         signal.signal(signal.SIGTERM, previous)
+        signal.signal(signal.SIGINT, previous_int)
     if outcome.changed:
         console.print(
             f"[green]Updated {config.node_id}: {outcome.old_version} → "
