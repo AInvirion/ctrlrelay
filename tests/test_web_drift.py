@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from ctrlrelay import __version__
 from ctrlrelay.core.config import Config
 from ctrlrelay.web.drift import (
     clean_fingerprint,
@@ -238,11 +239,13 @@ def test_a_shared_config_keeps_the_fingerprint_small(tmp_path: Path) -> None:
     assert len(json.dumps(fp)) < 6000
 
 
-def _peer_body(name: str, fp: Any) -> bytes:
+def _peer_body(name: str, fp: Any, *, node_version: str | None = None) -> bytes:
     node: dict[str, Any] = {
         "name": name, "state": "idle",
         "heartbeat_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if node_version is not None:
+        node["version"] = node_version
     if fp is not _NO_FP:
         node["config_fingerprint"] = fp
     return json.dumps({"host": name, "version": "0.22.0", "node": node}).encode()
@@ -280,6 +283,34 @@ def test_an_old_peer_without_a_fingerprint_is_unknown(tmp_path: Path) -> None:
     assert "no config fingerprint" in peer["drift"]["reason"]
     assert peer["drift"]["lines"] == []
     assert not [e for e in status["errors"] if e.startswith("fleet")]
+
+
+def test_a_peer_on_another_version_is_unknown_not_drift(tmp_path: Path) -> None:
+    """Two versions can hash one config differently (a changed default), so
+    a peer on another version is not compared, even with a fingerprint
+    that would otherwise read as drift."""
+    a = _config(tmp_path, "node-a", [_repo(ALPHA)])
+    b = config_fingerprint(_config(tmp_path, "node-b", [_repo(ALPHA), _repo(BETA)]))
+    status = _status_with_raw_peers(
+        tmp_path, a, [_peer_body("node-b", _wire(b), node_version="0.0.1")],
+    )
+    [peer] = status["fleet"]["peers"]
+    assert peer["drift"]["status"] == "unknown"
+    assert "0.0.1" in peer["drift"]["reason"] and __version__ in peer["drift"]["reason"]
+    assert peer["drift"]["lines"] == []
+
+
+def test_a_peer_on_the_same_version_is_compared(tmp_path: Path) -> None:
+    """The control for the test above: the same fingerprint, from a peer
+    on this machine's version, is compared and shows the drift."""
+    a = _config(tmp_path, "node-a", [_repo(ALPHA)])
+    b = config_fingerprint(_config(tmp_path, "node-b", [_repo(ALPHA), _repo(BETA)]))
+    status = _status_with_raw_peers(
+        tmp_path, a, [_peer_body("node-b", _wire(b), node_version=__version__)],
+    )
+    [peer] = status["fleet"]["peers"]
+    assert peer["drift"]["status"] == "differs"
+    assert peer["drift"]["lines"] == [f"1 repo only there: {BETA}"]
 
 
 def test_one_failing_comparison_leaves_the_other_peers_and_the_page(
@@ -461,6 +492,7 @@ def test_an_honest_empty_repo_list_is_compared(tmp_path: Path) -> None:
     "repos",
     "agent.binary",
     "not a repo/at all",
+    "example-org/beta\n",   # a trailing newline
 ])
 def test_expected_drift_refuses_what_it_cannot_compare(tmp_path: Path, entry: str) -> None:
     with pytest.raises(ValidationError, match="expected_drift"):

@@ -652,8 +652,11 @@ names and hashes are sent, never a value. The fingerprint is the config the
 server was started with, so an edit shows once the daemon is restarted.
 
 A peer on a version that sends no fingerprint, or one in another format,
-shows `config drift unknown`, not as drift. A field only one side has is not
-compared, so a config field added in a newer version does not read as drift.
+shows `config drift unknown`, not as drift. So does a peer on a different
+ctrlrelay version than this machine, even one that sends a fingerprint: two
+versions can hash the same config differently (a changed default, say), so
+the two are compared once both run the same version. A field only one side
+has is not compared.
 
 `expected_drift` is read on each machine for its own page only. A routing
 label that only some machines carry in `exclude_labels` is listed as

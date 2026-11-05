@@ -531,7 +531,9 @@ class StatusServer(ThreadingHTTPServer):
         expected = self.config.fleet.expected_drift
         for entry in block["peers"]:
             try:
-                entry["drift"] = peer_drift(entry, self.config_fingerprint, expected)
+                entry["drift"] = peer_drift(
+                    entry, self.config_fingerprint, expected, version=__version__,
+                )
             except Exception as exc:  # one peer's answer must not take the page down
                 error = f"{type(exc).__name__}: {exc}"[:300]
                 self._note_drift_failure(entry.get("url"), error)

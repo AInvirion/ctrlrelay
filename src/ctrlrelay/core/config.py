@@ -1135,7 +1135,7 @@ class FleetConfig(BaseModel):
         }
         for entry in v:
             if "/" in entry:
-                if not _REPO_NAME_RE.match(entry):
+                if not _REPO_NAME_RE.fullmatch(entry):
                     raise ValueError(
                         f"fleet.expected_drift: {entry!r} is not a repo (owner/name)"
                     )

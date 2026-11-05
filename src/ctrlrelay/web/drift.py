@@ -20,9 +20,10 @@ show that, without sending the config itself:
 Hashes are per field, not per section, so a comparison can name the field
 that differs ("automation.exclude_labels differs on 3 repos") and an
 expected difference can leave out one field. A field only one side has
-is not compared at all, so a config field added in a newer version does
-not read as drift; whether the two sides run the same version is shown
-separately, and a field only one side has is not reported either way.
+is not compared at all. Two machines on different ctrlrelay versions are
+not compared either (unknown): a changed default, or a field added inside
+one of the compared fields, would hash differently with nobody having
+edited anything.
 
 The fingerprint covers only ``repos[].automation``, ``repos[].steps`` and
 ``schedules``, none of which holds a credential. A hash hides a value's
@@ -235,16 +236,29 @@ def compare(
 
 def peer_drift(
     entry: dict[str, Any], mine: dict[str, Any] | None, expected: Iterable[str] = (),
+    *, version: str | None = None,
 ) -> dict[str, Any]:
     """The ``drift`` item for one ``fleet.peers`` entry. Unknown, never
     drift, whenever either fingerprint cannot be had: a peer not read, not
-    answering, or on a version that does not send one."""
+    answering, or on a version that does not send one.
+
+    Also unknown when the peer reports a different ctrlrelay version than
+    ``version`` (this machine's). Two versions can hash the same config
+    differently -- a changed default, or a field added inside one of the
+    compared fields -- so a comparison across versions could report drift
+    nobody made. A peer whose version is not known is still compared."""
     if mine is None:
         return unknown("this machine's config fingerprint could not be built")
     if entry.get("reachable") is not True:
         return unknown("not read yet" if entry.get("reachable") is None
                         else "not reachable from here")
     node = entry.get("node")
+    their_version = node.get("version") if isinstance(node, dict) else None
+    if version and their_version and their_version != version:
+        return unknown(
+            f"it runs {their_version} and this machine {version}; configs are "
+            "compared once both run the same version"
+        )
     theirs = node.get("config_fingerprint") if isinstance(node, dict) else None
     if theirs is None:
         return unknown(
