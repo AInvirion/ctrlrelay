@@ -323,6 +323,32 @@ class SecopsPipeline:
                 "for manual review."
             )
 
+        # The operator's own PRs beyond dependabot.yml (#335). ``ask``
+        # (the default) renders the prompt exactly as before the setting
+        # existed; ``ignore`` takes them out of scope.
+        operator_prs = getattr(automation, "operator_prs", None)
+        ignore_operator_prs = getattr(operator_prs, "value", operator_prs) == "ignore"
+        if ignore_operator_prs:
+            other_operator_pr_rule = (
+                "   - **Any other PR from `$OPERATOR`** (touches anything other\n"
+                "     than `.github/dependabot.yml`): out of scope on this repo;\n"
+                "     the operator handles these. Do not evaluate them, do not\n"
+                "     name them in the summary, do not signal BLOCKED on them."
+            )
+            operator_scope_note = (
+                "\n\nOn this repo the operator's own PRs are in scope only when\n"
+                "they touch ONLY `.github/dependabot.yml`. Drop every other\n"
+                "result of the step-4 query: it is not in scope, and it is not\n"
+                "a reason to signal BLOCKED."
+            )
+        else:
+            other_operator_pr_rule = (
+                "   - **Any other PR from `$OPERATOR`** (touches code, tests, configs\n"
+                "     other than dependabot.yml): signal BLOCKED for operator approval.\n"
+                "     Never auto-merge code changes, even from the trusted operator."
+            )
+            operator_scope_note = ""
+
         dependabot_policy_block = "\n".join(
             [
                 _policy_directive("patch updates", patch_pol),
@@ -484,9 +510,7 @@ BLOCKED at all: finish DONE and say what you left alone.
 
      If (a), (b), AND (c) all pass: merge with squash, delete the
      branch. If any one fails: BLOCKED.
-   - **Any other PR from `$OPERATOR`** (touches code, tests, configs
-     other than dependabot.yml): signal BLOCKED for operator approval.
-     Never auto-merge code changes, even from the trusted operator.
+{other_operator_pr_rule}
    - **PRs from anyone else** (collaborators, contributors, other bots):
      out of scope — see the PR scope fence below. Do not fetch them, do
      not evaluate them, do not name them, do not signal BLOCKED on them.
@@ -499,7 +523,7 @@ BLOCKED at all: finish DONE and say what you left alone.
 The ONLY open PRs in scope are the ones returned by the two author-
 filtered queries above: `--author "app/dependabot"` (step 2) and
 `--author "$OPERATOR"` (step 4). That is the complete universe of PRs
-this pipeline may look at.
+this pipeline may look at.{operator_scope_note}
 
 Never run an unfiltered `gh pr list` (or any other broad PR/issue
 search) to discover PRs beyond those two queries. A third party's open
