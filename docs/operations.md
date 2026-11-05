@@ -354,7 +354,10 @@ control plane. Every field is defined in `src/ctrlrelay/web/numbers.py`.
 **The page with peers.** A **Machines** strip shows one card per machine,
 this one first: state, slots, 5-hour and 7-day usage, heartbeat age. A card is
 red when the machine is paused, silent, unknown, not reachable, or not read
-yet. A peer that does not
+yet. A peer that answers with a different version from this machine's is red
+too, with `version X, this machine runs Y` on its card, so a node a release
+missed shows up; a peer whose version is unknown is not marked. A peer that
+does not
 answer is shown as **not reachable from here**, with the reason (`timeout`,
 `refused`, `name not found`, `bad host header`, an HTTP status) and its last
 known numbers greyed out, never as idle. **Who has what** lists every claimed
@@ -711,6 +714,64 @@ page's numbers count these runs in `stuck`.
 | Bot token env var | bridge **and** poller |
 
 After a `ctrlrelay` package upgrade (`uv pip install -e .`), restart both.
+For a node installed with `uv tool`, `ctrlrelay self-update` does the
+install and the restarts for you; see below.
+
+## Updating a node
+
+```bash
+ctrlrelay self-update                    # the latest version on PyPI
+ctrlrelay self-update --version 0.23.0   # a given version
+```
+
+It only installs a version already published on PyPI; publishing stays a
+human decision. In order:
+
+1. Reads `https://pypi.org/pypi/ctrlrelay/<version>/json` and checks that
+   this node's status page answers on `127.0.0.1:<web.port>`; without it the
+   update could not be checked, so it refuses. It also refuses when there is
+   no poller or web unit installed, or ctrlrelay is not a `uv tool` install.
+   Nothing has changed yet.
+2. Downloads the wheel into `wheels/` beside the state database and checks
+   its sha256 against that JSON. A mismatch deletes the file and installs
+   nothing. The wheel is installed by path rather than by name because a
+   node's package index has served a stale list for more than ten minutes
+   after a release. The file is kept, since uv's receipt records the path.
+3. Holds new work: it writes `intake-hold.json` beside the state database.
+   While it is there the poller leaves new issues for the next poll and
+   skips the scheduled sweep and resumed questions, the same way the usage
+   pause does; runs already going finish. The poller answers in
+   `intake-hold.ack.json` with whether anything is still in flight. The
+   command waits, up to `--wait-minutes` (default 60), until the poller says
+   nothing is in flight and the state database has no `running` session.
+   Checking the database alone is not enough: an issue can pass the poller's
+   checks a few seconds before its session row is written, and a restart in
+   that gap cancels it.
+4. `uv tool install --force <wheel>`, then restarts every installed unit:
+   `systemctl --user restart ctrlrelay-{bridge,poller,web}.service` on
+   Linux, `launchctl kickstart -k gui/<uid>/<label>` for each
+   `*.ctrlrelay-{bridge,poller,web}.plist` in `~/Library/LaunchAgents` on
+   macOS (the label is the file's name, whatever `--label-prefix` it was
+   installed with).
+5. Waits up to two minutes for `/api/status` to report the new version.
+
+If any step after the install fails, the old version is installed and
+restarted the same way, and checked. Chat (when a transport is configured)
+gets one line either way: the update, or the step that failed and whether
+the old version is running again. The command exits non-zero on any
+failure. The hold is removed on every way out, including Ctrl-C and
+SIGTERM; one left by a process that was killed outright is ignored once
+that process is gone or the hold's expiry (the wait plus 30 minutes) has
+passed.
+
+A poller from before this command does not know the hold and never
+acknowledges it, so the command stops after a minute without changing
+anything. For that one update, `--no-ack` goes on the state database alone,
+with the gap described in step 3. A poller that is not running (its
+heartbeat is older than `fleet.silent_after_seconds`) is not waited on.
+
+A scheduled security sweep whose time comes while the hold is in place is
+skipped until its next time, not delayed.
 
 After merging a PR that the dev pipeline opened, no manual restart is required —
 the PR is referenced from the open branch in your bare repo, so cleanup is

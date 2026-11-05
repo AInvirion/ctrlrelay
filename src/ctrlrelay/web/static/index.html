@@ -629,6 +629,13 @@ function machineCard(name, node, state, bad, now, extra, pageUrl) {
   return box;
 }
 
+// #306: a peer on another version than this machine. Only when both are
+// known: an unknown version is not a mismatch, it is unknown.
+function versionDiffers(mine, theirs) {
+  return typeof mine === "string" && mine !== "" &&
+    typeof theirs === "string" && theirs !== "" && mine !== theirs;
+}
+
 var BAD_STATES = { "paused-limit": 1, "silent": 1, "unknown": 1 };
 function isBad(state) {
   return typeof state !== "string" || Object.prototype.hasOwnProperty.call(BAD_STATES, state);
@@ -657,8 +664,12 @@ function renderFleet(data, now) {
       }
       cards.push(c);
     } else {
+      var theirs = p.node && p.node.version;
+      var differs = versionDiffers(data.version, theirs);
       cards.push(machineCard(p.name || p.url, p.node, p.state,
-        p.reachable !== true || isBad(p.state), now, null, p.page_url));
+        p.reachable !== true || isBad(p.state) || differs, now,
+        differs ? "version " + theirs + ", this machine runs " + data.version : null,
+        p.page_url));
     }
   });
   put(document.getElementById("fleet-strip"), cards);

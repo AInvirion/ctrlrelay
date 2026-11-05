@@ -1651,3 +1651,27 @@ def test_a_refilled_bucket_is_not_highlighted() -> None:
     assert core["cls"] == "line" and "refilled" in core["text"]
     assert search["cls"] == "line high" and "1 of 30 left" in search["text"]
     assert graphql == {"cls": "line", "text": "GitHub graphql unknown"}
+
+
+# --- #306: a peer on another version ------------------------------------------
+
+
+@pytest.mark.parametrize("mine,theirs,expected", [
+    ("0.22.0", "0.23.0", True),
+    ("0.22.0", "0.22.0", False),
+    ("0.22.0", None, False),     # unknown is not a mismatch
+    ("0.22.0", "", False),
+    (None, "0.22.0", False),
+    ("0.22.0", 22, False),
+])
+def test_page_marks_a_peer_on_another_version(mine, theirs, expected) -> None:
+    got = _run_js(["versionDiffers"],
+                  f"versionDiffers({json.dumps(mine)}, {json.dumps(theirs)})")
+    assert got is expected
+
+
+def test_render_fleet_marks_and_explains_a_version_mismatch() -> None:
+    body = _js_function(_script(), "renderFleet")
+    assert "versionDiffers(data.version, theirs)" in body
+    assert "|| differs" in body
+    assert '"version " + theirs + ", this machine runs " + data.version' in body

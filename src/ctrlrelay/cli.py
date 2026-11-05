@@ -2946,6 +2946,46 @@ def poller_start(
             on_resume=_wake_usage_deferred,
         )
 
+        # `ctrlrelay self-update` holds new work while it waits to restart
+        # this process (#306). Every way in to new work (an issue, the
+        # scheduled sweep, a resumed question) asks the hold first and is
+        # counted while it runs, so the acknowledgement can say truthfully
+        # whether anything is still in flight here.
+        from ctrlrelay.core.intake_hold import IntakeHold
+
+        intake_hold = IntakeHold.beside(config.paths.state_db)
+
+        async def handle_issue_unless_held(repo: str, issue: dict) -> None:
+            hold = intake_hold.begin()
+            if hold is not None:
+                # Offered again on the next poll; the hold lasts minutes.
+                poller.recheck_at(repo, issue["number"], 0.0)
+                console.print(
+                    f"[yellow]#{issue['number']} in {repo} left for later: "
+                    f"{hold.reason}.[/yellow]"
+                )
+                return
+            try:
+                await handle_issue(repo, issue)
+            finally:
+                intake_hold.end()
+
+        def unless_held(name: str, func):
+            async def job() -> None:
+                hold = intake_hold.begin()
+                if hold is not None:
+                    log_event(_logger, "intake_hold.job_skipped", job=name,
+                              reason=hold.reason)
+                    console.print(
+                        f"[yellow]Scheduled {name} skipped: {hold.reason}.[/yellow]"
+                    )
+                    return
+                try:
+                    await func()
+                finally:
+                    intake_hold.end()
+            return job
+
         # The account's GitHub API budget (#237): read on a schedule, shown
         # on the page, and a gate on this process's `gh` calls whose bucket
         # is known, so those fail fast as rate limited until the reset.
@@ -4142,7 +4182,7 @@ def poller_start(
             scheduler.add_cron_job(
                 name="secops",
                 cron_expr=config.schedules.secops_cron,
-                func=_run_scheduled_secops,
+                func=unless_held("secops", _run_scheduled_secops),
             )
             # Drain answered pending_resumes every minute so a Telegram
             # reply to a BLOCKED session turns into an actual pipeline
@@ -4151,7 +4191,7 @@ def poller_start(
             scheduler.add_cron_job(
                 name="pending_resume_sweeper",
                 cron_expr="* * * * *",
-                func=_run_pending_resume_sweeper,
+                func=unless_held("pending_resume_sweeper", _run_pending_resume_sweeper),
             )
             # Retire questions nobody can act on any more. Without
             # this the pending_resumes table only grows: unanswered
@@ -4221,6 +4261,7 @@ def poller_start(
 
             heartbeat = Heartbeat.beside(config.paths.state_db)
             heartbeat_task = asyncio.create_task(heartbeat.run())
+            intake_ack_task = asyncio.create_task(intake_hold.run_acks())
 
             # #250: a peer that answers with this machine's name. Checked
             # once, in the background, so a slow peer cannot hold startup.
@@ -4353,7 +4394,8 @@ def poller_start(
             try:
                 await github_budget.refresh()
                 await run_poll_loop(
-                    poller=poller, handler=handle_issue, interval=interval,
+                    poller=poller, handler=handle_issue_unless_held,
+                    interval=interval,
                     interval_scale=lambda: (
                         config.github_api.slow_factor
                         if github_budget.is_low() else 1.0
@@ -4362,6 +4404,7 @@ def poller_start(
                 )
             finally:
                 heartbeat_task.cancel()
+                intake_ack_task.cancel()
                 peer_check_task.cancel()
                 # Scheduler shutdown is async so it can cancel + await any
                 # in-flight job tasks (e.g. a scheduled secops sweep that was
@@ -5339,6 +5382,175 @@ def setup(
 def version() -> None:
     """Print the package version."""
     console.print(__version__)
+
+
+_SELF_UPDATE_MAX_JSON_BYTES = 5_000_000
+_SELF_UPDATE_MAX_WHEEL_BYTES = 100_000_000
+
+
+def _self_update_effects(config, *, say):
+    """The real network, processes and files behind ``self-update``."""
+    import subprocess
+    import urllib.request
+
+    from ctrlrelay.core.heartbeat import Heartbeat
+    from ctrlrelay.core.self_update import Effects
+    from ctrlrelay.web.fleet import fetch_peer
+    from ctrlrelay.web.status import _read
+
+    def fetch_json(url: str):
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            body = resp.read(_SELF_UPDATE_MAX_JSON_BYTES + 1)
+        if len(body) > _SELF_UPDATE_MAX_JSON_BYTES:
+            raise ValueError("answer too large")
+        import json
+        return json.loads(body)
+
+    def download(url: str, dest: Path) -> None:
+        size = 0
+        with urllib.request.urlopen(url, timeout=60) as resp, dest.open("wb") as out:  # noqa: S310
+            while chunk := resp.read(1 << 20):
+                size += len(chunk)
+                if size > _SELF_UPDATE_MAX_WHEEL_BYTES:
+                    raise ValueError("wheel too large")
+                out.write(chunk)
+
+    def run(argv: list[str], timeout: float) -> tuple[int, str]:
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=timeout, check=False)
+        except subprocess.TimeoutExpired:
+            return 124, f"timed out after {int(timeout)}s"
+        return done.returncode, (done.stdout or "") + (done.stderr or "")
+
+    def status() -> dict:
+        # The loopback address answers whatever web.host is (the server
+        # adds a loopback twin), and passes its Host check.
+        return fetch_peer(f"http://127.0.0.1:{config.web.port}",
+                          timeout=config.fleet.timeout_seconds)
+
+    def running_sessions() -> int | None:
+        try:
+            return int(_read(
+                Path(config.paths.state_db),
+                lambda conn: conn.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE status = 'running'"
+                ).fetchone()[0],
+            ))
+        except Exception as e:
+            # Could not look is not "nothing running".
+            log_event(_logger, "self_update.sessions_unreadable", error=str(e)[:200])
+            return None
+
+    def poller_alive() -> bool:
+        beat = Heartbeat.beside(config.paths.state_db).read()
+        return beat is not None and (
+            time.time() - beat["heartbeat_at"] <= config.fleet.silent_after_seconds
+        )
+
+    def notify(text: str) -> None:
+        async def send() -> None:
+            transport = await connect_notify_transport(config)
+            if transport is None:
+                return
+            try:
+                await transport.send(text)
+            finally:
+                try:
+                    await asyncio.wait_for(transport.close(), timeout=5)
+                except Exception:
+                    pass
+
+        async def bounded() -> None:
+            await asyncio.wait_for(send(), timeout=30)
+
+        asyncio.run(bounded())
+
+    return Effects(
+        fetch_json=fetch_json, download=download, run=run, status=status,
+        running_sessions=running_sessions, poller_alive=poller_alive,
+        notify=notify, clock=time.monotonic, sleep=time.sleep, say=say,
+    )
+
+
+@app.command("self-update")
+def self_update(
+    version_: str | None = typer.Option(
+        None, "--version",
+        help="Version to install (default: the latest on PyPI).",
+    ),
+    wait_minutes: float = typer.Option(
+        60.0, "--wait-minutes", min=1.0,
+        help="How long to wait for a run in flight before giving up.",
+    ),
+    no_ack: bool = typer.Option(
+        False, "--no-ack",
+        help=(
+            "Go on an idle state database alone when the poller does not "
+            "acknowledge the hold (a poller older than this command)."
+        ),
+    ),
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+) -> None:
+    """Install a published version on this node, only once it is idle.
+
+    Holds new work, waits for the run in flight, installs the wheel from
+    PyPI after checking its sha256, restarts this node's units and checks
+    the status page reports the new version. On any failure the old
+    version stays (or is put back) and chat is told.
+    """
+    import shutil
+    import signal
+
+    from ctrlrelay.core.intake_hold import IntakeHold
+    from ctrlrelay.core.self_update import Limits, SelfUpdate, SelfUpdateError, find_units
+
+    config = _load_config_or_exit(config_path)
+    uv = shutil.which("uv")
+    if uv is None:
+        console.print("[red]error:[/red] `uv` is not on PATH; self-update installs with it.")
+        raise typer.Exit(1)
+
+    def say(text: str) -> None:
+        console.print(f"[dim]{rich_escape(text)}[/dim]")
+
+    state_dir = Path(config.paths.state_db).parent
+    updater = SelfUpdate(
+        hold=IntakeHold.beside(config.paths.state_db),
+        units=find_units(sys.platform, home=Path.home()),
+        wheel_dir=state_dir / "wheels",
+        uv=uv,
+        uid=os.getuid(),
+        node=config.node_id,
+        effects=_self_update_effects(config, say=say),
+        limits=Limits(idle_seconds=wait_minutes * 60),
+        require_ack=not no_ack,
+    )
+
+    # SIGTERM would end the process without running `finally`, and leave
+    # new work held until the hold expires. As SystemExit it unwinds.
+    def _on_term(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, _on_term)
+    try:
+        outcome = updater.run(version_)
+    except SelfUpdateError as e:
+        console.print(f"[red]{rich_escape(e.message)}[/red]")
+        raise typer.Exit(1)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    if outcome.changed:
+        console.print(
+            f"[green]Updated {config.node_id}: {outcome.old_version} → "
+            f"{outcome.new_version}.[/green]"
+        )
 
 
 @app.command("status")

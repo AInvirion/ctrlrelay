@@ -383,6 +383,20 @@ Opens the SQLite state DB at `paths.state_db` and prints:
 
 If the DB doesn't exist yet, prints a hint to run a pipeline first.
 
+## `ctrlrelay self-update`
+
+```bash
+ctrlrelay self-update [--version X] [--wait-minutes N] [--no-ack] [-c PATH]
+```
+
+Installs a version already on PyPI on this node once it is idle: holds new
+work, waits (up to `--wait-minutes`, default 60) for the run in flight,
+installs the wheel after checking its sha256 against PyPI's JSON, restarts
+this node's units and checks `/api/status` reports the new version. On any
+failure the old version stays or is put back, chat is told, and it exits
+non-zero. `--no-ack` is for updating from a poller too old to acknowledge
+the hold. See [Operations: Updating a node](operations.md#updating-a-node).
+
 ## `ctrlrelay version`
 
 ```bash
