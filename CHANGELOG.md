@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-05
+
 ### Added
 
 - A run going in circles is stopped early with a clear reason, instead of
@@ -2405,7 +2407,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.2...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.2...v0.21.0
 [0.20.2]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.19.1...v0.20.0
