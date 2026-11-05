@@ -462,3 +462,41 @@ async def test_a_saved_question_that_cannot_be_closed_is_expired(
     assert row["expired_at"] is not None
     assert state_db.answer_pending_resume(result.session_id, "late") is False
     state_db.close()
+
+
+@pytest.mark.asyncio
+async def test_an_answer_to_a_question_retired_during_the_wait_still_resumes(
+    tmp_path: Path,
+) -> None:
+    """The saved question was expired while the run waited (nobody answered
+    it there), then the live wait got its answer. An expired row is no
+    other answer, so the run resumes with this one."""
+    state_db = StateDB(tmp_path / "state.db")
+    calls: list[dict[str, Any]] = []
+
+    async def spawn(**kw: Any) -> SessionResult:
+        calls.append(kw)
+        return _blocked(kw["session_id"]) if len(calls) == 1 \
+            else _resumed(kw["session_id"])
+
+    dispatcher = AsyncMock()
+    dispatcher.spawn_session.side_effect = spawn
+    transport = AsyncMock()
+
+    async def ask(question: str, *, session_id: str, **kw: Any) -> str:
+        assert state_db.expire_pending_resume(session_id, "operator")
+        return "pin it"
+
+    transport.ask.side_effect = ask
+
+    await run_dev_issue(
+        claims=None, repo=REPO, issue_number=13,
+        branch_template="fix/issue-{n}", dispatcher=dispatcher,
+        github=_github(), worktree=_worktree(tmp_path / "wt"),
+        dashboard=None, state_db=state_db, transport=transport,
+        contexts_dir=tmp_path / "contexts",
+    )
+
+    assert len(calls) == 2
+    assert "pin it" in calls[1]["prompt"]
+    state_db.close()
