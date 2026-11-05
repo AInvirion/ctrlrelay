@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A run waiting for the operator's answer is no longer lost when the poller
+  stops during the wait. The question is now saved, and the session marked
+  `blocked`, before the wait starts rather than after it ends. If the
+  poller stops, a later answer in chat reaches the saved question and
+  resumes the same agent session; when the poller starts again it drops the
+  repo lock such a run held, so the repo is not wedged until then. An
+  answer that arrives during the wait still resumes the run at once and
+  closes the saved question. A planning session's question resumes the
+  plan, not the code. The claim on the issue is not marked held while the
+  question waits, so after a stop it goes stale as before (#324).
+
 - An issue is read again from GitHub just before its run starts. A poll
   returns a batch that is handled one issue at a time, so with one slot the
   last issue could start an hour after the poll saw it, after its trigger
