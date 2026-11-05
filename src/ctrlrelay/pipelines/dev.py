@@ -2177,9 +2177,10 @@ def _take_answer(run: _DevRun, answer: str) -> bool:
     missing or expired is no other answer, so the run resumes with this
     one. If the row cannot be closed, it is expired instead, so no later
     reply can resume the session a second time; and if it turns out to be
-    answered already, that answer stands as above. When the database
-    cannot be read at all, the run resumes, as it did before the row
-    existed."""
+    answered already, that answer stands as above. When the database can
+    be neither written nor read, the run resumes as it did before the row
+    existed, and the row may stay open: a later reply could then resume
+    the session again."""
     sid = run.session_id
     try:
         if run.state_db.take_parked_answer(sid, answer):
@@ -2276,6 +2277,15 @@ async def _answer_while_blocked(
                 session_id=run.session_id, repo=run.repo,
                 issue_number=run.issue_number,
             )
+            # Say so to whoever typed the second reply: it is not applied.
+            try:
+                await run.transport.send(
+                    f"Your reply for #{run.issue_number} in {run.repo} was "
+                    "not applied: an earlier reply had already answered "
+                    "that question, and the run resumes with it."
+                )
+            except Exception:
+                pass
             return PipelineResult(
                 success=False,
                 blocked=True,

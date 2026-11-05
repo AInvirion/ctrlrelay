@@ -277,6 +277,21 @@ def _read_running(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def _read_busy(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Sessions the poller is busy with: running, plus blocked ones that
+    still hold their repo lock. Those are waiting in process for an answer
+    (#324: the session is marked blocked before that wait), and the poller
+    takes nothing else meanwhile."""
+    rows = conn.execute(
+        """SELECT id, pipeline, repo, issue_number, worktree_path, started_at
+           FROM sessions WHERE status = 'running'
+              OR (status = 'blocked'
+                  AND id IN (SELECT session_id FROM repo_locks))
+           ORDER BY started_at ASC, id ASC"""
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def _read_locks(conn: sqlite3.Connection) -> dict[str, str]:
     rows = conn.execute("SELECT repo, session_id FROM repo_locks").fetchall()
     return {r["repo"]: r["session_id"] for r in rows}
@@ -943,7 +958,7 @@ def make_sessions_reader(db_path: Path) -> SessionsReader:
     path = Path(db_path)
 
     def read() -> tuple[list[dict[str, Any]], dict[str, str]]:
-        rows, locks = _read(path, lambda conn: (_read_running(conn), _read_locks(conn)))
+        rows, locks = _read(path, lambda conn: (_read_busy(conn), _read_locks(conn)))
         running = [
             {
                 "session_id": r["id"],

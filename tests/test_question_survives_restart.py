@@ -332,6 +332,8 @@ async def test_a_question_answered_first_through_its_saved_row_is_not_resumed_tw
     (todo,) = state_db.list_pending_resumes_to_execute()
     assert todo["answer"] == "pin it"
     assert state_db.list_locks() == []
+    told = [c.args[0] for c in transport.send.await_args_list]
+    assert any("was not applied" in t for t in told), told
 
     # The sweeper's turn: it resumes once, with the first answer.
     dispatcher.spawn_session.side_effect = (
@@ -579,3 +581,26 @@ def test_a_failed_park_leaves_no_half_write_open(tmp_path: Path) -> None:
         "SELECT status FROM sessions WHERE id = 's'"
     ).fetchone()["status"] == "running"
     db.close()
+
+
+def test_the_waiting_line_counts_a_run_waiting_for_its_answer_as_busy(
+    tmp_path: Path,
+) -> None:
+    """A run waiting in process for an answer is `blocked` and holds its
+    lock; another issue in that repo waits on it, not on "the next poll"."""
+    from ctrlrelay.web.status import make_sessions_reader
+
+    db = StateDB(tmp_path / "state.db")
+    db.execute(
+        "INSERT INTO sessions (id, pipeline, repo, issue_number, status, "
+        "started_at) VALUES ('s-wait', 'dev', 'o/r', 7, 'blocked', 1), "
+        "('s-parked', 'dev', 'o/q', 8, 'blocked', 1)"
+    )
+    db.commit()
+    assert db.acquire_lock("o/r", "s-wait")
+    db.close()
+
+    running, locks = make_sessions_reader(tmp_path / "state.db")()
+
+    assert [r["session_id"] for r in running] == ["s-wait"]
+    assert locks == {"o/r": "s-wait"}
