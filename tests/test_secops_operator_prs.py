@@ -124,6 +124,8 @@ class TestPrompt:
         step = prompt[drop:prompt.index("5. For each alert or PR:")]
         for governed in ('"each open PR"', "BLOCKED", "step-6 summary", '"what you left alone"'):
             assert governed in step
+        assert "applies only to the PRs that remain" in step
+        assert "A dropped PR is not an open PR for this run" in step
 
     def test_ignore_keeps_the_dependabot_yml_carve_out_word_for_word(self) -> None:
         ignore = _prompt(AutomationConfig(operator_prs="ignore"))
