@@ -697,8 +697,8 @@ The secops sweep looks at the open PRs you authored on each repo. One that
 touches only `.github/dependabot.yml` is a "turn on Dependabot" change: it is
 merged if it passes an author check, a diff check (additions only) and a CI
 check, and is a question if it fails any of them.
-Any other PR of yours is a question by default (`ask`), and that question
-comes back on every sweep until the PR is closed.
+Any other PR of yours is a question by default (`ask`), and while the PR
+stays open that question can be asked again on later sweeps.
 
 On a repo where you keep your own PRs open for a while (blog posts, drafts),
 set `ignore`:

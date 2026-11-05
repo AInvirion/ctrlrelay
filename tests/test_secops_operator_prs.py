@@ -147,6 +147,10 @@ class TestPrompt:
         assert "**Author check**" in carve_out
         assert "**Diff check**" in carve_out
         assert "**CI check**" in carve_out
+        assert (
+            "If (a), (b), AND (c) all pass: merge with squash, delete the\n"
+            "     branch. If any one fails: BLOCKED." in carve_out
+        )
         # And the step that lists the operator's PRs is still asked for.
         assert '--author "$OPERATOR" --json number,title,files' in ignore
 
