@@ -124,7 +124,10 @@ def test_macos_memory_and_uptime_come_from_sysctl_and_vm_stat(tmp_path: Path) ->
     assert out["memory"]["available_bytes"] == pages * 16384
     assert out["memory"]["available_pct"] == round(100.0 * pages * 16384 / 68719476736, 1)
     assert out["memory"]["low"] is False
-    assert out["uptime_s"] == int(NOW - 1790576331)
+    # The boot instant is sec AND usec, so this is a second less than the
+    # seconds field alone would give -- which is the point of counting usec.
+    assert out["uptime_s"] == int(NOW - (1790576331 + 490981 / 1_000_000))
+    assert out["uptime_s"] == 3257708
     # The point of the ticket: nothing is missing and nothing is explained away.
     assert out["unavailable"] == []
 
@@ -212,7 +215,10 @@ def test_macos_one_missing_counter_is_a_gap_not_a_partial_sum(
             "a page size of zero",
             VM_STAT.replace("page size of 16384 bytes", "page size of 0 bytes"),
         ),
-        ("a plausible wrong size", VM_STAT.replace("of 16384 bytes", "of 3 bytes")),
+        # Not "a plausible wrong size": a size this reader supports but that
+        # is wrong for the machine (4096 where the kernel said 16384) is
+        # indistinguishable here and is not claimed to be covered.
+        ("an unsupported size", VM_STAT.replace("of 16384 bytes", "of 3 bytes")),
         (
             "the header further down instead of first",
             "something else entirely\n" + VM_STAT,
@@ -226,7 +232,6 @@ def test_macos_a_page_size_it_cannot_trust_is_a_gap(tmp_path: Path, name: str, t
     out = _mac(tmp_path, vm_stat=lambda: text)
 
     assert out["memory"] == dict.fromkeys(MEMORY_KEYS), name
-    assert out["memory"]["available_bytes"] is None, name
 
 
 def test_macos_an_implausible_total_is_a_gap_and_does_not_escape(tmp_path: Path) -> None:
@@ -331,7 +336,7 @@ def test_macos_an_ambiguous_boot_time_is_unknown(tmp_path: Path, name: str, boot
     assert any(line.startswith("uptime (sysctl kern.boottime):") for line in out["unavailable"])
 
 
-def test_a_platform_with_neither_source_says_which_two_it_looked_for(tmp_path: Path) -> None:
+def test_a_platform_with_no_reader_says_so_once_per_reading(tmp_path: Path) -> None:
     out = read_server_health(
         disks=[("home", tmp_path)], loadavg=lambda: (0.1, 0.1, 0.1), cpu_count=lambda: 2,
         disk_usage=lambda p: Usage(1000, 600, 400), platform="sunos5",
@@ -343,7 +348,9 @@ def test_a_platform_with_neither_source_says_which_two_it_looked_for(tmp_path: P
         "memory: no reader for platform 'sunos5'",
         "uptime: no reader for platform 'sunos5'",
     ]
-    # Everything that does not need a platform is still there.
+    # Worded as what happened -- nothing was probed -- rather than as two
+    # sources having been tried and failed. Everything that does not need a
+    # platform is still there.
     assert out["load_1m"] == 0.1 and out["cpu_count"] == 2 and out["disks"][0]["free_pct"] == 40.0
 
 
@@ -534,7 +541,84 @@ def test_reads_this_machines_real_sysctl_and_vm_stat(tmp_path: Path) -> None:
     memory = out["memory"]
     # Sane rather than exact: these move between runs.
     assert memory["total_bytes"] > 2 * 2**30
-    assert 0 < memory["available_bytes"] <= memory["total_bytes"]
-    assert 0.0 < memory["available_pct"] <= 100.0
+    # `>= 0`, not `> 0`: a machine with one page available is a reading, and
+    # 0.0% is what it rounds to. Unknown is `None`, which the assertion above
+    # has already excluded -- that is the distinction this panel is built on.
+    assert 0 <= memory["available_bytes"] <= memory["total_bytes"]
+    assert 0.0 <= memory["available_pct"] <= 100.0
     assert memory["low"] is (memory["available_bytes"] < LOW_FRACTION * memory["total_bytes"])
     assert out["uptime_s"] is not None and out["uptime_s"] > 0
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        ("two values for one counter", VM_STAT.replace(
+            "Pages active:                           1665080.",
+            "Pages free:                                   1.",
+        )),
+        ("a duplicate further down", VM_STAT + "Pages free:                            1.\n"),
+    ],
+)
+def test_macos_a_duplicated_counter_is_a_gap_not_the_last_value(
+    tmp_path: Path, name: str, text: str,
+) -> None:
+    """`Pages free: 509239.` and then `Pages free: 1.` would have reported a
+    machine out of memory, with nothing saying the source was ambiguous."""
+    out = _mac(tmp_path, vm_stat=lambda: text)
+
+    assert out["memory"] == dict.fromkeys(MEMORY_KEYS), name
+    assert any("two Pages free lines" in line for line in out["unavailable"]), name
+
+
+def test_macos_a_total_smaller_than_a_page_is_a_gap(tmp_path: Path) -> None:
+    """hw.memsize=1 passed the positive check and gave total=1, available=0,
+    low=True: an impossible machine presented as one out of memory."""
+    out = _mac(tmp_path, sysctl=_sysctl(**{"hw.memsize": "1"}))
+
+    assert out["memory"] == dict.fromkeys(MEMORY_KEYS)
+    assert any("smaller than one 16384-byte page" in line for line in out["unavailable"])
+
+
+@pytest.mark.parametrize(
+    ("name", "boottime"),
+    [
+        ("a field that merely ends in sec", "{ not-sec = 100, usec = 0 }"),
+        ("no usec field", "{ sec = 100 }"),
+        ("a malformed second record", "{ sec = 1, usec = 0 }\n{ sec = tomorrow }"),
+        ("a prefix before the record", "boottime: { sec = 100, usec = 0 }"),
+    ],
+)
+def test_macos_a_boot_time_that_is_not_one_whole_record_is_a_gap(
+    tmp_path: Path, name: str, boottime: str,
+) -> None:
+    """Searching for `sec = <digits>` anywhere accepted all of these: a word
+    boundary is not a field boundary, and a malformed second record is
+    invisible to a search that already matched the first."""
+    out = _mac(tmp_path, sysctl=_sysctl(**{"kern.boottime": boottime}), now=lambda: 200.5)
+
+    assert out["uptime_s"] is None, name
+    assert any(
+        line.startswith("uptime (sysctl kern.boottime):") for line in out["unavailable"]
+    ), name
+
+
+def test_macos_uptime_counts_the_microseconds_too(tmp_path: Path) -> None:
+    """`usec` is part of the boot instant, so a boot 0.9s in the future is in
+    the future even when its `sec` field alone is in the past."""
+    out = _mac(
+        tmp_path,
+        sysctl=_sysctl(**{"kern.boottime": "{ sec = 100, usec = 900000 }"}),
+        now=lambda: 100.5,
+    )
+
+    assert out["uptime_s"] is None
+    assert any("boot time is in the future" in line for line in out["unavailable"])
+
+    # And the same record half a second later is a reading of zero seconds.
+    ok = _mac(
+        tmp_path,
+        sysctl=_sysctl(**{"kern.boottime": "{ sec = 100, usec = 900000 }"}),
+        now=lambda: 101.0,
+    )
+    assert ok["uptime_s"] == 0

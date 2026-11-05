@@ -8,9 +8,13 @@ on Linux, ``sysctl`` and ``vm_stat`` on macOS.
 On every ``/api/status`` request. **The two paths do not cost the same**:
 reading ``/proc`` is a few microseconds, while the macOS path starts
 **three** processes -- ``sysctl hw.memsize``, ``vm_stat`` and
-``sysctl kern.boottime`` -- which is milliseconds at best. Each is bounded
-by ``_RUN_TIMEOUT_S``, so a pathological host holds a status request for
-three times that and no longer; the bound is small for that reason.
+``sysctl kern.boottime`` -- which is milliseconds at best.
+
+Each command's **communication** is bounded by ``_RUN_TIMEOUT_S``, which is
+why that number is small. It is not a ceiling on the request: a timeout does
+not bound process creation, and killing a command does not reap whatever it
+started. A host sick enough to make `fork` slow can hold a status page for
+longer than three times the bound, and nothing here prevents that.
 
 Every number may be ``null``. A number that could not be read is ``null``,
 never ``0`` (which would read as "out of memory" or "no load"), and
@@ -29,17 +33,21 @@ look (#321).
 definition ``psutil`` uses for macOS, chosen because other tools already
 agree on it rather than because it was invented here.
 
-It is an **estimate and an upper bound**: inactive pages can hold dirty
+It is an **estimate, and it can be wrong in both directions** -- not a
+bound either way. It overstates, because inactive pages can hold dirty
 anonymous data that must be compressed or swapped before the memory is
-handed out, so some of what is counted is not free for the asking.
-``speculative`` and ``purgeable`` are deliberately **not** added -- purgeable
-pages are counted inside the other queues, so adding them double-counts.
+handed out; and it understates, because memory the kernel could reclaim
+from elsewhere is not counted. ``speculative`` and ``purgeable`` are
+deliberately not added: purgeable pages are counted inside the other
+queues, so adding them double-counts.
 
 **The two platforms measure different estimates and this does not claim
-otherwise.** ``LOW_FRACTION`` is applied to each platform's own estimate:
-"less than 10% of what this kernel would call available". Useful on both,
-the same measurement on neither -- which matters to anyone comparing two
-machines' percentages side by side.
+otherwise.** ``low`` is ``available < LOW_FRACTION * total`` on both: the
+platform's available estimate is less than 10% **of the machine's total
+memory** -- not 10% of available, and on macOS the estimate is the one this
+reader constructs rather than a number any kernel hands over. Useful on
+both, the same measurement on neither, which matters to anyone comparing
+two machines' percentages side by side.
 
 Shape::
 
@@ -177,11 +185,19 @@ def _vm_stat_pages(text: str) -> tuple[int, dict[str, int]]:
     page_size = int(head.group(1))
     if page_size not in _PAGE_SIZES:
         raise ValueError(f"page size is {page_size}, not one of {_PAGE_SIZES}")
-    counts = {}
+    counts: dict[str, int] = {}
     for line in lines[1:]:
         found = _VM_STAT_LINE.match(line.strip())
-        if found:
-            counts[found.group(1).strip('"')] = int(found.group(2))
+        if not found:
+            continue
+        name = found.group(1).strip('"')
+        if name in counts:
+            # Two values for one counter is not a reading to take the last
+            # of: `Pages free: 5000.` followed by `Pages free: 1.` would
+            # report a machine out of memory, with nothing to say it was
+            # ambiguous.
+            raise ValueError(f"vm_stat has two {name} lines")
+        counts[name] = int(found.group(2))
     return page_size, counts
 
 
@@ -193,7 +209,7 @@ def _memory_darwin(
     # exception leaving this module and taking the request with it.
     try:
         total = int(sysctl("hw.memsize"))
-        if not 0 < total <= _MAX_TOTAL_BYTES:
+        if not 0 < total <= _MAX_TOTAL_BYTES:  # before the page-size check below
             # The number itself, only while it is short enough to be worth
             # reading: `_why` truncates at 200 characters, and a 400-digit
             # `hw.memsize` pushed the explanation off the end of its own
@@ -201,6 +217,11 @@ def _memory_darwin(
             shown = str(total) if abs(total) <= _MAX_TOTAL_BYTES else f"{len(str(total))} digits"
             raise ValueError(f"hw.memsize is {shown}, not a plausible size")
         page_size, counts = _vm_stat_pages(vm_stat())
+        if total < page_size:
+            # A machine is at least one page. `hw.memsize` of 1 would
+            # otherwise give total=1, available=0, low=True -- an impossible
+            # reading presented as "out of memory".
+            raise ValueError(f"hw.memsize is {total}, smaller than one {page_size}-byte page")
         missing = [name for name in _AVAILABLE_PAGES if name not in counts]
         if missing:
             # Not guessed at: a vm_stat without these lines is one this does
@@ -225,27 +246,33 @@ def _memory_darwin(
 
 
 # `kern.boottime` prints `{ sec = 1790576331, usec = 490981 } Sun Sep 27 ...`.
-# The word boundary matters -- without it a reading with no `sec` field takes
-# the microseconds as seconds -- and so does the terminator: `sec = 100oops`
-# would otherwise read as 100. A test plants both.
-_BOOTTIME_SEC = re.compile(r"\bsec\s*=\s*(\d+)\s*(?=[,}]|$)")
+# The whole record is matched, anchored at the start, with both field names
+# spelled out -- because a word boundary is not a field boundary, and
+# searching for `sec = <digits>` somewhere in the text accepted
+# `{ not-sec = 100 }`, read `sec = 100oops` as 100, and took the first of two
+# records whichever the second said. The trailing human-readable date is
+# whatever the kernel appends and is not read.
+_BOOTTIME = re.compile(r"\A\{\s*sec\s*=\s*(\d+)\s*,\s*usec\s*=\s*(\d+)\s*\}")
 
 
 def _uptime_darwin(
     sysctl: Callable[[str], str], now: Callable[[], float], unavailable: list[str],
 ) -> int | None:
     try:
-        text = sysctl("kern.boottime")
-        found = _BOOTTIME_SEC.findall(text)
+        text = sysctl("kern.boottime").strip()
+        found = _BOOTTIME.match(text)
         if not found:
-            raise ValueError(f"no 'sec = <n>' in {text!r}")
-        if len(found) > 1:
-            # Two boot times is not a reading to pick the first of.
-            raise ValueError(f"{len(found)} 'sec =' fields in {text!r}")
-        # Compared as a float before truncating: `int()` of -0.5 is 0, so
-        # truncating first turns a boot time half a second in the future into
-        # a plausible zero-second uptime.
-        elapsed = now() - int(found[0])
+            raise ValueError(f"not a '{{ sec = <n>, usec = <n> }}' record: {text[:80]!r}")
+        if text.count("{") > 1:
+            # Two records is not a reading to take the first of, whatever the
+            # second one says -- including when the second is malformed and a
+            # search would simply not have seen it.
+            raise ValueError(f"{text.count('{')} boot-time records in {text[:80]!r}")
+        # usec included and compared as a float before truncating: `int()` of
+        # -0.5 is 0, so truncating first turns a boot time a fraction of a
+        # second in the future into a plausible zero-second uptime.
+        boot = int(found.group(1)) + int(found.group(2)) / 1_000_000
+        elapsed = now() - boot
         if elapsed < 0:
             raise ValueError("boot time is in the future")
         return int(elapsed)
@@ -332,7 +359,9 @@ def read_server_health(
     under ``proc`` on Linux, ``sysctl`` and ``vm_stat`` on macOS -- and is a
     parameter so that both paths are tested from fixture text on either
     kind of host. A platform with neither source is not an error: its
-    numbers are ``null`` and ``unavailable`` says what was looked for.
+    numbers are ``null`` and ``unavailable`` says that no reader exists for
+    it -- which is what happened, since nothing was probed on a platform
+    this does not know how to read.
 
     Never raises for anything a reading does: each reading is guarded on
     its own, so one that fails is ``null`` with a line in ``unavailable``
