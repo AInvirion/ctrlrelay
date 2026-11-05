@@ -681,6 +681,7 @@ and ask the operator), or `never` (skip).
 | `codeql_dismiss` | `ask` | CodeQL alert dismissal. |
 | `secret_alerts` | `never` | Secret-scan alerts. |
 | `deploy_after_merge` | `auto` | Whether to deploy after a merged PR. |
+| `operator_prs` | `ask` | `ask` or `ignore`. What the secops sweep does with your own open PRs that touch more than `.github/dependabot.yml`. See [operator_prs](#reposautomationoperator_prs) below. |
 | `accept_foreign_assignments` | `false` | When `true`, the poller also picks up issues assigned to you by someone else. Default (`false`) runs the dev pipeline only on issues you self-assigned. |
 | `exclude_labels` | `["manual", "operator", "instruction"]` | Issue labels that tell the poller "this isn't for the agent". See [exclude_labels](#reposautomationexclude_labels) below. |
 | `include_labels` | `[]` | Issue labels that opt an issue **into** the dev pipeline regardless of who is (or isn't) assigned. See [include_labels](#reposautomationinclude_labels) below. |
@@ -689,6 +690,31 @@ and ask the operator), or `never` (skip).
 
 The current secops and dev pipelines read these settings to bias their prompts
 to the agent — they're not enforced by hard-coded checks.
+
+### repos[].automation.operator_prs
+
+The secops sweep looks at the open PRs you authored on each repo. One that
+touches only `.github/dependabot.yml` is a "turn on Dependabot" change: it is
+merged if it passes an author check, a diff check (additions only) and a CI
+check, and is a question if it fails any of them.
+Any other PR of yours is a question by default (`ask`), and while the PR
+stays open that question can be asked again on later sweeps.
+
+On a repo where you keep your own PRs open for a while (blog posts, drafts),
+set `ignore`:
+
+```yaml
+repos:
+  - name: you/your-blog
+    automation:
+      operator_prs: ignore
+```
+
+With `ignore`, those PRs are left alone: no question, and they are not named
+in the sweep's summary. A PR that touches only `.github/dependabot.yml` is
+still handled as above, and Dependabot PRs and alerts are handled as before.
+Unset is `ask`, and the sweep then runs exactly as it did before the setting
+existed.
 
 ### repos[].automation.exclude_labels
 

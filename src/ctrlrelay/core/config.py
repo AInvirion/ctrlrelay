@@ -40,6 +40,19 @@ class AutomationPolicy(str, Enum):
     NEVER = "never"
 
 
+class OperatorPrsPolicy(str, Enum):
+    """What the secops sweep does with the operator's own open PRs (#335).
+
+    ``ask`` (the default) asks about every one that touches more than
+    ``.github/dependabot.yml``. ``ignore`` leaves those alone: no
+    question, not named in the summary. A PR that touches only
+    ``.github/dependabot.yml`` is handled the same under both.
+    """
+
+    ASK = "ask"
+    IGNORE = "ignore"
+
+
 class PathsConfig(BaseModel):
     """File system paths configuration."""
 
@@ -445,6 +458,9 @@ class AutomationConfig(BaseModel):
     codeql_dismiss: AutomationPolicy = AutomationPolicy.ASK
     secret_alerts: AutomationPolicy = AutomationPolicy.NEVER
     deploy_after_merge: AutomationPolicy = AutomationPolicy.AUTO
+    # The operator's own open PRs in the secops sweep (#335). See
+    # ``OperatorPrsPolicy``.
+    operator_prs: OperatorPrsPolicy = OperatorPrsPolicy.ASK
     accept_foreign_assignments: bool = False
     exclude_labels: list[str] = Field(
         default_factory=lambda: ["manual", "operator", "instruction"]

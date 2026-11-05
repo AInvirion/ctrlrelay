@@ -323,6 +323,43 @@ class SecopsPipeline:
                 "for manual review."
             )
 
+        # The operator's own PRs beyond dependabot.yml (#335). ``ask``
+        # (the default) renders the prompt exactly as before the setting
+        # existed; ``ignore`` takes them out of scope.
+        operator_prs = getattr(automation, "operator_prs", None)
+        ignore_operator_prs = getattr(operator_prs, "value", operator_prs) == "ignore"
+        if ignore_operator_prs:
+            other_operator_pr_rule = (
+                "   - **Any other PR from `$OPERATOR`** (touches anything other\n"
+                "     than `.github/dependabot.yml`): out of scope on this repo;\n"
+                "     the operator handles these. Do not evaluate them, do not\n"
+                "     name them in the summary, do not signal BLOCKED on them."
+            )
+            operator_drop_step = (
+                "\n   On this repo, drop every step-4 result whose files include\n"
+                "   anything other than `.github/dependabot.yml`, before doing\n"
+                "   anything else. A dropped PR is not an open PR for this run:\n"
+                "   where a rule below speaks of \"each open PR\", a BLOCKED\n"
+                "   question, the step-6 summary or \"what you left alone\", a\n"
+                "   dropped PR is never one of them. Alerts, Dependabot PRs and\n"
+                "   the remaining operator PRs are handled exactly as below. Do\n"
+                "   not evaluate, ask about, count or name a dropped PR anywhere."
+            )
+            operator_scope_note = (
+                "\n\nOn this repo the step-4 results are in scope only after the\n"
+                "drop in step 4: an operator PR that touches anything other than\n"
+                "`.github/dependabot.yml` is outside this fence, and is not an\n"
+                "author-filtered result for step 6 or for this paragraph."
+            )
+        else:
+            operator_drop_step = ""
+            other_operator_pr_rule = (
+                "   - **Any other PR from `$OPERATOR`** (touches code, tests, configs\n"
+                "     other than dependabot.yml): signal BLOCKED for operator approval.\n"
+                "     Never auto-merge code changes, even from the trusted operator."
+            )
+            operator_scope_note = ""
+
         dependabot_policy_block = "\n".join(
             [
                 _policy_directive("patch updates", patch_pol),
@@ -404,7 +441,7 @@ class SecopsPipeline:
    Dependabot itself. These are prerequisites for future Dependabot
    work and block the security pipeline if left open:
    `gh pr list --repo {repo} --state open --author "$OPERATOR" --json number,title,files`
-   For each, inspect files: `gh pr view <NUM> --repo {repo} --json files`
+   For each, inspect files: `gh pr view <NUM> --repo {repo} --json files`{operator_drop_step}
 5. For each alert or PR:
    - **Dependabot PRs**: classify the update as patch/minor/major and
      apply the per-repo policy below. If the severity is unclear, signal
@@ -484,9 +521,7 @@ BLOCKED at all: finish DONE and say what you left alone.
 
      If (a), (b), AND (c) all pass: merge with squash, delete the
      branch. If any one fails: BLOCKED.
-   - **Any other PR from `$OPERATOR`** (touches code, tests, configs
-     other than dependabot.yml): signal BLOCKED for operator approval.
-     Never auto-merge code changes, even from the trusted operator.
+{other_operator_pr_rule}
    - **PRs from anyone else** (collaborators, contributors, other bots):
      out of scope — see the PR scope fence below. Do not fetch them, do
      not evaluate them, do not name them, do not signal BLOCKED on them.
@@ -499,7 +534,7 @@ BLOCKED at all: finish DONE and say what you left alone.
 The ONLY open PRs in scope are the ones returned by the two author-
 filtered queries above: `--author "app/dependabot"` (step 2) and
 `--author "$OPERATOR"` (step 4). That is the complete universe of PRs
-this pipeline may look at.
+this pipeline may look at.{operator_scope_note}
 
 Never run an unfiltered `gh pr list` (or any other broad PR/issue
 search) to discover PRs beyond those two queries. A third party's open
