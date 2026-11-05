@@ -20,11 +20,26 @@ Handlers never call GitHub. The waiting line is refreshed by
 a handler reads only the tracker's last snapshot and titles. A handler
 that raises answers ``500 {"error": "internal error"}``; the traceback goes
 to the log, never to the client.
+
+Two listeners, one page (#322). When ``web.host`` is one LAN address, a
+second listener on ``127.0.0.1`` serves the same page, so a browser or a
+health check on the machine itself is not refused. The bind is not widened
+to every interface: what the LAN sees stays exactly ``web.host``.
+
+A vanished address is an exit, not a silence. :class:`AddressWatch` asks
+every ``_ADDRESS_CHECK_SECONDS`` whether ``web.host`` is still one of this
+machine's addresses. When it is not (a new DHCP lease, another network),
+the listeners stop, ``web.address_gone`` is logged and ``web start`` exits
+1, so the service manager restarts it: on the old address that start fails
+with "Cannot listen", on stderr, every few seconds until somebody fixes
+``web.host``; if the address comes back, the page does too.
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
+import ipaddress
 import json
 import socket
 import threading
@@ -56,6 +71,10 @@ CSP = (
 )
 _REFRESH_PLACEHOLDER = "__REFRESH_SECONDS__"
 _ALL_INTERFACES = {"", "0.0.0.0", "::", "[::]"}
+_LOOPBACK = "127.0.0.1"
+# How often the bound address is checked. A lease that moves while the
+# laptop sleeps is noticed within this long of waking.
+_ADDRESS_CHECK_SECONDS = 30.0
 # Distinct refused Host values remembered for "log once"; past this many
 # the log stays quiet rather than the set growing without bound.
 _MISDIRECTED_LOG_LIMIT = 256
@@ -80,6 +99,160 @@ def bind_warning(host: str) -> str | None:
             "the internet."
         )
     return None
+
+
+def _covers_loopback(host: str) -> bool:
+    """True when binding ``host`` already answers on 127.0.0.1 or ::1:
+    every interface, a loopback address, or ``localhost``."""
+    h = host.strip().strip("[]")
+    if host.strip() in _ALL_INTERFACES or h.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def address_state(host: str) -> tuple[str, str]:
+    """Whether ``host`` is still an address of this machine.
+
+    ``("present", "")``, ``("gone", why)`` or ``("unknown", why)``. Asked by
+    binding a fresh socket to ``(host, 0)``: the kernel refuses an address
+    the machine does not have with ``EADDRNOTAVAIL``, on Linux and macOS
+    alike, and that refusal is the only answer read as gone. A name that
+    does not resolve, or any other error, is unknown, never gone and never
+    present."""
+    h = host.strip()
+    if h in _ALL_INTERFACES:
+        return "present", ""
+    h = h.strip("[]")
+    try:
+        infos = socket.getaddrinfo(h, 0, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return "unknown", f"{type(exc).__name__}: {exc}"[:300]
+    family, _t, _p, _c, sockaddr = infos[0]
+    s = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        s.bind((sockaddr[0], 0))
+    except OSError as exc:
+        why = f"{type(exc).__name__}: {exc}"[:300]
+        return ("gone" if exc.errno == errno.EADDRNOTAVAIL else "unknown"), why
+    finally:
+        s.close()
+    return "present", ""
+
+
+class AddressWatch:
+    """Calls ``on_gone`` once, from its own daemon thread, when ``probe``
+    says ``host`` is no longer this machine's. An unknown answer is logged
+    once per distinct reason and the watch keeps asking."""
+
+    thread_name = "ctrlrelay-web-address"
+
+    def __init__(
+        self,
+        host: str,
+        *,
+        on_gone: Callable[[], None],
+        interval_s: float = _ADDRESS_CHECK_SECONDS,
+        probe: Callable[[str], tuple[str, str]] = address_state,
+    ) -> None:
+        self.host = host
+        self.gone = False
+        self.on_gone = on_gone
+        self._interval = interval_s
+        self._probe = probe
+        self._unchecked: set[str] = set()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=self.thread_name, daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                state, why = self._probe(self.host)
+            except Exception as exc:
+                state, why = "unknown", f"{type(exc).__name__}: {exc}"[:300]
+            if state == "gone":
+                self.gone = True
+                _logger.error(
+                    "web.address_gone",
+                    extra={"host": self.host, "error": why,
+                           "action": "stopping so the service manager restarts "
+                                     "it; if web.host is no longer this "
+                                     "machine's address, set it to the new one"},
+                )
+                self.on_gone()
+                return
+            if state == "unknown" and why not in self._unchecked:
+                self._unchecked.add(why)
+                _logger.warning("web.address_unchecked",
+                                extra={"host": self.host, "error": why})
+
+
+class Listeners:
+    """The page's listeners served together: ``primary`` in the caller's
+    thread, the loopback ``twin`` (if any) in a daemon thread, and the
+    address ``watch`` (if any) stopping both when the address goes."""
+
+    def __init__(
+        self,
+        primary: ThreadingHTTPServer,
+        twin: ThreadingHTTPServer | None,
+        *,
+        watch: AddressWatch | None,
+    ) -> None:
+        self.primary = primary
+        self.twin = twin
+        self.watch = watch
+        self._twin_thread: threading.Thread | None = None
+        if watch is not None:
+            outer = watch.on_gone
+
+            def _gone() -> None:
+                outer()
+                self.shutdown()
+
+            watch.on_gone = _gone
+
+    def serve_forever(self, poll_interval: float = 0.5) -> bool:
+        """Serve until stopped. True when stopped because the address went."""
+        if self.twin is not None:
+            self._twin_thread = threading.Thread(
+                target=self.twin.serve_forever, kwargs={"poll_interval": poll_interval},
+                name="ctrlrelay-web-loopback", daemon=True,
+            )
+            self._twin_thread.start()
+        if self.watch is not None:
+            self.watch.start()
+        try:
+            self.primary.serve_forever(poll_interval=poll_interval)
+        finally:
+            if self.watch is not None:
+                self.watch.stop()
+        return self.watch is not None and self.watch.gone
+
+    def shutdown(self) -> None:
+        """Stop serving; safe from any thread but the primary's own."""
+        if self.twin is not None and self._twin_thread is not None:
+            self.twin.shutdown()
+        self.primary.shutdown()
+
+    def close(self) -> None:
+        if self._twin_thread is not None:
+            self._twin_thread.join(5)
+        for srv in (self.primary, self.twin):
+            if srv is not None:
+                srv.server_close()
 
 
 def _norm_name(name: str) -> str:
@@ -253,6 +426,7 @@ class StatusServer(ThreadingHTTPServer):
         *,
         home: Path | None = None,
         peers: PeerReader | None = None,
+        bind_host: str | None = None,
     ) -> None:
         self.config = config
         self.waiting = waiting
@@ -263,7 +437,7 @@ class StatusServer(ThreadingHTTPServer):
         self.host_names = allowed_host_names(config.web)
         self._misdirected: set[str] = set()
         self._misdirected_lock = threading.Lock()
-        host = config.web.host
+        host = config.web.host if bind_host is None else bind_host
         if ":" in host:
             self.address_family = socket.AF_INET6
         super().__init__((host, config.web.port), _Handler)
@@ -371,6 +545,33 @@ def make_server(
     warning = bind_warning(config.web.host)
     if warning:
         _logger.warning(warning)
+    return srv
+
+
+def make_loopback_twin(
+    config: Config,
+    *,
+    waiting: _Tracker,
+    home: Path | None = None,
+    peers: PeerReader | None = None,
+) -> StatusServer | None:
+    """A second server on ``127.0.0.1:port`` when ``web.host`` does not
+    already answer there, else ``None``. Same page, same Host check. A port
+    that cannot be bound on loopback is logged and the LAN page still
+    starts: losing the local view is better than losing both."""
+    if _covers_loopback(config.web.host):
+        return None
+    address = f"http://{_LOOPBACK}:{config.web.port}/"
+    try:
+        srv = StatusServer(config, waiting, home=home, peers=peers, bind_host=_LOOPBACK)
+    except OSError as exc:
+        _logger.warning(
+            "web.loopback_unavailable",
+            extra={"address": address, "error": f"{type(exc).__name__}: {exc}"[:300],
+                   "action": "free that port on 127.0.0.1, or browse to web.host"},
+        )
+        return None
+    log_event(_logger, "web.started", address=address, version=__version__)
     return srv
 
 

@@ -534,7 +534,7 @@ web:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `host` | string | `"127.0.0.1"` | Address to listen on, exactly. Loopback by default so a fresh install is never reachable from other machines. Set it to this machine's LAN address to open the page from the home network. `0.0.0.0` listens on every interface and is warned about at startup. |
+| `host` | string | `"127.0.0.1"` | Address to listen on, exactly. Loopback by default so a fresh install is never reachable from other machines. Set it to this machine's LAN address to open the page from the home network. `0.0.0.0` listens on every interface and is warned about at startup. A LAN address also gets a second listener on `127.0.0.1`, and the server exits (for the service manager to restart it) if that address stops being this machine's. |
 | `port` | int (1-65535) | `8787` | Port to listen on. |
 | `history_days` | int (>= 1) | `7` | Days of feed the page shows, and what `/api/events` returns without `?since=`. Events older than this are deleted, so the run numbers' time to PR and time to merge are shown only for a window whose runs all started after the oldest event kept. Set it to `30` to get the 30-day ones; they appear once 30 days of events have been kept. |
 | `refresh_seconds` | int (>= 1) | `5` | How often the page asks `/api/status` again. |

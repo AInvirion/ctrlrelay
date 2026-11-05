@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The status page bound to a LAN address now also answers on
+  `127.0.0.1`, and it no longer keeps running, silently, on an address the
+  machine has lost. It checks every 30 seconds; when `web.host` is gone it
+  logs `web.address_gone`, says so in `web.error.log` and exits 1 so the
+  service manager restarts it (#322).
+
 ## [0.20.2] - 2026-11-04
 
 ### Fixed

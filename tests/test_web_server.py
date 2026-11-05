@@ -31,8 +31,12 @@ from ctrlrelay.core.state import StateDB
 from ctrlrelay.web import server as server_module
 from ctrlrelay.web.server import (
     CSP,
+    AddressWatch,
+    Listeners,
     WaitingRefresher,
+    address_state,
     bind_warning,
+    make_loopback_twin,
     make_server,
 )
 from ctrlrelay.web.status import FEED_LIMIT, make_sessions_reader
@@ -550,6 +554,193 @@ def test_all_interfaces_is_warned(host: str) -> None:
 @pytest.mark.parametrize("host", ["127.0.0.1", "192.168.1.20", "localhost"])
 def test_specific_host_is_not_warned(host: str) -> None:
     assert bind_warning(host) is None
+
+
+# --- a loopback listener beside a LAN bind, and a vanished address (#322) ------
+
+
+def _lan_address() -> str | None:
+    """This machine's address on its default route, or None with no route.
+    A UDP connect sends nothing; it only picks the source address."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))
+        addr = s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+    return None if addr.startswith("127.") else addr
+
+
+def _get(host: str, port: int, header_host: str) -> int:
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        conn.request("GET", "/api/status", headers={"Host": header_host})
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status
+    finally:
+        conn.close()
+
+
+def test_a_lan_bind_is_also_reachable_on_loopback(tmp_path: Path, caplog) -> None:
+    """The page answers on 127.0.0.1 as well as on web.host, through the
+    same Host check, and both listeners stop together."""
+    lan = _lan_address()
+    if lan is None:
+        pytest.skip("no non-loopback address on this machine")
+    StateDB(tmp_path / "state.db").close()
+    config = _config(tmp_path, host=lan)
+    tracker = _tracker(config, tmp_path)
+    with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+        primary = make_server(config, waiting=tracker)
+        twin = make_loopback_twin(config, waiting=tracker)
+    assert twin is not None
+    assert twin.server_address[:2] == ("127.0.0.1", config.web.port)
+    listeners = Listeners(primary, twin, watch=None)
+    t = threading.Thread(target=listeners.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True)
+    t.start()
+    try:
+        port = config.web.port
+        assert _get(lan, port, f"{lan}:{port}") == 200
+        assert _get("127.0.0.1", port, f"localhost:{port}") == 200
+        # The loopback listener is not a way round the Host check.
+        assert _get("127.0.0.1", port, "evil.example") == 421
+    finally:
+        listeners.shutdown()
+        t.join(timeout=5)
+        listeners.close()
+    assert not t.is_alive()
+    started = sorted(r.address for r in caplog.records if r.getMessage() == "web.started")
+    assert started == sorted([f"http://{lan}:{config.web.port}/",
+                              f"http://127.0.0.1:{config.web.port}/"])
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.2", "localhost", "::1",
+                                  "0.0.0.0", "::", ""])
+def test_no_loopback_twin_when_the_host_already_covers_loopback(
+    tmp_path: Path, host: str,
+) -> None:
+    config = _config(tmp_path, host=host)
+    assert make_loopback_twin(config, waiting=_tracker(config, tmp_path)) is None
+
+
+def test_a_taken_loopback_port_is_logged_and_the_lan_page_still_starts(
+    tmp_path: Path, caplog,
+) -> None:
+    lan = _lan_address()
+    if lan is None:
+        pytest.skip("no non-loopback address on this machine")
+    config = _config(tmp_path, host=lan)
+    squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    squatter.bind(("127.0.0.1", config.web.port))
+    squatter.listen()
+    try:
+        with caplog.at_level(logging.WARNING, logger="ctrlrelay"):
+            twin = make_loopback_twin(config, waiting=_tracker(config, tmp_path))
+    finally:
+        squatter.close()
+    assert twin is None
+    warned = [r for r in caplog.records if r.getMessage() == "web.loopback_unavailable"]
+    assert len(warned) == 1
+    assert f"127.0.0.1:{config.web.port}" in warned[0].address
+
+
+def test_address_state_of_an_address_this_machine_has() -> None:
+    assert address_state("127.0.0.1")[0] == "present"
+
+
+def test_address_state_of_an_address_this_machine_does_not_have() -> None:
+    # TEST-NET-1 (RFC 5737) is never assigned to a host.
+    state, detail = address_state("192.0.2.123")
+    assert state == "gone", detail
+
+
+def test_address_state_of_a_name_that_does_not_resolve_is_unknown_not_gone() -> None:
+    state, _detail = address_state("no-such-host.invalid")
+    assert state == "unknown"
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", ""])
+def test_address_state_of_every_interface_is_present(host: str) -> None:
+    assert address_state(host)[0] == "present"
+
+
+def test_watch_stops_the_servers_and_logs_when_the_address_goes(caplog) -> None:
+    answers = iter([("present", ""), ("present", ""), ("gone", "errno 99")])
+    fired = threading.Event()
+    watch = AddressWatch("192.168.68.80", on_gone=fired.set, interval_s=0.01,
+                         probe=lambda _h: next(answers))
+    with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+        watch.start()
+        assert fired.wait(5)
+        watch.stop()
+    assert watch.gone
+    errors = [r for r in caplog.records if r.getMessage() == "web.address_gone"]
+    assert len(errors) == 1 and errors[0].levelno == logging.ERROR
+    assert errors[0].host == "192.168.68.80"
+
+
+def test_watch_does_not_stop_on_a_check_it_could_not_make(caplog) -> None:
+    """An unknown answer is logged once and is not read as the address
+    being gone, nor as it being fine: the watch keeps asking."""
+    calls = []
+
+    def probe(_h: str) -> tuple[str, str]:
+        calls.append(1)
+        return ("unknown", "gaierror: name not known")
+
+    fired = threading.Event()
+    watch = AddressWatch("lan.example", on_gone=fired.set, interval_s=0.01, probe=probe)
+    with caplog.at_level(logging.INFO, logger="ctrlrelay"):
+        watch.start()
+        deadline = time.monotonic() + 5
+        while len(calls) < 5 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        watch.stop()
+    assert len(calls) >= 5
+    assert not fired.is_set() and not watch.gone
+    unchecked = [r for r in caplog.records if r.getMessage() == "web.address_unchecked"]
+    assert len(unchecked) == 1 and unchecked[0].levelno == logging.WARNING
+
+
+def test_listeners_report_a_vanished_address(tmp_path: Path) -> None:
+    """End to end: serving, the watch finds the address gone, and
+    serve_forever returns True so the caller can exit non-zero."""
+    StateDB(tmp_path / "state.db").close()
+    config = _config(tmp_path)
+    primary = make_server(config, waiting=_tracker(config, tmp_path))
+    answers = iter([("present", "")] * 3 + [("gone", "errno 99")] * 100)
+    watch = AddressWatch(config.web.host, on_gone=lambda: None, interval_s=0.02,
+                         probe=lambda _h: next(answers))
+    listeners = Listeners(primary, None, watch=watch)
+    out: list[bool] = []
+    t = threading.Thread(target=lambda: out.append(
+        listeners.serve_forever(poll_interval=0.05)), daemon=True)
+    t.start()
+    t.join(timeout=10)
+    listeners.close()
+    assert out == [True]
+
+
+def test_listeners_stopped_from_outside_are_not_a_vanished_address(tmp_path: Path) -> None:
+    StateDB(tmp_path / "state.db").close()
+    config = _config(tmp_path)
+    primary = make_server(config, waiting=_tracker(config, tmp_path))
+    watch = AddressWatch(config.web.host, on_gone=lambda: None, interval_s=0.02,
+                         probe=lambda _h: ("present", ""))
+    listeners = Listeners(primary, None, watch=watch)
+    out: list[bool] = []
+    t = threading.Thread(target=lambda: out.append(
+        listeners.serve_forever(poll_interval=0.05)), daemon=True)
+    t.start()
+    time.sleep(0.2)
+    listeners.shutdown()
+    t.join(timeout=10)
+    listeners.close()
+    assert out == [False]
 
 
 # --- the waiting line refresh ------------------------------------------------------
