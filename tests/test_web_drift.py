@@ -244,12 +244,13 @@ def test_an_old_peer_without_a_fingerprint_is_unknown(tmp_path: Path) -> None:
 # --- the pieces -----------------------------------------------------------------
 
 
-def test_the_hash_does_not_depend_on_key_order(tmp_path: Path) -> None:
-    a = _config(tmp_path, "a", [_repo(ALPHA, exclude=["x"])])
-    b = Config.model_validate(
-        json.loads(json.dumps(a.model_dump(mode="json"), sort_keys=True))
+def test_the_hash_does_not_depend_on_key_order() -> None:
+    from ctrlrelay.web.drift import _hash
+
+    assert _hash({"a": 1, "b": {"c": [1, 2], "d": None}}) == _hash(
+        {"b": {"d": None, "c": [1, 2]}, "a": 1}
     )
-    assert config_fingerprint(a) == config_fingerprint(b)
+    assert _hash({"a": 1}) != _hash({"a": 2})
 
 
 def test_a_peer_not_read_or_not_reachable_is_unknown(tmp_path: Path) -> None:
