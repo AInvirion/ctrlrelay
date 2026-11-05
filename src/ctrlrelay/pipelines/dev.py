@@ -2172,36 +2172,43 @@ def _take_answer(run: _DevRun, answer: str) -> bool:
     resumes the session with it, and mark the session running again.
 
     Returns ``False`` only when the saved question was answered first
-    another way (a reply the bridge routed to it; see
-    ``StateDB.take_parked_answer``): that answer stands and the sweeper
-    resumes with it, so this one must not. A row that is missing or
-    expired is no other answer, so the run resumes with this one. If the
-    row cannot be closed, it is expired instead, so no later reply can
-    resume the session a second time; if even that fails, the run
-    resumes, as it did before the row existed."""
+    another way (a reply the bridge routed to it): that answer stands and
+    the sweeper resumes with it, so this one must not. A row that is
+    missing or expired is no other answer, so the run resumes with this
+    one. If the row cannot be closed, it is expired instead, so no later
+    reply can resume the session a second time; and if it turns out to be
+    answered already, that answer stands as above. When the database
+    cannot be read at all, the run resumes, as it did before the row
+    existed."""
+    sid = run.session_id
     try:
-        if run.state_db.take_parked_answer(run.session_id, answer):
+        if run.state_db.take_parked_answer(sid, answer):
             return True
-        row = run.state_db.get_pending_resume(run.session_id)
-        return not (
-            row is not None
-            and row.get("answered_at") is not None
-            and row.get("resumed_at") is None
-            and row.get("expired_at") is None
-        )
     except Exception as e:
         log_event(
-            _logger, "dev.question.unpark_failed", session_id=run.session_id,
+            _logger, "dev.question.unpark_failed", session_id=sid,
             repo=run.repo, issue_number=run.issue_number,
             error_type=type(e).__name__, error=str(e)[:200],
         )
         try:
             run.state_db.expire_pending_resume(
-                run.session_id, "answered while the run waited",
+                sid, "answered while the run waited",
             )
         except Exception:
             pass
-        return True
+    try:
+        row = run.state_db.get_pending_resume(sid)
+        if (
+            row is not None
+            and row.get("answered_at") is not None
+            and row.get("resumed_at") is None
+            and row.get("expired_at") is None
+        ):
+            return False
+        run.state_db.mark_session_running(sid)
+    except Exception:
+        pass
+    return True
 
 
 async def _answer_while_blocked(

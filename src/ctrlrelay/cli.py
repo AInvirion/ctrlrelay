@@ -3802,6 +3802,7 @@ def poller_start(
                                 try:
                                     state_db.mark_pending_resume_resumed(
                                         session_id, answered_at=row["answered_at"],
+                                        answer=row["answer"],
                                     )
                                 except Exception:
                                     pass
@@ -3845,6 +3846,7 @@ def poller_start(
                             try:
                                 state_db.mark_pending_resume_resumed(
                                     session_id, answered_at=row["answered_at"],
+                                    answer=row["answer"],
                                 )
                             except Exception:
                                 pass
@@ -3864,6 +3866,7 @@ def poller_start(
                         try:
                             state_db.mark_pending_resume_resumed(
                                 session_id, answered_at=row["answered_at"],
+                                answer=row["answer"],
                             )
                         except Exception:
                             pass
@@ -3930,6 +3933,7 @@ def poller_start(
                     try:
                         state_db.mark_pending_resume_resumed(
                             session_id, answered_at=row["answered_at"],
+                            answer=row["answer"],
                         )
                     except Exception:
                         pass

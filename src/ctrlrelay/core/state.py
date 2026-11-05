@@ -1034,27 +1034,35 @@ class StateDB:
         coroutine, and a restart lost it with the session row left
         ``running``.
         """
-        self._conn.execute(
-            "UPDATE sessions SET status = 'blocked' "
-            "WHERE id = ? AND status = 'running'",
-            (session_id,),
-        )
-        # Commits both statements.
-        self.add_pending_resume(
-            session_id=session_id, pipeline=pipeline, repo=repo,
-            question=question,
-        )
+        try:
+            self._conn.execute(
+                "UPDATE sessions SET status = 'blocked' "
+                "WHERE id = ? AND status = 'running'",
+                (session_id,),
+            )
+            # Commits both statements.
+            self.add_pending_resume(
+                session_id=session_id, pipeline=pipeline, repo=repo,
+                question=question,
+            )
+        except BaseException:
+            # Never leave the half-done write open through the wait: it
+            # would hold the database's write lock against the bridge, and
+            # a later commit would keep only half of it.
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
 
     def take_parked_answer(self, session_id: str, answer: str) -> bool:
         """The in-process wait got its answer (#324): mark the parked row
         answered AND resumed, so neither the bridge nor the sweeper acts on
         it again, and put the session back to ``running``. One commit.
 
-        Only an unanswered, open row is taken. Returns ``False`` when the
-        row was already answered some other way (a reply the bridge routed
-        to the saved question), expired, or is missing; then nothing is
-        changed and the caller must not resume with its own answer: the
-        first answer stands, and the sweeper resumes with it."""
+        Only an unanswered, open row is taken. Returns ``False`` when no
+        such row is there, and changes nothing: the row may have been
+        answered some other way first (a reply the bridge routed to the
+        saved question), expired, or be missing. The caller tells these
+        apart; only the first means another answer stands."""
         now = int(time.time())
         ours = not self._conn.in_transaction
         try:
@@ -1077,6 +1085,17 @@ class StateDB:
                 self._conn.rollback()
             raise
         return cursor.rowcount > 0
+
+    def mark_session_running(self, session_id: str) -> None:
+        """Put a ``blocked`` session back to ``running`` (#324): its run
+        resumed in process with an answer the saved question did not
+        record (that row expired or is missing)."""
+        self._conn.execute(
+            "UPDATE sessions SET status = 'running' "
+            "WHERE id = ? AND status = 'blocked'",
+            (session_id,),
+        )
+        self._conn.commit()
 
     def has_open_pending_resume(self, session_id: str, question: str) -> bool:
         """Whether this session already has a row for this same question
@@ -1279,7 +1298,10 @@ class StateDB:
         return [dict(row) for row in rows]
 
     def mark_pending_resume_resumed(
-        self, session_id: str, answered_at: int | None = None,
+        self,
+        session_id: str,
+        answered_at: int | None = None,
+        answer: str | None = None,
     ) -> bool:
         """Mark a pending resume as executed so the sweeper doesn't pick
         it up again.
@@ -1295,11 +1317,12 @@ class StateDB:
         wedging the session. The guard makes this a no-op when the
         row has been refreshed.
 
-        ``answered_at``, when given, is that of the row the caller took
-        (#324). Since the question is saved before the wait, a resume that
-        re-blocks can have its NEW question answered (through the bridge)
-        before this call; matching the answer time keeps this call from
-        marking that new answer resumed, which would hide it for ever.
+        ``answered_at`` and ``answer``, when given, are those of the row
+        the caller took (#324). Since the question is saved before the
+        wait, a resume that re-blocks can have its NEW question answered
+        (through the bridge) before this call; matching the answer and its
+        time keeps this call from marking that new answer resumed, which
+        would hide it for ever.
 
         Returns True iff a row was updated."""
         if answered_at is None:
@@ -1311,8 +1334,9 @@ class StateDB:
         else:
             cursor = self._conn.execute(
                 "UPDATE pending_resumes SET resumed_at = ? "
-                "WHERE session_id = ? AND answered_at = ?",
-                (int(time.time()), session_id, answered_at),
+                "WHERE session_id = ? AND answered_at = ? "
+                "AND answer IS ?",
+                (int(time.time()), session_id, answered_at, answer),
             )
         self._conn.commit()
         return cursor.rowcount > 0

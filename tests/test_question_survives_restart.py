@@ -304,8 +304,8 @@ async def test_a_question_answered_first_through_its_saved_row_is_not_resumed_tw
 ) -> None:
     """The bridge routed one reply to the saved question while the live wait
     was still open, and then the live wait got a different reply. The first
-    answer stands: this run must not resume with the second, and the
-    sweeper resumes once, with the first."""
+    answer stands: this run must not resume with the second, and the resume
+    the sweeper runs for that row resumes once, with the first."""
     state_db = StateDB(tmp_path / "state.db")
     dispatcher = AsyncMock()
     dispatcher.spawn_session.side_effect = (
@@ -346,6 +346,7 @@ async def test_a_question_answered_first_through_its_saved_row_is_not_resumed_tw
     )
     assert state_db.mark_pending_resume_resumed(
         todo["session_id"], answered_at=todo["answered_at"],
+        answer=todo["answer"],
     )
     assert dispatcher.spawn_session.await_count == 2
     assert "pin it" in dispatcher.spawn_session.await_args.kwargs["prompt"]
@@ -368,11 +369,15 @@ def test_marking_a_resume_done_does_not_touch_a_newer_answer(
 
     db.park_blocked_question("s", "dev", REPO, "second?")
     assert db.answer_pending_resume("s", "two")
+    # The worst case: the new answer lands in the same second as the one
+    # the sweeper took. The answer itself still tells them apart.
     db.execute("UPDATE pending_resumes SET answered_at = ? WHERE session_id = 's'",
-               (taken + 30,))
+               (taken,))
     db.commit()
 
-    assert db.mark_pending_resume_resumed("s", answered_at=taken) is False
+    assert db.mark_pending_resume_resumed(
+        "s", answered_at=taken, answer="one",
+    ) is False
     (todo,) = db.list_pending_resumes_to_execute()
     assert todo["answer"] == "two"
     db.close()
@@ -387,7 +392,8 @@ def test_the_sweeper_marks_only_the_answer_it_took() -> None:
     src = Path(cli.__file__).read_text()
     calls = re.findall(r"mark_pending_resume_resumed\(([^)]*)\)", src)
     assert len(calls) == 4
-    assert all('answered_at=row["answered_at"]' in c for c in calls), calls
+    assert all('answered_at=row["answered_at"]' in c
+               and 'answer=row["answer"]' in c for c in calls), calls
 
 
 @pytest.mark.asyncio
@@ -470,12 +476,19 @@ async def test_an_answer_to_a_question_retired_during_the_wait_still_resumes(
 ) -> None:
     """The saved question was expired while the run waited (nobody answered
     it there), then the live wait got its answer. An expired row is no
-    other answer, so the run resumes with this one."""
+    other answer, so the run resumes with this one, as `running`."""
     state_db = StateDB(tmp_path / "state.db")
     calls: list[dict[str, Any]] = []
+    status_box: list[str] = []
+    status_at_resume: list[str] = []
 
     async def spawn(**kw: Any) -> SessionResult:
         calls.append(kw)
+        if len(calls) == 2:
+            status_at_resume.append(state_db.execute(
+                "SELECT status FROM sessions WHERE id = ?",
+                (status_box[0],),
+            ).fetchone()["status"])
         return _blocked(kw["session_id"]) if len(calls) == 1 \
             else _resumed(kw["session_id"])
 
@@ -485,6 +498,7 @@ async def test_an_answer_to_a_question_retired_during_the_wait_still_resumes(
 
     async def ask(question: str, *, session_id: str, **kw: Any) -> str:
         assert state_db.expire_pending_resume(session_id, "operator")
+        status_box.append(session_id)
         return "pin it"
 
     transport.ask.side_effect = ask
@@ -500,3 +514,68 @@ async def test_an_answer_to_a_question_retired_during_the_wait_still_resumes(
     assert len(calls) == 2
     assert "pin it" in calls[1]["prompt"]
     state_db.close()
+    assert status_at_resume == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_a_close_failure_on_a_row_answered_first_still_resumes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bridge answered the saved question first, and closing it for the
+    live answer then fails. Expiring cannot retire an answered row, so the
+    first answer must still stand: no resume here."""
+    state_db = StateDB(tmp_path / "state.db")
+
+    def broken(*a: Any, **kw: Any) -> bool:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(state_db, "take_parked_answer", broken)
+    dispatcher = AsyncMock()
+    dispatcher.spawn_session.side_effect = (
+        lambda **kw: _blocked(kw["session_id"])
+    )
+    transport = AsyncMock()
+
+    async def ask(question: str, *, session_id: str, **kw: Any) -> str:
+        assert state_db.answer_pending_resume(session_id, "pin it")
+        return "bump it"
+
+    transport.ask.side_effect = ask
+
+    result = await run_dev_issue(
+        claims=None, repo=REPO, issue_number=13,
+        branch_template="fix/issue-{n}", dispatcher=dispatcher,
+        github=_github(), worktree=_worktree(tmp_path / "wt"),
+        dashboard=None, state_db=state_db, transport=transport,
+        contexts_dir=tmp_path / "contexts",
+    )
+
+    assert result.blocked
+    assert dispatcher.spawn_session.await_count == 1
+    (todo,) = state_db.list_pending_resumes_to_execute()
+    assert todo["answer"] == "pin it"
+    state_db.close()
+
+
+def test_a_failed_park_leaves_no_half_write_open(tmp_path: Path) -> None:
+    """The session update succeeded and the question insert failed: the
+    update is rolled back, not left open through the wait."""
+    db = StateDB(tmp_path / "state.db")
+    db.execute(
+        "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+        "VALUES ('s', 'dev', 'o/r', 'running', 1)"
+    )
+    db.commit()
+
+    def broken(**kw: Any) -> None:
+        raise RuntimeError("disk I/O error")
+
+    db.add_pending_resume = broken  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        db.park_blocked_question("s", "dev", "o/r", "q?")
+
+    assert not db._conn.in_transaction
+    assert db.execute(
+        "SELECT status FROM sessions WHERE id = 's'"
+    ).fetchone()["status"] == "running"
+    db.close()
