@@ -13,7 +13,10 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 
-def fake_relay_publish(github, *, pr_number: int = 42, repo: str = "owner/repo"):
+def fake_relay_publish(
+    github, *, pr_number: int = 42, repo: str = "owner/repo",
+    head_sha: str = "c0ffee",
+):
     github.get_default_branch = AsyncMock(return_value="main")
     # The review base's head, as GitHub names it (#263).
     github.get_ref_sha = AsyncMock(return_value="b" * 40)
@@ -24,4 +27,10 @@ def fake_relay_publish(github, *, pr_number: int = 42, repo: str = "owner/repo")
             "url": f"https://github.com/{repo}/pull/{pr_number}",
         }
     )
+    # The PR's head as GitHub reports it after the review (#222): the
+    # commit the dev tests' fake push returns, so the review is current.
+    github.get_pr_head = AsyncMock(
+        return_value={"sha": head_sha, "draft": False}
+    )
+    github.set_pr_draft = AsyncMock(return_value=None)
     return github

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The code review is tied to the commit it read. Each `review_finished`
+  event records that commit (`head_sha`) and whether the findings reached
+  the PR (`posted`), so the status page feed and `/api/status` show what a
+  verdict is about. After a review the relay reads the PR's head from
+  GitHub; if somebody pushed after the review, the PR gets a comment saying
+  it needs review again, a `review_stale` event is recorded, and the new
+  head is reviewed before the run reports done. With
+  `steps.review: required`, the PR is opened as a draft (a reused PR is put
+  back to draft when the run pushes to it) and marked ready only once the
+  latest review posted on its current head. Draft pull requests need a
+  public repository or a paid GitHub plan.
+
 ## [0.21.0] - 2026-11-05
 
 ### Added

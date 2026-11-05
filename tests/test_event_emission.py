@@ -190,7 +190,13 @@ async def test_dev_run_records_dispatched_pr_ci_review_done(
     }
     assert events[3]["detail"] == {"pr_number": 7, "ok": True}
     assert events[4]["detail"] == {"pr_number": 7}
-    assert events[5]["detail"] == {"pr_number": 7, "ok": True}
+    # The verdict names the commit it is about (#222). ``ok``: the
+    # reviewer read the diff; ``posted``: its findings reached the PR,
+    # which comment_on_pr=False keeps from happening here.
+    assert events[5]["detail"] == {
+        "pr_number": 7, "ok": True, "head_sha": "c0ffee",
+        "status": "not_commented", "posted": False,
+    }
     # The dev pipeline carries an exit code only on a failure.
     assert events[6]["detail"] == {
         "pipeline": "dev", "exit_code": None, "question": None,
@@ -248,7 +254,8 @@ async def test_ci_and_review_that_did_not_pass_finish_with_ok_false(
         "pr_number": 9, "ok": False,
     }
     assert _by_kind(db, "review_finished")[0]["detail"] == {
-        "pr_number": 9, "ok": False,
+        "pr_number": 9, "ok": False, "head_sha": "c0ffee",
+        "status": "failed", "posted": False,
     }
 
 

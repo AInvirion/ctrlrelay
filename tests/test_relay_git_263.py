@@ -414,7 +414,7 @@ async def _dev_run(tmp_path: Path, monkeypatch, *, ref_sha: str):
     dispatcher = AsyncMock()
     dispatcher.spawn_session.side_effect = _done_state(7)
     github = AsyncMock()
-    fake_relay_publish(github, pr_number=7, repo=REPO)
+    fake_relay_publish(github, pr_number=7, repo=REPO, head_sha="c" * 40)
     github.get_ref_sha = AsyncMock(return_value=ref_sha)
     github.get_issue.return_value = {
         "number": 1, "title": "x", "body": "y", "comments": [],

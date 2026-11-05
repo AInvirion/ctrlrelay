@@ -337,7 +337,7 @@ def test_event_kind_values() -> None:
     assert {k.value for k in EventKind} == {
         "dispatched", "done", "blocked", "failed", "pr_opened", "merged",
         "ci_started", "ci_finished", "review_started", "review_finished",
-        "message_sent", "question_posted", "question_held", "alert_sent",
+        "review_stale", "message_sent", "question_posted", "question_held", "alert_sent",
         "restart",
     }
     assert EventKind.DONE == "done"

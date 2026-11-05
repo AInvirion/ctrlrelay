@@ -42,6 +42,9 @@ class EventKind(StrEnum):
     CI_FINISHED = "ci_finished"
     REVIEW_STARTED = "review_started"
     REVIEW_FINISHED = "review_finished"
+    # A review's commit is no longer the PR's head: somebody pushed after
+    # it, and the PR needs review again (#222).
+    REVIEW_STALE = "review_stale"
     MESSAGE_SENT = "message_sent"
     QUESTION_POSTED = "question_posted"
     QUESTION_HELD = "question_held"
