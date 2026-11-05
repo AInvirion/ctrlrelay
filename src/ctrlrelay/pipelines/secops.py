@@ -348,7 +348,8 @@ class SecopsPipeline:
             operator_scope_note = (
                 "\n\nOn this repo the step-4 results are in scope only after the\n"
                 "drop in step 4: an operator PR that touches anything other than\n"
-                "`.github/dependabot.yml` is outside this fence."
+                "`.github/dependabot.yml` is outside this fence, and is not an\n"
+                "author-filtered result for step 6 or for this paragraph."
             )
         else:
             operator_drop_step = ""

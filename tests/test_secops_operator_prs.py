@@ -107,6 +107,7 @@ class TestPrompt:
         # result in scope.
         fence = prompt[prompt.index("**PR scope fence:**"):]
         assert SCOPE_NOTE_START in fence
+        assert "not an\nauthor-filtered result for step 6" in fence
 
     def test_ignore_drops_those_prs_in_step_4_before_any_rule_that_counts_them(
         self,
@@ -153,6 +154,25 @@ class TestPrompt:
         )
         # And the step that lists the operator's PRs is still asked for.
         assert '--author "$OPERATOR" --json number,title,files' in ignore
+
+    def test_ignore_changes_nothing_but_its_three_insertions(self) -> None:
+        """Take the three ``ignore`` pieces back out and the ``ask`` prompt
+        must be what is left, byte for byte. So alerts, Dependabot PRs and
+        every other rule read the same under both."""
+        ignore = _prompt(AutomationConfig(operator_prs="ignore"))
+        ask = _prompt(AutomationConfig())
+
+        drop_start = ignore.index("\n" + DROP_STEP_START)
+        drop_end = ignore.index("\n5. For each alert or PR:")
+        stripped = ignore[:drop_start] + ignore[drop_end:]
+        rule_start = stripped.index(IGNORE_RULE_START)
+        rule_end = stripped.index("   - **PRs from anyone else**", rule_start)
+        stripped = stripped[:rule_start] + ASK_RULE + stripped[rule_end:]
+        note_start = stripped.index("\n\n" + SCOPE_NOTE_START)
+        note_end = stripped.index("\n\nNever run an unfiltered", note_start)
+        stripped = stripped[:note_start] + stripped[note_end:]
+
+        assert stripped == ask
 
     def test_ignore_leaves_the_dependabot_policy_alone(self) -> None:
         ignore = _prompt(AutomationConfig(operator_prs="ignore"))
