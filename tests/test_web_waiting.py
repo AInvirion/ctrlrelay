@@ -19,8 +19,9 @@ import pytest
 
 from ctrlrelay.core.config import Config
 from ctrlrelay.core.github import GitHubCLI, GitHubError
-from ctrlrelay.core.poller import IssuePoller
+from ctrlrelay.core.poller import BLOCKERS_UNREADABLE_AFTER, IssuePoller
 from ctrlrelay.web.waiting import (
+    REASON_BLOCKERS_UNKNOWN,
     REASON_CONFIRM,
     REASON_FOREIGN,
     REASON_NOT_CONFIGURED,
@@ -31,6 +32,7 @@ from ctrlrelay.web.waiting import (
     WaitingTracker,
     classify_issues,
     compute_waiting,
+    load_blocked,
     load_seen,
 )
 
@@ -315,6 +317,61 @@ def test_load_seen_missing_or_corrupt_is_empty(tmp_path: Path) -> None:
     wrong = tmp_path / "wrong.json"
     wrong.write_text(json.dumps({"seen_issues": ["x"]}))
     assert load_seen(wrong) == set()
+
+
+def test_a_blocked_issue_is_skipped_with_its_blockers(tmp_path: Path) -> None:
+    """#310: an issue the poller holds for an open GitHub blocker is not
+    "next poll"; it is skipped, and the reason names the blockers, or says
+    they could not be read."""
+    config = _config(tmp_path, [_accepting(BETA)])
+    blocked = {f"{BETA}#48": ["#5", f"{GAMMA}#9"], f"{BETA}#47": None}
+    waiting, skipped = classify_issues(
+        config, _issues(), seen=set(), running=[], locks={}, blocked=blocked,
+    )
+    assert _keys(waiting) == [(BETA, 46)]
+    assert {(i.issue_number, i.reason) for i in skipped if i.repo == BETA} == {
+        (48, f"blocked by #5, {GAMMA}#9"),
+        (47, REASON_BLOCKERS_UNKNOWN),
+    }
+
+
+def test_a_blocked_label_only_issue_is_listed_too(tmp_path: Path) -> None:
+    """A label alone triggers the poller, so a blocked label-only issue is
+    held by its blocker, and the page says so."""
+    config = _config(tmp_path, [{
+        "name": GAMMA, "automation": {"include_labels": ["auto"]},
+    }])
+    row = {**_issue_list_row(7, ["auto"], assignees=[]),
+           "repo": GAMMA, VIA_LABEL: True}
+    waiting, skipped = classify_issues(
+        config, [row], seen=set(), running=[], locks={},
+        blocked={f"{GAMMA}#7": ["#3"]},
+    )
+    assert waiting == []
+    assert [(i.issue_number, i.reason) for i in skipped] == [(7, "blocked by #3")]
+
+
+def test_load_blocked_reads_the_poller_state_file(tmp_path: Path) -> None:
+    """Written by the real poller, read back in our key format."""
+    state_file = tmp_path / "poller_state.json"
+    poller = IssuePoller(
+        github=GitHubCLI(), username="octo", repos=[BETA], state_file=state_file,
+    )
+    poller.note_blocked(BETA, 48, ["#5"])
+    poller.note_blockers_unreadable(BETA, 47)
+    # Last read blockers are shown through a failed lookup or two, and
+    # "could not read" once the failures persist.
+    poller.note_blocked(BETA, 46, ["#4"])
+    poller.note_blockers_unreadable(BETA, 46)
+    poller.note_blocked(BETA, 45, ["#3"])
+    for _ in range(BLOCKERS_UNREADABLE_AFTER):
+        poller.note_blockers_unreadable(BETA, 45)
+
+    assert load_blocked(state_file) == {
+        f"{BETA}#48": ["#5"], f"{BETA}#47": None,
+        f"{BETA}#46": ["#4"], f"{BETA}#45": None,
+    }
+    assert load_blocked(tmp_path / "nope.json") == {}
 
 
 def test_reasons(tmp_path: Path) -> None:
