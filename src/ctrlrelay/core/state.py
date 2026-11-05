@@ -229,6 +229,13 @@ CREATE TABLE IF NOT EXISTS relay_pushes (
 CREATE INDEX IF NOT EXISTS idx_relay_pushes_branch
     ON relay_pushes(repo, branch, id);
 
+-- When each scheduled chat message was last delivered (#230), so a
+-- restart does not send this week's summary a second time.
+CREATE TABLE IF NOT EXISTS scheduled_sends (
+    name TEXT PRIMARY KEY,
+    sent_at INTEGER NOT NULL
+);
+
 -- Feed for the status page. Written best-effort by the daemon through
 -- ctrlrelay.core.events.emit_event; a failed write never affects the work.
 CREATE TABLE IF NOT EXISTS events (
@@ -242,13 +249,6 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, ts);
-
--- When each scheduled chat message was last delivered (#230), so a
--- restart does not send this week's summary a second time.
-CREATE TABLE IF NOT EXISTS scheduled_sends (
-    name TEXT PRIMARY KEY,
-    sent_at INTEGER NOT NULL
-);
 
 """
 
