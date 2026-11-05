@@ -271,3 +271,7 @@ repos: []
   #   # Fix rounds for a PR whose CI is red or whose branch conflicts,
   #   # before the run fails. Defaults to 3; 0 means none.
   #   max_fix_attempts: 3
+  #   # A dev run's question is asked on its issue as well as in chat.
+  #   # auto: full text on a private repo, a short notice on a public one.
+  #   # full / notice force one or the other.
+  #   question_on_issue: auto

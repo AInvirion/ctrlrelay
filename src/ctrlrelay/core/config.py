@@ -624,6 +624,14 @@ class RepoConfig(BaseModel):
     # default is the pipeline's own (DEFAULT_MAX_FIX_ATTEMPTS in
     # pipelines/dev.py; a test keeps the two equal). 0 means no fix round.
     max_fix_attempts: int = Field(default=3, ge=0)
+    # What a dev run's question looks like on its GitHub issue (#328).
+    # The question is always asked there as well as in chat. ``auto``:
+    # the full text on a private repository and a short "a question is
+    # waiting in chat" notice on a public one (or one whose visibility
+    # could not be read); ``full`` and ``notice`` force one or the other.
+    # A question can name machines, other repositories and plans, which
+    # is why a public repository does not get it by default.
+    question_on_issue: Literal["auto", "full", "notice"] = "auto"
 
     @model_validator(mode="after")
     def _review_settings_agree(self) -> RepoConfig:

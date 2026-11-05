@@ -40,6 +40,11 @@ from ctrlrelay.core.events import (
     emit_outcome,
 )
 from ctrlrelay.core.github import GitHubCLI
+from ctrlrelay.core.issue_questions import (
+    ask_on_issue,
+    check_issue_answer,
+    note_chat_answer_on_issue,
+)
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier, VerificationResult
 from ctrlrelay.core.state import StateDB
@@ -2102,6 +2107,15 @@ class _DevRun:
     plan_text: str | None = None
     plan_path: Path | None = None
 
+    # A question is asked on the issue as well as in chat (#328).
+    # ``question_on_issue`` is the repo's setting; ``keeper`` keeps the
+    # claim, marked held while a question waits; ``answer_poll_seconds``
+    # is how often the wait reads the issue and the saved question for
+    # an answer that did not come through chat.
+    question_on_issue: str | None = "auto"
+    keeper: ClaimKeeper | None = None
+    answer_poll_seconds: float = 60.0
+
 
 def plan_path_for(contexts_dir: Path, repo: str, issue_number: int) -> Path:
     """``<paths.contexts>/<owner>-<repo>/plans/issue-<n>.md`` (#220)."""
@@ -2212,6 +2226,109 @@ def _take_answer(run: _DevRun, answer: str) -> bool:
     return True
 
 
+# How often a waiting run reads the saved question and the issue for an
+# answer that did not come through chat (#328). Read when each run starts.
+ANSWER_POLL_SECONDS = 60.0
+
+
+async def _hold_claim(run: _DevRun) -> None:
+    """Mark the claim held while a question waits (#328): a claim left
+    ``working`` goes stale if the poller stops during the wait, and another
+    node could then take an issue whose question is still answerable."""
+    if run.keeper is None:
+        return
+    try:
+        await run.keeper.hold()
+    except Exception as e:
+        log_event(
+            _logger, "dev.claim.hold_for_question_failed",
+            session_id=run.session_id, repo=run.repo,
+            issue_number=run.issue_number,
+            error_type=type(e).__name__, error=str(e)[:200],
+        )
+
+
+async def _claim_working_again(run: _DevRun) -> None:
+    """The question was answered and this run resumes: the claim goes
+    back to ``working`` and is refreshed again."""
+    if run.keeper is None:
+        return
+    try:
+        await run.keeper.resume_working()
+    except Exception as e:
+        log_event(
+            _logger, "dev.claim.resume_working_failed",
+            session_id=run.session_id, repo=run.repo,
+            issue_number=run.issue_number,
+            error_type=type(e).__name__, error=str(e)[:200],
+        )
+
+
+async def _send_quietly(run: _DevRun, text: str) -> None:
+    if run.transport is None:
+        return
+    try:
+        await run.transport.send(text)
+    except Exception:
+        pass
+
+
+async def _answered_another_way(run: _DevRun) -> bool:
+    """Wait until the saved question is answered other than through this
+    run's chat ask: on the issue (read here, #328), or a reply the bridge
+    routed to the saved row. Returns True then; runs until cancelled
+    otherwise. Every failure is logged inside and the wait goes on."""
+    sid = run.session_id
+    while True:
+        await asyncio.sleep(run.answer_poll_seconds)
+        try:
+            row = run.state_db.get_pending_resume(sid)
+        except Exception:
+            continue
+        if row is None or row.get("expired_at") is not None:
+            continue
+        if row.get("resumed_at") is not None:
+            continue
+        if row.get("answered_at") is not None:
+            return True
+        if row.get("issue_comment_id") is not None and await check_issue_answer(
+            run.github, run.state_db, row,
+            notify=lambda text: _send_quietly(run, text),
+        ):
+            return True
+
+
+async def _wait_for_answer(
+    run: _DevRun, question: str, watch: bool,
+) -> str | None:
+    """The chat answer to ``question``, or None when the saved question
+    was answered another way first (``watch`` only). A failed chat ask
+    raises, as ``Transport.ask`` does."""
+    assert run.transport is not None
+    ask = asyncio.ensure_future(run.transport.ask(
+        question,
+        session_id=run.session_id,
+        repo=run.repo,
+        issue_number=run.issue_number,
+    ))
+    if not watch:
+        return await ask
+    other = asyncio.ensure_future(_answered_another_way(run))
+    try:
+        done, _ = await asyncio.wait(
+            {ask, other}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if ask in done:
+            return ask.result()
+        return None
+    finally:
+        # Cancelled, not awaited: awaiting here could swallow the
+        # cancellation of this run itself.
+        for task in (ask, other):
+            if not task.done():
+                task.cancel()
+
+
 async def _answer_while_blocked(
     run: _DevRun,
     result: PipelineResult,
@@ -2241,15 +2358,21 @@ async def _answer_while_blocked(
             "question. Reply with guidance to resume."
         )
         # Saved first, so a poller that stops during the wait leaves the
-        # question answerable rather than lost (#324).
+        # question answerable rather than lost (#324), and before either
+        # post, so an answer from either channel has a row to land on.
         parked = _park_question(run, question)
-        try:
-            answer = await run.transport.ask(
-                question,
-                session_id=run.session_id,
-                repo=run.repo,
-                issue_number=run.issue_number,
+        on_issue = False
+        if parked:
+            await _hold_claim(run)
+            # Asked on the issue as well as in chat (#328).
+            on_issue = await ask_on_issue(
+                run.github, run.state_db,
+                session_id=run.session_id, repo=run.repo,
+                issue_number=run.issue_number, question=question,
+                mode=run.question_on_issue,
             )
+        try:
+            answer = await _wait_for_answer(run, question, watch=parked)
         except Exception as e:
             # Transport failed (bridge down, timeout, etc.). The
             # session IS still blocked — we just couldn't reach the
@@ -2265,6 +2388,27 @@ async def _answer_while_blocked(
                 session_id=run.session_id,
                 summary=f"{deferred} (transport): {e}",
                 error=str(e),
+                question=question,
+                outputs=result.outputs,
+            )
+        if answer is None:
+            # Answered on the issue, or through the saved question, while
+            # the chat ask waited (#328). That answer stands and the
+            # sweeper resumes with it once this run has let go of the
+            # repo lock; the chat was told when the answer was read.
+            log_event(
+                _logger, "dev.question.answered_elsewhere",
+                session_id=run.session_id, repo=run.repo,
+                issue_number=run.issue_number, while_waiting=True,
+            )
+            return PipelineResult(
+                success=False,
+                blocked=True,
+                session_id=run.session_id,
+                summary=(
+                    f"{deferred}: answered through the saved question; "
+                    "the sweeper resumes it with that answer"
+                ),
                 question=question,
                 outputs=result.outputs,
             )
@@ -2297,6 +2441,19 @@ async def _answer_while_blocked(
                 question=question,
                 outputs=result.outputs,
             )
+        if on_issue:
+            # Answered in chat: say so on the issue, so nobody answers
+            # there too (#328).
+            try:
+                row = run.state_db.get_pending_resume(run.session_id)
+            except Exception:
+                row = None
+            if row is not None:
+                await note_chat_answer_on_issue(
+                    run.github, run.state_db, row, mode=run.question_on_issue,
+                )
+        if parked:
+            await _claim_working_again(run)
         rounds += 1
         result = await resume(run.ctx, answer)
         # A resumed worker is the one whose exit code the failure
@@ -2818,6 +2975,7 @@ async def run_dev_issue(
     *,
     claims: ClaimSettings | None,
     steps: Any = None,
+    question_on_issue: str | None = "auto",
 ) -> PipelineResult:
     """Run dev pipeline for a single issue.
 
@@ -3053,6 +3211,9 @@ async def run_dev_issue(
             review_mode=review_mode,
             plan_mode=plan_mode,
             plan_path=plan_path_for(contexts_dir, repo, issue_number),
+            question_on_issue=question_on_issue,
+            keeper=keeper,
+            answer_poll_seconds=ANSWER_POLL_SECONDS,
         )
         dispatched = True
         # The work: plan, code, publish, verify, review (DEV_WORK_STEPS). Everything
@@ -3455,6 +3616,7 @@ async def resume_dev_from_pending(
     pr_verifier: PRVerifier | None = None,
     code_review: Any = None,
     steps: Any = None,
+    question_on_issue: str | None = "auto",
 ) -> PipelineResult:
     """Resume a BLOCKED dev session using an answer that arrived via
     Telegram after ``run_dev_issue`` exited.
@@ -3633,6 +3795,8 @@ async def resume_dev_from_pending(
             review_mode=review_mode,
             plan_mode=plan_mode,
             plan_path=plan_path,
+            question_on_issue=question_on_issue,
+            answer_poll_seconds=ANSWER_POLL_SECONDS,
         )
         if plan_was_pending:
             await _finish_plan(run, await pipeline.resume_plan(ctx, answer))

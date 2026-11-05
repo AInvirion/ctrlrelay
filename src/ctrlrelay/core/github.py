@@ -714,6 +714,55 @@ class GitHubCLI:
         )
         return [json.loads(line) for line in output.splitlines() if line.strip()]
 
+    async def list_issue_comments_since(
+        self, repo: str, issue_number: int, since: str,
+    ) -> list[dict[str, Any]]:
+        """Comments on an issue updated at or after ``since`` (ISO 8601),
+        oldest first, with each author's ``author_association`` (#328).
+
+        ``since`` filters on the update time, not the creation time, so a
+        caller that wants only new comments still compares
+        ``created_at`` itself."""
+        output = await self._run_gh(
+            "api", "--paginate",
+            f"repos/{repo}/issues/{issue_number}/comments"
+            f"?per_page=100&since={since}",
+            "--jq",
+            ".[] | {id, body, created_at, updated_at, author_association, "
+            "user: {login: .user.login}}",
+        )
+        return [json.loads(line) for line in output.splitlines() if line.strip()]
+
+    async def get_collaborator_permission(self, repo: str, login: str) -> str:
+        """``admin``, ``write``, ``read`` or ``none``: what ``login`` may
+        do in ``repo`` (#328). ``maintain`` reads as ``write`` and
+        ``triage`` as ``read`` in this field."""
+        output = await self._run_gh(
+            "api", f"repos/{repo}/collaborators/{login}/permission",
+            "--jq", ".permission",
+        )
+        permission = output.strip()
+        if not permission:
+            raise GitHubError(f"no permission returned for {login} on {repo}")
+        return permission
+
+    async def repo_is_private(self, repo: str) -> bool:
+        """Whether ``repo`` is private (#328). Strict, like
+        ``repo_is_archived``: anything but a boolean raises."""
+        output = await self._run_gh("repo", "view", repo, "--json", "isPrivate")
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as e:
+            raise GitHubError(
+                f"gh repo view returned non-JSON for {repo}: {e}"
+            ) from e
+        value = data.get("isPrivate") if isinstance(data, dict) else None
+        if not isinstance(value, bool):
+            raise GitHubError(
+                f"gh repo view returned no boolean isPrivate for {repo}"
+            )
+        return value
+
     async def post_issue_comment(
         self, repo: str, issue_number: int, body: str,
     ) -> int:

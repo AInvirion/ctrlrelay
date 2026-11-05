@@ -606,6 +606,21 @@ class ClaimKeeper:
         task.add_done_callback(_forget)
         return False
 
+    async def resume_working(self) -> bool:
+        """Back to ``working`` after a ``hold`` for a question that has
+        now been answered in process (#328): cancel any background hold
+        retry, write ``working`` and start refreshing again. A claim taken
+        over stays the taker's. Returns whether ``working`` was written;
+        refreshing restarts either way, and its next tick writes it."""
+        if self.taken_over_by is not None:
+            return False
+        pending = _BACKGROUND_HOLDS.pop(self.claim_id, None)
+        if pending is not None:
+            pending.cancel()
+        written = await self._write(WORKING)
+        self.start()
+        return written
+
     async def _hold_later(self) -> None:
         deadline = self._confirmed_at + self.settings.stale_after_seconds
         while True:
