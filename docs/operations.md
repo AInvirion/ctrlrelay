@@ -333,6 +333,13 @@ Added in #249:
 | `node.open_questions` | How many questions are waiting for an answer. |
 | `fleet` | `{peers: [...]}` with one item per `fleet.peers` URL: `url`, `name`, `reachable`, `checked_at`, `error`, `state`, `node` (that peer's `node` block), `last_known` (its last block while it does not answer) and `needs_you`. `null` when no peers are configured. |
 
+Added in #307:
+
+| Field | What |
+|---|---|
+| `node.config_fingerprint` | `{v, repos_hash, profiles, repos, schedules}`, `v` is `2`. `profiles` maps a profile hash to `{automation, steps}`, each a map of field name to a hash of its value; `repos` maps each repo name to its profile hash, so repos with the same configuration share one profile; `repos_hash` is the hash of the sorted, lowercased repo names; `schedules` maps each `schedules` field to a hash. Hashes and repo names only, never a value. `null` if it could not be built. A peer's fingerprint is unknown unless every hash is 16 lowercase hex characters, `repos_hash` is the hash of its own repo names, each profile key is the hash of that profile, and each repo names a profile it carries. A field's hash cannot be checked against its value, which is never sent. |
+| `fleet.peers[].drift` | `{status, reason, only_here, only_there, fields, lines}`. `status` is `same`, `differs` or `unknown` (with `reason`: not read yet, not reachable, the peer sends no fingerprint in this format, or the comparison failed); `fields` maps a field path such as `automation.exclude_labels` to the repos it differs on; `lines` is what the page shows. Leaves out `fleet.expected_drift`. The peer's own fingerprint is not repeated in `fleet.peers[].node`. |
+
 Added in #230: `numbers` is how this machine's runs went, for the last 7 and
 the last 30 days (`numbers.windows`, each with `days`, `since`/`since_ts`,
 `until`/`until_ts`). The page shows it in the **Numbers** box, with a table

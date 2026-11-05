@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import ipaddress
 import json
 import socket
@@ -58,6 +59,8 @@ from ctrlrelay.core.github_budget import BudgetStore, budget_json
 from ctrlrelay.core.heartbeat import Heartbeat
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.usage import UsageStore, pause_for, usage_json
+from ctrlrelay.web.drift import config_fingerprint, peer_drift
+from ctrlrelay.web.drift import unknown as drift_unknown
 from ctrlrelay.web.fleet import PeerReader
 from ctrlrelay.web.health import read_server_health
 from ctrlrelay.web.status import DAY_KINDS, build_status, list_day_events, list_feed
@@ -460,6 +463,18 @@ class StatusServer(ThreadingHTTPServer):
             ("worktrees", Path(self.config.paths.worktrees)),
         ])
 
+    @functools.cached_property
+    def config_fingerprint(self) -> dict[str, Any] | None:
+        """#307: the config this server was started with. It does not
+        change while the server runs, so it is fingerprinted once; ``None``
+        (every peer's drift unknown) if that fails."""
+        try:
+            return config_fingerprint(self.config)
+        except Exception as exc:
+            log_event(_logger, "web.config_fingerprint_failed",
+                      error=f"{type(exc).__name__}: {exc}"[:300])
+            return None
+
     def node(self) -> dict[str, Any]:
         """This machine's own block: its name and subscription usage
         (#247). Whether it is paused is worked out from the same reading
@@ -481,6 +496,7 @@ class StatusServer(ThreadingHTTPServer):
             "chat": self._chat(),
             "usage": usage_json(reading),
             "pause_at": self.config.usage.pause_at,
+            "config_fingerprint": self.config_fingerprint,
             "paused": None if pause is None else {
                 "reason": pause.reason,
                 "until": None if pause.until is None else datetime.fromtimestamp(
@@ -507,12 +523,50 @@ class StatusServer(ThreadingHTTPServer):
             # The chat probe must not take the rest of the node block with it.
             return {"transport": None, "connected": None}
 
+    def fleet(self) -> dict[str, Any]:
+        """The peers' latest reads, each with how its config differs from
+        this machine's (#307), worked out now so a peer's change shows
+        within one read of it."""
+        block = self.peers.snapshot() if self.peers is not None else {"peers": []}
+        expected = self.config.fleet.expected_drift
+        for entry in block["peers"]:
+            try:
+                entry["drift"] = peer_drift(
+                    entry, self.config_fingerprint, expected, version=__version__,
+                )
+            except Exception as exc:  # one peer's answer must not take the page down
+                error = f"{type(exc).__name__}: {exc}"[:300]
+                self._note_drift_failure(entry.get("url"), error)
+                entry["drift"] = drift_unknown(
+                    f"could not compare: {type(exc).__name__}"
+                )
+            # The fingerprint was only needed for the comparison; the page
+            # gets the drift. Copied, never popped: the reader's stored
+            # entry keeps it for the next comparison.
+            for key in ("node", "last_known"):
+                node = entry.get(key)
+                if isinstance(node, dict) and "config_fingerprint" in node:
+                    entry[key] = {k: v for k, v in node.items() if k != "config_fingerprint"}
+        return block
+
+    @functools.cached_property
+    def _drift_failures(self) -> set[tuple[Any, str]]:
+        return set()
+
+    def _note_drift_failure(self, url: Any, error: str) -> None:
+        """Log a failed comparison once per peer and error, not per request."""
+        with self._misdirected_lock:
+            if (url, error) in self._drift_failures:
+                return
+            self._drift_failures.add((url, error))
+        _logger.warning("web.drift_compare_failed", extra={"peer": url, "error": error})
+
     def status(self) -> dict[str, Any]:
         web = self.config.web
         return build_status(
             heartbeat=Heartbeat.beside(self.config.paths.state_db).read,
             silent_after_s=self.config.fleet.silent_after_seconds,
-            fleet=self.peers.snapshot if self.peers is not None else None,
+            fleet=self.fleet if self.peers is not None else None,
             node=self.node,
             db_path=self.config.paths.state_db,
             waiting=self.waiting.snapshot(),

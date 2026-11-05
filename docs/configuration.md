@@ -623,6 +623,8 @@ fleet:
   timeout_seconds: 5
   silent_after_seconds: 300
   account_label: "max-2"
+  expected_drift:
+    - "automation.exclude_labels"
 ```
 
 | Key | Type | Default | Description |
@@ -632,6 +634,36 @@ fleet:
 | `timeout_seconds` | number (0-60] | `5` | The longest wait for any one network step of a read; a whole read gets twice this before the peer is reported as `timeout`. |
 | `silent_after_seconds` | int (>= 60) | `300` | A machine whose daemon heartbeat is older than this is shown as **silent**: its web server answers, but the daemon's heartbeat is missing or old, so its poller cannot be confirmed to be working. |
 | `account_label` | string | unset | A name for this machine's agent subscription, shown on its card, such as `max-2`. Never an email address (refused). |
+| `expected_drift` | list of strings | `[]` | Config differences with the peers that are intended, so the page does not report them. Each entry is a repo (`owner/name`: left out of the comparison entirely), a section (`automation`, `steps`, `schedules`) or one field of one (`automation.exclude_labels`, `steps.review`, `schedules.secops_cron`). Anything else is refused at load. See [Config drift](#config-drift). |
+
+### Config drift
+
+Each machine's status page publishes a fingerprint of its config in
+`node.config_fingerprint`. Each time the page or `/api/status` is built, it
+compares the latest fingerprint read from each peer with its own, so a change
+on a peer shows within one peer read. A difference shows on that peer's card, for example
+`config: 2 repos only here: org/a, org/b` or
+`config: automation.exclude_labels differs on 3 repos: …`, and marks the card.
+Identical configs show nothing.
+
+What is compared: the list of repos; for each repo in both, every field of
+`automation` and of `steps`; and every field of `schedules`. Only repo
+names and hashes are sent, never a value. The fingerprint is the config the
+server was started with, so an edit shows once the daemon is restarted.
+
+A peer on a version that sends no fingerprint, or one in another format,
+shows `config drift unknown`, not as drift. So does a peer on a different
+ctrlrelay version than this machine, even one that sends a fingerprint: two
+versions can hash the same config differently (a changed default, say), so
+the two are compared once both run the same version. A field only one side
+has is not compared.
+
+`expected_drift` is read on each machine for its own page only. A routing
+label that only some machines carry in `exclude_labels` is listed as
+`automation.exclude_labels` on every machine whose page should not report
+it. Leaving out a field leaves it out on every repo: a different change to
+that field is not reported either, which is the cost of comparing hashes
+rather than values.
 
 ## repos
 

@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not), and Dependabot PRs and alerts are unchanged. Unset renders the same
   prompt as before (#335).
 
+- The status page shows config drift between machines. Each machine's
+  `/api/status` carries a fingerprint of its config: the repo names, and a
+  hash per field of each repo's `automation` and `steps` and of
+  `schedules`; never a value. Each peer's card names what differs from this
+  machine, such as repos only here or only there, or a field that differs
+  on some repos, within one peer read. A peer on a different version shows
+  as unknown, not as drift. An intended difference, such as a routing label in
+  `exclude_labels`, is left out with `fleet.expected_drift` (#307).
+
 - Reopened issues are recorded. When the relay sees an issue's PR merge
   (and closes the issue), it notes the finish in the state database. If
   that issue later turns up open in the poller's search, the poller reads
