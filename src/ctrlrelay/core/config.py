@@ -948,6 +948,40 @@ class Personalization(BaseModel):
         return v
 
 
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+class WeeklySummaryConfig(BaseModel):
+    """One chat message a week with this node's last-7-day numbers (#230).
+
+    Sent on ``day`` at ``hour`` (0-23) in the top-level ``timezone``, or at
+    the first check after that if the daemon was not running then or the
+    send failed. At most once a week: the last delivery is kept in the
+    state database, so a restart does not send it again.
+    """
+
+    enabled: bool = True
+    day: str = "mon"
+    hour: int = Field(default=9, ge=0, le=23)
+
+    @field_validator("day")
+    @classmethod
+    def a_weekday(cls, v: str) -> str:
+        given = str(v).strip().lower()
+        full = dict(zip(
+            ("monday", "tuesday", "wednesday", "thursday", "friday",
+             "saturday", "sunday"),
+            WEEKDAYS,
+        ))
+        name = full.get(given, given)
+        if name not in WEEKDAYS:
+            raise ValueError(
+                f"schedules.weekly_summary.day {v!r} is not a weekday; use "
+                "one of mon, tue, wed, thu, fri, sat, sun"
+            )
+        return name
+
+
 class SchedulesConfig(BaseModel):
     """Cron schedules for background jobs run by the poller daemon.
 
@@ -966,6 +1000,7 @@ class SchedulesConfig(BaseModel):
 
     secops_cron: str = "0 6 * * *"
     personalization_cron: str | None = None
+    weekly_summary: WeeklySummaryConfig = Field(default_factory=WeeklySummaryConfig)
 
     @field_validator("secops_cron")
     @classmethod

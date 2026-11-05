@@ -2908,6 +2908,10 @@ def poller_start(
         # grace only catches up on fires that happened AFTER registration.
 
         state_db = StateDB(config.paths.state_db)
+        # Reopens of issues the relay finished (#230), noticed in what
+        # each poll's search already returned.
+        from ctrlrelay.core.reopens import ReopenTracker
+        poller.reopen_tracker = ReopenTracker(state_db=state_db, github=github)
         # The daemon is the case #204 is about: nothing is watching,
         # so every spawn's exit code and output tail are recorded and
         # a run of failures raises one alert.
@@ -3703,6 +3707,29 @@ def poller_start(
                     except Exception:
                         pass
 
+        async def _send_weekly_summary(text: str) -> None:
+            # Raises when there is no channel right now, so the summary is
+            # not marked sent and the next check tries again.
+            transport = await _watch_transport_factory()
+            if transport is None:
+                raise RuntimeError("no chat transport is configured")
+            try:
+                await transport.send(text)
+            finally:
+                try:
+                    await asyncio.wait_for(transport.close(), timeout=5)
+                except Exception:
+                    pass
+
+        from ctrlrelay.core.weekly_summary import WeeklySummary
+
+        weekly = config.schedules.weekly_summary
+        weekly_summary = WeeklySummary(
+            state_db=state_db, node_id=config.node_id, day=weekly.day,
+            hour=weekly.hour, timezone=config.timezone,
+            send=_send_weekly_summary,
+        )
+
         async def _run_usage_probe() -> None:
             last = usage_store.last_attempt_at()
             max_age = config.usage.probe_minutes * 60
@@ -4221,6 +4248,21 @@ def poller_start(
                 cron_expr="0 * * * *",
                 func=_run_question_expiry_sweeper,
             )
+            # The weekly numbers (#230). Checked every five minutes rather
+            # than fired once by cron, so a daemon that was down at the
+            # send time, or a send that failed, still sends that week; the
+            # last delivery in the state database keeps it to once. Not
+            # registered without a chat transport: there is nowhere to send.
+            weekly_summary_text = "weekly_summary=off"
+            if weekly.enabled and _bridge_socket_settings(config) is not None:
+                scheduler.add_cron_job(
+                    name="weekly_summary",
+                    cron_expr="*/5 * * * *",
+                    func=weekly_summary.tick,
+                )
+                weekly_summary_text = (
+                    f"weekly_summary={weekly.day} {weekly.hour:02d}:00"
+                )
             # Register the personalization auto-pull only when the
             # operator has both configured the personalization block
             # AND set a cron expression. Either alone is intentional
@@ -4251,7 +4293,7 @@ def poller_start(
                 f"[dim]Scheduler: secops cron={config.schedules.secops_cron} "
                 f"tz={config.timezone} | "
                 f"pending_resume_sweeper=every 1m | "
-                f"question_expiry_sweeper=hourly"
+                f"question_expiry_sweeper=hourly | {weekly_summary_text}"
                 f"{personalization_cron_summary}[/dim]"
             )
 

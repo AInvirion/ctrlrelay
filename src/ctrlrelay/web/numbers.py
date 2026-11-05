@@ -2,7 +2,7 @@
 
 Per node only: numbers across machines belong to the control plane (#251),
 which can read each node's ``/api/status``. Everything here is computed
-from what the state database already holds; nothing new is recorded.
+from what the state database already holds; nothing is written here.
 
 A **run** is one row in ``sessions`` (one dispatch of one pipeline on one
 repo; a blocked run resumed after an answer is the same row). A run is in
@@ -29,13 +29,21 @@ Per window, overall and per repo:
   earlier run on the same repo and issue had ended ``done`` (its
   ``ended_at`` is before the new run's ``started_at``). The earlier run may
   be older than the window. The window's ``came_back_issues`` lists them.
-  Reopening on GitHub itself is not recorded by ctrlrelay, so an issue that
-  was reopened and never picked up again is not counted.
+- ``reopened``: issues the relay finished (it saw their PR merge, then
+  closed them) that were reopened on GitHub in the window, by the time of
+  GitHub's ``reopened`` event; one per finish, so an issue finished and
+  reopened twice counts twice. The window's ``reopened_issues`` lists them.
+  The poller notices a reopen (see ``ctrlrelay.core.reopens``) only for an
+  issue its search returns, and only for finishes recorded since the
+  ``issue_finishes`` table was created (then filled from the ``merged``
+  events still kept).
 
 ``null`` where a number cannot be known, with the reason in the window's
 ``unavailable``, never a guess:
 
 - ``cost_per_run``: always ``null``; cost per run is not recorded (#223).
+- ``reopened``: ``null`` when the database predates the record of finished
+  issues (``issue_finishes``), or it could not be read.
 - ``stuck``: of the runs started in the window, the ones the relay stopped
   as stuck (#224); they are also counted in ``failed``. Runs from before the
   relay recorded this are not counted. ``null`` only when the database
@@ -64,8 +72,8 @@ from typing import Any
 from ctrlrelay.web.links import github_url
 
 WINDOWS = (7, 30)
-# The most issues one window's ``came_back_issues`` lists; ``came_back``
-# still counts all of them.
+# The most issues one window's ``came_back_issues`` (or
+# ``reopened_issues``) lists; the count still counts all of them.
 CAME_BACK_LIMIT = 50
 _PR_KINDS = ("pr_opened", "merged")
 _OUTCOMES = ("done", "failed", "blocked", "running")
@@ -75,6 +83,10 @@ STUCK_GAP = (
     "daemon to add it"
 )
 EVENTS_GAP = "events could not be read"
+REOPEN_GAP = (
+    "this database predates the record of finished issues; restart the "
+    "daemon to add it"
+)
 
 
 def window_start(now: int, days: int) -> int:
@@ -112,6 +124,23 @@ def read_came_back(conn: Any, since: int, now: int) -> list[dict[str, Any]]:
             AND d.ended_at IS NOT NULL AND d.ended_at < l.started_at
            WHERE l.issue_number IS NOT NULL
              AND l.started_at >= ? AND l.started_at <= ?""",
+        (int(since), int(now)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def read_reopens(conn: Any, since: int, now: int) -> list[dict[str, Any]] | None:
+    """Every reopen recorded in ``[since, now]``, or ``None`` when the
+    database has no ``issue_finishes`` table yet (the daemon creates it on
+    its next start), so the count is unknown rather than 0."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='issue_finishes'"
+    ).fetchone()
+    if not exists:
+        return None
+    rows = conn.execute(
+        """SELECT repo, issue_number, reopened_at FROM issue_finishes
+           WHERE reopened_at >= ? AND reopened_at <= ?""",
         (int(since), int(now)),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -170,6 +199,7 @@ def _counts(
     runs: list[dict[str, Any]],
     pr_times: dict[str, dict[str, int]] | None,
     came_back: int,
+    reopened: int | None = None,
 ) -> dict[str, Any]:
     by_status = dict.fromkeys(_OUTCOMES, 0)
     other = 0
@@ -200,6 +230,7 @@ def _counts(
         "time_to_pr_s": None if pr_times is None else _median(to_pr),
         "time_to_merge_s": None if pr_times is None else _median(to_merge),
         "came_back": came_back,
+        "reopened": reopened,
         "stuck": (
             sum(1 for r in runs if r["stuck_reason"])
             if all("stuck_reason" in r for r in runs)
@@ -222,12 +253,23 @@ def _window(
     pr_times: dict[str, dict[str, int]] | None,
     oldest_ts: int | None,
     events_reason: str | None,
+    reopens: list[dict[str, Any]] | None = None,
+    reopens_reason: str | None = None,
 ) -> dict[str, Any]:
     since = window_start(now, days)
     runs = [r for r in runs if r["started_at"] >= since]
     back = _issues(r for r in came_back if r["started_at"] >= since)
+    reopened = (
+        None if reopens is None
+        else sorted(
+            (r["repo"], int(r["issue_number"]))
+            for r in reopens if int(r["reopened_at"]) >= since
+        )
+    )
 
     unavailable = {"cost_per_run": COST_GAP}
+    if reopened is None:
+        unavailable["reopened"] = reopens_reason or REOPEN_GAP
     if not all("stuck_reason" in r for r in runs):
         unavailable["stuck"] = STUCK_GAP
     times = pr_times
@@ -240,12 +282,19 @@ def _window(
         unavailable["time_to_pr_s"] = reason
         unavailable["time_to_merge_s"] = reason
 
-    repos = sorted({r["repo"] for r in runs} | {repo for repo, _ in back})
+    repos = sorted(
+        {r["repo"] for r in runs} | {repo for repo, _ in back}
+        | {repo for repo, _ in reopened or []}
+    )
     by_repo = []
     for repo in repos:
         mine = [r for r in runs if r["repo"] == repo]
         n_back = sum(1 for rp, _ in back if rp == repo)
-        by_repo.append({"repo": repo, **_counts(mine, times, n_back)})
+        n_reopened = (
+            None if reopened is None
+            else sum(1 for rp, _ in reopened if rp == repo)
+        )
+        by_repo.append({"repo": repo, **_counts(mine, times, n_back, n_reopened)})
 
     return {
         "days": days,
@@ -253,11 +302,17 @@ def _window(
         "since": datetime.fromtimestamp(since, UTC).isoformat(),
         "until_ts": int(now),
         "until": datetime.fromtimestamp(now, UTC).isoformat(),
-        "overall": _counts(runs, times, len(back)),
+        "overall": _counts(
+            runs, times, len(back), None if reopened is None else len(reopened),
+        ),
         "by_repo": by_repo,
         "came_back_issues": [
             {"repo": repo, "issue_number": n, "url": github_url(repo, n)}
             for repo, n in back[:CAME_BACK_LIMIT]
+        ],
+        "reopened_issues": [
+            {"repo": repo, "issue_number": n, "url": github_url(repo, n)}
+            for repo, n in sorted(set(reopened or []))[:CAME_BACK_LIMIT]
         ],
         "unavailable": unavailable,
     }
@@ -270,10 +325,14 @@ def build_numbers(
     came_back: list[dict[str, Any]],
     events: dict[str, Any] | None,
     events_reason: str | None = None,
+    reopens: list[dict[str, Any]] | None = None,
+    reopens_reason: str | None = None,
 ) -> dict[str, Any]:
     """``{"windows": [<7 days>, <30 days>]}`` from rows read for the longest
     window. ``events`` is :func:`read_pr_times`'s answer, or ``None`` when
-    the events could not be read (``events_reason`` says why)."""
+    the events could not be read (``events_reason`` says why). ``reopens``
+    is :func:`read_reopens`'s, or ``None`` when unknown (``reopens_reason``
+    says why when it is not that the table is missing)."""
     if events is None and events_reason is None:
         events_reason = EVENTS_GAP
     pr_times = None if events is None else events["times"]
@@ -284,6 +343,7 @@ def build_numbers(
                 days, now=now, runs=runs, came_back=came_back,
                 pr_times=pr_times, oldest_ts=oldest_ts,
                 events_reason=events_reason,
+                reopens=reopens, reopens_reason=reopens_reason,
             )
             for days in WINDOWS
         ],

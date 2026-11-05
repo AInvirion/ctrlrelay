@@ -338,7 +338,7 @@ def test_event_kind_values() -> None:
         "dispatched", "done", "blocked", "failed", "pr_opened", "merged",
         "ci_started", "ci_finished", "review_started", "review_finished",
         "review_stale", "message_sent", "question_posted", "question_held", "alert_sent",
-        "restart",
+        "restart", "reopened",
     }
     assert EventKind.DONE == "done"
 

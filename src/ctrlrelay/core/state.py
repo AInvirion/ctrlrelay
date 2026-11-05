@@ -229,6 +229,13 @@ CREATE TABLE IF NOT EXISTS relay_pushes (
 CREATE INDEX IF NOT EXISTS idx_relay_pushes_branch
     ON relay_pushes(repo, branch, id);
 
+-- When each scheduled chat message was last delivered (#230), so a
+-- restart does not send this week's summary a second time.
+CREATE TABLE IF NOT EXISTS scheduled_sends (
+    name TEXT PRIMARY KEY,
+    sent_at INTEGER NOT NULL
+);
+
 -- Feed for the status page. Written best-effort by the daemon through
 -- ctrlrelay.core.events.emit_event; a failed write never affects the work.
 CREATE TABLE IF NOT EXISTS events (
@@ -243,6 +250,25 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, ts);
 
+"""
+
+# Issues the relay finished, and whether each was reopened afterwards
+# (#230). Kept apart from ``events`` because events are deleted after
+# ``web.history_days``, and an issue can be reopened long after that.
+# One row per merged PR; ``finished_at`` is when the relay saw the merge
+# (it closes the issue right after), ``reopened_at`` the time of the
+# first GitHub ``reopened`` event after it, NULL until one is seen.
+# Created by StateDB._ensure_issue_finishes.
+ISSUE_FINISHES_SCHEMA = """
+CREATE TABLE issue_finishes (
+    repo TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    pr_number INTEGER NOT NULL,
+    finished_at INTEGER NOT NULL,
+    session_id TEXT,
+    reopened_at INTEGER,
+    PRIMARY KEY (repo, issue_number, pr_number)
+)
 """
 
 
@@ -417,7 +443,112 @@ class StateDB:
                 "ADD COLUMN alert_delivered_at INTEGER"
             )
 
+        self._ensure_issue_finishes()
         self._ensure_dispatch_health_row()
+
+    def _ensure_issue_finishes(self) -> None:
+        """Create ``issue_finishes`` (#230), filling it from the ``merged``
+        events still kept when the table is new.
+
+        Created here rather than in ``SCHEMA`` so the backfill runs exactly
+        once, on the start that creates the table. Without it, every issue
+        the relay finished before this version could be reopened without
+        anybody counting it. Events older than ``web.history_days`` are
+        already gone, so those finishes stay unknown.
+        """
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='issue_finishes'"
+        ).fetchone()
+        if exists:
+            return
+        self._conn.execute(ISSUE_FINISHES_SCHEMA)
+        self._conn.execute(
+            """INSERT OR IGNORE INTO issue_finishes
+               (repo, issue_number, pr_number, finished_at, session_id)
+               SELECT repo, issue_number,
+                      CAST(json_extract(detail, '$.pr_number') AS INTEGER),
+                      MIN(ts), MIN(session_id)
+               FROM events
+               WHERE kind = 'merged' AND repo IS NOT NULL
+                 AND issue_number IS NOT NULL
+                 AND json_valid(detail)
+                 AND json_extract(detail, '$.pr_number') IS NOT NULL
+               GROUP BY repo, issue_number,
+                        json_extract(detail, '$.pr_number')"""
+        )
+
+    # Finished issues and reopens (#230)
+
+    def record_issue_finish(
+        self,
+        *,
+        repo: str,
+        issue_number: int,
+        pr_number: int,
+        session_id: str | None,
+        finished_at: int | None = None,
+    ) -> None:
+        """Note that the relay saw ``pr_number`` merge for this issue, after
+        which its post-merge pipeline closes the issue. A PR merges once, so
+        a watcher that finds the same merge again after a restart changes
+        nothing. Raises on failure."""
+        self._conn.execute(
+            """INSERT OR IGNORE INTO issue_finishes
+               (repo, issue_number, pr_number, finished_at, session_id)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                repo, int(issue_number), int(pr_number),
+                int(time.time()) if finished_at is None else int(finished_at),
+                session_id,
+            ),
+        )
+        self._conn.commit()
+
+    def list_open_finishes(self) -> dict[tuple[str, int], int]:
+        """``{(repo, issue_number): finished_at}`` for every issue whose
+        latest finish has no reopen recorded after it: the issues a reopen
+        could still be noticed on."""
+        rows = self._conn.execute(
+            """SELECT f.repo, f.issue_number, f.finished_at
+               FROM issue_finishes f
+               WHERE f.reopened_at IS NULL
+                 AND f.finished_at = (
+                   SELECT MAX(g.finished_at) FROM issue_finishes g
+                   WHERE g.repo = f.repo AND g.issue_number = f.issue_number)"""
+        ).fetchall()
+        return {(r["repo"], int(r["issue_number"])): int(r["finished_at"]) for r in rows}
+
+    def record_reopen(
+        self, repo: str, issue_number: int, finished_at: int, reopened_at: int,
+    ) -> bool:
+        """Mark the finish at ``finished_at`` as reopened at ``reopened_at``.
+        True only for the call that recorded it, so one reopen is counted
+        once however many polls see it."""
+        cursor = self._conn.execute(
+            """UPDATE issue_finishes SET reopened_at = ?
+               WHERE repo = ? AND issue_number = ? AND finished_at = ?
+                 AND reopened_at IS NULL""",
+            (int(reopened_at), repo, int(issue_number), int(finished_at)),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    # Scheduled messages (#230)
+
+    def last_sent(self, name: str) -> int | None:
+        """When the scheduled message ``name`` was last delivered, or None."""
+        row = self._conn.execute(
+            "SELECT sent_at FROM scheduled_sends WHERE name = ?", (name,)
+        ).fetchone()
+        return None if row is None else int(row["sent_at"])
+
+    def record_sent(self, name: str, sent_at: int) -> None:
+        self._conn.execute(
+            """INSERT INTO scheduled_sends (name, sent_at) VALUES (?, ?)
+               ON CONFLICT(name) DO UPDATE SET sent_at = excluded.sent_at""",
+            (name, int(sent_at)),
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         """Close the database connection (and the event side connection)."""

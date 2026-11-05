@@ -1039,7 +1039,7 @@ function renderTodayList(data) {
 // #230: the columns of a Numbers row, and the text of one cell each.
 var NUMBER_COLUMNS = [
   "runs", "done", "failed", "blocked", "running", "stuck", "success",
-  "time to PR", "time to merge", "came back", "cost / run"
+  "time to PR", "time to merge", "came back", "reopened", "cost / run"
 ];
 
 function medianText(m) {
@@ -1059,7 +1059,7 @@ function numberCells(c) {
     typeof c.success_rate === "number" ? Math.round(c.success_rate * 100) + "%" :
       (typeof c.started === "number" ? "none finished" : "unknown"),
     medianText(c.time_to_pr_s), medianText(c.time_to_merge_s),
-    countText(c.came_back),
+    countText(c.came_back), countText(c.reopened),
     typeof c.cost_per_run === "number" ? String(c.cost_per_run) : "not recorded"
   ];
 }
@@ -1099,13 +1099,19 @@ function renderNumbers(data) {
     else {
       more.appendChild(numbersTable(repos.map(function (r) { return [r.repo, r]; })));
     }
-    var back = Array.isArray(w.came_back_issues) ? w.came_back_issues : [];
-    if (back.length) {
+    var listed = [];
+    (Array.isArray(w.came_back_issues) ? w.came_back_issues : []).forEach(function (i) {
+      listed.push(["came back: ", i]);
+    });
+    (Array.isArray(w.reopened_issues) ? w.reopened_issues : []).forEach(function (i) {
+      listed.push(["reopened: ", i]);
+    });
+    if (listed.length) {
       var list = el("ul", "plain");
-      back.forEach(function (i) {
+      listed.forEach(function (pair) {
         var li = el("li");
-        li.appendChild(el("span", "muted", "came back: "));
-        li.appendChild(ghLink(i.url, i.repo + "#" + i.issue_number, "repo"));
+        li.appendChild(el("span", "muted", pair[0]));
+        li.appendChild(ghLink(pair[1].url, pair[1].repo + "#" + pair[1].issue_number, "repo"));
         list.appendChild(li);
       });
       more.appendChild(list);
@@ -1118,7 +1124,7 @@ function renderNumbers(data) {
     var u = w.unavailable || {};
     Object.keys(u).forEach(function (k) {
       var line = k.replace(/_s$/, "").replace(/_/g, " ") + " (" + w.days + " days): " + u[k];
-      if (k === "cost_per_run" || k === "stuck") {
+      if (k === "cost_per_run" || k === "stuck" || k === "reopened") {
         line = k.replace(/_/g, " ") + ": " + u[k];
       }
       if (!seen[line]) { seen[line] = true; gaps.appendChild(el("li", null, line)); }

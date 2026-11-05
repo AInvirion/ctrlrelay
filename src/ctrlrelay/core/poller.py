@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 from ctrlrelay.core.archived import ArchivedRepoTracker
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.obs import get_logger, log_event
+from ctrlrelay.core.reopens import ReopenTracker
 
 _logger = get_logger("core.poller")
 
@@ -155,6 +156,22 @@ class _Intake:
             raise found
         return list((found or {}).get(repo, []))
 
+    def open_issues(self) -> set[tuple[str, int]]:
+        """Every ``(repo, number)`` the searches that answered returned:
+        all open issues, whether or not they are new."""
+        found: set[tuple[str, int]] = set()
+        sources = [self._assigned] + [
+            v for v in self._labeled.values() if not isinstance(v, BaseException)
+        ]
+        for by_repo in sources:
+            for repo, rows in by_repo.items():
+                for row in rows:
+                    try:
+                        found.add((repo, int(row["number"])))
+                    except Exception:
+                        continue
+        return found
+
     def failed_labels(self) -> list[str]:
         """The trigger labels whose search failed this time."""
         return sorted(k for k, v in self._labeled.items() if isinstance(v, BaseException))
@@ -279,6 +296,9 @@ class IssuePoller:
     # ``_issues_disabled_repos``: confirmed-archived only, in memory, reset
     # on restart. See ctrlrelay.core.archived for the fail-open rule.
     archived_tracker: ArchivedRepoTracker | None = None
+    # Records reopens of issues the relay finished (#230), from the open
+    # issues each poll's search already returned. None: not looked for.
+    reopen_tracker: ReopenTracker | None = None
 
     def __post_init__(self) -> None:
         if self.archived_tracker is None:
@@ -455,6 +475,9 @@ class IssuePoller:
                     "already there would read as new; not polling"
                 )
         intake = await self._fetch_intake()
+        if self.reopen_tracker is not None:
+            # Never fails the poll: ReopenTracker.check logs and swallows.
+            await self.reopen_tracker.check(intake.open_issues())
 
         for repo in self.repos:
             # Repos with GitHub Issues disabled will never return issues; skip

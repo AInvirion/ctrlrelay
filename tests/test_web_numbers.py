@@ -32,7 +32,7 @@ WAITING_OK = {
 COUNT_KEYS = {
     "started", "done", "failed", "blocked", "running", "other",
     "success_rate", "time_to_pr_s", "time_to_merge_s", "came_back",
-    "stuck", "cost_per_run",
+    "reopened", "stuck", "cost_per_run",
 }
 
 
@@ -389,9 +389,9 @@ def test_page_shows_unknowns_as_unknown_never_zero(tmp_path: Path) -> None:
     out = _numbers(tmp_path)
     cells_30 = _page_number_cells(_window(out, 30)["overall"])
     # runs, done, failed, blocked, running, stuck, success, PR, merge,
-    # back, cost
+    # back, reopened, cost
     assert cells_30 == [
-        "2", "2", "0", "0", "0", "0", "100%", "unknown", "unknown", "0",
+        "2", "2", "0", "0", "0", "0", "100%", "unknown", "unknown", "0", "0",
         "not recorded",
     ]
     (tmp_path / "state.db").unlink()
@@ -400,7 +400,7 @@ def test_page_shows_unknowns_as_unknown_never_zero(tmp_path: Path) -> None:
     assert _page_number_cells(empty_7)[6:9] == [
         "none finished", "none yet", "none yet",
     ]
-    assert _page_number_cells({}) == ["unknown"] * 10 + ["not recorded"]
+    assert _page_number_cells({}) == ["unknown"] * 11 + ["not recorded"]
 
 
 def test_page_shows_rates_and_medians(tmp_path: Path) -> None:
@@ -408,12 +408,14 @@ def test_page_shows_rates_and_medians(tmp_path: Path) -> None:
         "started": 4, "done": 2, "failed": 1, "blocked": 1, "running": 0,
         "stuck": 1, "success_rate": 0.5, "time_to_pr_s": {"median": 300, "n": 3},
         "time_to_merge_s": {"median": 7_200, "n": 1}, "came_back": 1,
-        "cost_per_run": None,
+        "reopened": None, "cost_per_run": None,
     }
+    # A reopen count that could not be read is unknown, not 0.
     assert _page_number_cells(counts) == [
         "4", "2", "1", "1", "0", "1", "50%", "5m (n=3)", "2h 0m (n=1)", "1",
-        "not recorded",
+        "unknown", "not recorded",
     ]
+    assert _page_number_cells({**counts, "reopened": 2})[10] == "2"
 
 
 def test_page_renders_the_numbers_section() -> None:
