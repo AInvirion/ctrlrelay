@@ -208,6 +208,13 @@ def test_a_dead_blocked_runs_lock_is_dropped_and_no_live_ones_are(
     assert released == ["s-dead"]
     left = {r["session_id"] for r in db.list_locks()}
     assert left == {"s-mine", "s-alive", "s-legacy", "s-running"}
+    # Each step guards on the status on its own: the lister finds only
+    # blocked rows, and the drop refuses a session that is not blocked
+    # (one resumed between the two keeps its lock).
+    assert {r["id"] for r in db.list_blocked_sessions_holding_locks()} \
+        == {"s-mine", "s-alive", "s-legacy"}
+    assert db.release_blocked_session_lock("s-running") is False
+    assert "s-running" in {r["session_id"] for r in db.list_locks()}
     db.close()
 
 
