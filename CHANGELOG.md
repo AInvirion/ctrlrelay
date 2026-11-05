@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-11-04
+
+### Fixed
+
+- A node no longer stops taking work when the agent CLI reports its usage
+  status as `allowed_warning`. That status means a usage window has passed
+  a warning line, and calls are still served; it was treated as a refusal,
+  so nodes at 26% of the 7-day window paused until that window reset, a
+  week away. How close a window is to its limit is still decided by the
+  pause threshold, and any other status still pauses (#338).
+
 ## [0.20.1] - 2026-11-04
 
 ### Fixed
@@ -2348,7 +2359,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.2...HEAD
+[0.20.2]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.19.0...v0.19.1
