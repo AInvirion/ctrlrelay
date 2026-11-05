@@ -2,9 +2,10 @@
 
 ``poll()`` returns a batch and the loop handles it one issue at a time. With
 one slot and long runs, the last issue in a batch can start an hour after the
-poll saw it, after the operator removed its trigger label or closed it. These
-tests change the issue on "GitHub" while the batch's first handler is running,
-which is exactly the window the re-read exists for.
+poll saw it, after the operator removed its trigger label or closed it. Most
+of these tests change the issue on "GitHub" while the batch's first handler is
+running, which is exactly the window the re-read exists for; one makes the
+re-read itself fail.
 """
 
 from __future__ import annotations
@@ -155,11 +156,12 @@ async def test_an_issue_given_an_exclude_label_after_the_poll_does_not_start(
 
 
 @pytest.mark.asyncio
-async def test_an_unchanged_issue_still_starts_with_todays_labels(
+async def test_an_issue_that_still_qualifies_starts_with_todays_labels(
     tmp_path: Path,
 ) -> None:
-    """The control: nothing changed, so both start; and the handler routes
-    on the labels read now, not the poll's."""
+    """The control: issue 2 only gained a label that is no trigger and no
+    exclusion, so both start; and the handler is given the labels read now,
+    not the poll's (which is what it routes on)."""
     live = _live()
     gh = _github(live)
     poller = _poller(gh, tmp_path)
