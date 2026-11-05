@@ -1847,6 +1847,37 @@ class WorktreeManager:
 
         return bare_path
 
+    async def fetch_pr_head(self, repo: str, pr_number: int) -> str:
+        """Fetch a pull request's current head into the bare clone and
+        return its commit id (#222).
+
+        Into ``refs/ctrlrelay/review/pr-<n>``, never into the branch: a
+        run's branch is checked out in its worktree for the whole session,
+        and :meth:`ensure_bare_repo` leaves such branches out of its fetch
+        (#253), so a commit pushed by someone else never reached the clone
+        and the review copy of it failed.
+        """
+        if not isinstance(pr_number, int) or pr_number <= 0:
+            raise WorktreeError(f"not a pull request number: {pr_number!r}")
+        bare_path = self._get_bare_repo_path(repo)
+        ref = f"refs/ctrlrelay/review/pr-{pr_number}"
+        await self._run_git(
+            "fetch", "--no-tags", "origin",
+            f"+refs/pull/{pr_number}/head:{ref}",
+            cwd=bare_path,
+            timeout=_GIT_TRANSFER_TIMEOUT_SECONDS,
+        )
+        sha = (
+            await self._run_git(
+                "rev-parse", "--verify", "--quiet", "--end-of-options",
+                f"{ref}^{{commit}}",
+                cwd=bare_path,
+            )
+        ).strip()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+            raise WorktreeError(f"{ref} is not a commit: {sha[:80]!r}")
+        return sha
+
     async def _follow_origin_default(
         self, repo: str, bare_path: Path, default_branch: str,
     ) -> None:

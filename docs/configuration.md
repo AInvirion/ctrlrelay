@@ -946,6 +946,28 @@ an exception inside the review are all failures. It is about the review
 having happened, not about what it found. **`review: off`** is the same as
 `code_review.method: off`, and loads as that.
 
+A review is about one commit. With `review: required` the PR is opened as a
+**draft**, and a PR the run reuses is put back to draft when the run pushes to
+it, because its new commits have not been reviewed. The relay marks it ready
+for review only when the latest review posted on the PR's current head. If
+the PR stays a draft, nothing was handed over. Draft pull requests need a
+public repository or a paid GitHub plan; where GitHub refuses a draft, the
+publish step fails and says why.
+
+With the review `on`, unset or `required`, the relay reads the PR's head from
+GitHub after each review. If somebody pushed after the review, the verdict is
+stale: the PR gets a comment saying it needs review again, a `review_stale`
+event is recorded, and the new head is reviewed before the run reports done
+(at most three reviews in all; a head still moving after that is not a
+pass). With `required`, a head GitHub will not report is not a pass either.
+
+Each `review_finished` event names the commit it reviewed, so the status page
+feed and `/api/status` show what the verdict is about:
+`{"pr_number", "ok", "head_sha", "status", "posted"}`. `ok` means the reviewer
+read the diff; `posted` means its findings reached the PR, which is what
+`required` checks. `review_stale` carries `{"pr_number", "head_sha",
+"current_sha"}`.
+
 Two settings for one reviewer must agree, or the config refuses to load:
 
 - `code_review.method: off` with `steps.review: on` or `required`;

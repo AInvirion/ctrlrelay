@@ -419,3 +419,45 @@ async def test_a_copy_that_cannot_be_deleted_says_so(
     finally:
         copy.chmod(0o700)
         await mgr.remove_review_copy(copy)
+
+
+@pytest.mark.asyncio
+async def test_a_pushed_head_reaches_the_clone_while_its_branch_is_checked_out(
+    tmp_path: Path, git_home: Path,
+) -> None:
+    """#222: the review of a new head needs that commit in the bare clone,
+    and the run's branch is checked out in its worktree, which the normal
+    fetch leaves out (#253). The PR's own ref brings it in."""
+    mgr = WorktreeManager(
+        worktrees_dir=tmp_path / "worktrees", bare_repos_dir=tmp_path / "repos",
+    )
+    origin = tmp_path / "origin.git"
+    src = tmp_path / "src"
+    src.mkdir()
+    _git("init", "-q", cwd=src)
+    (src / "a").write_text("a\n")
+    _git("add", "a", cwd=src)
+    _git("commit", "-qm", "init", cwd=src)
+    _git("clone", "-q", "--bare", str(src), str(origin), cwd=tmp_path)
+    bare = mgr._get_bare_repo_path(REPO)
+    bare.parent.mkdir(parents=True, exist_ok=True)
+    _git("clone", "-q", "--bare", str(origin), str(bare), cwd=tmp_path)
+    _git("worktree", "add", "-q", "-b", "fix/issue-1", str(tmp_path / "wt"),
+         cwd=bare)
+
+    # Someone pushes to the PR after the relay's push.
+    _git("checkout", "-qb", "fix/issue-1", cwd=src)
+    (src / "a").write_text("b\n")
+    _git("commit", "-qam", "later", cwd=src)
+    new_head = _git("rev-parse", "HEAD", cwd=src).strip()
+    _git("push", "-q", str(origin), "HEAD:refs/heads/fix/issue-1", cwd=src)
+    _git("push", "-q", str(origin), "HEAD:refs/pull/7/head", cwd=src)
+
+    await mgr.ensure_bare_repo(REPO)
+    with pytest.raises(subprocess.CalledProcessError):
+        _git("cat-file", "-e", f"{new_head}^{{commit}}", cwd=bare)
+
+    assert await mgr.fetch_pr_head(REPO, 7) == new_head
+    _git("cat-file", "-e", f"{new_head}^{{commit}}", cwd=bare)
+    # The checked-out branch itself is left alone.
+    assert _git("rev-parse", "refs/heads/fix/issue-1", cwd=bare).strip() != new_head

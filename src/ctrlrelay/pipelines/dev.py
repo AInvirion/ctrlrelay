@@ -1447,6 +1447,13 @@ async def _failed_check_logs(
 # Outputs the relay owns after #219. Whatever the agent wrote under these
 # names is dropped: a pull request number the agent reports is not
 # evidence a pull request exists, and the PR text is consumed here.
+_UNREVIEWED_PUSH_NOTE = (
+    "**Not reviewed yet.** This repository requires a review before the "
+    "relay hands a PR over, and this PR could not be marked as a draft, "
+    "so GitHub shows it as ready. Do not merge it until the relay's "
+    "review of its current head has passed."
+)
+
 _RELAY_OWNED_OUTPUTS = ("pr_number", "pr_url", "pr_title", "pr_body")
 
 # A full commit id, as GitHub names the head of the review base.
@@ -1474,6 +1481,11 @@ class _Publisher:
     last_pushed_sha: str | None = None
     pr_number: int | None = None
     pr_url: str | None = None
+    # Open the pull request as a draft, and put a reused one back to
+    # draft, because its new commits have not been reviewed yet (#222).
+    # Set when the repo's review is required; the review step marks the
+    # PR ready once a review passed on its current head.
+    draft: bool = False
 
     def _check_reusable(self, pr: dict[str, Any]) -> None:
         """Refuse to adopt an open PR this run would not have opened.
@@ -1495,6 +1507,69 @@ class _Publisher:
                 f"{head_repo!r}, base {base!r}; expected {self.repo!r} into "
                 f"{self.default_branch!r}"
             )
+
+    async def _create_pr(self, **kwargs: Any) -> dict[str, Any]:
+        """Open the PR, as a draft when review is required (#222). A
+        repository that does not allow drafts (a private repository on
+        GitHub's free plan) gets a normal PR and a comment saying it has
+        not been reviewed, instead of no PR at all."""
+        if not self.draft:
+            return await self.github.create_pr(self.repo, **kwargs)
+        try:
+            return await self.github.create_pr(self.repo, draft=True, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if "draft" not in str(e).lower():
+                raise
+            log_event(
+                _logger, "dev.publish.draft_unsupported",
+                session_id=self.session_id, repo=self.repo,
+                error=str(e)[:200],
+            )
+        created = await self.github.create_pr(self.repo, **kwargs)
+        try:
+            await self.github.comment_on_pr(
+                self.repo, int(created["number"]), _UNREVIEWED_PUSH_NOTE,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        return created
+
+    async def _back_to_draft(self) -> None:
+        """A reused PR just got commits no review has read (#222).
+
+        Best-effort: the push already landed, and the review step that
+        follows is what decides whether the PR is marked ready. A PR
+        left ready here is logged, and a failed required review still
+        stops the run with "not handed over".
+        """
+        try:
+            await self.github.set_pr_draft(self.repo, self.pr_number, True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event(
+                _logger,
+                "dev.publish.draft_failed",
+                session_id=self.session_id,
+                repo=self.repo,
+                pr_number=self.pr_number,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
+            # The PR now reads "ready" on commits nobody reviewed. Say so
+            # on it, where a reader looks, not only in the log.
+            try:
+                await self.github.comment_on_pr(
+                    self.repo, self.pr_number, _UNREVIEWED_PUSH_NOTE,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
 
     async def publish(self, result: PipelineResult) -> PipelineResult:
         """Push, then open (or find) the pull request.
@@ -1552,9 +1627,10 @@ class _Publisher:
                     self.pr_url = (
                         f"https://github.com/{self.repo}/pull/{self.pr_number}"
                     )
+                    if self.draft:
+                        await self._back_to_draft()
                 else:
-                    created = await self.github.create_pr(
-                        self.repo,
+                    created = await self._create_pr(
                         title=build_pr_title(
                             agent_outputs.get("pr_title"),
                             issue_number=self.issue_number,
@@ -1677,6 +1753,10 @@ class ReviewReport:
     # warning about a pull request nobody read. An explicit flag set at
     # the site that knows cannot collide with anything.
     deliberate: bool = False
+    # The commit this verdict is about (#222). A verdict without one is
+    # about nothing in particular, so a later push could not be told
+    # apart from the reviewed code. None when no commit was reviewed.
+    head_sha: str | None = None
 
     @property
     def is_failure(self) -> bool:
@@ -1770,30 +1850,69 @@ async def _review_and_comment(
             "detail": {"pr_number": pr_number},
         },
     )
-    review_ok = False
+    # Filled in as the review gets further, and recorded on the finish
+    # event whichever way this function leaves — also on a raise, so the
+    # phase does not read as still open (#222: the verdict is stored
+    # with the commit it is about, where the status page reads it).
+    finish: dict[str, Any] = {"ok": False, "status": "errored", "posted": False}
     try:
-        outcome = await run_code_review(
-            repo=repo,
-            worktree_path=worktree_path,
-            base_branch=base_branch,
-            cli_command=getattr(
-                config, "cli_command", 'codex review -c sandbox_mode="read-only"'
-            ),
-            timeout_seconds=getattr(config, "timeout_seconds", 900),
-            session_id=session_id,
+        report = await _run_review_and_post(
+            github=github, repo=repo, session_id=session_id,
+            pr_number=pr_number, worktree_path=worktree_path,
+            base_branch=base_branch, config=config, head_sha=head_sha,
+            base_sha=base_sha, finish=finish,
         )
-        review_ok = outcome.worth_posting
+        finish["status"] = report.status
+        finish["posted"] = report.posted
+        return report
     finally:
-        # Also on a raise, so the phase does not read as still open.
         emit_event(
             state_db, EventKind.REVIEW_FINISHED,
             lambda: {
                 "repo": repo,
                 "issue_number": issue_number,
                 "session_id": session_id,
-                "detail": {"pr_number": pr_number, "ok": review_ok},
+                "detail": {
+                    "pr_number": pr_number,
+                    "ok": finish["ok"],
+                    "head_sha": head_sha,
+                    "status": finish["status"],
+                    "posted": finish["posted"],
+                },
             },
         )
+
+
+async def _run_review_and_post(
+    *,
+    github: GitHubCLI,
+    repo: str,
+    session_id: str,
+    pr_number: int,
+    worktree_path: Path,
+    base_branch: str,
+    config: Any,
+    head_sha: str | None,
+    base_sha: str | None,
+    finish: dict[str, Any],
+) -> ReviewReport:
+    """The body of :func:`_review_and_comment`, after the start event.
+
+    ``finish["ok"]`` is set as soon as the reviewer's outcome is known:
+    whether it read the diff, which is a different fact from whether its
+    findings reached the PR.
+    """
+    outcome = await run_code_review(
+        repo=repo,
+        worktree_path=worktree_path,
+        base_branch=base_branch,
+        cli_command=getattr(
+            config, "cli_command", 'codex review -c sandbox_mode="read-only"'
+        ),
+        timeout_seconds=getattr(config, "timeout_seconds", 900),
+        session_id=session_id,
+    )
+    finish["ok"] = outcome.worth_posting
 
     if not outcome.worth_posting:
         log_event(
@@ -2861,6 +2980,7 @@ async def _step_publish(run: _DevRun) -> None:
         issue_number=run.issue_number,
         issue_title=run.issue.get("title", ""),
         session_id=run.session_id,
+        draft=run.review_mode == "required",
     )
     if run.result.success:
         run.result = await run.publisher.publish(run.result)
@@ -2955,7 +3075,6 @@ async def _step_review(run: _DevRun) -> None:
     pr_number_for_review = run.pr_number_for_review
     repo = run.repo
     session_id = run.session_id
-    worktree = run.worktree
     code_review = run.code_review
     # Starts as a failure, not as "fine". Every branch below
     # overwrites it; this value is what survives if a new
@@ -2998,15 +3117,6 @@ async def _step_review(run: _DevRun) -> None:
             repo=repo,
             error_type=type(e).__name__,
         )
-    # The reviewer reads a fresh copy of the commit the relay
-    # pushed, never the agent's worktree (#263): files the
-    # agent left there that git follows (a nested repository
-    # with its own config) would run as code in the
-    # reviewer's process, outside the agent sandbox. No
-    # pushed commit means nothing fixed to review, which is
-    # reported as not reviewed rather than reviewed.
-    review_sha = run.publisher.last_pushed_sha
-    review_path: Path | None = None
     # Switched off: nothing is read, so no copy is made, and
     # the wrapper reports it as the operator's own choice.
     review_off = getattr(code_review, "method", "cli") == "off"
@@ -3022,85 +3132,288 @@ async def _step_review(run: _DevRun) -> None:
             state_db=run.state_db,
             issue_number=run.issue_number,
         )
-    elif review_base is not None and review_sha is None:
-        review_report = ReviewReport(
-            posted=False,
-            status="no_pushed_head",
-            detail="no record of the commit the relay pushed",
-        )
     elif review_base is not None:
-        try:
-            review_path = await worktree.make_review_copy(
-                repo, review_sha,
-                base_branch=review_base, base_sha=review_base_sha,
-            )
-        except Exception as e:
-            review_report = ReviewReport(
-                posted=False,
-                status="copy_failed",
-                detail=(
-                    "could not make a clean copy to review "
-                    f"({type(e).__name__}: {str(e)[:160]})"
-                ),
-            )
-            log_event(
-                _logger,
-                "dev.code_review.copy_failed",
-                session_id=session_id,
-                repo=repo,
-                error_type=type(e).__name__,
-                error=str(e)[:200],
-            )
-    if review_path is not None:
-        try:
-            review_report = await _review_and_comment(
-                github=run.github,
-                repo=repo,
-                session_id=session_id,
-                pr_number=pr_number_for_review,
-                worktree_path=review_path,
-                base_branch=review_base,
-                config=code_review,
-                state_db=run.state_db,
-                issue_number=run.issue_number,
-                head_sha=review_sha,
-                base_sha=review_base_sha,
-            )
-        except Exception as e:
-            review_report = ReviewReport(
-                posted=False,
-                status="errored",
-                detail=f"{type(e).__name__}: {str(e)[:200]}",
-            )
-            log_event(
-                _logger,
-                "dev.code_review.errored",
-                session_id=session_id,
-                repo=repo,
-                error_type=type(e).__name__,
-                error=str(e)[:200],
-            )
-        finally:
-            try:
-                await worktree.remove_review_copy(review_path)
-            except Exception as e:
-                log_event(
-                    _logger,
-                    "dev.code_review.copy_cleanup_failed",
-                    session_id=session_id,
-                    repo=repo,
-                    error_type=type(e).__name__,
-                )
+        assert review_base_sha is not None
+        review_report = await _review_until_current(
+            run, review_base, review_base_sha,
+        )
     run.review_report = review_report
-    if run.review_mode == "required" and not review_report.posted:
+    if run.review_mode != "required":
+        return
+    if not review_report.posted:
         # Required means findings reached the pull request. Every other
         # outcome — a reviewer that could not run, one that read nothing,
-        # a comment that failed to post, findings kept in the log — is
-        # not a pass (#226).
+        # a comment that failed to post, findings kept in the log, a head
+        # that moved after the review — is not a pass (#226, #222).
         reason = review_report.detail.strip() or review_report.status
         _fail_required_step(
             run, "review", f"the review did not post ({reason})"
         )
+        return
+    # The PR was opened as a draft (or put back to one when this run
+    # pushed to it). A review passed on its current head, so it is ready.
+    try:
+        await run.github.set_pr_draft(repo, pr_number_for_review, False)
+    except Exception as e:
+        log_event(
+            _logger,
+            "dev.code_review.ready_failed",
+            session_id=session_id,
+            repo=repo,
+            pr_number=pr_number_for_review,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        _fail_required_step(
+            run, "review",
+            f"the review passed on {review_report.head_sha} but the PR "
+            f"could not be marked ready ({type(e).__name__}: "
+            f"{str(e)[:160]})",
+        )
+
+
+# How many times the review runs when the PR's head keeps moving under it
+# (#222). Each round is a full review, so this is small: a head that moves
+# three times in a row is somebody pushing, and the run says so.
+MAX_REVIEW_ROUNDS = 3
+
+
+async def _pr_head_sha(run: _DevRun) -> str | None:
+    """The commit GitHub has as the PR's head, or None when it could not
+    be read. Never a guess: an unreadable head is not the reviewed one."""
+    assert run.pr_number_for_review is not None
+    try:
+        head = await run.github.get_pr_head(run.repo, run.pr_number_for_review)
+    except Exception as e:
+        log_event(
+            _logger,
+            "dev.code_review.head_unknown",
+            session_id=run.session_id,
+            repo=run.repo,
+            pr_number=run.pr_number_for_review,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        return None
+    sha = head.get("sha") if isinstance(head, dict) else None
+    return sha.strip() if isinstance(sha, str) and sha.strip() else None
+
+
+async def _review_until_current(
+    run: _DevRun, base_branch: str, base_sha: str,
+) -> ReviewReport:
+    """Review the pushed commit, then again while the PR's head moved (#222).
+
+    A verdict is about one commit. After each review the PR's head is
+    read from GitHub: the same commit means the verdict is current, a
+    different one means somebody pushed after the review, so the verdict
+    is recorded as stale and the new head is reviewed. A head that cannot
+    be read, or that is still moving after :data:`MAX_REVIEW_ROUNDS`
+    reviews, is not a pass. A head that cannot be read fails only a
+    required review.
+    """
+    sha = run.publisher.last_pushed_sha if run.publisher else None
+    for _ in range(MAX_REVIEW_ROUNDS):
+        report = await _review_commit(run, sha, base_branch, base_sha)
+        if not report.posted:
+            return report
+        head = await _pr_head_sha(run)
+        if head == sha:
+            return report
+        if head is None and run.review_mode != "required":
+            # Not a gate here: the comment names the commit it read, so a
+            # reader can still compare it with the PR (logged above).
+            return report
+        if head is None:
+            return dataclasses.replace(
+                report,
+                posted=False,
+                status="head_unknown",
+                detail=(
+                    f"reviewed {sha}, but could not read the PR's current "
+                    "head to confirm the review is about it"
+                ),
+            )
+        state_db = run.state_db
+        emit_event(
+            state_db, EventKind.REVIEW_STALE,
+            lambda: {
+                "repo": run.repo,
+                "issue_number": run.issue_number,
+                "session_id": run.session_id,
+                "detail": {
+                    "pr_number": run.pr_number_for_review,
+                    "head_sha": sha,
+                    "current_sha": head,
+                },
+            },
+        )
+        log_event(
+            _logger,
+            "dev.code_review.stale",
+            session_id=run.session_id,
+            repo=run.repo,
+            pr_number=run.pr_number_for_review,
+            reviewed_sha=sha,
+            current_sha=head,
+        )
+        await _comment_on_pr_best_effort(
+            run,
+            f"The PR's head moved to `{head}` after the review of `{sha}`. "
+            "That review is stale: this PR needs review again, and the "
+            "relay is reviewing the new head.",
+        )
+        fetched = await _fetch_for_review(run, head)
+        if fetched is not None:
+            return dataclasses.replace(
+                report, posted=False, status="stale",
+                detail=f"reviewed {sha}, but the PR is now at {head}; {fetched}",
+                head_sha=sha,
+            )
+        sha = head
+    return ReviewReport(
+        posted=False,
+        status="stale",
+        detail=(
+            f"the PR's head kept moving: {MAX_REVIEW_ROUNDS} reviews, and it "
+            f"is now at {head}, which none of them read"
+        ),
+        head_sha=sha,
+    )
+
+
+async def _fetch_for_review(run: _DevRun, head: str) -> str | None:
+    """Bring the PR's new head into the bare clone, so the next review
+    copy can check it out. Returns None, or why it could not.
+
+    Fetched from the pull request's own ref: the run's branch is checked
+    out in its worktree, and the clone's normal fetch leaves such branches
+    out (#253). The bare clone is shared, so this holds the repo lock: the
+    CI wait may have left it released.
+    """
+    assert run.pr_number_for_review is not None
+    try:
+        if not run.lock.held and not await run.lock.reacquire():
+            return "could not take the repo lock to fetch the new head"
+        fetched = await run.worktree.fetch_pr_head(
+            run.repo, int(run.pr_number_for_review),
+        )
+    except Exception as e:
+        log_event(
+            _logger,
+            "dev.code_review.fetch_failed",
+            session_id=run.session_id,
+            repo=run.repo,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        return f"could not fetch the new head ({type(e).__name__})"
+    if fetched != head:
+        # It moved again between the two reads: the next round sees it.
+        return f"the PR's head moved again while it was fetched (now {fetched})"
+    return None
+
+
+async def _comment_on_pr_best_effort(run: _DevRun, body: str) -> None:
+    """A comment on the PR that must not fail the run if `gh` does."""
+    assert run.pr_number_for_review is not None
+    try:
+        await run.github.comment_on_pr(run.repo, run.pr_number_for_review, body)
+    except Exception as e:
+        log_event(
+            _logger,
+            "dev.code_review.comment_failed",
+            session_id=run.session_id,
+            repo=run.repo,
+            pr_number=run.pr_number_for_review,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+
+
+async def _review_commit(
+    run: _DevRun, sha: str | None, base_branch: str, base_sha: str,
+) -> ReviewReport:
+    """Review one commit, from a fresh copy of it, and report the verdict
+    with the commit it is about."""
+    repo = run.repo
+    session_id = run.session_id
+    worktree = run.worktree
+    # The reviewer reads a fresh copy of the commit the relay
+    # pushed, never the agent's worktree (#263): files the
+    # agent left there that git follows (a nested repository
+    # with its own config) would run as code in the
+    # reviewer's process, outside the agent sandbox. No
+    # pushed commit means nothing fixed to review, which is
+    # reported as not reviewed rather than reviewed.
+    if sha is None:
+        return ReviewReport(
+            posted=False,
+            status="no_pushed_head",
+            detail="no record of the commit the relay pushed",
+        )
+    try:
+        review_path = await worktree.make_review_copy(
+            repo, sha, base_branch=base_branch, base_sha=base_sha,
+        )
+    except Exception as e:
+        log_event(
+            _logger,
+            "dev.code_review.copy_failed",
+            session_id=session_id,
+            repo=repo,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        return ReviewReport(
+            posted=False,
+            status="copy_failed",
+            detail=(
+                "could not make a clean copy to review "
+                f"({type(e).__name__}: {str(e)[:160]})"
+            ),
+            head_sha=sha,
+        )
+    try:
+        report = await _review_and_comment(
+            github=run.github,
+            repo=repo,
+            session_id=session_id,
+            pr_number=run.pr_number_for_review,
+            worktree_path=review_path,
+            base_branch=base_branch,
+            config=run.code_review,
+            state_db=run.state_db,
+            issue_number=run.issue_number,
+            head_sha=sha,
+            base_sha=base_sha,
+        )
+    except Exception as e:
+        log_event(
+            _logger,
+            "dev.code_review.errored",
+            session_id=session_id,
+            repo=repo,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        report = ReviewReport(
+            posted=False,
+            status="errored",
+            detail=f"{type(e).__name__}: {str(e)[:200]}",
+        )
+    finally:
+        try:
+            await worktree.remove_review_copy(review_path)
+        except Exception as e:
+            log_event(
+                _logger,
+                "dev.code_review.copy_cleanup_failed",
+                session_id=session_id,
+                repo=repo,
+                error_type=type(e).__name__,
+            )
+    return dataclasses.replace(report, head_sha=sha)
 
 
 @dataclass(frozen=True)

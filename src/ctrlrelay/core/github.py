@@ -581,8 +581,13 @@ class GitHubCLI:
         body: str,
         head: str,
         base: str,
+        draft: bool = False,
     ) -> dict[str, Any]:
         """Create a pull request; return ``{"number", "url"}``.
+
+        ``draft`` opens it as a draft (#222): a repository whose review is
+        required gets a PR that reads "not ready" until a review passed
+        on its current head.
 
         ``gh pr create`` has no ``--json`` flag (it prints the new
         pull request's URL), so the number is read from that URL. The
@@ -599,6 +604,7 @@ class GitHubCLI:
             "--body", body,
             "--head", head,
             "--base", base,
+            *(("--draft",) if draft else ()),
         )
         url = ""
         for line in output.splitlines():
@@ -611,6 +617,25 @@ class GitHubCLI:
                 f"gh pr create returned no pull request URL: {output.strip()[:200]!r}"
             )
         return {"number": int(match.group(1)), "url": url}
+
+    async def get_pr_head(self, repo: str, pr_number: int) -> dict[str, Any]:
+        """``{"sha", "draft"}`` for a pull request: the commit GitHub has
+        as its head, and whether it is a draft (#222)."""
+        output = await self._run_gh(
+            "pr", "view", str(pr_number),
+            "--repo", repo,
+            "--json", "headRefOid,isDraft",
+        )
+        data = json.loads(output)
+        return {"sha": data.get("headRefOid"), "draft": data.get("isDraft")}
+
+    async def set_pr_draft(self, repo: str, pr_number: int, draft: bool) -> None:
+        """Mark a pull request as a draft, or as ready for review (#222)."""
+        await self._run_gh(
+            "pr", "ready", str(pr_number),
+            "--repo", repo,
+            *(("--undo",) if draft else ()),
+        )
 
     async def get_default_branch(self, repo: str) -> str:
         """The repository's default branch, as GitHub reports it.
