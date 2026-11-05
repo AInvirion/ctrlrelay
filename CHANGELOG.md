@@ -18,10 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so it starts on the first poll after its last blocker closes. Blockers
   that cannot be read (an API error, a rate limit, a 404 on a GitHub
   without the dependencies API) hold the issue the same way
-  (`poll.issue.blockers_unknown`) and are never read as "no blockers". A
-  held issue stays out of `seen_issues` and is recorded in `blocked` in
-  `poller_state.json`, so a restart neither loses it nor repeats the chat
-  line. Free text such as "Starts after: #A" is not read; use the link.
+  (`poll.issue.blockers_unknown`) and are never read as "no blockers"; the
+  chat is told only after 3 failed polls in a row. A held issue stays out
+  of `seen_issues` and is recorded in `blocked` in `poller_state.json`, so
+  a restart neither loses it nor repeats the chat line, and its
+  self-assignment is not re-checked while it waits, so a failed check
+  cannot drop it. Free text such as "Starts after: #A" is not read; use the link.
 
 ## [0.22.0] - 2026-11-05
 

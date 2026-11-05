@@ -22,7 +22,11 @@ import pytest
 
 from ctrlrelay.core.blockers import hold_if_blocked
 from ctrlrelay.core.github import GitHubCLI, GitHubError
-from ctrlrelay.core.poller import IssuePoller, run_poll_loop
+from ctrlrelay.core.poller import (
+    BLOCKERS_UNREADABLE_AFTER,
+    IssuePoller,
+    run_poll_loop,
+)
 from tests._poller_fakes import wire_search
 
 REPO = "owner/repo"
@@ -58,6 +62,11 @@ def _issue_row(repo: str, number: int, state: str) -> dict[str, Any]:
         "updated_at": "2026-11-01T00:00:00Z",
         "author_association": "OWNER",
     }
+
+
+def _held(blockers: list[str] | None, failures: int = 0) -> dict[str, Any]:
+    """A poller ``blocked`` entry."""
+    return {"open": blockers, "failures": failures}
 
 
 def _as_jq_lines(rows: list[dict[str, Any]]) -> str:
@@ -227,7 +236,7 @@ async def test_an_open_blocker_holds_the_issue_and_is_logged(
     with caplog.at_level("INFO"):
         await relay.poll()
     assert relay.started == []
-    assert poller.blocked == {REPO: {12: ["#5"]}}
+    assert poller.blocked == {REPO: {12: _held(["#5"])}}
     assert 12 not in poller.seen_issues.get(REPO, set())
     logged = [r for r in caplog.records if r.getMessage() == "poll.issue.blocked"]
     assert [getattr(r, "blocked_by", None) for r in logged] == [["#5"]]
@@ -243,7 +252,7 @@ async def test_a_blocker_in_another_repository_holds_it(tmp_path: Path) -> None:
     relay = _Relay(gh, poller)
     await relay.poll()
     assert relay.started == []
-    assert poller.blocked == {REPO: {12: [f"{OTHER}#9"]}}
+    assert poller.blocked == {REPO: {12: _held([f"{OTHER}#9"])}}
     assert f"blocked by {OTHER}#9" in relay.chat[0]
 
 
@@ -264,10 +273,17 @@ async def test_a_failed_lookup_does_not_start_and_is_retried(
     with caplog.at_level("INFO"):
         await relay.poll()
     assert relay.started == []
-    assert poller.blocked == {REPO: {12: None}}
+    assert poller.blocked == {REPO: {12: _held(None, failures=1)}}
     assert any(r.getMessage() == "poll.issue.blockers_unknown"
                for r in caplog.records)
+    # One failure is not worth a chat line; it is said once it persists.
+    assert relay.chat == []
+    for _ in range(BLOCKERS_UNREADABLE_AFTER - 1):
+        await relay.poll()
+    assert relay.started == []
     assert len(relay.chat) == 1 and "could not be read" in relay.chat[0]
+    await relay.poll()
+    assert len(relay.chat) == 1
 
     # The next poll asks again, and starts it once the answer is "none open".
     blockers.error = None
@@ -311,11 +327,90 @@ async def test_the_chat_hears_it_once_not_every_poll(tmp_path: Path) -> None:
     await relay.poll()
     assert len(relay.chat) == 1
 
-    # Going from "blocked" to "could not read" is a different reason.
+    # "Could not read", once it has persisted, is a different reason.
+    blockers.error = GitHubError("gh failed: HTTP 502")
+    for _ in range(BLOCKERS_UNREADABLE_AFTER + 2):
+        await relay.poll()
+    assert len(relay.chat) == 2
+
+
+@pytest.mark.asyncio
+async def test_one_failed_lookup_between_the_same_blockers_says_nothing(
+    tmp_path: Path,
+) -> None:
+    """blocked -> one failed lookup -> blocked by the same: one chat line
+    in all, not three."""
+    blockers = _Blockers()
+    blockers.rows[12] = [_issue_row(REPO, 5, "open")]
+    gh = _github(blockers)
+    poller = _poller(gh, tmp_path / "s.json")
+    relay = _Relay(gh, poller)
+
+    await relay.poll()
     blockers.error = GitHubError("gh failed: HTTP 502")
     await relay.poll()
+    # The last blockers read are kept through the blip.
+    assert poller.blocked == {REPO: {12: _held(["#5"], failures=1)}}
+    blockers.error = None
+    await relay.poll()
+    assert len(relay.chat) == 1
+    assert poller.blocked == {REPO: {12: _held(["#5"])}}
+    assert relay.started == []
+
+
+@pytest.mark.asyncio
+async def test_recovering_after_a_long_outage(tmp_path: Path) -> None:
+    """Once the chat was told the blockers cannot be read, finding the same
+    blockers again is silent, and finding different ones is said."""
+    blockers = _Blockers()
+    blockers.rows[12] = [_issue_row(REPO, 5, "open")]
+    gh = _github(blockers)
+    relay = _Relay(gh, _poller(gh, tmp_path / "s.json"))
+
+    await relay.poll()
+    blockers.error = GitHubError("gh failed: HTTP 502")
+    for _ in range(BLOCKERS_UNREADABLE_AFTER):
+        await relay.poll()
+    assert len(relay.chat) == 2
+    blockers.error = None
     await relay.poll()
     assert len(relay.chat) == 2
+
+    blockers.error = GitHubError("gh failed: HTTP 502")
+    for _ in range(BLOCKERS_UNREADABLE_AFTER):
+        await relay.poll()
+    assert len(relay.chat) == 3
+    blockers.error = None
+    blockers.rows[12] = [_issue_row(OTHER, 9, "open")]
+    await relay.poll()
+    assert len(relay.chat) == 4 and f"blocked by {OTHER}#9" in relay.chat[3]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_events_call_while_held_does_not_lose_the_issue(
+    tmp_path: Path,
+) -> None:
+    """A held assignment-only issue is offered every poll. A failed
+    self-assignment (events) call marks an issue seen for good, so the
+    poll does not ask again for an issue already held: it was confirmed
+    when it was first held."""
+    blockers = _Blockers()
+    blockers.rows[12] = [_issue_row(REPO, 5, "open")]
+    gh = _github(blockers)
+    poller = _poller(gh, tmp_path / "s.json")
+    relay = _Relay(gh, poller)
+
+    await relay.poll()
+    assert relay.started == []
+    gh.list_assignment_events = AsyncMock(
+        side_effect=GitHubError("gh failed: HTTP 502"),
+    )
+    await relay.poll()
+    assert relay.started == []
+
+    blockers.rows[12] = [_issue_row(REPO, 5, "closed")]
+    await relay.poll()
+    assert relay.started == [12]
 
 
 @pytest.mark.asyncio
@@ -335,10 +430,10 @@ async def test_a_held_issue_survives_a_restart(tmp_path: Path) -> None:
 
     on_disk = json.loads(state_file.read_text())
     assert 12 not in on_disk["seen_issues"].get(REPO, [])
-    assert on_disk["blocked"] == {REPO: {"12": ["#5"]}}
+    assert on_disk["blocked"] == {REPO: {"12": _held(["#5"])}}
 
     second = _Relay(gh, _poller(gh, state_file))
-    assert second.poller.blocked == {REPO: {12: ["#5"]}}
+    assert second.poller.blocked == {REPO: {12: _held(["#5"])}}
     await second.poll()
     assert second.started == []
     assert second.chat == []
@@ -356,7 +451,7 @@ async def test_closing_the_held_issue_forgets_the_hold(tmp_path: Path) -> None:
     poller = _poller(gh, tmp_path / "s.json")
     relay = _Relay(gh, poller)
     await relay.poll()
-    assert poller.blocked == {REPO: {12: ["#5"]}}
+    assert poller.blocked == {REPO: {12: _held(["#5"])}}
 
     # Closed between the poll and its turn: the re-read drops it.
     gh.get_issue_gate = AsyncMock(return_value={

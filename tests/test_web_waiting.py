@@ -19,7 +19,7 @@ import pytest
 
 from ctrlrelay.core.config import Config
 from ctrlrelay.core.github import GitHubCLI, GitHubError
-from ctrlrelay.core.poller import IssuePoller
+from ctrlrelay.core.poller import BLOCKERS_UNREADABLE_AFTER, IssuePoller
 from ctrlrelay.web.waiting import (
     REASON_BLOCKERS_UNKNOWN,
     REASON_CONFIRM,
@@ -358,9 +358,19 @@ def test_load_blocked_reads_the_poller_state_file(tmp_path: Path) -> None:
         github=GitHubCLI(), username="octo", repos=[BETA], state_file=state_file,
     )
     poller.note_blocked(BETA, 48, ["#5"])
-    poller.note_blocked(BETA, 47, None)
+    poller.note_blockers_unreadable(BETA, 47)
+    # Last read blockers are shown through a failed lookup or two, and
+    # "could not read" once the failures persist.
+    poller.note_blocked(BETA, 46, ["#4"])
+    poller.note_blockers_unreadable(BETA, 46)
+    poller.note_blocked(BETA, 45, ["#3"])
+    for _ in range(BLOCKERS_UNREADABLE_AFTER):
+        poller.note_blockers_unreadable(BETA, 45)
 
-    assert load_blocked(state_file) == {f"{BETA}#48": ["#5"], f"{BETA}#47": None}
+    assert load_blocked(state_file) == {
+        f"{BETA}#48": ["#5"], f"{BETA}#47": None,
+        f"{BETA}#46": ["#4"], f"{BETA}#45": None,
+    }
     assert load_blocked(tmp_path / "nope.json") == {}
 
 

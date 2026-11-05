@@ -641,18 +641,23 @@ poller claims an issue it reads that issue's blockers
 - **The blockers could not be read** (an API error, the GitHub API budget
   used up, a 404 from a GitHub Enterprise Server without the dependencies
   API): treated like an open blocker, never as "no blockers". The log has
-  `poll.issue.blockers_unknown` with the error, the status page says
-  `could not read its blockers`, the chat is told once per issue, and the
-  next poll tries again.
+  `poll.issue.blockers_unknown` with the error on every failed poll, and
+  the next poll tries again. A single failure is usually a blip, so the
+  status page keeps showing the blockers last read and the chat is not
+  told; after 3 failed polls in a row the page says `could not read its
+  blockers` and the chat is told once per issue. If the blockers can then
+  be read and are the same as before, nothing more is said.
 
 Only the dependency link counts. A line such as "Starts after: #A" in the
 issue body is not read, so add the link as well.
 
 A held issue is kept out of `seen_issues` (that is what brings it back)
 and recorded in `blocked` in the same `poller_state.json`, so a restart
-neither loses it nor repeats the chat line. Each poll costs a held issue
-one extra REST call (`core` budget) on top of the reads every candidate
-issue gets. A blocked issue that is closed or loses its trigger is dropped
+neither loses it nor repeats the chat line. Its self-assignment is not
+checked again while it is held: it was confirmed when the issue was first
+held, and a failed check would otherwise mark the issue handled for good.
+Each poll costs a held issue one extra REST call (`core` budget) for its
+blockers, plus the re-read every issue gets just before it starts. A blocked issue that is closed or loses its trigger is dropped
 from `blocked` when the poller next sees it.
 
 ## Stuck runs
@@ -880,8 +885,9 @@ poller holds the set in memory and rewrites the file from it).
 
 An issue held back by an open GitHub blocker (see [Issues blocked by
 other issues](#issues-blocked-by-other-issues)) is never in `seen_issues`
-while it waits; it is listed in `blocked[<repo>]` with its open blockers
-(`null` when they could not be read). Nothing needs deleting: it starts on
+while it waits; it is listed in `blocked[<repo>]` as `{"open": [...],
+"failures": n}`: the open blockers as last read (`null` if never read)
+and how many lookups have failed in a row since. Nothing needs deleting: it starts on
 its own once the blockers close.
 
 ### A repo whose history was replaced

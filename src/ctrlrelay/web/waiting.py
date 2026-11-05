@@ -31,7 +31,7 @@ from typing import Any
 
 from ctrlrelay.core.config import Config
 from ctrlrelay.core.github import GitHubCLI
-from ctrlrelay.core.poller import IssuePoller
+from ctrlrelay.core.poller import BLOCKERS_UNREADABLE_AFTER, IssuePoller
 from ctrlrelay.web.links import github_url
 
 REASON_CONFIRM = "waits for the poller to confirm the assignment"
@@ -126,19 +126,25 @@ def load_seen(poller_state_file: Path) -> set[str]:
 
 def load_blocked(poller_state_file: Path) -> dict[str, list[str] | None]:
     """The poller's ``blocked`` issues (#310) as ``"owner/repo#N"`` keys:
-    the open blockers, or ``None`` when the poller could not read them.
-    A missing, unreadable or malformed file gives an empty dict, as for
-    :func:`load_seen`; the poller re-checks every held issue each poll."""
+    the open blockers, or ``None`` when the poller cannot read them. Last
+    read blockers are shown through a failed lookup or two; ``None`` once
+    the lookups have failed as many polls in a row as it takes to tell the
+    chat, or when they have never been read. A missing, unreadable or
+    malformed file gives an empty dict, as for :func:`load_seen`; the
+    poller re-checks every held issue each poll."""
     try:
         data = json.loads(poller_state_file.read_text())
         raw = data.get("blocked", {})
         out: dict[str, list[str] | None] = {}
         for repo, entries in raw.items():
-            for n, blockers in entries.items():
-                if blockers is None:
-                    out[seen_key(repo, int(n))] = None
+            for n, entry in entries.items():
+                blockers = entry.get("open")
+                failures = entry.get("failures", 0)
+                key = seen_key(repo, int(n))
+                if blockers is None or failures >= BLOCKERS_UNREADABLE_AFTER:
+                    out[key] = None
                 elif isinstance(blockers, list):
-                    out[seen_key(repo, int(n))] = [str(b) for b in blockers]
+                    out[key] = [str(b) for b in blockers]
         return out
     except Exception:
         return {}

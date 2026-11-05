@@ -11,7 +11,9 @@ The dependency link is the only source. Free text such as "Starts after:
 
 "Could not read the blockers" (an API error, a rate limit, a 404 from a
 GitHub without the dependencies API) is never read as "no blockers": the
-issue is held the same way and asked about again on the next poll.
+issue is held the same way and asked about again on the next poll. The chat
+hears about it only once it has failed several polls in a row, since one
+failure is usually gone by the next poll.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ctrlrelay.core.obs import get_logger, log_event
+from ctrlrelay.core.poller import BLOCKERS_UNREADABLE_AFTER
 
 _logger = get_logger("core.blockers")
 
@@ -65,7 +68,7 @@ async def hold_if_blocked(
             _logger, "poll.issue.blockers_unknown", repo=repo,
             issue_number=issue_number, error=error,
         )
-        news = poller.note_blocked(repo, issue_number, None)
+        news = poller.note_blockers_unreadable(repo, issue_number)
         return BlockerHold(
             line=(
                 f"{where} left for the next poll: could not read its "
@@ -73,9 +76,9 @@ async def hold_if_blocked(
             ),
             chat=(
                 f"⏸️ {where} is not started: its GitHub \"blocked by\" "
-                f"issues could not be read ({error}). It is asked again "
-                "every poll and starts once they can be read and none is "
-                "open."
+                f"issues could not be read {BLOCKERS_UNREADABLE_AFTER} "
+                f"polls in a row ({error}). It is asked again every poll "
+                "and starts once they can be read and none is open."
             ) if news else None,
         )
 
