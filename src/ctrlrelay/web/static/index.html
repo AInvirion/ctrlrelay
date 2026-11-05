@@ -465,6 +465,14 @@ function runningCard(card, now) {
   if (card.looks_stuck) {
     top.appendChild(el("span", "tag stuck", "looks stuck"));
   }
+  if (typeof card.running_command === "string" && card.running_command) {
+    // #309: no new step because the agent is inside one long command.
+    var cmd = el("span", "tag", "running ");
+    cmd.appendChild(el("code", null, card.running_command));
+    top.appendChild(cmd);
+    top.appendChild(ticking(typeof card.last_step_ts === "number"
+      ? now - card.last_step_ts : null, "for ", ""));
+  }
   box.appendChild(top);
   box.appendChild(phaseBar(card.phase));
 

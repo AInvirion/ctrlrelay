@@ -62,7 +62,7 @@ RUNNING_KEYS = {
     "session_id", "pipeline", "repo", "issue_number", "title", "started",
     "started_ts", "elapsed_s", "phase", "phase_source", "last_command",
     "last_step", "last_step_ts", "looks_stuck", "reason", "url",
-    "current_activity", "pr_url",
+    "current_activity", "pr_url", "running_command",
 }
 NEEDS_KEYS = {
     "session_id", "pipeline", "repo", "issue_number", "title", "question",
@@ -137,6 +137,8 @@ def _status(tmp_path: Path, now: int, **kw) -> dict:
         now=now,
         home=kw.pop("home", tmp_path),
         server=kw.pop("server", lambda: SERVER_OK),
+        # Hermetic: the real process table is never read by a test.
+        processes=kw.pop("processes", None),
         **kw,
     )
 
@@ -1469,3 +1471,100 @@ def test_needs_you_refs_stop_at_twenty(tmp_path: Path) -> None:
     refs = _only(_status(tmp_path, 2_000)["needs_you"], "s-many")["refs"]
 
     assert [r["number"] for r in refs] == list(range(1, 21))
+
+
+# --- #309: a command still running is not stuck -------------------------------
+
+POLLER = 4000
+
+
+def _ps(*rows: tuple[int, int, str, str]) -> str:
+    """``ps -axo pid=,ppid=,etime=,comm=`` output, as both platforms print it."""
+    return "".join(f"{pid:>7} {ppid:>7} {etime:>12} {comm}\n"
+                   for pid, ppid, etime, comm in rows)
+
+
+def _stuck_candidate(tmp_path: Path, owner_pid: int | None = POLLER) -> int:
+    """A running session whose last transcript step is 20 minutes old."""
+    db = _db(tmp_path)
+    wt = _worktree(tmp_path, "w1")
+    _fixture_transcript(tmp_path, wt)
+    _session(db, "s1", worktree=wt, started_at=FIXTURE_LAST_TS - 60)
+    db.execute("UPDATE sessions SET owner_pid = ? WHERE id = 's1'", (owner_pid,))
+    db.commit()
+    return FIXTURE_LAST_TS + 1200
+
+
+def test_an_agent_inside_one_long_command_is_not_stuck(tmp_path: Path) -> None:
+    now = _stuck_candidate(tmp_path)
+    ps = _ps(
+        (1, 0, "10-00:00:00", "/sbin/init"),
+        (POLLER, 1, "2-01:00:00", "python3"),
+        (4100, POLLER, "40:00", "claude"),                 # the agent
+        (4101, 4100, "38:00", "node"),                      # an MCP server, older
+        (4200, 4100, "19:58", "/usr/bin/bash"),             # the step's command
+        (4201, 4200, "19:57", "/home/u/.venv/bin/pytest"),  # what it started
+        (4300, POLLER, "00:03", "gh"),                      # the poller's own call
+    )
+    card = _only(_status(tmp_path, now, processes=lambda: ps)["running"], "s1")
+    assert card["looks_stuck"] is False
+    assert card["running_command"] == "bash"
+
+
+def test_an_idle_agent_is_still_stuck(tmp_path: Path) -> None:
+    now = _stuck_candidate(tmp_path)
+    ps = _ps(
+        (POLLER, 1, "2-01:00:00", "python3"),
+        (4100, POLLER, "40:00", "claude"),
+        (4101, 4100, "38:00", "node"),      # started before the last step
+        (4300, POLLER, "00:03", "gh"),      # a child of the poller, not the agent
+    )
+    card = _only(_status(tmp_path, now, processes=lambda: ps)["running"], "s1")
+    assert card["looks_stuck"] is True
+    assert card["running_command"] is None
+
+
+@pytest.mark.parametrize("owner, reader, why", [
+    (POLLER, None, "no process reader"),
+    (POLLER, lambda: (_ for _ in ()).throw(OSError("ps missing")), "ps missing"),
+    (POLLER, lambda: "garbage\n", "no process lines"),
+    (None, lambda: _ps((POLLER, 1, "01:00", "python3")), "no owner process"),
+])
+def test_could_not_look_stays_stuck_and_says_why(
+    tmp_path: Path, owner, reader, why,
+) -> None:
+    now = _stuck_candidate(tmp_path, owner_pid=owner)
+    card = _only(_status(tmp_path, now, processes=reader)["running"], "s1")
+    assert card["looks_stuck"] is True
+    assert why in (card["reason"] or "")
+
+
+def test_a_fresh_card_never_reads_the_process_table(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    wt = _worktree(tmp_path, "w1")
+    _fixture_transcript(tmp_path, wt)
+    _session(db, "s1", worktree=wt, started_at=FIXTURE_LAST_TS - 60)
+    calls: list[int] = []
+
+    def reader() -> str:
+        calls.append(1)
+        return ""
+
+    card = _only(
+        _status(tmp_path, FIXTURE_LAST_TS + 60, processes=reader)["running"], "s1",
+    )
+    assert card["looks_stuck"] is False
+    assert calls == []
+
+
+@pytest.mark.parametrize("text, seconds", [
+    ("05", None), ("01:05", 65), ("02:01:05", 7265), ("3-02:01:05", 266465),
+])
+def test_ps_elapsed_time(text: str, seconds: int | None) -> None:
+    from ctrlrelay.web.status import _etime_s
+
+    if seconds is None:
+        with pytest.raises(ValueError):
+            _etime_s(text)
+    else:
+        assert _etime_s(text) == seconds
