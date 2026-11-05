@@ -4228,20 +4228,8 @@ def poller_start(
             # `blocked` with its question saved, and is resumed when the
             # answer comes; the repo lock it held would only wedge the
             # repo until then.
-            from ctrlrelay.core.claims import PROCESS_RUN
-            try:
-                for sid in state_db.release_locks_of_blocked_sessions(
-                    PROCESS_RUN,
-                ):
-                    log_event(
-                        _logger, "poller.blocked_lock_released",
-                        session_id=sid,
-                    )
-            except Exception as e:
-                log_event(
-                    _logger, "poller.blocked_lock_release_failed",
-                    reason=type(e).__name__, error=str(e)[:200],
-                )
+            from ctrlrelay.core.orphans import release_dead_blocked_locks
+            release_dead_blocked_locks(state_db)
 
             try:
                 await github_budget.refresh()

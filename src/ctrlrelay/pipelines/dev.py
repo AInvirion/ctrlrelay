@@ -2164,17 +2164,23 @@ def _park_question(run: _DevRun, question: str) -> None:
         )
 
 
-def _take_answer(run: _DevRun, answer: str) -> None:
+def _take_answer(run: _DevRun, answer: str) -> bool:
     """The wait got its answer: close the parked row so nothing else
-    resumes the session with it, and mark the session running again."""
+    resumes the session with it, and mark the session running again.
+
+    Returns ``False`` when the saved question had already been answered
+    another way (see ``StateDB.take_parked_answer``): that first answer
+    stands and the sweeper resumes with it, so this one must not. A failed
+    write is logged and returns ``True``, as before the row existed."""
     try:
-        run.state_db.take_parked_answer(run.session_id, answer)
+        return run.state_db.take_parked_answer(run.session_id, answer)
     except Exception as e:
         log_event(
             _logger, "dev.question.unpark_failed", session_id=run.session_id,
             repo=run.repo, issue_number=run.issue_number,
             error_type=type(e).__name__, error=str(e)[:200],
         )
+        return True
 
 
 async def _answer_while_blocked(
@@ -2233,7 +2239,26 @@ async def _answer_while_blocked(
                 question=question,
                 outputs=result.outputs,
             )
-        _take_answer(run, answer)
+        if not _take_answer(run, answer):
+            # Answered first through the saved question (#324). That
+            # answer stands; the sweeper resumes with it once this run
+            # has let go of the repo lock.
+            log_event(
+                _logger, "dev.question.answered_elsewhere",
+                session_id=run.session_id, repo=run.repo,
+                issue_number=run.issue_number,
+            )
+            return PipelineResult(
+                success=False,
+                blocked=True,
+                session_id=run.session_id,
+                summary=(
+                    f"{deferred}: answered through the saved question; "
+                    "the sweeper resumes it with that answer"
+                ),
+                question=question,
+                outputs=result.outputs,
+            )
         rounds += 1
         result = await resume(run.ctx, answer)
         # A resumed worker is the one whose exit code the failure

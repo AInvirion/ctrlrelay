@@ -174,32 +174,40 @@ async def test_the_answer_after_a_restart_resumes_the_same_agent_session(
     again.close()
 
 
-@pytest.mark.asyncio
-async def test_a_blocked_runs_lock_is_dropped_when_the_next_poller_starts(
+def test_a_dead_blocked_runs_lock_is_dropped_and_no_live_ones_are(
     tmp_path: Path,
 ) -> None:
-    """A lock left by a run stopped mid-wait would wedge the repo, and the
-    resume itself could not take it. Locks of this process's own runs, and
-    of runs that are not blocked, stay."""
+    """A lock left by a run stopped mid-wait would wedge the repo. Only a
+    blocked run whose process is gone loses its lock: not this process's
+    own runs, not a live process's (a run started by hand in another
+    terminal), not a row that names no process, not a running session."""
+    from ctrlrelay.core.claims import PROCESS_RUN
+    from ctrlrelay.core.orphans import release_dead_blocked_locks
+
     db = StateDB(tmp_path / "state.db")
-    db.execute(
-        "INSERT INTO sessions (id, pipeline, repo, status, started_at, "
-        "owner_run) VALUES "
-        "('s-old', 'dev', 'o/a', 'blocked', 1, 'deadrun'),"
-        "('s-mine', 'dev', 'o/b', 'blocked', 1, 'thisrun'),"
-        "('s-live', 'dev', 'o/c', 'running', 1, 'deadrun'),"
-        "('s-legacy', 'dev', 'o/d', 'blocked', 1, NULL)"
-    )
-    db.commit()
-    for repo, sid in [("o/a", "s-old"), ("o/b", "s-mine"),
-                      ("o/c", "s-live"), ("o/d", "s-legacy")]:
+    rows = [
+        ("s-dead", "o/a", "blocked", 101, "otherrun"),
+        ("s-mine", "o/b", "blocked", 102, PROCESS_RUN),
+        ("s-alive", "o/c", "blocked", 103, "otherrun"),
+        ("s-legacy", "o/d", "blocked", None, None),
+        ("s-running", "o/e", "running", 101, "otherrun"),
+    ]
+    for sid, repo, status, pid, run in rows:
+        db.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at, "
+            "owner_pid, owner_run) VALUES (?, 'dev', ?, ?, 1, ?, ?)",
+            (sid, repo, status, pid, run),
+        )
+        db.commit()
         assert db.acquire_lock(repo, sid)
 
-    dropped = db.release_locks_of_blocked_sessions("thisrun")
+    released = release_dead_blocked_locks(
+        db, is_alive=lambda pid: pid == 103,
+    )
 
-    assert sorted(dropped) == ["s-legacy", "s-old"]
+    assert released == ["s-dead"]
     left = {r["session_id"] for r in db.list_locks()}
-    assert left == {"s-mine", "s-live"}
+    assert left == {"s-mine", "s-alive", "s-legacy", "s-running"}
     db.close()
 
 
@@ -280,4 +288,41 @@ async def test_an_answer_attached_during_the_wait_is_not_wiped_when_it_ends(
     (todo,) = state_db.list_pending_resumes_to_execute()
     assert todo["session_id"] == result.session_id
     assert todo["answer"] == "pin it"
+    state_db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_question_answered_first_through_its_saved_row_is_not_resumed_twice(
+    tmp_path: Path,
+) -> None:
+    """The bridge routed one reply to the saved question while the live wait
+    was still open, and then the live wait got a different reply. The first
+    answer stands: this run must not resume with the second, and the
+    sweeper resumes once, with the first."""
+    state_db = StateDB(tmp_path / "state.db")
+    dispatcher = AsyncMock()
+    dispatcher.spawn_session.side_effect = (
+        lambda **kw: _blocked(kw["session_id"])
+    )
+    transport = AsyncMock()
+
+    async def ask(question: str, *, session_id: str, **kw: Any) -> str:
+        assert state_db.answer_pending_resume(session_id, "pin it")
+        return "bump it"
+
+    transport.ask.side_effect = ask
+
+    result = await run_dev_issue(
+        claims=None, repo=REPO, issue_number=13,
+        branch_template="fix/issue-{n}", dispatcher=dispatcher,
+        github=_github(), worktree=_worktree(tmp_path / "wt"),
+        dashboard=None, state_db=state_db, transport=transport,
+        contexts_dir=tmp_path / "contexts",
+    )
+
+    assert result.blocked
+    assert dispatcher.spawn_session.await_count == 1
+    (todo,) = state_db.list_pending_resumes_to_execute()
+    assert todo["answer"] == "pin it"
+    assert state_db.list_locks() == []
     state_db.close()

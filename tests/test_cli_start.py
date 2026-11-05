@@ -870,15 +870,13 @@ class TestPollerStartSettlesDeadRuns:
             )
         assert order[:2] == ["reap", "loop"], (order, result.output)
 
-    def test_drops_blocked_runs_locks_before_the_poll_loop_starts(
+    def test_runs_the_blocked_lock_release_before_the_poll_loop_starts(
         self, telegram_config: Path, tmp_path: Path
     ) -> None:
-        """#324: a run stopped while waiting for an answer stays blocked
-        with its question saved; its repo lock is dropped at start, sparing
-        only this process's own runs."""
+        """#324: the poller calls the release of dead blocked runs' locks
+        after the reaper and before its first poll. What that release
+        drops is tested in test_question_survives_restart.py."""
         from unittest.mock import AsyncMock
-
-        from ctrlrelay.core.claims import PROCESS_RUN
 
         cfg = yaml.safe_load(telegram_config.read_text())
         cfg["repos"] = [{"name": "owner/repo",
@@ -886,15 +884,15 @@ class TestPollerStartSettlesDeadRuns:
         telegram_config.write_text(yaml.dump(cfg))
         (tmp_path / "poller_state.json").write_text('{"seen_issues": {}}')
         order: list[str] = []
-        spared: list[str] = []
+        spared: list[object] = []
 
         async def fake_reap(state_db, **kw):
             order.append("reap")
             return []
 
-        def fake_release(self, this_run):
+        def fake_release(state_db, **kw):
             order.append("locks")
-            spared.append(this_run)
+            spared.append(state_db)
             return []
 
         async def fake_loop(**kw):
@@ -911,8 +909,8 @@ class TestPollerStartSettlesDeadRuns:
                 side_effect=fake_reap,
             ),
             patch(
-                "ctrlrelay.core.state.StateDB.release_locks_of_blocked_sessions",
-                new=fake_release,
+                "ctrlrelay.core.orphans.release_dead_blocked_locks",
+                side_effect=fake_release,
             ),
             patch(
                 "ctrlrelay.core.poller.run_poll_loop",
@@ -930,4 +928,4 @@ class TestPollerStartSettlesDeadRuns:
                  str(telegram_config)],
             )
         assert order[:3] == ["reap", "locks", "loop"], (order, result.output)
-        assert spared == [PROCESS_RUN]
+        assert len(spared) == 1 and spared[0] is not None

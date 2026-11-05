@@ -1049,21 +1049,27 @@ class StateDB:
         """The in-process wait got its answer (#324): mark the parked row
         answered AND resumed, so neither the bridge nor the sweeper acts on
         it again, and put the session back to ``running``. One commit.
-        Returns whether a row still open was found; a row the sweeper had
-        already taken is left alone."""
+
+        Only an unanswered, open row is taken. Returns ``False`` when the
+        row was already answered some other way (a reply the bridge routed
+        to the saved question), expired, or is missing; then nothing is
+        changed and the caller must not resume with its own answer: the
+        first answer stands, and the sweeper resumes with it."""
         now = int(time.time())
         ours = not self._conn.in_transaction
         try:
             cursor = self._conn.execute(
                 "UPDATE pending_resumes SET answer = ?, answered_at = ?, "
-                "resumed_at = ? WHERE session_id = ? AND resumed_at IS NULL",
+                "resumed_at = ? WHERE session_id = ? AND answered_at IS NULL "
+                "AND resumed_at IS NULL AND expired_at IS NULL",
                 (answer, now, now, session_id),
             )
-            self._conn.execute(
-                "UPDATE sessions SET status = 'running' "
-                "WHERE id = ? AND status = 'blocked'",
-                (session_id,),
-            )
+            if cursor.rowcount > 0:
+                self._conn.execute(
+                    "UPDATE sessions SET status = 'running' "
+                    "WHERE id = ? AND status = 'blocked'",
+                    (session_id,),
+                )
             if ours:
                 self._conn.commit()
         except BaseException:
@@ -1083,26 +1089,29 @@ class StateDB:
         ).fetchone()
         return row is not None
 
-    def release_locks_of_blocked_sessions(self, this_run: str) -> list[str]:
-        """Drop repo locks still held by ``blocked`` sessions, except this
-        process's own (#324). Called at poller start. A blocked run holds
-        its lock only while the process that ran it waits in memory for
-        the answer; once that process is gone, the lock only wedges the
-        repo, and the resume takes the lock again itself. Returns the
-        session ids whose locks were dropped."""
+    def list_blocked_sessions_holding_locks(self) -> list[dict[str, Any]]:
+        """``blocked`` sessions that still hold a repo lock, with the
+        process that ran them (#324). A blocked run holds its lock only
+        while that process waits in memory for the answer; see
+        :func:`ctrlrelay.core.orphans.release_dead_blocked_locks`."""
         rows = self._conn.execute(
-            "SELECT l.session_id FROM repo_locks l JOIN sessions s "
-            "ON s.id = l.session_id WHERE s.status = 'blocked' "
-            "AND (s.owner_run IS NULL OR s.owner_run != ?)",
-            (this_run,),
+            "SELECT s.id, s.repo, s.owner_pid, s.owner_run "
+            "FROM repo_locks l JOIN sessions s ON s.id = l.session_id "
+            "WHERE s.status = 'blocked'"
         ).fetchall()
-        ids = [r["session_id"] for r in rows]
-        for sid in ids:
-            self._conn.execute(
-                "DELETE FROM repo_locks WHERE session_id = ?", (sid,),
-            )
+        return [dict(r) for r in rows]
+
+    def release_blocked_session_lock(self, session_id: str) -> bool:
+        """Drop the lock of a session that is still ``blocked`` (#324).
+        Guarded on the status, so a session resumed in the meantime keeps
+        its lock."""
+        cursor = self._conn.execute(
+            "DELETE FROM repo_locks WHERE session_id = ? AND EXISTS ("
+            "SELECT 1 FROM sessions WHERE id = ? AND status = 'blocked')",
+            (session_id, session_id),
+        )
         self._conn.commit()
-        return ids
+        return cursor.rowcount > 0
 
     def get_oldest_unanswered_pending_resume(
         self,

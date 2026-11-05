@@ -11,13 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A run waiting for the operator's answer is no longer lost when the poller
   stops during the wait. The question is now saved, and the session marked
-  `blocked`, before the wait starts rather than after it ends. If the
+  `blocked`, before the wait starts rather than after it ends (if that
+  write fails it is logged and the wait goes ahead as before). If the
   poller stops, a later answer in chat reaches the saved question and
   resumes the same agent session; when the poller starts again it drops the
-  repo lock such a run held, so the repo is not wedged until then. An
-  answer that arrives during the wait still resumes the run at once and
-  closes the saved question. A planning session's question resumes the
-  plan, not the code. The claim on the issue is not marked held while the
+  repo lock such a run held, if the process that ran it is gone, so the
+  repo is not wedged until then. An answer that arrives during the wait
+  still resumes the run at once and closes the saved question; if a reply
+  already answered the saved question first, that first answer stands and
+  the run is resumed once, with it. A planning session's question resumes
+  the plan, not the code. The claim on the issue is not marked held while the
   question waits, so after a stop it goes stale as before (#324).
 
 - An issue is read again from GitHub just before its run starts. A poll
