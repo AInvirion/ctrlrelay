@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A push GitHub refuses because the branch changes a file under
+  `.github/workflows/` and the relay's token has no `workflow` scope is no
+  longer retried. It cost one full agent run per poll, up to three, for a
+  push that could never pass. Chat now says the branch changes a workflow
+  file, names it, and says why no retry can pass. For any other rejected
+  push, the chat line shows the remote's reason rather than the first 200
+  characters of the error, which ended before the reason (#325).
+
 - The status page bound to a LAN address now also answers on
   `127.0.0.1`, and it no longer keeps running, silently, on an address the
   machine has lost. It checks every 30 seconds; when `web.host` is gone it
