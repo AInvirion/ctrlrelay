@@ -1203,9 +1203,17 @@ PUBLISH_ATTEMPTS = 3
 
 def publish_failure_message(
     repo: str, issue_number: int, error: str, *, attempts: int, retrying: bool,
+    rejection: str | None = None,
 ) -> str:
-    """The chat line for a run whose branch the relay could not publish."""
-    why = (error.strip().splitlines() or ["no error recorded"])[0][:200]
+    """The chat line for a run whose branch the relay could not publish.
+
+    When the remote rejected the push, its reason is the line shown: the
+    full error leads with the URL, sha and ref, and its first 200
+    characters ended before the reason did (#325)."""
+    if rejection and rejection.strip():
+        why = rejection.strip()[:300]
+    else:
+        why = (error.strip().splitlines() or ["no error recorded"])[0][:200]
     if retrying:
         return (
             f"\u23f3 #{issue_number} in {repo}: the agent finished but the "
@@ -1264,6 +1272,13 @@ async def settle_publish_failure(
             _logger, "publish.refused_not_retried", repo=repo,
             issue_number=issue_number, error=(result.error or "")[:200],
         )
+        refusal = outputs.get("publish_refusal")
+        if isinstance(refusal, str) and refusal:
+            return (
+                f"\u26d4 #{issue_number} in {repo}: the agent finished, but "
+                f"the branch cannot be published, so the relay is not "
+                f"retrying: {refusal}."
+            )
         return (
             f"\u26d4 #{issue_number} in {repo}: the relay refused to push "
             f"the branch, so it is not retrying. {result.error or ''}".strip()
@@ -1297,9 +1312,11 @@ async def settle_publish_failure(
                 error=f"{type(e).__name__}: {str(e)[:200]}",
             )
             notice_failed = True
+    rejection = outputs.get("push_rejection")
     message = publish_failure_message(
         repo, issue_number, result.error or "",
         attempts=attempts, retrying=retrying,
+        rejection=rejection if isinstance(rejection, str) else None,
     )
     if notice_failed:
         # The issue's last word is still the retraction promising a

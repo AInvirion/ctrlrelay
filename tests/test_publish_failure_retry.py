@@ -436,3 +436,97 @@ def test_a_refused_push_with_a_pr_still_names_the_retry_route() -> None:
         "s", reason="push refused", exit_code=0, pr_number=12, will_retry=False,
     )
     assert MANUAL_RETRY_ROUTE in body and "Review PR #12" in body
+
+
+# The porcelain line alkamax's push got back on 4 Nov (#325), as GitHub
+# sends it, and as the issue quoted it with the backticks lost.
+WORKFLOW_PORCELAIN = (
+    "To https://github.com/o/r.git\n"
+    "!\tf26298ab:refs/heads/fix/issue-67\t[remote rejected] (refusing to "
+    "allow an OAuth App to create or update workflow "
+    "`.github/workflows/ci.yml` without `workflow` scope)\n"
+    "Done\n"
+)
+
+
+def _rejected(porcelain: str):
+    from ctrlrelay.core.worktree import PushRejectedError, parse_push_rejection
+
+    reason = parse_push_rejection(porcelain)
+    assert reason is not None
+    return PushRejectedError(
+        "git failed: push rejected by https://github.com/o/r.git: "
+        f"{reason}; git push exited 1", reason=reason,
+    )
+
+
+class TestAWorkflowScopeRefusal:
+    """#325: GitHub's refusal to take a workflow file from a token without
+    the `workflow` scope is permanent, and was retried as a blip."""
+
+    @pytest.mark.parametrize("porcelain", [
+        WORKFLOW_PORCELAIN,
+        WORKFLOW_PORCELAIN.replace("`", ""),
+    ])
+    @pytest.mark.asyncio
+    async def test_it_is_not_retried_and_chat_names_the_file(
+        self, tmp_path: Path, porcelain: str,
+    ) -> None:
+        result, _ = await TestRunDevIssueFlagsThePublishFailure()._run(
+            tmp_path, push_raises=_rejected(porcelain),
+        )
+        assert result.outputs["publish_refused"] is True
+
+        poller = _poller(tmp_path / "state.json")
+        poller.mark_seen(REPO, 853)
+        github = AsyncMock()
+        message = await settle_publish_failure(github, poller, REPO, 853, result)
+
+        # First failure, and no un-mark: the issue stays seen.
+        assert 853 in poller.seen_issues[REPO]
+        assert 853 not in poller.publish_failures.get(REPO, {})
+        assert message is not None
+        assert "workflow" in message
+        assert ".github/workflows/ci.yml" in message
+        assert "not retrying" in message
+
+    @pytest.mark.asyncio
+    async def test_another_rejection_still_retries_up_to_the_limit(
+        self, tmp_path: Path,
+    ) -> None:
+        stale = (
+            "!\tf26298ab:refs/heads/fix/issue-67\t[rejected] (stale info)\n"
+        )
+        result, _ = await TestRunDevIssueFlagsThePublishFailure()._run(
+            tmp_path, push_raises=_rejected(stale),
+        )
+        assert not result.outputs.get("publish_refused")
+
+        poller = _poller(tmp_path / "state.json")
+        github = AsyncMock()
+        messages = []
+        for _ in range(PUBLISH_ATTEMPTS):
+            poller.mark_seen(REPO, 853)
+            messages.append(
+                await settle_publish_failure(github, poller, REPO, 853, result)
+            )
+        assert "Will retry" in messages[0]
+        assert "not retrying" in messages[-1]
+        # The chat line leads with the remote's reason, not the URL.
+        assert "(stale info)" in messages[0]
+
+
+def test_the_chat_line_keeps_the_remotes_reason_past_200_characters() -> None:
+    from ctrlrelay.cli import publish_failure_message
+
+    url = "https://github.com/OpenAgenticFramework/OpenAgenticFramework.git"
+    reason = (
+        "f26298ab" * 10 + ":refs/heads/fix/issue-67 [remote rejected] "
+        "(pre-receive hook declined)"
+    )
+    error = f"PushRejectedError: git failed: push rejected by {url}: {reason}"
+    assert len(error.split("(pre-receive")[0]) > 200
+    line = publish_failure_message(
+        REPO, 67, error, attempts=1, retrying=True, rejection=reason,
+    )
+    assert "(pre-receive hook declined)" in line

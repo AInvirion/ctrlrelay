@@ -658,6 +658,35 @@ async def reconcile_claim_on_failure(
     )
     return True
 
+# GitHub refuses a push that adds or changes a file under
+# .github/workflows/ unless the token has the `workflow` scope (or, for an
+# App, the `workflows` permission). That text is fixed, and no retry can
+# pass until the token or the change does (#325). The backticks are
+# GitHub's; a copy that lost them still matches.
+_WORKFLOW_SCOPE_REJECTION = re.compile(
+    r"refusing to allow an? (?:OAuth App|GitHub App|Personal Access Token)"
+    r" to create or update workflow `?([^`\s]+?)`? without `?workflows?`?"
+    r" (?:scope|permission)",
+    re.IGNORECASE,
+)
+
+
+def workflow_scope_refusal(rejection: str | None) -> str | None:
+    """The operator-facing reason when GitHub refused the push because the
+    token cannot write workflow files, naming the file; else ``None``."""
+    if not rejection:
+        return None
+    match = _WORKFLOW_SCOPE_REJECTION.search(rejection)
+    if match is None:
+        return None
+    return (
+        f"the branch changes the workflow file `{match.group(1)}`, and the "
+        "relay's GitHub token has no `workflow` scope, so GitHub will not "
+        "take the push. No retry can pass until the token gets that scope "
+        "or the change leaves .github/workflows/"
+    )
+
+
 def publish_failure_is_retryable(result: PipelineResult) -> bool:
     """Whether the relay should offer this failed run's issue again
     (#268).
@@ -1576,6 +1605,18 @@ class _Publisher:
                 },
             )
             outputs["publish_failed"] = True
+            rejection = e.reason if isinstance(e, PushRejectedError) else None
+            if rejection:
+                # The remote's own words, for the chat line (#325): the
+                # error string leads with the URL, sha and ref, and a cut
+                # at a fixed length dropped the reason.
+                outputs["push_rejection"] = rejection
+            refusal = workflow_scope_refusal(rejection)
+            if refusal is not None:
+                # GitHub's answer, not ours, but just as permanent: every
+                # retry is a full agent run that ends at the same refusal.
+                refused = True
+                outputs["publish_refusal"] = refusal
             # A refusal is a decision the relay re-reaches every time
             # (#268): the daemon must not spend another agent run on it.
             if refused:
