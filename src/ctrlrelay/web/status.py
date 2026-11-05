@@ -871,6 +871,10 @@ def build_status(
                 section_errors, "events",
                 lambda: run_numbers.read_pr_times(conn, numbers_since, now),
             ),
+            "reopens": _section(
+                section_errors, "issue_finishes",
+                lambda: run_numbers.read_reopens(conn, numbers_since, now),
+            ),
             "errors": section_errors,
         }
 
@@ -927,9 +931,15 @@ def build_status(
             snap["came_back"], _Missing
         ):
             pr_times = snap["pr_times"]
+            reopens = snap["reopens"]
             got = _section(errors, "numbers", lambda: run_numbers.build_numbers(
                 now=now, runs=snap["runs"], came_back=snap["came_back"],
                 events=None if isinstance(pr_times, _Missing) else pr_times,
+                reopens=None if isinstance(reopens, _Missing) else reopens,
+                reopens_reason=(
+                    "the record of finished issues could not be read"
+                    if isinstance(reopens, _Missing) else None
+                ),
             ))
             numbers = None if isinstance(got, _Missing) else got
 

@@ -1024,12 +1024,39 @@ won't silently disable the job at runtime.
 schedules:
   secops_cron: "0 6 * * *"          # daily 06:00 sweep across repos
   personalization_cron: "*/15 * * * *"  # optional auto-pull
+  weekly_summary:                   # one chat message a week (#230)
+    enabled: true
+    day: mon
+    hour: 9
 ```
 
 | Key | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `secops_cron` | string | no | `"0 6 * * *"` | When to run the secops sweep (`ctrlrelay secops run` equivalent) across all configured repos. Set to e.g. `"0 6 * * 1"` for weekly Mondays. |
 | `personalization_cron` | string | no | unset | When to auto-pull the personalization repo on this machine. Only effective when [`personalization`](#personalization) is also set. Skip-on-dirty: never rebases under uncommitted operator edits. Adoption is never performed by auto-pull — that stays an init-time concern. |
+| `weekly_summary.enabled` | bool | no | `true` | Send this node's last-7-day numbers to the chat once a week. `false` turns it off. Nothing is sent when no chat [`transport`](#transport) is configured. |
+| `weekly_summary.day` | string | no | `"mon"` | The weekday to send it: `mon` to `sun` (full English names work too). |
+| `weekly_summary.hour` | int | no | `9` | The hour to send it, 0-23, in the top-level `timezone`. |
+
+### schedules.weekly_summary
+
+Once a week, each node sends one chat message with its own numbers for
+the last 7 days, the same ones its status page shows: runs started, done,
+failed, blocked and stuck, the success rate, the median time to PR and to
+merge, and how many issues the relay finished were reopened. A number the
+node cannot read is written `unknown`, with the reason, never 0.
+
+The daemon checks every five minutes. It sends at the first check after
+`day` at `hour`:00 that finds nothing delivered since then, so a node that
+was off at that time sends when it comes back, and a send that fails (the
+bridge restarting, the chat unreachable) is logged as
+`summary.weekly.send_failed` and tried again five minutes later. The time
+of the last delivery is kept in the state database, so restarting the
+poller does not send the week a second time. Two cases can still give an
+extra message: a poller stopped after the message went out but before
+that time was written, and changing `day` or `hour` to a time that has
+already passed this week. The first check on a new or upgraded node only
+notes the time, so its first summary goes at the next `day` and `hour`.
 
 ## personalization
 

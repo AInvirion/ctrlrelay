@@ -497,6 +497,20 @@ class GitHubCLI:
         )
         return [json.loads(line) for line in output.splitlines() if line.strip()]
 
+    async def list_reopen_times(
+        self,
+        repo: str,
+        issue_number: int,
+    ) -> list[str]:
+        """When the issue was reopened, oldest first, as GitHub's ISO
+        times: the ``created_at`` of each ``reopened`` event, every page."""
+        output = await self._run_gh(
+            "api", "--paginate",
+            f"/repos/{repo}/issues/{issue_number}/events",
+            "--jq", '.[] | select(.event=="reopened") | .created_at',
+        )
+        return [line.strip() for line in output.splitlines() if line.strip()]
+
     async def current_login(self) -> str:
         """The login ``gh`` is authenticated as (``gh api user``).
 

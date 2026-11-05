@@ -345,11 +345,15 @@ control plane. Every field is defined in `src/ctrlrelay/web/numbers.py`.
 | `done`, `failed`, `blocked`, `running`, `other` | How many of those runs have that status now. `running` includes a run left behind by a daemon that stopped mid-run. The five add up to `started`. |
 | `success_rate` | `done / (done + failed + blocked)`, 0 to 1; `null` when none has finished. |
 | `time_to_pr_s`, `time_to_merge_s` | `{median, n}`: seconds from the run's start to its first `pr_opened` (or `merged`) event, over the `n` runs that have one. Events stamped after now are not read. `null` when events cannot be read, or when a run in the window started before the oldest event still kept: its PR event may have been deleted. The daemon deletes events older than `web.history_days` (7 by default), so with the default the 30-day times are `null`. **To get them, set `web.history_days` to 30**; they appear once the events kept reach back past every run in the window (up to 30 days after the change, since deleted events do not come back). |
-| `came_back` | Distinct issues dispatched again in the window after an earlier run on the same issue had ended `done`. The window's `came_back_issues` lists them (`repo`, `issue_number`, `url`; at most 50). An issue reopened on GitHub and not picked up again is not counted: ctrlrelay does not record reopening. |
+| `came_back` | Distinct issues dispatched again in the window after an earlier run on the same issue had ended `done`. The window's `came_back_issues` lists them (`repo`, `issue_number`, `url`; at most 50). |
+| `reopened` | Issues the relay finished (it saw their PR merge and closed them) that were reopened on GitHub in the window, dated by GitHub's `reopened` event. Counted whether or not the relay picks the issue up again; one per finish. The window's `reopened_issues` lists them. The poller notices a reopen only for an issue its search returns (open and assigned to the operator, or wearing a trigger label), with no extra GitHub call unless a finished issue shows up open. Finishes are recorded in the state database from this version on, plus those still in the kept `merged` events when the table is created. `null` on a database the daemon has not migrated yet. A `reopened` event goes to the feed when one is recorded. |
 | `cost_per_run` | Always `null` for now: cost per run is not recorded yet (#223). The window's `unavailable` says this, and why any other field is `null`. |
 | `stuck` | Runs the relay stopped as stuck (#224), also counted in `failed`. `null` only on a database the daemon has not migrated yet. |
 
 `numbers` is `null`, with a line in `errors`, when the sessions cannot be read.
+
+Each machine also sends these 7-day numbers to the chat once a week; see
+[configuration: schedules.weekly_summary]({{ '/configuration/' | relative_url }}#schedulesweekly_summary).
 
 **The page with peers.** A **Machines** strip shows one card per machine,
 this one first: state, slots, 5-hour and 7-day usage, heartbeat age. A card is

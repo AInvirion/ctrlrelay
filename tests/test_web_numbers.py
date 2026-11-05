@@ -32,7 +32,7 @@ WAITING_OK = {
 COUNT_KEYS = {
     "started", "done", "failed", "blocked", "running", "other",
     "success_rate", "time_to_pr_s", "time_to_merge_s", "came_back",
-    "stuck", "cost_per_run",
+    "reopened", "stuck", "cost_per_run",
 }
 
 

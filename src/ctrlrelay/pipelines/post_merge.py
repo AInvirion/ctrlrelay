@@ -376,6 +376,23 @@ async def pr_watch_task(
                 }
 
             emit_event_once(state_db, EventKind.MERGED, _merge_fields)
+            # The finish a later reopen is measured against (#230). Kept
+            # out of the events table, which is pruned; best-effort like
+            # every other state write here.
+            if state_db is not None:
+                try:
+                    state_db.record_issue_finish(
+                        repo=repo, issue_number=issue_number,
+                        pr_number=pr_number, session_id=session_id,
+                    )
+                except Exception as e:
+                    log_event(
+                        _logger, "dev.pr.watch_persist_failed",
+                        session_id=session_id, repo=repo,
+                        issue_number=issue_number, pr_number=pr_number,
+                        reason=type(e).__name__, error=str(e)[:200],
+                        phase="finish",
+                    )
         if merged:
             # Defer transport construction to inside the retry loop so
             # each attempt gets a fresh connection — a bridge restart

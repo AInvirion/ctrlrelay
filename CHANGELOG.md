@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reopened issues are recorded. When the relay sees an issue's PR merge
+  (and closes the issue), it notes the finish in the state database. If
+  that issue later turns up open in the poller's search, the poller reads
+  its GitHub events and, when there is a `reopened` event after the
+  finish, records the reopen once and puts a `reopened` event in the
+  feed. Ordinary polls make no extra GitHub call. The status page and
+  `/api/status` count reopens per window and per repo (`reopened`, with
+  `reopened_issues`), whether or not the relay picks the issue up again;
+  `null` until the daemon has added the new table (#230).
+- A weekly chat summary. Once a week each node sends one message with its
+  last-7-day numbers: runs started, done, failed, blocked and stuck, the
+  success rate, time to PR, time to merge and reopens. A number it cannot
+  read says `unknown`, never 0. Set with `schedules.weekly_summary`
+  (`enabled`, `day`, `hour`; Monday 09:00 in the configured timezone by
+  default). The last delivery is kept in the state database, so a restart
+  does not send it twice, and a failed send is logged and tried again five
+  minutes later without affecting the poller (#230).
+
 - `ctrlrelay self-update [--version X]` updates a node in one command, only
   once it is idle. It reads the release from PyPI's JSON, downloads the
   wheel and checks its sha256 (installing by path, because a node's index

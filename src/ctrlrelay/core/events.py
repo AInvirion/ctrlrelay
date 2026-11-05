@@ -50,6 +50,8 @@ class EventKind(StrEnum):
     QUESTION_HELD = "question_held"
     ALERT_SENT = "alert_sent"
     RESTART = "restart"
+    # An issue the relay finished was reopened on GitHub (#230).
+    REOPENED = "reopened"
 
 
 # What a builder returns: the keyword arguments of
