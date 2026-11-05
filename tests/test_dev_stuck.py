@@ -158,6 +158,19 @@ async def test_infra_failing_again_after_the_rerun_stops_without_the_agent(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_a_new_infra_flake_after_a_fix_round_gets_its_own_rerun(tmp_path):
+    result, row, dispatcher, github = await _run(
+        tmp_path,
+        verifications=[_failed()] * 3 + [VerificationResult(ready=True)],
+        # flake, re-run; real failure, fix round; new flake, re-run again
+        logs=[INFRA_LOG, CODE_LOG, INFRA_LOG],
+    )
+    assert result.success, result.summary
+    assert github.rerun_failed_jobs.await_count == 2
+    assert dispatcher.spawn_session.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_out_of_budget_is_not_retried_at_all(tmp_path):
     result, row, dispatcher, github = await _run(
         tmp_path, verifications=[_failed()], logs=[BUDGET_LOG],

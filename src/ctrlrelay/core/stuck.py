@@ -75,6 +75,8 @@ class _Call:
     tool_input: dict[str, Any]
     ok: bool | None = None  # None until its result row is read
     error: str | None = None
+    # The result's fingerprint, error or not; None until it is read.
+    result: str | None = None
 
 
 def _epoch(timestamp: Any) -> float | None:
@@ -158,9 +160,11 @@ def _calls(lines: Iterable[str], since: float | None) -> list[_Call]:
                 call = by_id.get(item.get("tool_use_id"))
                 if call is None:
                     continue
+                fingerprint = _fingerprint(_result_text(item.get("content")))
+                call.result = fingerprint
                 if item.get("is_error") is True:
                     call.ok = False
-                    call.error = _fingerprint(_result_text(item.get("content")))
+                    call.error = fingerprint
                 else:
                     call.ok = True
     return calls
@@ -191,7 +195,11 @@ def detect_loop(
 
     Two patterns, both in a row:
 
-    - the last ``limit`` tool calls are the same call with the same input;
+    - the last ``limit`` tool calls are the same call with the same input
+      **and got the same result back** every time. An agent polling a
+      background job runs one call over and over while the output moves
+      on, and that is waiting, not a loop; a call whose result has not
+      been read yet does not count;
     - the last ``limit`` failed calls are the same call failing with the
       same error, and that call did not succeed anywhere in between. Other
       calls in between (edits, reads) are allowed: an agent that edits,
@@ -202,7 +210,11 @@ def detect_loop(
     calls = _calls(lines, since)
     if len(calls) >= limit:
         tail = calls[-limit:]
-        if len({c.key for c in tail}) == 1:
+        if (
+            len({c.key for c in tail}) == 1
+            and all(c.result is not None for c in tail)
+            and len({c.result for c in tail}) == 1
+        ):
             return (
                 f"ran the same command {limit} times in a row: "
                 f"{_describe(tail[-1])}"
@@ -310,8 +322,7 @@ _BUDGET = re.compile(
     r"|has exceeded the maximum execution time"
     r"|spending limit"
     r"|recent account payments have failed"
-    r"|you've used \d+% of included services"
-    r"|usage limit",
+    r"|you've used \d+% of included services",
     re.IGNORECASE,
 )
 
@@ -372,6 +383,38 @@ def classify_failure(log: str) -> FailureKind:
     if _INFRA.search(log):
         return FailureKind.INFRA
     return FailureKind.CODE
+
+
+def classify_failures(
+    logs: Iterable[str | None],
+) -> tuple[FailureKind, frozenset[str]]:
+    """The kind of a CI round with several failing jobs, and the failing
+    tests they name. One entry per failing check: its own log, or ``None``
+    when the relay could not read one.
+
+    Each job is sorted on its own log, so one job's network error cannot
+    make another job's failing tests read as flaky infrastructure, and the
+    relay's own "could not fetch the log" text is never read as a CI log.
+    Out of budget anywhere wins; infrastructure needs every job to be
+    infrastructure; a job with no log is unknown, which is a code failure.
+    """
+    kinds: list[FailureKind] = []
+    names: set[str] = set()
+    for log in logs:
+        if log is None:
+            kinds.append(FailureKind.CODE)
+            continue
+        kind = classify_failure(log)
+        kinds.append(kind)
+        if kind is FailureKind.CODE:
+            names |= failed_tests(log)
+    if not kinds:
+        return FailureKind.CODE, frozenset()
+    if FailureKind.BUDGET in kinds:
+        return FailureKind.BUDGET, frozenset()
+    if all(k is FailureKind.INFRA for k in kinds):
+        return FailureKind.INFRA, frozenset()
+    return FailureKind.CODE, frozenset(names)
 
 
 def format_tests(names: Iterable[str], limit: int = 5) -> str:

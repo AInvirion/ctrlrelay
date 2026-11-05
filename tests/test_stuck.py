@@ -15,6 +15,7 @@ from ctrlrelay.core.stuck import (
     FailureKind,
     StuckPolicy,
     classify_failure,
+    classify_failures,
     detect_loop,
     failed_tests,
     watch_transcript,
@@ -32,7 +33,7 @@ class _T:
         self.ts = ts
 
     def call(self, name: str, tool_input: dict, *, error: str | None = None,
-             ok: bool = True) -> _T:
+             ok: bool = True, out: str = "ok") -> _T:
         self.n += 1
         tid = f"toolu_{self.n}"
         self.rows.append(json.dumps({
@@ -42,7 +43,7 @@ class _T:
             ]},
         }))
         result: dict = {"type": "tool_result", "tool_use_id": tid,
-                        "content": error if error is not None else "ok"}
+                        "content": error if error is not None else out}
         if error is not None:
             result["is_error"] = True
         if error is not None or ok:
@@ -276,3 +277,57 @@ class TestDispatcherStopsAStuckAgent:
         )
         assert result.timed_out
         assert result.stuck_reason is None
+
+
+class TestPollingIsNotALoop:
+    def test_the_same_call_with_output_moving_on_is_waiting(self):
+        t = _T()
+        for i in range(8):
+            t.bash("tail -n 5 /tmp/ci.log", out=f"collected {i * 100} tests")
+        assert detect_loop(t.rows, limit=5) is None
+
+    def test_the_same_call_with_the_same_output_is_still_a_loop(self):
+        t = _T()
+        for _ in range(5):
+            t.bash("tail -n 5 /tmp/ci.log", out="still running")
+        assert detect_loop(t.rows, limit=5) is not None
+
+    def test_a_call_whose_result_is_not_read_yet_does_not_count(self):
+        t = _T()
+        for _ in range(4):
+            t.bash("pytest tests/test_a.py")
+        t.bash("pytest tests/test_a.py", ok=False)  # still running
+        assert detect_loop(t.rows, limit=5) is None
+
+
+CODE_JOB = "FAILED tests/test_a.py::test_one - assert 1 == 2\n1 failed"
+INFRA_JOB = "Error: connection reset by peer\nThe operation was canceled."
+
+
+class TestSortingEachJobOnItsOwn:
+    def test_one_jobs_network_error_does_not_hide_anothers_tests(self):
+        kind, names = classify_failures([INFRA_JOB, CODE_JOB])
+        assert kind is FailureKind.CODE
+        assert names == {"tests/test_a.py::test_one"}
+
+    def test_every_job_infrastructure_is_infrastructure(self):
+        assert classify_failures([INFRA_JOB, INFRA_JOB])[0] is FailureKind.INFRA
+
+    def test_a_job_with_no_log_is_unknown_so_a_code_failure(self):
+        # The relay's own "could not fetch the log: 503" never reaches here.
+        assert classify_failures([INFRA_JOB, None])[0] is FailureKind.CODE
+
+    def test_out_of_budget_anywhere_wins(self):
+        budget = (
+            "The job running on runner X has exceeded the maximum "
+            "execution time of 360 minutes."
+        )
+        assert classify_failures([CODE_JOB, budget])[0] is FailureKind.BUDGET
+
+    def test_no_jobs_is_a_code_failure(self):
+        assert classify_failures([]) == (FailureKind.CODE, frozenset())
+
+
+def test_a_test_that_prints_usage_limit_is_a_code_failure():
+    log = "FAILED tests/test_usage.py::test_x - AssertionError: 'usage limit' in out"
+    assert classify_failure(log) is FailureKind.CODE

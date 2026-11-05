@@ -52,8 +52,7 @@ from ctrlrelay.core.stuck import (
     DEFAULT_INFRA_RETRIES,
     DEFAULT_SAME_FAILURE_ROUNDS,
     FailureKind,
-    classify_failure,
-    failed_tests,
+    classify_failures,
     format_tests,
 )
 from ctrlrelay.core.worktree import PartialSaveError, WorktreeManager
@@ -1363,15 +1362,20 @@ _ACTIONS_JOB_URL = re.compile(r"/actions/runs/\d+/job/(\d+)")
 
 async def _failed_check_logs(
     github: GitHubCLI, repo: str, failing_checks: list[dict[str, Any]]
-) -> str:
+) -> tuple[str, list[str | None]]:
     """Tail of each failed Actions job's log, for the fix prompt (#219).
 
     The agent used to run ``gh run view --log-failed`` itself. It has
     no GitHub login now, so the relay fetches the logs. A check whose
     log cannot be read is NAMED as unreadable rather than left out, so
     the agent is not told "here are the logs" over an empty section.
+
+    Also returns each check's own log tail, or ``None`` when there was none
+    to read, so a round is sorted job by job (#224) rather than on the
+    joined, cut-down prompt text.
     """
     sections: list[str] = []
+    raw: list[str | None] = []
     jobs = 0
     for check in failing_checks:
         name = str(check.get("name") or "?")
@@ -1381,9 +1385,11 @@ async def _failed_check_logs(
             sections.append(
                 f"### {name}\n(no GitHub Actions job log for this check: {link or 'no link'})"
             )
+            raw.append(None)
             continue
         if jobs >= _CI_LOG_MAX_JOBS:
             sections.append(f"### {name}\n(log not fetched: job limit reached)")
+            raw.append(None)
             continue
         jobs += 1
         try:
@@ -1395,15 +1401,17 @@ async def _failed_check_logs(
                 f"### {name}\n(could not fetch the log: {type(e).__name__}: "
                 f"{str(e)[:200]})"
             )
+            raw.append(None)
             continue
         tail = "\n".join(text.splitlines()[-_CI_LOG_TAIL_LINES:])
         sections.append(f"### {name}\n```\n{tail}\n```")
+        raw.append(tail)
     if not sections:
-        return "(no failing check carried a log)"
+        return "(no failing check carried a log)", raw
     out = "\n\n".join(sections)
     if len(out) > _CI_LOG_MAX_CHARS:
         out = out[-_CI_LOG_MAX_CHARS:]
-    return out
+    return out, raw
 
 
 # Outputs the relay owns after #219. Whatever the agent wrote under these
@@ -2030,11 +2038,10 @@ async def _verify_and_fix_pr(
         ci_logs = ""
         if not rebase_needed and verification.failing_checks:
             # Pure `gh`, so before the lock is taken back.
-            ci_logs = await _failed_check_logs(
+            ci_logs, job_logs = await _failed_check_logs(
                 pipeline.github, ctx.repo, verification.failing_checks
             )
-            kind = classify_failure(ci_logs)
-            names = failed_tests(ci_logs) if kind is FailureKind.CODE else frozenset()
+            kind, names = classify_failures(job_logs)
             log_event(
                 _logger,
                 "dev.verify.ci_failure_sorted",
@@ -2077,6 +2084,9 @@ async def _verify_and_fix_pr(
                             "the agent"
                         ),
                     )
+            # A code round in between means a later infrastructure flake is
+            # a new one, and gets its own re-run.
+            infra_retries = 0
             if names and names == repeated_tests:
                 repeated_rounds += 1
             else:
