@@ -148,6 +148,7 @@ def emit_outcome(
         kind = _OUTCOME_KINDS[f["status"]]
         exit_code = f.get("exit_code")
         question = f.get("question")
+        stuck_reason = f.get("stuck_reason")
         fields = {
             "repo": f.get("repo"),
             "issue_number": f.get("issue_number"),
@@ -167,6 +168,9 @@ def emit_outcome(
                 ),
             },
         }
+        # Only on a run the relay stopped as stuck (#224).
+        if isinstance(stuck_reason, str) and stuck_reason:
+            fields["detail"]["stuck"] = stuck_reason[:QUESTION_DETAIL_CHARS]
     except Exception as e:  # noqa: BLE001 - best-effort by design
         _log_failure("<outcome>", e)
         return

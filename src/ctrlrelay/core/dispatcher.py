@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -35,6 +36,7 @@ from ctrlrelay.core.agent_env import (
 from ctrlrelay.core.binaries import resolve_binary
 from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
+from ctrlrelay.core.stuck import StuckPolicy, watch_transcript
 from ctrlrelay.core.usage import (
     UsageStore,
     parse_agent_session_id,
@@ -136,6 +138,9 @@ class SessionResult:
     # The relay killed the agent at its time limit (#311). Set only by the
     # relay's own timeout path, never parsed from anything the agent wrote.
     timed_out: bool = False
+    # The relay stopped the agent because its transcript showed it going in
+    # circles (#224), and why. Set only by the relay's own watch.
+    stuck_reason: str | None = None
 
     @property
     def success(self) -> bool:
@@ -188,10 +193,68 @@ class CliAgentAdapter:
     # name the backend without every subclass remembering to.
     agent_type: ClassVar[str] = "unknown"
 
+    # How the live transcript is watched for a run going in circles (#224).
+    # A plain class attribute, not a dataclass field: every adapter gets
+    # the watch by construction, and a test sets it on the instance.
+    # ``None`` turns the watch off.
+    stuck_policy: StuckPolicy | None = StuckPolicy()
+
     @property
     def agent_binary(self) -> str:
         """The executable this adapter runs. Subclasses override."""
         raise NotImplementedError
+
+    def _transcript_dirs(
+        self, working_dir: Path, env: dict[str, str]
+    ) -> list[Path]:
+        """Where this CLI writes the live transcript of a run in
+        ``working_dir``. Empty by default: a backend whose transcript is
+        not known is not watched, rather than watched somewhere wrong."""
+        return []
+
+    async def _communicate_watched(
+        self,
+        proc: Any,
+        *,
+        folders: list[Path],
+        since: float,
+        ident: dict[str, Any],
+        stuck: list[str],
+    ) -> tuple[bytes, bytes]:
+        """``proc.communicate()``, while the transcript is watched (#224).
+
+        When the watch sees a loop it records the reason in ``stuck`` and
+        kills the child, which ends ``communicate()`` the normal way. The
+        watch is cancelled however this returns, the time limit included.
+        """
+        if not folders or self.stuck_policy is None:
+            return await proc.communicate()
+        policy = self.stuck_policy
+
+        async def _watch() -> None:
+            reason = await watch_transcript(
+                folders, since=since, policy=policy, ident=ident,
+            )
+            stuck.append(reason)
+            _logger.warning(
+                "dispatcher.session.stuck",
+                extra={**ident, "reason": reason},
+            )
+            try:
+                if proc.returncode is None:
+                    proc.kill()
+            except ProcessLookupError:
+                pass
+
+        watcher = asyncio.create_task(_watch())
+        try:
+            return await proc.communicate()
+        finally:
+            watcher.cancel()
+            try:
+                await watcher
+            except BaseException:
+                pass
 
     def _parse_agent_session_id(self, stdout_text: str) -> str | None:
         """The agent's own session id, for a later resume.
@@ -288,6 +351,10 @@ class CliAgentAdapter:
             prompt_len=len(prompt),
         )
         started = time.monotonic()
+        # Transcript rows are stamped in wall-clock time. A second of slack
+        # for the clock the CLI reads being a hair behind this one.
+        wall_started = time.time() - 1.0
+        stuck: list[str] = []
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -328,7 +395,14 @@ class CliAgentAdapter:
 
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
+                self._communicate_watched(
+                    proc,
+                    folders=self._transcript_dirs(working_dir, env),
+                    since=wall_started,
+                    ident=ident,
+                    stuck=stuck,
+                ),
+                timeout=timeout,
             )
         except asyncio.TimeoutError as e:
             proc.kill()
@@ -482,6 +556,15 @@ class CliAgentAdapter:
         agent_session_id = self._parse_agent_session_id(stdout_text)
         self._record_usage(stdout_text, ident)
 
+        # A checkpoint the agent wrote wins: it finished, or asked, before
+        # the kill landed, so it was not stuck at the end.
+        stuck_reason = stuck[0] if stuck and state is None else None
+        if stuck_reason is not None:
+            # In stderr too, so a lane that reads only stderr still says why.
+            stderr_text = (
+                f"Session stopped: stuck: {stuck_reason}\n{stderr_text}"
+            )
+
         log_event(
             _logger,
             "dispatcher.session.finished",
@@ -510,6 +593,7 @@ class CliAgentAdapter:
             stdout=stdout_text,
             stderr=stderr_text,
             agent_session_id=agent_session_id,
+            stuck_reason=stuck_reason,
         )
 
 
@@ -559,6 +643,21 @@ class ClaudeDispatcher(CliAgentAdapter):
 
     def _parse_agent_session_id(self, stdout_text: str) -> str | None:
         return _extract_agent_session_id(stdout_text)
+
+    def _transcript_dirs(
+        self, working_dir: Path, env: dict[str, str]
+    ) -> list[Path]:
+        """``<config dir>/projects/<working dir, "/", "." and "_" as "-">``,
+        the folder :mod:`ctrlrelay.web.transcript` reads too. Both the path
+        as given and its resolved form, since which one the CLI sees
+        depends on how the worktree path was spelled."""
+        base = Path(env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+        out: list[Path] = []
+        for spelled in (str(working_dir), str(working_dir.resolve())):
+            folder = base / "projects" / re.sub(r"[/._]", "-", spelled)
+            if folder not in out:
+                out.append(folder)
+        return out
 
     def __post_init__(self) -> None:
         # Only auto-resolve the bare default. Absolute paths, relative paths

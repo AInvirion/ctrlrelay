@@ -644,6 +644,17 @@ class GitHubCLI:
             timeout=timeout,
         )
 
+    async def rerun_failed_jobs(
+        self, repo: str, run_id: str, *, timeout: int | None = None,
+    ) -> None:
+        """``gh run rerun <id> --failed``: run an Actions run's failed jobs
+        again, on the same commit (#224). Only for a failure the relay
+        sorted as flaky infrastructure; a code failure goes to the agent."""
+        await self._run_gh(
+            "run", "rerun", str(run_id), "--repo", repo, "--failed",
+            timeout=timeout,
+        )
+
     async def get_pr_state(
         self,
         repo: str,

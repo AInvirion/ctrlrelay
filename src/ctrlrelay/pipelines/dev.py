@@ -48,6 +48,13 @@ from ctrlrelay.core.issue_questions import (
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier, VerificationResult
 from ctrlrelay.core.state import StateDB
+from ctrlrelay.core.stuck import (
+    DEFAULT_INFRA_RETRIES,
+    DEFAULT_SAME_FAILURE_ROUNDS,
+    FailureKind,
+    classify_failures,
+    format_tests,
+)
 from ctrlrelay.core.worktree import PartialSaveError, WorktreeManager
 from ctrlrelay.dashboard.client import DashboardClient, EventPayload
 from ctrlrelay.pipelines.base import (
@@ -1217,6 +1224,16 @@ CTRLRELAY_DONE
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
         """Convert SessionResult to PipelineResult."""
+        if result.state is None and result.stuck_reason is not None:
+            # The relay stopped an agent going in circles (#224).
+            reason = f"the agent {result.stuck_reason}"
+            return PipelineResult(
+                success=False,
+                session_id=result.session_id,
+                summary=f"Stuck: {reason}",
+                exit_code=result.exit_code,
+                stuck_reason=reason,
+            )
         if result.state is None:
             return PipelineResult(
                 success=False,
@@ -1345,15 +1362,23 @@ _ACTIONS_JOB_URL = re.compile(r"/actions/runs/\d+/job/(\d+)")
 
 async def _failed_check_logs(
     github: GitHubCLI, repo: str, failing_checks: list[dict[str, Any]]
-) -> str:
+) -> tuple[str, list[str | None]]:
     """Tail of each failed Actions job's log, for the fix prompt (#219).
 
     The agent used to run ``gh run view --log-failed`` itself. It has
     no GitHub login now, so the relay fetches the logs. A check whose
     log cannot be read is NAMED as unreadable rather than left out, so
     the agent is not told "here are the logs" over an empty section.
+
+    Also returns each fetched job's own log tail, or ``None`` when its
+    fetch failed, so a round is sorted job by job (#224) rather than on
+    the joined, cut-down prompt text. A check that is not an Actions job,
+    or one past the job limit, was never looked at and is left out of the
+    sorting: counting it as unknown would make an outage across many
+    matrix jobs read as a code failure.
     """
     sections: list[str] = []
+    raw: list[str | None] = []
     jobs = 0
     for check in failing_checks:
         name = str(check.get("name") or "?")
@@ -1377,15 +1402,17 @@ async def _failed_check_logs(
                 f"### {name}\n(could not fetch the log: {type(e).__name__}: "
                 f"{str(e)[:200]})"
             )
+            raw.append(None)
             continue
         tail = "\n".join(text.splitlines()[-_CI_LOG_TAIL_LINES:])
         sections.append(f"### {name}\n```\n{tail}\n```")
+        raw.append(tail)
     if not sections:
-        return "(no failing check carried a log)"
+        return "(no failing check carried a log)", raw
     out = "\n\n".join(sections)
     if len(out) > _CI_LOG_MAX_CHARS:
         out = out[-_CI_LOG_MAX_CHARS:]
-    return out
+    return out, raw
 
 
 # Outputs the relay owns after #219. Whatever the agent wrote under these
@@ -1793,6 +1820,83 @@ async def _review_and_comment(
         )
 
 
+# #224. Module-level so a test can shorten them.
+_INFRA_RETRIES = DEFAULT_INFRA_RETRIES
+_SAME_FAILURE_ROUNDS = DEFAULT_SAME_FAILURE_ROUNDS
+# Seconds between asking GitHub to re-run a job and reading the checks
+# again, so the read does not see the old failure before the re-run is
+# queued.
+_RERUN_SETTLE_SECONDS = 30.0
+_ACTIONS_RUN_URL = re.compile(r"/actions/runs/(\d+)/job/\d+")
+
+
+def _check_names(checks: list[dict[str, Any]]) -> str:
+    return ", ".join(str(c.get("name") or "?") for c in checks) or "no check named"
+
+
+def _stopped(
+    current: PipelineResult,
+    outputs: dict[str, Any],
+    *,
+    summary: str,
+    stuck_reason: str | None = None,
+) -> PipelineResult:
+    """The verify loop's result when it stops on its own (#224), with the
+    pull request's outputs kept so the failure comment can name it."""
+    return PipelineResult(
+        success=False,
+        session_id=current.session_id,
+        summary=summary,
+        outputs={**outputs, **current.outputs},
+        exit_code=current.exit_code,
+        stuck_reason=stuck_reason,
+    )
+
+
+async def _rerun_failed_ci(
+    github: GitHubCLI,
+    repo: str,
+    failing_checks: list[dict[str, Any]],
+    *,
+    session_id: str,
+) -> bool:
+    """Ask GitHub to re-run the failed jobs of every Actions run a failing
+    check belongs to. True when at least one re-run was accepted; False
+    when none could be (no Actions run named, or GitHub refused), and the
+    caller then treats the failure as one a re-run cannot help."""
+    run_ids: list[str] = []
+    for check in failing_checks:
+        match = _ACTIONS_RUN_URL.search(str(check.get("link") or ""))
+        if match is not None and match.group(1) not in run_ids:
+            run_ids.append(match.group(1))
+    accepted = False
+    for run_id in run_ids:
+        try:
+            await github.rerun_failed_jobs(
+                repo, run_id, timeout=_CI_LOG_FETCH_TIMEOUT
+            )
+            accepted = True
+        except Exception as e:
+            log_event(
+                _logger,
+                "dev.verify.ci_rerun_failed",
+                session_id=session_id,
+                repo=repo,
+                run_id=run_id,
+                error_type=type(e).__name__,
+                error=str(e)[:200],
+            )
+    log_event(
+        _logger,
+        "dev.verify.ci_rerun",
+        session_id=session_id,
+        repo=repo,
+        runs=len(run_ids),
+        accepted=accepted,
+    )
+    return accepted
+
+
 async def _verify_and_fix_pr(
     *,
     pipeline: DevPipeline,
@@ -1922,7 +2026,85 @@ async def _verify_and_fix_pr(
     if verification.timed_out:
         return _timed_out(result)
     attempts = 0
+    # #224: how many times flaky CI was re-run, and the failing tests of
+    # the last CI rounds that failed the same way in a row.
+    infra_retries = 0
+    repeated_tests: frozenset[str] = frozenset()
+    repeated_rounds = 0
     while not verification.ready and attempts < max_attempts:
+        rebase_needed = (
+            verification.mergeable == "CONFLICTING"
+            or verification.merge_state_status == "BEHIND"
+        )
+        ci_logs = ""
+        if not rebase_needed and verification.failing_checks:
+            # Pure `gh`, so before the lock is taken back.
+            ci_logs, job_logs = await _failed_check_logs(
+                pipeline.github, ctx.repo, verification.failing_checks
+            )
+            kind, names = classify_failures(job_logs)
+            log_event(
+                _logger,
+                "dev.verify.ci_failure_sorted",
+                session_id=result.session_id,
+                repo=ctx.repo,
+                pr_number=pr_number,
+                kind=kind.name,
+                failed_tests=len(names),
+            )
+            checks = _check_names(verification.failing_checks)
+            if kind is FailureKind.BUDGET:
+                return _stopped(
+                    result,
+                    reported_outputs,
+                    summary=(
+                        f"PR #{pr_number}: CI ran out of budget ({checks}); "
+                        "not retried, since a re-run spends the same budget "
+                        "again"
+                    ),
+                )
+            if kind is FailureKind.INFRA:
+                if infra_retries < _INFRA_RETRIES and await _rerun_failed_ci(
+                    pipeline.github, ctx.repo, verification.failing_checks,
+                    session_id=result.session_id,
+                ):
+                    infra_retries += 1
+                    await asyncio.sleep(_RERUN_SETTLE_SECONDS)
+                    verification = await _run_verify()
+                    if verification.timed_out:
+                        return _timed_out(result)
+                    continue
+                if infra_retries:
+                    return _stopped(
+                        result,
+                        reported_outputs,
+                        summary=(
+                            f"PR #{pr_number}: CI failed on infrastructure "
+                            f"again after {infra_retries} re-run(s) "
+                            f"({checks}); not a code problem, so not sent to "
+                            "the agent"
+                        ),
+                    )
+            # A code round in between means a later infrastructure flake is
+            # a new one, and gets its own re-run.
+            infra_retries = 0
+            if names and names == repeated_tests:
+                repeated_rounds += 1
+            else:
+                repeated_tests = names
+                repeated_rounds = 1 if names else 0
+            if repeated_rounds >= _SAME_FAILURE_ROUNDS:
+                reason = (
+                    f"the same tests failed in CI after {repeated_rounds - 1} "
+                    f"fix round(s): {format_tests(repeated_tests)}"
+                )
+                return _stopped(
+                    result,
+                    reported_outputs,
+                    summary=f"Stuck: {reason}",
+                    stuck_reason=reason,
+                )
+
         # Reacquire before request_fix — claude spawns inside the
         # worktree and pushes to the shared bare repo. If we can't
         # get the lock back in a reasonable window, bail cleanly
@@ -1953,21 +2135,11 @@ async def _verify_and_fix_pr(
         default_branch = publisher.default_branch or (
             await pipeline.github.get_default_branch(ctx.repo)
         )
-        if (
-            verification.mergeable == "CONFLICTING"
-            or verification.merge_state_status == "BEHIND"
-        ):
+        if rebase_needed:
             # The agent cannot fetch, so the relay brings the shared
             # clone's default branch up to date before asking it to
             # rebase. The lock is held again at this point.
             await pipeline.worktree.ensure_bare_repo(ctx.repo)
-            ci_logs = ""
-        elif verification.failing_checks:
-            ci_logs = await _failed_check_logs(
-                pipeline.github, ctx.repo, verification.failing_checks
-            )
-        else:
-            ci_logs = ""
         fix_prompt = _build_fix_prompt(
             pr_number,
             verification,
@@ -1994,6 +2166,7 @@ async def _verify_and_fix_pr(
                 outputs=merged_outputs,
                 exit_code=fix_result.exit_code,
                 timed_out=fix_result.timed_out,
+                stuck_reason=fix_result.stuck_reason,
             )
 
         result = fix_result
@@ -3293,9 +3466,14 @@ async def run_dev_issue(
 
         # Update session status
         status = "done" if result.success else ("blocked" if result.blocked else "failed")
+        # A stuck run is a failed run that also says it was stuck (#224).
+        stuck_reason = (
+            result.stuck_reason if status == "failed" else None
+        )
         state_db.execute(
-            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? WHERE id = ?",
-            (status, result.summary, int(time.time()), session_id),
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ?, "
+            "stuck_reason = ? WHERE id = ?",
+            (status, result.summary, int(time.time()), stuck_reason, session_id),
         )
         state_db.commit()
 
@@ -3338,6 +3516,7 @@ async def run_dev_issue(
                 "session_id": session_id,
                 "exit_code": result.exit_code,
                 "question": result.question,
+                "stuck_reason": stuck_reason,
             },
         )
 

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A run going in circles is stopped early with a clear reason, instead of
+  running until the session timeout (#224). The agent is stopped when its
+  live transcript shows the same command 5 times in a row with the same
+  result each time (polling a job whose output moves on is not a loop,
+  though 5 identical polls in a row still are), or
+  the same error from the same command 5 times in a row. Between CI fix
+  rounds each failed job's log is sorted on its own, as flaky infrastructure (the failed jobs are re-run once, without
+  the agent), out of budget (not retried), or a code failure (sent to the
+  agent, as before); the same tests failing in 3 CI rounds in a row stops the
+  run. A stopped run is recorded as failed with `sessions.stuck_reason`, the
+  issue comment and chat say it was stuck and why, and the status page counts
+  these runs. See "Stuck runs" in the operations guide.
+
 - A dev run's question is now asked on its GitHub issue as well as in chat,
   and the first answer from either one wins. An answer on the issue is a
   comment that starts with `/answer`, since the relay and every working

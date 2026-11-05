@@ -59,6 +59,12 @@ class PipelineResult:
     # different fact from a review that found nothing, and reads as a
     # failure downstream.
     review: Any = None
+    # The run was stopped because it was going in circles (#224), and why:
+    # the agent repeating itself in its transcript, or CI failing the same
+    # tests after fix round after fix round. A field for the same reason as
+    # `timed_out`: set only by the relay, never read from the agent's own
+    # checkpoint. The session is recorded as failed, with this reason.
+    stuck_reason: str | None = None
 
 
 def failure_text(result: PipelineResult) -> str:

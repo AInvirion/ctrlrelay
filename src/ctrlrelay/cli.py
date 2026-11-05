@@ -626,6 +626,12 @@ async def announce_issue_outcome(
         line = f"⏸️ Blocked on #{issue_number}: {result.question}"
         await transport.send(line)
         sent.append(line)
+    elif getattr(result, "stuck_reason", None):
+        # Its own line (#224): a stuck run cost time and quota going in
+        # circles, which is a different thing to look at from a crash.
+        line = f"🔁 Stuck on #{issue_number}, stopped: {result.stuck_reason}"
+        await transport.send(line)
+        sent.append(line)
     else:
         line = f"❌ Failed on #{issue_number}: {failure_text(result)}"
         await transport.send(line)

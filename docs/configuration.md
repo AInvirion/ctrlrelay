@@ -207,7 +207,7 @@ agent:
 |---|---|---|---|
 | `type` | string | `"claude"` | Default backend for every repo: `"claude"` or `"opencode"`. See [agent backends](#agent-backends). |
 | `binary` | string | `"claude"` | Path to the `claude` executable. The bare name `"claude"` is auto-resolved at startup using `shutil.which("claude")`, then `~/.local/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude`. Set an absolute path to skip lookup (useful under launchd/systemd where PATH is minimal). |
-| `default_timeout_seconds` | int | `1800` | Per-session timeout passed to `asyncio.wait_for`. Sessions that exceed this are killed and reported as failed. |
+| `default_timeout_seconds` | int | `1800` | Per-session timeout passed to `asyncio.wait_for`. Sessions that exceed this are killed and reported as failed. A session going in circles is stopped before this; see [stuck runs](operations.md#stuck-runs). |
 | `output_format` | string | `"json"` | Not used. The relay always runs `claude -p --output-format stream-json --verbose`, because only that output carries the subscription usage it reads (see [usage](#usage)). Kept so existing configs still load. |
 
 ctrlrelay always invokes claude with `--dangerously-skip-permissions` so the

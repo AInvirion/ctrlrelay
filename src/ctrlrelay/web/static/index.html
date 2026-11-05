@@ -1018,8 +1018,8 @@ function renderTodayList(data) {
 
 // #230: the columns of a Numbers row, and the text of one cell each.
 var NUMBER_COLUMNS = [
-  "runs", "done", "failed", "blocked", "running", "success", "time to PR",
-  "time to merge", "came back", "cost / run"
+  "runs", "done", "failed", "blocked", "running", "stuck", "success",
+  "time to PR", "time to merge", "came back", "cost / run"
 ];
 
 function medianText(m) {
@@ -1035,7 +1035,7 @@ function countText(v) { return typeof v === "number" ? String(v) : "unknown"; }
 function numberCells(c) {
   return [
     countText(c.started), countText(c.done), countText(c.failed),
-    countText(c.blocked), countText(c.running),
+    countText(c.blocked), countText(c.running), countText(c.stuck),
     typeof c.success_rate === "number" ? Math.round(c.success_rate * 100) + "%" :
       (typeof c.started === "number" ? "none finished" : "unknown"),
     medianText(c.time_to_pr_s), medianText(c.time_to_merge_s),

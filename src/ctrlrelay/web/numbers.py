@@ -36,8 +36,10 @@ Per window, overall and per repo:
 ``unavailable``, never a guess:
 
 - ``cost_per_run``: always ``null``; cost per run is not recorded (#223).
-- ``stuck``: always ``null``; no run records that it was stuck (#224). A
-  stuck run that is still marked running is in ``running``.
+- ``stuck``: of the runs started in the window, the ones the relay stopped
+  as stuck (#224); they are also counted in ``failed``. Runs from before the
+  relay recorded this are not counted. ``null`` only when the database
+  predates the record (``sessions.stuck_reason``).
 - ``time_to_pr_s``/``time_to_merge_s``: ``null`` when the events table
   cannot be read, or when the events it still holds cannot cover every run
   in the window. The daemon deletes events older than ``web.history_days``
@@ -69,8 +71,8 @@ _PR_KINDS = ("pr_opened", "merged")
 _OUTCOMES = ("done", "failed", "blocked", "running")
 COST_GAP = "cost per run is not recorded yet (#223)"
 STUCK_GAP = (
-    "no run records that it was stuck yet (#224); a stuck run still marked "
-    "running is counted in running"
+    "this database predates the record of stuck runs (#224); restart the "
+    "daemon to add it"
 )
 EVENTS_GAP = "events could not be read"
 
@@ -83,10 +85,17 @@ def window_start(now: int, days: int) -> int:
 
 
 def read_runs(conn: Any, since: int, now: int) -> list[dict[str, Any]]:
-    """Every run started in ``[since, now]``."""
+    """Every run started in ``[since, now]``.
+
+    Each row carries ``stuck_reason`` only when the database has that
+    column (#224); a database the daemon has not migrated yet does not,
+    and the page then says the stuck count is unknown rather than 0.
+    """
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+    stuck = ", stuck_reason" if "stuck_reason" in columns else ""
     rows = conn.execute(
-        """SELECT id, repo, issue_number, status, started_at FROM sessions
-           WHERE started_at >= ? AND started_at <= ?""",
+        f"""SELECT id, repo, issue_number, status, started_at{stuck}
+           FROM sessions WHERE started_at >= ? AND started_at <= ?""",
         (int(since), int(now)),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -191,7 +200,11 @@ def _counts(
         "time_to_pr_s": None if pr_times is None else _median(to_pr),
         "time_to_merge_s": None if pr_times is None else _median(to_merge),
         "came_back": came_back,
-        "stuck": None,
+        "stuck": (
+            sum(1 for r in runs if r["stuck_reason"])
+            if all("stuck_reason" in r for r in runs)
+            else None
+        ),
         "cost_per_run": None,
     }
 
@@ -214,7 +227,9 @@ def _window(
     runs = [r for r in runs if r["started_at"] >= since]
     back = _issues(r for r in came_back if r["started_at"] >= since)
 
-    unavailable = {"cost_per_run": COST_GAP, "stuck": STUCK_GAP}
+    unavailable = {"cost_per_run": COST_GAP}
+    if not all("stuck_reason" in r for r in runs):
+        unavailable["stuck"] = STUCK_GAP
     times = pr_times
     reason = events_reason
     if reason is None:

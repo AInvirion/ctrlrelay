@@ -346,7 +346,8 @@ control plane. Every field is defined in `src/ctrlrelay/web/numbers.py`.
 | `success_rate` | `done / (done + failed + blocked)`, 0 to 1; `null` when none has finished. |
 | `time_to_pr_s`, `time_to_merge_s` | `{median, n}`: seconds from the run's start to its first `pr_opened` (or `merged`) event, over the `n` runs that have one. Events stamped after now are not read. `null` when events cannot be read, or when a run in the window started before the oldest event still kept: its PR event may have been deleted. The daemon deletes events older than `web.history_days` (7 by default), so with the default the 30-day times are `null`. **To get them, set `web.history_days` to 30**; they appear once the events kept reach back past every run in the window (up to 30 days after the change, since deleted events do not come back). |
 | `came_back` | Distinct issues dispatched again in the window after an earlier run on the same issue had ended `done`. The window's `came_back_issues` lists them (`repo`, `issue_number`, `url`; at most 50). An issue reopened on GitHub and not picked up again is not counted: ctrlrelay does not record reopening. |
-| `cost_per_run`, `stuck` | Always `null` for now: cost per run is not recorded yet (#223), and no run records that it was stuck (#224). The window's `unavailable` says this, and why any other field is `null`. |
+| `cost_per_run` | Always `null` for now: cost per run is not recorded yet (#223). The window's `unavailable` says this, and why any other field is `null`. |
+| `stuck` | Runs the relay stopped as stuck (#224), also counted in `failed`. `null` only on a database the daemon has not migrated yet. |
 
 `numbers` is `null`, with a line in `errors`, when the sessions cannot be read.
 
@@ -621,6 +622,43 @@ unit files above set `ExitTimeOut=180` (launchd) and
 (launchd 20s, systemd 90s) SIGKILLs the daemon before cleanup finishes
 and leaves stale `git worktree` admin state behind. If you're upgrading
 from an older plist/unit that didn't set these, add them and reload.
+
+## Stuck runs
+
+A run that goes in circles is stopped early instead of running until
+`agent.default_timeout_seconds`.
+
+- **While the agent works**, ctrlrelay reads its live transcript every 30
+  seconds. If the agent runs the same command with the same input 5 times in
+  a row and gets the same result back each time, or gets the same error
+  back from the same command 5 times in a row with no success of that
+  command in between (edits in between do not count), the agent is stopped.
+  A command polled while its output moves on is waiting, not a loop; a poll
+  that gets the identical output back 5 times in a row is still treated as
+  one. Only the `claude` backend writes a transcript ctrlrelay knows how to
+  read; other backends are not watched.
+- **Between CI fix rounds**, each failed job's log is sorted on its own into
+  one of three kinds. The round is *out of budget* if any job is,
+  *infrastructure* only if every job is, and a *code failure* otherwise; a
+  job whose log could not be fetched counts as a code failure, and a check
+  that is not an Actions job, or one past the first 3 jobs, is not sorted
+  at all:
+  - *flaky infrastructure* (the runner was lost, the network failed, a
+    registry answered 502/503, and no failing test is named): the failed
+    GitHub Actions jobs are re-run once, without asking the agent. If they
+    fail on infrastructure again, the run stops. A fix round in between
+    resets this, so a new flake later gets its own re-run.
+  - *out of budget* (the job hit its maximum execution time or a spending
+    limit): the run stops at once. A re-run would spend the same budget.
+  - *code failure* (anything else, including every log that names failing
+    tests): sent to the agent as a fix round, as before. If the same tests
+    fail in 3 CI rounds in a row (the first failure and two fixes that changed
+    nothing), the run stops instead of spending the next round.
+
+A stopped run is recorded as `failed` with a `stuck_reason` in the
+`sessions` table, its summary starts with `Stuck:`, the issue comment gives
+the reason, and chat gets `🔁 Stuck on #<n>, stopped: <reason>`. The status
+page's numbers count these runs in `stuck`.
 
 ## When to restart
 
