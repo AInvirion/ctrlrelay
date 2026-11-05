@@ -421,7 +421,7 @@ class CliAgentAdapter:
             )
             raise
 
-        self._record_agent_pid(session_id, proc.pid)
+        self._record_agent_pid(session_id, getattr(proc, "pid", None))
 
         try:
             stdout, stderr = await asyncio.wait_for(
