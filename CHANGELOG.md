@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `repos[].automation.operator_prs` (`ask` or `ignore`; unset is `ask`)
+  lets the secops sweep leave the operator's own open PRs alone on a repo.
+  By default every such PR that touches more than `.github/dependabot.yml`
+  is a question, asked again on every sweep while the PR stays open. With
+  `ignore` those PRs get no question and are not named in the summary; a PR
+  that touches only `.github/dependabot.yml` is still checked and merged as
+  before, and Dependabot PRs and alerts are unchanged. Unset renders the
+  same prompt as before (#335).
+
 - Reopened issues are recorded. When the relay sees an issue's PR merge
   (and closes the issue), it notes the finish in the state database. If
   that issue later turns up open in the poller's search, the poller reads
