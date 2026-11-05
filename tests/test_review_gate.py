@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -67,7 +67,7 @@ def _calls(github, worktree) -> list[tuple]:
     track(github.set_pr_draft, "draft")
     track(github.comment_on_pr, "comment")
     track(worktree.make_review_copy, "copy")
-    track(worktree.ensure_bare_repo, "fetch")
+    track(worktree.fetch_pr_head, "fetch")
     return log
 
 
@@ -80,6 +80,25 @@ def _after_first_copy(log: list[tuple]) -> list[tuple]:
 
 def _heads(*shas):
     return iter([{"sha": s, "draft": True} for s in shas])
+
+
+def _fetch_follows(github, worktree) -> None:
+    """The PR-ref fetch brings in whatever head GitHub last reported."""
+    seen: list[str] = []
+    original = github.get_pr_head.side_effect
+
+    async def head(*_a, **_kw):
+        got = next(original) if not isinstance(original, BaseException) else None
+        if got is None:
+            raise original
+        seen.append(got["sha"])
+        return got
+
+    async def fetch(*_a, **_kw):
+        return seen[-1]
+
+    github.get_pr_head.side_effect = head
+    worktree.fetch_pr_head.side_effect = fetch
 
 
 def _events(state_db: StateDB, kind: str) -> list[dict]:
@@ -233,6 +252,7 @@ async def test_a_push_after_the_review_is_reviewed_before_ready(
     reviewer = _reviewer(monkeypatch, REVIEWED)
     worktree, github = _fakes(tmp_path)
     github.get_pr_head.side_effect = _heads(LATER, LATER)
+    _fetch_follows(github, worktree)
     log = _calls(github, worktree)
     state_db = StateDB(tmp_path / "s.db")
     result, *_ = await _run(
@@ -270,6 +290,7 @@ async def test_a_push_after_the_review_is_reviewed_again_when_not_required(
     reviewer = _reviewer(monkeypatch, REVIEWED)
     worktree, github = _fakes(tmp_path)
     github.get_pr_head.side_effect = _heads(LATER, LATER)
+    _fetch_follows(github, worktree)
     result, *_ = await _run(
         tmp_path, repo=_repo(), worktree=worktree, github=github,
     )
@@ -289,6 +310,7 @@ async def test_a_head_that_keeps_moving_is_not_a_pass(
     worktree, github = _fakes(tmp_path)
     moving = [c * 40 for c in "123456789"]
     github.get_pr_head.side_effect = _heads(*moving)
+    _fetch_follows(github, worktree)
     result, *_ = await _run(
         tmp_path, repo=_repo(steps=REQUIRED), worktree=worktree, github=github,
     )
@@ -307,12 +329,7 @@ async def test_a_new_head_that_cannot_be_fetched_is_not_reviewed(
     worktree, github = _fakes(tmp_path)
     github.get_pr_head.side_effect = _heads(LATER)
 
-    async def fetch(*_a, **_kw):
-        # The fetch at the run's start works; the one for the new head not.
-        if worktree.make_review_copy.await_count:
-            raise RuntimeError("network")
-
-    worktree.ensure_bare_repo.side_effect = fetch
+    worktree.fetch_pr_head.side_effect = RuntimeError("network")
     result, *_ = await _run(
         tmp_path, repo=_repo(steps=REQUIRED), worktree=worktree, github=github,
     )
@@ -409,3 +426,68 @@ async def test_get_pr_head_reads_the_head_commit() -> None:
         head = await GitHubCLI().get_pr_head("owner/repo", 7)
     assert head == {"sha": LATER, "draft": True}
     assert "headRefOid,isDraft" in run.call_args[0]
+
+
+# --- drafts the repository cannot have (#222 review) ---------------------------
+
+
+def _publisher(github, *, draft: bool = True):
+    from ctrlrelay.pipelines.dev import _Publisher
+
+    return _Publisher(
+        github=github, worktree=MagicMock(), state_db=MagicMock(),
+        repo="owner/repo", branch="fix/issue-1", issue_number=1,
+        issue_title="t", session_id="s", pr_number=42, draft=draft,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_repo_without_drafts_still_gets_a_pr_and_says_unreviewed() -> None:
+    github = AsyncMock()
+    calls: list[bool] = []
+
+    async def create(repo, **kw):
+        calls.append(bool(kw.get("draft")))
+        if kw.get("draft"):
+            raise RuntimeError(
+                "gh failed: Draft pull requests are not supported in this "
+                "repository."
+            )
+        return {"number": 9, "url": "https://github.com/owner/repo/pull/9"}
+
+    github.create_pr.side_effect = create
+    created = await _publisher(github)._create_pr(
+        title="t", body="b", head="fix/issue-1", base="main",
+    )
+    assert created["number"] == 9
+    assert calls == [True, False]
+    [(args, _)] = [(c.args, c.kwargs) for c in github.comment_on_pr.await_args_list]
+    assert args[1] == 9 and "Not reviewed yet" in args[2]
+
+
+@pytest.mark.asyncio
+async def test_any_other_create_failure_is_not_retried_without_draft() -> None:
+    github = AsyncMock()
+    github.create_pr.side_effect = RuntimeError("gh failed: 502")
+    with pytest.raises(RuntimeError, match="502"):
+        await _publisher(github)._create_pr(
+            title="t", body="b", head="fix/issue-1", base="main",
+        )
+    assert github.create_pr.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_reused_pr_that_cannot_go_back_to_draft_says_so_on_it() -> None:
+    github = AsyncMock()
+    github.set_pr_draft.side_effect = RuntimeError("gh failed: 403")
+    await _publisher(github)._back_to_draft()
+    [(args, _)] = [(c.args, c.kwargs) for c in github.comment_on_pr.await_args_list]
+    assert args[1] == 42 and "Not reviewed yet" in args[2]
+
+
+@pytest.mark.asyncio
+async def test_a_reused_pr_back_to_draft_posts_nothing() -> None:
+    github = AsyncMock()
+    await _publisher(github)._back_to_draft()
+    github.set_pr_draft.assert_awaited_once_with("owner/repo", 42, True)
+    github.comment_on_pr.assert_not_awaited()

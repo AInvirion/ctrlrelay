@@ -18,8 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   head is reviewed before the run reports done. With
   `steps.review: required`, the PR is opened as a draft (a reused PR is put
   back to draft when the run pushes to it) and marked ready only once the
-  latest review posted on its current head. Draft pull requests need a
-  public repository or a paid GitHub plan.
+  latest review posted on its current head. The new head is fetched from
+  the PR's own ref, since the run's branch is checked out in its worktree.
+  A repository that does not allow drafts (a private one on GitHub's free
+  plan) gets a normal PR with a comment saying it has not been reviewed
+  yet. A reused PR that cannot be put back to draft gets the same comment.
 
 ## [0.21.0] - 2026-11-05
 

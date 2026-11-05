@@ -1447,6 +1447,13 @@ async def _failed_check_logs(
 # Outputs the relay owns after #219. Whatever the agent wrote under these
 # names is dropped: a pull request number the agent reports is not
 # evidence a pull request exists, and the PR text is consumed here.
+_UNREVIEWED_PUSH_NOTE = (
+    "**Not reviewed yet.** This repository requires a review before the "
+    "relay hands a PR over, and this PR could not be marked as a draft, "
+    "so GitHub shows it as ready. Do not merge it until the relay's "
+    "review of its current head has passed."
+)
+
 _RELAY_OWNED_OUTPUTS = ("pr_number", "pr_url", "pr_title", "pr_body")
 
 # A full commit id, as GitHub names the head of the review base.
@@ -1501,6 +1508,36 @@ class _Publisher:
                 f"{self.default_branch!r}"
             )
 
+    async def _create_pr(self, **kwargs: Any) -> dict[str, Any]:
+        """Open the PR, as a draft when review is required (#222). A
+        repository that does not allow drafts (a private repository on
+        GitHub's free plan) gets a normal PR and a comment saying it has
+        not been reviewed, instead of no PR at all."""
+        if not self.draft:
+            return await self.github.create_pr(self.repo, **kwargs)
+        try:
+            return await self.github.create_pr(self.repo, draft=True, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if "draft" not in str(e).lower():
+                raise
+            log_event(
+                _logger, "dev.publish.draft_unsupported",
+                session_id=self.session_id, repo=self.repo,
+                error=str(e)[:200],
+            )
+        created = await self.github.create_pr(self.repo, **kwargs)
+        try:
+            await self.github.comment_on_pr(
+                self.repo, int(created["number"]), _UNREVIEWED_PUSH_NOTE,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        return created
+
     async def _back_to_draft(self) -> None:
         """A reused PR just got commits no review has read (#222).
 
@@ -1523,6 +1560,16 @@ class _Publisher:
                 error_type=type(e).__name__,
                 error=str(e)[:200],
             )
+            # The PR now reads "ready" on commits nobody reviewed. Say so
+            # on it, where a reader looks, not only in the log.
+            try:
+                await self.github.comment_on_pr(
+                    self.repo, self.pr_number, _UNREVIEWED_PUSH_NOTE,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
 
     async def publish(self, result: PipelineResult) -> PipelineResult:
         """Push, then open (or find) the pull request.
@@ -1583,8 +1630,7 @@ class _Publisher:
                     if self.draft:
                         await self._back_to_draft()
                 else:
-                    created = await self.github.create_pr(
-                        self.repo,
+                    created = await self._create_pr(
                         title=build_pr_title(
                             agent_outputs.get("pr_title"),
                             issue_number=self.issue_number,
@@ -1597,7 +1643,6 @@ class _Publisher:
                         ),
                         head=self.branch,
                         base=self.default_branch,
-                        **({"draft": True} if self.draft else {}),
                     )
                     self.pr_number = int(created["number"])
                     self.pr_url = str(created["url"])
@@ -3218,7 +3263,7 @@ async def _review_until_current(
             "That review is stale: this PR needs review again, and the "
             "relay is reviewing the new head.",
         )
-        fetched = await _fetch_for_review(run)
+        fetched = await _fetch_for_review(run, head)
         if fetched is not None:
             return dataclasses.replace(
                 report, posted=False, status="stale",
@@ -3237,17 +3282,22 @@ async def _review_until_current(
     )
 
 
-async def _fetch_for_review(run: _DevRun) -> str | None:
-    """Bring a head the relay did not push into the bare clone, so the
-    next review copy can check it out. Returns None, or why it could not.
+async def _fetch_for_review(run: _DevRun, head: str) -> str | None:
+    """Bring the PR's new head into the bare clone, so the next review
+    copy can check it out. Returns None, or why it could not.
 
-    The bare clone is shared, so this holds the repo lock: the CI wait
-    may have left it released.
+    Fetched from the pull request's own ref: the run's branch is checked
+    out in its worktree, and the clone's normal fetch leaves such branches
+    out (#253). The bare clone is shared, so this holds the repo lock: the
+    CI wait may have left it released.
     """
+    assert run.pr_number_for_review is not None
     try:
         if not run.lock.held and not await run.lock.reacquire():
             return "could not take the repo lock to fetch the new head"
-        await run.worktree.ensure_bare_repo(run.repo)
+        fetched = await run.worktree.fetch_pr_head(
+            run.repo, int(run.pr_number_for_review),
+        )
     except Exception as e:
         log_event(
             _logger,
@@ -3258,6 +3308,9 @@ async def _fetch_for_review(run: _DevRun) -> str | None:
             error=str(e)[:200],
         )
         return f"could not fetch the new head ({type(e).__name__})"
+    if fetched != head:
+        # It moved again between the two reads: the next round sees it.
+        return f"the PR's head moved again while it was fetched (now {fetched})"
     return None
 
 
