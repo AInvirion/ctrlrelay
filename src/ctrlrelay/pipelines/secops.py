@@ -339,10 +339,11 @@ class SecopsPipeline:
                 "\n   On this repo, drop every step-4 result whose files include\n"
                 "   anything other than `.github/dependabot.yml`, before doing\n"
                 "   anything else. A dropped PR is not an open PR for this run:\n"
-                "   every rule below that speaks of \"each open PR\", a BLOCKED\n"
-                "   question, the step-6 summary or \"what you left alone\"\n"
-                "   applies only to the PRs that remain. Do not evaluate, ask\n"
-                "   about, count or name a dropped PR anywhere."
+                "   where a rule below speaks of \"each open PR\", a BLOCKED\n"
+                "   question, the step-6 summary or \"what you left alone\", a\n"
+                "   dropped PR is never one of them. Alerts, Dependabot PRs and\n"
+                "   the remaining operator PRs are handled exactly as below. Do\n"
+                "   not evaluate, ask about, count or name a dropped PR anywhere."
             )
             operator_scope_note = (
                 "\n\nOn this repo the step-4 results are in scope only after the\n"

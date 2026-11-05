@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   By default every such PR that touches more than `.github/dependabot.yml`
   is a question, asked again on every sweep while the PR stays open. With
   `ignore` those PRs get no question and are not named in the summary; a PR
-  that touches only `.github/dependabot.yml` is still checked and merged as
-  before, and Dependabot PRs and alerts are unchanged. Unset renders the
+  that touches only `.github/dependabot.yml` is handled as before (merged if
+  it passes the author, diff and CI checks, a question if not), and
+  Dependabot PRs and alerts are unchanged. Unset renders the
   same prompt as before (#335).
 
 - Reopened issues are recorded. When the relay sees an issue's PR merge

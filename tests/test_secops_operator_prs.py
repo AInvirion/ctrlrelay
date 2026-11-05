@@ -124,8 +124,18 @@ class TestPrompt:
         step = prompt[drop:prompt.index("5. For each alert or PR:")]
         for governed in ('"each open PR"', "BLOCKED", "step-6 summary", '"what you left alone"'):
             assert governed in step
-        assert "applies only to the PRs that remain" in step
+        assert "dropped PR is never one of them" in step
         assert "A dropped PR is not an open PR for this run" in step
+        # It drops by what the PR touches, not every operator PR.
+        assert (
+            "drop every step-4 result whose files include\n"
+            "   anything other than `.github/dependabot.yml`" in step
+        )
+        # And it does not narrow the rules for anything else.
+        assert (
+            "Alerts, Dependabot PRs and\n"
+            "   the remaining operator PRs are handled exactly as below." in step
+        )
 
     def test_ignore_keeps_the_dependabot_yml_carve_out_word_for_word(self) -> None:
         ignore = _prompt(AutomationConfig(operator_prs="ignore"))
