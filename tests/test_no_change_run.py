@@ -184,3 +184,36 @@ async def test_no_change_is_refused_once_this_run_has_pushed() -> None:
         assert not result.success, (pr_number, pushed)
         assert result.outputs.get("no_change") is not True
         assert result.outputs["publish_refused"] is True
+
+
+@pytest.mark.parametrize("pushed_before, open_prs, lookup_fails", [
+    (frozenset({"c0ffee"}), [], False),           # an earlier session pushed
+    (frozenset(), [{"number": 41}], False),        # an earlier PR is open
+    (frozenset(), [], True),                       # could not look
+])
+@pytest.mark.asyncio
+async def test_no_change_is_refused_when_an_earlier_run_published(
+    pushed_before, open_prs, lookup_fails,
+) -> None:
+    from ctrlrelay.pipelines.dev import _Publisher
+
+    worktree = AsyncMock()
+    worktree.push_run_branch.side_effect = NOTHING
+    state_db = MagicMock()
+    state_db.last_relay_push.return_value = None
+    state_db.relay_pushed_shas.return_value = pushed_before
+    github = AsyncMock()
+    if lookup_fails:
+        github.list_prs.side_effect = RuntimeError("gh broke")
+    else:
+        github.list_prs.return_value = open_prs
+    publisher = _Publisher(
+        github=github, worktree=worktree, state_db=state_db,
+        repo=REPO, branch="fix/issue-853", issue_number=853,
+        issue_title="t", session_id="s", default_branch="main",
+    )
+    result = await publisher.publish(PipelineResult(
+        success=True, session_id="s", summary="done", outputs=NO_CHANGE,
+    ))
+    assert not result.success
+    assert result.outputs.get("no_change") is not True

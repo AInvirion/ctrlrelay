@@ -1631,6 +1631,29 @@ class _Publisher:
             except Exception:
                 pass
 
+    async def _branch_never_published(self) -> bool:
+        """No session on this issue ever pushed the branch, and no PR is
+        open for it (#336). The branch name is fixed per issue, so an
+        earlier run (another node, a re-cloned bare repo) may have opened a
+        PR this run never saw. A lookup that fails answers False: "could
+        not look" is not "nothing there"."""
+        try:
+            if self.state_db.relay_pushed_shas(repo=self.repo, branch=self.branch):
+                return False
+            open_prs = await self.github.list_prs(
+                self.repo, state="open", head=self.branch,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event(
+                _logger, "dev.publish.no_change_unchecked",
+                session_id=self.session_id, repo=self.repo,
+                error_type=type(e).__name__, error=str(e)[:200],
+            )
+            return False
+        return not open_prs
+
     async def publish(self, result: PipelineResult) -> PipelineResult:
         """Push, then open (or find) the pull request.
 
@@ -1731,6 +1754,7 @@ class _Publisher:
                 # would orphan that PR and say none was opened.
                 and self.pr_number is None
                 and self.last_pushed_sha is None
+                and await self._branch_never_published()
             ):
                 # The agent said nothing should change, and the relay's own
                 # count agrees. The declaration alone is never trusted: a
