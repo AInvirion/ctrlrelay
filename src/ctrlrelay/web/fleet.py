@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ctrlrelay.core.obs import get_logger, log_event
+from ctrlrelay.web.drift import clean_fingerprint
 from ctrlrelay.web.links import peer_page_url
 
 _logger = get_logger("web.fleet")
@@ -283,6 +284,8 @@ def _clean_node(raw: Any) -> dict[str, Any] | None:
             "seven_day": _clean_window(usage.get("seven_day")),
         } if isinstance(usage, dict) else "unknown",
         "claims": _clean_claims(raw.get("claims")),
+        # #307: None (unknown) from a version that does not send one.
+        "config_fingerprint": clean_fingerprint(raw.get("config_fingerprint")),
     }
 
 

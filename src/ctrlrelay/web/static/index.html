@@ -127,6 +127,7 @@ a:hover, a:focus-visible { text-decoration: underline; }
 .strip .machine.bad .state { color: var(--bad); font-weight: 700; }
 .strip .machine.greyed .last { opacity: .55; }
 .strip .machine .name { font-weight: 700; font-size: 14px; }
+.strip .machine .drift { color: var(--bad); overflow-wrap: anywhere; }
 table.who { border-collapse: collapse; width: 100%; font-size: 13px; }
 table.who th, table.who td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
 details > summary {
@@ -636,6 +637,19 @@ function versionDiffers(mine, theirs) {
     typeof theirs === "string" && theirs !== "" && mine !== theirs;
 }
 
+// #307: how a peer's config differs from this machine's, as the server
+// worked it out. Nothing when it is the same; one "unknown" line when it
+// cannot be compared (an older peer sends no fingerprint), never drift.
+function driftLines(drift) {
+  if (!drift || typeof drift !== "object") { return ["config drift unknown"]; }
+  if (drift.status === "same") { return []; }
+  if (drift.status === "differs" && Array.isArray(drift.lines)) {
+    return drift.lines.filter(function (l) { return typeof l === "string"; })
+      .map(function (l) { return "config: " + l; });
+  }
+  return ["config drift unknown" + (typeof drift.reason === "string" ? ": " + drift.reason : "")];
+}
+
 var BAD_STATES = { "paused-limit": 1, "silent": 1, "unknown": 1 };
 function isBad(state) {
   return typeof state !== "string" || Object.prototype.hasOwnProperty.call(BAD_STATES, state);
@@ -666,10 +680,15 @@ function renderFleet(data, now) {
     } else {
       var theirs = p.node && p.node.version;
       var differs = versionDiffers(data.version, theirs);
-      cards.push(machineCard(p.name || p.url, p.node, p.state,
-        p.reachable !== true || isBad(p.state) || differs, now,
+      var drifted = !!(p.drift && p.drift.status === "differs");
+      var card = machineCard(p.name || p.url, p.node, p.state,
+        p.reachable !== true || isBad(p.state) || differs || drifted, now,
         differs ? "version " + theirs + ", this machine runs " + data.version : null,
-        p.page_url));
+        p.page_url);
+      driftLines(p.drift).forEach(function (line) {
+        card.appendChild(el("div", drifted ? "drift" : "muted", line));
+      });
+      cards.push(card);
     }
   });
   put(document.getElementById("fleet-strip"), cards);

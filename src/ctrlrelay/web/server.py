@@ -58,6 +58,7 @@ from ctrlrelay.core.github_budget import BudgetStore, budget_json
 from ctrlrelay.core.heartbeat import Heartbeat
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.usage import UsageStore, pause_for, usage_json
+from ctrlrelay.web.drift import config_fingerprint, peer_drift
 from ctrlrelay.web.fleet import PeerReader
 from ctrlrelay.web.health import read_server_health
 from ctrlrelay.web.status import DAY_KINDS, build_status, list_day_events, list_feed
@@ -434,6 +435,14 @@ class StatusServer(ThreadingHTTPServer):
         # The other machines' pages, read on their own timer (#249).
         self.peers = peers
         self.page = load_page(config.web.refresh_seconds)
+        # #307: the config this server was started with; it does not change
+        # while it runs, so it is fingerprinted once.
+        try:
+            self.config_fingerprint: dict[str, Any] | None = config_fingerprint(config)
+        except Exception as exc:
+            log_event(_logger, "web.config_fingerprint_failed",
+                      error=f"{type(exc).__name__}: {exc}"[:300])
+            self.config_fingerprint = None
         self.host_names = allowed_host_names(config.web)
         self._misdirected: set[str] = set()
         self._misdirected_lock = threading.Lock()
@@ -481,6 +490,7 @@ class StatusServer(ThreadingHTTPServer):
             "chat": self._chat(),
             "usage": usage_json(reading),
             "pause_at": self.config.usage.pause_at,
+            "config_fingerprint": self.config_fingerprint,
             "paused": None if pause is None else {
                 "reason": pause.reason,
                 "until": None if pause.until is None else datetime.fromtimestamp(
@@ -507,12 +517,22 @@ class StatusServer(ThreadingHTTPServer):
             # The chat probe must not take the rest of the node block with it.
             return {"transport": None, "connected": None}
 
+    def fleet(self) -> dict[str, Any]:
+        """The peers' latest reads, each with how its config differs from
+        this machine's (#307), worked out now so a peer's change shows
+        within one read of it."""
+        block = self.peers.snapshot() if self.peers is not None else {"peers": []}
+        expected = self.config.fleet.expected_drift
+        for entry in block["peers"]:
+            entry["drift"] = peer_drift(entry, self.config_fingerprint, expected)
+        return block
+
     def status(self) -> dict[str, Any]:
         web = self.config.web
         return build_status(
             heartbeat=Heartbeat.beside(self.config.paths.state_db).read,
             silent_after_s=self.config.fleet.silent_after_seconds,
-            fleet=self.peers.snapshot if self.peers is not None else None,
+            fleet=self.fleet if self.peers is not None else None,
             node=self.node,
             db_path=self.config.paths.state_db,
             waiting=self.waiting.snapshot(),

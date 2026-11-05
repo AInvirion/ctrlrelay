@@ -1120,6 +1120,36 @@ class FleetConfig(BaseModel):
     # A name for this machine's agent subscription, shown on the page.
     # A label such as "max-2", never an email address.
     account_label: str | None = None
+    # Config differences with the peers that are intended, so the status
+    # page does not report them (#307): a repo ("owner/name"), a section
+    # ("automation", "steps", "schedules") or one field of one
+    # ("automation.exclude_labels"). Compared on this machine only.
+    expected_drift: list[str] = Field(default_factory=list)
+
+    @field_validator("expected_drift")
+    @classmethod
+    def known_drift_entries(cls, v: list[str]) -> list[str]:
+        sections = {
+            "automation": AutomationConfig, "steps": DevStepsConfig,
+            "schedules": SchedulesConfig,
+        }
+        for entry in v:
+            if "/" in entry:
+                if not _REPO_NAME_RE.match(entry):
+                    raise ValueError(
+                        f"fleet.expected_drift: {entry!r} is not a repo (owner/name)"
+                    )
+                continue
+            section, dot, field = entry.partition(".")
+            model = sections.get(section)
+            if model is None or (dot and field not in model.model_fields):
+                raise ValueError(
+                    f"fleet.expected_drift: {entry!r} is neither a repo (owner/name) "
+                    "nor a field the status page compares: automation, steps, "
+                    "schedules, or one of their fields such as "
+                    "automation.exclude_labels"
+                )
+        return v
 
     @field_validator("account_label")
     @classmethod

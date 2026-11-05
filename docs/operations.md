@@ -333,6 +333,13 @@ Added in #249:
 | `node.open_questions` | How many questions are waiting for an answer. |
 | `fleet` | `{peers: [...]}` with one item per `fleet.peers` URL: `url`, `name`, `reachable`, `checked_at`, `error`, `state`, `node` (that peer's `node` block), `last_known` (its last block while it does not answer) and `needs_you`. `null` when no peers are configured. |
 
+Added in #307:
+
+| Field | What |
+|---|---|
+| `node.config_fingerprint` | `{v, repos_hash, repos, schedules}`: `repos` maps each repo name to `{automation, steps}`, each a map of field name to a hash of its value; `schedules` is the same for `schedules`. Hashes and repo names only, never a value. `null` if it could not be built. |
+| `fleet.peers[].drift` | `{status, reason, only_here, only_there, fields, lines}`. `status` is `same`, `differs` or `unknown` (with `reason`: not read yet, not reachable, or the peer sends no fingerprint); `fields` maps a field path such as `automation.exclude_labels` to the repos it differs on; `lines` is what the page shows. Leaves out `fleet.expected_drift`. |
+
 Added in #230: `numbers` is how this machine's runs went, for the last 7 and
 the last 30 days (`numbers.windows`, each with `days`, `since`/`since_ts`,
 `until`/`until_ts`). The page shows it in the **Numbers** box, with a table
