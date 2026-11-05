@@ -43,6 +43,14 @@ UNKNOWN_RESET_PAUSE_SECONDS = 3600
 # recursion limit (RecursionError). Any of them is unreadable, not fatal.
 _UNPARSEABLE = (ValueError, RecursionError)
 ALLOWED = "allowed"
+# Statuses that still let a run through. The agent CLI reports
+# ``allowed_warning`` once a window passes a warning line well short of
+# its limit (seen at 26% of the 7-day window), and the call is served.
+# Pausing on it idled machines for the rest of the 7-day window, so it
+# counts as allowed; how close a window is to its limit is the
+# threshold's question, not the status's. Any other status, including
+# one not seen before, still pauses.
+RUNNABLE_STATUSES = frozenset({ALLOWED, "allowed_warning"})
 
 
 @dataclass(frozen=True)
@@ -225,7 +233,7 @@ def pause_for(
 ) -> Pause | None:
     """Whether to stop taking new work.
 
-    Paused when the status is not ``allowed`` or a window is at or above
+    Paused when the status is not one of ``RUNNABLE_STATUSES`` or a window is at or above
     ``threshold``, until that window's reset (for the status, the event's
     own reset). A reading whose reset time has passed says nothing about
     now, so it does not pause. When the reset time is missing or cannot
@@ -243,7 +251,7 @@ def pause_for(
     # From the reading, or from now if the reading claims to be from the
     # future (a clock set back): an hour, never longer.
     fallback = int(min(reading.read_at, now)) + UNKNOWN_RESET_PAUSE_SECONDS
-    if reading.status != ALLOWED:
+    if reading.status not in RUNNABLE_STATUSES:
         until = reading.resets_at if reading.resets_at is not None else fallback
         hits.append((f"usage status is {reading.status}", until))
     for name, w in reading.windows.items():

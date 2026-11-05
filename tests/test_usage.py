@@ -110,6 +110,30 @@ class TestPause:
         p = pause_for(_reading(status="rejected"), threshold=0.9, now=NOW)
         assert p is not None and p.until == NOW + 3600
 
+    def test_allowed_warning_below_the_threshold_does_not_pause(self) -> None:
+        # The usage.json alkamax wrote on 2026-11-04: a warning status at
+        # 26% of the 7-day window, which had paused it for a week.
+        r = UsageReading.from_json(json.loads(
+            '{"status": "allowed_warning", "read_at": 1793857204, '
+            '"resets_at": 1794412800, '
+            '"seven_day": {"used": 0.26, "resets_at": 1794412800}}'
+        ))
+        assert r is not None and r.status == "allowed_warning"
+        assert pause_for(r, threshold=0.9, now=1793857204) is None
+
+    def test_allowed_warning_at_the_threshold_still_pauses(self) -> None:
+        p = pause_for(
+            _reading(status="allowed_warning",
+                     windows={"seven_day": Window(0.95, NOW + 86400)}),
+            threshold=0.9, now=NOW,
+        )
+        assert p is not None and p.until == NOW + 86400
+        assert "status" not in p.reason
+
+    @pytest.mark.parametrize("status", ["rejected", "allowed_later", "", "ALLOWED"])
+    def test_any_other_status_pauses(self, status: str) -> None:
+        assert pause_for(_reading(status=status), threshold=0.9, now=NOW) is not None
+
     def test_after_the_reset_the_old_reading_does_not_pause(self) -> None:
         r = _reading(windows={"five_hour": Window(0.99, NOW + 600)})
         assert pause_for(r, threshold=0.9, now=NOW + 600) is None
