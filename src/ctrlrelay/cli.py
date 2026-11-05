@@ -5467,10 +5467,14 @@ def _self_update_effects(config, *, say):
 
         asyncio.run(bounded())
 
+    def poller_heartbeat() -> dict | None:
+        return Heartbeat.beside(config.paths.state_db).read_process()
+
     return Effects(
         fetch_json=fetch_json, download=download, run=run, status=status,
         running_sessions=running_sessions, poller_alive=poller_alive,
-        notify=notify, clock=time.monotonic, sleep=time.sleep, say=say,
+        notify=notify, poller_heartbeat=poller_heartbeat,
+        clock=time.monotonic, sleep=time.sleep, now=time.time, say=say,
     )
 
 
@@ -5534,8 +5538,12 @@ def self_update(
     )
 
     # SIGTERM would end the process without running `finally`, and leave
-    # new work held until the hold expires. As SystemExit it unwinds.
+    # new work held until the hold expires. As SystemExit it unwinds, and
+    # after an install has begun it rolls back first. A second SIGTERM is
+    # ignored so it cannot cut that roll-back short; each of its steps is
+    # bounded.
     def _on_term(signum, _frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         raise SystemExit(128 + signum)
 
     previous = signal.signal(signal.SIGTERM, _on_term)

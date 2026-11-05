@@ -79,6 +79,13 @@ class FakeNode:
         # The poller's own instance, on the same file.
         self.poller = IntakeHold.beside(tmp_path / "state.db", clock=self.clock)
         self.on_sleep: list = []
+        # The poller process: a pre-#306 poller writes no version.
+        self.poller_pid = 4000
+        self.poller_version: str | None = None
+        self.poller_up = True
+        # What a poller started on NEW does: "ok", "dead" (never writes a
+        # heartbeat) or "crashloop" (a new pid at every look).
+        self.new_poller = "ok"
 
     def clock(self) -> float:
         return self.now
@@ -120,9 +127,27 @@ class FakeNode:
                     self.installed = version
             return 0, ""
         if "restart" in argv or "kickstart" in argv:
-            self.running_version = self.installed
+            if "poller" in argv[-1]:
+                self._start_poller()
+            else:
+                self.running_version = self.installed
             return 0, ""
         return 0, ""
+
+    def _start_poller(self) -> None:
+        self.poller_pid += 1
+        self.poller_version = NEW if self.installed == NEW else None
+        self.poller_up = not (self.installed == NEW and self.new_poller == "dead")
+
+    def poller_heartbeat(self) -> dict | None:
+        if self.installed == NEW and self.new_poller == "crashloop":
+            self.poller_pid += 1
+        if not self.poller_up:
+            # Only the last heartbeat of the process that was stopped.
+            return {"heartbeat_at": 900, "pid": 4000, "version": None,
+                    "started_at": 800}
+        return {"heartbeat_at": int(self.now), "pid": self.poller_pid,
+                "version": self.poller_version, "started_at": int(self.now)}
 
     def status(self) -> dict:
         return {"host": "alka", "version": self.running_version}
@@ -137,7 +162,8 @@ class FakeNode:
             fetch_json=self.fetch_json, download=self.download, run=self.run,
             status=self.status, running_sessions=self.running_sessions,
             poller_alive=lambda: self.poller_alive, notify=self.chat.append,
-            clock=self.clock, sleep=self.sleep,
+            poller_heartbeat=self.poller_heartbeat,
+            clock=self.clock, sleep=self.sleep, now=self.clock,
         )
 
     def installs(self) -> list[list[str]]:
@@ -175,6 +201,7 @@ def test_an_idle_node_is_updated_restarted_and_checked(node, tmp_path) -> None:
         ["systemctl", "--user", "restart", u.name] for u in UNITS
     ]
     assert node.running_version == NEW
+    assert node.poller_version == NEW and node.poller_pid == 4001
     assert not node.hold.path.exists() and not node.hold.ack_path.exists()
     assert node.chat == [f"✅ alka updated from ctrlrelay {OLD} to {NEW}."]
 
@@ -483,3 +510,100 @@ def test_restart_command_on_systemd() -> None:
     assert restart_command(UNITS[1], 1000) == [
         "systemctl", "--user", "restart", "ctrlrelay-poller.service",
     ]
+
+
+# --- the poller, not just the web server, has to come up on the new version --
+
+
+@pytest.mark.parametrize("mode", ["dead", "crashloop"])
+def test_a_new_poller_that_does_not_stay_up_is_rolled_back(node, tmp_path, mode) -> None:
+    """The web server reports the new version and every restart command
+    returned 0, yet no new poller process kept beating."""
+    node.new_poller = mode
+
+    with pytest.raises(SelfUpdateError) as e:
+        _updater(node, tmp_path).run(NEW)
+
+    assert node.running_version == OLD   # the web was rolled back too
+    assert e.value.step == "verify" and "poller" in e.value.message
+    assert node.installed == OLD
+    assert len(node.chat) == 1
+    assert "failed at verify" in node.chat[0] and "was put back" in node.chat[0]
+    assert not node.hold.path.exists()
+
+
+def test_a_poller_still_on_the_old_version_is_not_enough(node, tmp_path) -> None:
+    def start_stale() -> None:
+        node.poller_pid += 1
+        node.poller_version = OLD
+        node.poller_up = True
+
+    node._start_poller = start_stale
+    with pytest.raises(SelfUpdateError) as e:
+        _updater(node, tmp_path).run(NEW)
+    assert e.value.step == "verify"
+    assert "was put back" in node.chat[0]
+
+
+# --- interrupted after the install ------------------------------------------
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_an_interruption_after_the_install_rolls_back_and_says_so(
+    node, tmp_path, exc,
+) -> None:
+    real_run = node.run
+    interrupted = []
+
+    def run(argv, timeout):
+        out = real_run(argv, timeout)
+        if argv[1:3] == ["tool", "install"] and not interrupted:
+            interrupted.append(True)
+            raise exc(143) if exc is SystemExit else exc()
+        return out
+
+    node.run = run
+    with pytest.raises(exc):
+        _updater(node, tmp_path).run(NEW)
+
+    assert node.installed == OLD and node.running_version == OLD
+    assert len(node.chat) == 1
+    assert f"interrupted ({exc.__name__})" in node.chat[0]
+    assert f"{OLD} was put back and is running" in node.chat[0]
+    assert not node.hold.path.exists()
+
+
+def test_an_interruption_before_the_install_changes_nothing(node, tmp_path) -> None:
+    node.sessions = [1]
+
+    def interrupt() -> None:
+        raise KeyboardInterrupt
+
+    node.on_sleep.append(interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _updater(node, tmp_path).run(NEW)
+    assert node.installs() == [] and node.chat == []
+
+
+# --- the heartbeat names its process and version ----------------------------
+
+
+def test_the_heartbeat_names_its_process_and_version(tmp_path) -> None:
+    import json
+    import os
+
+    from ctrlrelay.core.heartbeat import Heartbeat
+
+    path = tmp_path / "heartbeat.json"
+    Heartbeat(path, version="9.9.9").beat(now=1_800_000_000)
+    got = Heartbeat(path).read_process()
+    assert got["pid"] == os.getpid() and got["version"] == "9.9.9"
+    assert got["heartbeat_at"] == 1_800_000_000
+    assert isinstance(got["started_at"], int)
+
+    # One written before #306: no version, no start time.
+    path.write_text(json.dumps({"heartbeat_at": 1_800_000_000, "last_poll_at": None,
+                                "pid": 12}))
+    assert Heartbeat(path).read_process() == {
+        "heartbeat_at": 1_800_000_000, "pid": 12, "version": None, "started_at": None,
+    }

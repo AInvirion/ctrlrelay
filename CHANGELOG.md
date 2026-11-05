@@ -18,9 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing is in flight and no session is running, so a poll cannot start a
   run between the check and the restart. Then `uv tool install --force`,
   a restart of this node's systemd user units or LaunchAgents, and a check
-  that `/api/status` reports the new version. If a step after the install
-  fails, the old version is installed and restarted again; chat is told
-  either way and the command exits non-zero. The hold is removed on every
+  that `/api/status` reports the new version and that a new poller process
+  reports it in its heartbeat and stays up (the heartbeat now carries the
+  poller's pid, version and start time). If a step after the install
+  fails, or the command is interrupted after the install began, the old
+  version is installed and restarted again; chat is told either way and
+  the command exits non-zero. The hold is removed on every
   exit, and ignored once its process is gone or it expires (#306).
 - The status page marks a peer whose version differs from this machine's:
   its card is red and says which version each runs (#306).

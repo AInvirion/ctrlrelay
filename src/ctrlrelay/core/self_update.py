@@ -84,6 +84,10 @@ class Limits:
     ack_interval: float = 2.0
     status_seconds: float = 120.0
     status_interval: float = 3.0
+    # The new poller has to beat twice from one pid: it writes every 30 s,
+    # so two beats show it stayed up rather than crash-looping.
+    poller_seconds: float = 150.0
+    poller_interval: float = 5.0
     command_seconds: float = 300.0
     # How long past the idle wait the hold may outlive a dead updater.
     hold_margin_seconds: float = 1800.0
@@ -99,8 +103,13 @@ class Effects:
     running_sessions: Callable[[], int | None]
     poller_alive: Callable[[], bool]
     notify: Callable[[str], None]
+    # The poller's heartbeat: {heartbeat_at, pid, version, started_at}.
+    poller_heartbeat: Callable[[], dict[str, Any] | None]
     clock: Callable[[], float]
     sleep: Callable[[float], None]
+    # Wall time, to compare with the heartbeat's epoch seconds; ``clock``
+    # is for deadlines and may be monotonic.
+    now: Callable[[], float]
     say: Callable[[str], None] = field(default=lambda _text: None)
 
 
@@ -285,8 +294,7 @@ class SelfUpdate:
             fx.say(f"Installing {wheel.name}.")
             touched = True
             self._install(wheel)
-            self._restart()
-            self._verify(release.version)
+            self._restart_and_verify(release.version, strict=True)
         except SelfUpdateError as e:
             log_event(_logger, "self_update.failed", step=e.step, error=e.message[:300],
                       target=target, old=old)
@@ -298,6 +306,19 @@ class SelfUpdate:
                 text += f" Nothing was changed; {self.node} still runs {old}."
             self._notify(text)
             raise SelfUpdateError(e.step, text) from e
+        except BaseException as e:
+            # Ctrl-C, or SIGTERM (the CLI makes it SystemExit), after the
+            # install started would leave the node half updated and nobody
+            # told. Every step of the roll-back is bounded, so finishing it
+            # before going on with the interruption does not hang.
+            if touched:
+                log_event(_logger, "self_update.interrupted",
+                          reason=type(e).__name__, target=target, old=old)
+                text = (f"⚠️ self-update of {self.node} to {target} was "
+                        f"interrupted ({type(e).__name__}) after the install "
+                        f"began. " + self._roll_back(old))
+                self._notify(text)
+            raise
         finally:
             if token is not None:
                 self.hold.release(token)
@@ -382,6 +403,55 @@ class SelfUpdate:
                     f"{out.strip()[-200:]}",
                 )
 
+    def _restart_and_verify(self, version: str, *, strict: bool) -> None:
+        """Restart every unit, then require both the web server and a new
+        poller process to report ``version``. A restart command returns 0
+        even when the unit then crash-loops (``Restart=always``), and the
+        status page's version is the web process's own, so neither proves
+        the poller is up. ``strict=False`` is for the roll-back: an old
+        poller's heartbeat may carry no version, and a fresh one from a new
+        process is then the best evidence there is."""
+        before = self._heartbeat()
+        old_pid = before["pid"] if before else None
+        since = int(self.fx.now())
+        self._restart()
+        self._verify(version)
+        self._verify_poller(version, old_pid=old_pid, since=since, strict=strict)
+
+    def _heartbeat(self) -> dict[str, Any] | None:
+        try:
+            return self.fx.poller_heartbeat()
+        except Exception:
+            return None
+
+    def _verify_poller(
+        self, version: str, *, old_pid: int | None, since: int, strict: bool,
+    ) -> None:
+        first_beat: dict[int, int] = {}
+        last: list[dict[str, Any] | None] = [None]
+
+        def up() -> bool:
+            hb = self._heartbeat()
+            last[0] = hb
+            if hb is None or hb["pid"] == old_pid or hb["heartbeat_at"] < since:
+                return False
+            got = hb.get("version")
+            if got != version and (strict or got is not None):
+                return False
+            first = first_beat.setdefault(hb["pid"], hb["heartbeat_at"])
+            return hb["heartbeat_at"] > first
+
+        if not wait_until(up, seconds=self.limits.poller_seconds,
+                          interval=self.limits.poller_interval,
+                          clock=self.fx.clock, sleep=self.fx.sleep):
+            hb = last[0]
+            seen = ("no heartbeat" if hb is None else
+                    f"pid {hb['pid']}, version {hb.get('version') or 'unknown'}")
+            raise SelfUpdateError(
+                "verify", f"no new poller process stayed up on {version} within "
+                f"{int(self.limits.poller_seconds)}s (last heartbeat: {seen})",
+            )
+
     def _verify(self, version: str) -> None:
         seen: list[str] = []
 
@@ -409,8 +479,7 @@ class SelfUpdate:
             release = resolve_release(old, fetch_json=self.fx.fetch_json)
             wheel = download_verified(release, self.wheel_dir, download=self.fx.download)
             self._install(wheel)
-            self._restart()
-            self._verify(old)
+            self._restart_and_verify(old, strict=False)
         except SelfUpdateError as e:
             log_event(_logger, "self_update.rollback_failed", step=e.step,
                       error=e.message[:300], old=old)

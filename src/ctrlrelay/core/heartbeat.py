@@ -11,6 +11,12 @@ daemon writes a small file beside the state database:
 
 A page that finds the heartbeat old says the machine is **silent**: the
 web server answers but nothing confirms the poller is working.
+
+It also carries the writer's ``pid``, ``version`` and ``started_at``, so
+``ctrlrelay self-update`` (#306) can tell that a new poller process came up
+on the new version and stayed up, rather than trusting the web server,
+which reports only its own version, or a restart command that succeeds
+even when the unit then crash-loops.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ctrlrelay import __version__
 from ctrlrelay.core.obs import get_logger, log_event
 
 _logger = get_logger("core.heartbeat")
@@ -37,9 +44,11 @@ def _is_time(value: object) -> bool:
 
 
 class Heartbeat:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, version: str = __version__) -> None:
         self.path = Path(path)
         self._last_poll_at: int | None = None
+        self._version = version
+        self._started_at = int(time.time())
 
     @classmethod
     def beside(cls, state_db: Path) -> Heartbeat:
@@ -55,7 +64,11 @@ class Heartbeat:
     def _write(self, now: int) -> None:
         """Best-effort: a heartbeat that cannot be written is logged, never
         allowed to stop the daemon it reports on."""
-        data = {"heartbeat_at": now, "last_poll_at": self._last_poll_at, "pid": os.getpid()}
+        data = {
+            "heartbeat_at": now, "last_poll_at": self._last_poll_at,
+            "pid": os.getpid(), "version": self._version,
+            "started_at": self._started_at,
+        }
         tmp: str | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,6 +103,27 @@ class Heartbeat:
         return {
             "heartbeat_at": beat,
             "last_poll_at": poll if _is_time(poll) else None,
+        }
+
+    def read_process(self) -> dict[str, Any] | None:
+        """``{heartbeat_at, pid, version, started_at}`` of the process that
+        wrote the heartbeat, or ``None`` when it is unreadable. ``version``
+        and ``started_at`` are ``None`` from a writer before #306."""
+        try:
+            data = json.loads(self.path.read_text())
+        except (OSError, ValueError, RecursionError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        beat, pid = data.get("heartbeat_at"), data.get("pid")
+        if not _is_time(beat) or type(pid) is not int:
+            return None
+        version, started = data.get("version"), data.get("started_at")
+        return {
+            "heartbeat_at": beat,
+            "pid": pid,
+            "version": version if isinstance(version, str) and version else None,
+            "started_at": started if _is_time(started) else None,
         }
 
     async def run(self, interval: float = HEARTBEAT_SECONDS) -> None:

@@ -753,10 +753,18 @@ human decision. In order:
    `*.ctrlrelay-{bridge,poller,web}.plist` in `~/Library/LaunchAgents` on
    macOS (the label is the file's name, whatever `--label-prefix` it was
    installed with).
-5. Waits up to two minutes for `/api/status` to report the new version.
+5. Waits up to two minutes for `/api/status` to report the new version,
+   and up to two and a half for a new poller process to report it in its
+   heartbeat (`heartbeat.json` now carries the poller's `pid`, `version`
+   and `started_at`) and to beat a second time. The status page's version
+   is the web server's own, and a restart command succeeds even when the
+   unit then crash-loops, so neither alone shows the poller is up.
 
-If any step after the install fails, the old version is installed and
-restarted the same way, and checked. Chat (when a transport is configured)
+If any step after the install fails, or the command is interrupted
+(Ctrl-C, SIGTERM) once the install has begun, the old version is installed
+and restarted the same way, and checked; a poller from before this command
+writes no version in its heartbeat, so for the old version a fresh
+heartbeat from a new process is enough. Chat (when a transport is configured)
 gets one line either way: the update, or the step that failed and whether
 the old version is running again. The command exits non-zero on any
 failure. The hold is removed on every way out, including Ctrl-C and
