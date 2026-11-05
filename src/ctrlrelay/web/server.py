@@ -60,6 +60,7 @@ from ctrlrelay.core.heartbeat import Heartbeat
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.usage import UsageStore, pause_for, usage_json
 from ctrlrelay.web.drift import config_fingerprint, peer_drift
+from ctrlrelay.web.drift import unknown as drift_unknown
 from ctrlrelay.web.fleet import PeerReader
 from ctrlrelay.web.health import read_server_health
 from ctrlrelay.web.status import DAY_KINDS, build_status, list_day_events, list_feed
@@ -529,8 +530,34 @@ class StatusServer(ThreadingHTTPServer):
         block = self.peers.snapshot() if self.peers is not None else {"peers": []}
         expected = self.config.fleet.expected_drift
         for entry in block["peers"]:
-            entry["drift"] = peer_drift(entry, self.config_fingerprint, expected)
+            try:
+                entry["drift"] = peer_drift(entry, self.config_fingerprint, expected)
+            except Exception as exc:  # one peer's answer must not take the page down
+                error = f"{type(exc).__name__}: {exc}"[:300]
+                self._note_drift_failure(entry.get("url"), error)
+                entry["drift"] = drift_unknown(
+                    f"could not compare: {type(exc).__name__}"
+                )
+            # The fingerprint was only needed for the comparison; the page
+            # gets the drift. Copied, never popped: the reader's stored
+            # entry keeps it for the next comparison.
+            for key in ("node", "last_known"):
+                node = entry.get(key)
+                if isinstance(node, dict) and "config_fingerprint" in node:
+                    entry[key] = {k: v for k, v in node.items() if k != "config_fingerprint"}
         return block
+
+    @functools.cached_property
+    def _drift_failures(self) -> set[tuple[Any, str]]:
+        return set()
+
+    def _note_drift_failure(self, url: Any, error: str) -> None:
+        """Log a failed comparison once per peer and error, not per request."""
+        with self._misdirected_lock:
+            if (url, error) in self._drift_failures:
+                return
+            self._drift_failures.add((url, error))
+        _logger.warning("web.drift_compare_failed", extra={"peer": url, "error": error})
 
     def status(self) -> dict[str, Any]:
         web = self.config.web

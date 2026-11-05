@@ -650,9 +650,9 @@ What is compared: the list of repos; for each repo in both, every field of
 names and hashes are sent, never a value. The fingerprint is the config the
 server was started with, so an edit shows once the daemon is restarted.
 
-A peer on a version that sends no fingerprint shows `config drift unknown`,
-not as drift. A field only one side has (two versions with different config
-models) is not compared; the card already marks the version difference.
+A peer on a version that sends no fingerprint, or one in another format,
+shows `config drift unknown`, not as drift. A field only one side has is not
+compared, so a config field added in a newer version does not read as drift.
 
 `expected_drift` is read on each machine for its own page only. A routing
 label that only some machines carry in `exclude_labels` is listed as

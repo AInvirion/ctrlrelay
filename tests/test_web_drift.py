@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -95,6 +96,7 @@ def fleet(tmp_path: Path) -> Iterator:
         threading.Thread(target=httpd_a.serve_forever,
                          kwargs={"poll_interval": 0.05}, daemon=True).start()
         started.append(httpd_a)
+        run.server = httpd_a  # type: ignore[attr-defined]
         return _fetch(httpd_a)
 
     (tmp_path / "a").mkdir()
@@ -202,43 +204,127 @@ def test_no_config_value_crosses_the_wire(tmp_path: Path, fleet) -> None:
     a = _config(tmp_path, "node-a", repos)
     b = _config(tmp_path, "node-b", repos + [_repo(BETA, exclude=[LABEL])])
     status = fleet(a, b)
-    # Positive control: the fingerprints are there, both this node's and the
-    # peer's as read over HTTP, and the peer's carries B's extra repo.
+    # Positive control: this node's fingerprint is there, and the peer's was
+    # read over HTTP and compared (B's extra repo is named).
     mine = status["node"]["config_fingerprint"]
-    theirs = status["fleet"]["peers"][0]["node"]["config_fingerprint"]
     assert set(mine["repos"]) == {ALPHA}
-    assert set(theirs["repos"]) == {ALPHA, BETA}
-    assert set(theirs["repos"][ALPHA]["automation"]) >= {"exclude_labels", "dependabot_patch"}
+    [profile] = mine["profiles"].values()
+    assert set(profile["automation"]) >= {"exclude_labels", "dependabot_patch"}
+    assert _drift(status)["only_there"] == [BETA]
     body = json.dumps(status)
     assert LABEL not in body
     assert TOKEN not in body
-    assert "required" not in json.dumps(theirs)  # the steps.review value
+    assert "required" not in json.dumps(mine)  # the steps.review value
 
 
-def test_an_old_peer_without_a_fingerprint_is_unknown(tmp_path: Path) -> None:
-    old = {"host": "node-b", "version": "0.22.0",
-           "node": {"name": "node-b", "state": "idle",
-                    "heartbeat_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
-    srv, url = _serve_raw(200, json.dumps(old).encode())
+def test_a_peers_fingerprint_is_not_echoed_but_still_compared_next_time(
+    tmp_path: Path, fleet,
+) -> None:
     a = _config(tmp_path, "node-a", [_repo(ALPHA)])
-    (tmp_path / "a").mkdir()
-    reader = PeerReader([url], interval_s=60, timeout_s=5, silent_after=300)
+    b = _config(tmp_path, "node-b", [_repo(ALPHA), _repo(BETA)])
+    first = fleet(a, b)
+    again = _fetch(fleet.server)
+    for status in (first, again):
+        [peer] = status["fleet"]["peers"]
+        assert "config_fingerprint" not in peer["node"]
+        assert peer["node"]["name"] == "node-b"
+        assert peer["drift"]["only_there"] == [BETA]
+
+
+def test_a_shared_config_keeps_the_fingerprint_small(tmp_path: Path) -> None:
+    repos = [_repo(f"example-org/repo-{i:03d}", exclude=["manual", LABEL]) for i in range(100)]
+    fp = config_fingerprint(_config(tmp_path, "a", repos))
+    assert len(fp["repos"]) == 100 and len(fp["profiles"]) == 1
+    assert len(json.dumps(fp)) < 6000
+
+
+def _peer_body(name: str, fp: Any) -> bytes:
+    node: dict[str, Any] = {
+        "name": name, "state": "idle",
+        "heartbeat_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if fp is not _NO_FP:
+        node["config_fingerprint"] = fp
+    return json.dumps({"host": name, "version": "0.22.0", "node": node}).encode()
+
+
+_NO_FP = object()
+
+
+def _status_with_raw_peers(tmp_path: Path, a: Config, bodies: list[bytes]) -> dict:
+    """Node A's /api/status, with each body served as one peer's answer and
+    read through A's PeerReader."""
+    peers = [_serve_raw(200, body) for body in bodies]
+    (tmp_path / "a").mkdir(exist_ok=True)
+    reader = PeerReader([url for _, url in peers], interval_s=60, timeout_s=5,
+                        silent_after=300)
     reader.read_once()
     httpd = make_server(a, waiting=_tracker(a, tmp_path / "a"), peers=reader)
     threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05},
                      daemon=True).start()
     try:
-        status = _fetch(httpd)
+        return _fetch(httpd)
     finally:
         httpd.shutdown()
         httpd.server_close()
-        srv.shutdown()
+        for srv, _ in peers:
+            srv.shutdown()
+
+
+def test_an_old_peer_without_a_fingerprint_is_unknown(tmp_path: Path) -> None:
+    a = _config(tmp_path, "node-a", [_repo(ALPHA)])
+    status = _status_with_raw_peers(tmp_path, a, [_peer_body("node-b", _NO_FP)])
     [peer] = status["fleet"]["peers"]
     assert peer["reachable"] is True and peer["error"] is None
     assert peer["drift"]["status"] == "unknown"
     assert "no config fingerprint" in peer["drift"]["reason"]
     assert peer["drift"]["lines"] == []
     assert not [e for e in status["errors"] if e.startswith("fleet")]
+
+
+def test_one_failing_comparison_leaves_the_other_peers_and_the_page(
+    tmp_path: Path, monkeypatch, caplog,
+) -> None:
+    from ctrlrelay.web import drift as drift_module
+
+    real = drift_module.compare
+
+    def compare(mine, theirs, expected=()):
+        if BETA in theirs["repos"]:
+            raise RuntimeError("boom")
+        return real(mine, theirs, expected)
+
+    monkeypatch.setattr(drift_module, "compare", compare)
+    a = _config(tmp_path, "node-a", [_repo(ALPHA)])
+    bad = config_fingerprint(_config(tmp_path, "b", [_repo(ALPHA), _repo(BETA)]))
+    good = config_fingerprint(_config(tmp_path, "c", [_repo(ALPHA), _repo(GAMMA)]))
+    bodies = [_peer_body("node-b", bad), _peer_body("node-c", good)]
+    peers = [_serve_raw(200, body) for body in bodies]
+    (tmp_path / "a").mkdir()
+    reader = PeerReader([url for _, url in peers], interval_s=60, timeout_s=5,
+                        silent_after=300)
+    reader.read_once()
+    httpd = make_server(a, waiting=_tracker(a, tmp_path / "a"), peers=reader)
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05},
+                     daemon=True).start()
+    try:
+        with caplog.at_level(logging.WARNING, logger="ctrlrelay"):
+            first, second = _fetch(httpd), _fetch(httpd)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        for srv, _ in peers:
+            srv.shutdown()
+    for status in (first, second):
+        b_peer, c_peer = status["fleet"]["peers"]
+        assert b_peer["drift"]["status"] == "unknown"
+        assert b_peer["drift"]["reason"] == "could not compare: RuntimeError"
+        assert b_peer["drift"]["lines"] == []
+        assert "config_fingerprint" not in b_peer["node"]
+        assert c_peer["drift"]["lines"] == [f"1 repo only there: {GAMMA}"]
+        assert status["node"]["name"] == "node-a"
+    logged = [r for r in caplog.records if r.getMessage() == "web.drift_compare_failed"]
+    assert len(logged) == 1
 
 
 # --- the pieces -----------------------------------------------------------------
@@ -260,27 +346,95 @@ def test_a_peer_not_read_or_not_reachable_is_unknown(tmp_path: Path) -> None:
     assert down["status"] == "unknown" and down["reason"] == "not reachable from here"
 
 
-def test_a_field_only_one_version_has_is_not_drift(tmp_path: Path) -> None:
+def _rekey(fp: dict) -> dict:
+    """Recompute a fingerprint's profile keys and repos_hash after editing
+    a profile, so it is a valid fingerprint of the edited content."""
+    from ctrlrelay.web.drift import _hash
+
+    old_to_new = {}
+    profiles = {}
+    for key, profile in fp["profiles"].items():
+        old_to_new[key] = _hash(profile)
+        profiles[old_to_new[key]] = profile
+    fp["profiles"] = profiles
+    fp["repos"] = {name: old_to_new[key] for name, key in fp["repos"].items()}
+    fp["repos_hash"] = _hash(sorted(n.lower() for n in fp["repos"]))
+    return fp
+
+
+def _wire(fp: dict) -> dict:
+    return json.loads(json.dumps(fp))
+
+
+def test_a_field_only_one_side_has_is_not_drift(tmp_path: Path) -> None:
     mine = config_fingerprint(_config(tmp_path, "a", [_repo(ALPHA)]))
-    theirs = json.loads(json.dumps(mine))
-    theirs["repos"][ALPHA]["automation"]["a_newer_field"] = "0" * 16
+    theirs = _wire(mine)
+    [profile] = theirs["profiles"].values()
+    profile["automation"]["a_newer_field"] = "0" * 16
     del theirs["schedules"]["weekly_summary"]
-    assert compare(mine, clean_fingerprint(theirs))["status"] == "same"
+    clean = clean_fingerprint(_rekey(theirs))
+    assert clean is not None
+    assert compare(mine, clean)["status"] == "same"
 
 
-@pytest.mark.parametrize("mutate", [
-    lambda fp: fp.update(v=2),
-    lambda fp: fp.update(repos=[]),
-    lambda fp: fp["repos"][ALPHA].pop("steps"),
-    lambda fp: fp["repos"][ALPHA]["automation"].update(exclude_labels="manual"),
-    lambda fp: fp["schedules"].update(secops_cron=7),
-    lambda fp: fp.update(repos_hash=None),
-])
-def test_a_malformed_fingerprint_is_unknown_not_drift(tmp_path: Path, mutate) -> None:
-    fp = json.loads(json.dumps(config_fingerprint(_config(tmp_path, "a", [_repo(ALPHA)]))))
-    assert clean_fingerprint(fp) is not None
-    mutate(fp)
-    assert clean_fingerprint(fp) is None
+def _profile(fp: dict) -> dict:
+    return next(iter(fp["profiles"].values()))
+
+
+def _many_profiles(fp: dict) -> None:
+    from ctrlrelay.web.drift import _hash
+
+    for i in range(5001):
+        profile = {"automation": {"f": _hash(i)}, "steps": {}}
+        fp["profiles"][_hash(profile)] = profile
+
+
+MALFORMED = {
+    "the old format": lambda fp: fp.update(v=1),
+    "no repos, any repos_hash": lambda fp: fp.update(repos={}),
+    "a repo renamed, repos_hash kept": lambda fp: fp.update(
+        repos={"other/name": next(iter(fp["repos"].values()))}),
+    "no profiles": lambda fp: fp.pop("profiles"),
+    "a repo naming no profile": lambda fp: fp["repos"].update({ALPHA: "f" * 16}),
+    "a profile edited, key kept": lambda fp: _profile(fp)["automation"].update(
+        exclude_labels="0" * 16),
+    "a profile missing a section": lambda fp: _profile(fp).pop("steps"),
+    "a hash that is not one": lambda fp: _profile(fp)["automation"].update(
+        exclude_labels="manual"),
+    "a schedule that is not a hash": lambda fp: fp["schedules"].update(secops_cron=7),
+    "too many profiles": _many_profiles,
+}
+
+
+def test_a_well_formed_peer_fingerprint_is_compared(tmp_path: Path) -> None:
+    """The control for the malformed cases below: the same fingerprint,
+    unmutated, through the same path, is compared."""
+    a = _config(tmp_path, "node-a", [_repo(ALPHA)])
+    fp = _wire(config_fingerprint(_config(tmp_path, "b", [_repo(ALPHA), _repo(BETA)])))
+    [peer] = _status_with_raw_peers(tmp_path, a, [_peer_body("node-b", fp)])["fleet"]["peers"]
+    assert peer["drift"]["lines"] == [f"1 repo only there: {BETA}"]
+
+
+@pytest.mark.parametrize("name", sorted(MALFORMED))
+def test_a_malformed_fingerprint_is_unknown_not_drift(tmp_path: Path, name: str) -> None:
+    a = _config(tmp_path, "node-a", [_repo(ALPHA)])
+    fp = _wire(config_fingerprint(_config(tmp_path, "b", [_repo(ALPHA), _repo(BETA)])))
+    MALFORMED[name](fp)
+    [peer] = _status_with_raw_peers(tmp_path, a, [_peer_body("node-b", fp)])["fleet"]["peers"]
+    assert peer["reachable"] is True
+    assert peer["drift"]["status"] == "unknown"
+    assert peer["drift"]["lines"] == []
+    assert peer["drift"]["only_here"] is None
+    # Refused when read, not by the comparison failing on it.
+    assert peer["drift"]["reason"].startswith("it sends no config fingerprint")
+
+
+def test_an_honest_empty_repo_list_is_compared(tmp_path: Path) -> None:
+    a = _config(tmp_path, "node-a", [_repo(ALPHA)])
+    fp = _wire(config_fingerprint(_config(tmp_path, "b", [])))
+    assert fp["repos"] == {} and fp["profiles"] == {}
+    [peer] = _status_with_raw_peers(tmp_path, a, [_peer_body("node-b", fp)])["fleet"]["peers"]
+    assert peer["drift"]["lines"] == [f"1 repo only here: {ALPHA}"]
 
 
 @pytest.mark.parametrize("entry", [
@@ -314,9 +468,9 @@ def test_page_shows_drift_lines_and_nothing_when_the_same() -> None:
 
 
 @pytest.mark.parametrize("drift,expected", [
-    ({"status": "unknown", "reason": "it sends no config fingerprint (an older version?)",
+    ({"status": "unknown", "reason": "it sends no config fingerprint this version can read",
       "lines": []},
-     ["config drift unknown: it sends no config fingerprint (an older version?)"]),
+     ["config drift unknown: it sends no config fingerprint this version can read"]),
     (None, ["config drift unknown"]),   # a server from before #307
 ])
 def test_page_shows_an_old_peer_as_unknown(drift, expected) -> None:
