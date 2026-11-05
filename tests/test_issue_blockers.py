@@ -156,6 +156,13 @@ class _Blockers:
             return await GitHubCLI().list_blocked_by(repo, number)
 
 
+_SELF_ASSIGNED = [{
+    "event": "assigned", "actor": {"login": "alice"},
+    "assignee": {"login": "alice"}, "assigner": {"login": "alice"},
+    "created_at": "2026-01-01T00:00:00Z",
+}]
+
+
 def _github(blockers: _Blockers) -> MagicMock:
     """GitHub with one open issue, #12, self-assigned to alice."""
     gh = MagicMock()
@@ -163,11 +170,7 @@ def _github(blockers: _Blockers) -> MagicMock:
              "labels": [], "assignees": [{"login": "alice"}]}
     gh.list_assigned_issues = AsyncMock(return_value=[issue])
     gh.list_issues_by_label = AsyncMock(return_value=[])
-    gh.list_assignment_events = AsyncMock(return_value=[{
-        "event": "assigned", "actor": {"login": "alice"},
-        "assignee": {"login": "alice"}, "assigner": {"login": "alice"},
-        "created_at": "2026-01-01T00:00:00Z",
-    }])
+    gh.list_assignment_events = AsyncMock(return_value=_SELF_ASSIGNED)
     gh.get_issue_gate = AsyncMock(return_value={
         "state": "open", "labels": [], "assignees": ["alice"],
     })
@@ -390,10 +393,9 @@ async def test_recovering_after_a_long_outage(tmp_path: Path) -> None:
 async def test_a_failed_events_call_while_held_does_not_lose_the_issue(
     tmp_path: Path,
 ) -> None:
-    """A held assignment-only issue is offered every poll. A failed
-    self-assignment (events) call marks an issue seen for good, so the
-    poll does not ask again for an issue already held: it was confirmed
-    when it was first held."""
+    """A held assignment-only issue is offered, and its self-assignment
+    checked, every poll. A failed events call marks an ordinary issue seen
+    for good; a held one is left unmarked so the next poll asks again."""
     blockers = _Blockers()
     blockers.rows[12] = [_issue_row(REPO, 5, "open")]
     gh = _github(blockers)
@@ -408,9 +410,46 @@ async def test_a_failed_events_call_while_held_does_not_lose_the_issue(
     await relay.poll()
     assert relay.started == []
 
+    assert 12 not in poller.seen_issues.get(REPO, set())
+
+    gh.list_assignment_events = AsyncMock(return_value=_SELF_ASSIGNED)
     blockers.rows[12] = [_issue_row(REPO, 5, "closed")]
     await relay.poll()
     assert relay.started == [12]
+
+
+@pytest.mark.asyncio
+async def test_a_held_issue_reassigned_by_someone_else_is_not_started(
+    tmp_path: Path,
+) -> None:
+    """Held, then unassigned (it leaves the search, its hold stays), then
+    assigned to the operator by another login. Being held must not skip
+    the who-assigned check: the repo does not accept foreign assignments,
+    so the issue is not started, even once its blocker closes."""
+    blockers = _Blockers()
+    blockers.rows[12] = [_issue_row(REPO, 5, "open")]
+    gh = _github(blockers)
+    poller = _poller(gh, tmp_path / "s.json")
+    relay = _Relay(gh, poller)
+    await relay.poll()
+    assert poller.is_held(REPO, 12)
+
+    issue = (await gh.list_assigned_issues(REPO, assignee="alice"))[0]
+    gh.list_assigned_issues = AsyncMock(return_value=[])
+    await relay.poll()
+    assert poller.is_held(REPO, 12)
+
+    gh.list_assigned_issues = AsyncMock(return_value=[issue])
+    gh.list_assignment_events = AsyncMock(return_value=[*_SELF_ASSIGNED, {
+        "event": "assigned", "actor": {"login": "alice"},
+        "assignee": {"login": "alice"}, "assigner": {"login": "mallory"},
+        "created_at": "2026-02-01T00:00:00Z",
+    }])
+    blockers.rows[12] = [_issue_row(REPO, 5, "closed")]
+    await relay.poll()
+    await relay.poll()
+    assert relay.started == []
+    assert not poller.is_held(REPO, 12)
 
 
 @pytest.mark.asyncio

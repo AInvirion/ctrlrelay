@@ -711,17 +711,6 @@ class IssuePoller:
                     if not is_assigned:
                         continue
 
-                # Held back by its GitHub blockers (#310): it was admitted
-                # by this check when it was first held, and it is offered
-                # again every poll until the last blocker closes. Asking
-                # again each time would only add risk: a failed events
-                # call below marks the issue seen for good, and an issue
-                # blocked for days would take that chance every poll.
-                if self.is_held(repo, number):
-                    seen_for_repo.add(number)
-                    new_issues.append({"repo": repo, "issue": issue})
-                    continue
-
                 # Assignment-only path: run the self-assignment event
                 # check exactly as before.
                 events_check_failed = False
@@ -749,6 +738,16 @@ class IssuePoller:
                     # Self-assigned: admit and mark seen.
                     seen_for_repo.add(number)
                     new_issues.append({"repo": repo, "issue": issue})
+                elif events_check_failed and self.is_held(repo, number):
+                    # Held back by its GitHub blockers (#310), so offered
+                    # (and checked) every poll until the last one closes.
+                    # Marking it seen here would lose it for good on one
+                    # failed call, a chance an issue blocked for days takes
+                    # every poll; left unmarked, the next poll asks again.
+                    # The check itself still runs each time: the issue may
+                    # have been unassigned and assigned again by someone
+                    # else since it was first held.
+                    pass
                 elif events_check_failed:
                     # Transient events-API failure (codex P2 round-4).
                     # Mark seen regardless of include_labels to avoid
@@ -764,6 +763,9 @@ class IssuePoller:
                     # Confirmed foreign-assigned on a pre-#80 repo:
                     # mark seen to avoid re-checking events every poll.
                     seen_for_repo.add(number)
+                if not accepted and not events_check_failed:
+                    # No longer ours to start, so no longer held (#310).
+                    self.clear_blocked(repo, number)
                 # Confirmed foreign on include_labels repos is
                 # INTENTIONALLY left unmarked (codex P1 round-2 fix)
                 # so a later label addition can still trigger. The

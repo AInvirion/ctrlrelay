@@ -653,9 +653,10 @@ issue body is not read, so add the link as well.
 
 A held issue is kept out of `seen_issues` (that is what brings it back)
 and recorded in `blocked` in the same `poller_state.json`, so a restart
-neither loses it nor repeats the chat line. Its self-assignment is not
-checked again while it is held: it was confirmed when the issue was first
-held, and a failed check would otherwise mark the issue handled for good.
+neither loses it nor repeats the chat line. Its self-assignment is
+checked again every poll (it may have been unassigned and assigned again
+by someone else), but a check that fails leaves a held issue for the next
+poll instead of marking it handled for good.
 Each poll costs a held issue one extra REST call (`core` budget) for its
 blockers, plus the re-read every issue gets just before it starts. A blocked issue that is closed or loses its trigger is dropped
 from `blocked` when the poller next sees it.

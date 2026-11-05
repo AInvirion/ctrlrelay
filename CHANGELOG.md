@@ -21,9 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`poll.issue.blockers_unknown`) and are never read as "no blockers"; the
   chat is told only after 3 failed polls in a row. A held issue stays out
   of `seen_issues` and is recorded in `blocked` in `poller_state.json`, so
-  a restart neither loses it nor repeats the chat line, and its
-  self-assignment is not re-checked while it waits, so a failed check
-  cannot drop it. Free text such as "Starts after: #A" is not read; use the link.
+  a restart neither loses it nor repeats the chat line, and a failed
+  self-assignment check while it waits retries it next poll rather than
+  dropping it. Free text such as "Starts after: #A" is not read; use the link.
 
 ## [0.22.0] - 2026-11-05
 
