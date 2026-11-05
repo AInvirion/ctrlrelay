@@ -10,9 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - A dev run's question is now asked on its GitHub issue as well as in chat,
-  and the first answer from either one wins. An answer on the issue counts
-  only from an account with write access to the repository, and only if it
-  is newer than the question and carries no relay marker; other comments
+  and the first answer from either one wins. An answer on the issue is a
+  comment that starts with `/answer`, since the relay and every working
+  session comment as the operator's account; it counts only from an account
+  with write access to the repository, and only if it is newer than the
+  question and carries no relay marker; other comments
   are logged and ignored. The chat is told when the issue answered it, and a
   chat answer is copied to the issue. A reply that loses is told it was not
   applied, and never resumes the session a second time. On a public

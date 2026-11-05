@@ -40,6 +40,13 @@ _logger = get_logger("issue_questions")
 # has one is never an answer: the relay comments as the operator's account.
 RELAY_MARKER_PREFIX = "<!-- ctrlrelay:"
 
+# An answer on the issue must start with this. The relay, every node and
+# every working session comment as the operator's own account, so "a
+# comment from a writer, after the question" also matches a session's
+# "claiming this issue" note, which would then be fed to the agent as its
+# answer. Only a comment that says it is an answer is one.
+ANSWER_COMMAND = "/answer"
+
 QUESTION_ON_ISSUE_MODES = ("auto", "full", "notice")
 
 # author_association values that MAY have write access; the permission
@@ -72,9 +79,9 @@ def question_comment(session_id: str, question: str, full: bool) -> str:
         )
     return (
         f"{head}\n\n"
-        "_Answer here or in chat; the first answer wins. A reply here "
-        "counts only from an account with write access to this "
-        "repository._\n"
+        f"_Answer in chat, or here with a comment that starts with "
+        f"`{ANSWER_COMMAND}`; the first answer wins. A reply here counts "
+        "only from an account with write access to this repository._\n"
         f"{_marker('question', session_id)}"
     )
 
@@ -177,6 +184,19 @@ async def ask_on_issue(
     return watched
 
 
+def answer_text(body: str) -> str | None:
+    """The answer in a comment that starts with ``/answer``, or ``None``
+    for any other comment. The command is matched as a whole word, in any
+    case; an empty answer is not one."""
+    text = body.strip()
+    head, _, rest = text.partition("\n")
+    word, _, tail = head.partition(" ")
+    if word.lower() != ANSWER_COMMAND:
+        return None
+    answer = (tail + ("\n" + rest if rest else "")).strip()
+    return answer or None
+
+
 def _iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -246,7 +266,8 @@ async def check_issue_answer(
 
     One comments call, with ``since`` the question's time. The first
     comment that is newer than the question comment, carries no relay
-    marker and comes from an account with write access is the answer.
+    marker, starts with ``/answer`` and comes from an account with write
+    access is the answer.
     Comments from anyone else are logged and ignored.
     """
     sid = row["session_id"]
@@ -276,7 +297,10 @@ async def check_issue_answer(
         if created is not None and created < int(asked_at):
             continue
         body = comment.get("body") or ""
-        if RELAY_MARKER_PREFIX in body or not body.strip():
+        if RELAY_MARKER_PREFIX in body:
+            continue
+        answer = answer_text(body)
+        if answer is None:
             continue
         login = (comment.get("user") or {}).get("login") or ""
         allowed = await _has_write_access(github, repo, comment, cache)
@@ -294,7 +318,7 @@ async def check_issue_answer(
             )
             continue
         if state_db.answer_pending_resume(
-            sid, body.strip(), source="github", by=login, ref=cid,
+            sid, answer, source="github", by=login, ref=cid,
         ):
             log_event(
                 _logger, "issue_question.answered_on_github", session_id=sid,
@@ -389,6 +413,12 @@ async def note_chat_answer_on_issue(
             _logger, "issue_question.answer_copy_failed", session_id=sid,
             repo=repo, error_type=type(e).__name__, error=str(e)[:200],
         )
+        # Give the claim back, so the next caller tries the copy again
+        # rather than leaving the issue showing an open question.
+        try:
+            state_db.release_answer_noted(sid, int(row["answered_at"]))
+        except Exception:
+            pass
         return False
     return True
 
@@ -419,6 +449,8 @@ __all__ = [
     "ask_on_issue",
     "check_issue_answer",
     "note_chat_answer_on_issue",
+    "answer_text",
+    "ANSWER_COMMAND",
     "note_expiry_on_issue",
     "watch_issue_answers",
 ]

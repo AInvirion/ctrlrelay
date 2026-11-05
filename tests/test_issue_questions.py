@@ -19,8 +19,11 @@ from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
 from ctrlrelay.core.dispatcher import SessionResult
 from ctrlrelay.core.issue_questions import (
     RELAY_MARKER_PREFIX,
+    answer_text,
     check_issue_answer,
+    note_chat_answer_on_issue,
     note_expiry_on_issue,
+    question_comment,
     watch_issue_answers,
 )
 from ctrlrelay.core.state import StateDB
@@ -224,7 +227,7 @@ async def test_answer_on_the_issue_resumes_the_same_session_and_tells_chat(
     github = _GitHub(private=True)
     github.permissions["maintainer"] = "write"
     github.issue_comments = [
-        _comment(200, "pin it", "COLLABORATOR", "maintainer"),
+        _comment(200, "/answer pin it", "COLLABORATOR", "maintainer"),
     ]
     transport = _Transport(answer=None)  # chat never answers
 
@@ -273,7 +276,7 @@ async def test_chat_answer_first_is_copied_to_the_issue_and_wins(
     assert dispatcher.spawn_session.await_count == 2  # first run + resume
 
     # A later comment on the issue is not a second answer.
-    github.issue_comments = [_comment(300, "pin it", "OWNER", "oscar")]
+    github.issue_comments = [_comment(300, "/answer pin it", "OWNER", "oscar")]
     assert await watch_issue_answers(github.mock, state_db) == 0
     assert state_db.list_pending_resumes_to_execute() == []
     assert state_db.get_pending_resume(sid)["answer"] == "bump it"
@@ -294,15 +297,15 @@ async def test_comments_that_do_not_count_leave_the_row_unanswered(
     github = _GitHub()
     github.permissions["reader"] = "read"
     github.issue_comments = [
-        _comment(201, "do X", "NONE", "stranger"),
-        _comment(202, "do Y", "CONTRIBUTOR", "drive-by"),
-        _comment(203, "do Z", "COLLABORATOR", "reader"),
+        _comment(201, "/answer do X", "NONE", "stranger"),
+        _comment(202, "/answer do Y", "CONTRIBUTOR", "drive-by"),
+        _comment(203, "/answer do Z", "COLLABORATOR", "reader"),
         _comment(
-            204, f"claim\n{RELAY_MARKER_PREFIX}claimed node=a id=1 -->",
+            204, f"/answer claim\n{RELAY_MARKER_PREFIX}claimed node=a id=1 -->",
             "OWNER", "oscar",
         ),
         # Older than the question comment.
-        _comment(99, "old reply", "OWNER", "oscar"),
+        _comment(99, "/answer old reply", "OWNER", "oscar"),
     ]
     assert not await check_issue_answer(github.mock, state_db, row)
     fresh = state_db.get_pending_resume("s-1")
@@ -323,8 +326,8 @@ async def test_an_unreadable_permission_does_not_let_a_later_comment_win(
     github = _GitHub()
     github.mock.get_collaborator_permission.side_effect = RuntimeError("503")
     github.issue_comments = [
-        _comment(201, "first", "MEMBER", "member"),
-        _comment(202, "second", "OWNER", "oscar"),
+        _comment(201, "/answer first", "MEMBER", "member"),
+        _comment(202, "/answer second", "OWNER", "oscar"),
     ]
     assert not await check_issue_answer(github.mock, state_db, row)
     assert state_db.get_pending_resume("s-1")["answered_at"] is None
@@ -337,7 +340,7 @@ async def test_two_watchers_reading_the_same_comment_note_it_once(
     state_db = StateDB(tmp_path / "state.db")
     row = _watched_row(state_db)
     github = _GitHub()
-    github.issue_comments = [_comment(201, "pin it", "OWNER", "oscar")]
+    github.issue_comments = [_comment(201, "/answer pin it", "OWNER", "oscar")]
     notes: list[str] = []
 
     async def notify(text: str) -> None:
@@ -360,7 +363,7 @@ async def test_a_github_reply_after_a_chat_answer_is_told_it_lost(
     row = _watched_row(state_db)  # read before the chat answer landed
     assert state_db.answer_pending_resume("s-1", "bump it")
     github = _GitHub()
-    github.issue_comments = [_comment(201, "pin it", "OWNER", "oscar")]
+    github.issue_comments = [_comment(201, "/answer pin it", "OWNER", "oscar")]
     assert not await check_issue_answer(github.mock, state_db, row)
     assert state_db.get_pending_resume("s-1")["answer"] == "bump it"
     (note,) = github.bodies("already-answered")
@@ -417,3 +420,61 @@ async def test_claim_goes_back_to_working_after_a_held_wait() -> None:
     ]
     assert states == [HELD, WORKING]
     await keeper.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_own_account_comment_without_the_command_is_not_an_answer(
+    tmp_path: Path,
+) -> None:
+    # Every session comments as the operator's account, with no relay
+    # marker: a claim note after the question must not become the answer.
+    state_db = StateDB(tmp_path / "state.db")
+    row = _watched_row(state_db)
+    github = _GitHub()
+    github.issue_comments = [
+        _comment(201, "Taking over PR #331 by hand on alkathink.", "OWNER", "oscar"),
+        _comment(202, "/answer pin it", "OWNER", "oscar"),
+    ]
+    assert await check_issue_answer(github.mock, state_db, row)
+    fresh = state_db.get_pending_resume("s-1")
+    assert fresh["answer"] == "pin it"
+    assert fresh["answer_ref"] == 202
+
+
+@pytest.mark.parametrize("body, expected", [
+    ("/answer pin it", "pin it"),
+    ("  /ANSWER  pin it  ", "pin it"),
+    ("/answer\npin it\nand bump", "pin it\nand bump"),
+    ("/answer", None),
+    ("/answer   ", None),
+    ("/answered it already", None),
+    ("pin it /answer", None),
+    ("Taking over this issue", None),
+    ("", None),
+])
+def test_answer_text(body: str, expected: str | None) -> None:
+    assert answer_text(body) == expected
+
+
+def test_the_question_comment_says_how_to_answer() -> None:
+    assert "`/answer`" in question_comment("s-1", "which?", True)
+    assert "`/answer`" in question_comment("s-1", "which?", False)
+
+
+@pytest.mark.asyncio
+async def test_a_chat_answer_copy_that_fails_can_be_tried_again(
+    tmp_path: Path,
+) -> None:
+    state_db = StateDB(tmp_path / "state.db")
+    _watched_row(state_db)
+    assert state_db.answer_pending_resume("s-1", "bump it")
+    row = state_db.get_pending_resume("s-1")
+    github = _GitHub()
+    github.mock.post_issue_comment.side_effect = RuntimeError("502")
+    assert not await note_chat_answer_on_issue(github.mock, state_db, row, mode="full")
+    assert state_db.get_pending_resume("s-1")["answer_noted_at"] is None
+
+    github.mock.post_issue_comment.side_effect = github._post
+    row = state_db.get_pending_resume("s-1")
+    assert await note_chat_answer_on_issue(github.mock, state_db, row, mode="full")
+    assert len(github.bodies("ctrlrelay:answer")) == 1

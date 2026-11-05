@@ -1364,6 +1364,16 @@ class StateDB:
         self._conn.commit()
         return cursor.rowcount > 0
 
+    def release_answer_noted(self, session_id: str, answered_at: int) -> None:
+        """Undo ``mark_answer_noted`` when the note could not be posted,
+        so a later caller can try it again."""
+        self._conn.execute(
+            "UPDATE pending_resumes SET answer_noted_at = NULL "
+            "WHERE session_id = ? AND answered_at = ?",
+            (session_id, answered_at),
+        )
+        self._conn.commit()
+
     def list_pending_resumes_to_execute(self) -> list[dict[str, Any]]:
         """Rows that have been answered by the operator but not yet
         resumed. Poller's pending-resume sweeper loads these and drives
