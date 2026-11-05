@@ -954,6 +954,84 @@ class IssuePoller:
                 return True
         return False
 
+    async def recheck_before_dispatch(
+        self, repo: str, issue: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Read the issue again just before it is handled (#326).
+
+        ``poll()`` returns a batch and the loop handles it one issue at a
+        time, so with one slot and long runs the last issue in a batch can
+        start an hour after the poll saw it. In that time the operator may
+        have removed the trigger label or closed the issue, and the run
+        would start anyway.
+
+        Returns the issue with today's ``state``, ``labels`` and
+        ``assignees`` when it may still start. Returns ``None`` when it is
+        closed, now carries an ``exclude_labels`` label, no longer meets
+        any trigger, or could not be read; then it is also taken out of
+        ``seen_issues``, so the next poll judges it afresh rather than
+        never again. Whether the operator was the one who added a label or
+        assignment is not asked again: that was settled by ``poll()``.
+        """
+        number = int(issue["number"])
+        try:
+            live = await self.github.get_issue_gate(repo, number)
+            state = str(live["state"]).lower()
+            labels = [str(n) for n in live["labels"]]
+            assignees = [str(n) for n in live["assignees"]]
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.unmark_seen(repo, number)
+            log_event(
+                _logger, "poll.issue.recheck_failed", repo=repo,
+                issue_number=number, reason=type(e).__name__,
+                error=str(e)[:200],
+            )
+            return None
+
+        fresh = {
+            **issue,
+            "state": state,
+            "labels": [{"name": n} for n in labels],
+            "assignees": [{"login": n} for n in assignees],
+        }
+        reason: str | None = None
+        if state != "open":
+            reason = "closed"
+        else:
+            excluded = self._matched_exclude_label(fresh, {
+                x.lower() for x in self.exclude_labels_by_repo.get(repo, [])
+            })
+            include_lowered = {
+                x.lower() for x in self.include_labels_by_repo.get(repo, [])
+            }
+            require_lowered = {
+                x.lower() for x in self.require_labels_by_repo.get(repo, [])
+            }
+            # Logins compared without case, as the assignee search that
+            # admitted the issue does: a case-only mismatch would skip the
+            # issue on every poll and never start it.
+            me = (self.username or "").lower()
+            assigned = bool(me) and me in {n.lower() for n in assignees} and (
+                not require_lowered
+                or self._matched_require_label(fresh, require_lowered)
+                is not None
+            )
+            labelled = self._matched_include_label(fresh, include_lowered)
+            if excluded is not None:
+                reason = f"excluded_by_label:{excluded}"
+            elif not assigned and labelled is None:
+                reason = "trigger_gone"
+        if reason is not None:
+            self.unmark_seen(repo, number)
+            log_event(
+                _logger, "poll.issue.stale_at_dispatch", repo=repo,
+                issue_number=number, reason=reason,
+            )
+            return None
+        return fresh
+
     def mark_seen(self, repo: str, issue_number: int) -> None:
         """Mark an issue as seen without triggering a poll.
 
@@ -1310,7 +1388,15 @@ async def run_poll_loop(
         # would otherwise be silently dropped until daemon restart.
         for item in new_issues:
             try:
-                await handler(item["repo"], item["issue"])
+                # The batch can be an hour old by the time an item's turn
+                # comes (#326): read it again, and skip it if it may no
+                # longer start.
+                fresh = await poller.recheck_before_dispatch(
+                    item["repo"], item["issue"],
+                )
+                if fresh is None:
+                    continue
+                await handler(item["repo"], fresh)
             except asyncio.CancelledError:
                 raise
             except Exception as e:

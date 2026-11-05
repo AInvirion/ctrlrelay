@@ -79,6 +79,7 @@ class TestHeartbeat:
 
         poller = MagicMock()
         poller.poll = AsyncMock(return_value=[{"repo": "o/r", "issue": {"number": 1}}])
+        poller.recheck_before_dispatch = AsyncMock(side_effect=lambda repo, issue: issue)
         task = asyncio.create_task(hb.run(interval=0.005))
         await run_poll_loop(poller=poller, handler=long_run, interval=0, max_iterations=1,
                             on_poll=hb.polled)

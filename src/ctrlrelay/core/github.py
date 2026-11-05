@@ -561,6 +561,19 @@ class GitHubCLI:
         )
         return json.loads(output)
 
+    async def get_issue_gate(self, repo: str, issue_number: int) -> dict[str, Any]:
+        """Return ``{"state", "labels", "assignees"}`` for one issue, read
+        live over REST: the fields that decide whether the relay may still
+        start it (#326). ``labels`` and ``assignees`` are lists of names.
+        """
+        output = await self._run_gh(
+            "api", f"repos/{repo}/issues/{issue_number}",
+            "--jq",
+            "{state: .state, labels: [.labels[].name], "
+            "assignees: [.assignees[].login]}",
+        )
+        return json.loads(output)
+
     async def create_pr(
         self,
         repo: str,
