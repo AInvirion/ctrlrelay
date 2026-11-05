@@ -38,11 +38,13 @@ REASON_CONFIRM = "waits for the poller to confirm the assignment"
 REASON_NEXT_POLL = "next poll"
 
 # Why an assigned open issue will not be picked up (#232). With
-# "missing required label X" and "excluded label X" these are the only
-# reasons a skipped item carries.
+# "missing required label X", "excluded label X" and the two blocker
+# reasons (#310) these are the only reasons a skipped item carries.
 REASON_NOT_CONFIGURED = "repo not in config"
 REASON_SEEN = "already handled once (won't retry)"
 REASON_FOREIGN = "assigned by someone else"
+# Held back by its GitHub "blocked by" issues (#310); see `_blocked_reason`.
+REASON_BLOCKERS_UNKNOWN = "could not read its blockers; asked again every poll"
 
 # How long a "not self-assigned" answer is trusted before it is asked again.
 # A "self-assigned" answer is kept while the issue is unchanged: the cache is
@@ -122,6 +124,32 @@ def load_seen(poller_state_file: Path) -> set[str]:
         return set()
 
 
+def load_blocked(poller_state_file: Path) -> dict[str, list[str] | None]:
+    """The poller's ``blocked`` issues (#310) as ``"owner/repo#N"`` keys:
+    the open blockers, or ``None`` when the poller could not read them.
+    A missing, unreadable or malformed file gives an empty dict, as for
+    :func:`load_seen`; the poller re-checks every held issue each poll."""
+    try:
+        data = json.loads(poller_state_file.read_text())
+        raw = data.get("blocked", {})
+        out: dict[str, list[str] | None] = {}
+        for repo, entries in raw.items():
+            for n, blockers in entries.items():
+                if blockers is None:
+                    out[seen_key(repo, int(n))] = None
+                elif isinstance(blockers, list):
+                    out[seen_key(repo, int(n))] = [str(b) for b in blockers]
+        return out
+    except Exception:
+        return {}
+
+
+def _blocked_reason(blockers: list[str] | None) -> str:
+    if blockers is None:
+        return REASON_BLOCKERS_UNKNOWN
+    return "blocked by " + ", ".join(blockers)
+
+
 def _label_name(label: Any) -> str:
     """A label's name, from a ``{"name": ...}`` dict or a plain string, the
     two shapes the poller's label checks accept."""
@@ -167,12 +195,13 @@ def compute_waiting(
     locks: dict[str, str],
     assignments: Mapping[str, bool] | None = None,
     username: str = "",
+    blocked: Mapping[str, list[str] | None] | None = None,
 ) -> list[WaitingItem]:
     """What the poller would pick up next, in the order it would take it:
     the waiting half of :func:`classify_issues`."""
     return classify_issues(
         config, issues, seen=seen, running=running, locks=locks,
-        assignments=assignments, username=username,
+        assignments=assignments, username=username, blocked=blocked,
     )[0]
 
 
@@ -190,6 +219,7 @@ def classify_issues(
     locks: dict[str, str],
     assignments: Mapping[str, bool] | None = None,
     username: str = "",
+    blocked: Mapping[str, list[str] | None] | None = None,
 ) -> tuple[list[WaitingItem], list[SkippedItem]]:
     """Every issue, sorted into what the poller would pick up next
     (waiting) and the assigned issues it will not (skipped, with why).
@@ -215,12 +245,20 @@ def classify_issues(
     also marked seen by the poller, so the label is checked first: it is
     the reason the issue is held back.
 
+    ``blocked`` holds the issues the poller left for later because of
+    their GitHub "blocked by" issues (#310), keyed like ``seen``. One of
+    those that would otherwise wait is skipped instead, with the open
+    blockers (or "could not read") as the reason, label-only rows
+    included: the poller did take the label as a trigger, and it is the
+    blocker that holds the issue back.
+
     Waiting order: config repo order (the poller walks ``config.repos``),
     then GitHub's order within a repo, assignee rows before label-only
     rows. Skipped order: the same for configured repos, then the issues of
     repos not in the config, in GitHub's order.
     """
     assignments = assignments or {}
+    blocked = blocked or {}
     running_keys = {
         seen_key(s.get("repo") or "", int(s["issue_number"])).lower()
         for s in running
@@ -233,8 +271,11 @@ def classify_issues(
     items: list[WaitingItem] = []
     skipped: list[SkippedItem] = []
 
-    def skip(repo: str, issue: dict[str, Any], number: int, reason: str) -> None:
-        if issue.get(VIA_LABEL):
+    def skip(
+        repo: str, issue: dict[str, Any], number: int, reason: str,
+        *, label_rows: bool = False,
+    ) -> None:
+        if issue.get(VIA_LABEL) and not label_rows:
             return
         skipped.append(SkippedItem(
             repo=repo,
@@ -283,6 +324,10 @@ def classify_issues(
                     continue
                 is_assigned = False
             if label_match is None and not is_assigned:
+                continue
+            if key in blocked:
+                skip(repo, issue, number, _blocked_reason(blocked[key]),
+                     label_rows=True)
                 continue
             if label_match is None and not auto.accept_foreign_assignments:
                 # Assignment-only: the poller takes it only if the
@@ -404,11 +449,12 @@ class WaitingTracker:
             titles = _titles_of(issues)
             running, locks = self._sessions()
             seen = load_seen(self._poller_state_file)
+            blocked = load_blocked(self._poller_state_file)
             # First pass: which items wait only on the self-assignment
             # check. Only those (already past the label rules) are checked.
             pending = compute_waiting(
                 self._config, issues, seen=seen, running=running, locks=locks,
-                username=username,
+                username=username, blocked=blocked,
             )
             assignments: dict[str, bool] = {}
             for item in pending:
@@ -424,7 +470,7 @@ class WaitingTracker:
                 )
             items, skipped = classify_issues(
                 self._config, issues, seen=seen, running=running, locks=locks,
-                assignments=assignments, username=username,
+                assignments=assignments, username=username, blocked=blocked,
             )
         except asyncio.CancelledError:
             raise

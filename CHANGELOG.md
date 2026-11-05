@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The poller does not start an issue whose GitHub "blocked by" issues are
+  still open (#310). Before claiming an issue it reads its blockers from
+  GitHub's issue dependencies, including blockers in other repositories.
+  An issue with an open blocker is not claimed, is logged as
+  `poll.issue.blocked`, is listed on the status page under Skipped as
+  "blocked by #A", and is said in chat once; every later poll asks again,
+  so it starts on the first poll after its last blocker closes. Blockers
+  that cannot be read (an API error, a rate limit, a 404 on a GitHub
+  without the dependencies API) hold the issue the same way
+  (`poll.issue.blockers_unknown`) and are never read as "no blockers". A
+  held issue stays out of `seen_issues` and is recorded in `blocked` in
+  `poller_state.json`, so a restart neither loses it nor repeats the chat
+  line. Free text such as "Starts after: #A" is not read; use the link.
+
 ## [0.22.0] - 2026-11-05
 
 ### Added

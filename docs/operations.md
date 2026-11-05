@@ -295,7 +295,7 @@ Fields added in #232 (all in `/api/status`):
 |---|---|
 | `url` | On every `running`, `needs_you`, `waiting.items`, `skipped` and `feed` item (and on `/api/events` events): a link to the GitHub issue, or for a feed event that names a PR by number, the PR. Built only as `https://github.com/<owner>/<repo>/issues/<n>` or `/pull/<n>`, from a repo matching `owner/name` and an integer; `null` otherwise (a secops run with no issue, a restart). A `pr_url` an agent reported is never used. |
 | `refs` | On every `needs_you` item (#241): one `{"number", "url"}` per distinct `#N` in the question, in order, at most 20, with `url` built the same way as `url` above from the item's repo and N. A `#N` right after a letter, digit, `_`, `/` or `&` is not counted. The page turns each listed `#N` in the question into a link, so a secops question's PRs are clickable. `[]` when there are none. |
-| `skipped` | Every open issue assigned to you that the poller will **not** pick up and is not running, from the same search as the waiting line (no extra GitHub calls): `repo`, `issue_number`, `title`, `url`, `updated`/`updated_ts` and `reason`, one of `repo not in config`, `excluded label <label>`, `already handled once (won't retry)`, `missing required label <label>` (several joined with "or": any one admits it), `assigned by someone else`. `null` until GitHub has answered once; `waiting.status` and `waiting.last_good_ts` say how current it is. The page shows it collapsed, with a count. |
+| `skipped` | Every open issue assigned to you that the poller will **not** pick up and is not running, from the same search as the waiting line (no extra GitHub calls): `repo`, `issue_number`, `title`, `url`, `updated`/`updated_ts` and `reason`, one of `repo not in config`, `excluded label <label>`, `already handled once (won't retry)`, `missing required label <label>` (several joined with "or": any one admits it), `assigned by someone else`, `blocked by <#N, owner/repo#N>` or `could not read its blockers; asked again every poll` (#310, see [Issues blocked by other issues](#issues-blocked-by-other-issues); these two are listed for a label-triggered issue too). `null` until GitHub has answered once; `waiting.status` and `waiting.last_good_ts` say how current it is. The page shows it collapsed, with a count. |
 | `server` | This machine's health, read on each request: `load_1m`, `load_5m`, `load_15m`, `cpu_count`, `memory` (`total_bytes`, `available_bytes`, `available_pct`, `low`), `disks` (one each for `home` and `worktrees`: `name`, `path`, `total_bytes`, `free_bytes`, `free_pct`, `low`), `uptime_s`, and `unavailable` (why any number is `null`; memory and uptime are `null` off Linux). `low` is true below 10% free and the page marks it. The whole section is `null`, with a line in `errors`, only if reading it failed outright. |
 
 Added in #247:
@@ -623,6 +623,38 @@ unit files above set `ExitTimeOut=180` (launchd) and
 and leaves stale `git worktree` admin state behind. If you're upgrading
 from an older plist/unit that didn't set these, add them and reload.
 
+## Issues blocked by other issues
+
+When work has an order (B changes the same files as A, so B waits for A),
+say so on GitHub with an issue dependency: on B, **Relationships → Mark as
+blocked by → A**. The blocker may be in another repository. Before the
+poller claims an issue it reads that issue's blockers
+(`GET /repos/{owner}/{repo}/issues/{n}/dependencies/blocked_by`), and:
+
+- **None is open:** the run starts as usual.
+- **One or more is open:** the issue is not claimed and not started. The
+  log has `poll.issue.blocked` with `blocked_by` (the open ones, `#N` in
+  the same repository, `owner/repo#N` in another), the status page lists
+  it under **Skipped** as `blocked by …`, and the chat is told once per
+  issue, not every poll. Every later poll asks again, so it starts on the
+  first poll after the last blocker closes, with nothing to do by hand.
+- **The blockers could not be read** (an API error, the GitHub API budget
+  used up, a 404 from a GitHub Enterprise Server without the dependencies
+  API): treated like an open blocker, never as "no blockers". The log has
+  `poll.issue.blockers_unknown` with the error, the status page says
+  `could not read its blockers`, the chat is told once per issue, and the
+  next poll tries again.
+
+Only the dependency link counts. A line such as "Starts after: #A" in the
+issue body is not read, so add the link as well.
+
+A held issue is kept out of `seen_issues` (that is what brings it back)
+and recorded in `blocked` in the same `poller_state.json`, so a restart
+neither loses it nor repeats the chat line. Each poll costs a held issue
+one extra REST call (`core` budget) on top of the reads every candidate
+issue gets. A blocked issue that is closed or loses its trigger is dropped
+from `blocked` when the poller next sees it.
+
 ## Stuck runs
 
 A run that goes in circles is stopped early instead of running until
@@ -845,6 +877,12 @@ make the poller look at it again. The skip decision reads the issue
 number only — no assignee and no labels — so the number has to leave
 `seen_issues` (and the relay has to be restarted, since the running
 poller holds the set in memory and rewrites the file from it).
+
+An issue held back by an open GitHub blocker (see [Issues blocked by
+other issues](#issues-blocked-by-other-issues)) is never in `seen_issues`
+while it waits; it is listed in `blocked[<repo>]` with its open blockers
+(`null` when they could not be read). Nothing needs deleting: it starts on
+its own once the blockers close.
 
 ### A repo whose history was replaced
 

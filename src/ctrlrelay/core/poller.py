@@ -83,6 +83,34 @@ def _read_failure_counts(raw: object) -> dict[str, dict[int, int]]:
     return out
 
 
+def _read_blocked(raw: object) -> dict[str, dict[int, list[str] | None]]:
+    """The issues held back by open blockers (#310), from the state file:
+    per repo and issue, the open blockers as ``"#N"`` / ``"owner/repo#N"``,
+    or ``None`` when they could not be read. Anything of another shape is
+    dropped; the next poll asks GitHub again either way, so a lost entry
+    costs at most one more chat line."""
+    out: dict[str, dict[int, list[str] | None]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for repo, entries in raw.items():
+        if not isinstance(repo, str) or not isinstance(entries, dict):
+            continue
+        kept: dict[int, list[str] | None] = {}
+        for number, blockers in entries.items():
+            if not (isinstance(number, str) and number.isascii()
+                    and number.isdigit() and len(number) <= 18):
+                continue
+            if blockers is None:
+                kept[int(number)] = None
+            elif isinstance(blockers, list) and all(
+                isinstance(b, str) for b in blockers
+            ):
+                kept[int(number)] = list(blockers)
+        if kept:
+            out[repo] = kept
+    return out
+
+
 class _Intake:
     """What one poll learned from GitHub, read once for every repo (#282).
 
@@ -202,6 +230,13 @@ class IssuePoller:
     # as an epoch time. In memory only; after a restart the issue is
     # simply checked once more.
     recheck_after: dict[str, dict[int, float]] = field(default_factory=dict)
+    # Issues not started because a GitHub "blocked by" issue is still
+    # open, or because the blockers could not be read (#310): per repo
+    # and issue, the open blockers, or ``None`` for "could not read".
+    # Persisted, so the status page (another process) can say why, and
+    # so a restart does not repeat the chat line. The issue itself is
+    # kept out of ``seen_issues``, which is what brings it back.
+    blocked: dict[str, dict[int, list[str] | None]] = field(default_factory=dict)
     accept_foreign_assignments: set[str] = field(default_factory=set)
     exclude_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
     include_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
@@ -257,6 +292,7 @@ class IssuePoller:
             self.publish_failures = _read_failure_counts(
                 data.get("publish_failures"),
             )
+            self.blocked = _read_blocked(data.get("blocked"))
         except (ValueError, OSError, AttributeError, TypeError):
             # Corrupt or unreadable state — start fresh. ValueError
             # covers JSONDecodeError and an integer too long to convert;
@@ -265,6 +301,7 @@ class IssuePoller:
             self.seen_issues = {}
             self.pre_dispatch_failures = {}
             self.publish_failures = {}
+            self.blocked = {}
 
     def _save_state(self) -> None:
         """Persist seen issues and a ``last_poll`` timestamp to the state file."""
@@ -281,6 +318,11 @@ class IssuePoller:
                 repo: {str(n): c for n, c in sorted(counts.items())}
                 for repo, counts in self.publish_failures.items()
                 if counts
+            },
+            "blocked": {
+                repo: {str(n): b for n, b in sorted(entries.items())}
+                for repo, entries in self.blocked.items()
+                if entries
             },
             "last_poll": datetime.now(timezone.utc).isoformat(),
         }
@@ -1025,6 +1067,9 @@ class IssuePoller:
                 reason = "trigger_gone"
         if reason is not None:
             self.unmark_seen(repo, number)
+            # Closed or no longer a trigger: whatever held it back no
+            # longer matters, and the status page should stop saying so.
+            self.clear_blocked(repo, number)
             log_event(
                 _logger, "poll.issue.stale_at_dispatch", repo=repo,
                 issue_number=number, reason=reason,
@@ -1065,6 +1110,40 @@ class IssuePoller:
         """
         self.recheck_after.setdefault(repo, {})[issue_number] = when
         self.unmark_seen(repo, issue_number)
+
+    def note_blocked(
+        self, repo: str, issue_number: int, blockers: list[str] | None,
+    ) -> bool:
+        """Leave ``issue_number`` for the next poll because of its GitHub
+        blockers (#310): ``blockers`` are the open ones, or ``None`` when
+        they could not be read.
+
+        The issue is taken out of ``seen_issues`` in the same state write,
+        so every later poll offers it again and it starts on the first one
+        that finds no open blocker, with no operator action; it is never
+        given a later recheck time, because a blocker can close at any
+        moment. Returns ``True`` when this is news worth one chat line:
+        the issue was not held back before, or it was for the other reason
+        (blocked vs could not read). A changed list of blockers is not news.
+        """
+        entries = self.blocked.setdefault(repo, {})
+        before = entries.get(issue_number, False)
+        news = before is False or (before is None) != (blockers is None)
+        entries[issue_number] = None if blockers is None else list(blockers)
+        seen = self.seen_issues.get(repo)
+        if seen:
+            seen.discard(issue_number)
+        self._save_state_best_effort()
+        return news
+
+    def clear_blocked(self, repo: str, issue_number: int) -> None:
+        """Forget that ``issue_number`` was held back by its blockers."""
+        entries = self.blocked.get(repo)
+        if entries and issue_number in entries:
+            del entries[issue_number]
+            if not entries:
+                del self.blocked[repo]
+            self._save_state_best_effort()
 
     def _recheck_due(self, repo: str, issue_number: int) -> bool:
         pending = self.recheck_after.get(repo)

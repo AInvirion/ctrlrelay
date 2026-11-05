@@ -12,6 +12,7 @@ from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from ctrlrelay import __version__
+from ctrlrelay.core.blockers import hold_if_blocked
 from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 from ctrlrelay.core.events import EventKind, emit_event
 from ctrlrelay.core.github import GitHubCLI, GitHubError
@@ -3166,6 +3167,20 @@ def poller_start(
         # reference to it before it is sent.
         _notice_tasks: set[asyncio.Task] = set()
 
+        def _notice_in_background(text: str, failed_event: str) -> None:
+            """Send one chat line without holding up the poll; a failed
+            send is logged as ``failed_event``."""
+            async def send() -> None:
+                try:
+                    await _chat_notice(text)
+                except Exception as e:
+                    log_event(_logger, failed_event,
+                              error=f"{type(e).__name__}: {str(e)[:200]}")
+
+            task = asyncio.get_running_loop().create_task(send())
+            _notice_tasks.add(task)
+            task.add_done_callback(_notice_tasks.discard)
+
         def _duplicate_name(where: str, number: int | None = None) -> None:
             text = (
                 f"⚠️ Another ctrlrelay process is using this machine's "
@@ -3211,6 +3226,17 @@ def poller_start(
                 if usage_gate.paused is None:
                     _wake_usage_deferred()
                 console.print(f"[yellow]{deferred}[/yellow]")
+                return
+
+            # GitHub "blocked by" issues still open (#310): not started,
+            # and offered again by every poll until the last one closes.
+            hold = await hold_if_blocked(github, poller, repo, issue_number)
+            if hold is not None:
+                console.print(f"[yellow]{hold.line}[/yellow]")
+                if hold.chat is not None:
+                    _notice_in_background(
+                        hold.chat, "poll.issue.blocked_notice_failed",
+                    )
                 return
 
             owner = await peek_claim_owner(

@@ -85,6 +85,32 @@ def _iso_utc(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# "owner/repo" from an issue's API or web URL, on github.com or a GitHub
+# Enterprise host ("/api/v3/repos/o/r", "/repos/o/r", "github.com/o/r/issues/N").
+_API_REPO_RE = re.compile(r"/repos/([^/]+/[^/]+?)/?$")
+_HTML_REPO_RE = re.compile(r"^https?://[^/]+/([^/]+/[^/]+)/(?:issues|pull)/\d+")
+
+
+def _read_blocker(row: Any, repo: str, issue_number: int) -> dict[str, Any]:
+    """One ``blocked_by`` row as ``{"repo", "number", "state"}``, or
+    ``GitHubError`` when any of the three cannot be read."""
+    where = f"blocked_by for {repo}#{issue_number}"
+    if not isinstance(row, dict):
+        raise GitHubError(f"{where} gave a row that is not an object")
+    number = row.get("number")
+    if not isinstance(number, int) or isinstance(number, bool):
+        raise GitHubError(f"{where} gave a row without an issue number")
+    state = str(row.get("state") or "").lower()
+    if state not in ("open", "closed"):
+        raise GitHubError(f"{where} gave #{number} an unknown state {state!r}")
+    match = _API_REPO_RE.search(str(row.get("repository_url") or ""))
+    if match is None:
+        match = _HTML_REPO_RE.match(str(row.get("html_url") or ""))
+    if match is None:
+        raise GitHubError(f"{where} gave #{number} no repository")
+    return {"repo": match.group(1), "number": number, "state": state}
+
+
 def _find_gh() -> str:
     """Find gh binary, checking common paths if not in PATH."""
     gh = shutil.which("gh")
@@ -545,6 +571,43 @@ class GitHubCLI:
             "--jq", '.[] | select(.event=="assigned")',
         )
         return [json.loads(line) for line in output.splitlines() if line.strip()]
+
+    async def list_blocked_by(
+        self,
+        repo: str,
+        issue_number: int,
+    ) -> list[dict[str, Any]]:
+        """The issues that block ``issue_number``, from GitHub's issue
+        dependencies (#310), every page, as ``{"repo", "number", "state"}``.
+
+        A blocker can live in another repository, so ``repo`` comes from
+        each row's ``repository_url`` (or its ``html_url``), never from the
+        issue being asked about. ``state`` is GitHub's current one,
+        ``"open"`` or ``"closed"``.
+
+        Strict, because the caller starts work when this says nothing is
+        open: a row it cannot read (no number, an unknown state, no
+        repository) raises ``GitHubError`` instead of being dropped, and so
+        does ``gh`` failing, including a 404 from a GitHub without the
+        dependencies API. An empty list is only ever "GitHub said none".
+        """
+        output = await self._run_gh(
+            "api", "--paginate",
+            f"/repos/{repo}/issues/{issue_number}/dependencies/blocked_by",
+            "--jq", ".[] | tojson",
+        )
+        blockers: list[dict[str, Any]] = []
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise GitHubError(
+                    f"blocked_by for {repo}#{issue_number} gave non-JSON: {e}"
+                ) from e
+            blockers.append(_read_blocker(row, repo, issue_number))
+        return blockers
 
     async def get_issue(
         self,
