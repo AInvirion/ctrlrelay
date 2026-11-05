@@ -265,6 +265,34 @@ class CliAgentAdapter:
         """
         return None
 
+    def _record_agent_pid(self, session_id: str, pid: int | None) -> None:
+        """Note which process is this session's agent (#309), in
+        ``agents/<session_id>.pid`` beside the state database, so the status
+        page can tell an agent inside a long command from one that stopped.
+        Several runs share the poller's pid, so only the agent's own pid
+        says which command belongs to which run. Best-effort; files older
+        than a week are pruned here."""
+        store = getattr(self, "usage_store", None)
+        if store is None or not pid:
+            return
+        folder = Path(store.path).parent / "agents"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            cutoff = time.time() - 7 * 86400
+            for old in folder.glob("*.pid"):
+                try:
+                    if old.stat().st_mtime < cutoff:
+                        old.unlink()
+                except OSError:
+                    pass
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)
+            (folder / f"{safe}.pid").write_text(f"{int(pid)}\n")
+        except Exception as e:  # noqa: BLE001 - must never fail a run
+            log_event(
+                _logger, "dispatcher.agent_pid.write_failed",
+                session_id=session_id, error=str(e)[:200],
+            )
+
     def _record_usage(self, stdout_text: str, ident: dict) -> None:
         """Keep this run's usage reading, if the backend reports one.
 
@@ -392,6 +420,8 @@ class CliAgentAdapter:
                 stderr=f"{type(e).__name__}: {e}",
             )
             raise
+
+        self._record_agent_pid(session_id, getattr(proc, "pid", None))
 
         try:
             stdout, stderr = await asyncio.wait_for(

@@ -265,6 +265,130 @@ def _section(errors: list[str], name: str, fn: Callable[[], T]) -> T | _Missing:
         return _MISSING
 
 
+# --- a command still running (#309) ----------------------------------------------
+
+# A tool call writes nothing to the transcript until it returns, so a long
+# test run reads exactly like an agent that stopped. Before calling a card
+# stuck, the process table is read under the session's own agent process,
+# whose pid the dispatcher writes to ``agents/<session_id>.pid`` beside the
+# state database. Several runs share the poller's pid, so only the agent's
+# own pid says which command belongs to which run. A process under it that
+# started at or after the transcript's last step is the command that step
+# launched; processes the agent started earlier (an MCP server, the agent
+# CLI itself under a sandbox wrapper) are too old to count.
+_PS_ARGV = ("ps", "-axo", "pid=,ppid=,etime=,comm=")
+_PS_TIMEOUT_S = 2
+# The tool_use row is written just before its command starts.
+_START_SLACK_S = 5
+
+
+def default_processes() -> str:
+    """``ps`` output: one ``pid ppid etime comm`` line per process. The same
+    flags work on Linux and macOS. Raises when it cannot be read."""
+    import subprocess
+
+    return subprocess.run(
+        list(_PS_ARGV), capture_output=True, text=True,
+        timeout=_PS_TIMEOUT_S, check=True,
+    ).stdout
+
+
+def _etime_s(text: str) -> int:
+    """``ps`` elapsed time, ``[[dd-]hh:]mm:ss``, in seconds."""
+    days, _, rest = text.rpartition("-")
+    parts = [int(p) for p in rest.split(":")]
+    if not 2 <= len(parts) <= 3:
+        raise ValueError(f"etime {text!r}")
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, sec = parts
+    return (int(days) if days else 0) * 86400 + h * 3600 + m * 60 + sec
+
+
+def _parse_ps(text: str) -> dict[int, tuple[int, int, str]]:
+    table: dict[int, tuple[int, int, str]] = {}
+    for line in text.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) < 4:
+            continue
+        try:
+            table[int(fields[0])] = (
+                int(fields[1]), _etime_s(fields[2]), fields[3].strip(),
+            )
+        except ValueError:
+            continue
+    if not table:
+        raise ValueError("no process lines in ps output")
+    return table
+
+
+def read_agent_pid(agents_dir: Path, session_id: str) -> int:
+    """The session's agent pid, as the dispatcher recorded it. Raises when
+    there is none, so a missing file reads as "could not look"."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)
+    text = (agents_dir / f"{safe}.pid").read_text().strip()
+    pid = int(text)
+    if pid <= 0:
+        raise ValueError(f"agent pid {pid}")
+    return pid
+
+
+def running_command(
+    ps_text: str, agent_pid: int, *, last_step_age_s: int,
+) -> str | None:
+    """The name of the command the agent is running, or ``None`` when it is
+    running none. Only the program's own name (``pytest``, ``bash``) is
+    returned, never its arguments. Raises when ``ps_text`` cannot be read,
+    so "could not look" is never taken for "nothing running"."""
+    table = _parse_ps(ps_text)
+    if agent_pid not in table:
+        raise ValueError("the agent process is gone")
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    found: list[tuple[int, str]] = []
+    stack = list(children.get(agent_pid, []))
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        _, age, comm = table[pid]
+        if age <= last_step_age_s + _START_SLACK_S:
+            found.append((age, comm))
+        stack.extend(children.get(pid, []))
+    if not found:
+        return None
+    # The oldest such process is the one the step launched; anything it
+    # started is younger.
+    _, comm = max(found)
+    return os.path.basename(comm) or None
+
+
+class _Processes:
+    """Read the process table at most once per status request, and only
+    if a card would otherwise be called stuck."""
+
+    def __init__(self, reader: Callable[[], str] | None) -> None:
+        self._reader = reader
+        self._done = False
+        self.text: str | None = None
+        self.error: str | None = None
+
+    def get(self) -> tuple[str | None, str | None]:
+        if not self._done:
+            self._done = True
+            if self._reader is None:
+                self.error = "no process reader"
+            else:
+                try:
+                    self.text = self._reader()
+                except Exception as e:  # noqa: BLE001 - "could not look"
+                    self.error = f"{type(e).__name__}: {str(e)[:120]}"
+        return self.text, self.error
+
+
 # --- queries -------------------------------------------------------------------
 
 
@@ -518,6 +642,8 @@ def _card(
     titles: dict[tuple[str, int], str],
     stale_after_s: int,
     home: Path | None,
+    processes: _Processes | None = None,
+    agents_dir: Path | None = None,
 ) -> dict[str, Any]:
     sid = row["id"]
     started = int(row["started_at"])
@@ -557,6 +683,28 @@ def _card(
         and activity.last_step_ts is not None
         and now - activity.last_step_ts > stale_after_s
     )
+    command: str | None = None
+    if looks_stuck and processes is not None:
+        # Before calling it stuck, check for a command still running
+        # (#309). Where that cannot be checked, the card stays stuck and
+        # says why: "could not look" is not "not stuck".
+        try:
+            if agents_dir is None:
+                raise ValueError("no agent pid folder")
+            try:
+                agent = read_agent_pid(agents_dir, sid)
+            except (OSError, ValueError) as e:
+                raise ValueError(f"no agent pid recorded ({type(e).__name__})")
+            text, error = processes.get()
+            if text is None:
+                raise ValueError(error or "process table unavailable")
+            command = running_command(
+                text, agent, last_step_age_s=now - int(activity.last_step_ts),
+            )
+        except Exception as e:  # noqa: BLE001
+            reasons.append(f"could not check for a running command: {e}"[:200])
+        if command is not None:
+            looks_stuck = False
     issue = row.get("issue_number")
     title = _title_for(titles, row["repo"], issue)
     return {
@@ -575,6 +723,9 @@ def _card(
         "last_step": _iso(activity.last_step_ts),
         "last_step_ts": activity.last_step_ts,
         "looks_stuck": looks_stuck,
+        # The program the agent is inside (#309), when that is why there
+        # is no new step: its name only, never its arguments.
+        "running_command": command,
         "reason": "; ".join(reasons) or None,
         "url": github_url(row["repo"], issue),
         # Built from the session's repo and the number ctrlrelay recorded,
@@ -650,6 +801,7 @@ def build_status(
     heartbeat: Callable[[], dict | None] | None = None,
     silent_after_s: int = 300,
     fleet: Callable[[], dict] | None = None,
+    processes: Callable[[], str] | None = default_processes,
 ) -> dict:
     """Everything the page shows, as the documented JSON contract. Never
     raises for a database problem; see the module docstring.
@@ -750,11 +902,14 @@ def build_status(
         # Shaping happens inside the section guard: one row that cannot be
         # shaped makes the whole section unknown, never a shorter list.
         if not isinstance(snap["running"], _Missing):
+            proc_reader = _Processes(processes)
             cards = _section(errors, "sessions", lambda: [
                 _card(
                     row, now=now, pipeline_phases=pipeline_phases, reached=reached,
                     titles=title_map,
                     stale_after_s=stale_after_s, home=home,
+                    processes=proc_reader,
+                    agents_dir=Path(db_path).parent / "agents",
                 )
                 for row in snap["running"]
             ])

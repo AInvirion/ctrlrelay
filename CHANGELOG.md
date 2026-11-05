@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The status page no longer says "looks stuck" while the agent is inside
+  one long command, such as a 20-minute test run. A tool call writes
+  nothing to the transcript until it returns. So before calling a card
+  stuck, the page reads `ps` for a process under that run's own agent
+  (the dispatcher records its pid in `agents/<session>.pid` beside the
+  state database) that started at or after the agent's last step. If it
+  finds one, it shows "running `<program>`" instead, with the program's
+  name only. An idle agent is still stuck. Where the process
+  table cannot be read, the card stays stuck and says why (#309).
+
 - A run that correctly changes nothing is no longer recorded as a failed
   publish. The agent can now finish with `"no_changes": True` and a one-line
   `"no_changes_reason"`. When the relay's own check also finds no new
