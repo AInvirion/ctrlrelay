@@ -27,6 +27,7 @@ logged and the question stays answerable in chat.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -184,17 +185,21 @@ async def ask_on_issue(
     return watched
 
 
+_ANSWER_COMMAND_RE = re.compile(
+    rf"{re.escape(ANSWER_COMMAND)}(?=\s|$)", re.IGNORECASE,
+)
+
+
 def answer_text(body: str) -> str | None:
     """The answer in a comment that starts with ``/answer``, or ``None``
     for any other comment. The command is matched as a whole word, in any
-    case; an empty answer is not one."""
-    text = body.strip()
-    head, _, rest = text.partition("\n")
-    word, _, tail = head.partition(" ")
-    if word.lower() != ANSWER_COMMAND:
+    case, followed by any whitespace (GitHub's web editor sends CRLF line
+    breaks); an empty answer is not one."""
+    text = body.replace("\r\n", "\n").strip()
+    match = _ANSWER_COMMAND_RE.match(text)
+    if match is None:
         return None
-    answer = (tail + ("\n" + rest if rest else "")).strip()
-    return answer or None
+    return text[match.end():].strip() or None
 
 
 def _iso(ts: int) -> str:

@@ -445,6 +445,8 @@ async def test_an_own_account_comment_without_the_command_is_not_an_answer(
     ("/answer pin it", "pin it"),
     ("  /ANSWER  pin it  ", "pin it"),
     ("/answer\npin it\nand bump", "pin it\nand bump"),
+    ("/answer\r\npin it\r\nand bump", "pin it\nand bump"),
+    ("/answer\tpin it", "pin it"),
     ("/answer", None),
     ("/answer   ", None),
     ("/answered it already", None),
