@@ -1626,7 +1626,9 @@ class WorktreeManager:
                     session_id=session_id,
                     branch=branch,
                 )
-                raise PushRefusedError(
+                from ctrlrelay.core.publish import NothingToPushError
+
+                raise NothingToPushError(
                     f"push refused: {branch!r} has no commits that "
                     f"{default_branch!r} does not already have; the agent "
                     f"must commit its work on {branch!r}"

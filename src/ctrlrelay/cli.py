@@ -566,6 +566,17 @@ async def announce_dev_success(
     the caller's tests assert on.
     """
     sent: list[str] = []
+    outputs = getattr(result, "outputs", None) or {}
+    if outputs.get("no_change") is True:
+        # No pull request by design (#336): nothing to warn about, and
+        # "PR ready" with an empty link would be false.
+        line = (
+            f"✅ {repo}: finished, no change needed: "
+            f"{outputs.get('no_change_reason') or 'no reason given'}"
+        )
+        await transport.send(line)
+        sent.append(line)
+        return sent
     warning = unreviewed_pr_warning(repo, result)
     if warning is not None:
         await transport.send(warning)

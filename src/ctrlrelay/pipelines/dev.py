@@ -1249,6 +1249,13 @@ with open(sys.argv[1], "w") as f:
 CTRLRELAY_DONE
 ```
 
+**DONE with no change** (only when the right outcome is to change nothing,
+for example the work is already on the default branch, or the operator told
+you to stop without a pull request). Commit nothing, and write the DONE
+block above with these two outputs in place of the pull request ones:
+`"no_changes": True` and `"no_changes_reason": "<ONE LINE: WHY NOTHING
+CHANGED>"`. If the branch does have commits, they are published anyway.
+
 {_blocked_and_failed_blocks(quoted_dir, quoted_path, session_id)}"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
@@ -1444,9 +1451,6 @@ async def _failed_check_logs(
     return out, raw
 
 
-# Outputs the relay owns after #219. Whatever the agent wrote under these
-# names is dropped: a pull request number the agent reports is not
-# evidence a pull request exists, and the PR text is consumed here.
 _UNREVIEWED_PUSH_NOTE = (
     "**Not reviewed yet.** This repository requires a review before the "
     "relay hands a PR over, and this PR could not be marked as a draft, "
@@ -1454,7 +1458,63 @@ _UNREVIEWED_PUSH_NOTE = (
     "review of its current head has passed."
 )
 
-_RELAY_OWNED_OUTPUTS = ("pr_number", "pr_url", "pr_title", "pr_body")
+
+# Outputs the relay owns after #219. Whatever the agent wrote under these
+# names is dropped: a pull request number the agent reports is not
+# evidence a pull request exists, and the PR text is consumed here.
+_RELAY_OWNED_OUTPUTS = (
+    "pr_number", "pr_url", "pr_title", "pr_body",
+    # Set only once the relay has confirmed there is nothing to push (#336).
+    "no_change", "no_change_reason",
+)
+_NO_CHANGE_REASON_MAX = 300
+
+
+def _declared_no_change(agent_outputs: dict[str, Any]) -> str | None:
+    """The agent's reason when its DONE declared that no change was the
+    right outcome (#336), else ``None``. Only a literal ``True`` counts;
+    the reason is the agent's own text, kept to one capped line."""
+    if agent_outputs.get("no_changes") is not True:
+        return None
+    raw = agent_outputs.get("no_changes_reason")
+    reason = " ".join(raw.split()) if isinstance(raw, str) else ""
+    return reason[:_NO_CHANGE_REASON_MAX] or "no reason given"
+
+
+async def _note_no_change_on_issue(
+    github: Any, *, repo: str, issue_number: int, result: PipelineResult,
+) -> None:
+    """Say on the issue that the run finished with nothing to change
+    (#336): with no pull request, nothing else would. Best-effort; a
+    failed comment never changes the run's outcome."""
+    if not (result.success and result.outputs.get("no_change") is True):
+        return
+    try:
+        await github.comment_on_issue(
+            repo=repo, issue_number=issue_number,
+            body=no_change_comment(
+                result.session_id,
+                str(result.outputs.get("no_change_reason") or ""),
+            ),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log_event(
+            _logger, "dev.no_change.comment_failed", repo=repo,
+            issue_number=issue_number, error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+
+
+def no_change_comment(session_id: str, reason: str) -> str:
+    """The issue comment for a run that finished with nothing to change."""
+    return (
+        "**Finished with no change.** The agent decided nothing needed to "
+        f"change, and the branch has no new commits, so no pull request "
+        f"was opened.\n\n> {reason}\n\n"
+        f"<!-- ctrlrelay:no-change session={session_id} -->"
+    )
 
 # A full commit id, as GitHub names the head of the review base.
 _BASE_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -1658,7 +1718,32 @@ class _Publisher:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            from ctrlrelay.core.publish import NothingToPushError
             from ctrlrelay.core.worktree import PushRejectedError
+
+            no_change = _declared_no_change(agent_outputs)
+            if isinstance(e, NothingToPushError) and no_change is not None:
+                # The agent said nothing should change, and the relay's own
+                # count agrees. The declaration alone is never trusted: a
+                # branch with commits got past this point and was pushed.
+                log_event(
+                    _logger,
+                    "dev.publish.no_change",
+                    session_id=self.session_id,
+                    repo=self.repo,
+                    issue_number=self.issue_number,
+                    branch=self.branch,
+                )
+                return PipelineResult(
+                    success=True,
+                    session_id=result.session_id,
+                    summary=f"Finished, no change needed: {no_change}",
+                    outputs={
+                        **outputs, "no_change": True,
+                        "no_change_reason": no_change,
+                    },
+                    exit_code=result.exit_code,
+                )
 
             refused = isinstance(e, PushRefusedError)
             _logger.error(
@@ -2990,6 +3075,10 @@ async def _step_verify(run: _DevRun) -> None:
     """Wait for CI and mergeability, asking the agent to fix what fails."""
     assert run.result is not None
     assert run.publisher is not None
+    if run.result.outputs.get("no_change") is True:
+        # Nothing was pushed, by design (#336): no PR to verify, and that
+        # is not a failed required step.
+        return
     # Verify PR is green & conflict-free before handing off. Resume the
     # session with a fix request if either is broken, up to max_fix_attempts.
     #
@@ -3068,7 +3157,11 @@ async def _step_review(run: _DevRun) -> None:
     # The whole call is guarded — a review must never fail a PR
     # whose code and CI are fine.
     if run.pr_number_for_review is None or not run.result.success:
-        if run.review_mode == "required" and run.result.success:
+        if (
+            run.review_mode == "required"
+            and run.result.success
+            and run.result.outputs.get("no_change") is not True
+        ):
             # Same rule as verify: nothing reviewed is not a pass.
             _fail_required_step(run, "review", "no pull request to review")
         return
@@ -3957,6 +4050,9 @@ async def run_dev_issue(
                 await keeper.hold()
             else:
                 await keeper.stop()
+        await _note_no_change_on_issue(
+            github, repo=repo, issue_number=issue_number, result=result,
+        )
         if not result.success and not result.blocked:
             pr_raw = result.outputs.get("pr_number")
             try:
@@ -4372,6 +4468,9 @@ async def resume_dev_from_pending(
             (status, result.summary, int(time.time()), session_id),
         )
         state_db.commit()
+        await _note_no_change_on_issue(
+            github, repo=repo, issue_number=issue_number, result=result,
+        )
 
         if result.blocked:
             try:
