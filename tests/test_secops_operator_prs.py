@@ -22,7 +22,8 @@ IGNORE_RULE_START = (
     "   - **Any other PR from `$OPERATOR`** (touches anything other\n"
     "     than `.github/dependabot.yml`): out of scope on this repo;"
 )
-SCOPE_NOTE_START = "On this repo the operator's own PRs are in scope only when"
+SCOPE_NOTE_START = "On this repo the step-4 results are in scope only after the"
+DROP_STEP_START = "   On this repo, drop every step-4 result whose files include"
 CARVE_OUT_START = "   - **PR authored by `$OPERATOR` touching ONLY `.github/dependabot.yml`**"
 CARVE_OUT_END = "   - **Any other PR from `$OPERATOR`**"
 
@@ -90,6 +91,7 @@ class TestPrompt:
         assert _prompt(AutomationConfig(operator_prs="ask")) == unset
         assert ASK_RULE in unset
         assert SCOPE_NOTE_START not in unset
+        assert DROP_STEP_START not in unset
         assert IGNORE_RULE_START not in unset
 
     def test_ignore_takes_other_operator_prs_out_of_scope(self) -> None:
@@ -97,12 +99,31 @@ class TestPrompt:
 
         assert ASK_RULE not in prompt
         assert "signal BLOCKED for operator approval" not in prompt
-        assert IGNORE_RULE_START in prompt
-        assert "do not signal BLOCKED on them" in prompt
-        # The scope fence says the same, so the summary rule cannot pull
-        # the dropped PRs back in.
+        rule_start = prompt.index(IGNORE_RULE_START)
+        rule = prompt[rule_start:prompt.index("   - **PRs from anyone else**", rule_start)]
+        assert "do not signal BLOCKED on them" in rule
+        assert "do not\n     name them in the summary" in rule
+        # The scope fence says the same, so it cannot call every step-4
+        # result in scope.
         fence = prompt[prompt.index("**PR scope fence:**"):]
         assert SCOPE_NOTE_START in fence
+
+    def test_ignore_drops_those_prs_in_step_4_before_any_rule_that_counts_them(
+        self,
+    ) -> None:
+        """The rules after step 4 speak of "each open PR", BLOCKED questions,
+        the summary and "what you left alone". The drop has to come first and
+        say it governs all of them, or those rules pull the PRs back in."""
+        prompt = _prompt(AutomationConfig(operator_prs="ignore"))
+
+        drop = prompt.index(DROP_STEP_START)
+        assert prompt.index("4. Check open PRs authored by the trusted operator") < drop
+        assert drop < prompt.index("5. For each alert or PR:")
+        assert drop < prompt.index("You have exactly three legitimate exits for each open PR")
+        assert drop < prompt.index("Every BLOCKED question must contain ONLY items")
+        step = prompt[drop:prompt.index("5. For each alert or PR:")]
+        for governed in ('"each open PR"', "BLOCKED", "step-6 summary", '"what you left alone"'):
+            assert governed in step
 
     def test_ignore_keeps_the_dependabot_yml_carve_out_word_for_word(self) -> None:
         ignore = _prompt(AutomationConfig(operator_prs="ignore"))
