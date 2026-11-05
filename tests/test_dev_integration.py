@@ -769,6 +769,10 @@ class TestLabelTriggeredDevPipelineE2E:
         mock_github.list_issues_by_label = AsyncMock(return_value=[labeled_issue])
         # Fail LOUD if the label path ever consults the assignment
         # events endpoint — the label is its own trust signal per #80.
+        # The loop reads each issue again before handling it (#326).
+        mock_github.get_issue_gate = AsyncMock(return_value={
+            "state": "open", "labels": ["ctrlrelay:auto"], "assignees": [],
+        })
         mock_github.list_assignment_events = AsyncMock(
             side_effect=AssertionError(
                 "assignment events must NOT be fetched for label-triggered issues"
@@ -946,6 +950,10 @@ class TestLabelTriggeredDevPipelineE2E:
         fake_relay_publish(mock_github)
         mock_github.list_assigned_issues = AsyncMock(return_value=[])
         mock_github.list_issues_by_label = AsyncMock(return_value=[labeled_issue])
+        # The loop reads each issue again before handling it (#326).
+        mock_github.get_issue_gate = AsyncMock(return_value={
+            "state": "open", "labels": ["ctrlrelay:auto"], "assignees": [],
+        })
         mock_github.list_assignment_events = AsyncMock(return_value=[])
 
         poller = IssuePoller(

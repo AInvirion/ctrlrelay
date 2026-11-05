@@ -363,6 +363,11 @@ class TestIssuePoller:
             make_assigned_event("testuser", "testuser"),
         ]
 
+        # The loop reads each issue again before handling it (#326).
+        mock_github.get_issue_gate = AsyncMock(return_value={
+            "state": "open", "labels": [], "assignees": ["testuser"],
+        })
+
         poller = IssuePoller(
             github=mock_github,
             username="testuser",
@@ -431,6 +436,11 @@ class TestIssuePoller:
         mock_github.list_assignment_events = AsyncMock(
             return_value=[make_assigned_event("testuser", "testuser")]
         )
+
+        # The loop reads each issue again before handling it (#326).
+        mock_github.get_issue_gate = AsyncMock(return_value={
+            "state": "open", "labels": [], "assignees": ["testuser"],
+        })
 
         poller = IssuePoller(
             github=mock_github,
@@ -600,6 +610,11 @@ class TestIssuePoller:
             return_value=[make_assigned_event("testuser", "testuser")]
         )
 
+        # The loop reads each issue again before handling it (#326).
+        mock_github.get_issue_gate = AsyncMock(return_value={
+            "state": "open", "labels": [], "assignees": ["testuser"],
+        })
+
         poller = IssuePoller(
             github=mock_github,
             username="testuser",
@@ -647,6 +662,11 @@ class TestIssuePoller:
         mock_github.list_assignment_events = AsyncMock(
             return_value=[make_assigned_event("testuser", "testuser")]
         )
+
+        # The loop reads each issue again before handling it (#326).
+        mock_github.get_issue_gate = AsyncMock(return_value={
+            "state": "open", "labels": [], "assignees": ["testuser"],
+        })
 
         poller = IssuePoller(
             github=mock_github,

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An issue is read again from GitHub just before its run starts. A poll
+  returns a batch that is handled one issue at a time, so with one slot the
+  last issue could start an hour after the poll saw it, after its trigger
+  label was removed or the issue was closed. Now an issue that is closed,
+  has gained an `exclude_labels` label, or no longer meets any trigger is
+  skipped and left for the next poll to judge; so is one that cannot be read.
+  The run is routed on the labels read then, not the poll's (#326).
+
 ## [0.20.0] - 2026-11-04
 
 ### Added
