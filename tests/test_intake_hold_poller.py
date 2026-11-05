@@ -78,6 +78,11 @@ def _drive(tmp_path: Path, body) -> list:
         patch("ctrlrelay.core.scheduler.make_scheduler", return_value=scheduler),
         patch("ctrlrelay.core.poller.run_poll_loop", new=fake_poll_loop),
         patch("ctrlrelay.core.poller.IssuePoller.seed_current", new=AsyncMock()),
+        # The blocker check (#310) runs before the claim; no blockers here.
+        patch(
+            "ctrlrelay.core.github.GitHubCLI.list_blocked_by",
+            new=AsyncMock(return_value=[]),
+        ),
         # The first real step of each piece of work.
         patch("ctrlrelay.cli.peek_claim_owner", new=AsyncMock(side_effect=ReachedError)),
         patch("ctrlrelay.cli._bridge_socket_settings", side_effect=ReachedError),
