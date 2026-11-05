@@ -3801,7 +3801,7 @@ def poller_start(
                                 )
                                 try:
                                     state_db.mark_pending_resume_resumed(
-                                        session_id
+                                        session_id, answered_at=row["answered_at"],
                                     )
                                 except Exception:
                                     pass
@@ -3844,7 +3844,7 @@ def poller_start(
                             )
                             try:
                                 state_db.mark_pending_resume_resumed(
-                                    session_id
+                                    session_id, answered_at=row["answered_at"],
                                 )
                             except Exception:
                                 pass
@@ -3862,7 +3862,9 @@ def poller_start(
                         # same broken row. Operator can inspect via the
                         # sessions table.
                         try:
-                            state_db.mark_pending_resume_resumed(session_id)
+                            state_db.mark_pending_resume_resumed(
+                                session_id, answered_at=row["answered_at"],
+                            )
                         except Exception:
                             pass
                         continue
@@ -3926,7 +3928,9 @@ def poller_start(
                         continue
 
                     try:
-                        state_db.mark_pending_resume_resumed(session_id)
+                        state_db.mark_pending_resume_resumed(
+                            session_id, answered_at=row["answered_at"],
+                        )
                     except Exception:
                         pass
 

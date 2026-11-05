@@ -1278,7 +1278,9 @@ class StateDB:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def mark_pending_resume_resumed(self, session_id: str) -> bool:
+    def mark_pending_resume_resumed(
+        self, session_id: str, answered_at: int | None = None,
+    ) -> bool:
         """Mark a pending resume as executed so the sweeper doesn't pick
         it up again.
 
@@ -1293,12 +1295,25 @@ class StateDB:
         wedging the session. The guard makes this a no-op when the
         row has been refreshed.
 
+        ``answered_at``, when given, is that of the row the caller took
+        (#324). Since the question is saved before the wait, a resume that
+        re-blocks can have its NEW question answered (through the bridge)
+        before this call; matching the answer time keeps this call from
+        marking that new answer resumed, which would hide it for ever.
+
         Returns True iff a row was updated."""
-        cursor = self._conn.execute(
-            "UPDATE pending_resumes SET resumed_at = ? "
-            "WHERE session_id = ? AND answered_at IS NOT NULL",
-            (int(time.time()), session_id),
-        )
+        if answered_at is None:
+            cursor = self._conn.execute(
+                "UPDATE pending_resumes SET resumed_at = ? "
+                "WHERE session_id = ? AND answered_at IS NOT NULL",
+                (int(time.time()), session_id),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE pending_resumes SET resumed_at = ? "
+                "WHERE session_id = ? AND answered_at = ?",
+                (int(time.time()), session_id, answered_at),
+            )
         self._conn.commit()
         return cursor.rowcount > 0
 

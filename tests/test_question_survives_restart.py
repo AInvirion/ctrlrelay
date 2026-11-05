@@ -332,4 +332,133 @@ async def test_a_question_answered_first_through_its_saved_row_is_not_resumed_tw
     (todo,) = state_db.list_pending_resumes_to_execute()
     assert todo["answer"] == "pin it"
     assert state_db.list_locks() == []
+
+    # The sweeper's turn: it resumes once, with the first answer.
+    dispatcher.spawn_session.side_effect = (
+        lambda **kw: _resumed(kw["session_id"])
+    )
+    await resume_dev_from_pending(
+        session_id=todo["session_id"], repo=REPO, answer=todo["answer"],
+        branch_template="fix/issue-{n}", dispatcher=dispatcher,
+        github=_github(), worktree=_worktree(tmp_path / "wt"),
+        dashboard=None, state_db=state_db, transport=None,
+        contexts_dir=tmp_path / "contexts",
+    )
+    assert state_db.mark_pending_resume_resumed(
+        todo["session_id"], answered_at=todo["answered_at"],
+    )
+    assert dispatcher.spawn_session.await_count == 2
+    assert "pin it" in dispatcher.spawn_session.await_args.kwargs["prompt"]
+    assert state_db.list_pending_resumes_to_execute() == []
+    state_db.close()
+
+
+def test_marking_a_resume_done_does_not_touch_a_newer_answer(
+    tmp_path: Path,
+) -> None:
+    """The sweeper resumed an answered row; the agent asked a NEW question,
+    saved before its wait, and a reply answered it before the sweeper
+    marked its own row done. Marking by session alone would mark the new
+    answer done and hide it for ever."""
+    db = StateDB(tmp_path / "state.db")
+    db.add_pending_resume(session_id="s", pipeline="dev", repo=REPO,
+                          question="first?")
+    assert db.answer_pending_resume("s", "one")
+    taken = db.list_pending_resumes_to_execute()[0]["answered_at"]
+
+    db.park_blocked_question("s", "dev", REPO, "second?")
+    assert db.answer_pending_resume("s", "two")
+    db.execute("UPDATE pending_resumes SET answered_at = ? WHERE session_id = 's'",
+               (taken + 30,))
+    db.commit()
+
+    assert db.mark_pending_resume_resumed("s", answered_at=taken) is False
+    (todo,) = db.list_pending_resumes_to_execute()
+    assert todo["answer"] == "two"
+    db.close()
+
+
+def test_the_sweeper_marks_only_the_answer_it_took() -> None:
+    """Every place the sweeper marks a row done names the answer it took."""
+    import re
+
+    import ctrlrelay.cli as cli
+
+    src = Path(cli.__file__).read_text()
+    calls = re.findall(r"mark_pending_resume_resumed\(([^)]*)\)", src)
+    assert len(calls) == 4
+    assert all('answered_at=row["answered_at"]' in c for c in calls), calls
+
+
+@pytest.mark.asyncio
+async def test_a_question_that_could_not_be_saved_still_resumes_on_its_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_db = StateDB(tmp_path / "state.db")
+
+    def broken(*a: Any, **kw: Any) -> None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(state_db, "park_blocked_question", broken)
+    calls: list[dict[str, Any]] = []
+
+    async def spawn(**kw: Any) -> SessionResult:
+        calls.append(kw)
+        return _blocked(kw["session_id"]) if len(calls) == 1 \
+            else _resumed(kw["session_id"])
+
+    dispatcher = AsyncMock()
+    dispatcher.spawn_session.side_effect = spawn
+    transport = AsyncMock()
+    transport.ask.return_value = "pin it"
+
+    await run_dev_issue(
+        claims=None, repo=REPO, issue_number=13,
+        branch_template="fix/issue-{n}", dispatcher=dispatcher,
+        github=_github(), worktree=_worktree(tmp_path / "wt"),
+        dashboard=None, state_db=state_db, transport=transport,
+        contexts_dir=tmp_path / "contexts",
+    )
+
+    assert len(calls) == 2
+    assert "pin it" in calls[1]["prompt"]
+    state_db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_saved_question_that_cannot_be_closed_is_expired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The run resumes with the answer it got; the saved question is retired
+    so a later reply cannot resume the session a second time."""
+    state_db = StateDB(tmp_path / "state.db")
+
+    def broken(*a: Any, **kw: Any) -> bool:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(state_db, "take_parked_answer", broken)
+    calls: list[dict[str, Any]] = []
+
+    async def spawn(**kw: Any) -> SessionResult:
+        calls.append(kw)
+        return _blocked(kw["session_id"]) if len(calls) == 1 \
+            else _resumed(kw["session_id"])
+
+    dispatcher = AsyncMock()
+    dispatcher.spawn_session.side_effect = spawn
+    transport = AsyncMock()
+    transport.ask.return_value = "pin it"
+
+    result = await run_dev_issue(
+        claims=None, repo=REPO, issue_number=13,
+        branch_template="fix/issue-{n}", dispatcher=dispatcher,
+        github=_github(), worktree=_worktree(tmp_path / "wt"),
+        dashboard=None, state_db=state_db, transport=transport,
+        contexts_dir=tmp_path / "contexts",
+    )
+
+    assert len(calls) == 2
+    row = state_db.get_pending_resume(result.session_id)
+    assert row["expired_at"] is not None
+    assert state_db.answer_pending_resume(result.session_id, "late") is False
     state_db.close()

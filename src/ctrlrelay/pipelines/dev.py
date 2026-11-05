@@ -2148,38 +2148,59 @@ def _plan_comment(criteria: str) -> str:
     )
 
 
-def _park_question(run: _DevRun, question: str) -> None:
+def _park_question(run: _DevRun, question: str) -> bool:
     """Save the question before waiting for its answer (#324); see
     ``StateDB.park_blocked_question``. Best-effort: a failed write is
-    logged and the wait goes ahead, as it did before the row existed."""
+    logged and the wait goes ahead, as it did before the row existed.
+    Returns whether it was saved."""
     try:
         run.state_db.park_blocked_question(
             run.session_id, "dev", run.repo, question,
         )
+        return True
     except Exception as e:
         log_event(
             _logger, "dev.question.park_failed", session_id=run.session_id,
             repo=run.repo, issue_number=run.issue_number,
             error_type=type(e).__name__, error=str(e)[:200],
         )
+        return False
 
 
 def _take_answer(run: _DevRun, answer: str) -> bool:
-    """The wait got its answer: close the parked row so nothing else
+    """The wait got its answer: close the saved question so nothing else
     resumes the session with it, and mark the session running again.
 
-    Returns ``False`` when the saved question had already been answered
-    another way (see ``StateDB.take_parked_answer``): that first answer
-    stands and the sweeper resumes with it, so this one must not. A failed
-    write is logged and returns ``True``, as before the row existed."""
+    Returns ``False`` only when the saved question was answered first
+    another way (a reply the bridge routed to it; see
+    ``StateDB.take_parked_answer``): that answer stands and the sweeper
+    resumes with it, so this one must not. A row that is missing or
+    expired is no other answer, so the run resumes with this one. If the
+    row cannot be closed, it is expired instead, so no later reply can
+    resume the session a second time; if even that fails, the run
+    resumes, as it did before the row existed."""
     try:
-        return run.state_db.take_parked_answer(run.session_id, answer)
+        if run.state_db.take_parked_answer(run.session_id, answer):
+            return True
+        row = run.state_db.get_pending_resume(run.session_id)
+        return not (
+            row is not None
+            and row.get("answered_at") is not None
+            and row.get("resumed_at") is None
+            and row.get("expired_at") is None
+        )
     except Exception as e:
         log_event(
             _logger, "dev.question.unpark_failed", session_id=run.session_id,
             repo=run.repo, issue_number=run.issue_number,
             error_type=type(e).__name__, error=str(e)[:200],
         )
+        try:
+            run.state_db.expire_pending_resume(
+                run.session_id, "answered while the run waited",
+            )
+        except Exception:
+            pass
         return True
 
 
@@ -2213,7 +2234,7 @@ async def _answer_while_blocked(
         )
         # Saved first, so a poller that stops during the wait leaves the
         # question answerable rather than lost (#324).
-        _park_question(run, question)
+        parked = _park_question(run, question)
         try:
             answer = await run.transport.ask(
                 question,
@@ -2239,7 +2260,7 @@ async def _answer_while_blocked(
                 question=question,
                 outputs=result.outputs,
             )
-        if not _take_answer(run, answer):
+        if parked and not _take_answer(run, answer):
             # Answered first through the saved question (#324). That
             # answer stands; the sweeper resumes with it once this run
             # has let go of the repo lock.
