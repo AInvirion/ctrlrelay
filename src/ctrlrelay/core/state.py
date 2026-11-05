@@ -119,7 +119,21 @@ CREATE TABLE IF NOT EXISTS pending_resumes (
     -- The answer time this row carried before a re-block rewrote it.
     -- The rewrite clears answered_at so the row can take a new answer;
     -- this keeps the fact that the question WAS answered.
-    last_answered_at INTEGER
+    last_answered_at INTEGER,
+    -- The question asked on the GitHub issue as well as in chat (#328):
+    -- the issue, the relay's question comment and when it was posted.
+    issue_number INTEGER,
+    issue_comment_id INTEGER,
+    issue_asked_at INTEGER,
+    -- Where the answer came from: 'github', or NULL for chat (every
+    -- writer before #328). For a GitHub answer, who wrote it and the
+    -- comment's id.
+    answer_source TEXT,
+    answer_by TEXT,
+    answer_ref INTEGER,
+    -- When the other channel was told about the answer: the chat answer
+    -- copied to the issue, or the chat told of the GitHub answer.
+    answer_noted_at INTEGER
 );
 
 -- In-flight PR merge watchers that must survive a poller restart. Without
@@ -365,6 +379,19 @@ class StateDB:
                 "ALTER TABLE pending_resumes "
                 "ADD COLUMN last_answered_at INTEGER"
             )
+        for col, kind in (
+            ("issue_number", "INTEGER"),
+            ("issue_comment_id", "INTEGER"),
+            ("issue_asked_at", "INTEGER"),
+            ("answer_source", "TEXT"),
+            ("answer_by", "TEXT"),
+            ("answer_ref", "INTEGER"),
+            ("answer_noted_at", "INTEGER"),
+        ):
+            if pending_cols and col not in pending_cols:
+                self._conn.execute(
+                    f"ALTER TABLE pending_resumes ADD COLUMN {col} {kind}"
+                )
 
         health_cols = {
             row[1]
@@ -1012,6 +1039,13 @@ class StateDB:
                  expired_reason = NULL,
                  held_until = excluded.held_until,
                  posted = excluded.posted,
+                 issue_number = NULL,
+                 issue_comment_id = NULL,
+                 issue_asked_at = NULL,
+                 answer_source = NULL,
+                 answer_by = NULL,
+                 answer_ref = NULL,
+                 answer_noted_at = NULL,
                  last_answered_at = COALESCE(
                      pending_resumes.answered_at,
                      pending_resumes.last_answered_at
@@ -1261,16 +1295,71 @@ class StateDB:
         self._conn.commit()
         return cursor.rowcount
 
-    def answer_pending_resume(self, session_id: str, answer: str) -> bool:
+    def answer_pending_resume(
+        self,
+        session_id: str,
+        answer: str,
+        *,
+        source: str | None = None,
+        by: str | None = None,
+        ref: int | None = None,
+    ) -> bool:
         """Attach an operator's answer to a pending resume, marking it
         ready for the sweeper to execute. Returns True if a row was
-        updated, False if the session_id was unknown or already answered."""
+        updated, False if the session_id was unknown or already answered.
+
+        The first answer wins: a second one, from any channel, finds
+        ``answered_at`` set and changes nothing. ``source``, ``by`` and
+        ``ref`` say where it came from (#328); a chat answer leaves them
+        NULL, as every answer did before."""
         cursor = self._conn.execute(
             """UPDATE pending_resumes
-               SET answer = ?, answered_at = ?
+               SET answer = ?, answered_at = ?, answer_source = ?,
+                   answer_by = ?, answer_ref = ?
                WHERE session_id = ? AND answered_at IS NULL
                  AND expired_at IS NULL""",
-            (answer, int(time.time()), session_id),
+            (answer, int(time.time()), source, by, ref, session_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def record_issue_question(
+        self, session_id: str, issue_number: int, comment_id: int,
+        asked_at: int,
+    ) -> bool:
+        """Note that this open question was also asked on its GitHub
+        issue (#328), so the issue is watched for an answer. Only an open
+        row takes it: one already answered or expired is not watched."""
+        cursor = self._conn.execute(
+            "UPDATE pending_resumes SET issue_number = ?, "
+            "issue_comment_id = ?, issue_asked_at = ? "
+            "WHERE session_id = ? AND answered_at IS NULL "
+            "AND expired_at IS NULL",
+            (issue_number, comment_id, asked_at, session_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def list_issue_questions_to_watch(self) -> list[dict[str, Any]]:
+        """Open questions that were also asked on a GitHub issue (#328):
+        the only issues read for an answer."""
+        rows = self._conn.execute(
+            "SELECT * FROM pending_resumes "
+            "WHERE answered_at IS NULL AND expired_at IS NULL "
+            "AND issue_comment_id IS NOT NULL "
+            "ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_answer_noted(self, session_id: str, answered_at: int) -> bool:
+        """Claim the one note that tells the other channel about this
+        answer (#328). True for the first caller only, and only while the
+        row still carries the answer given at ``answered_at``."""
+        cursor = self._conn.execute(
+            "UPDATE pending_resumes SET answer_noted_at = ? "
+            "WHERE session_id = ? AND answered_at = ? "
+            "AND answer_noted_at IS NULL",
+            (int(time.time()), session_id, answered_at),
         )
         self._conn.commit()
         return cursor.rowcount > 0

@@ -15,6 +15,11 @@ from ctrlrelay import __version__
 from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 from ctrlrelay.core.events import EventKind, emit_event
 from ctrlrelay.core.github import GitHubCLI, GitHubError
+from ctrlrelay.core.issue_questions import (
+    note_chat_answer_on_issue,
+    note_expiry_on_issue,
+    watch_issue_answers,
+)
 from ctrlrelay.core.job_claims import JobClaimer
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier
@@ -2514,6 +2519,7 @@ def run_dev(
             code_review=repo_config.code_review,
             max_fix_attempts=repo_config.max_fix_attempts,
             steps=repo_config.steps,
+            question_on_issue=repo_config.question_on_issue,
         )
 
     try:
@@ -3268,6 +3274,7 @@ def poller_start(
                         max_fix_attempts=repo_config.max_fix_attempts,
                         steps=repo_config.steps,
                         claims=claims,
+                        question_on_issue=repo_config.question_on_issue,
                     )
 
                 # Lost the race check to another machine (#245): not a
@@ -3673,6 +3680,32 @@ def poller_start(
                     f"[dim]question_expiry: retired "
                     f"{row['session_id']} ({row['expired_reason']})[/dim]"
                 )
+                # Expired in every channel at once (#328): the row stops
+                # being routable in chat and watched on the issue; the
+                # issue is told.
+                await note_expiry_on_issue(github, row)
+
+        async def _notify_chat_once(text: str) -> None:
+            """Send one chat message on a short-lived bridge connection:
+            the note that a question was answered on GitHub (#328)."""
+            settings = _bridge_socket_settings(config)
+            if settings is None:
+                return
+            from ctrlrelay.transports import SocketTransport
+            sock, ask_timeout = settings
+            if not sock.exists():
+                return
+            note_transport = SocketTransport(
+                sock, ask_timeout_seconds=ask_timeout,
+            )
+            await note_transport.connect()
+            try:
+                await note_transport.send(text)
+            finally:
+                try:
+                    await note_transport.close()
+                except Exception:
+                    pass
 
         async def _run_pending_resume_sweeper() -> None:
             """Drain pending_resumes rows that an operator answered via
@@ -3686,6 +3719,12 @@ def poller_start(
             resumed and fans out a Telegram notification with the result
             so the operator knows whether the resume landed.
             """
+            # Questions asked on their GitHub issue as well (#328): read
+            # each one's issue for an answer, so a row answered there is
+            # resumed in this same tick.
+            await watch_issue_answers(
+                github, state_db, notify=_notify_chat_once,
+            )
             try:
                 pending = state_db.list_pending_resumes_to_execute()
             except Exception as e:
@@ -3748,6 +3787,17 @@ def poller_start(
                     repo = row["repo"]
                     pipeline_name = row["pipeline"]
                     answer = row["answer"] or ""
+
+                    # A chat answer to a question also asked on the issue
+                    # is copied there before the resume (#328), once.
+                    sweep_cfg = repo_cfg_by_name.get(repo)
+                    await note_chat_answer_on_issue(
+                        github, state_db, row,
+                        mode=(
+                            sweep_cfg.question_on_issue
+                            if sweep_cfg is not None else "auto"
+                        ),
+                    )
 
                     if sweeper_transport:
                         try:
@@ -3822,6 +3872,7 @@ def poller_start(
                                 max_fix_attempts=repo_cfg.max_fix_attempts,
                                 code_review=repo_cfg.code_review,
                                 steps=repo_cfg.steps,
+                                question_on_issue=repo_cfg.question_on_issue,
                             )
                         elif pipeline_name == "task":
                             result = await resume_task_from_pending(

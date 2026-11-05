@@ -665,6 +665,7 @@ repos:
 | `code_review` | object | no | (defaults) | Review run over an agent branch before its PR is handed over. See [code_review](#code_review). |
 | `steps` | object | no | (all unset) | How strict each dev pipeline work step is. See [steps](#repossteps). |
 | `max_fix_attempts` | integer ≥ 0 | no | `3` | Fix rounds the dev pipeline asks for when a PR's CI is red or its branch conflicts, before the run fails. `0` means none. See [steps](#repossteps). |
+| `question_on_issue` | `auto` \| `full` \| `notice` | no | `auto` | What a dev run's question looks like on its GitHub issue. The question is asked there as well as in chat, and the first answer from either wins; on the issue only a comment from an account with write access counts. `auto` posts the full question on a private repository and a short "a question is waiting for the operator in chat" notice on a public one (or one whose visibility could not be read); a chat answer is copied to the issue under the same rule. `full` and `notice` force one or the other. |
 | `deploy` | object | no | `null` | Reserved for deploy policy. Currently surfaced in `ctrlrelay config repos` but otherwise inert. |
 
 ### repos[].automation
