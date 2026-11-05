@@ -52,7 +52,10 @@ SAME, DIFFERS, UNKNOWN = "same", "differs", "unknown"
 _MAX_REPOS = 5000
 _MAX_PROFILES = 5000
 _MAX_FIELDS = 200
-_HASH_RE = re.compile(r"^[0-9a-f]{8,64}$")
+# Every hash in a fingerprint is this many hex characters, exactly: a peer
+# answer with any other shape is not one this version made.
+HASH_LEN = 16
+_HASH_RE = re.compile(f"[0-9a-f]{{{HASH_LEN}}}")
 # Repo names shown in one line before "and N more".
 _SHOW = 5
 
@@ -60,7 +63,7 @@ _SHOW = 5
 def _hash(value: Any) -> str:
     """A short hash of a JSON value, canonical: keys sorted, no spacing."""
     text = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:HASH_LEN]
 
 
 def _field_hashes(model: BaseModel) -> dict[str, str]:
@@ -89,13 +92,17 @@ def config_fingerprint(config: Config) -> dict[str, Any]:
     }
 
 
+def _is_hash(value: Any) -> bool:
+    return isinstance(value, str) and _HASH_RE.fullmatch(value) is not None
+
+
 def _clean_hashes(raw: Any) -> dict[str, str] | None:
     if not isinstance(raw, dict) or len(raw) > _MAX_FIELDS:
         return None
     for key, value in raw.items():
         if not isinstance(key, str) or not 0 < len(key) <= 100:
             return None
-        if not isinstance(value, str) or not _HASH_RE.match(value):
+        if not _is_hash(value):
             return None
     return dict(raw)
 
@@ -105,9 +112,12 @@ def clean_fingerprint(raw: Any) -> dict[str, Any] | None:
     another format version, or holds anything not shaped like one: a
     fingerprint with a bad entry dropped would read as drift.
 
-    It must also agree with itself: ``repos_hash`` is the hash of its own
-    repo names, and each profile's key is the hash of that profile. A
-    peer that sent ``repos: {}`` with some other ``repos_hash`` would
+    Every hash must be exactly ``HASH_LEN`` hex characters. It must also
+    agree with itself, as far as hashes can be checked without values:
+    ``repos_hash`` is the hash of its own repo names, each profile's key is
+    the hash of that profile, and each repo names a profile it carries. A
+    field's hash cannot be checked, since its value is never sent. A peer
+    that sent ``repos: {}`` with some other ``repos_hash`` would
     otherwise make every repo here read as "only here". An empty repo
     list with the matching hash is a real one and is kept."""
     if not isinstance(raw, dict) or raw.get("v") != FINGERPRINT_VERSION:
@@ -117,7 +127,7 @@ def clean_fingerprint(raw: Any) -> dict[str, Any] | None:
         return None
     clean_profiles: dict[str, dict[str, dict[str, str]]] = {}
     for key, sections in profiles.items():
-        if not isinstance(key, str) or not isinstance(sections, dict):
+        if not _is_hash(key) or not isinstance(sections, dict):
             return None
         profile = {}
         for section in REPO_SECTIONS:
@@ -134,11 +144,11 @@ def clean_fingerprint(raw: Any) -> dict[str, Any] | None:
     for name, key in repos.items():
         if not isinstance(name, str) or not 0 < len(name) <= 200:
             return None
-        if not isinstance(key, str) or key not in clean_profiles:
+        if not _is_hash(key) or key not in clean_profiles:
             return None
     schedules = _clean_hashes(raw.get("schedules"))
     repos_hash = raw.get("repos_hash")
-    if schedules is None or repos_hash != _repos_hash(repos):
+    if schedules is None or not _is_hash(repos_hash) or repos_hash != _repos_hash(repos):
         return None
     return {
         "v": FINGERPRINT_VERSION, "repos_hash": repos_hash,

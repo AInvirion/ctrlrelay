@@ -389,6 +389,11 @@ def _many_profiles(fp: dict) -> None:
         fp["profiles"][_hash(profile)] = profile
 
 
+def _short_field_hash(fp: dict) -> None:
+    _profile(fp)["automation"]["exclude_labels"] = "00000000"
+    _rekey(fp)
+
+
 MALFORMED = {
     "the old format": lambda fp: fp.update(v=1),
     "no repos, any repos_hash": lambda fp: fp.update(repos={}),
@@ -403,6 +408,14 @@ MALFORMED = {
         exclude_labels="manual"),
     "a schedule that is not a hash": lambda fp: fp["schedules"].update(secops_cron=7),
     "too many profiles": _many_profiles,
+    "a schedule hash of 8 characters": lambda fp: fp["schedules"].update(
+        secops_cron="00000000"),
+    "a schedule hash with a newline": lambda fp: fp["schedules"].update(
+        secops_cron="0" * 16 + "\n"),
+    "a schedule hash of 32 characters": lambda fp: fp["schedules"].update(
+        secops_cron="0" * 32),
+    # Rekeyed, so the profile key agrees and only the hash's length is wrong.
+    "a field hash of 8 characters, rekeyed": _short_field_hash,
 }
 
 
@@ -477,10 +490,86 @@ def test_page_shows_an_old_peer_as_unknown(drift, expected) -> None:
     assert _run_js(["driftLines"], f"driftLines({json.dumps(drift)})") == expected
 
 
-def test_render_fleet_marks_a_drifted_peer() -> None:
+_FAKE_DOM = """
+function Node(tag) { this.tag = tag; this.className = ""; this.textContent = "";
+  this.children = []; }
+Node.prototype.appendChild = function (c) { this.children.push(c); return c; };
+Node.prototype.removeChild = function (c) { this.children.splice(this.children.indexOf(c), 1); };
+Object.defineProperty(Node.prototype, "firstChild",
+  { get: function () { return this.children[0] || null; } });
+var ids = {};
+var document = {
+  createElement: function (tag) { return new Node(tag); },
+  getElementById: function (id) { return ids[id] || (ids[id] = new Node("div")); },
+};
+function texts(n) { return [n.textContent].concat(
+  [].concat.apply([], n.children.map(texts))).filter(function (t) { return t; }); }
+function ago(iso, now) { return "1m ago"; }
+function renderWho() {}
+"""
+
+
+def _render_fleet(peers: list[dict]) -> list[dict]:
+    """Run the page's own renderFleet in node over a fake DOM and return
+    each machine card's class and texts."""
+    import re
+    import shutil
+    import subprocess
+
     from tests.test_web_server import _js_function, _script
 
-    body = _js_function(_script(), "renderFleet")
-    assert 'p.drift.status === "differs"' in body
-    assert "|| drifted" in body
-    assert "driftLines(p.drift)" in body
+    node = shutil.which("node") or shutil.which("nodejs")
+    if node is None:
+        pytest.skip("node is not installed, so the page's script cannot run here")
+    script = _script()
+    defs = []
+    for name in ("el", "put", "safePeerUrl", "peerLink", "pct", "usagePct",
+                 "machineCard", "versionDiffers", "isBad", "driftLines", "renderFleet"):
+        m = re.search(r"\bfunction\s+" + name + r"\s*\(([^)]*)\)", script)
+        assert m, name
+        defs.append(f"function {name}({m.group(1)}) {{{_js_function(script, name)}}}")
+    consts = "\n".join(re.findall(r"^var (?:PEER_URL|BAD_STATES) = .*;$", script, re.M))
+    assert consts.count("var ") == 2
+    data = {"version": "0.23.0", "host": "node-a",
+            "node": {"name": "node-a", "state": "idle", "version": "0.23.0"},
+            "fleet": {"peers": peers}}
+    program = "\n".join([
+        _FAKE_DOM, consts, *defs,
+        f"renderFleet({json.dumps(data)}, 1793490000);",
+        "process.stdout.write(JSON.stringify(ids['fleet-strip'].children.map("
+        "function (c) { return {cls: c.className, texts: texts(c)}; })));",
+    ])
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True,
+                          timeout=30, check=True)
+    return json.loads(done.stdout)
+
+
+def _peer(drift: dict | None) -> dict:
+    return {"url": "http://node-b:8787", "name": "node-b", "reachable": True,
+            "state": "idle", "page_url": "http://node-b:8787/", "drift": drift,
+            "node": {"name": "node-b", "state": "idle", "version": "0.23.0",
+                     "heartbeat_at": "2026-11-05T00:00:00Z"}}
+
+
+def test_render_fleet_marks_a_drifted_peer_and_lists_its_lines() -> None:
+    drift = {"status": "differs", "lines": [f"1 repo only there: {BETA}"]}
+    me, peer = _render_fleet([_peer(drift)])
+    assert me["cls"] == "machine"
+    assert peer["cls"] == "machine bad"
+    assert f"config: 1 repo only there: {BETA}" in peer["texts"]
+
+
+def test_render_fleet_shows_nothing_for_the_same_config() -> None:
+    _, peer = _render_fleet([_peer({"status": "same", "lines": []})])
+    assert peer["cls"] == "machine"
+    assert not [t for t in peer["texts"] if "config" in t]
+    assert "node-b" in peer["texts"]  # the card itself was rendered
+
+
+def test_render_fleet_shows_an_unknown_comparison_as_unknown() -> None:
+    drift = {"status": "unknown", "reason": "it sends no config fingerprint this version can read",
+             "lines": []}
+    _, peer = _render_fleet([_peer(drift)])
+    assert peer["cls"] == "machine"
+    assert ("config drift unknown: it sends no config fingerprint this version can read"
+            in peer["texts"])
