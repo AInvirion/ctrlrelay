@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-11-04
+
 ### Fixed
+
+- The status page's server panel reads memory and uptime on macOS too. It
+  read those two from `/proc`, which macOS does not have, so on a Mac those
+  rows were empty and the page printed the read error. On macOS it now
+  uses `sysctl` and `vm_stat`. macOS has no `MemAvailable`, so "available"
+  there is free plus inactive pages: an estimate, and not the same
+  measurement as Linux's (#321).
 
 - A run waiting for the operator's answer is no longer lost when the poller
   stops during the wait. The question is now saved, and the session marked
@@ -2339,7 +2348,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.18.0...v0.19.0
