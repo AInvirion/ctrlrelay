@@ -1021,6 +1021,89 @@ class StateDB:
         )
         self._conn.commit()
 
+    def park_blocked_question(
+        self, session_id: str, pipeline: str, repo: str, question: str,
+    ) -> None:
+        """Record a question BEFORE the run waits on the chat answer (#324).
+
+        The session goes ``running`` -> ``blocked`` and its question gets a
+        ``pending_resumes`` row, in one commit. While the poller waits in
+        process, this is only a record; if the poller stops during the
+        wait, it is what the bridge routes a late answer to and what the
+        sweeper resumes. Without it, the only record of the question was a
+        coroutine, and a restart lost it with the session row left
+        ``running``.
+        """
+        self._conn.execute(
+            "UPDATE sessions SET status = 'blocked' "
+            "WHERE id = ? AND status = 'running'",
+            (session_id,),
+        )
+        # Commits both statements.
+        self.add_pending_resume(
+            session_id=session_id, pipeline=pipeline, repo=repo,
+            question=question,
+        )
+
+    def take_parked_answer(self, session_id: str, answer: str) -> bool:
+        """The in-process wait got its answer (#324): mark the parked row
+        answered AND resumed, so neither the bridge nor the sweeper acts on
+        it again, and put the session back to ``running``. One commit.
+        Returns whether a row still open was found; a row the sweeper had
+        already taken is left alone."""
+        now = int(time.time())
+        ours = not self._conn.in_transaction
+        try:
+            cursor = self._conn.execute(
+                "UPDATE pending_resumes SET answer = ?, answered_at = ?, "
+                "resumed_at = ? WHERE session_id = ? AND resumed_at IS NULL",
+                (answer, now, now, session_id),
+            )
+            self._conn.execute(
+                "UPDATE sessions SET status = 'running' "
+                "WHERE id = ? AND status = 'blocked'",
+                (session_id,),
+            )
+            if ours:
+                self._conn.commit()
+        except BaseException:
+            if ours and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return cursor.rowcount > 0
+
+    def has_open_pending_resume(self, session_id: str, question: str) -> bool:
+        """Whether this session already has a row for this same question
+        that is neither resumed nor expired. Re-writing such a row would
+        clear an answer already attached to it (#324)."""
+        row = self._conn.execute(
+            "SELECT 1 FROM pending_resumes WHERE session_id = ? "
+            "AND question = ? AND resumed_at IS NULL AND expired_at IS NULL",
+            (session_id, question),
+        ).fetchone()
+        return row is not None
+
+    def release_locks_of_blocked_sessions(self, this_run: str) -> list[str]:
+        """Drop repo locks still held by ``blocked`` sessions, except this
+        process's own (#324). Called at poller start. A blocked run holds
+        its lock only while the process that ran it waits in memory for
+        the answer; once that process is gone, the lock only wedges the
+        repo, and the resume takes the lock again itself. Returns the
+        session ids whose locks were dropped."""
+        rows = self._conn.execute(
+            "SELECT l.session_id FROM repo_locks l JOIN sessions s "
+            "ON s.id = l.session_id WHERE s.status = 'blocked' "
+            "AND (s.owner_run IS NULL OR s.owner_run != ?)",
+            (this_run,),
+        ).fetchall()
+        ids = [r["session_id"] for r in rows]
+        for sid in ids:
+            self._conn.execute(
+                "DELETE FROM repo_locks WHERE session_id = ?", (sid,),
+            )
+        self._conn.commit()
+        return ids
+
     def get_oldest_unanswered_pending_resume(
         self,
         pipeline: str | None = None,
