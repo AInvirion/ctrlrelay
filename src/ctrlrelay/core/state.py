@@ -55,7 +55,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     owner_run TEXT,
     -- The id of this machine's claim on the issue (#245), so a run that
     -- died can still have its claim released by id afterwards (#312).
-    claim_id TEXT
+    claim_id TEXT,
+    -- Why the relay stopped this run as stuck (#224): going in circles in
+    -- its transcript, or the same CI failures after fix round after fix
+    -- round. NULL for every run that was not. Its status is 'failed'.
+    stuck_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS repo_locks (
@@ -339,6 +343,10 @@ class StateDB:
         if "claim_id" not in existing:
             self._conn.execute(
                 "ALTER TABLE sessions ADD COLUMN claim_id TEXT"
+            )
+        if "stuck_reason" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN stuck_reason TEXT"
             )
 
         pr_watches_cols = {

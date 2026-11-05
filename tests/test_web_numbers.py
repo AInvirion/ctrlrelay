@@ -100,8 +100,8 @@ def test_an_empty_database_is_zero_runs_not_unknown(tmp_path: Path) -> None:
         assert w["by_repo"] == [] and w["came_back_issues"] == []
         assert w["overall"]["cost_per_run"] is None
         assert "#223" in w["unavailable"]["cost_per_run"]
-        assert w["overall"]["stuck"] is None
-        assert "#224" in w["unavailable"]["stuck"]
+        assert w["overall"]["stuck"] == 0
+        assert "stuck" not in w["unavailable"]
         # No runs: no PR time is missing, there are none.
         assert w["overall"]["time_to_pr_s"] == {"median": None, "n": 0}
         assert "time_to_pr_s" not in w["unavailable"]
@@ -388,29 +388,30 @@ def test_page_shows_unknowns_as_unknown_never_zero(tmp_path: Path) -> None:
     _pruned_at_7_days(tmp_path)
     out = _numbers(tmp_path)
     cells_30 = _page_number_cells(_window(out, 30)["overall"])
-    # runs, done, failed, blocked, running, success, PR, merge, back, cost
+    # runs, done, failed, blocked, running, stuck, success, PR, merge,
+    # back, cost
     assert cells_30 == [
-        "2", "2", "0", "0", "0", "100%", "unknown", "unknown", "0",
+        "2", "2", "0", "0", "0", "0", "100%", "unknown", "unknown", "0",
         "not recorded",
     ]
     (tmp_path / "state.db").unlink()
     _db(tmp_path).close()
     empty_7 = _window(_numbers(tmp_path), 7)["overall"]
-    assert _page_number_cells(empty_7)[5:8] == [
+    assert _page_number_cells(empty_7)[6:9] == [
         "none finished", "none yet", "none yet",
     ]
-    assert _page_number_cells({}) == ["unknown"] * 9 + ["not recorded"]
+    assert _page_number_cells({}) == ["unknown"] * 10 + ["not recorded"]
 
 
 def test_page_shows_rates_and_medians(tmp_path: Path) -> None:
     counts = {
         "started": 4, "done": 2, "failed": 1, "blocked": 1, "running": 0,
-        "success_rate": 0.5, "time_to_pr_s": {"median": 300, "n": 3},
+        "stuck": 1, "success_rate": 0.5, "time_to_pr_s": {"median": 300, "n": 3},
         "time_to_merge_s": {"median": 7_200, "n": 1}, "came_back": 1,
         "cost_per_run": None,
     }
     assert _page_number_cells(counts) == [
-        "4", "2", "1", "1", "0", "50%", "5m (n=3)", "2h 0m (n=1)", "1",
+        "4", "2", "1", "1", "0", "1", "50%", "5m (n=3)", "2h 0m (n=1)", "1",
         "not recorded",
     ]
 
@@ -424,3 +425,35 @@ def test_page_renders_the_numbers_section() -> None:
     body = _js_function(_script(), "renderNumbers")
     # A null section is drawn as unknown, not as an empty table.
     assert 'unknown("unknown: the runs could not be read")' in body
+
+
+def test_a_run_stopped_as_stuck_is_counted_and_also_failed(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _run(db, "a", started_at=NOW - DAY, status="failed")
+    _run(db, "b", started_at=NOW - DAY, status="failed")
+    _run(db, "c", started_at=NOW - DAY, status="done")
+    # The update dev.py makes for a stuck run (#224).
+    db.execute(
+        "UPDATE sessions SET stuck_reason = ? WHERE id = ?",
+        ("the agent ran the same command 5 times in a row", "b"),
+    )
+    db.commit()
+    db.close()
+
+    w = _window(_numbers(tmp_path), 7)
+    assert w["overall"]["stuck"] == 1
+    assert w["overall"]["failed"] == 2
+    assert _repo(w, ALPHA)["stuck"] == 1
+    assert "stuck" not in w["unavailable"]
+
+
+def test_a_database_without_the_stuck_record_says_unknown(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _run(db, "a", started_at=NOW - DAY, status="failed")
+    db.execute("ALTER TABLE sessions DROP COLUMN stuck_reason")
+    db.commit()
+    db._conn.close()
+
+    w = _window(_numbers(tmp_path), 7)
+    assert w["overall"]["stuck"] is None
+    assert "#224" in w["unavailable"]["stuck"]
