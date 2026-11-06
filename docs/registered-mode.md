@@ -23,6 +23,34 @@ mode it asks the control plane for work instead. In both modes the node calls
 out and never listens, keeps its own repo allowlist and credentials, and writes
 its claim on the GitHub issue.
 
+## Direction: the control plane is the brain
+
+Set by the owner on 2026-11-06. The control plane is the **centralized
+knowledge, brain, coordinator and role definition** of the factory:
+
+- **Knowledge and memory:** history, per-repo learnings, design decisions,
+  context. One store every node draws on, not one per node.
+- **Coordination:** the work queue, routing, schedules, config (decisions 6
+  and 7).
+- **Roles:** what a node is asked to be for a piece of work (for example
+  planner, builder, reviewer, triager), with the skills, context and, where
+  needed, the credentials and agent config that role needs.
+
+**Nodes are smart but can start clean.** A node brings the runtime: the
+agent CLI, the sandbox, its skills, the pipeline steps, its claims and its
+own GitHub access. It does not need to carry knowledge between runs: a fresh
+machine, or one wiped, gets what it needs from the control plane when it
+registers and when it takes work. Losing a node loses no knowledge.
+
+**What this page covers and what it does not.** The protocol below (register,
+heartbeat, get work, report, release, auth, outage, claims) is agreed and is
+the first thing to build. Handing knowledge, roles and credentials from the
+control plane to a node is the direction, not yet designed. It reverses rule
+3 below, and it turns the threat model around: once the control plane writes
+into the agent's prompt and holds credentials, a compromised control plane
+can steer every node. Protecting the control plane then becomes the main
+security job, and that needs its own design (#372) before it is built.
+
 ## What already exists and is reused
 
 These shipped for several machines on one account. Registered mode builds on
@@ -377,11 +405,9 @@ nothing a node cannot also show for itself.
 in the repository on GitHub**, readable by every node with the token it
 already has, and changes only after the operator approves them, as #225 asks.
 The control plane may show it, and may say a new version exists; the node
-reads it from GitHub. **Later direction:** the control plane is meant to hold
-and hand out memory: history, learnings, design, context, and in some cases
-credentials and config for the agent. That reverses rule 3 and the "put its
-own instructions in front of the agent" row of the threat model, so it needs
-its own design and threat model before it is built.
+reads it from GitHub. **Later direction:** the control plane holds and hands
+out this memory (see "Direction: the control plane is the brain"), designed
+in #372.
 
 **Routing by backend (#286).** Nodes declare `capabilities.agents` and
 `labels` at register. The control plane only offers work a node says it can
@@ -479,9 +505,10 @@ Made by the owner: 1, 3 and 4 on 2026-11-03, the rest on 2026-11-06 (see #251).
 4. **Webhook work** never runs without the operator's assignment. The node
    opens the issue, only for opted-in repos, and it waits for assignment or
    triage (#227).
-5. **Shared per-repo learning:** in the repository on GitHub for now. Later
-   the control plane holds memory, and possibly agent credentials and config,
-   under its own design (see "Shared per-repo learning").
+5. **Shared per-repo learning:** in the repository on GitHub for now. The
+   direction is the control plane as the brain: knowledge, memory, roles, and
+   where needed agent credentials and config, with nodes able to start clean
+   (see "Direction: the control plane is the brain", designed in #372).
 6. **Config from the control plane:** full config, except the `control_plane`
    block, the node key and `node_id`.
 7. **Scheduled jobs:** configurable by the control plane; the ref claim stays
