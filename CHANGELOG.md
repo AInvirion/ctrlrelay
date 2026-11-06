@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-11-06
+
 ### Added
 
 - A dev run can now finish with an answer instead of code (#368). For an
@@ -2638,7 +2640,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.22.0...v0.23.0
