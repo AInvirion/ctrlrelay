@@ -1400,6 +1400,16 @@ block above with these two outputs in place of the pull request ones:
 `"no_changes": True` and `"no_changes_reason": "<ONE LINE: WHY NOTHING
 CHANGED>"`. If the branch does have commits, they are published anyway.
 
+**When the issue asks for an answer, not code** (a question, an
+investigation, a plan, a proposed split into smaller issues): if the result
+is a document that belongs in the repository, commit it and finish with a
+pull request as usual. Otherwise commit nothing, finish DONE with no change
+as above, and add a third output, `"reply": r'''<YOUR ANSWER, MARKDOWN>'''`
+(a raw triple-quoted string, like a pull request description). The
+orchestrator posts the reply on the issue as a comment, in full. You cannot
+create issues, so for a split, list each proposed issue with its title and
+description in the reply.
+
 {_blocked_and_failed_blocks(quoted_dir, quoted_path, session_id)}"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
@@ -1622,8 +1632,33 @@ _RELAY_OWNED_OUTPUTS = (
     "pr_number", "pr_url", "pr_title", "pr_body",
     # Set only once the relay has confirmed there is nothing to push (#336).
     "no_change", "no_change_reason",
+    # The agent's reply, set only on a confirmed no-change run (#368).
+    "no_change_reply", "no_change_reply_posted",
 )
 _NO_CHANGE_REASON_MAX = 300
+# GitHub refuses a comment over 65,536 characters; this leaves room for the
+# heading, the cut note and the marker.
+_REPLY_MAX = 60_000
+
+
+def _declared_reply(agent_outputs: dict[str, Any]) -> str | None:
+    """The agent's markdown reply for the issue (#368), else ``None``.
+
+    The relay comments as the operator's own account and finds its own
+    comments by their ``<!-- ctrlrelay:`` marker (claims, questions). The
+    reply is the agent's text, so every HTML comment opener in it is
+    escaped: it can never carry a marker the relay would read as its own.
+    """
+    raw = agent_outputs.get("reply")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    reply = raw.strip()
+    if len(reply) > _REPLY_MAX:
+        reply = (
+            reply[:_REPLY_MAX]
+            + f"\n\n_(Cut at {_REPLY_MAX:,} characters.)_"
+        )
+    return reply.replace("<!--", "&lt;!--")
 
 
 def _declared_no_change(agent_outputs: dict[str, Any]) -> str | None:
@@ -1639,20 +1674,42 @@ def _declared_no_change(agent_outputs: dict[str, Any]) -> str | None:
 
 async def _note_no_change_on_issue(
     github: Any, *, repo: str, issue_number: int, result: PipelineResult,
+    mode: str | None = "auto",
 ) -> None:
     """Say on the issue that the run finished with nothing to change
     (#336): with no pull request, nothing else would. Best-effort; a
-    failed comment never changes the run's outcome."""
+    failed comment never changes the run's outcome.
+
+    With a reply (#368) the comment carries it in full, under the same
+    rule as a question (#328): ``mode`` is the repository's
+    ``question_on_issue``, and a public repository (or one whose
+    visibility cannot be read) gets a note instead, since the agent's
+    text can name things from its context. Whether it was posted is
+    recorded in ``no_change_reply_posted`` so the chat line can carry
+    the reply when the issue does not.
+    """
     if not (result.success and result.outputs.get("no_change") is True):
         return
+    reply = result.outputs.get("no_change_reply")
+    full = False
+    if isinstance(reply, str) and reply:
+        from ctrlrelay.core.issue_questions import resolve_full_text
+
+        full = await resolve_full_text(github, repo, mode)
+    else:
+        reply = None
     try:
         await github.comment_on_issue(
             repo=repo, issue_number=issue_number,
             body=no_change_comment(
                 result.session_id,
                 str(result.outputs.get("no_change_reason") or ""),
+                reply=reply if full else None,
+                reply_held=reply is not None and not full,
             ),
         )
+        if reply is not None:
+            result.outputs["no_change_reply_posted"] = full
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -1663,13 +1720,29 @@ async def _note_no_change_on_issue(
         )
 
 
-def no_change_comment(session_id: str, reason: str) -> str:
-    """The issue comment for a run that finished with nothing to change."""
+def no_change_comment(
+    session_id: str, reason: str, *, reply: str | None = None,
+    reply_held: bool = False,
+) -> str:
+    """The issue comment for a run that finished with nothing to change.
+
+    ``reply`` is the agent's answer (#368), posted in full. ``reply_held``
+    says the agent wrote one but this repository does not get it.
+    """
+    marker = f"<!-- ctrlrelay:no-change session={session_id} -->"
+    if reply is not None:
+        return f"{reply}\n\n---\n_Reply from the agent run, no pull request._\n\n{marker}"
+    held = (
+        "\n\nThe agent wrote a reply. It is not posted here because this "
+        "repository is public or its visibility could not be read; it was "
+        "sent to the operator's chat. Set `question_on_issue: full` on the "
+        "repository to post replies here."
+        if reply_held else ""
+    )
     return (
         "**Finished with no change.** The agent decided nothing needed to "
         f"change, and the branch has no new commits, so no pull request "
-        f"was opened.\n\n> {reason}\n\n"
-        f"<!-- ctrlrelay:no-change session={session_id} -->"
+        f"was opened.\n\n> {reason}{held}\n\n{marker}"
     )
 
 # A full commit id, as GitHub names the head of the review base.
@@ -1827,9 +1900,11 @@ class _Publisher:
         )
 
         agent_outputs = dict(result.outputs)
+        # "reply" is read only on the no-change path below (#368); it is
+        # not carried on any other outcome.
         outputs = {
             k: v for k, v in agent_outputs.items()
-            if k not in _RELAY_OWNED_OUTPUTS
+            if k not in _RELAY_OWNED_OUTPUTS and k != "reply"
         }
         try:
             if self.default_branch is None:
@@ -1926,6 +2001,7 @@ class _Publisher:
                     issue_number=self.issue_number,
                     branch=self.branch,
                 )
+                reply = _declared_reply(agent_outputs)
                 return PipelineResult(
                     success=True,
                     session_id=result.session_id,
@@ -1933,6 +2009,7 @@ class _Publisher:
                     outputs={
                         **outputs, "no_change": True,
                         "no_change_reason": no_change,
+                        **({"no_change_reply": reply} if reply else {}),
                     },
                     exit_code=result.exit_code,
                 )
@@ -4920,6 +4997,7 @@ async def run_dev_issue(
                 await keeper.stop()
         await _note_no_change_on_issue(
             github, repo=repo, issue_number=issue_number, result=result,
+            mode=question_on_issue,
         )
         if not result.success and not result.blocked:
             pr_raw = result.outputs.get("pr_number")
@@ -5364,6 +5442,7 @@ async def resume_dev_from_pending(
         state_db.commit()
         await _note_no_change_on_issue(
             github, repo=repo, issue_number=issue_number, result=result,
+            mode=question_on_issue,
         )
 
         if result.blocked:

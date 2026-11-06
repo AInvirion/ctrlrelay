@@ -545,6 +545,11 @@ def unresolved_review_programs(config) -> dict[str, list[str]]:
     }
 
 
+# A chat message is capped by the transport (Telegram: 4,096 characters);
+# the reply is cut well short of that, leaving room for the first line.
+_CHAT_REPLY_MAX = 3_000
+
+
 async def announce_dev_success(
     transport, *, repo: str, result
 ) -> list[str]:
@@ -575,6 +580,16 @@ async def announce_dev_success(
             f"✅ {repo}: finished, no change needed: "
             f"{outputs.get('no_change_reason') or 'no reason given'}"
         )
+        reply = outputs.get("no_change_reply")
+        if isinstance(reply, str) and reply:
+            # #368: posted on the issue, or held back from a public one,
+            # in which case chat is the only place it lands.
+            if outputs.get("no_change_reply_posted") is True:
+                line += "\nThe agent's reply is posted on the issue."
+            else:
+                cut = reply[:_CHAT_REPLY_MAX]
+                more = "\n(cut here)" if len(reply) > _CHAT_REPLY_MAX else ""
+                line += f"\nThe agent's reply (not posted on the issue):\n{cut}{more}"
         await transport.send(line)
         sent.append(line)
         return sent
