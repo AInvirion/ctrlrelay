@@ -996,13 +996,24 @@ already ran arbitrary code as this user, so the proof runs unconfined too.
 The copies have no untracked files, so the command must set up what it needs
 offline.
 
+A run counts only with evidence that the named tests ran. For a pytest
+command (`pytest`, `uv run pytest`, `python -m pytest`) the relay adds
+`--junitxml` and reads the report: on the branch each named test must have
+passed, on the base each must have failed or errored. pytest exiting 2 to 5
+(a collection error, a usage error, no tests collected, or `uv run` failing
+to start it), no report, or a named test missing from it is no evidence. A
+new test should import new code inside the test function, or the base run
+stops at collection. For any other runner the command must exit 0 on the
+branch and 1 on the base, and each named test (the part after the last
+`::`) must appear in its output.
+
 There are three outcomes:
 
 | Outcome | When |
 |---|---|
-| `proven` | The test fails on the base and passes on the branch. |
-| `failed` | It does not pass on the branch; it passes on the base too, so it proves nothing; the diff has no real change (empty or whitespace only); or the diff weakens tests. |
-| `not proven` | No proof was named, the proof is malformed or names a test outside the test files, the command could not run (tool missing), or it timed out. |
+| `proven` | The named tests failed on the base and passed on the branch. |
+| `failed` | The named tests ran on the branch and did not pass; they ran on the base and passed, so they prove nothing; the diff has no real change (empty or whitespace only); or the diff weakens tests. |
+| `not proven` | No proof was named, the proof is malformed or names a test outside the test files, there is no evidence the named tests ran (a setup, dependency or network failure, a usage error, a collection error), the command could not start, it timed out, or the branch moved after the proof ran. |
 
 Only `proven` lets the PR go ready. Two exemptions, recorded as `not
 required`: a diff that only touches docs (`*.md`, `*.rst`, `*.adoc`,
@@ -1010,14 +1021,30 @@ required`: a diff that only touches docs (`*.md`, `*.rst`, `*.adoc`,
 
 **The test weakening scan** reads the diff's test files (`tests/`, `test_*.py`,
 `*_test.py`, `conftest.py`, `*.test.ts`, `*.spec.js`, `__tests__/` and the
-like). It flags a deleted test file, a removed test function, an added skip,
-xfail or `.only` marker (pytest, unittest, and JS `.skip`, `xit`, `it.only`),
-and a removed assert line. Lines are matched by text, so a test moved to
-another file is not a hit, but an assert line whose text changed is. Any hit
-makes the run `failed`, unless the plan's acceptance criteria say the change
-is intended with an item `Test removal intended: <why>`. Python and JS/TS are
-read; a test file in another language makes the scan report `not checked`,
-never `clean`.
+like) and the test runner's config. These are blockers:
+
+- a deleted test file, in any language;
+- a test file renamed to a name the runner does not collect, or moved out
+  of the tests;
+- a removed test function;
+- an added skip, xfail or `.only` marker: decorators, a module-level
+  `pytestmark`, `pytest.importorskip`, unittest skips, and JS `.skip`,
+  `xit`, `it.only`;
+- an added line in runner config that can deselect or skip: `addopts`,
+  `--deselect`, `-k`, `testpaths`, `norecursedirs`, `collect_ignore` (in
+  `pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`, `conftest.py`),
+  and jest's `testPathIgnorePatterns`, `testMatch`, `testRegex`;
+- a bare `return` added as the first statement of an existing Python test;
+- an assert line removed from a diff hunk that adds no assert.
+
+An assert line removed from a hunk that also adds one is an edit. The scan
+cannot tell a corrected expectation from a loosened one, so it is shown as a
+warning on the PR and does not block. Lines are matched by text, so a test or
+an assert moved to another file is not a hit. Any blocker makes the run
+`failed`, unless the plan's acceptance criteria say the change is intended
+with an item `Test removal intended: <why>`. Python and JS/TS are read; a
+test file in another language makes the scan report `not checked`, never
+`clean`.
 
 If no test can show the change, the plan's acceptance criteria can say `No
 test possible: <why>`. The run is still `not proven` and the PR stays a
@@ -1033,7 +1060,10 @@ draft gets a comment telling readers not to merge it.
 
 With `require_proof` on, the PR is opened as a draft, as with
 `steps.review: required`. When both are on, the review step marks it ready
-after the proof passed and the review posted.
+after the proof passed and the review posted. Right before it is marked
+ready, the relay reads the PR's head from GitHub: if it is not the commit the
+proof ran on, or cannot be read, the run is `not proven` and the PR stays a
+draft.
 
 Set `require_proof: false` for a repo with no runnable tests. The PR is then
 opened as before and its comment says `proof not required by config`.

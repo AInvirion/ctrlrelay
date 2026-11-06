@@ -42,7 +42,7 @@ import shutil
 import signal
 import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -92,8 +92,10 @@ _DOC_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".adoc"})
 _PY_TEST_DEF = re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\(")
 _JS_TEST_DEF = re.compile(r"""\b(?:it|test)(?:\.\w+)?\s*\(\s*(['"`])(.+?)\1""")
 _PY_SKIP = re.compile(
-    r"@pytest\.mark\.(?:skip|skipif|xfail)\b"
-    r"|\bpytest\.(?:skip|xfail)\s*\("
+    # Decorators, ``pytestmark = pytest.mark.skip(...)`` and marks in a
+    # list alike, and ``from pytest import mark``.
+    r"\b(?:pytest\.)?mark\.(?:skip|skipif|xfail)\b"
+    r"|\bpytest\.(?:skip|xfail|importorskip)\s*\("
     r"|@unittest\.(?:skip|skipIf|skipUnless|expectedFailure)\b"
     r"|\.skipTest\s*\("
 )
@@ -104,6 +106,19 @@ _JS_SKIP = re.compile(
 )
 _PY_ASSERT = re.compile(r"^\s*assert\b|\bself\.assert\w*\s*\(|\bpytest\.raises\s*\(")
 _JS_ASSERT = re.compile(r"\bexpect\s*\(|\bassert(?:\.\w+)?\s*\(")
+
+# Files that tell a test runner what to collect, and the keys in them
+# that can deselect or skip tests. An added line with one of these keys is
+# a hit: the scan cannot tell a narrowing from a harmless edit.
+_RUNNER_CONFIG_NAME = re.compile(
+    r"^(?:pytest\.ini|pyproject\.toml|setup\.cfg|tox\.ini|conftest\.py"
+    r"|package\.json|(?:jest|vitest)\.config\.[cm]?[jt]s(?:on)?)$"
+)
+_RUNNER_CONFIG_KEY = re.compile(
+    r"\baddopts\b|--deselect\b|--ignore\b|(?:^|[\s'\"=\[,])-k(?:[\s=]|$)"
+    r"|\btestpaths\b|\bnorecursedirs\b|\bcollect_ignore"
+    r"|\btestPathIgnorePatterns\b|\btestMatch\b|\btestRegex\b"
+)
 
 # Lines in the plan's acceptance criteria that the gate reads (#221).
 # Each needs a reason after the colon; the bare words are not enough.
@@ -182,6 +197,24 @@ def is_test_file(path: str) -> bool:
     )
 
 
+def is_runner_config(path: str) -> bool:
+    return bool(_RUNNER_CONFIG_NAME.match(PurePosixPath(path).name))
+
+
+def _collected(path: str) -> bool | None:
+    """Whether the test runner collects ``path`` by its name: True or
+    False for a Python or JS/TS file, None for any other."""
+    p = PurePosixPath(path)
+    lang = test_language(path)
+    if lang == "python":
+        return bool(re.match(r"^(?:test_.+|.+_test)\.py$", p.name))
+    if lang == "js":
+        return bool(re.search(r"\.(?:test|spec)\.", p.name)) or (
+            "__tests__" in p.parts[:-1]
+        )
+    return None
+
+
 def test_language(path: str) -> str | None:
     """``python`` or ``js`` for test code the scan reads, else None."""
     suffix = PurePosixPath(path).suffix.lower()
@@ -214,7 +247,10 @@ class Change:
 
 @dataclass(frozen=True)
 class WeakeningScan:
+    # Blockers: any of these makes the run not done unless the plan says so.
     hits: tuple[str, ...] = ()
+    # Shown on the PR, never a blocker: an assert line edited in place.
+    warnings: tuple[str, ...] = ()
     # Test files in a language the scan cannot read: not "clean".
     unchecked: tuple[str, ...] = ()
 
@@ -222,6 +258,8 @@ class WeakeningScan:
         parts: list[str] = []
         if self.hits:
             parts.append(f"{len(self.hits)} hit(s)")
+        if self.warnings:
+            parts.append(f"{len(self.warnings)} warning(s)")
         if self.unchecked:
             parts.append(
                 "not checked for " + ", ".join(f"`{p}`" for p in self.unchecked)
@@ -229,24 +267,32 @@ class WeakeningScan:
         return "; ".join(parts) if parts else "clean"
 
 
-def _diff_lines_by_file(diff: str) -> dict[str, tuple[list[str], list[str]]]:
-    """``{path: (removed lines, added lines)}`` from a ``-U0`` diff."""
-    out: dict[str, tuple[list[str], list[str]]] = {}
+Hunk = tuple[list[str], list[str]]
+
+
+def _diff_hunks_by_file(diff: str) -> dict[str, list[Hunk]]:
+    """``{path: [(removed lines, added lines), ...]}``, one entry per hunk
+    of a ``-U0`` diff."""
+    out: dict[str, list[Hunk]] = {}
     old = new = None
-    current: tuple[list[str], list[str]] | None = None
+    hunks: list[Hunk] | None = None
+    current: Hunk | None = None
     for line in diff.splitlines():
         if line.startswith("diff --git "):
             old = new = None
-            current = None
-        elif line.startswith("--- "):
+            hunks = current = None
+        elif hunks is None and line.startswith("--- "):
             old = line[4:]
             old = old[2:] if old.startswith("a/") else None
-        elif line.startswith("+++ "):
+        elif hunks is None and line.startswith("+++ "):
             new = line[4:]
             new = new[2:] if new.startswith("b/") else None
             key = new or old
             if key is not None:
-                current = out.setdefault(key, ([], []))
+                hunks = out.setdefault(key, [])
+        elif hunks is not None and line.startswith("@@"):
+            current = ([], [])
+            hunks.append(current)
         elif current is not None and line.startswith("-"):
             current[0].append(line[1:])
         elif current is not None and line.startswith("+"):
@@ -254,34 +300,107 @@ def _diff_lines_by_file(diff: str) -> dict[str, tuple[list[str], list[str]]]:
     return out
 
 
-def scan_weakening(changes: Sequence[Change], diff: str) -> WeakeningScan:
-    """Deleted test files and test functions, added skip/xfail/only
-    markers, and removed assert lines, in the test files of a diff.
+def early_returns(base_src: str, head_src: str) -> list[str]:
+    """Test functions that existed on the base and on the head begin with
+    a bare ``return`` (after any docstring), so they pass without testing
+    anything. Python only; a file that does not parse gives nothing."""
+    import ast
+
+    def starts(src: str) -> dict[str, bool]:
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return {}
+        out: dict[str, bool] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                node.name.startswith("test")
+            ):
+                body = list(node.body)
+                if (
+                    body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)
+                ):
+                    body = body[1:]
+                out[node.name] = bool(
+                    body and isinstance(body[0], ast.Return)
+                    and body[0].value is None
+                )
+        return out
+
+    before = starts(base_src)
+    return sorted(
+        name for name, bare in starts(head_src).items()
+        if bare and before.get(name) is False
+    )
+
+
+def scan_weakening(
+    changes: Sequence[Change],
+    diff: str,
+    *,
+    sources: dict[str, tuple[str, str]] | None = None,
+) -> WeakeningScan:
+    """Look for weakened tests in a diff.
+
+    Blockers: a deleted test file (any language), a test file renamed to a
+    name the runner does not collect or moved out of the tests, a removed
+    test function, an added skip/xfail/only marker or ``importorskip``, an
+    added runner-config line that can deselect or skip, an early bare
+    ``return`` added to an existing Python test, and an assert line removed
+    from a hunk that adds no assert.
 
     Lines are matched by their text across all the test files, so a test
-    or an assert moved from one file to another is not a hit. Anything
-    else is: an assert line whose text changed counts as removed, because
-    the scan cannot tell a corrected expectation from a loosened one. The
-    plan says so when it is intended (``Test removal intended: <why>``).
+    or an assert moved from one file to another is not a hit. An assert
+    line removed from a hunk that also adds an assert is an edit: the scan
+    cannot tell a corrected expectation from a loosened one, so it is a
+    warning on the PR, not a blocker.
+
+    ``sources`` maps a modified Python test file to its ``(base, head)``
+    text, for the early-return check.
     """
     hits: list[str] = []
+    warnings: list[str] = []
     unchecked: list[str] = []
-    lines = _diff_lines_by_file(diff)
-    # (kind, text) -> paths, one entry per line, for each side.
-    removed_items: dict[tuple[str, str], list[str]] = {}
-    added_items: dict[tuple[str, str], list[str]] = {}
+    files = _diff_hunks_by_file(diff)
+    # (kind, text) -> [(path, hunk index)], one entry per line, each side.
+    removed_items: dict[tuple[str, str], list[tuple[str, int]]] = {}
+    added_items: dict[tuple[str, str], list[tuple[str, int]]] = {}
+    # (path, hunk index) -> asserts the hunk adds.
+    hunk_adds: dict[tuple[str, int], int] = {}
 
-    def note(side: dict, kind: str, text: str, path: str) -> None:
-        side.setdefault((kind, " ".join(text.split())), []).append(path)
+    def note(side: dict, kind: str, text: str, where: tuple[str, int]) -> None:
+        side.setdefault((kind, " ".join(text.split())), []).append(where)
 
     for change in changes:
         path = change.path
+        old = change.old
         if (
-            change.status == "R" and change.old
-            and is_test_file(change.old) and not is_test_file(path)
+            change.status == "D" and is_test_file(path)
+            and PurePosixPath(path).suffix.lower() not in _DATA_SUFFIXES
         ):
-            hits.append(f"moved test file `{change.old}` out of the tests")
+            hits.append(f"deleted test file `{path}`")
             continue
+        if change.status == "R" and old and is_test_file(old):
+            if not is_test_file(path):
+                hits.append(f"moved test file `{old}` out of the tests")
+                continue
+            if _collected(old) and _collected(path) is False:
+                hits.append(
+                    f"renamed test file `{old}` to `{path}`, which the test "
+                    "runner does not collect"
+                )
+                continue
+        hunks = files.get(path, [])
+        if is_runner_config(path):
+            for removed_lines, added_lines in hunks:
+                for text in added_lines:
+                    if _RUNNER_CONFIG_KEY.search(text):
+                        hits.append(
+                            f"runner config in `{path}` can deselect or skip "
+                            f"tests: `{text.strip()[:120]}`"
+                        )
         if not is_test_file(path):
             continue
         lang = test_language(path)
@@ -289,41 +408,53 @@ def scan_weakening(changes: Sequence[Change], diff: str) -> WeakeningScan:
             if PurePosixPath(path).suffix.lower() not in _DATA_SUFFIXES:
                 unchecked.append(path)
             continue
-        if change.status == "D":
-            hits.append(f"deleted test file `{path}`")
-            continue
-        removed, added = lines.get(path, ([], []))
         def_re, group = (
             (_PY_TEST_DEF, 1) if lang == "python" else (_JS_TEST_DEF, 2)
         )
         skip_re = _PY_SKIP if lang == "python" else _JS_SKIP
         assert_re = _PY_ASSERT if lang == "python" else _JS_ASSERT
-        for side, texts in ((removed_items, removed), (added_items, added)):
-            for text in texts:
-                m = def_re.search(text)
-                if m:
-                    note(side, "test", m.group(group), path)
-                if skip_re.search(text):
-                    note(side, "skip", text, path)
-                if assert_re.search(text):
-                    note(side, "assert", text, path)
+        for i, (removed, added) in enumerate(hunks):
+            where = (path, i)
+            hunk_adds[where] = sum(1 for t in added if assert_re.search(t))
+            for side, texts in ((removed_items, removed), (added_items, added)):
+                for text in texts:
+                    m = def_re.search(text)
+                    if m:
+                        note(side, "test", m.group(group), where)
+                    if skip_re.search(text):
+                        note(side, "skip", text, where)
+                    if assert_re.search(text):
+                        note(side, "assert", text, where)
+        if lang == "python" and sources and path in sources:
+            base_src, head_src = sources[path]
+            for name in early_returns(base_src, head_src):
+                hits.append(
+                    f"added an early `return` to `{name}` in `{path}`, so it "
+                    "tests nothing"
+                )
 
-    def surplus(more: dict, fewer: dict, kind: str) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
-        for (k, text), paths in more.items():
+    def surplus(more: dict, fewer: dict, kind: str) -> list[tuple[str, str, int]]:
+        out: list[tuple[str, str, int]] = []
+        for (k, text), places in more.items():
             if k != kind:
                 continue
-            extra = len(paths) - len(fewer.get((k, text), []))
-            out += [(text, p) for p in paths[:max(extra, 0)]]
+            extra = len(places) - len(fewer.get((k, text), []))
+            out += [(text, p, i) for p, i in places[:max(extra, 0)]]
         return out
 
-    for name, path in surplus(removed_items, added_items, "test"):
+    for name, path, _ in surplus(removed_items, added_items, "test"):
         hits.append(f"removed test `{name}` from `{path}`")
-    for text, path in surplus(added_items, removed_items, "skip"):
+    for text, path, _ in surplus(added_items, removed_items, "skip"):
         hits.append(f"added skip/xfail/only marker in `{path}`: `{text[:120]}`")
-    for text, path in surplus(removed_items, added_items, "assert"):
-        hits.append(f"removed assert line in `{path}`: `{text[:120]}`")
-    return WeakeningScan(hits=tuple(hits), unchecked=tuple(unchecked))
+    for text, path, i in surplus(removed_items, added_items, "assert"):
+        if hunk_adds.get((path, i), 0) > 0:
+            hunk_adds[(path, i)] -= 1
+            warnings.append(f"edited assert line in `{path}`: `{text[:120]}`")
+        else:
+            hits.append(f"removed assert line in `{path}`: `{text[:120]}`")
+    return WeakeningScan(
+        hits=tuple(hits), warnings=tuple(warnings), unchecked=tuple(unchecked),
+    )
 
 
 # --- running the command -----------------------------------------------------
@@ -333,19 +464,30 @@ def scan_weakening(changes: Sequence[Change], diff: str) -> WeakeningScan:
 class CommandRun:
     """One run of the proof command."""
 
-    # "passed", "failed", "timed out" or "could not run".
+    # From the exit code alone (run_proof_command): "passed", "failed",
+    # "timed out" or "could not run". Once judged against the named tests
+    # (run_claim): "passed" and "failed" mean the named tests ran and did
+    # or did not pass, and "not shown" means there is no evidence they ran.
     status: str
     exit_code: int | None = None
     # Redacted and capped.
     output: str = ""
     detail: str = ""
+    # The whole output, for finding the named tests in it. Never shown.
+    full_output: str = field(default="", repr=False, compare=False)
 
     def describe(self) -> str:
         if self.status == "timed out":
             return f"timed out ({self.detail})" if self.detail else "timed out"
-        if self.status == "could not run":
-            return f"could not run ({self.detail})"
-        return f"{self.status} (exit {self.exit_code})"
+        if self.status in ("could not run", "not shown"):
+            label = (
+                "could not run" if self.status == "could not run"
+                else "no evidence the named test ran"
+            )
+            code = f", exit {self.exit_code}" if self.exit_code is not None else ""
+            return f"{label} ({self.detail}{code})"
+        text = f"{self.status} (exit {self.exit_code})"
+        return f"{text}: {self.detail}" if self.detail else text
 
 
 @dataclass(frozen=True)
@@ -459,9 +601,10 @@ async def run_proof_command(
             if isinstance(e, asyncio.CancelledError):
                 raise
             return CommandRun(status="timed out", detail=f"after {timeout:g}s")
-        output = tail(redact_secrets(stdout.decode(errors="replace")), _TAIL_CHARS)
+        full = stdout.decode(errors="replace")
+        output = tail(redact_secrets(full), _TAIL_CHARS)
         code = proc.returncode
-        raw = stdout.decode(errors="replace").lstrip()
+        raw = full.lstrip()
         if confinement.mode == "bwrap" and code != 0 and raw.startswith("bwrap:"):
             # The sandbox itself did not start: the test never ran.
             return CommandRun(
@@ -475,10 +618,156 @@ async def run_proof_command(
             )
         return CommandRun(
             status="passed" if code == 0 else "failed",
-            exit_code=code, output=output,
+            exit_code=code, output=output, full_output=full,
         )
     finally:
         shutil.rmtree(private, ignore_errors=True)
+
+
+# --- did the named tests run? ------------------------------------------------
+
+# pytest's own exit codes past 1: interrupted (collection errors), internal
+# error, usage error, no tests collected. ``uv run`` also exits 2 when it
+# cannot start the program. None of them shows a named test ran.
+_PYTEST_NOT_RUN = {
+    2: "interrupted, often a collection error, or the runner could not start",
+    3: "internal error",
+    4: "usage error",
+    5: "no tests collected",
+}
+
+
+def is_pytest_command(command: Sequence[str]) -> bool:
+    """``pytest ...``, ``uv run pytest ...``, ``python -m pytest ...``."""
+    for i, arg in enumerate(command):
+        name = PurePosixPath(arg).name
+        if name in ("pytest", "py.test"):
+            return True
+        if arg == "-m" and i + 1 < len(command) and command[i + 1] == "pytest":
+            return True
+    return False
+
+
+def _junit_cases(xml_text: str) -> list[tuple[str, str, str]]:
+    """``(classname, name, result)`` per testcase; result is ``passed``,
+    ``failed`` (failure or error) or ``skipped``."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(xml_text)
+    out: list[tuple[str, str, str]] = []
+    for case in root.iter("testcase"):
+        tags = {child.tag for child in case}
+        result = (
+            "failed" if tags & {"failure", "error"}
+            else "skipped" if "skipped" in tags
+            else "passed"
+        )
+        out.append((case.get("classname", ""), case.get("name", ""), result))
+    return out
+
+
+def _matching_cases(
+    test_id: str, cases: list[tuple[str, str, str]],
+) -> list[str]:
+    """Results of the junit cases a pytest node id names: the file part
+    as a dotted module, any class parts, and the function (all its
+    parametrized cases when no ``[...]`` is given). A file alone names
+    every case in it."""
+    parts = test_id.split("::")
+    module = parts[0].removesuffix(".py").replace("/", ".")
+    if len(parts) == 1:
+        return [
+            r for c, _, r in cases if c == module or c.startswith(module + ".")
+        ]
+    classname = ".".join([module, *parts[1:-1]])
+    func = parts[-1]
+    return [
+        r for c, n, r in cases
+        if c == classname
+        and (n == func or ("[" not in func and n.startswith(func + "[")))
+    ]
+
+
+def judge(
+    run: CommandRun, claim: ProofClaim, *, before: bool,
+    junit: str | None, pytest_run: bool,
+) -> CommandRun:
+    """``run`` judged against the named tests.
+
+    pytest: decided from its junit report. Exit 2-5, no report, or a named
+    test missing from it is "not shown". On the branch each named test must
+    have passed; on the base each must have failed or errored. Anything
+    else other runners: the exit code (1 on the base, 0 on the branch) and
+    each named test, the part after the last ``::``, in the output.
+    """
+    if run.status in ("timed out", "could not run"):
+        return run
+
+    def not_shown(why: str) -> CommandRun:
+        return replace(run, status="not shown", detail=why)
+
+    code = run.exit_code
+    if pytest_run:
+        if code in _PYTEST_NOT_RUN:
+            return not_shown(f"pytest {_PYTEST_NOT_RUN[code]}")
+        if code not in (0, 1):
+            return not_shown("unexpected exit code")
+        if junit is None:
+            return not_shown("pytest wrote no junit report")
+        try:
+            cases = _junit_cases(junit)
+        except Exception as e:
+            return not_shown(f"the junit report could not be read ({type(e).__name__})")
+        results: list[str] = []
+        for test in claim.tests:
+            found = _matching_cases(test, cases)
+            if not found:
+                return not_shown(f"`{test}` is not in the junit report")
+            if "skipped" in found:
+                return not_shown(f"`{test}` was skipped")
+            results += found
+        if before:
+            if all(r == "failed" for r in results):
+                return replace(run, status="failed", detail="the named tests failed")
+            return replace(run, status="passed", detail="a named test passed")
+        if all(r == "passed" for r in results):
+            return replace(run, status="passed", detail="the named tests passed")
+        return replace(run, status="failed", detail="a named test did not pass")
+    missing = [
+        t for t in claim.tests
+        if t.rsplit("::", 1)[-1] not in run.full_output
+    ]
+    if missing:
+        return not_shown(
+            "not in the output: " + ", ".join(f"`{t}`" for t in missing)
+        )
+    if before and code == 1:
+        return replace(run, status="failed")
+    if not before and code == 0:
+        return replace(run, status="passed")
+    return not_shown(f"expected exit {1 if before else 0}")
+
+
+async def run_claim(
+    claim: ProofClaim, cwd: Path, confinement: Confinement, *,
+    before: bool, timeout: float = PROOF_TIMEOUT_SECONDS,
+) -> CommandRun:
+    """Run the claim's command in ``cwd`` and judge whether the named tests
+    ran and how they came out. A pytest command gets ``--junitxml``, written
+    inside ``cwd`` (the one place the sandbox lets it write)."""
+    pytest_run = is_pytest_command(claim.command)
+    command = list(claim.command)
+    report = cwd / f".ctrlrelay-proof-{os.urandom(6).hex()}.xml"
+    if pytest_run:
+        command.append(f"--junitxml={report}")
+    run = await run_proof_command(command, cwd, confinement, timeout=timeout)
+    junit = None
+    if pytest_run:
+        try:
+            junit = report.read_text(errors="replace")
+        except OSError:
+            junit = None
+    return judge(run, claim, before=before, junit=junit, pytest_run=pytest_run)
 
 
 # --- the evidence ------------------------------------------------------------
@@ -609,17 +898,30 @@ async def prove(
                 ),
                 **common,
             )
-        test_paths = sorted({c.path for c in changes if is_test_file(c.path)} | {
+        scanned = sorted({
+            c.path for c in changes
+            if is_test_file(c.path) or is_runner_config(c.path)
+        } | {
             c.old for c in changes
             if c.old and c.status == "R" and is_test_file(c.old)
         })
         diff = ""
-        if test_paths:
+        if scanned:
             _, diff = await _git(
                 head_copy, "diff", "-U0", "-M", "--no-color", "--no-ext-diff",
-                merge_base, head_sha, "--", *test_paths,
+                merge_base, head_sha, "--", *scanned,
             )
-        scan = scan_weakening(changes, diff)
+        sources: dict[str, tuple[str, str]] = {}
+        for c in changes:
+            if c.status == "M" and is_test_file(c.path) and (
+                test_language(c.path) == "python"
+            ):
+                _, base_src = await _git(
+                    head_copy, "show", f"{merge_base}:{c.path}",
+                )
+                _, head_src = await _git(head_copy, "show", f"{head_sha}:{c.path}")
+                sources[c.path] = (base_src, head_src)
+        scan = scan_weakening(changes, diff, sources=sources)
         common["scan"] = scan
         allowed = plan_allows_test_removal(plan_criteria) if scan.hits else None
         common["weakening_allowed"] = allowed
@@ -668,17 +970,18 @@ async def prove(
                 **common,
             )
 
-        after = await run_proof_command(
-            claim.command, head_copy, confinement, timeout=timeout,
+        after = await run_claim(
+            claim, head_copy, confinement, before=False, timeout=timeout,
         )
         common["after"] = after
-        if after.status in ("timed out", "could not run"):
+        if after.status in ("timed out", "could not run", "not shown"):
             return ProofReport(
                 outcome=NOT_PROVEN,
                 reason=f"on the branch, the proof command {after.describe()}",
                 **common,
             )
         if after.status != "passed":
+            # The named tests ran on the branch and did not pass.
             return ProofReport(
                 outcome=FAILED,
                 reason=f"the proof does not pass on the branch: {after.describe()}",
@@ -695,11 +998,11 @@ async def prove(
             await _git(base_copy, "checkout", head_sha, "--", *take)
         for path in remove:
             await _git(base_copy, "rm", "-q", "--ignore-unmatch", "--", path)
-        before = await run_proof_command(
-            claim.command, base_copy, confinement, timeout=timeout,
+        before = await run_claim(
+            claim, base_copy, confinement, before=True, timeout=timeout,
         )
         common["before"] = before
-        if before.status in ("timed out", "could not run"):
+        if before.status in ("timed out", "could not run", "not shown"):
             return ProofReport(
                 outcome=NOT_PROVEN,
                 reason=f"on the base, the proof command {before.describe()}",
@@ -785,6 +1088,8 @@ def proof_comment(report: ProofReport) -> str:
         lines.append(f"- **Test weakening scan:** {report.scan.describe()}")
         for hit in report.scan.hits:
             lines.append(f"  - {hit}")
+        for warning in report.scan.warnings:
+            lines.append(f"  - warning: {warning}")
         if report.weakening_allowed:
             lines.append(
                 "  - allowed by the plan: "

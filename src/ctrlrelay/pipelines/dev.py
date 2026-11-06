@@ -1339,8 +1339,17 @@ applied (must fail). Each run has no network, no GitHub credentials and a
 time limit, and starts without the untracked files of this worktree, so
 the command must set up what it needs offline, for example
 `["uv", "run", "--offline", "pytest", "tests/test_x.py::test_y"]`. Each
-entry in `tests` starts with the path of the test file. A PR without a
-proof that fails before and passes after stays a draft. Do not delete,
+entry in `tests` starts with the path of the test file. A result counts
+only with evidence that the named tests ran. For pytest the relay adds
+`--junitxml` and reads it: on the branch each named test must pass, on
+the base each must fail or error; pytest exiting 2 to 5 (a collection
+error, a usage error, no tests collected) or a named test missing from
+the report counts as not proven. So import new code inside the test
+function, not at the top of the test file, or the base run stops at
+collection. For any other runner, the command must exit 0 on the branch
+and 1 on the base, and the part of each `tests` entry after the last `::`
+must appear in its output. A PR without a proof that fails before and
+passes after stays a draft. Do not delete,
 skip or loosen tests to get there: the relay scans the diff for that, and
 holds the PR unless the plan says the removal is intended. A change that
 only touches docs needs no proof.
@@ -3355,6 +3364,61 @@ async def _post_proof(run: _DevRun, report: ProofReport) -> bool:
         return False
 
 
+def _hold_unproven(run: _DevRun, report: ProofReport) -> None:
+    """Fail the run with the PR left a draft, saying why in chat."""
+    assert run.result is not None
+    _fail_required_step(run, "proof", report.reason)
+    run.result = dataclasses.replace(
+        run.result,
+        summary=(
+            f"PR #{run.pr_number_for_review} held as a draft: {report.outcome}"
+        ),
+    )
+
+
+async def _proof_still_current(run: _DevRun) -> bool:
+    """Right before the PR is marked ready: is its head on GitHub still the
+    commit the proof ran on? A head that moved, or that cannot be read,
+    makes the run not proven: the PR stays a draft and the evidence comment
+    says why. True when there is no proof to hold to (proof off, or not
+    asked for by the caller)."""
+    report = run.proof_report
+    if not run.require_proof or report is None:
+        return True
+    head = await _pr_head_sha(run)
+    if head is not None and head == report.head_sha:
+        return True
+    moved = ProofReport(
+        outcome=NOT_PROVEN,
+        reason=(
+            "the branch moved after the proof ran: the proof is about "
+            f"`{report.head_sha}`, and the PR is now at "
+            + (f"`{head}`" if head else "a head GitHub did not report")
+        ),
+        claim=report.claim,
+        before=report.before,
+        after=report.after,
+        scan=report.scan,
+        weakening_allowed=report.weakening_allowed,
+        head_sha=report.head_sha,
+        base_sha=report.base_sha,
+        confinement=report.confinement,
+    )
+    run.proof_report = moved
+    log_event(
+        _logger,
+        "dev.proof.head_moved",
+        session_id=run.session_id,
+        repo=run.repo,
+        pr_number=run.pr_number_for_review,
+        proof_sha=report.head_sha,
+        current_sha=head,
+    )
+    await _post_proof(run, moved)
+    _hold_unproven(run, moved)
+    return False
+
+
 async def _step_proof(run: _DevRun) -> None:
     """Hold the PR as a draft unless the relay itself proved the change
     (#221). See :mod:`ctrlrelay.core.proof` for what counts."""
@@ -3418,11 +3482,7 @@ async def _step_proof(run: _DevRun) -> None:
     )
     posted = await _post_proof(run, report)
     if not report.passed:
-        _fail_required_step(run, "proof", report.reason)
-        run.result = dataclasses.replace(
-            run.result,
-            summary=f"PR #{pr} held as a draft: {report.outcome}",
-        )
+        _hold_unproven(run, report)
         return
     if not posted:
         _fail_required_step(
@@ -3432,6 +3492,8 @@ async def _step_proof(run: _DevRun) -> None:
         return
     if run.review_mode == "required":
         # The review step marks it ready once a review passed too.
+        return
+    if not await _proof_still_current(run):
         return
     try:
         await run.github.set_pr_draft(run.repo, pr, False)
@@ -3542,7 +3604,10 @@ async def _step_review(run: _DevRun) -> None:
         )
         return
     # The PR was opened as a draft (or put back to one when this run
-    # pushed to it). A review passed on its current head, so it is ready.
+    # pushed to it). A review passed on its current head, so it is ready,
+    # if that head is also the one the proof ran on (#221).
+    if not await _proof_still_current(run):
+        return
     try:
         await run.github.set_pr_draft(repo, pr_number_for_review, False)
     except Exception as e:

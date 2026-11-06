@@ -35,8 +35,11 @@ from ctrlrelay.core.proof import (
     ProofClaim,
     ProofReport,
     confinement_for,
+    early_returns,
     is_docs_file,
+    is_pytest_command,
     is_test_file,
+    judge,
     parse_proof_claim,
     plan_allows_test_removal,
     plan_says_no_test_possible,
@@ -104,7 +107,10 @@ def test_paths_are_classified() -> None:
 
 
 def _diff(path: str, removed: list[str], added: list[str]) -> str:
-    out = [f"diff --git a/{path} b/{path}", f"--- a/{path}", f"+++ b/{path}"]
+    out = [
+        f"diff --git a/{path} b/{path}", f"--- a/{path}", f"+++ b/{path}",
+        "@@ -1 +1 @@",
+    ]
     out += [f"-{line}" for line in removed] + [f"+{line}" for line in added]
     return "\n".join(out) + "\n"
 
@@ -144,15 +150,30 @@ def test_a_removed_assert_is_a_hit() -> None:
     )
 
 
-def test_a_changed_assert_counts_as_removed() -> None:
-    """The scan cannot tell a corrected expectation from a loosened one;
-    the plan says when the change is intended."""
+def test_an_assert_edited_in_its_hunk_is_a_warning_not_a_hit() -> None:
+    """The scan cannot tell a corrected expectation from a loosened one,
+    so an edit is shown on the PR and does not block."""
     path = "tests/test_a.py"
     scan = scan_weakening(
         [Change("M", path)],
         _diff(path, ["    assert add(1, 2) == 3"], ["    assert add(1, 2)"]),
     )
-    assert len(scan.hits) == 1 and "removed assert line" in scan.hits[0]
+    assert scan.hits == ()
+    assert scan.warnings == (
+        f"edited assert line in `{path}`: `assert add(1, 2) == 3`",
+    )
+    assert "warning" in scan.describe()
+
+
+def test_an_assert_added_in_another_hunk_does_not_excuse_a_removal() -> None:
+    path = "tests/test_a.py"
+    diff = _diff(path, ["    assert add(1, 2) == 3"], ["    add(1, 2)"])
+    diff += "@@ -9 +9,2 @@\n+def test_new():\n+    assert sub(2, 1) == 1\n"
+    scan = scan_weakening([Change("M", path)], diff)
+    assert scan.hits == (
+        f"removed assert line in `{path}`: `assert add(1, 2) == 3`",
+    )
+    assert scan.warnings == ()
 
 
 def test_a_removed_test_function_is_a_hit() -> None:
@@ -398,9 +419,10 @@ async def test_a_removed_assert_fails_the_run(tmp_path: Path, git_home: Path) ->
     repo = Repo(tmp_path)
     repo.write("calc.py", FIXED)
     repo.write("tests/test_calc.py", EXISTING_TEST.replace(
-        "    assert neg(2) == -2\n", "    neg(2)\n") + NEW_TEST)
+        "    assert neg(2) == -2\n", "    neg(2)\n"))
+    repo.write("tests/test_add.py", NEW_TEST)
     repo.commit("fix add, drop an assert")
-    report = await repo.prove(_pytest_claim())
+    report = await repo.prove(_pytest_claim("tests/test_add.py::test_add"))
     assert report.outcome == FAILED, report
     assert "weakens tests" in report.reason
     assert report.scan.hits
@@ -414,10 +436,12 @@ async def test_the_plan_can_allow_a_test_removal(
     repo = Repo(tmp_path)
     repo.write("calc.py", FIXED)
     repo.write("tests/test_calc.py", EXISTING_TEST.replace(
-        "    assert neg(2) == -2\n", "    neg(2)\n") + NEW_TEST)
+        "    assert neg(2) == -2\n", "    neg(2)\n"))
+    repo.write("tests/test_add.py", NEW_TEST)
     repo.commit("fix add, drop an assert")
     report = await repo.prove(
-        _pytest_claim(), plan="1. Test removal intended: neg is deprecated",
+        _pytest_claim("tests/test_add.py::test_add"),
+        plan="1. Test removal intended: neg is deprecated",
     )
     assert report.outcome == PROVEN, report
     assert report.weakening_allowed == "neg is deprecated"
@@ -669,7 +693,10 @@ async def test_a_run_without_proof_stays_a_draft_and_says_so(
 
 @pytest.mark.asyncio
 async def test_a_proven_run_is_marked_ready(tmp_path: Path, monkeypatch) -> None:
-    report = ProofReport(outcome=PROVEN, reason="fails on the base, passes on the branch")
+    report = ProofReport(
+        outcome=PROVEN, reason="fails on the base, passes on the branch",
+        head_sha="c0ffee",
+    )
     result, github, fake = await _gate_run(tmp_path, monkeypatch, report)
     assert result.success, result
     assert github.create_pr.await_args.kwargs.get("draft") is True
@@ -706,7 +733,9 @@ async def test_a_proven_run_whose_evidence_cannot_be_posted_stays_a_draft(
 async def test_the_evidence_comment_is_edited_in_place_on_a_rerun(
     tmp_path: Path, monkeypatch
 ) -> None:
-    fake = AsyncMock(return_value=ProofReport(outcome=PROVEN, reason="ok"))
+    fake = AsyncMock(
+        return_value=ProofReport(outcome=PROVEN, reason="ok", head_sha="c0ffee"),
+    )
     monkeypatch.setattr(dev, "prove", fake)
     worktree, github = _fakes(tmp_path)
     github.list_issue_comments = AsyncMock(return_value=[
@@ -811,3 +840,375 @@ async def test_a_sandbox_that_does_not_start_is_could_not_run(tmp_path: Path) ->
         ["true"], tmp_path, Confinement(mode="bwrap", bwrap=str(fake)),
     )
     assert run.status == "could not run", run
+
+
+# --- review round 1: evidence that the named test ran -------------------------
+
+JUNIT = """<?xml version="1.0"?><testsuites><testsuite>{cases}</testsuite></testsuites>"""
+CLAIM = ProofClaim(command=("pytest",), tests=("tests/test_a.py::test_x",))
+
+
+def _case(name: str, result: str = "passed", classname: str = "tests.test_a") -> str:
+    inner = {"passed": "", "failed": "<failure/>", "error": "<error/>",
+             "skipped": "<skipped/>"}[result]
+    return f'<testcase classname="{classname}" name="{name}">{inner}</testcase>'
+
+
+def _judge(code, junit, *, before, pytest_run=True, output="", claim=CLAIM):
+    run = CommandRun(
+        status="passed" if code == 0 else "failed", exit_code=code,
+        full_output=output,
+    )
+    return judge(run, claim, before=before, junit=junit, pytest_run=pytest_run)
+
+
+@pytest.mark.parametrize("code", [2, 3, 4, 5])
+def test_pytest_exit_2_to_5_is_no_evidence(code: int) -> None:
+    junit = JUNIT.format(cases=_case("test_x", "failed"))
+    assert _judge(code, junit, before=True).status == "not shown"
+    assert _judge(code, junit, before=False).status == "not shown"
+
+
+def test_pytest_without_a_junit_report_is_no_evidence() -> None:
+    assert _judge(1, None, before=True).status == "not shown"
+
+
+def test_a_named_test_missing_from_the_report_is_no_evidence() -> None:
+    junit = JUNIT.format(cases=_case("test_other", "failed"))
+    run = _judge(1, junit, before=True)
+    assert run.status == "not shown" and "test_x" in run.detail
+
+
+def test_a_skipped_named_test_is_no_evidence() -> None:
+    junit = JUNIT.format(cases=_case("test_x", "skipped"))
+    assert _judge(0, junit, before=False).status == "not shown"
+
+
+@pytest.mark.parametrize("result", ["failed", "error"])
+def test_on_base_a_named_test_that_failed_or_errored_counts(result: str) -> None:
+    junit = JUNIT.format(cases=_case("test_x", result))
+    assert _judge(1, junit, before=True).status == "failed"
+
+
+def test_parametrized_cases_and_classes_are_matched() -> None:
+    claim = ProofClaim(command=("pytest",), tests=(
+        "tests/test_a.py::test_x", "tests/test_a.py::TestK::test_y",
+    ))
+    junit = JUNIT.format(cases=_case("test_x[1]") + _case("test_x[2]")
+                         + _case("test_y", classname="tests.test_a.TestK"))
+    assert _judge(0, junit, before=False, claim=claim).status == "passed"
+    junit = JUNIT.format(cases=_case("test_x[1]") + _case("test_x[2]", "failed")
+                         + _case("test_y", classname="tests.test_a.TestK"))
+    assert _judge(1, junit, before=False, claim=claim).status == "failed"
+
+
+def test_other_runners_need_the_exit_code_and_the_test_in_the_output() -> None:
+    claim = ProofClaim(command=("npx", "jest"), tests=("web/a.test.ts::adds numbers",))
+    out = "FAIL web/a.test.ts\n  x adds numbers\n"
+    assert _judge(1, None, before=True, pytest_run=False, output=out,
+                  claim=claim).status == "failed"
+    # exit 2 is a runner that could not start, not a failing test
+    assert _judge(2, None, before=True, pytest_run=False, output=out,
+                  claim=claim).status == "not shown"
+    assert _judge(1, None, before=True, pytest_run=False, output="FAIL",
+                  claim=claim).status == "not shown"
+    ok = "PASS web/a.test.ts\n  v adds numbers\n"
+    assert _judge(0, None, before=False, pytest_run=False, output=ok,
+                  claim=claim).status == "passed"
+    assert _judge(1, None, before=False, pytest_run=False, output=ok,
+                  claim=claim).status == "not shown"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (["pytest", "x"], True),
+        (["uv", "run", "pytest", "x"], True),
+        (["uv", "run", "--offline", "python", "-m", "pytest"], True),
+        ([".venv/bin/pytest"], True),
+        (["npx", "jest"], False),
+        (["sh", "-c", "pytest x"], False),
+    ],
+)
+def test_pytest_commands_are_recognised(command, expected) -> None:
+    assert is_pytest_command(command) is expected
+
+
+@pytest.mark.asyncio
+async def test_a_command_that_does_not_run_the_named_test_is_not_proven(
+    tmp_path: Path, git_home: Path
+) -> None:
+    """The command passes on the branch, but runs another test."""
+    repo = Repo(tmp_path)
+    repo.write("calc.py", FIXED)
+    repo.write("tests/test_calc.py", EXISTING_TEST + NEW_TEST)
+    repo.commit("fix add")
+    claim = _pytest_claim("tests/test_calc.py::test_neg")
+    claim["tests"] = ["tests/test_calc.py::test_add"]
+    report = await repo.prove(claim)
+    assert report.outcome == NOT_PROVEN, report
+    assert report.after.status == "not shown"
+
+
+@pytest.mark.asyncio
+async def test_a_setup_failure_on_the_branch_is_not_proven_with_its_output(
+    tmp_path: Path, git_home: Path
+) -> None:
+    """A runner that cannot start (``uv run`` exits 2: "Failed to spawn")
+    or a usage error is not a test that ran and failed."""
+    repo = Repo(tmp_path)
+    repo.write("calc.py", FIXED)
+    repo.write("tests/test_calc.py", EXISTING_TEST + NEW_TEST)
+    repo.commit("fix add")
+    claim = {
+        "command": [sys.executable, "-c",
+                    "import sys; print('error: Failed to spawn: `pytest`');"
+                    " sys.exit(2)"],
+        "tests": ["tests/test_calc.py::test_add"],
+    }
+    report = await repo.prove(claim)
+    assert report.outcome == NOT_PROVEN, report
+    assert "Failed to spawn" in report.after.output
+    usage = await repo.prove(_pytest_claim("tests/test_calc.py::test_nope"))
+    assert usage.outcome == NOT_PROVEN, usage
+    assert "usage error" in usage.after.detail
+
+
+@pytest.mark.asyncio
+async def test_a_collection_error_on_the_base_is_not_proven(
+    tmp_path: Path, git_home: Path
+) -> None:
+    """A new test file that imports a name the base does not have stops at
+    collection there (pytest exits 2): the test itself never ran."""
+    repo = Repo(tmp_path)
+    repo.write("calc.py", FIXED + "\n\ndef mul(a, b):\n    return a * b\n")
+    repo.write(
+        "tests/test_mul.py",
+        "from calc import mul\n\n\ndef test_mul():\n    assert mul(2, 3) == 6\n",
+    )
+    repo.commit("add mul")
+    report = await repo.prove(_pytest_claim("tests/test_mul.py::test_mul"))
+    assert report.outcome == NOT_PROVEN, report
+    assert report.after.status == "passed"
+    assert report.before.status == "not shown"
+
+
+# --- review round 1: what the scan misses ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "pytestmark = pytest.mark.skip(reason='later')",
+        "pytestmark = [pytest.mark.skipif(True, reason='x')]",
+        "np = pytest.importorskip('numpy')",
+        "@mark.xfail",
+    ],
+)
+def test_module_level_skips_are_hits(line: str) -> None:
+    path = "tests/test_a.py"
+    scan = scan_weakening([Change("M", path)], _diff(path, [], [line]))
+    assert len(scan.hits) == 1, scan
+
+
+def test_deleting_a_test_file_in_any_language_is_a_hit() -> None:
+    scan = scan_weakening([Change("D", "pkg/thing_test.go")], "")
+    assert scan.hits == ("deleted test file `pkg/thing_test.go`",)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("tests/test_a.py", "tests/a_checks.py"),
+        ("tests/a.test.ts", "tests/a.ts"),
+    ],
+)
+def test_a_rename_the_runner_will_not_collect_is_a_hit(old: str, new: str) -> None:
+    scan = scan_weakening([Change("R", new, old)], "")
+    assert len(scan.hits) == 1 and "does not collect" in scan.hits[0], scan
+    ok = scan_weakening([Change("R", "tests/test_b.py", "tests/test_a.py")], "")
+    assert ok.hits == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "line"),
+    [
+        ("pyproject.toml", 'addopts = "--deselect tests/test_a.py::test_x"'),
+        ("pytest.ini", "addopts = -k 'not slow'"),
+        ("setup.cfg", "norecursedirs = tests/legacy"),
+        ("tox.ini", "testpaths = tests/unit"),
+        ("tests/conftest.py", "collect_ignore = ['test_a.py']"),
+        ("package.json", '    "testPathIgnorePatterns": ["/legacy/"],'),
+        ("jest.config.js", "  testMatch: ['**/unit/*.test.js'],"),
+    ],
+)
+def test_runner_config_that_can_deselect_is_a_hit(path: str, line: str) -> None:
+    scan = scan_weakening([Change("M", path)], _diff(path, [], [line]))
+    assert any("runner config" in h for h in scan.hits), scan
+
+
+def test_an_unrelated_config_edit_is_clean() -> None:
+    path = "pyproject.toml"
+    scan = scan_weakening(
+        [Change("M", path)], _diff(path, ['version = "1.0"'], ['version = "1.1"']),
+    )
+    assert scan.hits == ()
+
+
+def test_an_early_bare_return_in_an_existing_test_is_a_hit() -> None:
+    base = 'def test_x():\n    """Doc."""\n    assert f() == 1\n'
+    head = 'def test_x():\n    """Doc."""\n    return\n    assert f() == 1\n'
+    assert early_returns(base, head) == ["test_x"]
+    assert early_returns(base, base) == []
+    path = "tests/test_a.py"
+    scan = scan_weakening(
+        [Change("M", path)], _diff(path, [], ["    return"]),
+        sources={path: (base, head)},
+    )
+    assert any("early `return`" in h for h in scan.hits), scan
+
+
+@pytest.mark.asyncio
+async def test_an_early_return_through_the_real_diff_fails_the_run(
+    tmp_path: Path, git_home: Path
+) -> None:
+    repo = Repo(tmp_path)
+    repo.write("calc.py", FIXED)
+    repo.write(
+        "tests/test_calc.py",
+        EXISTING_TEST.replace("def test_neg():\n", "def test_neg():\n    return\n"),
+    )
+    repo.write("tests/test_add.py", NEW_TEST)
+    repo.commit("fix add, silence test_neg")
+    report = await repo.prove(_pytest_claim("tests/test_add.py::test_add"))
+    assert report.outcome == FAILED, report
+    assert any("early `return`" in h for h in report.scan.hits)
+
+
+@pytest.mark.asyncio
+async def test_runner_config_through_the_real_diff_fails_the_run(
+    tmp_path: Path, git_home: Path
+) -> None:
+    repo = Repo(tmp_path)
+    repo.write("calc.py", FIXED)
+    repo.write("tests/test_calc.py", EXISTING_TEST + NEW_TEST)
+    repo.write("pytest.ini", "[pytest]\naddopts = --deselect tests/test_calc.py::test_neg\n")
+    repo.commit("fix add, deselect test_neg")
+    report = await repo.prove(_pytest_claim())
+    assert report.outcome == FAILED, report
+
+
+def test_the_comment_shows_warnings() -> None:
+    report = ProofReport(
+        outcome=PROVEN, reason="ok",
+        scan=scan_weakening(
+            [Change("M", "tests/test_a.py")],
+            _diff("tests/test_a.py", ["    assert x == 3"], ["    assert x == 4"]),
+        ),
+    )
+    assert "warning: edited assert line" in proof_comment(report)
+
+
+# --- review round 1: the branch moved after the proof ------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_head_that_moved_after_the_proof_keeps_the_pr_a_draft(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Review off: the proof step itself is about to mark the PR ready."""
+    report = ProofReport(outcome=PROVEN, reason="ok", head_sha="c0ffee")
+    monkeypatch.setattr(dev, "prove", AsyncMock(return_value=report))
+    worktree, github = _fakes(tmp_path)
+    github.list_issue_comments = AsyncMock(return_value=[])
+    github.get_pr_head = AsyncMock(return_value={"sha": "beef00", "draft": True})
+    result = await dev.run_dev_issue(
+        claims=None, repo="owner/repo", issue_number=123,
+        branch_template="fix/issue-{n}", dispatcher=_proof_dispatcher(),
+        github=github, worktree=worktree, dashboard=None,
+        state_db=StateDB(tmp_path / "s.db"), transport=None,
+        contexts_dir=tmp_path / "contexts", pr_verifier=_verifier(GREEN),
+        require_proof=True,
+    )
+    assert not result.success
+    assert result.summary == f"PR #{PR} held as a draft: {NOT_PROVEN}"
+    assert "the branch moved after the proof ran" in result.error
+    assert _ready_calls(github) == []
+    assert any("branch moved" in b for b in _proof_comments(github))
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_head_keeps_the_pr_a_draft(
+    tmp_path: Path, monkeypatch
+) -> None:
+    report = ProofReport(outcome=PROVEN, reason="ok", head_sha="c0ffee")
+    monkeypatch.setattr(dev, "prove", AsyncMock(return_value=report))
+    worktree, github = _fakes(tmp_path)
+    github.list_issue_comments = AsyncMock(return_value=[])
+    github.get_pr_head = AsyncMock(side_effect=RuntimeError("gh down"))
+    result = await dev.run_dev_issue(
+        claims=None, repo="owner/repo", issue_number=123,
+        branch_template="fix/issue-{n}", dispatcher=_proof_dispatcher(),
+        github=github, worktree=worktree, dashboard=None,
+        state_db=StateDB(tmp_path / "s.db"), transport=None,
+        contexts_dir=tmp_path / "contexts", pr_verifier=_verifier(GREEN),
+        require_proof=True,
+    )
+    assert not result.success
+    assert _ready_calls(github) == []
+
+
+@pytest.mark.asyncio
+async def test_with_review_required_a_head_moved_after_the_proof_is_not_marked_ready(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Review on: the review passed on the PR's current head, but the
+    proof ran on an earlier one."""
+    from ctrlrelay.core.config import RepoConfig
+    from tests.test_dev_step_switches import REVIEWED, _reviewer
+
+    _reviewer(monkeypatch, REVIEWED)
+    report = ProofReport(outcome=PROVEN, reason="ok", head_sha="0ldhead")
+    monkeypatch.setattr(dev, "prove", AsyncMock(return_value=report))
+    worktree, github = _fakes(tmp_path)
+    github.list_issue_comments = AsyncMock(return_value=[])
+    repo_cfg = RepoConfig(name="owner/repo", steps={"review": "required"})
+    result = await dev.run_dev_issue(
+        claims=None, repo="owner/repo", issue_number=123,
+        branch_template="fix/issue-{n}", dispatcher=_proof_dispatcher(),
+        github=github, worktree=worktree, dashboard=None,
+        state_db=StateDB(tmp_path / "s.db"), transport=None,
+        contexts_dir=tmp_path / "contexts", pr_verifier=_verifier(GREEN),
+        steps=repo_cfg.steps, code_review=repo_cfg.code_review,
+        require_proof=True,
+    )
+    assert result.review.posted  # the review itself passed
+    assert not result.success
+    assert "the branch moved after the proof ran" in result.error
+    assert _ready_calls(github) == []
+
+
+@pytest.mark.asyncio
+async def test_with_review_required_a_proof_on_the_current_head_is_marked_ready(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from ctrlrelay.core.config import RepoConfig
+    from tests.test_dev_step_switches import REVIEWED, _reviewer
+
+    _reviewer(monkeypatch, REVIEWED)
+    report = ProofReport(outcome=PROVEN, reason="ok", head_sha="c0ffee")
+    monkeypatch.setattr(dev, "prove", AsyncMock(return_value=report))
+    worktree, github = _fakes(tmp_path)
+    github.list_issue_comments = AsyncMock(return_value=[])
+    repo_cfg = RepoConfig(name="owner/repo", steps={"review": "required"})
+    result = await dev.run_dev_issue(
+        claims=None, repo="owner/repo", issue_number=123,
+        branch_template="fix/issue-{n}", dispatcher=_proof_dispatcher(),
+        github=github, worktree=worktree, dashboard=None,
+        state_db=StateDB(tmp_path / "s.db"), transport=None,
+        contexts_dir=tmp_path / "contexts", pr_verifier=_verifier(GREEN),
+        steps=repo_cfg.steps, code_review=repo_cfg.code_review,
+        require_proof=True,
+    )
+    assert result.success, result
+    assert len(_ready_calls(github)) == 1
