@@ -572,9 +572,9 @@ class AutomationConfig(BaseModel):
     ci_wait_timeout_seconds: int = 600
     # A dev run's PR goes ready only with proof the change works (#221):
     # a test the agent names that fails on the base and passes on the
-    # branch, run by the relay, and no weakened tests. Off for a repo
-    # with no runnable tests; the PR then says proof was not required.
-    require_proof: bool = True
+    # branch, run by the relay, and no weakened tests. Off by default:
+    # a repo turns it on once its tests can run offline in a fresh copy.
+    require_proof: bool = False
 
 
 _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
