@@ -566,7 +566,8 @@ def _render_fleet(peers: list[dict]) -> list[dict]:
         m = re.search(r"\bfunction\s+" + name + r"\s*\(([^)]*)\)", script)
         assert m, name
         defs.append(f"function {name}({m.group(1)}) {{{_js_function(script, name)}}}")
-    consts = "\n".join(re.findall(r"^var (?:PEER_URL|BAD_STATES|NO_FIVE_HOUR) = .*;$", script, re.M))
+    names = r"(?:PEER_URL|BAD_STATES|NO_FIVE_HOUR)"
+    consts = "\n".join(re.findall(r"^var " + names + r" = .*;$", script, re.M))
     assert consts.count("var ") == 3
     data = {"version": "0.23.0", "host": "node-a",
             "node": {"name": "node-a", "state": "idle", "version": "0.23.0"},
@@ -617,7 +618,8 @@ def test_render_fleet_shows_an_unknown_comparison_as_unknown() -> None:
 
 
 def _usage_line(usage: object) -> str:
-    _, peer = _render_fleet([_peer({"status": "same", "lines": []}, usage)])
+    same = {"status": "same", "lines": []}
+    _, peer = _render_fleet([_peer(same, usage)])
     [line] = [t for t in peer["texts"] if t.startswith("5-hour ")]
     return line
 
