@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Each machine's agent sandbox mode is shown (#305). `/api/status` carries
+  `node.sandbox` (`"none"` or `"bwrap"`; `null` for a peer on an older
+  version), each machine's card on the status page says `sandbox off` in the
+  warning colour when the agent runs unconfined, and the poller logs
+  `poller.sandbox_off` once at start with what to do about it.
+
 ## [0.23.0] - 2026-11-05
 
 ### Added

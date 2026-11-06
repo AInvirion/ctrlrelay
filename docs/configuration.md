@@ -290,6 +290,14 @@ your user. With `sandbox: "none"` a deliberately hostile agent can read
 and use them by hand, and it can write anywhere your user can, including your
 dotfiles and ctrlrelay's install. On macOS the login keychain is reachable
 whatever the environment says. `sandbox: "bwrap"` closes this on Linux.
+macOS has no sandbox yet, so a macOS node should only take issues from
+repositories you trust.
+
+So that an unconfined node is never a surprise (#305), each machine's mode is
+in `/api/status` as `node.sandbox` (`"none"` or `"bwrap"`; `null` for a peer on
+an older version), its card on the status page says `sandbox off` in the
+warning colour when it is `"none"`, and the poller logs `poller.sandbox_off`
+once at start.
 
 **`sandbox: "bwrap"` (#236).** The dev and task agents run under bubblewrap
 in a read-only copy of the machine (the secops agent, which needs your GitHub

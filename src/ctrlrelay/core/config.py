@@ -7,7 +7,7 @@ import re
 import socket
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -112,6 +112,12 @@ class OpenCodeConfig(BaseModel):
     default_timeout_seconds: int | None = Field(default=None, ge=1)
 
 
+# The agent sandbox modes (#236). The status page reads the tuple to tell a
+# mode a peer sends from anything else (#305).
+SandboxMode = Literal["none", "bwrap"]
+SANDBOX_MODES: tuple[str, ...] = get_args(SandboxMode)
+
+
 class AgentConfig(BaseModel):
     """Headless coding-agent configuration.
 
@@ -144,7 +150,7 @@ class AgentConfig(BaseModel):
     # default because it needs bwrap installed and unprivileged user
     # namespaces allowed. The credential stripping in core.agent_env
     # applies either way.
-    sandbox: Literal["none", "bwrap"] = "none"
+    sandbox: SandboxMode = "none"
     sandbox_hide_paths: list[str] = Field(
         default_factory=lambda: list(DEFAULT_SANDBOX_HIDE_PATHS)
     )

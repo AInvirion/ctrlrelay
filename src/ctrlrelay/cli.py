@@ -2670,6 +2670,21 @@ poller_app = typer.Typer(help="Issue poller commands.")
 app.add_typer(poller_app, name="poller")
 
 
+def sandbox_off_warning(config) -> str | None:
+    """The one line the poller logs at start when the agent runs
+    unconfined (#305), or ``None`` when ``agent.sandbox`` is set."""
+    if config.agent.sandbox != "none":
+        return None
+    return (
+        "agent.sandbox is none: the coding agent runs with this user's full "
+        "access (the home folder, ssh keys, GitHub and chat tokens), and its "
+        "instructions come from issue text. Set agent.sandbox: bwrap on "
+        "Linux. macOS has no sandbox yet, so give it only issues from "
+        "repos you trust. See "
+        "docs/configuration.md."
+    )
+
+
 def _get_poller_pid_file(config_path: str | None) -> Path:
     """Get PID file path for poller process."""
     try:
@@ -3570,6 +3585,11 @@ def poller_start(
 
         console.print(f"[green]Starting poller[/green] for {len(repo_names)} repo(s) as {username}")
         console.print(f"  Interval: {interval}s | Press Ctrl+C to stop")
+        sandbox_warning = sandbox_off_warning(config)
+        if sandbox_warning is not None:
+            log_event(_logger, "poller.sandbox_off", node=config.node_id,
+                      detail=sandbox_warning)
+            console.print(f"[yellow]Warning:[/yellow] {rich_escape(sandbox_warning)}")
 
         async def _run_scheduled_secops() -> None:
             """Scheduler callback: run the secops sweep across all repos.

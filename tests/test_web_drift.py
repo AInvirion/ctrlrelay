@@ -561,7 +561,8 @@ def _render_fleet(peers: list[dict]) -> list[dict]:
     script = _script()
     defs = []
     for name in ("el", "put", "safePeerUrl", "peerLink", "pct", "usagePct",
-                 "machineCard", "versionDiffers", "isBad", "driftLines", "renderFleet"):
+                 "machineCard", "sandboxLine", "versionDiffers", "isBad",
+                 "driftLines", "renderFleet"):
         m = re.search(r"\bfunction\s+" + name + r"\s*\(([^)]*)\)", script)
         assert m, name
         defs.append(f"function {name}({m.group(1)}) {{{_js_function(script, name)}}}")
