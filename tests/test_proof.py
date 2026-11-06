@@ -1284,3 +1284,60 @@ async def test_with_review_required_a_proof_on_the_current_head_is_marked_ready(
     )
     assert result.success, result
     assert len(_ready_calls(github)) == 1
+
+
+# --- #223: a run stopped over budget or stuck never reaches the proof -------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["budget", "stuck"])
+async def test_a_run_stopped_in_a_fix_round_gets_no_proof_and_is_parked(
+    tmp_path: Path, monkeypatch, kind: str
+) -> None:
+    """The fix round's agent is stopped (over budget, or going in circles)
+    after the PR exists: the proof never runs, the PR is never marked
+    ready, and #223 puts it back to draft."""
+    from ctrlrelay.core.budget import budget_reason
+    from ctrlrelay.core.checkpoint import CheckpointStatus
+    from ctrlrelay.core.dispatcher import SessionResult
+    from tests.test_dev_step_switches import RED, _session
+
+    monkeypatch.setattr(dev, "reconcile_claim_on_failure", AsyncMock())
+    fake = AsyncMock(return_value=ProofReport(outcome=PROVEN, reason="ok",
+                                              head_sha="c0ffee"))
+    monkeypatch.setattr(dev, "prove", fake)
+    reason = (
+        budget_reason(1_100, 1_000) if kind == "budget"
+        else "repeated the same tool call 5 times"
+    )
+    calls = iter(["done", "stop"])
+
+    async def spawn(**kwargs):
+        sid = kwargs["session_id"]
+        if next(calls) == "done":
+            return _session(sid, CheckpointStatus.DONE)
+        return SessionResult(
+            session_id=sid, exit_code=-9, stdout="", stderr="", state=None,
+            stuck_reason=reason,
+        )
+
+    dispatcher = _proof_dispatcher()
+    dispatcher.spawn_session.side_effect = spawn
+    worktree, github = _fakes(tmp_path)
+    github.list_issue_comments = AsyncMock(return_value=[])
+    github.get_failed_job_log = AsyncMock(return_value="")
+    result = await dev.run_dev_issue(
+        claims=None, repo="owner/repo", issue_number=123,
+        branch_template="fix/issue-{n}", dispatcher=dispatcher,
+        github=github, worktree=worktree, dashboard=None,
+        state_db=StateDB(tmp_path / "s.db"), transport=None,
+        contexts_dir=tmp_path / "contexts", pr_verifier=_verifier(RED, GREEN),
+        require_proof=True,
+    )
+    assert not result.success
+    assert result.stuck_reason
+    fake.assert_not_awaited()
+    assert _ready_calls(github) == []
+    assert _proof_comments(github) == []
+    assert result.parked_pr == PR
+    github.set_pr_draft.assert_any_await("owner/repo", PR, True)

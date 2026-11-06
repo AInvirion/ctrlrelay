@@ -16,9 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GitHub token, and under bwrap with no network when the agent was
   sandboxed. It also flags deleted, skipped or loosened tests and empty or
   whitespace-only diffs. A result counts only with evidence the named test
-ran (pytest's junit report, or the exit code and the test in the output for
-other runners), and the PR's head must still be the proven commit when it
-is marked ready. The outcome is `proven`, `failed` or `not proven`;
+  ran (pytest's junit report, or the exit code and the test in the output
+  for other runners), and the PR's head must still be the proven commit when
+  it is marked ready. The outcome is `proven`, `failed` or `not proven`;
   only `proven` (or a docs-only diff) lets the PR go ready. Otherwise the PR
   stays a draft and the run fails with `PR #N held as a draft`. The PR gets
   one comment, edited in place, with the test, the command and both results.
