@@ -88,8 +88,8 @@ async def _run(tmp_path: Path, worktree, github, state_db):
 
 
 def test_the_order_is_the_documented_one() -> None:
-    """Fixed order, decided on #226 (plan added first by #220): plan,
-    code, publish, verify, review.
+    """Fixed order, decided on #226 (plan added first by #220, proof
+    before review by #221): plan, code, publish, verify, proof, review.
 
     A later change may switch a step off per repository; reordering is
     not on the table, so a change to this tuple is a design change and
@@ -100,6 +100,7 @@ def test_the_order_is_the_documented_one() -> None:
         "code",
         "publish",
         "verify",
+        "proof",
         "review",
     ]
     assert [s.run for s in dev.DEV_WORK_STEPS] == [
@@ -107,6 +108,7 @@ def test_the_order_is_the_documented_one() -> None:
         dev._step_code,
         dev._step_publish,
         dev._step_verify,
+        dev._step_proof,
         dev._step_review,
     ]
 
@@ -138,7 +140,7 @@ async def test_the_frame_runs_every_step_in_list_order(
     worktree, github = _fakes(tmp_path)
     result = await _run(tmp_path, worktree, github, StateDB(tmp_path / "s.db"))
 
-    assert ran == ["plan", "code", "publish", "verify", "review"]
+    assert ran == ["plan", "code", "publish", "verify", "proof", "review"]
     assert result.success, result
     assert result.outputs["pr_number"] == 42
     # The frame attached a review outcome because the run had a PR.

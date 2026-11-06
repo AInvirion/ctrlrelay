@@ -48,6 +48,15 @@ from ctrlrelay.core.issue_questions import (
 )
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.pr_verifier import PRVerifier, VerificationResult
+from ctrlrelay.core.proof import (
+    NOT_PROVEN,
+    NOT_REQUIRED,
+    PROOF_COMMENT_MARKER,
+    ProofReport,
+    confinement_for,
+    proof_comment,
+    prove,
+)
 from ctrlrelay.core.state import StateDB
 from ctrlrelay.core.stuck import (
     DEFAULT_INFRA_RETRIES,
@@ -1074,6 +1083,11 @@ What could break, and anything the coding session must be careful with.
 ## Acceptance criteria
 A numbered list (`1.`, `2.`, ...). Each item must be checkable, either by
 running a command or by reading the diff. These are what "done" means.
+The relay will hold the pull request until a test fails before the change
+and passes after it, and will refuse a change that deletes, skips or
+loosens tests. If the work really must remove or skip a test, add an item
+`Test removal intended: <why>`. If no test can show the change, add an
+item `No test possible: <why>`; a person then decides on the pull request.
 
 If the issue is too vague to plan, do not guess: signal BLOCKED with
 **one** clear question.
@@ -1306,12 +1320,30 @@ state = {{
     "outputs": {{
         "pr_title": "<PR TITLE>",
         "pr_body": r'''<PR DESCRIPTION>''',
+        "proof": {{
+            "command": ["<ARGV>", "<OF THE TEST COMMAND>"],
+            "tests": ["<TEST FILE PATH>::<TEST NAME>"],
+        }},
     }},
 }}
 with open(sys.argv[1], "w") as f:
     json.dump(state, f)
 CTRLRELAY_DONE
 ```
+
+**Proof.** Name in `proof` the test that shows your change works. The
+relay does not take your word for it: it runs `command` itself, as an
+argument list with no shell, in a fresh checkout of the commit it pushed
+(must pass) and of the base commit with only your changes to test files
+applied (must fail). Each run has no network, no GitHub credentials and a
+time limit, and starts without the untracked files of this worktree, so
+the command must set up what it needs offline, for example
+`["uv", "run", "--offline", "pytest", "tests/test_x.py::test_y"]`. Each
+entry in `tests` starts with the path of the test file. A PR without a
+proof that fails before and passes after stays a draft. Do not delete,
+skip or loosen tests to get there: the relay scans the diff for that, and
+holds the PR unless the plan says the removal is intended. A change that
+only touches docs needs no proof.
 
 **DONE with no change** (only when the right outcome is to change nothing,
 for example the work is already on the default branch, or the operator told
@@ -1527,6 +1559,13 @@ _UNREVIEWED_PUSH_NOTE = (
     "review of its current head has passed."
 )
 
+_UNPROVEN_PUSH_NOTE = (
+    "**Not proven yet.** This repository requires proof that the change "
+    "works before the relay hands a PR over, and this PR could not be "
+    "marked as a draft, so GitHub shows it as ready. Do not merge it until "
+    "the relay's proof comment on this PR says proven."
+)
+
 
 # Outputs the relay owns after #219. Whatever the agent wrote under these
 # names is dropped: a pull request number the agent reports is not
@@ -1613,8 +1652,11 @@ class _Publisher:
     # Open the pull request as a draft, and put a reused one back to
     # draft, because its new commits have not been reviewed yet (#222).
     # Set when the repo's review is required; the review step marks the
-    # PR ready once a review passed on its current head.
+    # PR ready once a review passed on its current head. Also set when the
+    # repo requires proof (#221); then the proof step marks it ready.
     draft: bool = False
+    # What the PR says when it could not be made a draft.
+    draft_note: str = _UNREVIEWED_PUSH_NOTE
 
     def _check_reusable(self, pr: dict[str, Any]) -> None:
         """Refuse to adopt an open PR this run would not have opened.
@@ -1659,7 +1701,7 @@ class _Publisher:
         created = await self.github.create_pr(self.repo, **kwargs)
         try:
             await self.github.comment_on_pr(
-                self.repo, int(created["number"]), _UNREVIEWED_PUSH_NOTE,
+                self.repo, int(created["number"]), self.draft_note,
             )
         except asyncio.CancelledError:
             raise
@@ -1693,7 +1735,7 @@ class _Publisher:
             # on it, where a reader looks, not only in the log.
             try:
                 await self.github.comment_on_pr(
-                    self.repo, self.pr_number, _UNREVIEWED_PUSH_NOTE,
+                    self.repo, self.pr_number, self.draft_note,
                 )
             except asyncio.CancelledError:
                 raise
@@ -2636,6 +2678,15 @@ class _DevRun:
     keeper: ClaimKeeper | None = None
     answer_poll_seconds: float = 60.0
 
+    # Proof of done (#221). ``require_proof`` is the repo's
+    # ``automation.require_proof``; None means the caller did not say,
+    # and the step does not run (the behaviour before it existed).
+    # ``proof_claim`` is the ``proof`` output of the DONE that was
+    # published, kept because a fix round's DONE need not repeat it.
+    require_proof: bool | None = None
+    proof_claim: Any = None
+    proof_report: ProofReport | None = None
+
 
 def plan_path_for(contexts_dir: Path, repo: str, issue_number: int) -> Path:
     """``<paths.contexts>/<owner>-<repo>/plans/issue-<n>.md`` (#220)."""
@@ -3167,9 +3218,15 @@ async def _step_publish(run: _DevRun) -> None:
         issue_number=run.issue_number,
         issue_title=run.issue.get("title", ""),
         session_id=run.session_id,
-        draft=run.review_mode == "required",
+        draft=run.review_mode == "required" or bool(run.require_proof),
+        draft_note=(
+            _UNREVIEWED_PUSH_NOTE if run.review_mode == "required"
+            else _UNPROVEN_PUSH_NOTE
+        ),
     )
     if run.result.success:
+        if "proof" in run.result.outputs:
+            run.proof_claim = run.result.outputs["proof"]
         run.result = await run.publisher.publish(run.result)
 
 
@@ -3246,6 +3303,155 @@ async def _step_verify(run: _DevRun) -> None:
     )
 
 
+async def _github_base(run: _DevRun) -> tuple[str, str]:
+    """The default branch and its head commit, from GitHub (#263): never
+    from the bare clone, whose refs the agent can write. Raises when
+    either cannot be read."""
+    assert run.publisher is not None
+    base = run.publisher.default_branch or (
+        await run.github.get_default_branch(run.repo)
+    )
+    sha = (await run.github.get_ref_sha(run.repo, f"refs/heads/{base}")).strip()
+    if not _BASE_SHA.match(sha):
+        raise ValueError(f"GitHub gave {sha[:50]!r} as the head of {base!r}")
+    return base, sha
+
+
+async def _post_proof(run: _DevRun, report: ProofReport) -> bool:
+    """Put the evidence on the PR, editing the relay's earlier proof
+    comment in place when there is one. Returns whether it is there."""
+    assert run.pr_number_for_review is not None
+    body = proof_comment(report)
+    try:
+        earlier: list[int] = []
+        try:
+            comments = await run.github.list_issue_comments(
+                run.repo, run.pr_number_for_review,
+            )
+            earlier = [
+                int(c["id"]) for c in comments
+                if PROOF_COMMENT_MARKER in str(c.get("body") or "")
+            ]
+        except Exception:
+            earlier = []
+        if earlier:
+            try:
+                await run.github.edit_issue_comment(run.repo, earlier[-1], body)
+                return True
+            except Exception:
+                pass  # not ours to edit, or gone: post a new one
+        await run.github.comment_on_pr(run.repo, run.pr_number_for_review, body)
+        return True
+    except Exception as e:
+        log_event(
+            _logger,
+            "dev.proof.comment_failed",
+            session_id=run.session_id,
+            repo=run.repo,
+            pr_number=run.pr_number_for_review,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        return False
+
+
+async def _step_proof(run: _DevRun) -> None:
+    """Hold the PR as a draft unless the relay itself proved the change
+    (#221). See :mod:`ctrlrelay.core.proof` for what counts."""
+    assert run.result is not None
+    if run.require_proof is None:
+        return
+    if run.pr_number_for_review is None or not run.result.success:
+        # No PR (a declared no-change run, #336), or the run already
+        # failed: nothing to hand over, so nothing to prove.
+        return
+    pr = run.pr_number_for_review
+    if not run.require_proof:
+        report = ProofReport(
+            outcome=NOT_REQUIRED, reason="proof not required by config",
+        )
+        run.proof_report = report
+        await _post_proof(run, report)
+        return
+    assert run.publisher is not None
+    head = run.publisher.last_pushed_sha
+    claim = run.result.outputs.get("proof", run.proof_claim)
+    try:
+        if head is None:
+            report = ProofReport(
+                outcome=NOT_PROVEN,
+                reason="no record of the commit the relay pushed",
+            )
+        else:
+            base_branch, base_sha = await _github_base(run)
+            plan = run.plan_text or ""
+            report = await prove(
+                worktree=run.worktree,
+                repo=run.repo,
+                head_sha=head,
+                base_branch=base_branch,
+                base_sha=base_sha,
+                claim_raw=claim,
+                plan_criteria=plan_criteria(plan) if plan else None,
+                confinement=confinement_for(run.pipeline.dispatcher, run.repo),
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        report = ProofReport(
+            outcome=NOT_PROVEN,
+            reason=(
+                f"the relay could not check the proof ({type(e).__name__}: "
+                f"{str(e)[:160]})"
+            ),
+            head_sha=head,
+        )
+    run.proof_report = report
+    log_event(
+        _logger,
+        "dev.proof.outcome",
+        session_id=run.session_id,
+        repo=run.repo,
+        pr_number=pr,
+        outcome=report.outcome,
+        reason=report.reason[:200],
+    )
+    posted = await _post_proof(run, report)
+    if not report.passed:
+        _fail_required_step(run, "proof", report.reason)
+        run.result = dataclasses.replace(
+            run.result,
+            summary=f"PR #{pr} held as a draft: {report.outcome}",
+        )
+        return
+    if not posted:
+        _fail_required_step(
+            run, "proof",
+            f"{report.outcome}, but the evidence could not be posted on the PR",
+        )
+        return
+    if run.review_mode == "required":
+        # The review step marks it ready once a review passed too.
+        return
+    try:
+        await run.github.set_pr_draft(run.repo, pr, False)
+    except Exception as e:
+        log_event(
+            _logger,
+            "dev.proof.ready_failed",
+            session_id=run.session_id,
+            repo=run.repo,
+            pr_number=pr,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        _fail_required_step(
+            run, "proof",
+            f"{report.outcome}, but the PR could not be marked ready "
+            f"({type(e).__name__}: {str(e)[:160]})",
+        )
+
+
 async def _step_review(run: _DevRun) -> None:
     """Review the pushed commit and record what the review found."""
     assert run.result is not None
@@ -3284,17 +3490,7 @@ async def _step_review(run: _DevRun) -> None:
     # adopt a PR aimed anywhere else).
     review_base_sha: str | None = None
     try:
-        review_base = run.publisher.default_branch or (
-            await run.github.get_default_branch(repo)
-        )
-        review_base_sha = (await run.github.get_ref_sha(
-            repo, f"refs/heads/{review_base}",
-        )).strip()
-        if not _BASE_SHA.match(review_base_sha):
-            raise ValueError(
-                f"GitHub gave {review_base_sha[:50]!r} as the head of "
-                f"{review_base!r}"
-            )
+        review_base, review_base_sha = await _github_base(run)
     except Exception as e:
         review_base = None
         review_report = ReviewReport(
@@ -3627,6 +3823,7 @@ DEV_WORK_STEPS: tuple[DevWorkStep, ...] = (
     DevWorkStep("code", _step_code),
     DevWorkStep("publish", _step_publish),
     DevWorkStep("verify", _step_verify),
+    DevWorkStep("proof", _step_proof),
     DevWorkStep("review", _step_review),
 )
 
@@ -3698,6 +3895,7 @@ async def run_dev_issue(
     claims: ClaimSettings | None,
     steps: Any = None,
     question_on_issue: str | None = "auto",
+    require_proof: bool | None = None,
 ) -> PipelineResult:
     """Run dev pipeline for a single issue.
 
@@ -3707,6 +3905,10 @@ async def run_dev_issue(
 
     ``steps`` is the repo's ``DevStepsConfig`` (#226); ``None`` leaves
     every step as it was before the switches existed.
+
+    ``require_proof`` is the repo's ``automation.require_proof`` (#221).
+    ``None`` runs no proof step, as before it existed; the daemon and the
+    ``dev`` command always pass the config's value, which defaults on.
     """
     # Before the lock: a refused mode is a caller error, not a run.
     plan_mode, verify_mode, review_mode = _resolve_step_modes(
@@ -3937,6 +4139,7 @@ async def run_dev_issue(
             question_on_issue=question_on_issue,
             keeper=keeper,
             answer_poll_seconds=ANSWER_POLL_SECONDS,
+            require_proof=require_proof,
         )
         dispatched = True
         # The work: plan, code, publish, verify, review (DEV_WORK_STEPS). Everything
@@ -4356,6 +4559,7 @@ async def resume_dev_from_pending(
     code_review: Any = None,
     steps: Any = None,
     question_on_issue: str | None = "auto",
+    require_proof: bool | None = None,
 ) -> PipelineResult:
     """Resume a BLOCKED dev session using an answer that arrived via
     Telegram after ``run_dev_issue`` exited.
@@ -4537,6 +4741,7 @@ async def resume_dev_from_pending(
             plan_path=plan_path,
             question_on_issue=question_on_issue,
             answer_poll_seconds=ANSWER_POLL_SECONDS,
+            require_proof=require_proof,
         )
         if plan_was_pending:
             await _finish_plan(run, await pipeline.resume_plan(ctx, answer))
@@ -4560,6 +4765,7 @@ async def resume_dev_from_pending(
             run.result = result
         await _step_publish(run)
         await _step_verify(run)
+        await _step_proof(run)
         if review_mode == "required":
             await _step_review(run)
             if run.pr_number_for_review is not None:
