@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A dev run saves each step it finishes (plan, code, publish, verify) in a
+  new `run_steps` table, and a run whose process died is continued after
+  its last saved step instead of starting over (#231). The branch must
+  still be at the saved commit. The agent is not run again for a saved
+  code step, and a saved pull request is reused rather than opened twice.
+  Proof and review always run again. `ctrlrelay run dev --from-step
+  plan|code|publish` starts a new run from a past step, keeping the old
+  branch head under `refs/ctrlrelay/before-retry/`.
+
 ## [0.24.0] - 2026-11-05
 
 ### Added

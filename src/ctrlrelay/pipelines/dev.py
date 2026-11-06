@@ -1055,6 +1055,22 @@ class DevPipeline:
         self, ctx: PipelineContext, fix_instructions: str
     ) -> PipelineResult:
         """Resume the session with a fix request (failing CI or merge conflict)."""
+        if self.state_db.get_agent_session_id(ctx.session_id) is None:
+            # No session to resume: this run took over an earlier run's
+            # steps (#231), or the first spawn reported no session id. A
+            # fresh agent gets only this prompt, so it carries the issue
+            # and the checkpoint contract, or the agent could fix the code
+            # and still not be able to say it is done.
+            fix_instructions = (
+                f"You are working on issue #{ctx.issue_number} in "
+                f"{ctx.repo}: {ctx.extra.get('issue_title', '')}\n\n"
+                f"{ctx.extra.get('issue_body', '')}\n\n"
+                "The branch you are on already holds the work for this "
+                "issue, and its pull request is open. Do only what is "
+                "asked below.\n\n"
+                f"{fix_instructions}\n\n"
+                f"{self._checkpoint_contract(str(ctx.state_file), ctx.session_id)}"
+            )
         result = await self._spawn(ctx, fix_instructions, resume=True)
         return self._session_to_result(result)
 
@@ -4237,8 +4253,16 @@ def _check_resume_head(
     created_fresh: bool,
     session_id: str,
     issue_number: int,
+    state_db: StateDB | None = None,
+    branch: str | None = None,
 ) -> ResumePoint | None:
     """Trust the saved steps only if the branch is where they left it.
+
+    After publish, the run's verify step may have pushed fix commits
+    before it died; that head is not the saved one but is still the
+    run's own. It is accepted when it is the last commit the dead run
+    itself pushed (``relay_pushes``), and the restored push lease is
+    moved to it, so the next push is leased against what is on GitHub.
 
     A worktree cut fresh from the default branch is fine while no code
     step is being taken over: there is no code to lose, only the plan.
@@ -4254,6 +4278,20 @@ def _check_resume_head(
         head = None
     if head == point.head_sha or (created_fresh and "code" not in point.steps):
         return point
+    if (
+        head is not None
+        and point.pr_number is not None
+        and state_db is not None
+        and branch is not None
+        and state_db.last_relay_push(
+            repo=repo, branch=branch, session_id=point.source_session,
+        ) == head
+    ):
+        data = dict(point.data)
+        pub = dict(data.get("publisher") or {})
+        pub["last_pushed_sha"] = head
+        data["publisher"] = pub
+        return dataclasses.replace(point, data=data, head_sha=head)
     log_event(
         _logger, "dev.resume.head_moved",
         session_id=session_id, repo=repo, issue_number=issue_number,
@@ -4430,6 +4468,9 @@ async def run_dev_issue(
     # Where this run starts (#231): after the saved steps of a run whose
     # process died, from a step the operator named, or from the beginning.
     resume_point: ResumePoint | None = None
+    # The pull request the run being continued had opened, kept for the
+    # failure comment even after `resume_point` is dropped.
+    resume_pr: int | None = None
 
     try:
         try:
@@ -4453,15 +4494,8 @@ async def run_dev_issue(
                 session_id=session_id, repo=repo, issue_number=issue_number,
                 error_type=type(e).__name__, error=str(e)[:200],
             )
-        if (
-            resume_point is not None
-            and not resume_point.rewind
-            and not state_db.mark_resumed(
-                resume_point.source_session, session_id,
-            )
-        ):
-            # Another run took it over first.
-            resume_point = None
+        if resume_point is not None:
+            resume_pr = resume_point.pr_number
 
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
@@ -4539,7 +4573,8 @@ async def run_dev_issue(
             resume_point = _check_resume_head(
                 worktree, repo, worktree_path, resume_point,
                 created_fresh=created_fresh, session_id=session_id,
-                issue_number=issue_number,
+                issue_number=issue_number, state_db=state_db,
+                branch=branch_name,
             )
 
         # Symlink context
@@ -4629,6 +4664,17 @@ async def run_dev_issue(
             answer_poll_seconds=ANSWER_POLL_SECONDS,
             require_proof=require_proof,
         )
+        if (
+            resume_point is not None
+            and not resume_point.rewind
+            and not state_db.mark_resumed(
+                resume_point.source_session, session_id,
+            )
+        ):
+            # Another run took it over first. Marked here, not when the
+            # point was found: a run that fails before this line (a `gh`
+            # error, a lost claim) leaves the steps for its retry.
+            resume_point = None
         if resume_point is not None:
             _restore_steps(run, resume_point)
             log_event(
@@ -5012,10 +5058,13 @@ async def run_dev_issue(
             pr_number=(
                 run.publisher.pr_number
                 if run is not None and run.publisher is not None
-                else None
+                else resume_pr
             ),
             claim_posted=claim_may_stand,
             claim_id=claim_id,
+            # Before the run was built, a pull request an earlier run
+            # opened may exist that this run never looked up (#231).
+            pr_known=run is not None,
         )
 
         return PipelineResult(

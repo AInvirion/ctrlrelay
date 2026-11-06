@@ -152,28 +152,43 @@ async def _run_dev(tmp: Path, agent, github, verifier, **kw):
 # --- the child process that gets killed ---------------------------------------
 
 
-def _child(tmp_s: str) -> None:
+RED = VerificationResult(
+    ready=False, reason="1 failing check",
+    failing_checks=[{"name": "ci", "state": "FAILURE"}],
+)
+
+
+def _child(tmp_s: str, red_first: bool = False) -> None:
     """Runs a dev run that stops in the verify step's CI wait, after
-    writing `ready`, until it is killed."""
+    writing `ready`, until it is killed. With ``red_first`` CI fails once
+    first, so the agent pushes a fix commit before the wait it dies in."""
     tmp = Path(tmp_s)
 
     async def main() -> None:
         verifier = AsyncMock()
+        calls = {"n": 0}
 
         async def wait_for_ci(*a, **k):
+            calls["n"] += 1
+            if red_first and calls["n"] == 1:
+                return RED
             (tmp / "ready").write_text("1")
             await asyncio.sleep(3600)
 
         verifier.verify.side_effect = wait_for_ci
-        await _run_dev(tmp, _Agent(), _github(), verifier)
+        with __import__("unittest.mock").mock.patch.object(
+            dev, "_failed_check_logs", AsyncMock(return_value=("", [])),
+        ):
+            await _run_dev(tmp, _Agent(), _github(), verifier)
 
     asyncio.run(main())
 
 
-def _kill_mid_verify(tmp: Path) -> int:
+def _kill_mid_verify(tmp: Path, red_first: bool = False) -> int:
     proc = subprocess.Popen(
         [sys.executable, "-c",
-         f"import tests.test_run_resume as t; t._child({str(tmp)!r})"],
+         "import tests.test_run_resume as t; "
+         f"t._child({str(tmp)!r}, {red_first!r})"],
         cwd=ROOT, env=_ENV,
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
@@ -522,3 +537,120 @@ async def test_from_step_does_not_rewind_a_branch_behind_an_open_pr(
     )
     assert not result.success
     assert _git("rev-parse", f"refs/heads/{BRANCH}", cwd=bare) == before
+
+
+@pytest.mark.asyncio
+async def test_a_run_killed_after_a_ci_fix_continues_from_its_own_push(
+    tmp_path,
+) -> None:
+    """The fix commit moved the branch past the saved publish step. It is
+    the dead run's own last push, so the run is continued, and the next
+    push would be leased against it."""
+    from ctrlrelay.core.orphans import reap_orphaned_sessions
+
+    _make_origin(tmp_path)
+    _kill_mid_verify(tmp_path, red_first=True)
+    bare = tmp_path / "repos" / "owner-repo.git"
+    db = StateDB(tmp_path / "s.db")
+    [dead] = db.list_running_sessions()
+    fixed = _git("rev-parse", f"refs/heads/{BRANCH}", cwd=bare)
+    saved_head = db.run_steps_for(dead["id"])[-1]["head_sha"]
+    assert fixed != saved_head  # the fix really moved the branch
+    assert db.last_relay_push(
+        repo=REPO, branch=BRANCH, session_id=dead["id"],
+    ) == fixed
+
+    github = _github(open_pr=PR)
+    manager = _manager(tmp_path)
+    await reap_orphaned_sessions(
+        db, poller=MagicMock(), github=github, worktree=manager,
+    )
+    agent = _Agent()
+    seen: list = []
+    real_restore = dev._restore_steps
+
+    def spy(run, point):
+        real_restore(run, point)
+        seen.append(run.publisher.last_pushed_sha)
+
+    with __import__("unittest.mock").mock.patch.object(
+        dev, "_restore_steps", spy,
+    ):
+        result = await _run_dev(
+            tmp_path, agent, github,
+            AsyncMock(verify=AsyncMock(return_value=GREEN)),
+            worktree=manager, state_db=db,
+        )
+    assert result.success, result
+    assert agent.prompts == []
+    github.create_pr.assert_not_awaited()
+    assert seen == [fixed]
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_run_that_fails_before_dispatch_leaves_the_resume(
+    tmp_path,
+) -> None:
+    """A transient failure before the run starts must not use up the
+    resume: the retry still continues the dead run, and the failure
+    comment does not claim there is no pull request."""
+    _make_origin(tmp_path)
+    db = StateDB(tmp_path / "s.db")
+    _saved(db, "dev-a", steps=("plan", "code", "publish"))
+    db.execute(
+        "UPDATE run_steps SET data = ? WHERE step = 'publish'",
+        (json.dumps({"publisher": {"pr_number": PR}}),),
+    )
+    db.commit()
+    github = _github(open_pr=PR)
+    manager = _manager(tmp_path)
+
+    async def clone_fails(repo):
+        raise RuntimeError("git fetch: timeout")
+
+    manager.ensure_bare_repo = clone_fails  # after the claim, before the run
+    result = await _run_dev(
+        tmp_path, _Agent(), github, AsyncMock(), state_db=db, worktree=manager,
+    )
+    assert not result.success, result
+    assert result.outputs.get("failed_before_dispatch"), result
+    assert db.get_session_row("dev-a")["resumed_by"] is None
+    assert dev.find_resume_point(db, REPO, ISSUE) is not None
+    bodies = [c.kwargs["body"] for c in github.comment_on_issue.await_args_list]
+    assert bodies and all("no pull request was opened" not in b for b in bodies)
+    assert any(f"#{PR}" in b for b in bodies), bodies
+
+
+@pytest.mark.asyncio
+async def test_a_fix_with_no_session_to_resume_carries_the_contract(
+    tmp_path,
+) -> None:
+    from ctrlrelay.pipelines.base import PipelineContext
+
+    db = StateDB(tmp_path / "s.db")
+    db.execute(
+        "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+        "VALUES ('dev-b', 'dev', ?, 'running', 1)", (REPO,),
+    )
+    db.commit()
+    agent = _Agent()
+    pipeline = dev.DevPipeline(
+        dispatcher=agent.dispatcher, github=AsyncMock(), worktree=AsyncMock(),
+        dashboard=None, state_db=db, transport=None,
+    )
+    work = tmp_path / "w"
+    work.mkdir()
+    _git("init", "-q", cwd=work)
+    ctx = PipelineContext(
+        session_id="dev-b", repo=REPO, worktree_path=work,
+        context_path=tmp_path / "c", state_file=work / "state.json",
+        issue_number=ISSUE, extra={"issue_title": "Fix bug"},
+    )
+    await pipeline.request_fix(ctx, "CI failed: fix it")
+    assert "Fix bug" in agent.prompts[0]
+    assert "CI failed: fix it" in agent.prompts[0]
+    assert "dev-b" in agent.prompts[0] and "state.json" in agent.prompts[0]
+
+    db.set_agent_session_id("dev-b", "uuid-1")
+    await pipeline.request_fix(ctx, "CI failed again")
+    assert agent.prompts[1] == "CI failed again"
