@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A sandboxed run (`agent.sandbox: bwrap`) failed at once with "Argument
+  list too long" on a machine with thousands of past agent project folders
+  (#362). The sandbox mounted each `~/.claude/projects/*/memory` on its own,
+  which ran past both the kernel's argument limit and bwrap's 9000 arguments.
+  It now mounts `~/.claude/projects` read-only once, opens only the run's
+  own transcript folder for writing, and passes its options to bwrap
+  through a file descriptor. A config that lists the old glob in
+  `sandbox_readonly_paths` should drop it.
+
 ### Added
 
 - `agent.max_parallel` lets one machine run several agents at once (#210).

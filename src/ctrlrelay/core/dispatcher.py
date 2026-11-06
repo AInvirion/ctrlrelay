@@ -10,6 +10,7 @@ so pipelines can stay agent-agnostic.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from ctrlrelay.core.agent_env import (
     SandboxUnavailableError,
     agent_cache_env,
     build_agent_env,
+    bwrap_args_via_fd,
     bwrap_prefix,
     git_dirs,
     resolve_bwrap,
@@ -388,8 +390,15 @@ class CliAgentAdapter:
         repo: str | None,
         issue_number: int | None,
         budget_scope: BudgetScope | None = None,
+        sandbox_prefix_len: int = 0,
     ) -> SessionResult:
-        """Run the child built by :meth:`spawn_session` to completion."""
+        """Run the child built by :meth:`spawn_session` to completion.
+
+        The first ``sandbox_prefix_len`` items of ``cmd`` are the bwrap
+        prefix. Its options are moved into a file descriptor right before
+        the child starts, and closed right after (#362), so no error path
+        can leave the descriptor open.
+        """
 
         # The prompt can carry issue bodies and operator answers, so only its
         # hash and length are ever logged (#41).
@@ -424,13 +433,24 @@ class CliAgentAdapter:
             watches.append(("budget", budget.run))
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=working_dir,
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            # The sandbox's options go through a file descriptor, not the
+            # command line, so no number of mounts can pass ARG_MAX (#362).
+            short, args_fd = bwrap_args_via_fd(cmd[:sandbox_prefix_len])
+            pass_fds = () if args_fd is None else (args_fd,)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *short, *cmd[sandbox_prefix_len:],
+                    cwd=working_dir,
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    pass_fds=pass_fds,
+                )
+            finally:
+                # The child has its own copy now; bwrap reads it at start.
+                for fd in pass_fds:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
         except Exception as e:
             # Usually the binary isn't where we resolved it — the exception
             # propagates to the pipeline, but without this it lands there
@@ -886,12 +906,29 @@ class ClaudeDispatcher(CliAgentAdapter):
             copy.chmod(0o600)
             # At the real path: a bind on a link lands where it leads.
             copies.append((copy, Path(os.path.realpath(main_config))))
+        # Where the agent CLI writes this run's transcript: the only part
+        # of the read-only projects folder the run may write (#362). Made
+        # here, since the sandbox cannot create it under a read-only one.
+        transcript_dirs = self._transcript_dirs(working_dir, env)
+        projects = Path(os.path.realpath(Path.home() / ".claude" / "projects"))
+        for folder in transcript_dirs:
+            folder.mkdir(parents=True, exist_ok=True)
+            # Bound writable as it resolves: a link left there (a run before
+            # #362 could write the projects folder) would open its target,
+            # the home directory for one. Only a plain folder directly in
+            # `projects` is opened.
+            if folder.is_symlink() or Path(os.path.realpath(folder)).parent != projects:
+                raise SandboxUnavailableError(
+                    f"the transcript folder {folder} is a link or is not "
+                    f"directly in {projects}; remove it before running "
+                    "sandboxed"
+                )
         return bwrap_prefix(
             self._bwrap,
             self.sandbox_hide_paths,
             writable=[
                 working_dir, *repo_dirs, private_root, cache_dir,
-                *self.sandbox_writable_paths,
+                *self.sandbox_writable_paths, *transcript_dirs,
             ],
             readonly=[*self.sandbox_readonly_paths, *git_protected],
             copies=copies,
@@ -999,6 +1036,7 @@ class ClaudeDispatcher(CliAgentAdapter):
         self.started += 1
         try:
             return await self._run_session(
+                sandbox_prefix_len=len(prefix),
                 cmd=cmd,
                 env=env,
                 ident=ident,

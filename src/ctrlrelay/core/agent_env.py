@@ -244,9 +244,12 @@ DEFAULT_SANDBOX_READONLY_PATHS: tuple[str, ...] = (
     "~/.claude/chrome",
     # The agent CLI itself, when installed under its state directory.
     "~/.claude/local",
-    # Each project's memory, which the operator's sessions in that project
-    # load. One ``*`` part is expanded to the directories there now.
-    "~/.claude/projects/*/memory",
+    # Every project's folder, memory included, which the operator's
+    # sessions in that project load. One mount for all of them (#362): a
+    # mount per project folder ran past bwrap's argument limit on a home
+    # with thousands. The run's own transcript folder is opened again,
+    # deeper, by the dispatcher.
+    "~/.claude/projects",
 )
 
 # The agent's package caches: its own, never the operator's, so a run
@@ -283,6 +286,43 @@ def _existing(raw: str | Path) -> Path | None:
     # Every link on the way resolved, so the bind names the real place.
     p = Path(os.path.realpath(expanded))
     return p if p.exists() else None
+
+
+def bwrap_args_via_fd(prefix: list[str]) -> tuple[list[str], int | None]:
+    """Move a ``bwrap_prefix`` argv's options into a file descriptor (#362).
+
+    One mount is a few path arguments, and a home with thousands of agent
+    project folders makes thousands of them: past ``ARG_MAX`` the kernel
+    refuses to start bwrap at all (``E2BIG``, "Argument list too long").
+    bwrap reads NUL-separated options from ``--args FD``, which has no such
+    limit, so the command line stays ``bwrap --args FD --`` however many
+    mounts there are.
+
+    Returns the short argv and the descriptor, which the caller passes to
+    the child (``pass_fds``) and closes once it has started. An empty
+    prefix (no sandbox) comes back as it is, with ``None``.
+    """
+    if not prefix:
+        return prefix, None
+    if prefix[-1] != "--":
+        raise ValueError("not a bwrap_prefix argv: it must end with '--'")
+    data = b"".join(os.fsencode(a) + b"\0" for a in prefix[1:-1])
+    if hasattr(os, "memfd_create"):
+        fd = os.memfd_create("ctrlrelay-bwrap-args")
+    else:  # pragma: no cover - bwrap is Linux-only, and Linux has memfd
+        import tempfile
+
+        fd, path = tempfile.mkstemp(prefix="ctrlrelay-bwrap-args-")
+        os.unlink(path)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.lseek(fd, 0, os.SEEK_SET)
+    except BaseException:
+        os.close(fd)
+        raise
+    return [prefix[0], "--args", str(fd), "--"], fd
 
 
 def bwrap_prefix(
