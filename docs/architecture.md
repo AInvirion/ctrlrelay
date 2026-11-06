@@ -140,6 +140,14 @@ to confirm the PR is mergeable and CI is green. If not, it builds a fix prompt
 fix"), resumes the same agent session with that prompt, and re-verifies. Up
 to `DEFAULT_MAX_FIX_ATTEMPTS` (3) attempts.
 
+Then the proof step
+([`src/ctrlrelay/core/proof.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/proof.py),
+#221) runs the test the agent named, in fresh copies of the pushed commit
+(must pass) and of the base with only the branch's test changes (must fail),
+and scans the diff for weakened tests. Only a proven run's PR is marked
+ready; any other outcome leaves it a draft and fails the run. See
+[`automation.require_proof`](configuration.md#reposautomationrequire_proof).
+
 `PRWatcher` (in
 [`src/ctrlrelay/core/pr_watcher.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/pr_watcher.py))
 polls a PR for merge status; the post-merge handler in

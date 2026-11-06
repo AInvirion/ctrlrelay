@@ -2597,6 +2597,7 @@ def run_dev(
             max_fix_attempts=repo_config.max_fix_attempts,
             steps=repo_config.steps,
             question_on_issue=repo_config.question_on_issue,
+            require_proof=repo_config.automation.require_proof,
         )
 
     try:
@@ -3436,6 +3437,7 @@ def poller_start(
                         steps=repo_config.steps,
                         claims=claims,
                         question_on_issue=repo_config.question_on_issue,
+                        require_proof=repo_config.automation.require_proof,
                     )
 
                 # Lost the race check to another machine (#245): not a
@@ -4056,6 +4058,7 @@ def poller_start(
                                 code_review=repo_cfg.code_review,
                                 steps=repo_cfg.steps,
                                 question_on_issue=repo_cfg.question_on_issue,
+                                require_proof=repo_cfg.automation.require_proof,
                             )
                         elif pipeline_name == "task":
                             result = await resume_task_from_pending(

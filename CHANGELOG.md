@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A dev run's PR goes ready only with proof the change works (#221). The
+  agent names a proving test in its DONE checkpoint. The relay runs it on
+  the pushed commit (must pass) and on the base with only the branch's test
+  changes (must fail), in fresh copies, with a time limit, without the
+  GitHub token, and under bwrap with no network when the agent was
+  sandboxed. It also flags deleted, skipped or loosened tests and empty or
+  whitespace-only diffs. A result counts only with evidence the named test
+  ran (pytest's junit report, or the exit code and the test in the output
+  for other runners), and the PR's head must still be the proven commit when
+  it is marked ready. The outcome is `proven`, `failed` or `not proven`;
+  only `proven` (or a docs-only diff) lets the PR go ready. Otherwise the PR
+  stays a draft and the run fails with `PR #N held as a draft`. The PR gets
+  one comment, edited in place, with the test, the command and both results.
+  On by default; `repos[].automation.require_proof: false` turns it off for
+  a repo, and the PR then says proof was not required by config.
+
 - Each machine's agent sandbox mode is shown (#305). `/api/status` carries
   `node.sandbox` (`"none"` or `"bwrap"`; `null` for a peer on an older
   version), each machine's card on the status page says `sandbox off` in the

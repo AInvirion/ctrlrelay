@@ -762,9 +762,11 @@ and ask the operator), or `never` (skip).
 | `include_labels` | `[]` | Issue labels that opt an issue **into** the dev pipeline regardless of who is (or isn't) assigned. See [include_labels](#reposautomationinclude_labels) below. |
 | `require_labels` | `[]` | Issue labels that gate the plain-assignment trigger: when set, assignment alone is no longer enough — the issue must also carry one of these labels. See [require_labels](#reposautomationrequire_labels) below. |
 | `ci_wait_timeout_seconds` | `600` | Unused since #219 (the agent no longer waits on CI; ctrlrelay does). Still accepted so existing configs load. See [ci_wait_timeout_seconds](#reposautomationci_wait_timeout_seconds) below. |
+| `require_proof` | `true` | A dev run's PR goes ready only when the relay itself proved the change: a test that fails on the base and passes on the branch, and no weakened tests. See [require_proof](#reposautomationrequire_proof) below. |
 
-The current secops and dev pipelines read these settings to bias their prompts
-to the agent — they're not enforced by hard-coded checks.
+The current secops and dev pipelines read the policy settings to bias their
+prompts to the agent — they're not enforced by hard-coded checks.
+`require_proof` is the exception: the relay enforces it.
 
 ### repos[].automation.operator_prs
 
@@ -965,13 +967,119 @@ repos:
 - This does not change the overall session timeout (`agent.default_timeout_seconds`,
   default 1800s) — it only bounds the one `ci wait` call.
 
+### repos[].automation.require_proof
+
+On by default (#221). Green CI says a change did not break what was already
+tested; it does not say the issue was fixed. With `require_proof` the relay
+checks real evidence before it hands a dev run's PR over as ready.
+
+The agent names its proof in its DONE checkpoint:
+
+```json
+"proof": {"command": ["uv", "run", "--offline", "pytest", "tests/test_x.py::test_y"],
+          "tests": ["tests/test_x.py::test_y"]}
+```
+
+After CI is green, the relay runs `command` twice, as an argument list with
+no shell, each time in a fresh copy of committed content (never the agent's
+worktree):
+
+- on the commit it pushed, where it must pass;
+- on the base commit (the merge base with the default branch) with only the
+  branch's changes to test files applied, where it must fail.
+
+Each run has a 10-minute limit and never gets the operator's GitHub token.
+When the agent ran under `agent.sandbox: bwrap`, the proof runs under the
+same kind of bwrap confinement, with no network and only the copy and the
+agent's cache dir writable. When the agent ran with `sandbox: none`, it
+already ran arbitrary code as this user, so the proof runs unconfined too.
+The copies have no untracked files, so the command must set up what it needs
+offline.
+
+A run counts only with evidence that the named tests ran. For a pytest
+command (`pytest`, `uv run pytest`, `python -m pytest`) the relay adds
+`--junitxml` and reads the report: on the branch each named test must have
+passed, on the base each must have failed or errored. pytest exiting 2 to 5
+(a collection error, a usage error, no tests collected, or `uv run` failing
+to start it), no report, or a named test missing from it is no evidence.
+One exception, on the base only: a collection error in the file of a named
+test (a new test file that imports code only the branch has) counts as
+failing before, recorded as "could not import on base". A collection error
+only in other files does not. For any other runner the command must exit 0 on the
+branch and 1 on the base, and each named test (the part after the last
+`::`) must appear in its output.
+
+There are three outcomes:
+
+| Outcome | When |
+|---|---|
+| `proven` | The named tests failed on the base and passed on the branch. |
+| `failed` | The named tests ran on the branch and did not pass; they ran on the base and passed, so they prove nothing; the diff has no real change (empty or whitespace only); or the diff weakens tests. |
+| `not proven` | No proof was named, the proof is malformed or names a test outside the test files, there is no evidence the named tests ran (a setup, dependency or network failure, a usage error, a collection error), the command could not start, it timed out, or the branch moved after the proof ran. |
+
+Only `proven` lets the PR go ready. Two exemptions, recorded as `not
+required`: a diff that only touches docs (`*.md`, `*.rst`, `*.adoc`,
+`docs/**`), and a repo with `require_proof: false`.
+
+**The test weakening scan** reads the diff's test files (`tests/`, `test_*.py`,
+`*_test.py`, `conftest.py`, `*.test.ts`, `*.spec.js`, `__tests__/` and the
+like) and the test runner's config. These are blockers:
+
+- a deleted test file, in any language;
+- a test file renamed to a name the runner does not collect, or moved out
+  of the tests;
+- a removed test function;
+- an added skip, xfail or `.only` marker: decorators, a module-level
+  `pytestmark`, `pytest.importorskip`, unittest skips, and JS `.skip`,
+  `xit`, `it.only`;
+- an added line in runner config that can deselect or skip: `addopts`,
+  `--deselect`, `-k`, `testpaths`, `norecursedirs`, `collect_ignore` (in
+  `pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`, `conftest.py`),
+  and jest's `testPathIgnorePatterns`, `testMatch`, `testRegex`;
+- a bare `return` added as the first statement of an existing Python test;
+- an assert line removed from a diff hunk that adds no assert.
+
+An assert line removed from a hunk that also adds one is an edit. The scan
+cannot tell a corrected expectation from a loosened one, so it is shown as a
+warning on the PR and does not block. Lines are matched by text, so a test or
+an assert moved to another file is not a hit. Any blocker makes the run
+`failed`, unless the plan's acceptance criteria say the change is intended
+with an item `Test removal intended: <why>`. Python and JS/TS are read; a
+test file in another language makes the scan report `not checked`, never
+`clean`.
+
+If no test can show the change, the plan's acceptance criteria can say `No
+test possible: <why>`. The run is still `not proven` and the PR stays a
+draft for a person to decide; the PR comment says why.
+
+**What the PR shows.** One comment, edited in place on a later run: the
+outcome and why, the proving test, the command, the fail-before and
+pass-after results with a short redacted tail of each, and any scan hits.
+A run that is not proven fails like any required step after the PR exists
+(see [below](#reposteps)): the PR stays a draft, and chat gets `❌ Failed on
+#N: PR #M held as a draft: not proven …`. A PR GitHub would not open as a
+draft gets a comment telling readers not to merge it.
+
+With `require_proof` on, the PR is opened as a draft, as with
+`steps.review: required`. When both are on, the review step marks it ready
+after the proof passed and the review posted. Right before it is marked
+ready, the relay reads the PR's head from GitHub: if it is not the commit the
+proof ran on, or cannot be read, the run is `not proven` and the PR stays a
+draft.
+
+Set `require_proof: false` for a repo with no runnable tests. The PR is then
+opened as before and its comment says `proof not required by config`.
+
 ### repos[].steps
 
 The dev pipeline does its work in a fixed order: **plan** (an optional
 planning session, off unless asked for), **code** (the agent run and
 any questions it asks), **publish** (the relay pushes the branch and opens the
 pull request), **verify** (wait for CI and mergeability, asking the agent to
-fix what fails, up to `max_fix_attempts` rounds) and **review** (the
+fix what fails, up to `max_fix_attempts` rounds), **proof** (the relay runs
+the agent's proving test before and after; switched by
+[`automation.require_proof`](#reposautomationrequire_proof), not here) and
+**review** (the
 configured reviewer reads the pushed commit and posts its findings). The order
 is not configurable. `steps` says how strict each step is for this repo.
 Only the dev pipeline reads it. The task and secops pipelines have no
@@ -1019,7 +1127,10 @@ that can each be checked by a command or by reading the diff. The relay then:
   outside the worktree, so it is never committed;
 - posts the criteria list as one comment on the issue;
 - adds the plan to the code session's prompt under `## Plan`, telling the
-  agent the criteria are what "done" means.
+  agent the criteria are what "done" means;
+- reads two items from the criteria for the proof step: `Test removal
+  intended: <why>` and `No test possible: <why>` (see
+  [require_proof](#reposautomationrequire_proof)).
 
 If the issue is too vague to plan, the planning session asks one question,
 through the same chat loop the code session uses. No code session runs and no
@@ -1090,7 +1201,7 @@ exists.** The ordinary failure path, unchanged:
 - chat gets `❌ Failed on #N: …`, never `✅ PR ready`.
 
 A resumed session (an answer that arrived after the run stopped to ask) goes
-through the same publish and verify steps. It did not run the review before
+through the same publish, verify and proof steps. It did not run the review before
 these switches, and with `review` unset or `on` it still does not; with
 `review: required` it does.
 
