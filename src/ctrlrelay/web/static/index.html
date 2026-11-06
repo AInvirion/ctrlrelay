@@ -646,7 +646,8 @@ function machineCard(name, node, state, bad, now, extra, pageUrl) {
   if (node && typeof node === "object") {
     var s = node.slots;
     box.appendChild(el("div", "line", "slots " + (s && typeof s.busy === "number"
-      ? s.busy + "/" + s.total : "unknown")));
+      ? (typeof s.total === "number" ? s.busy + "/" + s.total : s.busy + " (no cap)")
+      : "unknown")));
     box.appendChild(el("div", "line", "5-hour " + usagePct(node, "five_hour") +
       ", 7-day " + usagePct(node, "seven_day")));
     box.appendChild(el("div", "line", "heartbeat " + ago(node.heartbeat_at, now)));

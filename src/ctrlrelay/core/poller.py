@@ -16,6 +16,7 @@ from ctrlrelay.core.config import DEFAULT_PRIORITY_LABELS
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.reopens import ReopenTracker
+from ctrlrelay.core.slots import AgentSlots
 
 _logger = get_logger("core.poller")
 
@@ -1578,6 +1579,7 @@ async def run_poll_loop(
     max_iterations: int | None = None,
     interval_scale: Callable[[], float] | None = None,
     on_poll: Callable[[], None] | None = None,
+    slots: AgentSlots | None = None,
 ) -> None:
     """Run the polling loop.
 
@@ -1592,12 +1594,23 @@ async def run_poll_loop(
         on_poll: Called after each poll that answered (#249: the status
             page's "last poll" time). A callback that raises is logged and
             never stops the loop.
+        slots: The node's shared cap on agent runs (#210). With a limit,
+            a poll's issues start side by side, up to the free slots, never
+            two of one repo at once; the loop polls again while they run.
+            Without one (``None`` or no limit), one at a time as before.
 
     Iteration resilience: any non-cancellation exception from the poll or a
     handler call is logged as ``poll.iteration.failed`` and the loop sleeps
     and continues. This keeps a single bad cycle (slow network, one flaky
     handler) from crashing the daemon and forcing a launchd restart.
     """
+    if slots is not None and slots.limit is not None:
+        await _run_parallel_poll_loop(
+            poller, handler, slots, interval=interval,
+            max_iterations=max_iterations, interval_scale=interval_scale,
+            on_poll=on_poll,
+        )
+        return
     iterations = 0
     while max_iterations is None or iterations < max_iterations:
         # Guard poll() separately from the handler dispatch: a malformed
@@ -1665,3 +1678,146 @@ async def run_poll_loop(
                 if not math.isfinite(scale) or scale < 1.0:
                     scale = 1.0
             await asyncio.sleep(interval * scale)
+
+
+async def _poll_once(
+    poller: IssuePoller, iteration: int, on_poll: Callable[[], None] | None,
+) -> list[dict[str, Any]]:
+    """One poll, guarded like the serial loop's: a failed poll is logged
+    and gives an empty batch."""
+    try:
+        new_issues = await poller.poll()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log_event(
+            _logger, "poll.iteration.failed", iteration=iteration,
+            phase="poll", reason=type(e).__name__, error=str(e)[:200],
+        )
+        return []
+    if on_poll is not None:
+        try:
+            on_poll()
+        except Exception as e:
+            log_event(
+                _logger, "poll.on_poll_failed",
+                reason=type(e).__name__, error=str(e)[:200],
+            )
+    return new_issues
+
+
+async def _dispatch_item(
+    poller: IssuePoller,
+    handler: Callable[[str, dict[str, Any]], Awaitable[None]],
+    item: dict[str, Any],
+) -> None:
+    """Recheck and hand one issue to the handler, as the serial loop does,
+    logging a failure instead of raising it."""
+    try:
+        fresh = await poller.recheck_before_dispatch(item["repo"], item["issue"])
+        if fresh is None:
+            return
+        await handler(item["repo"], fresh)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        issue = item.get("issue") or {}
+        log_event(
+            _logger, "poll.handler.failed", repo=item.get("repo"),
+            issue_number=issue.get("number"), reason=type(e).__name__,
+            error=str(e)[:200],
+        )
+
+
+async def _run_parallel_poll_loop(
+    poller: IssuePoller,
+    handler: Callable[[str, dict[str, Any]], Awaitable[None]],
+    slots: AgentSlots,
+    *,
+    interval: int,
+    max_iterations: int | None,
+    interval_scale: Callable[[], float] | None,
+    on_poll: Callable[[], None] | None,
+) -> None:
+    """The poll loop with ``agent.max_parallel`` set (#210).
+
+    Each issue of a batch, in the batch's priority order, waits for a free
+    slot and starts in its own task. An issue whose repo already has one of
+    this loop's runs going waits for it, and the next issue of another
+    repo goes first: the repo lock would refuse it anyway. Once the whole
+    batch has started, the loop sleeps and polls again while the runs go
+    on; an issue is marked seen when polled, so it is never started twice.
+
+    Cancelling the loop cancels the runs it started, as cancelling the
+    serial loop cancels the issue in hand. With ``max_iterations`` the loop
+    waits for its runs before returning.
+    """
+    running: dict[asyncio.Task[None], str] = {}
+
+    def started(task: asyncio.Task[None], repo: str) -> None:
+        running[task] = repo
+
+        def done(t: asyncio.Task[None]) -> None:
+            running.pop(t, None)
+            slots.release()
+
+        task.add_done_callback(done)
+
+    iterations = 0
+    try:
+        while max_iterations is None or iterations < max_iterations:
+            pending = list(await _poll_once(poller, iterations, on_poll))
+            if pending:
+                log_event(
+                    _logger, "poll.batch.parallel", issues=len(pending),
+                    limit=slots.limit, busy=slots.busy,
+                )
+            while pending:
+                busy_repos = set(running.values())
+                pick = next(
+                    (i for i, it in enumerate(pending)
+                     if it.get("repo") not in busy_repos),
+                    None,
+                )
+                if pick is None:
+                    # Every issue left is for a repo with a run going.
+                    await asyncio.wait(
+                        set(running), return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    continue
+                await slots.acquire()
+                # The wait for a slot may have let a run of the picked
+                # repo start or end; pick again with what is true now.
+                busy_repos = set(running.values())
+                if pending[pick].get("repo") in busy_repos:
+                    slots.release()
+                    continue
+                item = pending.pop(pick)
+                try:
+                    task = asyncio.create_task(
+                        _dispatch_item(poller, handler, item),
+                    )
+                except BaseException:
+                    slots.release()
+                    raise
+                started(task, item.get("repo"))
+
+            iterations += 1
+            if max_iterations is None or iterations < max_iterations:
+                scale = 1.0
+                if interval_scale is not None:
+                    try:
+                        scale = float(interval_scale())
+                    except Exception:
+                        scale = 1.0
+                    if not math.isfinite(scale) or scale < 1.0:
+                        scale = 1.0
+                await asyncio.sleep(interval * scale)
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+    finally:
+        tasks = [t for t in running if not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

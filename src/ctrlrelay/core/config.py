@@ -230,6 +230,11 @@ class AgentConfig(BaseModel):
     opencode: OpenCodeConfig = Field(default_factory=OpenCodeConfig)
     # #223. Off until a limit is set.
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    # #210: how many agent runs this node may have going at once, over
+    # every track (new issues, resumed answers, the security sweep).
+    # Unset: no shared limit, and the poll loop takes one issue at a time,
+    # as before the setting existed.
+    max_parallel: int | None = Field(default=None, ge=1)
 
 
 # Backwards-compat alias. Older code and docs reference ``ClaudeConfig``;

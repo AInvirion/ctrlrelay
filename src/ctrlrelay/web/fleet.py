@@ -39,8 +39,6 @@ _logger = get_logger("web.fleet")
 WORKING, IDLE, PAUSED_LIMIT, SILENT, UNKNOWN = (
     "working", "idle", "paused-limit", "silent", "unknown",
 )
-# The daemon handles one issue at a time.
-SLOTS_TOTAL = 1
 # A peer's /api/status is small; anything bigger is not one.
 MAX_PEER_BYTES = 2_000_000
 
@@ -68,8 +66,14 @@ def node_activity(
     paused: Any,
     now: float,
     silent_after: float,
+    slots_total: int | None = None,
 ) -> dict[str, Any]:
     """State, slots, claims and heartbeat for this machine's ``node`` block.
+
+    ``slots_total`` is ``agent.max_parallel`` (#210). ``None`` means no
+    limit is set, and ``total`` is ``None``: the page says "no cap" rather
+    than inventing a number. ``busy`` is every run going, never clamped,
+    so a node over its cap shows it.
 
     ``running`` and ``needs_you`` are the page's own sections; ``None``
     means that part of the state database could not be read. If either is
@@ -127,8 +131,8 @@ def node_activity(
     return {
         "state": state,
         "slots": None if not readable or running is None else {
-            "total": SLOTS_TOTAL,
-            "busy": min(len(running), SLOTS_TOTAL),
+            "total": slots_total if type(slots_total) is int else None,
+            "busy": len(running),
         },
         "claims": claims,
         "heartbeat_at": _iso(beat),
@@ -281,7 +285,8 @@ def _clean_node(raw: Any) -> dict[str, Any] | None:
         "heartbeat_at": _text(raw.get("heartbeat_at"), 40),
         "last_poll_at": _text(raw.get("last_poll_at"), 40),
         "slots": {"total": slots["total"], "busy": slots["busy"]}
-        if isinstance(slots, dict) and type(slots.get("total")) is int
+        if isinstance(slots, dict)
+        and (type(slots.get("total")) is int or slots.get("total") is None)
         and type(slots.get("busy")) is int else None,
         "usage": {
             "five_hour": _clean_window(usage.get("five_hour")),

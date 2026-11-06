@@ -496,6 +496,8 @@ class StatusServer(ThreadingHTTPServer):
             # #305: "none" means the agent runs with this user's full
             # access, so the page says so on this machine's card.
             "sandbox": self.config.agent.sandbox,
+            # #210: the node's cap on agent runs at once; None is no cap.
+            "max_parallel": self.config.agent.max_parallel,
             "chat": self._chat(),
             "usage": usage_json(reading),
             "pause_at": self.config.usage.pause_at,
