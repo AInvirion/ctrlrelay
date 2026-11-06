@@ -99,7 +99,8 @@ def test_an_empty_database_is_zero_runs_not_unknown(tmp_path: Path) -> None:
         assert w["overall"]["success_rate"] is None
         assert w["by_repo"] == [] and w["came_back_issues"] == []
         assert w["overall"]["cost_per_run"] is None
-        assert "#223" in w["unavailable"]["cost_per_run"]
+        # No run ended: unknown, not a median of 0.
+        assert w["unavailable"]["cost_per_run"] == "no run ended in this window"
         assert w["overall"]["stuck"] == 0
         assert "stuck" not in w["unavailable"]
         # No runs: no PR time is missing, there are none.
@@ -373,7 +374,8 @@ def _page_number_cells(counts: dict) -> list[str]:
     funcs = "\n".join(
         f"function {name}({args}) {{{_js_function(script, name)}}}"
         for name, args in (("duration", "seconds"), ("medianText", "m"),
-                           ("countText", "v"), ("numberCells", "c"))
+                           ("countText", "v"), ("groupDigits", "n"),
+                           ("costText", "c"), ("numberCells", "c"))
     )
     program = funcs + (
         "\nprocess.stdout.write(JSON.stringify(numberCells("
@@ -392,7 +394,7 @@ def test_page_shows_unknowns_as_unknown_never_zero(tmp_path: Path) -> None:
     # back, reopened, cost
     assert cells_30 == [
         "2", "2", "0", "0", "0", "0", "100%", "unknown", "unknown", "0", "0",
-        "not recorded",
+        "unknown",
     ]
     (tmp_path / "state.db").unlink()
     _db(tmp_path).close()
@@ -400,7 +402,7 @@ def test_page_shows_unknowns_as_unknown_never_zero(tmp_path: Path) -> None:
     assert _page_number_cells(empty_7)[6:9] == [
         "none finished", "none yet", "none yet",
     ]
-    assert _page_number_cells({}) == ["unknown"] * 11 + ["not recorded"]
+    assert _page_number_cells({}) == ["unknown"] * 12
 
 
 def test_page_shows_rates_and_medians(tmp_path: Path) -> None:
@@ -413,7 +415,7 @@ def test_page_shows_rates_and_medians(tmp_path: Path) -> None:
     # A reopen count that could not be read is unknown, not 0.
     assert _page_number_cells(counts) == [
         "4", "2", "1", "1", "0", "1", "50%", "5m (n=3)", "2h 0m (n=1)", "1",
-        "unknown", "not recorded",
+        "unknown", "unknown",
     ]
     assert _page_number_cells({**counts, "reopened": 2})[10] == "2"
 
@@ -459,3 +461,162 @@ def test_a_database_without_the_stuck_record_says_unknown(tmp_path: Path) -> Non
     w = _window(_numbers(tmp_path), 7)
     assert w["overall"]["stuck"] is None
     assert "#224" in w["unavailable"]["stuck"]
+
+
+# --- cost per run (#230, from the usage #223 records) ----------------------------
+
+
+def _usage(db: StateDB, sid: str, *, tokens: int, cost: float | None,
+           unreadable: int = 0) -> None:
+    """Record a run's usage with the writer the budget uses."""
+    from ctrlrelay.core.budget import BudgetLimits, RunUsage, record_usage
+
+    # Split across the parts the budget counts, plus cache reads it does not.
+    usage = RunUsage(
+        input_tokens=tokens // 2, cache_creation_tokens=tokens - tokens // 2 - 7,
+        output_tokens=7, cache_read_tokens=1_000_000, unreadable=unreadable,
+        cost_usd=cost,
+    )
+    record_usage(db, sid, usage, BudgetLimits(soft=None, hard=5_000_000))
+
+
+def test_cost_per_run_is_median_and_total_over_ended_measured_runs(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    _run(db, "a", started_at=NOW - DAY, status="done")
+    _usage(db, "a", tokens=1_000, cost=0.5)
+    _run(db, "b", started_at=NOW - DAY, status="failed")
+    _usage(db, "b", tokens=3_000, cost=None)  # no cost reported
+    _run(db, "c", started_at=NOW - DAY, status="done", repo=BETA)
+    _usage(db, "c", tokens=10_000, cost=2.25)
+    # Not ended: its count still grows when it goes on.
+    _run(db, "d", started_at=NOW - DAY, status="blocked")
+    _usage(db, "d", tokens=999_999, cost=99.0)
+    _run(db, "e", started_at=NOW - DAY, status="running")
+    _usage(db, "e", tokens=888_888, cost=88.0)
+    # Older than 7 days: in the 30-day window only.
+    _run(db, "f", started_at=NOW - 20 * DAY, status="done")
+    _usage(db, "f", tokens=50_000, cost=4.0)
+    db.close()
+
+    out = _numbers(tmp_path)
+    w7, w30 = _window(out, 7), _window(out, 30)
+    assert w7["overall"]["cost_per_run"] == {
+        # Cache reads (1,000,000 per run) are not counted, as in the budget.
+        "tokens": {"median": 3_000, "total": 14_000, "n": 3},
+        "cost_usd": {"median": 1.375, "total": 2.75, "n": 2},
+        "runs_without_usage": 0,
+    }
+    assert "cost_per_run" not in w7["unavailable"]
+    assert w30["overall"]["cost_per_run"]["tokens"] == {
+        "median": 6_500, "total": 64_000, "n": 4,
+    }
+    assert _repo(w7, BETA)["cost_per_run"]["tokens"] == {
+        "median": 10_000, "total": 10_000, "n": 1,
+    }
+    assert _repo(w7, ALPHA)["cost_per_run"]["cost_usd"] == {
+        "median": 0.5, "total": 0.5, "n": 1,
+    }
+
+
+def test_runs_without_usage_are_left_out_and_counted_not_zero(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _run(db, "old-1", started_at=NOW - DAY, status="done")  # before #223
+    _run(db, "old-2", started_at=NOW - DAY, status="failed")
+    _run(db, "floor", started_at=NOW - DAY, status="done")
+    _usage(db, "floor", tokens=100, cost=0.1, unreadable=2)  # a floor only
+    _run(db, "broken", started_at=NOW - DAY, status="done")
+    db.execute("UPDATE sessions SET usage_tokens = 5, usage_detail = '{' "
+               "WHERE id = 'broken'")
+    db.commit()
+    _run(db, "new", started_at=NOW - DAY, status="done")
+    _usage(db, "new", tokens=8_000, cost=None)
+    db.close()
+
+    cost = _window(_numbers(tmp_path), 7)["overall"]["cost_per_run"]
+    # Read as 0 the median would be 0 and the total 8,000 over 5 runs.
+    assert cost == {
+        "tokens": {"median": 8_000, "total": 8_000, "n": 1},
+        "cost_usd": None,
+        "runs_without_usage": 4,
+    }
+
+
+def test_a_window_with_no_measured_run_is_unknown_not_zero(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _run(db, "old-1", started_at=NOW - DAY, status="done")
+    _run(db, "old-2", started_at=NOW - DAY, status="failed")
+    _run(db, "going", started_at=NOW - DAY, status="running")
+    _usage(db, "going", tokens=4_000, cost=1.0)
+    _run(db, "measured", started_at=NOW - 20 * DAY, status="done")
+    _usage(db, "measured", tokens=2_000, cost=None)
+    db.close()
+
+    out = _numbers(tmp_path)
+    w7, w30 = _window(out, 7), _window(out, 30)
+    assert w7["overall"]["cost_per_run"] is None
+    reason = w7["unavailable"]["cost_per_run"]
+    assert "none of the 2 run(s) that ended" in reason
+    assert "not counted as 0" in reason
+    assert _repo(w7, ALPHA)["cost_per_run"] is None
+    # The 30-day window has one measured run; the two older ones are counted.
+    assert w30["overall"]["cost_per_run"]["tokens"]["n"] == 1
+    assert w30["overall"]["cost_per_run"]["runs_without_usage"] == 2
+    assert "cost_per_run" not in w30["unavailable"]
+
+
+def test_a_database_without_the_usage_columns_says_so(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _run(db, "a", started_at=NOW - DAY, status="done")
+    db.execute("ALTER TABLE sessions DROP COLUMN usage_detail")
+    db.commit()
+    db.close()
+
+    out = _numbers(tmp_path)
+    assert out["errors"] == []
+    w7 = _window(out, 7)
+    assert w7["overall"]["cost_per_run"] is None
+    assert w7["unavailable"]["cost_per_run"] == numbers_module.COST_DB_GAP
+    assert w7["overall"]["done"] == 1
+
+
+def test_status_json_carries_cost_per_run_in_the_documented_shape(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    _run(db, "a", started_at=NOW - DAY, status="done")
+    _usage(db, "a", tokens=1_234, cost=0.3)
+    db.close()
+
+    out = json.loads(json.dumps(_numbers(tmp_path)))
+    for w in out["numbers"]["windows"]:
+        for counts in (w["overall"], *w["by_repo"]):
+            assert set(counts) - {"repo"} == COUNT_KEYS
+            cost = counts["cost_per_run"]
+            assert set(cost) == {"tokens", "cost_usd", "runs_without_usage"}
+            assert set(cost["tokens"]) == {"median", "total", "n"}
+            assert set(cost["cost_usd"]) == {"median", "total", "n"}
+    doc = (Path(__file__).parent.parent / "docs" / "operations.md").read_text()
+    row = next(line for line in doc.splitlines() if line.startswith("| `cost_per_run`"))
+    for text in ("`{tokens, cost_usd, runs_without_usage}`", "`{median, total, n}`",
+                 "`runs_without_usage`"):
+        assert text in row, text
+
+
+def test_page_shows_tokens_and_cost_per_run() -> None:
+    measured = {
+        "tokens": {"median": 1_234_567, "total": 3_000_000, "n": 3},
+        "cost_usd": {"median": 1.375, "total": 4.5, "n": 2},
+        "runs_without_usage": 2,
+    }
+    cells = _page_number_cells({"started": 5, "cost_per_run": measured})
+    assert cells[11] == (
+        "median 1,234,567 tokens (n=3, total 3,000,000), "
+        "median $1.38 (n=2, total $4.50), 2 not measured"
+    )
+    no_cost = {**measured, "cost_usd": None, "runs_without_usage": 0}
+    assert _page_number_cells({"cost_per_run": no_cost})[11] == (
+        "median 1,234,567 tokens (n=3, total 3,000,000), cost unknown"
+    )
+    assert _page_number_cells({"cost_per_run": None})[11] == "unknown"

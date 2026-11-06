@@ -109,6 +109,29 @@ def _median(m: Any) -> str:
     return f"median {_duration(m['median'])} over {_count(m.get('n'))} runs"
 
 
+def _spend(cost: Any) -> str:
+    """The tokens-per-run line's text, from a window's ``cost_per_run``."""
+    if not isinstance(cost, dict) or not isinstance(cost.get("tokens"), dict):
+        return UNKNOWN
+    tokens = cost["tokens"]
+    text = (
+        f"median {tokens['median']:,} over {_count(tokens.get('n'))} runs "
+        f"(total {tokens['total']:,})"
+    )
+    usd = cost.get("cost_usd")
+    if isinstance(usd, dict):
+        text += (
+            f", cost median ${usd['median']:,.2f} over {_count(usd.get('n'))} "
+            f"runs (total ${usd['total']:,.2f})"
+        )
+    else:
+        text += ", cost unknown"
+    without = cost.get("runs_without_usage")
+    if without:
+        text += f"; {_count(without)} more ended without usage recorded"
+    return text
+
+
 def format_summary(node_id: str, window: dict[str, Any] | None, now: int) -> str:
     """The message text. ``window`` is :func:`read_week`'s answer."""
     until = datetime.fromtimestamp(now, UTC).strftime("%Y-%m-%d %H:%M UTC")
@@ -129,12 +152,12 @@ def format_summary(node_id: str, window: dict[str, Any] | None, now: int) -> str
         f"time to PR: {_median(c.get('time_to_pr_s'))}",
         f"time to merge: {_median(c.get('time_to_merge_s'))}",
         f"reopened: {_count(c.get('reopened'))}",
+        f"tokens per run: {_spend(c.get('cost_per_run'))}",
     ]
     if window is None:
         lines.append("(the runs could not be read)")
     else:
-        gaps = {k: v for k, v in (window.get("unavailable") or {}).items()
-                if k != "cost_per_run"}
+        gaps = window.get("unavailable") or {}
         for key, reason in sorted(gaps.items()):
             lines.append(f"{key.removesuffix('_s').replace('_', ' ')} unknown: {reason}")
     return "\n".join(lines)

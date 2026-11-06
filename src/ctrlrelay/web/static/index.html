@@ -1108,8 +1108,31 @@ function medianText(m) {
 
 function countText(v) { return typeof v === "number" ? String(v) : "unknown"; }
 
+function groupDigits(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+
+// #230: median tokens (and cost, when the agent reported one) over the
+// runs that ended with their usage recorded. Runs with none recorded are
+// named, never read as 0; null is "unknown".
+function costText(c) {
+  if (!c || typeof c !== "object" || !c.tokens || typeof c.tokens.median !== "number") {
+    return "unknown";
+  }
+  var text = "median " + groupDigits(c.tokens.median) + " tokens (n=" + c.tokens.n +
+    ", total " + groupDigits(c.tokens.total) + ")";
+  if (c.cost_usd && typeof c.cost_usd.median === "number") {
+    text += ", median $" + c.cost_usd.median.toFixed(2) + " (n=" + c.cost_usd.n +
+      ", total $" + c.cost_usd.total.toFixed(2) + ")";
+  } else {
+    text += ", cost unknown";
+  }
+  if (typeof c.runs_without_usage === "number" && c.runs_without_usage > 0) {
+    text += ", " + c.runs_without_usage + " not measured";
+  }
+  return text;
+}
+
 // One row's cells, from a window's overall or per-repo counts. A null is
-// "unknown" (or "not recorded" for cost), never 0 or blank.
+// "unknown", never 0 or blank.
 function numberCells(c) {
   return [
     countText(c.started), countText(c.done), countText(c.failed),
@@ -1118,7 +1141,7 @@ function numberCells(c) {
       (typeof c.started === "number" ? "none finished" : "unknown"),
     medianText(c.time_to_pr_s), medianText(c.time_to_merge_s),
     countText(c.came_back), countText(c.reopened),
-    typeof c.cost_per_run === "number" ? String(c.cost_per_run) : "not recorded"
+    costText(c.cost_per_run)
   ];
 }
 
@@ -1182,7 +1205,7 @@ function renderNumbers(data) {
     var u = w.unavailable || {};
     Object.keys(u).forEach(function (k) {
       var line = k.replace(/_s$/, "").replace(/_/g, " ") + " (" + w.days + " days): " + u[k];
-      if (k === "cost_per_run" || k === "stuck" || k === "reopened") {
+      if (k === "stuck" || k === "reopened") {
         line = k.replace(/_/g, " ") + ": " + u[k];
       }
       if (!seen[line]) { seen[line] = true; gaps.appendChild(el("li", null, line)); }

@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the blocker hold are unchanged; the order is per machine and fixed for
   the batch.
 
+- Cost per run in the numbers (#230). Each 7- and 30-day window's
+  `cost_per_run` (in `/api/status` and the status page's **Numbers** box)
+  now gives the median and total tokens per run that ended (`done` or
+  `failed`), counted as the run budget counts them (#223), and the median
+  and total `total_cost_usd` where the agent reported one. Runs with no
+  usage recorded (from before #223, or on a backend that is not measured)
+  are left out and counted in `runs_without_usage`, never read as 0; a
+  window with no measured run is `null` with the reason in `unavailable`.
+  The weekly chat summary gets a `tokens per run` line, `unknown` when not
+  measured.
+
 - A dev run's PR goes ready only with proof the change works (#221). The
   agent names a proving test in its DONE checkpoint. The relay runs it on
   the pushed commit (must pass) and on the base with only the branch's test
