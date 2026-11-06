@@ -539,7 +539,7 @@ def _many_project_memories(home: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_thousands_of_project_folders_still_start_the_sandbox(
-    home: Path,
+    home: Path, monkeypatch,
 ) -> None:
     """The node that failed had 3695 `projects/*/memory` folders, each a
     read-only mount: past ARG_MAX bwrap could not be started at all. The
@@ -572,6 +572,16 @@ async def test_thousands_of_project_folders_still_start_the_sandbox(
         return await real(**kw)
 
     d._run_session = spy  # type: ignore[method-assign]
+    import asyncio as _asyncio
+
+    started: list[tuple] = []
+    real_exec = _asyncio.create_subprocess_exec
+
+    async def exec_spy(*args, **kw):
+        started.append((args, kw.get("pass_fds")))
+        return await real_exec(*args, **kw)
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", exec_spy)
     await d.spawn_session(
         session_id="s-362", prompt="p", working_dir=wt,
         state_file=wt / ".ctrlrelay" / "state.json", github_access=False,
@@ -582,6 +592,11 @@ async def test_thousands_of_project_folders_still_start_the_sandbox(
     # The options are moved to the fd as the child starts; on the way in,
     # the prefix is marked for that.
     assert n > 0 and cmd[0].endswith("bwrap") and cmd[n - 1] == "--"
+    # What was exec'd: bwrap reads its options from the fd it was handed,
+    # and the command line is a handful of words.
+    [(argv, fds)] = started
+    assert argv[1] == "--args" and argv[3] == "--" and fds == (int(argv[2]),)
+    assert len(argv) < 20
 
 
 def test_control_a_mount_per_project_folder_cannot_start_bwrap(
@@ -657,6 +672,10 @@ def test_a_linked_transcript_folder_is_refused(home: Path) -> None:
     link = h / ".claude" / "projects" / _re.sub(r"[/._]", "-", str(wt))
     link.parent.mkdir(parents=True, exist_ok=True)
     link.symlink_to(h)
+    # No other link in the home, so nothing but the transcript check can
+    # refuse this (the fixture's linked CLAUDE.md would, by another rule).
+    (h / ".claude" / "CLAUDE.md").unlink()
+    (h / ".claude" / "CLAUDE.md").write_text("mine\n")
     if not BWRAP:
         pytest.skip("bwrap not installed")
     d = ClaudeDispatcher(
@@ -665,6 +684,6 @@ def test_a_linked_transcript_folder_is_refused(home: Path) -> None:
     )
     private = home / "private"
     private.mkdir()
-    with pytest.raises(SandboxUnavailableError, match="is a link"):
+    with pytest.raises(SandboxUnavailableError, match="is a link or is not directly"):
         d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", private)
     assert (h / ".bashrc").read_text() == "# mine\n"
