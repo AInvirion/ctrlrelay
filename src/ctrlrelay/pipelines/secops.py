@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ctrlrelay.core.archived import ArchivedRepoTracker
 from ctrlrelay.core.checkpoint import CheckpointStatus
@@ -25,6 +25,7 @@ from ctrlrelay.core.question_expiry import (
     find_question_hold,
     format_utc_timestamp,
 )
+from ctrlrelay.core.slots import AgentSlots
 from ctrlrelay.core.state import StateDB
 from ctrlrelay.core.worktree import WorktreeManager
 from ctrlrelay.dashboard.client import DashboardClient, EventPayload
@@ -686,8 +687,15 @@ async def run_secops_all(
     *,
     hold_repeats: bool = False,
     job_claims: JobClaimer | None,
+    slots: AgentSlots | None = None,
+    held: Callable[[], str | None] | None = None,
 ) -> list[PipelineResult]:
     """Run secops pipeline on all configured repos.
+
+    ``slots`` (#210) is the node's shared cap on agent runs: each repo's
+    sweep takes one before its lock and gives it back when done. ``held``
+    is asked once a repo has its slot, since the wait can be long: a
+    reason back skips that repo (a self-update is waiting for the node).
 
     ``job_claims`` (#246): with several machines on one account, each
     repo's sweep for this run window is claimed first, and a machine that
@@ -726,502 +734,525 @@ async def run_secops_all(
         transport=transport,
     )
 
-    for repo_config in repos:
-        repo = repo_config.name
-        session_id = f"secops-{repo.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
+    # One slot per repo, taken before the lock (#210, see core.slots)
+    # and given back when the next repo starts or the sweep ends.
+    holding = False
+    try:
+        for repo_config in repos:
+            if holding:
+                slots.release()
+                holding = False
+            repo = repo_config.name
+            session_id = f"secops-{repo.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
 
-        # Archived repos accept no security work: the Dependabot alerts
-        # API returns 403 for them, so a sweep burns a full agent session
-        # to reach a benign "nothing to do" summary. Skip before the lock
-        # and the worktree. The tracker logs `poll.repo.archived` once so
-        # the operator knows to drop the entry from orchestrator.yaml.
-        if archived is not None and await archived.is_archived(repo):
-            results.append(PipelineResult(
-                success=True,
-                session_id=session_id,
-                summary=f"Skipped {repo}: repository is archived on GitHub",
-            ))
-            continue
-
-        if not state_db.acquire_lock(repo, session_id):
-            results.append(PipelineResult(
-                success=False,
-                session_id=session_id,
-                summary=f"Could not acquire lock for {repo}",
-                error="Repository locked by another session",
-            ))
-            continue
-
-        # Claimed only once the local lock is held: a claim won and then
-        # lost to a busy lock would leave the window swept by nobody.
-        if job_claims is not None:
-            try:
-                claim = await job_claims.claim(repo, "secops")
-            except BaseException:  # cancelled mid-claim: do not keep the lock
-                state_db.release_lock(repo, session_id)
-                raise
-            if claim.error is not None:
-                # Could not tell whether another machine has it: running
-                # could sweep twice, so this window is skipped and the
-                # next one tries again.
-                results.append(PipelineResult(
-                    success=False,
-                    session_id=session_id,
-                    summary=f"Skipped {repo}: could not claim this sweep",
-                    error=f"sweep claim failed: {claim.error}",
-                ))
-                state_db.release_lock(repo, session_id)
-                continue
-            if not claim.won:
+            # Archived repos accept no security work: the Dependabot alerts
+            # API returns 403 for them, so a sweep burns a full agent session
+            # to reach a benign "nothing to do" summary. Skip before the lock
+            # and the worktree. The tracker logs `poll.repo.archived` once so
+            # the operator knows to drop the entry from orchestrator.yaml.
+            if archived is not None and await archived.is_archived(repo):
                 results.append(PipelineResult(
                     success=True,
                     session_id=session_id,
-                    summary=f"Skipped {repo}: swept by {claim.owner} this window",
+                    summary=f"Skipped {repo}: repository is archived on GitHub",
                 ))
-                state_db.release_lock(repo, session_id)
                 continue
 
-        worktree_path: Path | None = None
-        session_row_inserted = False
-        session_final_state_written = False
-        # Index of this repo's entry in `results` once recorded. The
-        # scheduled fan-out pairs results with repos by position, so a
-        # failure after this point must replace that entry, not add a
-        # second one and shift every later repo onto its neighbour.
-        result_index: int | None = None
-        try:
-            await worktree.ensure_bare_repo(repo)
-            worktree_path = await worktree.create_worktree(repo, session_id)
+            if slots is not None:
+                await slots.acquire()
+                holding = True
+                why = held() if held is not None else None
+                if why is not None:
+                    results.append(PipelineResult(
+                        success=True,
+                        session_id=session_id,
+                        summary=f"Skipped {repo}: new work is held ({why})",
+                    ))
+                    continue
 
-            context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
-            if context_path.exists():
-                worktree.symlink_context(worktree_path, context_path)
+            if not state_db.acquire_lock(repo, session_id):
+                results.append(PipelineResult(
+                    success=False,
+                    session_id=session_id,
+                    summary=f"Could not acquire lock for {repo}",
+                    error="Repository locked by another session",
+                ))
+                continue
 
-            state_file = worktree_path / ".ctrlrelay" / "state.json"
-            state_file.parent.mkdir(parents=True, exist_ok=True)
+            # Claimed only once the local lock is held: a claim won and then
+            # lost to a busy lock would leave the window swept by nobody.
+            if job_claims is not None:
+                try:
+                    claim = await job_claims.claim(repo, "secops")
+                except BaseException:  # cancelled mid-claim: do not keep the lock
+                    state_db.release_lock(repo, session_id)
+                    raise
+                if claim.error is not None:
+                    # Could not tell whether another machine has it: running
+                    # could sweep twice, so this window is skipped and the
+                    # next one tries again.
+                    results.append(PipelineResult(
+                        success=False,
+                        session_id=session_id,
+                        summary=f"Skipped {repo}: could not claim this sweep",
+                        error=f"sweep claim failed: {claim.error}",
+                    ))
+                    state_db.release_lock(repo, session_id)
+                    continue
+                if not claim.won:
+                    results.append(PipelineResult(
+                        success=True,
+                        session_id=session_id,
+                        summary=f"Skipped {repo}: swept by {claim.owner} this window",
+                    ))
+                    state_db.release_lock(repo, session_id)
+                    continue
 
-            # Pull the 30-day rolling window of prior operator decisions
-            # so the prompt can include them. Best-effort: if the lookup
-            # fails for any reason, fall through with an empty list —
-            # losing this just means the next sweep re-asks, which is the
-            # pre-fix status quo, not a regression.
+            worktree_path: Path | None = None
+            session_row_inserted = False
+            session_final_state_written = False
+            # Index of this repo's entry in `results` once recorded. The
+            # scheduled fan-out pairs results with repos by position, so a
+            # failure after this point must replace that entry, not add a
+            # second one and shift every later repo onto its neighbour.
+            result_index: int | None = None
             try:
-                prior_decisions = state_db.list_recent_automation_decisions(
-                    repo,
-                    operation="dependabot_pr",
-                    since_ts=int(time.time()) - DECISION_RECALL_SECONDS,
-                )
-            except Exception as e:
-                log_event(
-                    _logger,
-                    "secops.prior_decisions.lookup_failed",
+                await worktree.ensure_bare_repo(repo)
+                worktree_path = await worktree.create_worktree(repo, session_id)
+
+                context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
+                if context_path.exists():
+                    worktree.symlink_context(worktree_path, context_path)
+
+                state_file = worktree_path / ".ctrlrelay" / "state.json"
+                state_file.parent.mkdir(parents=True, exist_ok=True)
+
+                # Pull the 30-day rolling window of prior operator decisions
+                # so the prompt can include them. Best-effort: if the lookup
+                # fails for any reason, fall through with an empty list —
+                # losing this just means the next sweep re-asks, which is the
+                # pre-fix status quo, not a regression.
+                try:
+                    prior_decisions = state_db.list_recent_automation_decisions(
+                        repo,
+                        operation="dependabot_pr",
+                        since_ts=int(time.time()) - DECISION_RECALL_SECONDS,
+                    )
+                except Exception as e:
+                    log_event(
+                        _logger,
+                        "secops.prior_decisions.lookup_failed",
+                        session_id=session_id,
+                        repo=repo,
+                        error_type=type(e).__name__,
+                        error=str(e)[:200],
+                    )
+                    prior_decisions = []
+
+                ctx = PipelineContext(
                     session_id=session_id,
                     repo=repo,
-                    error_type=type(e).__name__,
-                    error=str(e)[:200],
+                    worktree_path=worktree_path,
+                    context_path=context_path,
+                    state_file=state_file,
+                    extra={
+                        "automation": getattr(repo_config, "automation", None),
+                        "prior_decisions": prior_decisions,
+                    },
                 )
-                prior_decisions = []
 
-            ctx = PipelineContext(
-                session_id=session_id,
-                repo=repo,
-                worktree_path=worktree_path,
-                context_path=context_path,
-                state_file=state_file,
-                extra={
-                    "automation": getattr(repo_config, "automation", None),
-                    "prior_decisions": prior_decisions,
-                },
-            )
+                state_db.execute(
+                    """INSERT INTO sessions
+                       (id, pipeline, repo, worktree_path, status, started_at,
+                        owner_pid, owner_run)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        session_id, "secops", repo, str(worktree_path),
+                        "running", int(time.time()), os.getpid(), PROCESS_RUN,
+                    ),
+                )
+                state_db.commit()
+                session_row_inserted = True
+                emit_event(
+                    state_db, EventKind.DISPATCHED,
+                    lambda: {
+                        "repo": repo,
+                        "session_id": session_id,
+                        "detail": {"pipeline": "secops"},
+                    },
+                )
 
-            state_db.execute(
-                """INSERT INTO sessions
-                   (id, pipeline, repo, worktree_path, status, started_at,
-                    owner_pid, owner_run)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id, "secops", repo, str(worktree_path),
-                    "running", int(time.time()), os.getpid(), PROCESS_RUN,
-                ),
-            )
-            state_db.commit()
-            session_row_inserted = True
-            emit_event(
-                state_db, EventKind.DISPATCHED,
-                lambda: {
-                    "repo": repo,
-                    "session_id": session_id,
-                    "detail": {"pipeline": "secops"},
-                },
-            )
+                result = await pipeline.run(ctx)
 
-            result = await pipeline.run(ctx)
-
-            # BLOCKED loop: when the agent ends BLOCKED_NEEDS_INPUT, push
-            # the question to the operator via the configured transport
-            # (Telegram), wait for an answer, and resume. Mirrors the
-            # dev/task pipelines — without this, secops blocked sessions
-            # silently land as "blocked" in the DB without ever reaching
-            # the operator. transport.ask() failure preserves blocked=True
-            # so the persistence-on-blocked branch below still fires and
-            # writes a pending_resumes row that a later out-of-band reply
-            # could resume via the sweeper.
-            rounds = 0
-            held_until: int | None = None
-            # Whether the question the row will carry reached the
-            # operator. Only an ask the bridge ACKed and nobody
-            # answered did (TransportUnansweredError). Any other
-            # failure, including a timeout with no ACK, may never have
-            # put it in front of anyone, and counting it as a post
-            # would stretch the backoff over an outage (#214).
-            question_posted = False
-            while (
-                result.blocked
-                and transport is not None
-                and rounds < max_blocked_rounds
-            ):
-                question = _question_for_persist(session_id, result)
-                # Only before the first ask. Once the operator has
-                # answered in this session the follow-up is a new
-                # exchange, and that answer is not in the table yet to
-                # reset the count.
-                hold = (
-                    _question_hold(
+                # BLOCKED loop: when the agent ends BLOCKED_NEEDS_INPUT, push
+                # the question to the operator via the configured transport
+                # (Telegram), wait for an answer, and resume. Mirrors the
+                # dev/task pipelines — without this, secops blocked sessions
+                # silently land as "blocked" in the DB without ever reaching
+                # the operator. transport.ask() failure preserves blocked=True
+                # so the persistence-on-blocked branch below still fires and
+                # writes a pending_resumes row that a later out-of-band reply
+                # could resume via the sweeper.
+                rounds = 0
+                held_until: int | None = None
+                # Whether the question the row will carry reached the
+                # operator. Only an ask the bridge ACKed and nobody
+                # answered did (TransportUnansweredError). Any other
+                # failure, including a timeout with no ACK, may never have
+                # put it in front of anyone, and counting it as a post
+                # would stretch the backoff over an outage (#214).
+                question_posted = False
+                while (
+                    result.blocked
+                    and transport is not None
+                    and rounds < max_blocked_rounds
+                ):
+                    question = _question_for_persist(session_id, result)
+                    # Only before the first ask. Once the operator has
+                    # answered in this session the follow-up is a new
+                    # exchange, and that answer is not in the table yet to
+                    # reset the count.
+                    hold = (
+                        _question_hold(
+                            state_db,
+                            repo=repo,
+                            question=question,
+                            session_id=session_id,
+                        )
+                        if hold_repeats and rounds == 0
+                        else None
+                    )
+                    if hold is not None:
+                        held_until = hold.next_post_at
+                        result = PipelineResult(
+                            success=False,
+                            blocked=True,
+                            session_id=session_id,
+                            summary=(
+                                "Blocked; same question as an earlier "
+                                "unanswered post, held until "
+                                f"{format_utc_timestamp(hold.next_post_at)}"
+                            ),
+                            question=question,
+                            outputs={
+                                **(result.outputs or {}),
+                                QUESTION_HELD_UNTIL: hold.next_post_at,
+                            },
+                        )
+                        break
+                    try:
+                        answer = await transport.ask(
+                            question,
+                            session_id=session_id,
+                            repo=repo,
+                        )
+                    except Exception as e:
+                        question_posted = isinstance(e, TransportUnansweredError)
+                        log_event(
+                            _logger,
+                            "secops.transport.ask_failed",
+                            session_id=session_id,
+                            repo=repo,
+                            error_type=type(e).__name__,
+                            error=str(e)[:200],
+                        )
+                        result = PipelineResult(
+                            success=False,
+                            blocked=True,
+                            session_id=session_id,
+                            summary=f"Blocked session deferred (transport): {e}",
+                            error=str(e),
+                            question=question,
+                            outputs=result.outputs,
+                        )
+                        break
+                    _record_decisions_from_answer(
                         state_db,
                         repo=repo,
                         question=question,
+                        answer=answer,
                         session_id=session_id,
                     )
-                    if hold_repeats and rounds == 0
-                    else None
-                )
-                if hold is not None:
-                    held_until = hold.next_post_at
-                    result = PipelineResult(
-                        success=False,
-                        blocked=True,
-                        session_id=session_id,
-                        summary=(
-                            "Blocked; same question as an earlier "
-                            "unanswered post, held until "
-                            f"{format_utc_timestamp(hold.next_post_at)}"
-                        ),
-                        question=question,
-                        outputs={
-                            **(result.outputs or {}),
-                            QUESTION_HELD_UNTIL: hold.next_post_at,
-                        },
-                    )
-                    break
-                try:
-                    answer = await transport.ask(
-                        question,
-                        session_id=session_id,
-                        repo=repo,
-                    )
-                except Exception as e:
-                    question_posted = isinstance(e, TransportUnansweredError)
-                    log_event(
-                        _logger,
-                        "secops.transport.ask_failed",
-                        session_id=session_id,
-                        repo=repo,
-                        error_type=type(e).__name__,
-                        error=str(e)[:200],
-                    )
-                    result = PipelineResult(
-                        success=False,
-                        blocked=True,
-                        session_id=session_id,
-                        summary=f"Blocked session deferred (transport): {e}",
-                        error=str(e),
-                        question=question,
-                        outputs=result.outputs,
-                    )
-                    break
-                _record_decisions_from_answer(
-                    state_db,
-                    repo=repo,
-                    question=question,
-                    answer=answer,
-                    session_id=session_id,
-                )
-                rounds += 1
-                result = await pipeline.resume(ctx, answer)
+                    rounds += 1
+                    result = await pipeline.resume(ctx, answer)
 
-            # Close the loop on an answer the operator gave inline.
-            # The sweep-wide summary only lands when every repo has
-            # been swept — on a 90-repo sweep that's hours after the
-            # reply, so answering felt like shouting into a void. The
-            # late-answer path (pending_resumes) already reports per
-            # session; this is the same courtesy for the case where
-            # the session was still alive to receive the answer.
-            # Guarded on rounds > 0 so the ~90 repos that never asked
-            # anything stay silent.
-            if rounds > 0 and transport is not None:
-                try:
-                    if result.success:
-                        await transport.send(
-                            f"✅ Answer applied on {repo}\n"
-                            f"Session: `{session_id}`\n"
-                            f"\n{result.summary}"
+                # Close the loop on an answer the operator gave inline.
+                # The sweep-wide summary only lands when every repo has
+                # been swept — on a 90-repo sweep that's hours after the
+                # reply, so answering felt like shouting into a void. The
+                # late-answer path (pending_resumes) already reports per
+                # session; this is the same courtesy for the case where
+                # the session was still alive to receive the answer.
+                # Guarded on rounds > 0 so the ~90 repos that never asked
+                # anything stay silent.
+                if rounds > 0 and transport is not None:
+                    try:
+                        if result.success:
+                            await transport.send(
+                                f"✅ Answer applied on {repo}\n"
+                                f"Session: `{session_id}`\n"
+                                f"\n{result.summary}"
+                            )
+                        elif result.blocked:
+                            q = result.question or "(no question text)"
+                            await transport.send(
+                                f"⏸️ Re-blocked after your answer on {repo}\n"
+                                f"Session: `{session_id}`\n"
+                                f"\n{q}"
+                            )
+                        else:
+                            err = failure_text(result)
+                            await transport.send(
+                                f"❌ Failed after your answer on {repo}\n"
+                                f"Session: `{session_id}`\n"
+                                f"\n{err}"
+                            )
+                    except Exception as e:
+                        # Best-effort: a dead socket must not lose the
+                        # completed work or abort the rest of the sweep.
+                        log_event(
+                            _logger,
+                            "secops.answer_ack.send_failed",
+                            session_id=session_id,
+                            repo=repo,
+                            error_type=type(e).__name__,
+                            error=str(e)[:200],
                         )
-                    elif result.blocked:
-                        q = result.question or "(no question text)"
-                        await transport.send(
-                            f"⏸️ Re-blocked after your answer on {repo}\n"
-                            f"Session: `{session_id}`\n"
-                            f"\n{q}"
-                        )
-                    else:
-                        err = failure_text(result)
-                        await transport.send(
-                            f"❌ Failed after your answer on {repo}\n"
-                            f"Session: `{session_id}`\n"
-                            f"\n{err}"
-                        )
-                except Exception as e:
-                    # Best-effort: a dead socket must not lose the
-                    # completed work or abort the rest of the sweep.
-                    log_event(
-                        _logger,
-                        "secops.answer_ack.send_failed",
-                        session_id=session_id,
-                        repo=repo,
-                        error_type=type(e).__name__,
-                        error=str(e)[:200],
-                    )
 
-            results.append(result)
-            result_index = len(results) - 1
+                results.append(result)
+                result_index = len(results) - 1
 
-            status = "done" if result.success else ("blocked" if result.blocked else "failed")
-            state_db.execute(
-                "UPDATE sessions SET status = ?, summary = ?, ended_at = ? WHERE id = ?",
-                (status, result.summary, int(time.time()), session_id),
-            )
-            state_db.commit()
-            session_final_state_written = True
-
-            # Persist BLOCKED so a Telegram reply arriving after this
-            # session tears down can still be routed to a resume. Without
-            # this, the bridge's in-memory `_pending_questions` dies with
-            # the ASK socket and the operator's answer lands in a void.
-            if result.blocked:
-                try:
-                    state_db.add_pending_resume(
-                        session_id=session_id,
-                        pipeline="secops",
-                        repo=repo,
-                        question=_question_for_persist(session_id, result),
-                        held_until=held_until,
-                        posted=question_posted,
-                    )
-                except Exception as e:
-                    log_event(
-                        _logger,
-                        "secops.pending_resume.insert_failed",
-                        session_id=session_id,
-                        repo=repo,
-                        error_type=type(e).__name__,
-                        error=str(e)[:200],
-                    )
-
-            emit_outcome(
-                state_db,
-                lambda: {
-                    "status": status,
-                    "pipeline": "secops",
-                    "repo": repo,
-                    "issue_number": None,
-                    "session_id": session_id,
-                    "exit_code": result.exit_code,
-                    "question": result.question,
-                },
-            )
-
-            if dashboard and result.success:
-                await dashboard.push_event(EventPayload(
-                    level="info",
-                    pipeline="secops",
-                    repo=repo,
-                    message=result.summary,
-                    session_id=session_id,
-                ))
-
-        except asyncio.CancelledError:
-            # Scheduled secops interrupted mid-run (SIGTERM during a
-            # scheduler.shutdown). Mark the session as cancelled so later
-            # inspection doesn't see a phantom "running" row — but ONLY
-            # if we hadn't already written a final state. Without this
-            # guard, a cancel landing during the post-run dashboard push
-            # would clobber a successful "done" status with "cancelled"
-            # even though the work completed.
-            if session_row_inserted and not session_final_state_written:
-                try:
-                    state_db.execute(
-                        "UPDATE sessions SET status = ?, summary = ?, "
-                        "ended_at = ? WHERE id = ?",
-                        (
-                            "cancelled",
-                            "Cancelled during shutdown",
-                            int(time.time()),
-                            session_id,
-                        ),
-                    )
-                    state_db.commit()
-                except Exception:
-                    pass
-            raise
-
-        except Exception as e:
-            # Never let a repo fail silently. Two independent holes put
-            # the cause beyond reach for the operator:
-            #   1. No log_event here, so nothing reached poller.log.
-            #   2. The DB row is written only when the failure lands
-            #      AFTER the INSERT — anything raised by ensure_bare_repo
-            #      or create_worktree (both network-bound, both before
-            #      it) left no row at all.
-            # With an exception whose str() is empty (a bare
-            # asyncio.TimeoutError) the Telegram alert then fell back to
-            # the generic summary and named only the repo. Log first, so
-            # the cause survives regardless of which branch runs next.
-            detail = str(e) or type(e).__name__
-            # This is the last-resort handler for the whole repo, and
-            # every repo after this one in the sweep depends on it
-            # returning normally. A raising logger here would abort the
-            # remaining repos AND destroy the original exception —
-            # trading one repo's failure for the entire pass. Losing the
-            # log line is the strictly better failure.
-            try:
-                log_event(
-                    _logger,
-                    "secops.repo.failed",
-                    session_id=session_id,
-                    repo=repo,
-                    session_row_inserted=session_row_inserted,
-                    error_type=type(e).__name__,
-                    error=detail[:200],
-                )
-            except Exception:
-                pass
-            if session_row_inserted:
+                status = "done" if result.success else ("blocked" if result.blocked else "failed")
                 state_db.execute(
-                    "UPDATE sessions SET status = ?, summary = ?, "
-                    "ended_at = ? WHERE id = ?",
-                    ("failed", f"Error: {detail}", int(time.time()), session_id),
+                    "UPDATE sessions SET status = ?, summary = ?, ended_at = ? WHERE id = ?",
+                    (status, result.summary, int(time.time()), session_id),
                 )
                 state_db.commit()
+                session_final_state_written = True
+
+                # Persist BLOCKED so a Telegram reply arriving after this
+                # session tears down can still be routed to a resume. Without
+                # this, the bridge's in-memory `_pending_questions` dies with
+                # the ASK socket and the operator's answer lands in a void.
+                if result.blocked:
+                    try:
+                        state_db.add_pending_resume(
+                            session_id=session_id,
+                            pipeline="secops",
+                            repo=repo,
+                            question=_question_for_persist(session_id, result),
+                            held_until=held_until,
+                            posted=question_posted,
+                        )
+                    except Exception as e:
+                        log_event(
+                            _logger,
+                            "secops.pending_resume.insert_failed",
+                            session_id=session_id,
+                            repo=repo,
+                            error_type=type(e).__name__,
+                            error=str(e)[:200],
+                        )
+
                 emit_outcome(
                     state_db,
                     lambda: {
-                        "status": "failed",
+                        "status": status,
                         "pipeline": "secops",
                         "repo": repo,
                         "issue_number": None,
                         "session_id": session_id,
+                        "exit_code": result.exit_code,
+                        "question": result.question,
                     },
                 )
-            failure = PipelineResult(
-                success=False,
-                session_id=session_id,
-                summary=f"Error processing {repo}: {type(e).__name__}: {detail}",
-                # `str(e)` alone can be empty; the notifier picks
-                # `failure_text` keeps both fields now, so an empty
-                # error no longer decides the alert either way - but both
-                # are still filled so the exception type survives alone.
-                error=f"{type(e).__name__}: {detail}",
-            )
-            if result_index is None:
-                results.append(failure)
-            else:
-                results[result_index] = failure
 
-        finally:
-            # Hold the per-repo lock THROUGH worktree cleanup so a
-            # concurrent dev/secops run can't acquire the same repo and
-            # race `git worktree prune` on the shared bare clone.
-            # Cleanup is bounded by an asyncio.wait_for timeout so a
-            # truly-stuck operation can't pin the lock forever — once
-            # the timeout fires we release anyway, preferring "possibly
-            # leaked git admin state (recoverable via `git worktree
-            # prune`)" over "repo locked across daemon restart".
-            #
-            # No asyncio.shield here: `_run_git` kills its subprocess
-            # synchronously on CancelledError so unshielded cleanup
-            # unwinds fast and without leaking a stray git. Previously
-            # the shield made the outer task cancel immediately while
-            # the inner cleanup kept running untracked — leaking state.
-            if worktree_path is not None:
-                try:
-                    worktree.remove_context_symlink(worktree_path)
-                except Exception as cleanup_exc:
-                    log_event(
-                        _logger,
-                        "secops.cleanup.symlink_failed",
-                        session_id=session_id,
+                if dashboard and result.success:
+                    await dashboard.push_event(EventPayload(
+                        level="info",
+                        pipeline="secops",
                         repo=repo,
-                        error_type=type(cleanup_exc).__name__,
-                        error=str(cleanup_exc)[:200],
-                    )
-                try:
-                    # Timeout matches Scheduler's cancel budget (150s) — a
-                    # full worktree prune can take up to 120s per
-                    # WorktreeManager._run_git ceiling.
-                    await asyncio.wait_for(
-                        worktree.remove_worktree(repo, session_id),
-                        timeout=130.0,
-                    )
-                except asyncio.TimeoutError:
-                    log_event(
-                        _logger,
-                        "secops.cleanup.worktree_timeout",
+                        message=result.summary,
                         session_id=session_id,
-                        repo=repo,
-                        worktree_path=str(worktree_path),
-                    )
-                except asyncio.CancelledError:
-                    log_event(
-                        _logger,
-                        "secops.cleanup.worktree_cancelled_mid_shutdown",
-                        session_id=session_id,
-                        repo=repo,
-                        worktree_path=str(worktree_path),
-                    )
-                    # Release the lock before propagating — leaving it
-                    # held across a daemon restart is worse than the
-                    # small race with a future scheduled run (the dev
-                    # handler retries on lock conflict anyway).
+                    ))
+
+            except asyncio.CancelledError:
+                # Scheduled secops interrupted mid-run (SIGTERM during a
+                # scheduler.shutdown). Mark the session as cancelled so later
+                # inspection doesn't see a phantom "running" row — but ONLY
+                # if we hadn't already written a final state. Without this
+                # guard, a cancel landing during the post-run dashboard push
+                # would clobber a successful "done" status with "cancelled"
+                # even though the work completed.
+                if session_row_inserted and not session_final_state_written:
                     try:
-                        state_db.release_lock(repo, session_id)
+                        state_db.execute(
+                            "UPDATE sessions SET status = ?, summary = ?, "
+                            "ended_at = ? WHERE id = ?",
+                            (
+                                "cancelled",
+                                "Cancelled during shutdown",
+                                int(time.time()),
+                                session_id,
+                            ),
+                        )
+                        state_db.commit()
                     except Exception:
                         pass
-                    raise
-                except Exception as cleanup_exc:
+                raise
+
+            except Exception as e:
+                # Never let a repo fail silently. Two independent holes put
+                # the cause beyond reach for the operator:
+                #   1. No log_event here, so nothing reached poller.log.
+                #   2. The DB row is written only when the failure lands
+                #      AFTER the INSERT — anything raised by ensure_bare_repo
+                #      or create_worktree (both network-bound, both before
+                #      it) left no row at all.
+                # With an exception whose str() is empty (a bare
+                # asyncio.TimeoutError) the Telegram alert then fell back to
+                # the generic summary and named only the repo. Log first, so
+                # the cause survives regardless of which branch runs next.
+                detail = str(e) or type(e).__name__
+                # This is the last-resort handler for the whole repo, and
+                # every repo after this one in the sweep depends on it
+                # returning normally. A raising logger here would abort the
+                # remaining repos AND destroy the original exception —
+                # trading one repo's failure for the entire pass. Losing the
+                # log line is the strictly better failure.
+                try:
                     log_event(
                         _logger,
-                        "secops.cleanup.worktree_failed",
+                        "secops.repo.failed",
                         session_id=session_id,
                         repo=repo,
-                        worktree_path=str(worktree_path),
-                        error_type=type(cleanup_exc).__name__,
-                        error=str(cleanup_exc)[:200],
+                        session_row_inserted=session_row_inserted,
+                        error_type=type(e).__name__,
+                        error=detail[:200],
+                    )
+                except Exception:
+                    pass
+                if session_row_inserted:
+                    state_db.execute(
+                        "UPDATE sessions SET status = ?, summary = ?, "
+                        "ended_at = ? WHERE id = ?",
+                        ("failed", f"Error: {detail}", int(time.time()), session_id),
+                    )
+                    state_db.commit()
+                    emit_outcome(
+                        state_db,
+                        lambda: {
+                            "status": "failed",
+                            "pipeline": "secops",
+                            "repo": repo,
+                            "issue_number": None,
+                            "session_id": session_id,
+                        },
+                    )
+                failure = PipelineResult(
+                    success=False,
+                    session_id=session_id,
+                    summary=f"Error processing {repo}: {type(e).__name__}: {detail}",
+                    # `str(e)` alone can be empty; the notifier picks
+                    # `failure_text` keeps both fields now, so an empty
+                    # error no longer decides the alert either way - but both
+                    # are still filled so the exception type survives alone.
+                    error=f"{type(e).__name__}: {detail}",
+                )
+                if result_index is None:
+                    results.append(failure)
+                else:
+                    results[result_index] = failure
+
+            finally:
+                # Hold the per-repo lock THROUGH worktree cleanup so a
+                # concurrent dev/secops run can't acquire the same repo and
+                # race `git worktree prune` on the shared bare clone.
+                # Cleanup is bounded by an asyncio.wait_for timeout so a
+                # truly-stuck operation can't pin the lock forever — once
+                # the timeout fires we release anyway, preferring "possibly
+                # leaked git admin state (recoverable via `git worktree
+                # prune`)" over "repo locked across daemon restart".
+                #
+                # No asyncio.shield here: `_run_git` kills its subprocess
+                # synchronously on CancelledError so unshielded cleanup
+                # unwinds fast and without leaking a stray git. Previously
+                # the shield made the outer task cancel immediately while
+                # the inner cleanup kept running untracked — leaking state.
+                if worktree_path is not None:
+                    try:
+                        worktree.remove_context_symlink(worktree_path)
+                    except Exception as cleanup_exc:
+                        log_event(
+                            _logger,
+                            "secops.cleanup.symlink_failed",
+                            session_id=session_id,
+                            repo=repo,
+                            error_type=type(cleanup_exc).__name__,
+                            error=str(cleanup_exc)[:200],
+                        )
+                    try:
+                        # Timeout matches Scheduler's cancel budget (150s) — a
+                        # full worktree prune can take up to 120s per
+                        # WorktreeManager._run_git ceiling.
+                        await asyncio.wait_for(
+                            worktree.remove_worktree(repo, session_id),
+                            timeout=130.0,
+                        )
+                    except asyncio.TimeoutError:
+                        log_event(
+                            _logger,
+                            "secops.cleanup.worktree_timeout",
+                            session_id=session_id,
+                            repo=repo,
+                            worktree_path=str(worktree_path),
+                        )
+                    except asyncio.CancelledError:
+                        log_event(
+                            _logger,
+                            "secops.cleanup.worktree_cancelled_mid_shutdown",
+                            session_id=session_id,
+                            repo=repo,
+                            worktree_path=str(worktree_path),
+                        )
+                        # Release the lock before propagating — leaving it
+                        # held across a daemon restart is worse than the
+                        # small race with a future scheduled run (the dev
+                        # handler retries on lock conflict anyway).
+                        try:
+                            state_db.release_lock(repo, session_id)
+                        except Exception:
+                            pass
+                        raise
+                    except Exception as cleanup_exc:
+                        log_event(
+                            _logger,
+                            "secops.cleanup.worktree_failed",
+                            session_id=session_id,
+                            repo=repo,
+                            worktree_path=str(worktree_path),
+                            error_type=type(cleanup_exc).__name__,
+                            error=str(cleanup_exc)[:200],
+                        )
+
+                # Release the lock AFTER cleanup attempt so new runs don't
+                # race the prune. In the cancel path above we released early
+                # and re-raised; here we handle the non-cancel paths.
+                try:
+                    state_db.release_lock(repo, session_id)
+                except Exception as lock_exc:
+                    log_event(
+                        _logger,
+                        "secops.cleanup.lock_release_failed",
+                        session_id=session_id,
+                        repo=repo,
+                        error_type=type(lock_exc).__name__,
+                        error=str(lock_exc)[:200],
                     )
 
-            # Release the lock AFTER cleanup attempt so new runs don't
-            # race the prune. In the cancel path above we released early
-            # and re-raised; here we handle the non-cancel paths.
-            try:
-                state_db.release_lock(repo, session_id)
-            except Exception as lock_exc:
-                log_event(
-                    _logger,
-                    "secops.cleanup.lock_release_failed",
-                    session_id=session_id,
-                    repo=repo,
-                    error_type=type(lock_exc).__name__,
-                    error=str(lock_exc)[:200],
-                )
+    finally:
+        if holding and slots is not None:
+            slots.release()
 
     return results
 

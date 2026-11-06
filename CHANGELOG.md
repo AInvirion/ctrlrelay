@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `agent.max_parallel` lets one machine run several agents at once (#210).
+  It is one cap over new issues, resumed answers and the security sweep.
+  Each poll's issues start side by side up to the free slots, in priority
+  order, never two of one repo at once, and the loop polls again while they
+  run. Unset keeps the old one-at-a-time behaviour. The status page's slot
+  count now shows the real number of runs and the cap, or "no cap".
 - A dev run saves each step it finishes (plan, code, publish, verify) in a
   new `run_steps` table, and a run whose process died is continued after
   its last saved step instead of starting over (#231). The branch must

@@ -16,6 +16,7 @@ from ctrlrelay.core.config import DEFAULT_PRIORITY_LABELS
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.reopens import ReopenTracker
+from ctrlrelay.core.slots import AgentSlots
 
 _logger = get_logger("core.poller")
 
@@ -1578,6 +1579,7 @@ async def run_poll_loop(
     max_iterations: int | None = None,
     interval_scale: Callable[[], float] | None = None,
     on_poll: Callable[[], None] | None = None,
+    slots: AgentSlots | None = None,
 ) -> None:
     """Run the polling loop.
 
@@ -1592,12 +1594,23 @@ async def run_poll_loop(
         on_poll: Called after each poll that answered (#249: the status
             page's "last poll" time). A callback that raises is logged and
             never stops the loop.
+        slots: The node's shared cap on agent runs (#210). With a limit,
+            a poll's issues start side by side, up to the free slots, never
+            two of one repo at once; the loop polls again while they run.
+            Without one (``None`` or no limit), one at a time as before.
 
     Iteration resilience: any non-cancellation exception from the poll or a
     handler call is logged as ``poll.iteration.failed`` and the loop sleeps
     and continues. This keeps a single bad cycle (slow network, one flaky
     handler) from crashing the daemon and forcing a launchd restart.
     """
+    if slots is not None and slots.limit is not None:
+        await _run_parallel_poll_loop(
+            poller, handler, slots, interval=interval,
+            max_iterations=max_iterations, interval_scale=interval_scale,
+            on_poll=on_poll,
+        )
+        return
     iterations = 0
     while max_iterations is None or iterations < max_iterations:
         # Guard poll() separately from the handler dispatch: a malformed
@@ -1665,3 +1678,192 @@ async def run_poll_loop(
                 if not math.isfinite(scale) or scale < 1.0:
                     scale = 1.0
             await asyncio.sleep(interval * scale)
+
+
+async def _poll_once(
+    poller: IssuePoller, iteration: int, on_poll: Callable[[], None] | None,
+) -> list[dict[str, Any]]:
+    """One poll, guarded like the serial loop's: a failed poll is logged
+    and gives an empty batch."""
+    try:
+        new_issues = await poller.poll()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log_event(
+            _logger, "poll.iteration.failed", iteration=iteration,
+            phase="poll", reason=type(e).__name__, error=str(e)[:200],
+        )
+        return []
+    if on_poll is not None:
+        try:
+            on_poll()
+        except Exception as e:
+            log_event(
+                _logger, "poll.on_poll_failed",
+                reason=type(e).__name__, error=str(e)[:200],
+            )
+    return new_issues
+
+
+async def _dispatch_item(
+    poller: IssuePoller,
+    handler: Callable[[str, dict[str, Any]], Awaitable[None]],
+    item: dict[str, Any],
+) -> None:
+    """Recheck and hand one issue to the handler, as the serial loop does,
+    logging a failure instead of raising it."""
+    try:
+        fresh = await poller.recheck_before_dispatch(item["repo"], item["issue"])
+        if fresh is None:
+            return
+        await handler(item["repo"], fresh)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        issue = item.get("issue") or {}
+        log_event(
+            _logger, "poll.handler.failed", repo=item.get("repo"),
+            issue_number=issue.get("number"), reason=type(e).__name__,
+            error=str(e)[:200],
+        )
+
+
+async def _run_parallel_poll_loop(
+    poller: IssuePoller,
+    handler: Callable[[str, dict[str, Any]], Awaitable[None]],
+    slots: AgentSlots,
+    *,
+    interval: int,
+    max_iterations: int | None,
+    interval_scale: Callable[[], float] | None,
+    on_poll: Callable[[], None] | None,
+) -> None:
+    """The poll loop with ``agent.max_parallel`` set (#210).
+
+    Polled issues go into a backlog, in the order they were polled (each
+    batch already in priority order). Whenever a slot is free, the first
+    backlog issue whose repo has none of this loop's runs going starts in
+    its own task: two issues of one repo never run together, and the repo
+    lock would refuse the second anyway. The loop never waits for a run to
+    poll again; between polls it starts more issues each time a slot is
+    given back, by this loop's runs or by another track's.
+
+    Stopping the loop (cancelled, or an error) closes the slots, so no
+    track starts a run in a slot a cancelled run frees, cancels this loop's
+    runs, and hands every issue still in the backlog back to the poller,
+    since it was marked seen when polled and would otherwise not be
+    offered again. With ``max_iterations`` the loop starts the backlog and
+    waits for its runs before returning.
+    """
+    running: dict[asyncio.Task[None], str] = {}
+    backlog: list[dict[str, Any]] = []
+    queued: set[tuple[Any, Any]] = set()
+
+    def key(item: dict[str, Any]) -> tuple[Any, Any]:
+        return (item.get("repo"), (item.get("issue") or {}).get("number"))
+
+    def start_what_can_start() -> None:
+        while backlog:
+            busy_repos = set(running.values())
+            pick = next(
+                (i for i, it in enumerate(backlog)
+                 if it.get("repo") not in busy_repos),
+                None,
+            )
+            if pick is None or not slots.try_acquire():
+                return
+            item = backlog.pop(pick)
+            queued.discard(key(item))
+            try:
+                task = asyncio.create_task(_dispatch_item(poller, handler, item))
+            except BaseException:
+                slots.release()
+                raise
+            running[task] = item.get("repo")
+
+            def done(t: asyncio.Task[None]) -> None:
+                running.pop(t, None)
+                slots.release()
+
+            task.add_done_callback(done)
+
+    async def start_until(deadline: float | None) -> None:
+        """Start backlog issues as slots free up, until ``deadline`` (loop
+        time), or with ``None`` until the backlog and the runs are done."""
+        loop = asyncio.get_running_loop()
+        while True:
+            slots.clear_released()
+            start_what_can_start()
+            if deadline is None:
+                if not backlog and not running:
+                    return
+                remaining = 3600.0
+            else:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    # Yield once, as the serial loop's sleep always did, so
+                    # a zero interval cannot starve every other task.
+                    await asyncio.sleep(0)
+                    return
+            if backlog:
+                await slots.wait_released(remaining)
+            elif deadline is None:
+                await asyncio.wait(set(running))
+            else:
+                await asyncio.sleep(remaining)
+                return
+
+    iterations = 0
+    try:
+        while max_iterations is None or iterations < max_iterations:
+            batch = await _poll_once(poller, iterations, on_poll)
+            for item in batch:
+                if key(item) not in queued:
+                    queued.add(key(item))
+                    backlog.append(item)
+            if batch:
+                log_event(
+                    _logger, "poll.batch.parallel", issues=len(batch),
+                    backlog=len(backlog), limit=slots.limit, busy=slots.busy,
+                )
+            iterations += 1
+            if max_iterations is None or iterations < max_iterations:
+                scale = 1.0
+                if interval_scale is not None:
+                    try:
+                        scale = float(interval_scale())
+                    except Exception:
+                        scale = 1.0
+                    if not math.isfinite(scale) or scale < 1.0:
+                        scale = 1.0
+                await start_until(
+                    asyncio.get_running_loop().time() + interval * scale,
+                )
+        await start_until(None)
+    except BaseException:
+        slots.close()
+        raise
+    finally:
+        tasks = [t for t in running if not t.done()]
+        for t in tasks:
+            t.cancel()
+        # Hand the backlog back before waiting on the cancelled runs: a
+        # second cancellation during that wait must not leave these issues
+        # marked seen for good.
+        for item in backlog:
+            number = (item.get("issue") or {}).get("number")
+            try:
+                poller.unmark_seen(item.get("repo"), number)
+            except Exception as e:
+                log_event(
+                    _logger, "poll.backlog.unmark_failed",
+                    repo=item.get("repo"), issue_number=number,
+                    reason=type(e).__name__, error=str(e)[:200],
+                )
+        if backlog:
+            log_event(
+                _logger, "poll.backlog.handed_back", issues=len(backlog),
+            )
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

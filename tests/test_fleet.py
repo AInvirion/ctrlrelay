@@ -99,6 +99,19 @@ class TestNodeActivity:
         base.update(kw)
         return node_activity(**base)
 
+    def test_slots_report_the_cap_and_every_run_going(self) -> None:
+        """#210: the total is `agent.max_parallel`, and busy is not clamped
+        to it, so a node running more than it should shows that."""
+        act = self._act(running=[CARD, CARD, CARD], slots_total=2)
+        assert act["slots"] == {"total": 2, "busy": 3}
+
+    def test_a_peer_with_no_cap_keeps_its_slots(self) -> None:
+        from ctrlrelay.web.fleet import _clean_node
+
+        node = _clean_node({"slots": {"total": None, "busy": 2}})
+        assert node["slots"] == {"total": None, "busy": 2}
+        assert _clean_node({"slots": {"total": "3", "busy": 2}})["slots"] is None
+
     def test_idle_working_paused(self) -> None:
         assert self._act()["state"] == IDLE
         assert self._act(running=[CARD])["state"] == WORKING
@@ -120,7 +133,8 @@ class TestNodeActivity:
         assert [(c["issue_number"], c["phase"]) for c in act["claims"]] == [
             (7, "coding"), (9, "waiting for an answer"),
         ]
-        assert act["slots"] == {"total": 1, "busy": 1}
+        # No `agent.max_parallel`: no cap to report (#210).
+        assert act["slots"] == {"total": None, "busy": 1}
         assert act["open_questions"] == 1
         assert act["heartbeat_at"] == _iso(NOW - 10)
         assert act["last_poll_at"] == _iso(NOW - 20)

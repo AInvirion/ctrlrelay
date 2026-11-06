@@ -1015,6 +1015,7 @@ def build_status(
                 running=running, needs_you=needs_you, heartbeat=beat,
                 paused=node_block.get("paused"), now=now,
                 silent_after=silent_after_s,
+                slots_total=node_block.get("max_parallel"),
             ),
         }
     fleet_block: dict | None = None

@@ -824,6 +824,44 @@ branch first in that case.
 The log events are `dev.step.saved`, `dev.resume.restored` and
 `dev.resume.head_moved`.
 
+## Running several agents at once
+
+Set `agent.max_parallel` to let one machine run more than one agent (#210):
+
+```yaml
+agent:
+  max_parallel: 3
+```
+
+- **One cap over everything.** New issues from the poll, runs resumed after
+  you answer a question, and the scheduled security sweep all take a slot
+  from the same pool. A run takes its slot before the repo lock, and gives
+  it back when it ends.
+- **New issues side by side.** Polled issues wait in a backlog, in priority
+  order, and start as slots free up. Two issues of the same repo never run
+  together: the second waits, and an issue of another repo behind it goes
+  first. The loop keeps polling on its interval whatever is running, so one
+  slow issue never holds up new ones.
+- **A run holds its slot for its whole life**, including the wait for CI
+  and the fix rounds, and while it waits in the run for your answer. Once
+  it gives up waiting and saves the question, the slot is free again, and
+  the resume takes one when your answer comes. Two pull requests waiting on
+  slow CI can fill `max_parallel: 2`.
+- **A hold placed while a run waited for its slot is respected.** The resume
+  sweeper and the security sweep check again once they have a slot, so a
+  `self-update` that started meanwhile is not raced.
+- **On shutdown** no new run starts in a slot a stopping run frees, and
+  issues polled but not started are offered again after the restart.
+- **Unset** keeps the old behaviour: new issues one at a time, and nothing
+  limits the total.
+
+Each run uses its own agent session, worktree and memory. Size the number to
+the machine and to your plan's usage limits. Start with 2.
+
+The status page shows `slots busy/max`, and `slots N (no cap)` when it is
+unset. The log event `poll.batch.parallel` names each batch, the limit and
+how many slots were busy.
+
 ## When to restart
 
 | You changed... | Restart... |
