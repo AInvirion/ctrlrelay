@@ -4207,12 +4207,17 @@ def _restore_steps(run: _DevRun, point: ResumePoint) -> None:
     for row in point.rows:
         if row["step"] not in point.steps:
             continue
+        head, payload = row.get("head_sha"), row["data"]
+        if row["step"] == point.last_step:
+            # The point may have accepted a newer head than this row saved
+            # (the dead run's own fix push): the copy carries that head and
+            # its lease, so a second interruption can be continued too.
+            head, payload = point.head_sha, json.dumps(point.data)
         try:
             run.state_db.record_run_step(
                 session_id=run.session_id, repo=run.repo,
                 issue_number=run.issue_number, seq=row["seq"],
-                step=row["step"], head_sha=row.get("head_sha"),
-                data=row["data"],
+                step=row["step"], head_sha=head, data=payload,
             )
         except Exception as e:
             log_event(
@@ -4673,8 +4678,13 @@ async def run_dev_issue(
         ):
             # Another run took it over first. Marked here, not when the
             # point was found: a run that fails before this line (a `gh`
-            # error, a lost claim) leaves the steps for its retry.
-            resume_point = None
+            # error, a lost claim) leaves the steps for its retry. Stops
+            # rather than starting over, because the worktree may sit on
+            # a branch behind the earlier run's open pull request.
+            raise WorktreeError(
+                f"run {resume_point.source_session} was already continued "
+                "by another run"
+            )
         if resume_point is not None:
             _restore_steps(run, resume_point)
             log_event(

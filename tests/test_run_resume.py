@@ -585,6 +585,10 @@ async def test_a_run_killed_after_a_ci_fix_continues_from_its_own_push(
     assert agent.prompts == []
     github.create_pr.assert_not_awaited()
     assert seen == [fixed]
+    # The copy in the new run carries the accepted head and lease.
+    last = db.run_steps_for(result.session_id)[2]
+    assert last["step"] == "publish" and last["head_sha"] == fixed
+    assert json.loads(last["data"])["publisher"]["last_pushed_sha"] == fixed
 
 
 @pytest.mark.asyncio
