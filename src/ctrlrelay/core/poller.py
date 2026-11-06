@@ -1785,13 +1785,10 @@ async def _run_parallel_poll_loop(
                         set(running), return_when=asyncio.FIRST_COMPLETED,
                     )
                     continue
+                # Only this loop starts the runs it tracks, so while it
+                # waits for a slot the picked repo can stop being busy but
+                # never become busy: the pick stays good.
                 await slots.acquire()
-                # The wait for a slot may have let a run of the picked
-                # repo start or end; pick again with what is true now.
-                busy_repos = set(running.values())
-                if pending[pick].get("repo") in busy_repos:
-                    slots.release()
-                    continue
                 item = pending.pop(pick)
                 try:
                     task = asyncio.create_task(

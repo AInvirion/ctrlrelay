@@ -18,6 +18,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 from ctrlrelay.core.config import AgentConfig
 from ctrlrelay.core.poller import run_poll_loop
@@ -77,10 +78,27 @@ async def _until(cond, timeout: float = 5.0) -> None:
         await asyncio.sleep(0.01)
 
 
+_LOOPS: list[asyncio.Task] = []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _cancel_leftover_loops():
+    """A test that fails part-way leaves its loop and runs waiting; cancel
+    them so the failure is reported instead of the suite hanging."""
+    yield
+    for t in _LOOPS:
+        t.cancel()
+    if _LOOPS:
+        await asyncio.wait(_LOOPS, timeout=5)
+    _LOOPS.clear()
+
+
 def _loop(poller, handler, slots, iterations=1):
-    return asyncio.create_task(run_poll_loop(
+    task = asyncio.create_task(run_poll_loop(
         poller, handler, interval=0, max_iterations=iterations, slots=slots,
     ))
+    _LOOPS.append(task)
+    return task
 
 
 @pytest.mark.asyncio
@@ -220,7 +238,7 @@ async def test_cancelling_the_loop_cancels_its_runs() -> None:
     await _until(lambda: handler.going == 2)
     loop.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await loop
+        await asyncio.wait_for(loop, 5)
     assert handler.going == 0
     assert slots.busy == 0
 
