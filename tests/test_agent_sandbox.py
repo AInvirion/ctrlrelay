@@ -627,10 +627,17 @@ def test_control_a_mount_per_project_folder_cannot_start_bwrap(
         writable=list(DEFAULT_SANDBOX_WRITABLE_PATHS),
         readonly=["~/.claude/projects/*/memory"],
     )
-    assert size(old) > os.sysconf("SC_ARG_MAX") // 2
-    with pytest.raises(OSError) as info:
-        subprocess.run([*old, "true"], capture_output=True, timeout=30)
-    assert info.value.errno == errno.E2BIG
+    # Refused one way or the other: by the kernel where ARG_MAX is the
+    # usual 2 MB, or by bwrap's own cap of 9000 arguments where the stack
+    # limit (and so ARG_MAX) is larger, as on some CI runners.
+    assert len(old) > 9000
+    try:
+        out = subprocess.run([*old, "true"], capture_output=True, timeout=30)
+    except OSError as e:
+        assert e.errno == errno.E2BIG
+    else:
+        assert out.returncode != 0
+        assert b"maximum number of arguments" in out.stderr
 
     new = bwrap_prefix(
         BWRAP, DEFAULT_SANDBOX_HIDE_PATHS,
