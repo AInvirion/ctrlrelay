@@ -560,7 +560,7 @@ async def test_thousands_of_project_folders_still_start_the_sandbox(
         'echo "ran=yes write_memory=$m" > report\n'
     )
     agent.chmod(0o755)
-    seen: list[list[str]] = []
+    seen: list[tuple[list[str], int]] = []
     d = ClaudeDispatcher(
         usage_store=None, claude_binary=str(agent), sandbox="bwrap",
         sandbox_cache_dir=str(home / "agent-cache"),
@@ -568,7 +568,7 @@ async def test_thousands_of_project_folders_still_start_the_sandbox(
     real = d._run_session
 
     async def spy(**kw):
-        seen.append(kw["cmd"])
+        seen.append((kw["cmd"], kw["sandbox_prefix_len"]))
         return await real(**kw)
 
     d._run_session = spy  # type: ignore[method-assign]
@@ -578,9 +578,10 @@ async def test_thousands_of_project_folders_still_start_the_sandbox(
         timeout=60,
     )
     assert (wt / "report").read_text().split() == ["ran=yes", "write_memory=no"]
-    [cmd] = seen
-    assert cmd[1:4] == ["--args", cmd[2], "--"] and cmd[2].isdigit()
-    assert sum(len(a) + 1 for a in cmd) < 4096
+    [(cmd, n)] = seen
+    # The options are moved to the fd as the child starts; on the way in,
+    # the prefix is marked for that.
+    assert n > 0 and cmd[0].endswith("bwrap") and cmd[n - 1] == "--"
 
 
 def test_control_a_mount_per_project_folder_cannot_start_bwrap(
@@ -640,3 +641,30 @@ def test_bwrap_args_via_fd_round_trips_every_option() -> None:
     assert bwrap_args_via_fd([]) == ([], None)
     with pytest.raises(ValueError):
         bwrap_args_via_fd(["/usr/bin/bwrap", "--tmpfs", "/t"])
+
+
+def test_a_linked_transcript_folder_is_refused(home: Path) -> None:
+    """A run before #362 could write the projects folder and leave a link
+    where a later run's transcript folder goes. Opened writable, it would
+    open its target: here the home directory."""
+    import re as _re
+
+    from ctrlrelay.core.agent_env import SandboxUnavailableError
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    wt = _worktree(home)
+    h = home / "home"
+    link = h / ".claude" / "projects" / _re.sub(r"[/._]", "-", str(wt))
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(h)
+    if not BWRAP:
+        pytest.skip("bwrap not installed")
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
+        sandbox_cache_dir=str(home / "agent-cache"),
+    )
+    private = home / "private"
+    private.mkdir()
+    with pytest.raises(SandboxUnavailableError, match="is a link"):
+        d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", private)
+    assert (h / ".bashrc").read_text() == "# mine\n"
