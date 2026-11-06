@@ -173,6 +173,7 @@ class TestRouter:
 
     @pytest.mark.asyncio
     async def test_every_argument_is_forwarded_unchanged(self) -> None:
+        from ctrlrelay.core.budget import BudgetScope
         from ctrlrelay.core.dispatcher import RepoAgentRouter
 
         local = _fake_adapter("opencode")
@@ -180,6 +181,7 @@ class TestRouter:
             default=_fake_adapter("claude"),
             by_repo={"AInvirion/scratchpad": local},
         )
+        scope = BudgetScope(labels=["size:S"])
 
         await router.spawn_session(
             session_id="s1",
@@ -191,6 +193,7 @@ class TestRouter:
             repo="AInvirion/scratchpad",
             issue_number=286,
             github_access=True,
+            budget_scope=scope,
         )
         kwargs = local.spawn_session.await_args.kwargs
         assert kwargs == {
@@ -203,6 +206,7 @@ class TestRouter:
             "repo": "AInvirion/scratchpad",
             "issue_number": 286,
             "github_access": True,
+            "budget_scope": scope,
         }
 
 

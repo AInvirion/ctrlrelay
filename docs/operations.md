@@ -304,6 +304,18 @@ Added in #247:
 |---|---|
 | `node` | This machine's own block: `name` (`node_id`); `usage`, the agent subscription's usage as the last run or probe read it: `status`, `read_at`, and for `five_hour` and `seven_day` each `{used (0 to 1), resets_at}`, or `"unknown"` for a window it could not read; the whole `usage` is `"unknown"` before any reading. `pause_at` is `usage.pause_at`, and `paused` is `{reason, until}` while the machine takes no new issues, else `null`. The page shows it in the **Usage** box. `node` is `null`, with a line in `errors`, only if reading it failed outright. |
 
+Added in #223, on every `running` card (see [Run budgets](#run-budgets)):
+
+| Field | What |
+|---|---|
+| `tokens_used` | Tokens the session has used so far, over all its spawns: input + cache writes + output, what the budget counts. `null` before anything was measured, on a backend that is not measured, or when a transcript row could not be read (then `reason` gives the number of rows and the floor). Never `0` for unknown. |
+| `cache_read_tokens` | Cache reads, recorded but not counted. `null` as for `tokens_used`. |
+| `cost_usd` | The sum of `total_cost_usd` the agent CLI reported at the end of each spawn. Information only. `null` until a spawn reported one. |
+| `token_soft_limit`, `token_hard_limit` | The limits applied to this run. `null` when no limit applies or nothing was measured yet. |
+
+The page shows them in a `tokens:` row on each running card; the count is in
+the warning colour once it passes the soft limit.
+
 Added in #237: `node.github_api` is the account's GitHub API budget as this
 machine last read it: `read_at`, and for `core`, `search` and `graphql` each
 `{remaining, limit, resets_at, state}` with `state` one of `ok`, `low`, `out`,
@@ -717,6 +729,57 @@ A stopped run is recorded as `failed` with a `stuck_reason` in the
 `sessions` table, its summary starts with `Stuck:`, the issue comment gives
 the reason, and chat gets `🔁 Stuck on #<n>, stopped: <reason>`. The status
 page's numbers count these runs in `stuck`.
+
+## Run budgets
+
+Each run can have a token budget (#223), set in
+[`agent.budget`]({{ '/configuration/' | relative_url }}#agentbudget). There is no
+limit until one is set.
+
+- **What is counted.** Every 30 seconds ctrlrelay adds up the usage in the
+  agent's live transcript, sub-agents included: input tokens, cache writes
+  and output tokens. Cache reads are recorded but not counted. One API
+  message written as several rows is counted once.
+- **Per session, not per spawn.** A dev or task run spawns the agent more
+  than once (the first run, resumes after a question, CI fix rounds). They
+  all count against the same budget, because each spawn starts from what the
+  session row already holds.
+- **Soft limit.** The first time the total passes it, chat gets one line
+  (`💰 #<n> (<repo>) has used <N> tokens, past its soft limit ...`) and the
+  log gets `budget.soft_limit`. Once per session.
+- **Hard limit.** The agent is stopped through the same path as a stuck run.
+  The run is recorded as `failed` with `stuck_reason` set to
+  `budget: used <N> tokens, hard limit <M>`, its summary starts with
+  `Stopped:`, the issue comment gives the reason, and chat gets
+  `💸 Over budget on #<n>, stopped: <reason>`. A checkpoint the agent wrote
+  just before the stop is not used: the work is not handed over as ready.
+  When no pull request exists yet, the unfinished work is not saved to a
+  branch (only a timeout does that). The status page's numbers count the
+  run in `failed`, not in `stuck`.
+- **A stop after the PR was opened** (over budget in a CI fix round, or
+  stuck there): the PR is put back to draft and kept with the work so far,
+  no merge watcher is started for it, and chat and the issue comment say
+  `PR #<n> was kept as a draft with the work so far.` If GitHub refuses the
+  draft, a "Do not merge" comment goes on the PR instead, and the messages
+  say so.
+- **A floor, not an exact bill.** Only API calls that write an assistant
+  row to the transcript are counted; calls the CLI makes on its own without
+  one (for example, short helper calls) are not. The count can be a little
+  under what the subscription was charged.
+- **Unknown is not zero.** A transcript row whose usage cannot be read adds
+  nothing and is counted as unreadable; the log gets `budget.usage_unreadable`
+  and the page shows the total as unknown. What could be read is still a
+  true floor, so a run is stopped only when that floor reaches the hard limit.
+  An unreadable row on its own never stops a run.
+- **What is stored.** `sessions.usage_tokens` is the counted total (a floor
+  when rows were unreadable) and `sessions.usage_detail` holds the breakdown,
+  the unreadable row count, the cost and the limits applied, as JSON.
+  `cost_usd` is what the agent CLI's final `result` event reported
+  (`total_cost_usd`), summed over the session's spawns; it is information
+  only.
+- **Backends.** Only the `claude` backend writes a transcript ctrlrelay can
+  read. A run on `opencode` is not measured; with a limit set, the log gets
+  `dispatcher.budget.unmeasured` and nothing is enforced.
 
 ## When to restart
 

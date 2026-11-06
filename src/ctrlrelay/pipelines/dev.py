@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from ctrlrelay.core.budget import is_budget_reason, label_names, session_scope
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.claims import (
     CLAIM_MARKER_PREFIX,
@@ -415,6 +416,62 @@ def claim_failure_comment(
         # old, unnamed claims above it.
         + (f"\n{release_marker(claim_id)}" if claim_id else "")
     )
+
+
+async def park_stopped_pr(
+    github: GitHubCLI,
+    result: PipelineResult,
+    *,
+    repo: str,
+    pr_number: int | None,
+) -> PipelineResult:
+    """A run stopped over budget (#223) or as stuck (#224) after its pull
+    request was opened: put the PR back to draft so it does not read as
+    ready, and say so. When that fails, a do-not-merge comment goes on the
+    PR instead. ``pr_number`` must be the number the relay recorded when it
+    published, never one from the agent's checkpoint. Raises nothing but a
+    cancellation: this runs on a failure path."""
+    if result.success or result.blocked or not result.stuck_reason:
+        return result
+    if pr_number is None:
+        return result
+    why = "over budget" if is_budget_reason(result.stuck_reason) else "as stuck"
+    try:
+        await github.set_pr_draft(repo, pr_number, True)
+        note = f"PR #{pr_number} was kept as a draft with the work so far."
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log_event(
+            _logger, "dev.stopped.draft_failed", repo=repo,
+            session_id=result.session_id, pr_number=pr_number,
+            error_type=type(e).__name__, error=str(e)[:200],
+        )
+        try:
+            await github.comment_on_pr(
+                repo, pr_number,
+                f"**Do not merge.** ctrlrelay stopped this run {why} "
+                f"({result.stuck_reason}) and could not put this pull "
+                "request back to draft. It holds the work so far: not "
+                "finished and not reviewed.",
+            )
+            note = (
+                f"PR #{pr_number} could not be put back to draft; a "
+                "do-not-merge comment was posted on it."
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e2:
+            log_event(
+                _logger, "dev.stopped.comment_failed", repo=repo,
+                session_id=result.session_id, pr_number=pr_number,
+                error_type=type(e2).__name__, error=str(e2)[:200],
+            )
+            note = (
+                f"PR #{pr_number} could not be put back to draft or "
+                "commented on: do not merge it."
+            )
+    return dataclasses.replace(result, parked_pr=pr_number, parked_note=note)
 
 
 def wip_branch_name(issue_number: int, session_id: str) -> str:
@@ -1094,6 +1151,13 @@ CTRLRELAY_DONE
             # #219: the agent edits and commits only. The relay pushes
             # and opens the pull request with its own credentials.
             github_access=False,
+            # #223: the token budget is for the whole session.
+            budget_scope=session_scope(
+                self.state_db, ctx.session_id,
+                labels=ctx.extra.get("issue_labels") or (),
+                transport=self.transport, repo=ctx.repo,
+                issue_number=ctx.issue_number,
+            ),
         )
 
         if result.agent_session_id:
@@ -1261,12 +1325,17 @@ CHANGED>"`. If the branch does have commits, they are published anyway.
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
         """Convert SessionResult to PipelineResult."""
         if result.state is None and result.stuck_reason is not None:
-            # The relay stopped an agent going in circles (#224).
-            reason = f"the agent {result.stuck_reason}"
+            # The relay stopped an agent going in circles (#224), or over
+            # its token budget (#223).
+            over = is_budget_reason(result.stuck_reason)
+            reason = (
+                result.stuck_reason if over
+                else f"the agent {result.stuck_reason}"
+            )
             return PipelineResult(
                 success=False,
                 session_id=result.session_id,
-                summary=f"Stuck: {reason}",
+                summary=f"Stopped: {reason}" if over else f"Stuck: {reason}",
                 exit_code=result.exit_code,
                 stuck_reason=reason,
             )
@@ -3804,6 +3873,7 @@ async def run_dev_issue(
                 "issue_title": issue.get("title", ""),
                 "issue_body": issue.get("body", ""),
                 "issue_comments": format_issue_comments(issue.get("comments")),
+                "issue_labels": label_names(issue),
                 "branch_name": branch_name,
                 "ci_wait_timeout_seconds": ci_wait_timeout_seconds,
             },
@@ -3943,6 +4013,12 @@ async def run_dev_issue(
                 merged_outputs = dict(result.outputs)
                 merged_outputs["cleanup_deferred"] = True
                 result = dataclasses.replace(result, outputs=merged_outputs)
+
+        # A run stopped after its PR was opened keeps the PR, as a draft
+        # (#223).
+        result = await park_stopped_pr(
+            github, result, repo=repo, pr_number=run.pr_number_for_review,
+        )
 
         # Update session status
         status = "done" if result.success else ("blocked" if result.blocked else "failed")
@@ -4102,7 +4178,8 @@ async def run_dev_issue(
                 issue_number=issue_number,
                 session_id=session_id,
                 reason=failure_text(result)
-                + (f" {timeout_note}" if timeout_note else ""),
+                + (f" {timeout_note}" if timeout_note else "")
+                + (f" {result.parked_note}" if result.parked_note else ""),
                 exit_code=result.exit_code,
                 pr_number=pr_for_comment,
                 claim_posted=claim_may_stand,
@@ -4393,6 +4470,7 @@ async def resume_dev_from_pending(
                 "issue_title": issue.get("title", ""),
                 "issue_body": issue.get("body", ""),
                 "issue_comments": format_issue_comments(issue.get("comments")),
+                "issue_labels": label_names(issue),
                 "branch_name": branch_name,
             },
         )
@@ -4490,15 +4568,32 @@ async def resume_dev_from_pending(
                     review=run.review_report or REVIEW_NOT_REPORTED,
                 )
         assert run.result is not None
-        result = run.result
+        result = await park_stopped_pr(
+            github, run.result, repo=repo, pr_number=run.pr_number_for_review,
+        )
+        if result.parked_pr is not None:
+            # The same issue comment the first run posts for a stop with
+            # a PR (#223): why it stopped, and that the PR is a draft.
+            await reconcile_claim_on_failure(
+                github,
+                repo=repo,
+                issue_number=int(issue_number),
+                session_id=session_id,
+                reason=f"{failure_text(result)} {result.parked_note}",
+                exit_code=result.exit_code,
+                pr_number=result.parked_pr,
+                claim_id=session_row.get("claim_id"),
+            )
 
         status = "done" if result.success else (
             "blocked" if result.blocked else "failed"
         )
+        # Stuck or over budget (#224, #223), as in run_dev_issue.
+        stuck_reason = result.stuck_reason if status == "failed" else None
         state_db.execute(
-            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
-            "WHERE id = ?",
-            (status, result.summary, int(time.time()), session_id),
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ?, "
+            "stuck_reason = ? WHERE id = ?",
+            (status, result.summary, int(time.time()), stuck_reason, session_id),
         )
         state_db.commit()
         await _note_no_change_on_issue(
@@ -4539,6 +4634,7 @@ async def resume_dev_from_pending(
                 "session_id": session_id,
                 "exit_code": result.exit_code,
                 "question": result.question,
+                "stuck_reason": stuck_reason,
             },
         )
         return result

@@ -63,6 +63,9 @@ RUNNING_KEYS = {
     "started_ts", "elapsed_s", "phase", "phase_source", "last_command",
     "last_step", "last_step_ts", "looks_stuck", "reason", "url",
     "current_activity", "pr_url", "running_command",
+    # #223
+    "tokens_used", "cache_read_tokens", "cost_usd", "token_soft_limit",
+    "token_hard_limit",
 }
 NEEDS_KEYS = {
     "session_id", "pipeline", "repo", "issue_number", "title", "question",
@@ -1604,3 +1607,76 @@ def test_the_dispatcher_records_the_agent_pid_where_the_page_reads_it(
     adapter.usage_store = UsageStore.beside(tmp_path / "state.db")
     adapter._record_agent_pid("dev-o-r-1-abc", 4242)
     assert read_agent_pid(tmp_path / "agents", "dev-o-r-1-abc") == 4242
+
+
+# --- tokens per run (#223) ---------------------------------------------------
+
+
+def _usage(db: StateDB, sid: str, tokens: int, detail: dict | str) -> None:
+    import json
+
+    db.execute(
+        "UPDATE sessions SET usage_tokens = ?, usage_detail = ? WHERE id = ?",
+        (tokens, detail if isinstance(detail, str) else json.dumps(detail), sid),
+    )
+    db.commit()
+
+
+def test_running_card_shows_the_session_tokens(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _session(db, "s-1", worktree=_worktree(tmp_path, "a"), started_at=1_000)
+    _usage(db, "s-1", 1_500, {
+        "input_tokens": 500, "cache_creation_input_tokens": 700,
+        "cache_read_input_tokens": 90_000, "output_tokens": 300,
+        "unreadable_rows": 0, "cost_usd": 0.75,
+        "soft_tokens": 1_000, "hard_tokens": 5_000,
+    })
+    card = _only(_status(tmp_path, 2_000)["running"], "s-1")
+    assert card["tokens_used"] == 1_500
+    assert card["cache_read_tokens"] == 90_000
+    assert card["cost_usd"] == 0.75
+    assert card["token_soft_limit"] == 1_000
+    assert card["token_hard_limit"] == 5_000
+
+
+def test_tokens_not_measured_yet_are_null_not_zero(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _session(db, "s-1", worktree=_worktree(tmp_path, "a"), started_at=1_000)
+    card = _only(_status(tmp_path, 2_000)["running"], "s-1")
+    for key in ("tokens_used", "cache_read_tokens", "cost_usd",
+                "token_soft_limit", "token_hard_limit"):
+        assert card[key] is None
+
+
+def test_unreadable_usage_is_null_with_the_floor_in_the_reason(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _session(db, "s-1", worktree=_worktree(tmp_path, "a"), started_at=1_000)
+    _usage(db, "s-1", 1_200, {
+        "input_tokens": 1_200, "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0, "output_tokens": 0,
+        "unreadable_rows": 2, "cost_usd": None,
+        "soft_tokens": None, "hard_tokens": 2_000,
+    })
+    _session(db, "s-2", worktree=_worktree(tmp_path, "b"), started_at=1_001)
+    _usage(db, "s-2", 10, "{broken")
+    out = _status(tmp_path, 2_000)
+    assert out["errors"] == []
+    card = _only(out["running"], "s-1")
+    assert card["tokens_used"] is None
+    assert card["cache_read_tokens"] is None
+    assert card["token_hard_limit"] == 2_000
+    assert "2 transcript row(s) could not be read" in card["reason"]
+    assert "at least 1,200 tokens" in card["reason"]
+    broken = _only(out["running"], "s-2")
+    assert broken["tokens_used"] is None
+    assert "could not be read" in broken["reason"]
+
+
+def test_a_database_without_the_usage_columns_shows_null(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _session(db, "s-1", worktree=_worktree(tmp_path, "a"), started_at=1_000)
+    db.execute("ALTER TABLE sessions DROP COLUMN usage_detail")
+    db.commit()
+    out = _status(tmp_path, 2_000)
+    assert out["errors"] == []
+    assert _only(out["running"], "s-1")["tokens_used"] is None

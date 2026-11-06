@@ -217,6 +217,41 @@ modes either need every shell command allow-listed or filter by command text,
 which a wrapper script walks past, so they are not used as a guard. The guard
 is the next section: the agent holds no GitHub credentials.
 
+### agent.budget
+
+A token budget for each run (#223). Both limits unset (the default): no limit,
+and nothing changes. Usage is measured and shown on the status page either
+way. See [run budgets](operations.md#run-budgets) for what is counted.
+
+```yaml
+agent:
+  budget:
+    soft_tokens: 2000000     # warn once in chat and the log
+    hard_tokens: 6000000     # stop the agent
+    rules:                   # first rule naming any of the issue's labels wins
+      - labels: ["size:S", "size:XS"]
+        soft_tokens: 500000
+        hard_tokens: 1500000
+      - labels: ["size:L", "size:XL"]
+        hard_tokens: 15000000   # soft_tokens left out: 2000000 from above
+      - labels: ["no-budget"]
+        soft_tokens: null       # null: no limit for these runs
+        hard_tokens: null
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `soft_tokens` | int or null | `null` | When a run's total first reaches it, chat gets one line and the log gets `budget.soft_limit`. Once per session. |
+| `hard_tokens` | int or null | `null` | When a run's total reaches it, the agent is stopped and the run is recorded as failed with the reason `budget: used N tokens, hard limit M`. Must be at least `soft_tokens`. |
+| `rules` | list | `[]` | Other limits by issue label. Each rule has `labels` (a non-empty list) and optionally `soft_tokens` and `hard_tokens`. Labels match without regard to case. A size is a label (`size:S`), so this covers sizes too. A limit a rule leaves out comes from the top level; one set to `null` is no limit. |
+
+The count is input tokens + cache writes + output tokens; cache reads are
+recorded but not counted. The budget is for the whole issue session, across
+resumes and CI fix rounds. Unknown keys and a hard limit below the soft one
+(after a rule inherits from the top level) are refused when the config loads.
+Only the `claude` backend is measured. Runs with no issue (secops) get the
+top-level limits for each spawn.
+
 ### What the agent can reach (#219)
 
 The dev and task agents run **without GitHub access**. ctrlrelay starts them

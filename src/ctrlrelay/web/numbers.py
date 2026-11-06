@@ -45,7 +45,8 @@ Per window, overall and per repo:
 - ``reopened``: ``null`` when the database predates the record of finished
   issues (``issue_finishes``), or it could not be read.
 - ``stuck``: of the runs started in the window, the ones the relay stopped
-  as stuck (#224); they are also counted in ``failed``. Runs from before the
+  as stuck (#224); they are also counted in ``failed``. Runs stopped over
+  their token budget (#223) are counted in ``failed`` only. Runs from before the
   relay recorded this are not counted. ``null`` only when the database
   predates the record (``sessions.stuck_reason``).
 - ``time_to_pr_s``/``time_to_merge_s``: ``null`` when the events table
@@ -69,6 +70,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
+from ctrlrelay.core.budget import is_budget_reason
 from ctrlrelay.web.links import github_url
 
 WINDOWS = (7, 30)
@@ -232,7 +234,10 @@ def _counts(
         "came_back": came_back,
         "reopened": reopened,
         "stuck": (
-            sum(1 for r in runs if r["stuck_reason"])
+            sum(
+                1 for r in runs
+                if r["stuck_reason"] and not is_budget_reason(r["stuck_reason"])
+            )
             if all("stuck_reason" in r for r in runs)
             else None
         ),

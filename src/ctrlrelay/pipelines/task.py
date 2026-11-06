@@ -32,6 +32,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from ctrlrelay.core.budget import is_budget_reason, label_names, session_scope
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.claims import (
     PROCESS_RUN,
@@ -210,6 +211,13 @@ class TaskPipeline:
             # #219: the relay posts the report; the agent has no GitHub
             # credentials.
             github_access=False,
+            # #223: the token budget is for the whole session.
+            budget_scope=session_scope(
+                self.state_db, ctx.session_id,
+                labels=ctx.extra.get("issue_labels") or (),
+                transport=self.transport, repo=ctx.repo,
+                issue_number=ctx.issue_number,
+            ),
         )
 
         if result.agent_session_id:
@@ -364,6 +372,15 @@ printf '{{"version":"1","status":"FAILED",'\\
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
         state = result.state
+        if state is None and is_budget_reason(result.stuck_reason):
+            # Stopped over its token budget (#223).
+            return PipelineResult(
+                success=False,
+                session_id=result.session_id,
+                summary=f"Stopped: {result.stuck_reason}",
+                exit_code=result.exit_code,
+                stuck_reason=result.stuck_reason,
+            )
         if state is None:
             return PipelineResult(
                 success=False,
@@ -496,6 +513,7 @@ async def run_task_issue(
             extra={
                 "issue_title": issue.get("title", ""),
                 "issue_body": issue.get("body", ""),
+                "issue_labels": label_names(issue),
             },
         )
 
@@ -566,10 +584,12 @@ async def run_task_issue(
         status = "done" if result.success else (
             "blocked" if result.blocked else "failed"
         )
+        # Over budget (#223) is recorded like dev's stuck runs.
+        stuck_reason = result.stuck_reason if status == "failed" else None
         state_db.execute(
-            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
-            "WHERE id = ?",
-            (status, result.summary, int(time.time()), session_id),
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ?, "
+            "stuck_reason = ? WHERE id = ?",
+            (status, result.summary, int(time.time()), stuck_reason, session_id),
         )
         state_db.commit()
 
@@ -602,6 +622,7 @@ async def run_task_issue(
                 "session_id": session_id,
                 "exit_code": result.exit_code,
                 "question": result.question,
+                "stuck_reason": stuck_reason,
             },
         )
 
@@ -842,6 +863,7 @@ async def resume_task_from_pending(
             extra={
                 "issue_title": issue.get("title", ""),
                 "issue_body": issue.get("body", ""),
+                "issue_labels": label_names(issue),
             },
         )
 
@@ -895,10 +917,12 @@ async def resume_task_from_pending(
         status = "done" if result.success else (
             "blocked" if result.blocked else "failed"
         )
+        # Over budget (#223) is recorded like dev's stuck runs.
+        stuck_reason = result.stuck_reason if status == "failed" else None
         state_db.execute(
-            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
-            "WHERE id = ?",
-            (status, result.summary, int(time.time()), session_id),
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ?, "
+            "stuck_reason = ? WHERE id = ?",
+            (status, result.summary, int(time.time()), stuck_reason, session_id),
         )
         state_db.commit()
 
@@ -931,6 +955,7 @@ async def resume_task_from_pending(
                 "session_id": session_id,
                 "exit_code": result.exit_code,
                 "question": result.question,
+                "stuck_reason": stuck_reason,
             },
         )
         return result

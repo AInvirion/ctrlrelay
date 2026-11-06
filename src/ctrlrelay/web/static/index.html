@@ -500,8 +500,34 @@ function runningCard(card, now) {
   last.appendChild(ticking(typeof card.last_step_ts === "number" ? now - card.last_step_ts : null,
     "", " ago"));
   box.appendChild(last);
+  box.appendChild(tokenRow(card));
   if (card.reason) { box.appendChild(el("div", "muted", card.reason)); }
   return box;
+}
+
+// #223: what the session has used. null is unknown, never 0.
+function tokenRow(card) {
+  var row = el("div", "row");
+  row.appendChild(el("span", "muted", "tokens:"));
+  if (typeof card.tokens_used === "number") {
+    var text = card.tokens_used.toLocaleString();
+    if (typeof card.token_hard_limit === "number") {
+      text += " of " + card.token_hard_limit.toLocaleString();
+    }
+    var over = typeof card.token_soft_limit === "number"
+      && card.tokens_used >= card.token_soft_limit;
+    row.appendChild(el("span", over ? "tag stuck" : "tag", text));
+  } else {
+    row.appendChild(el("span", "unknown", "unknown"));
+  }
+  if (typeof card.cache_read_tokens === "number") {
+    row.appendChild(el("span", "muted",
+      card.cache_read_tokens.toLocaleString() + " cache reads (not counted)"));
+  }
+  if (typeof card.cost_usd === "number") {
+    row.appendChild(el("span", "muted", "$" + card.cost_usd.toFixed(2) + " reported"));
+  }
+  return row;
 }
 
 function renderRunning(data, now) {

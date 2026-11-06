@@ -112,6 +112,70 @@ class OpenCodeConfig(BaseModel):
     default_timeout_seconds: int | None = Field(default=None, ge=1)
 
 
+class BudgetRule(BaseModel):
+    """Limits for runs on issues carrying any of ``labels`` (#223).
+
+    A limit left out is taken from ``agent.budget``; one set to ``null``
+    means no limit of that kind for these runs. Size is a label
+    (``size:L``), so a size rule is a label rule.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    labels: list[str] = Field(min_length=1)
+    soft_tokens: int | None = Field(default=None, ge=1)
+    hard_tokens: int | None = Field(default=None, ge=1)
+
+    @field_validator("labels")
+    @classmethod
+    def _labels_named(cls, v: list[str]) -> list[str]:
+        if any(not isinstance(x, str) or not x.strip() for x in v):
+            raise ValueError("every label must be a non-empty string")
+        return v
+
+
+class BudgetConfig(BaseModel):
+    """A token budget for each run (#223). Both limits unset: no limit.
+
+    ``soft_tokens`` warns once in chat and in the log; ``hard_tokens``
+    stops the agent. ``rules`` give other limits to runs by label; the
+    first rule naming any of the issue's labels wins.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    soft_tokens: int | None = Field(default=None, ge=1)
+    hard_tokens: int | None = Field(default=None, ge=1)
+    rules: list[BudgetRule] = Field(default_factory=list)
+
+    def limits_for(self, rule: BudgetRule) -> tuple[int | None, int | None]:
+        """``(soft, hard)`` for a rule, with what it leaves out inherited."""
+        soft = (
+            rule.soft_tokens if "soft_tokens" in rule.model_fields_set
+            else self.soft_tokens
+        )
+        hard = (
+            rule.hard_tokens if "hard_tokens" in rule.model_fields_set
+            else self.hard_tokens
+        )
+        return soft, hard
+
+    @model_validator(mode="after")
+    def _hard_not_below_soft(self) -> BudgetConfig:
+        pairs = [("agent.budget", (self.soft_tokens, self.hard_tokens))]
+        pairs += [
+            (f"agent.budget.rules[{i}]", self.limits_for(rule))
+            for i, rule in enumerate(self.rules)
+        ]
+        for where, (soft, hard) in pairs:
+            if soft is not None and hard is not None and hard < soft:
+                raise ValueError(
+                    f"{where}: hard_tokens ({hard}) is below soft_tokens "
+                    f"({soft}); the hard limit must be at least the soft one"
+                )
+        return self
+
+
 # The agent sandbox modes (#236). The status page reads the tuple to tell a
 # mode a peer sends from anything else (#305).
 SandboxMode = Literal["none", "bwrap"]
@@ -164,6 +228,8 @@ class AgentConfig(BaseModel):
     # Read only when a backend of this type is built, so it is inert on
     # a claude-only deployment and harmless to leave in a config file.
     opencode: OpenCodeConfig = Field(default_factory=OpenCodeConfig)
+    # #223. Off until a limit is set.
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
 
 
 # Backwards-compat alias. Older code and docs reference ``ClaudeConfig``;

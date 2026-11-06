@@ -26,7 +26,8 @@ Contract (keys exactly; every timestamp is ``<name>_ts`` epoch seconds plus
                   "started", "started_ts", "elapsed_s", "phase",
                   "current_activity", "phase_source", "last_command",
                   "last_step", "last_step_ts", "looks_stuck", "reason", "url",
-                  "pr_url"}] | null,
+                  "pr_url", "tokens_used", "cache_read_tokens", "cost_usd",
+                  "token_soft_limit", "token_hard_limit"}] | null,
      "needs_you": [{"session_id", "pipeline", "repo", "issue_number",
                     "title", "question", "asked", "asked_ts", "held_until",
                     "held_until_ts", "url", "refs"}] | null,
@@ -86,6 +87,15 @@ last step is older than ``stale_after_s``.
 ``pr_url`` is the session's pull request, built by ``github_url`` from the
 repo and the last int ``pr_number`` its pipeline events carry, else
 ``null``; a ``pr_url`` in an event's detail is never used.
+
+Tokens (#223), over every spawn of the session so far: ``tokens_used`` is
+input + cache writes + output, what the budget counts; ``cache_read_tokens``
+is recorded but not counted; ``cost_usd`` is the sum of what the agent CLI
+reported at the end of each spawn (information only); ``token_soft_limit``
+and ``token_hard_limit`` are the limits applied. Each is ``null`` when not
+measured yet, when no limit applies, or when it could not be read; when a
+transcript row could not be read ``tokens_used`` and ``cache_read_tokens``
+are ``null`` and ``reason`` says how many rows and the floor.
 """
 
 from __future__ import annotations
@@ -101,6 +111,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
+from ctrlrelay.core.budget import RunUsage
 from ctrlrelay.web import numbers as run_numbers
 from ctrlrelay.web.fleet import node_activity
 from ctrlrelay.web.links import github_url
@@ -130,6 +141,11 @@ _CLOSES = {"ci_finished": Phase.CI, "review_finished": Phase.REVIEW}
 # The phase an event shows a session reached, whether or not it is still open.
 _REACHED = {**_OPENS, **_CLOSES, "pr_opened": Phase.PR}
 _EVENTS_UNKNOWN = "CI and review state unknown: events not readable"
+# A running card's token fields (#223), in the order they are published.
+_USAGE_FIELDS = (
+    "tokens_used", "cache_read_tokens", "cost_usd",
+    "token_soft_limit", "token_hard_limit",
+)
 
 
 class _Missing:
@@ -393,12 +409,51 @@ class _Processes:
 
 
 def _read_running(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    # The usage columns (#223) only when the database has them: one the
+    # daemon has not migrated yet shows usage as unknown, not as 0.
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+    usage = (
+        ", usage_tokens, usage_detail"
+        if {"usage_tokens", "usage_detail"} <= columns else ""
+    )
     rows = conn.execute(
-        """SELECT id, pipeline, repo, issue_number, worktree_path, started_at
+        f"""SELECT id, pipeline, repo, issue_number, worktree_path, started_at
+           {usage}
            FROM sessions WHERE status = 'running'
            ORDER BY started_at ASC, id ASC"""
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _usage(row: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """The card's token fields (#223), and a reason when they are unknown.
+    Every field is ``null`` unless it was measured and could be read."""
+    out: dict[str, Any] = dict.fromkeys(_USAGE_FIELDS)
+    raw = row.get("usage_detail")
+    if raw is None:
+        return out, None
+    try:
+        detail = json.loads(raw)
+        usage = RunUsage.from_json(detail)
+        soft, hard = detail.get("soft_tokens"), detail.get("hard_tokens")
+        for limit in (soft, hard):
+            if limit is not None and (
+                isinstance(limit, bool) or not isinstance(limit, int)
+            ):
+                raise ValueError("a limit is not a token count")
+    except (ValueError, RecursionError, TypeError, AttributeError):
+        return out, "token usage unknown: the recorded usage could not be read"
+    out["token_soft_limit"] = soft
+    out["token_hard_limit"] = hard
+    out["cost_usd"] = usage.cost_usd
+    if not usage.complete:
+        return out, (
+            f"token usage unknown: {usage.unreadable} transcript row(s) could "
+            f"not be read; at least {usage.counted:,} tokens used"
+        )
+    out["tokens_used"] = usage.counted
+    out["cache_read_tokens"] = usage.cache_read_tokens
+    return out, None
 
 
 def _read_busy(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -705,6 +760,9 @@ def _card(
             reasons.append(f"could not check for a running command: {e}"[:200])
         if command is not None:
             looks_stuck = False
+    usage, usage_reason = _usage(row)
+    if usage_reason:
+        reasons.append(usage_reason)
     issue = row.get("issue_number")
     title = _title_for(titles, row["repo"], issue)
     return {
@@ -731,6 +789,7 @@ def _card(
         # Built from the session's repo and the number ctrlrelay recorded,
         # never from a URL an agent reported.
         "pr_url": github_url(row["repo"], pr_number, kind="pull"),
+        **usage,
     }
 
 
