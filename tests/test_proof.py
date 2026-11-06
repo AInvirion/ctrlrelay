@@ -1341,3 +1341,99 @@ async def test_a_run_stopped_in_a_fix_round_gets_no_proof_and_is_parked(
     assert _proof_comments(github) == []
     assert result.parked_pr == PR
     github.set_pr_draft.assert_any_await("owner/repo", PR, True)
+
+
+# --- review round 2 ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "new",
+    [
+        "tests/test_x.txt",
+        "tests/test_x.md",
+        "tests/test_x.py.disabled",
+        "tests/test_x.json",
+    ],
+)
+def test_renaming_a_collected_test_to_anything_uncollected_is_a_hit(new: str) -> None:
+    scan = scan_weakening([Change("R", new, "tests/test_x.py")], "")
+    assert len(scan.hits) == 1 and "does not collect" in scan.hits[0], scan
+
+
+def test_renaming_a_test_in_another_language_away_is_a_hit() -> None:
+    gone = scan_weakening(
+        [Change("R", "tests/a_test.go.disabled", "tests/a_test.go")], "",
+    )
+    assert len(gone.hits) == 1, gone
+    kept = scan_weakening([Change("R", "pkg/b_test.go", "pkg/a_test.go")], "")
+    assert kept.hits == ()
+    out = scan_weakening([Change("R", "test_x.py.disabled", "test_x.py")], "")
+    assert len(out.hits) == 1, out
+
+
+def _bounded(coro, seconds: float = 10):
+    import asyncio
+
+    return asyncio.wait_for(coro, seconds)
+
+
+@pytest.mark.asyncio
+async def test_a_fifo_junit_report_is_refused_without_hanging(tmp_path: Path) -> None:
+    from ctrlrelay.core.proof import read_junit_report
+
+    fifo = tmp_path / "report.xml"
+    os.mkfifo(fifo)
+    text, why = await _bounded(read_junit_report(fifo, timeout=2))
+    assert text is None and "not a regular file" in why
+
+
+@pytest.mark.asyncio
+async def test_a_symlinked_junit_report_is_refused(tmp_path: Path) -> None:
+    from ctrlrelay.core.proof import read_junit_report
+
+    real = tmp_path / "real.xml"
+    real.write_text("<testsuites/>")
+    link = tmp_path / "report.xml"
+    link.symlink_to(real)
+    text, why = await _bounded(read_junit_report(link, timeout=2))
+    assert text is None and "not a regular file" in why
+    ok, problem = await _bounded(read_junit_report(real, timeout=2))
+    assert ok == "<testsuites/>" and problem is None
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_junit_report_is_refused(tmp_path: Path) -> None:
+    from ctrlrelay.core.proof import read_junit_report
+
+    big = tmp_path / "report.xml"
+    big.write_bytes(b"x" * 2048)
+    text, why = await _bounded(read_junit_report(big, limit=1024, timeout=2))
+    assert text is None and "over 1024 bytes" in why
+
+
+@pytest.mark.asyncio
+async def test_a_runner_that_plants_a_fifo_as_its_report_is_not_proven(
+    tmp_path: Path,
+) -> None:
+    """Through run_claim: a "pytest" that puts a FIFO where the report goes.
+    The relay neither hangs nor counts the run."""
+    from ctrlrelay.core.proof import run_claim
+
+    launcher = tmp_path / "bin" / "pytest"
+    launcher.parent.mkdir()
+    launcher.write_text(
+        "#!/bin/sh\nfor a in \"$@\"; do case $a in --junitxml=*) "
+        "mkfifo \"${a#--junitxml=}\";; esac; done\n"
+        "echo 'tests/test_a.py::test_x FAILED'\nexit 1\n"
+    )
+    launcher.chmod(0o755)
+    cwd = tmp_path / "holder" / "repo"
+    cwd.mkdir(parents=True)
+    claim = ProofClaim(command=(str(launcher),), tests=("tests/test_a.py::test_x",))
+    run = await _bounded(
+        run_claim(claim, cwd, Confinement(mode="none"), before=True, timeout=5),
+    )
+    assert run.status == "not shown", run
+    assert "not a regular file" in run.detail
+    # The report directory is the relay's, beside the copy, and is gone.
+    assert list((tmp_path / "holder").iterdir()) == [cwd]

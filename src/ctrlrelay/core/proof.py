@@ -215,6 +215,18 @@ def _collected(path: str) -> bool | None:
     return None
 
 
+def _runner_collects(path: str) -> bool:
+    """Whether a test runner picks ``path`` up as tests, by its name. A
+    name in a language the scan does not read counts when it follows a
+    test naming convention (``*_test.go``, ``*_spec.rb``); anything else,
+    such as ``test_x.txt`` or ``test_x.py.disabled``, is not collected."""
+    collected = _collected(path)
+    if collected is not None:
+        return collected
+    name = PurePosixPath(path).name
+    return bool(_TEST_NAME.match(name)) and name != "conftest.py"
+
+
 def test_language(path: str) -> str | None:
     """``python`` or ``js`` for test code the scan reads, else None."""
     suffix = PurePosixPath(path).suffix.lower()
@@ -386,7 +398,7 @@ def scan_weakening(
             if not is_test_file(path):
                 hits.append(f"moved test file `{old}` out of the tests")
                 continue
-            if _collected(old) and _collected(path) is False:
+            if _runner_collects(old) and not _runner_collects(path):
                 hits.append(
                     f"renamed test file `{old}` to `{path}`, which the test "
                     "runner does not collect"
@@ -500,7 +512,7 @@ class Confinement:
     hide_paths: tuple[str, ...] = ()
     cache_dir: Path | None = None
 
-    def prefix(self, cwd: Path) -> list[str]:
+    def prefix(self, cwd: Path, extra_writable: Sequence[Path] = ()) -> list[str]:
         if self.mode != "bwrap":
             # The agent ran unconfined: it already executed arbitrary code
             # as this user, with network. Running its test command the
@@ -508,7 +520,7 @@ class Confinement:
             # GitHub token is still stripped from the environment.
             return []
         assert self.bwrap is not None
-        writable: list[str | Path] = [cwd]
+        writable: list[str | Path] = [cwd, *extra_writable]
         if self.cache_dir is not None:
             writable.append(self.cache_dir)
         argv = bwrap_prefix(self.bwrap, self.hide_paths, writable=writable)
@@ -557,9 +569,11 @@ async def run_proof_command(
     confinement: Confinement,
     *,
     timeout: float = PROOF_TIMEOUT_SECONDS,
+    writable: Sequence[Path] = (),
 ) -> CommandRun:
     """Run ``command`` in ``cwd``, bounded by ``timeout``, without the
-    operator's GitHub token, under ``confinement``."""
+    operator's GitHub token, under ``confinement``. ``writable`` names
+    other directories the sandbox lets it write."""
     private = Path(tempfile.mkdtemp(prefix="ctrlrelay-proof-"))
     try:
         (private / "gh").mkdir()
@@ -570,7 +584,7 @@ async def run_proof_command(
         if confinement.mode == "bwrap" and confinement.cache_dir is not None:
             env.update(agent_cache_env(confinement.cache_dir))
         try:
-            argv = [*confinement.prefix(cwd), *command]
+            argv = [*confinement.prefix(cwd, writable), *command]
         except Exception as e:
             return CommandRun(
                 status="could not run",
@@ -720,7 +734,7 @@ def _collection_errors_in_named_files(
 
 def judge(
     run: CommandRun, claim: ProofClaim, *, before: bool,
-    junit: str | None, pytest_run: bool,
+    junit: str | None, pytest_run: bool, junit_problem: str | None = None,
 ) -> CommandRun:
     """``run`` judged against the named tests.
 
@@ -761,7 +775,7 @@ def judge(
         if code not in (0, 1):
             return not_shown("unexpected exit code")
         if junit is None:
-            return not_shown("pytest wrote no junit report")
+            return not_shown(junit_problem or "pytest wrote no junit report")
         try:
             cases = _junit_cases(junit)
         except Exception as e:
@@ -796,26 +810,85 @@ def judge(
     return not_shown(f"expected exit {1 if before else 0}")
 
 
+# The junit report is written by code the agent controls. It is read
+# only if it is a regular file (not a link, not a FIFO), no bigger than
+# this, and the read happens off the event loop with a time limit.
+JUNIT_MAX_BYTES = 5 * 1024 * 1024
+JUNIT_READ_TIMEOUT_SECONDS = 30.0
+
+
+def _read_report_blocking(path: Path, limit: int) -> str:
+    import stat
+
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        raise ValueError("pytest wrote no junit report") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("the junit report is not a regular file")
+    if st.st_size > limit:
+        raise ValueError(f"the junit report is over {limit} bytes")
+    # O_NOFOLLOW and O_NONBLOCK: a file swapped for a link or a FIFO after
+    # the check is refused or opens without waiting, and fstat sees it.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("the junit report is not a regular file")
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise ValueError(f"the junit report is over {limit} bytes")
+    return data.decode(errors="replace")
+
+
+async def read_junit_report(
+    path: Path, *, limit: int = JUNIT_MAX_BYTES,
+    timeout: float = JUNIT_READ_TIMEOUT_SECONDS,
+) -> tuple[str | None, str | None]:
+    """``(text, None)``, or ``(None, why it was not read)``."""
+    try:
+        text = await asyncio.wait_for(
+            asyncio.to_thread(_read_report_blocking, path, limit), timeout,
+        )
+    except ValueError as e:
+        return None, str(e)
+    except asyncio.TimeoutError:
+        return None, "the junit report could not be read in time"
+    except OSError as e:
+        return None, f"the junit report could not be read ({type(e).__name__})"
+    return text, None
+
+
 async def run_claim(
     claim: ProofClaim, cwd: Path, confinement: Confinement, *,
     before: bool, timeout: float = PROOF_TIMEOUT_SECONDS,
 ) -> CommandRun:
     """Run the claim's command in ``cwd`` and judge whether the named tests
-    ran and how they came out. A pytest command gets ``--junitxml``, written
-    inside ``cwd`` (the one place the sandbox lets it write)."""
+    ran and how they came out. A pytest command gets ``--junitxml`` in a
+    directory of the relay's own, beside ``cwd`` rather than in it, which
+    the sandbox lets it write."""
     pytest_run = is_pytest_command(claim.command)
     command = list(claim.command)
-    report = cwd / f".ctrlrelay-proof-{os.urandom(6).hex()}.xml"
-    if pytest_run:
-        command.append(f"--junitxml={report}")
-    run = await run_proof_command(command, cwd, confinement, timeout=timeout)
-    junit = None
-    if pytest_run:
-        try:
-            junit = report.read_text(errors="replace")
-        except OSError:
-            junit = None
-    return judge(run, claim, before=before, junit=junit, pytest_run=pytest_run)
+    report_dir = Path(tempfile.mkdtemp(prefix="ctrlrelay-junit-", dir=cwd.parent))
+    try:
+        report = report_dir / "report.xml"
+        if pytest_run:
+            command.append(f"--junitxml={report}")
+        run = await run_proof_command(
+            command, cwd, confinement, timeout=timeout,
+            writable=(report_dir,) if pytest_run else (),
+        )
+        junit = problem = None
+        if pytest_run:
+            junit, problem = await read_junit_report(report)
+        return judge(
+            run, claim, before=before, junit=junit, pytest_run=pytest_run,
+            junit_problem=problem,
+        )
+    finally:
+        shutil.rmtree(report_dir, ignore_errors=True)
 
 
 # --- the evidence ------------------------------------------------------------
