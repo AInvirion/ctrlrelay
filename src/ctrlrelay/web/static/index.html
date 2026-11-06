@@ -628,10 +628,20 @@ function ago(iso, now) {
   return isNaN(t) ? "unknown" : duration(Math.max(0, Math.round(now - t / 1000))) + " ago";
 }
 
+// A reading with a 7-day window and no 5-hour one: the account has no
+// 5-hour limit, which is how ultra plans report. No reading at all is
+// still unknown.
+function noFiveHour(u, name) {
+  var week = u && typeof u === "object" ? u.seven_day : null;
+  return name === "five_hour" && !!week && typeof week.used === "number";
+}
+var NO_FIVE_HOUR = "none (ultra plan)";
+
 function usagePct(node, name) {
   var u = node && node.usage;
   var w = u && typeof u === "object" ? u[name] : null;
-  return w && typeof w.used === "number" ? pct(w.used * 100) : "unknown";
+  if (w && typeof w.used === "number") { return pct(w.used * 100); }
+  return noFiveHour(u, name) ? NO_FIVE_HOUR : "unknown";
 }
 
 function machineCard(name, node, state, bad, now, extra, pageUrl) {
@@ -961,7 +971,8 @@ function renderUsage(data, now) {
   ["five_hour", "seven_day"].forEach(function (name) {
     var w = u[name];
     if (!w || typeof w !== "object" || typeof w.used !== "number") {
-      lines.push(el("div", "line", WINDOW_LABELS[name] + " unknown"));
+      lines.push(el("div", "line", WINDOW_LABELS[name] + " " +
+        (noFiveHour(u, name) ? NO_FIVE_HOUR : "unknown")));
       return;
     }
     var high = typeof n.pause_at === "number" && w.used >= n.pause_at;
