@@ -4571,6 +4571,19 @@ async def resume_dev_from_pending(
         result = await park_stopped_pr(
             github, run.result, repo=repo, pr_number=run.pr_number_for_review,
         )
+        if result.parked_pr is not None:
+            # The same issue comment the first run posts for a stop with
+            # a PR (#223): why it stopped, and that the PR is a draft.
+            await reconcile_claim_on_failure(
+                github,
+                repo=repo,
+                issue_number=int(issue_number),
+                session_id=session_id,
+                reason=f"{failure_text(result)} {result.parked_note}",
+                exit_code=result.exit_code,
+                pr_number=result.parked_pr,
+                claim_id=session_row.get("claim_id"),
+            )
 
         status = "done" if result.success else (
             "blocked" if result.blocked else "failed"

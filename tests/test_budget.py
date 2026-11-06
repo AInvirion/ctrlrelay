@@ -559,11 +559,14 @@ def test_the_outcome_event_names_a_budget_stop(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_task_lane_records_a_budget_stop(tmp_path: Path):
+@pytest.mark.parametrize("path", ["first run", "resume"])
+async def test_task_lane_records_a_budget_stop(tmp_path: Path, path: str):
+    """Both task finish paths write stuck_reason to the session row and
+    hand it to the outcome event."""
     from unittest.mock import MagicMock
 
     from ctrlrelay.core.dispatcher import SessionResult
-    from ctrlrelay.pipelines.task import run_task_issue
+    from ctrlrelay.pipelines.task import resume_task_from_pending, run_task_issue
 
     reason = budget_reason(1_100, 1_000)
     dispatcher = AsyncMock()
@@ -577,11 +580,23 @@ async def test_task_lane_records_a_budget_stop(tmp_path: Path):
     github = AsyncMock()
     github.get_issue.return_value = {"number": 5, "title": "t", "body": ""}
     db = StateDB(tmp_path / "state.db")
-    result = await run_task_issue(
-        claims=None, repo="o/r", issue_number=5, dispatcher=dispatcher,
-        github=github, worktree=worktree, dashboard=None, state_db=db,
-        transport=None, contexts_dir=tmp_path / "contexts",
+    common = dict(
+        repo="o/r", dispatcher=dispatcher, github=github, worktree=worktree,
+        dashboard=None, state_db=db, transport=None,
+        contexts_dir=tmp_path / "contexts",
     )
+    if path == "first run":
+        result = await run_task_issue(claims=None, issue_number=5, **common)
+    else:
+        db.execute(
+            """INSERT INTO sessions (id, pipeline, repo, worktree_path, status,
+               started_at, issue_number)
+               VALUES ('task-a', 'task', 'o/r', NULL, 'blocked', 1, 5)"""
+        )
+        db.commit()
+        result = await resume_task_from_pending(
+            session_id="task-a", answer="go on", **common,
+        )
     assert result.stuck_reason == reason
     row = db.execute("SELECT status, stuck_reason FROM sessions").fetchone()
     assert (row[0], row[1]) == ("failed", reason)

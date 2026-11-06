@@ -590,6 +590,19 @@ async def announce_dev_success(
     return sent
 
 
+def resume_failure_text(result) -> str:
+    """The reason in the sweeper's "Resume failed" chat line: the run's
+    failure text, plus what happened to its PR when a stopped run parked
+    it as a draft (#223)."""
+    from ctrlrelay.pipelines.base import failure_text
+
+    text = failure_text(result)
+    parked = getattr(result, "parked_note", None)
+    if isinstance(parked, str) and parked:
+        text += f" {parked}"
+    return text
+
+
 def pr_to_watch(result) -> int | None:
     """The PR whose merge the watcher should wait on after an issue run, or
     None. A PR a stopped run parked as a draft (#223) is not handed over,
@@ -3907,7 +3920,6 @@ def poller_start(
             if not pending:
                 return
 
-            from ctrlrelay.pipelines.base import failure_text
             from ctrlrelay.pipelines.dev import resume_dev_from_pending
             from ctrlrelay.pipelines.secops import resume_secops_from_pending
             from ctrlrelay.pipelines.task import resume_task_from_pending
@@ -4176,7 +4188,7 @@ def poller_start(
                                     f"\n{q}"
                                 )
                             else:
-                                err = failure_text(result)
+                                err = resume_failure_text(result)
                                 await sweeper_transport.send(
                                     f"❌ Resume failed on {repo}\n"
                                     f"Session: `{session_id}`\n"

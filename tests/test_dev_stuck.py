@@ -333,3 +333,54 @@ async def test_chat_names_the_parked_pr():
         ),
     )
     assert sent[0].endswith(note)
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_run_stopped_with_a_pr_says_so_on_the_issue_and_in_chat(
+    tmp_path, monkeypatch
+):
+    from ctrlrelay.cli import resume_failure_text
+    from ctrlrelay.pipelines.dev import resume_dev_from_pending
+
+    reconcile = AsyncMock()
+    monkeypatch.setattr(dev_mod, "reconcile_claim_on_failure", reconcile)
+    spawns = iter([_done(), _over_budget()])
+    dispatcher = AsyncMock()
+    dispatcher.spawn_session.side_effect = lambda *a, **k: next(spawns)
+    worktree = AsyncMock()
+    worktree.push_run_branch.return_value = "c0ffee"
+    worktree.create_worktree_with_new_branch.return_value = (
+        tmp_path / "worktree", True,
+    )
+    worktree.symlink_context = MagicMock()
+    worktree.remove_context_symlink = MagicMock()
+    github = AsyncMock()
+    fake_relay_publish(github)
+    github.get_issue.return_value = {"number": 1, "title": "x", "body": "y"}
+    github.get_failed_job_log = AsyncMock(return_value=CODE_LOG)
+    verifier = AsyncMock()
+    verifier.verify.side_effect = [_failed()]
+
+    state_db = StateDB(tmp_path / "state.db")
+    state_db.execute(
+        """INSERT INTO sessions (id, pipeline, repo, worktree_path, status,
+           started_at, issue_number, claim_id)
+           VALUES ('dev-a', 'dev', 'owner/repo', NULL, 'blocked', 1, 1, 'c-1')"""
+    )
+    state_db.commit()
+    result = await resume_dev_from_pending(
+        session_id="dev-a", repo="owner/repo", answer="go on",
+        branch_template="fix/issue-{n}", dispatcher=dispatcher, github=github,
+        worktree=worktree, dashboard=None, state_db=state_db, transport=None,
+        contexts_dir=tmp_path / "contexts", pr_verifier=verifier,
+        max_fix_attempts=3,
+    )
+    note = "PR #42 was kept as a draft with the work so far."
+    assert result.parked_pr == 42 and result.parked_note == note
+    kwargs = reconcile.await_args.kwargs
+    assert note in kwargs["reason"] and "budget: used 1,100" in kwargs["reason"]
+    assert kwargs["pr_number"] == 42 and kwargs["claim_id"] == "c-1"
+    assert resume_failure_text(result).endswith(note)
+    row = state_db.get_session_row("dev-a")
+    assert row["stuck_reason"] == result.stuck_reason
+    state_db.close()
