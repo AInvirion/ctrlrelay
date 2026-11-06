@@ -34,6 +34,18 @@ from ctrlrelay.core.agent_env import (
     resolve_bwrap,
 )
 from ctrlrelay.core.binaries import resolve_binary
+from ctrlrelay.core.budget import (
+    DEFAULT_POLL_SECONDS as BUDGET_POLL_SECONDS,
+)
+from ctrlrelay.core.budget import (
+    BudgetScope,
+    BudgetWatch,
+    RunUsage,
+    TranscriptMeter,
+    is_budget_reason,
+    parse_result_cost,
+    resolve_limits,
+)
 from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus, read_checkpoint
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
 from ctrlrelay.core.stuck import StuckPolicy, watch_transcript
@@ -44,7 +56,7 @@ from ctrlrelay.core.usage import (
 )
 
 if TYPE_CHECKING:
-    from ctrlrelay.core.config import AgentConfig, Config
+    from ctrlrelay.core.config import AgentConfig, BudgetConfig, Config
 
 _logger = get_logger("core.dispatcher")
 
@@ -138,9 +150,14 @@ class SessionResult:
     # The relay killed the agent at its time limit (#311). Set only by the
     # relay's own timeout path, never parsed from anything the agent wrote.
     timed_out: bool = False
-    # The relay stopped the agent because its transcript showed it going in
-    # circles (#224), and why. Set only by the relay's own watch.
+    # The relay stopped the agent, and why: its transcript showed it going
+    # in circles (#224), or it went over its hard token limit (#223; the
+    # reason then starts with ``budget: ``). Set only by the relay's own
+    # watches, which share one stop path.
     stuck_reason: str | None = None
+    # What the session has used so far, this spawn included (#223). None
+    # when nothing could be measured (a backend with no known transcript).
+    usage: RunUsage | None = None
 
     @property
     def success(self) -> bool:
@@ -198,6 +215,11 @@ class CliAgentAdapter:
     # the watch by construction, and a test sets it on the instance.
     # ``None`` turns the watch off.
     stuck_policy: StuckPolicy | None = StuckPolicy()
+    # The token budget (#223), from ``agent.budget``; ``None`` is no limit.
+    # Usage is measured and reported whatever this says. Class attributes
+    # for the same reason as ``stuck_policy``.
+    budget: BudgetConfig | None = None
+    budget_poll_seconds: float = BUDGET_POLL_SECONDS
 
     @property
     def agent_binary(self) -> str:
@@ -216,28 +238,30 @@ class CliAgentAdapter:
         self,
         proc: Any,
         *,
-        folders: list[Path],
-        since: float,
+        watches: list[tuple[str, Callable[[], Awaitable[str]]]],
         ident: dict[str, Any],
-        stuck: list[str],
+        stops: list[tuple[str, str]],
     ) -> tuple[bytes, bytes]:
-        """``proc.communicate()``, while the transcript is watched (#224).
+        """``proc.communicate()``, while the watches run.
 
-        When the watch sees a loop it records the reason in ``stuck`` and
-        kills the child, which ends ``communicate()`` the normal way. The
-        watch is cancelled however this returns, the time limit included.
+        The one "stop with a reason" path, shared by the stuck watch (#224)
+        and the budget watch (#223). Each watch is ``(kind, coroutine)``;
+        the coroutine returns only when the run must stop, with the
+        reason. The first to return is recorded in ``stops`` and the child
+        is killed, which ends ``communicate()`` the normal way. Every watch
+        is cancelled however this returns, the time limit included.
         """
-        if not folders or self.stuck_policy is None:
+        if not watches:
             return await proc.communicate()
-        policy = self.stuck_policy
 
-        async def _watch() -> None:
-            reason = await watch_transcript(
-                folders, since=since, policy=policy, ident=ident,
-            )
-            stuck.append(reason)
+        async def _watch(kind: str, watch: Callable[[], Awaitable[str]]) -> None:
+            reason = await watch()
+            if stops:
+                return
+            stops.append((kind, reason))
             _logger.warning(
-                "dispatcher.session.stuck",
+                "dispatcher.session.stuck" if kind == "stuck"
+                else f"dispatcher.session.stopped_{kind}",
                 extra={**ident, "reason": reason},
             )
             try:
@@ -246,15 +270,17 @@ class CliAgentAdapter:
             except ProcessLookupError:
                 pass
 
-        watcher = asyncio.create_task(_watch())
+        watchers = [asyncio.create_task(_watch(k, w)) for k, w in watches]
         try:
             return await proc.communicate()
         finally:
-            watcher.cancel()
-            try:
-                await watcher
-            except BaseException:
-                pass
+            for watcher in watchers:
+                watcher.cancel()
+            for watcher in watchers:
+                try:
+                    await watcher
+                except BaseException:
+                    pass
 
     def _parse_agent_session_id(self, stdout_text: str) -> str | None:
         """The agent's own session id, for a later resume.
@@ -361,6 +387,7 @@ class CliAgentAdapter:
         resume_session_id: str | None,
         repo: str | None,
         issue_number: int | None,
+        budget_scope: BudgetScope | None = None,
     ) -> SessionResult:
         """Run the child built by :meth:`spawn_session` to completion."""
 
@@ -382,7 +409,19 @@ class CliAgentAdapter:
         # Transcript rows are stamped in wall-clock time. A second of slack
         # for the clock the CLI reads being a hair behind this one.
         wall_started = time.time() - 1.0
-        stuck: list[str] = []
+        stops: list[tuple[str, str]] = []
+        folders = self._transcript_dirs(working_dir, env)
+        budget = self._budget_watch(
+            folders, since=wall_started, scope=budget_scope, ident=ident,
+        )
+        watches: list[tuple[str, Callable[[], Awaitable[str]]]] = []
+        if folders and self.stuck_policy is not None:
+            policy = self.stuck_policy
+            watches.append(("stuck", lambda: watch_transcript(
+                folders, since=wall_started, policy=policy, ident=ident,
+            )))
+        if budget is not None:
+            watches.append(("budget", budget.run))
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -426,11 +465,7 @@ class CliAgentAdapter:
         try:
             stdout, stderr = await asyncio.wait_for(
                 self._communicate_watched(
-                    proc,
-                    folders=self._transcript_dirs(working_dir, env),
-                    since=wall_started,
-                    ident=ident,
-                    stuck=stuck,
+                    proc, watches=watches, ident=ident, stops=stops,
                 ),
                 timeout=timeout,
             )
@@ -585,15 +620,31 @@ class CliAgentAdapter:
 
         agent_session_id = self._parse_agent_session_id(stdout_text)
         self._record_usage(stdout_text, ident)
+        usage: RunUsage | None = None
+        if budget is not None:
+            spawn_usage = await budget.finish(parse_result_cost(stdout_text))
+            if spawn_usage is not None:
+                usage = budget.total(spawn_usage)
 
-        # A checkpoint the agent wrote wins: it finished, or asked, before
-        # the kill landed, so it was not stuck at the end.
-        stuck_reason = stuck[0] if stuck and state is None else None
+        stop_kind, stop_reason = stops[0] if stops else (None, None)
+        if stop_kind == "budget" and state is not None:
+            # Over budget is not handed over, whatever the agent wrote just
+            # before the kill landed (#223).
+            log_event(
+                _logger, "dispatcher.budget.checkpoint_discarded", **ident,
+                checkpoint_status=state.status.value,
+            )
+            state = None
+        # A checkpoint the agent wrote wins over a stuck stop: it finished,
+        # or asked, before the kill landed, so it was not stuck at the end.
+        stuck_reason = stop_reason if state is None else None
         if stuck_reason is not None:
             # In stderr too, so a lane that reads only stderr still says why.
-            stderr_text = (
-                f"Session stopped: stuck: {stuck_reason}\n{stderr_text}"
+            said = (
+                stuck_reason if is_budget_reason(stuck_reason)
+                else f"stuck: {stuck_reason}"
             )
+            stderr_text = f"Session stopped: {said}\n{stderr_text}"
 
         log_event(
             _logger,
@@ -624,6 +675,34 @@ class CliAgentAdapter:
             stderr=stderr_text,
             agent_session_id=agent_session_id,
             stuck_reason=stuck_reason,
+            usage=usage,
+        )
+
+    def _budget_watch(
+        self,
+        folders: list[Path],
+        *,
+        since: float,
+        scope: BudgetScope | None,
+        ident: dict[str, Any],
+    ) -> BudgetWatch | None:
+        """The usage meter and budget check for one spawn (#223), or None
+        when this backend's transcript is not known and nothing can be
+        measured. A limit that cannot be enforced is said in the log."""
+        scope = scope or BudgetScope()
+        limits = resolve_limits(self.budget, scope.labels)
+        if not folders:
+            if limits.any:
+                log_event(
+                    _logger, "dispatcher.budget.unmeasured", **ident,
+                    agent_type=self.agent_type, soft=limits.soft,
+                    hard=limits.hard,
+                )
+            return None
+        return BudgetWatch(
+            TranscriptMeter(folders, since=since),
+            limits=limits, scope=scope, ident=ident,
+            poll_seconds=self.budget_poll_seconds,
         )
 
 
@@ -830,6 +909,7 @@ class ClaudeDispatcher(CliAgentAdapter):
         issue_number: int | None = None,
         *,
         github_access: bool,
+        budget_scope: BudgetScope | None = None,
     ) -> SessionResult:
         """Spawn a Claude session and wait for completion.
 
@@ -930,6 +1010,7 @@ class ClaudeDispatcher(CliAgentAdapter):
                 resume_session_id=resume_session_id,
                 repo=repo,
                 issue_number=issue_number,
+                budget_scope=budget_scope,
             )
         finally:
             self.active -= 1
@@ -1106,6 +1187,7 @@ class OpenCodeDispatcher(CliAgentAdapter):
         issue_number: int | None = None,
         *,
         github_access: bool,
+        budget_scope: BudgetScope | None = None,
     ) -> SessionResult:
         """Spawn an ``opencode run`` session and wait for completion.
 
@@ -1197,6 +1279,7 @@ class OpenCodeDispatcher(CliAgentAdapter):
                 resume_session_id=resume_session_id,
                 repo=repo,
                 issue_number=issue_number,
+                budget_scope=budget_scope,
             )
         finally:
             self.active -= 1
@@ -1312,6 +1395,7 @@ class RepoAgentRouter:
         issue_number: int | None = None,
         *,
         github_access: bool,
+        budget_scope: BudgetScope | None = None,
     ) -> SessionResult:
         backend = self._backend(repo)
         if backend is not self.default:
@@ -1335,6 +1419,7 @@ class RepoAgentRouter:
             repo=repo,
             issue_number=issue_number,
             github_access=github_access,
+            budget_scope=budget_scope,
         )
 
 
@@ -1380,6 +1465,7 @@ class AgentAdapter(Protocol):
         issue_number: int | None = None,
         *,
         github_access: bool,
+        budget_scope: BudgetScope | None = None,
     ) -> SessionResult:
         ...
 
@@ -1408,6 +1494,23 @@ def make_agent_dispatcher(
     keeps no usage reading leaves the page showing an older number, or
     unknown, and the pause before the limit blind.
     """
+    adapter = _make_adapter(
+        agent_config, outcome_hook=outcome_hook, usage_store=usage_store,
+    )
+    from ctrlrelay.core.config import BudgetConfig
+
+    budget = getattr(agent_config, "budget", None)
+    # Only a validated block: anything else would compare as a limit.
+    adapter.budget = budget if isinstance(budget, BudgetConfig) else None
+    return adapter
+
+
+def _make_adapter(
+    agent_config: "AgentConfig",
+    *,
+    outcome_hook: DispatchOutcomeHook | None,
+    usage_store: UsageStore | None,
+) -> CliAgentAdapter:
     t = agent_config.type
     if t == "claude":
         return ClaudeDispatcher(

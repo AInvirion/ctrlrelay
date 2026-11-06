@@ -59,7 +59,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- Why the relay stopped this run as stuck (#224): going in circles in
     -- its transcript, or the same CI failures after fix round after fix
     -- round. NULL for every run that was not. Its status is 'failed'.
-    stuck_reason TEXT
+    -- A run stopped over its token budget (#223) is recorded here too,
+    -- with a reason starting 'budget: '.
+    stuck_reason TEXT,
+    -- Tokens the session has used (#223): input + cache writes + output,
+    -- over every spawn of the session. NULL when nothing was measured.
+    -- A floor, not the total, when usage_detail counts unreadable rows.
+    usage_tokens INTEGER,
+    -- The breakdown, the reported cost and the limits applied, as JSON
+    -- (see ctrlrelay.core.budget.record_usage). NULL with usage_tokens.
+    usage_detail TEXT
 );
 
 CREATE TABLE IF NOT EXISTS repo_locks (
@@ -373,6 +382,14 @@ class StateDB:
         if "stuck_reason" not in existing:
             self._conn.execute(
                 "ALTER TABLE sessions ADD COLUMN stuck_reason TEXT"
+            )
+        if "usage_tokens" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN usage_tokens INTEGER"
+            )
+        if "usage_detail" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN usage_detail TEXT"
             )
 
         pr_watches_cols = {

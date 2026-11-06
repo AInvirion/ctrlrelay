@@ -23,6 +23,7 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+from ctrlrelay.core.budget import is_budget_reason
 from ctrlrelay.core.obs import get_logger, log_event
 
 if TYPE_CHECKING:
@@ -173,9 +174,11 @@ def emit_outcome(
                 ),
             },
         }
-        # Only on a run the relay stopped as stuck (#224).
+        # Only on a run the relay stopped as stuck (#224) or over its
+        # token budget (#223); both share the stop path and the field.
         if isinstance(stuck_reason, str) and stuck_reason:
-            fields["detail"]["stuck"] = stuck_reason[:QUESTION_DETAIL_CHARS]
+            key = "budget" if is_budget_reason(stuck_reason) else "stuck"
+            fields["detail"][key] = stuck_reason[:QUESTION_DETAIL_CHARS]
     except Exception as e:  # noqa: BLE001 - best-effort by design
         _log_failure("<outcome>", e)
         return

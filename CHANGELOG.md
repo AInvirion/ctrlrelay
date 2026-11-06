@@ -14,6 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version), each machine's card on the status page says `sandbox off` in the
   warning colour when the agent runs unconfined, and the poller logs
   `poller.sandbox_off` once at start with what to do about it.
+- A token budget for each run (#223). `agent.budget.soft_tokens` warns once
+  in chat and the log; `agent.budget.hard_tokens` stops the agent, records the
+  run as failed with the reason `budget: used N tokens, hard limit M`, and
+  says `💸 Over budget` in chat. `agent.budget.rules` sets other limits by
+  issue label, which covers `size:*`; the first match wins. Nothing is limited
+  until a limit is set. The count is input + cache writes + output tokens,
+  read live from the agent's transcript, and covers the whole issue session
+  across resumes and fix rounds. Cache reads are recorded but not counted.
+- Each session records the tokens it used (`sessions.usage_tokens` and
+  `sessions.usage_detail`, with the cost the agent CLI reported). Running
+  cards on the status page and `/api/status` show `tokens_used`,
+  `cache_read_tokens`, `cost_usd`, `token_soft_limit` and `token_hard_limit`.
+  A reading that could not be parsed shows as unknown (`null`), never as 0,
+  and never stops a run on its own (#223).
 
 ## [0.23.0] - 2026-11-05
 

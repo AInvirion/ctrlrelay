@@ -618,6 +618,7 @@ async def announce_issue_outcome(
     Returns the messages in the order they were sent, which is what
     the tests assert on.
     """
+    from ctrlrelay.core.budget import is_budget_reason
     from ctrlrelay.pipelines.base import failure_text
 
     sent: list[str] = []
@@ -641,7 +642,16 @@ async def announce_issue_outcome(
     elif getattr(result, "stuck_reason", None):
         # Its own line (#224): a stuck run cost time and quota going in
         # circles, which is a different thing to look at from a crash.
-        line = f"🔁 Stuck on #{issue_number}, stopped: {result.stuck_reason}"
+        # Over budget (#223) shares the stop path and gets its own words.
+        if is_budget_reason(result.stuck_reason):
+            line = (
+                f"💸 Over budget on #{issue_number}, stopped: "
+                f"{result.stuck_reason}"
+            )
+        else:
+            line = (
+                f"🔁 Stuck on #{issue_number}, stopped: {result.stuck_reason}"
+            )
         await transport.send(line)
         sent.append(line)
     else:

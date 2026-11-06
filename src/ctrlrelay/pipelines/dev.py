@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from ctrlrelay.core.budget import is_budget_reason, label_names, session_scope
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.claims import (
     CLAIM_MARKER_PREFIX,
@@ -1094,6 +1095,13 @@ CTRLRELAY_DONE
             # #219: the agent edits and commits only. The relay pushes
             # and opens the pull request with its own credentials.
             github_access=False,
+            # #223: the token budget is for the whole session.
+            budget_scope=session_scope(
+                self.state_db, ctx.session_id,
+                labels=ctx.extra.get("issue_labels") or (),
+                transport=self.transport, repo=ctx.repo,
+                issue_number=ctx.issue_number,
+            ),
         )
 
         if result.agent_session_id:
@@ -1261,12 +1269,17 @@ CHANGED>"`. If the branch does have commits, they are published anyway.
     def _session_to_result(self, result: SessionResult) -> PipelineResult:
         """Convert SessionResult to PipelineResult."""
         if result.state is None and result.stuck_reason is not None:
-            # The relay stopped an agent going in circles (#224).
-            reason = f"the agent {result.stuck_reason}"
+            # The relay stopped an agent going in circles (#224), or over
+            # its token budget (#223).
+            over = is_budget_reason(result.stuck_reason)
+            reason = (
+                result.stuck_reason if over
+                else f"the agent {result.stuck_reason}"
+            )
             return PipelineResult(
                 success=False,
                 session_id=result.session_id,
-                summary=f"Stuck: {reason}",
+                summary=f"Stopped: {reason}" if over else f"Stuck: {reason}",
                 exit_code=result.exit_code,
                 stuck_reason=reason,
             )
@@ -3804,6 +3817,7 @@ async def run_dev_issue(
                 "issue_title": issue.get("title", ""),
                 "issue_body": issue.get("body", ""),
                 "issue_comments": format_issue_comments(issue.get("comments")),
+                "issue_labels": label_names(issue),
                 "branch_name": branch_name,
                 "ci_wait_timeout_seconds": ci_wait_timeout_seconds,
             },
@@ -4393,6 +4407,7 @@ async def resume_dev_from_pending(
                 "issue_title": issue.get("title", ""),
                 "issue_body": issue.get("body", ""),
                 "issue_comments": format_issue_comments(issue.get("comments")),
+                "issue_labels": label_names(issue),
                 "branch_name": branch_name,
             },
         )
