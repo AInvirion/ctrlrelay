@@ -688,6 +688,36 @@ def _matching_cases(
     ]
 
 
+def _module_of(test_id: str) -> str:
+    return test_id.split("::", 1)[0].removesuffix(".py").replace("/", ".")
+
+
+def _collection_errors_in_named_files(
+    run: CommandRun, claim: ProofClaim, junit: str | None,
+) -> list[str]:
+    """The named tests' files that pytest could not collect, read from the
+    junit report, when every named test is in one of them. Empty when there
+    is no report, when pytest did not end as a collection failure (exit 2,
+    or 4 for a node id), or when any named test is outside those files:
+    then the collection errors say nothing about the named tests."""
+    if junit is None or run.exit_code not in (2, 4):
+        return []
+    try:
+        cases = _junit_cases(junit)
+    except Exception:
+        return []
+    broken = {name for classname, name, result in cases
+              if classname == "" and result == "failed"}
+    files: list[str] = []
+    for test in claim.tests:
+        if _module_of(test) not in broken:
+            return []
+        path = test.split("::", 1)[0]
+        if path not in files:
+            files.append(path)
+    return files
+
+
 def judge(
     run: CommandRun, claim: ProofClaim, *, before: bool,
     junit: str | None, pytest_run: bool,
@@ -708,6 +738,24 @@ def judge(
 
     code = run.exit_code
     if pytest_run:
+        if before:
+            failed_import = _collection_errors_in_named_files(
+                run, claim, junit,
+            )
+            if failed_import:
+                # A test the branch added that imports code only the branch
+                # has: on the base its module cannot be imported, which is
+                # the test failing before. pytest exits 2 for a file, or 4
+                # for a node id whose module did not collect, so the junit
+                # report decides, not the exit code.
+                return replace(
+                    run, status="failed",
+                    detail=(
+                        "fails before: could not import on base (collection "
+                        "error in " + ", ".join(f"`{f}`" for f in failed_import)
+                        + ")"
+                    ),
+                )
         if code in _PYTEST_NOT_RUN:
             return not_shown(f"pytest {_PYTEST_NOT_RUN[code]}")
         if code not in (0, 1):

@@ -975,11 +975,12 @@ async def test_a_setup_failure_on_the_branch_is_not_proven_with_its_output(
 
 
 @pytest.mark.asyncio
-async def test_a_collection_error_on_the_base_is_not_proven(
+async def test_a_new_test_importing_branch_only_code_fails_before_and_is_proven(
     tmp_path: Path, git_home: Path
 ) -> None:
-    """A new test file that imports a name the base does not have stops at
-    collection there (pytest exits 2): the test itself never ran."""
+    """A new test file that imports a name only the branch has cannot be
+    imported on the base: that is the test failing before (pytest exits 4
+    for a node id whose module did not collect)."""
     repo = Repo(tmp_path)
     repo.write("calc.py", FIXED + "\n\ndef mul(a, b):\n    return a * b\n")
     repo.write(
@@ -988,9 +989,80 @@ async def test_a_collection_error_on_the_base_is_not_proven(
     )
     repo.commit("add mul")
     report = await repo.prove(_pytest_claim("tests/test_mul.py::test_mul"))
-    assert report.outcome == NOT_PROVEN, report
+    assert report.outcome == PROVEN, report
     assert report.after.status == "passed"
+    assert report.before.status == "failed"
+    assert "could not import on base (collection error in `tests/test_mul.py`)" in (
+        report.before.detail
+    )
+    assert "ImportError" in report.before.output
+
+
+@pytest.mark.asyncio
+async def test_a_collection_error_only_in_an_unrelated_file_is_not_proven(
+    tmp_path: Path, git_home: Path
+) -> None:
+    repo = Repo(tmp_path)
+    repo.write("calc.py", FIXED + "\n\ndef mul(a, b):\n    return a * b\n")
+    repo.write("tests/test_calc.py", EXISTING_TEST + NEW_TEST)
+    repo.write(
+        "tests/test_other.py",
+        "from calc import mul\n\n\ndef test_mul():\n    assert mul(2, 3) == 6\n",
+    )
+    repo.commit("fix add, add mul")
+    claim = _pytest_claim()
+    claim["command"] = claim["command"][:-1] + [
+        "tests/test_calc.py::test_add", "tests/test_other.py",
+    ]
+    report = await repo.prove(claim)
+    assert report.after.status == "passed", report
+    assert report.outcome == NOT_PROVEN, report
     assert report.before.status == "not shown"
+
+
+@pytest.mark.asyncio
+async def test_a_launcher_failure_on_the_base_is_not_proven(
+    tmp_path: Path, git_home: Path
+) -> None:
+    """A launcher (like ``uv run``) that exits 2 before pytest starts
+    leaves no junit report: no evidence, even with the named file's module
+    unimportable on the base."""
+    repo = Repo(tmp_path)
+    repo.write("calc.py", FIXED + "\n\ndef mul(a, b):\n    return a * b\n")
+    repo.write(
+        "tests/test_mul.py",
+        "from calc import mul\n\n\ndef test_mul():\n    assert mul(2, 3) == 6\n",
+    )
+    repo.commit("add mul")
+    launcher = tmp_path / "bin" / "pytest"
+    launcher.parent.mkdir()
+    launcher.write_text(
+        "#!/bin/sh\n"
+        "if grep -q 'def mul' calc.py; then\n"
+        f"  exec {sys.executable} -m pytest \"$@\"\n"
+        "fi\n"
+        "echo 'error: Failed to spawn: `pytest`'\nexit 2\n"
+    )
+    launcher.chmod(0o755)
+    claim = {
+        "command": [str(launcher), "-q", "-p", "no:cacheprovider",
+                    "tests/test_mul.py::test_mul"],
+        "tests": ["tests/test_mul.py::test_mul"],
+    }
+    report = await repo.prove(claim)
+    assert report.after.status == "passed", report
+    assert report.outcome == NOT_PROVEN, report
+    assert report.before.status == "not shown"
+    assert "Failed to spawn" in report.before.output
+
+
+def test_a_collection_error_on_the_head_is_still_no_evidence() -> None:
+    junit = JUNIT.format(cases=_case("tests.test_a", "error", classname=""))
+    run = _judge(4, junit, before=False)
+    assert run.status == "not shown"
+    assert _judge(4, junit, before=True).status == "failed"
+    assert _judge(4, None, before=True).status == "not shown"
+    assert _judge(3, junit, before=True).status == "not shown"
 
 
 # --- review round 1: what the scan misses ------------------------------------

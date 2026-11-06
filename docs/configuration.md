@@ -1001,9 +1001,11 @@ command (`pytest`, `uv run pytest`, `python -m pytest`) the relay adds
 `--junitxml` and reads the report: on the branch each named test must have
 passed, on the base each must have failed or errored. pytest exiting 2 to 5
 (a collection error, a usage error, no tests collected, or `uv run` failing
-to start it), no report, or a named test missing from it is no evidence. A
-new test should import new code inside the test function, or the base run
-stops at collection. For any other runner the command must exit 0 on the
+to start it), no report, or a named test missing from it is no evidence.
+One exception, on the base only: a collection error in the file of a named
+test (a new test file that imports code only the branch has) counts as
+failing before, recorded as "could not import on base". A collection error
+only in other files does not. For any other runner the command must exit 0 on the
 branch and 1 on the base, and each named test (the part after the last
 `::`) must appear in its output.
 

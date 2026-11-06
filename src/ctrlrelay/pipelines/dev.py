@@ -1344,9 +1344,9 @@ only with evidence that the named tests ran. For pytest the relay adds
 `--junitxml` and reads it: on the branch each named test must pass, on
 the base each must fail or error; pytest exiting 2 to 5 (a collection
 error, a usage error, no tests collected) or a named test missing from
-the report counts as not proven. So import new code inside the test
-function, not at the top of the test file, or the base run stops at
-collection. For any other runner, the command must exit 0 on the branch
+the report counts as not proven. On the base only, a collection error in
+the file of a named test (it imports code only the branch has) counts as
+failing before. For any other runner, the command must exit 0 on the branch
 and 1 on the base, and the part of each `tests` entry after the last `::`
 must appear in its output. A PR without a proof that fails before and
 passes after stays a draft. Do not delete,
