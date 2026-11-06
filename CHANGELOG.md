@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-05
+
 ### Added
 
 - Each poll's new issues run in priority order, oldest first (#356). The
@@ -2589,7 +2591,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.20.2...v0.21.0
