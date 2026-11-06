@@ -9,6 +9,7 @@ of reach for that reason instead of the one under test.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
@@ -90,7 +91,9 @@ P="$HOME/.claude/projects"
 try rename_project_for_memory "mv $P/-other $P/-other.x && mkdir -p $P/-other/memory"
 try read_shell_snapshot "cat $HOME/.claude/shell-snapshots/snapshot-bash.sh"
 try write_shell_snapshot "echo planted >> $HOME/.claude/shell-snapshots/snapshot-bash.sh"
-try write_agent_state "touch $HOME/.claude/projects/run-log"
+try write_agent_state "touch $OWNPROJECT/run-log"
+try write_other_project "touch $HOME/.claude/projects/-other/run-log"
+try new_project_folder "mkdir $HOME/.claude/projects/-planted"
 try write_hooks "touch $GITCOMMON/hooks/pre-push"
 try write_git_config "git config --file $GITCOMMON/config core.fsmonitor /bin/evil"
 try write_tmp "touch /tmp/scratch"
@@ -160,7 +163,12 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
 
     d = ClaudeDispatcher(
         usage_store=None, claude_binary=str(agent), sandbox="bwrap",
-        extra_env={"GITCOMMON": str(bare), "GITDIR": str(gitdir)},
+        extra_env={
+            "GITCOMMON": str(bare), "GITDIR": str(gitdir),
+            "OWNPROJECT": str(
+                h / ".claude" / "projects" / re.sub(r"[/._]", "-", str(wt))
+            ),
+        },
         sandbox_cache_dir=str(home / "agent-cache"),
         sandbox_hide_paths=(*DEFAULT_SANDBOX_HIDE_PATHS, "~/.claude/secret-token"),
     )
@@ -200,7 +208,11 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         "read_shell_snapshot": "no",
         # Into the sandbox's own empty copy; the real one is checked below.
         "write_shell_snapshot": "yes",
+        # Its own transcript folder only (#362): the projects folder is
+        # read-only as a whole.
         "write_agent_state": "yes",
+        "write_other_project": "no",
+        "new_project_folder": "no",
         "write_hooks": "no",
         "write_git_config": "no",
         "write_tmp": "yes",
@@ -498,3 +510,133 @@ def test_a_linked_main_config_is_copied_to_where_it_leads(
     argv = d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", private)
     i = argv.index(str(private / "claude.json"))
     assert argv[i - 1:i + 2] == ["--bind", str(private / "claude.json"), str(real)]
+
+
+def _worktree(home: Path) -> Path:
+    bare = home / "repo.git"
+    _git("init", "-q", "--bare", str(bare), cwd=home)
+    seed = home / "seed"
+    _git("init", "-q", "-b", "main", str(seed), cwd=home)
+    _git("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q",
+         "--allow-empty", "-m", "init", cwd=seed)
+    _git("push", "-q", str(bare), "main", cwd=seed)
+    wt = home / "wt"
+    _git("worktree", "add", "-q", "-b", "run", str(wt), "main", cwd=bare)
+    return wt
+
+
+# A projects folder per working directory the agent CLI ever ran in, named
+# after the path: a node with a long history has thousands (#362).
+_MANY = 4000
+
+
+def _many_project_memories(home: Path) -> None:
+    projects = home / "home" / ".claude" / "projects"
+    for i in range(_MANY):
+        name = f"-home-someone-.ctrlrelay-worktrees-owner-some-repo-dev-{i:05d}-abcdef12"
+        (projects / name / "memory").mkdir(parents=True)
+
+
+@pytest.mark.asyncio
+async def test_thousands_of_project_folders_still_start_the_sandbox(
+    home: Path,
+) -> None:
+    """The node that failed had 3695 `projects/*/memory` folders, each a
+    read-only mount: past ARG_MAX bwrap could not be started at all. The
+    options go through a file descriptor, so the run starts, the mounts
+    still hold, and the command line stays short."""
+    why = _bwrap_works()
+    if why:
+        pytest.skip(why)
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    _many_project_memories(home)
+    wt = _worktree(home)
+    some_memory = next((home / "home" / ".claude" / "projects").glob("*-00007-*"))
+    agent = home / "agent.sh"
+    agent.write_text(
+        "#!/bin/sh\n"
+        f"if touch '{some_memory}/memory/x' 2>/dev/null; then m=yes; else m=no; fi\n"
+        'echo "ran=yes write_memory=$m" > report\n'
+    )
+    agent.chmod(0o755)
+    seen: list[list[str]] = []
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary=str(agent), sandbox="bwrap",
+        sandbox_cache_dir=str(home / "agent-cache"),
+    )
+    real = d._run_session
+
+    async def spy(**kw):
+        seen.append(kw["cmd"])
+        return await real(**kw)
+
+    d._run_session = spy  # type: ignore[method-assign]
+    await d.spawn_session(
+        session_id="s-362", prompt="p", working_dir=wt,
+        state_file=wt / ".ctrlrelay" / "state.json", github_access=False,
+        timeout=60,
+    )
+    assert (wt / "report").read_text().split() == ["ran=yes", "write_memory=no"]
+    [cmd] = seen
+    assert cmd[1:4] == ["--args", cmd[2], "--"] and cmd[2].isdigit()
+    assert sum(len(a) + 1 for a in cmd) < 4096
+
+
+def test_control_a_mount_per_project_folder_cannot_start_bwrap(
+    home: Path,
+) -> None:
+    """The rule before #362, a mount per `projects/*/memory`, on the same
+    home: the kernel refuses to start bwrap (the node's failure). The
+    default now mounts the projects folder once, and stays small."""
+    if BWRAP is None:
+        pytest.skip("bwrap not installed")
+    import errno
+    import os
+
+    from ctrlrelay.core.agent_env import (
+        DEFAULT_SANDBOX_HIDE_PATHS,
+        DEFAULT_SANDBOX_READONLY_PATHS,
+        DEFAULT_SANDBOX_WRITABLE_PATHS,
+        bwrap_prefix,
+    )
+
+    _many_project_memories(home)
+
+    def size(argv: list[str]) -> int:
+        return sum(len(os.fsencode(a)) + 1 for a in argv)
+
+    old = bwrap_prefix(
+        BWRAP, DEFAULT_SANDBOX_HIDE_PATHS,
+        writable=list(DEFAULT_SANDBOX_WRITABLE_PATHS),
+        readonly=["~/.claude/projects/*/memory"],
+    )
+    assert size(old) > os.sysconf("SC_ARG_MAX") // 2
+    with pytest.raises(OSError) as info:
+        subprocess.run([*old, "true"], capture_output=True, timeout=30)
+    assert info.value.errno == errno.E2BIG
+
+    new = bwrap_prefix(
+        BWRAP, DEFAULT_SANDBOX_HIDE_PATHS,
+        writable=list(DEFAULT_SANDBOX_WRITABLE_PATHS),
+        readonly=list(DEFAULT_SANDBOX_READONLY_PATHS),
+    )
+    assert size(new) < 8192
+
+
+def test_bwrap_args_via_fd_round_trips_every_option() -> None:
+    import os
+
+    from ctrlrelay.core.agent_env import bwrap_args_via_fd
+
+    prefix = ["/usr/bin/bwrap", "--ro-bind", "/a b", "/a b", "--tmpfs", "/t", "--"]
+    argv, fd = bwrap_args_via_fd(prefix)
+    try:
+        assert argv == ["/usr/bin/bwrap", "--args", str(fd), "--"]
+        data = os.read(fd, 1 << 16)
+        assert data.split(b"\0")[:-1] == [os.fsencode(a) for a in prefix[1:-1]]
+    finally:
+        os.close(fd)
+    assert bwrap_args_via_fd([]) == ([], None)
+    with pytest.raises(ValueError):
+        bwrap_args_via_fd(["/usr/bin/bwrap", "--tmpfs", "/t"])

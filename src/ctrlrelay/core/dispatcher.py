@@ -10,6 +10,7 @@ so pipelines can stay agent-agnostic.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from ctrlrelay.core.agent_env import (
     SandboxUnavailableError,
     agent_cache_env,
     build_agent_env,
+    bwrap_args_via_fd,
     bwrap_prefix,
     git_dirs,
     resolve_bwrap,
@@ -388,8 +390,13 @@ class CliAgentAdapter:
         repo: str | None,
         issue_number: int | None,
         budget_scope: BudgetScope | None = None,
+        pass_fds: tuple[int, ...] = (),
     ) -> SessionResult:
-        """Run the child built by :meth:`spawn_session` to completion."""
+        """Run the child built by :meth:`spawn_session` to completion.
+
+        ``pass_fds`` are handed to the child and closed here once it has
+        started (or failed to): the sandbox's options file (#362).
+        """
 
         # The prompt can carry issue bodies and operator answers, so only its
         # hash and length are ever logged (#41).
@@ -424,13 +431,20 @@ class CliAgentAdapter:
             watches.append(("budget", budget.run))
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=working_dir,
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=working_dir,
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    pass_fds=pass_fds,
+                )
+            finally:
+                # The child has its own copy now; bwrap reads it at start.
+                for fd in pass_fds:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
         except Exception as e:
             # Usually the binary isn't where we resolved it — the exception
             # propagates to the pipeline, but without this it lands there
@@ -886,12 +900,18 @@ class ClaudeDispatcher(CliAgentAdapter):
             copy.chmod(0o600)
             # At the real path: a bind on a link lands where it leads.
             copies.append((copy, Path(os.path.realpath(main_config))))
+        # Where the agent CLI writes this run's transcript: the only part
+        # of the read-only projects folder the run may write (#362). Made
+        # here, since the sandbox cannot create it under a read-only one.
+        transcript_dirs = self._transcript_dirs(working_dir, env)
+        for folder in transcript_dirs:
+            folder.mkdir(parents=True, exist_ok=True)
         return bwrap_prefix(
             self._bwrap,
             self.sandbox_hide_paths,
             writable=[
                 working_dir, *repo_dirs, private_root, cache_dir,
-                *self.sandbox_writable_paths,
+                *self.sandbox_writable_paths, *transcript_dirs,
             ],
             readonly=[*self.sandbox_readonly_paths, *git_protected],
             copies=copies,
@@ -982,6 +1002,9 @@ class ClaudeDispatcher(CliAgentAdapter):
         # to type. That stops an agent using normal tooling; one that
         # deliberately reads credential files as the same OS user is
         # stopped only by ``agent.sandbox: bwrap`` (#236).
+        # The sandbox's options go through a file descriptor, not the
+        # command line, so no number of mounts can pass ARG_MAX (#362).
+        prefix, args_fd = bwrap_args_via_fd(prefix)
         cmd = [
             *prefix,
             self.claude_binary,
@@ -999,6 +1022,7 @@ class ClaudeDispatcher(CliAgentAdapter):
         self.started += 1
         try:
             return await self._run_session(
+                pass_fds=() if args_fd is None else (args_fd,),
                 cmd=cmd,
                 env=env,
                 ident=ident,
