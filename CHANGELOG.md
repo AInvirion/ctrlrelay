@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A dev run can now finish with an answer instead of code (#368). For an
+  issue that asks a question, an investigation, a plan or a proposed split,
+  the agent commits nothing and writes its answer as `"reply"` in the DONE
+  block, and the relay posts it on the issue as a comment, in full (cut at
+  60,000 characters). A document that belongs in the repository is still
+  committed and opened as a pull request. Replies follow
+  `question_on_issue`: a public repository gets a short note and the reply
+  goes to chat, unless the repository is set to `full`.
+
+### Changed
+
+- The status page says `5-hour none (ultra plan)` instead of
+  `5-hour unknown` when a usage reading has a 7-day window and no 5-hour
+  one, which is how ultra plans report (#367).
+
 ## [0.25.0] - 2026-11-06
 
 ### Fixed
