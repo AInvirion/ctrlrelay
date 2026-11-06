@@ -1848,8 +1848,9 @@ async def _run_parallel_poll_loop(
         tasks = [t for t in running if not t.done()]
         for t in tasks:
             t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # Hand the backlog back before waiting on the cancelled runs: a
+        # second cancellation during that wait must not leave these issues
+        # marked seen for good.
         for item in backlog:
             number = (item.get("issue") or {}).get("number")
             try:
@@ -1864,3 +1865,5 @@ async def _run_parallel_poll_loop(
             log_event(
                 _logger, "poll.backlog.handed_back", issues=len(backlog),
             )
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

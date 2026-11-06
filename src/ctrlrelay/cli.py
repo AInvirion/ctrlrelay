@@ -3925,7 +3925,12 @@ def poller_start(
             hold = intake_hold.active()
             if hold is not None:
                 return f"new work is held ({hold.reason})"
-            current = state_db.get_pending_resume(row["session_id"])
+            try:
+                current = state_db.get_pending_resume(row["session_id"])
+            except Exception as e:
+                # Could not look: leave the answer for the next tick rather
+                # than letting the sweeper's error path mark it resumed.
+                return f"the question could not be read ({type(e).__name__})"
             if (
                 current is None
                 or current.get("resumed_at") is not None
