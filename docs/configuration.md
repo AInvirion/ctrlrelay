@@ -40,6 +40,7 @@ repos:        [ ... ]
 | `transport` | object | **yes** | — | See [transport](#transport). |
 | `dashboard` | object | no | (defaults) | See [dashboard](#dashboard). |
 | `web` | object | no | (defaults) | The read-only status page. See [web](#web). |
+| `intake` | object | no | (defaults) | The order each poll's new issues run in. See [intake](#intake). |
 | `claims` | object | no | (defaults) | Claim timings for several machines on one account. See [claims](#claims). |
 | `repos` | list | no | `[]` | See [repos](#repos). |
 | `schedules` | object | no | (defaults) | See [schedules](#schedules). |
@@ -587,6 +588,29 @@ web:
 
 The page has no login and shows repository names, issue titles and the
 questions agents asked. **Never expose it to the internet.**
+
+## intake
+
+The order each poll's new issues run in (#356). A poll gathers one batch of
+new issues and works through it before the next poll; this sets the order of
+that batch.
+
+```yaml
+intake:
+  priority_labels: ["P0", "P1", "P2", "P3"]
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `priority_labels` | list of strings | `["P0", "P1", "P2", "P3"]` | Issues carrying an earlier label in this list run first; labels are compared without case, and an issue carrying several runs at its earliest. Issues carrying none of them run last. Within the same label, the oldest issue runs first (by when it was opened, then by number). An issue whose creation time cannot be read runs after the others with its label. `[]` keeps the oldest-first order only. Each label must be a non-empty string and listed once. |
+
+Each poll that found new issues logs the order it will run them in, as one
+`poll.batch.order` event (`order`: `owner/repo#N` in run order). The order is
+fixed when the poll ends: an urgent issue opened while a batch runs waits for
+the next poll. Each issue is still read again just before it starts, and an
+issue blocked by an open issue is still held until the blocker closes; those
+can skip an issue, never reorder the batch. The order applies to this machine
+only, not across machines.
 
 ## claims
 

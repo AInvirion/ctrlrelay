@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Each poll's new issues run in priority order, oldest first (#356). The
+  batch is sorted by the position of the issue's priority label in
+  `intake.priority_labels` (default `["P0", "P1", "P2", "P3"]`, compared
+  without case; an issue with several runs at its earliest; unlabeled
+  last), then by when the issue was opened, then by number. An issue whose
+  creation time cannot be read runs after the others with its label. `[]`
+  keeps the oldest-first order only. Each poll that found issues logs the
+  order once as `poll.batch.order`. The re-read before each dispatch and
+  the blocker hold are unchanged; the order is per machine and fixed for
+  the batch.
+
 - A dev run's PR goes ready only with proof the change works (#221). The
   agent names a proving test in its DONE checkpoint. The relay runs it on
   the pushed commit (must pass) and on the base with only the branch's test

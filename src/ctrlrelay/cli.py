@@ -2956,6 +2956,7 @@ def poller_start(
             exclude_labels_by_repo=exclude_labels_by_repo,
             include_labels_by_repo=include_labels_by_repo,
             require_labels_by_repo=require_labels_by_repo,
+            priority_labels=list(config.intake.priority_labels),
         )
         claims = claim_settings(config, username)
 

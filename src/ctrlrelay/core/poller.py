@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ctrlrelay.core.archived import ArchivedRepoTracker
+from ctrlrelay.core.config import DEFAULT_PRIORITY_LABELS
 from ctrlrelay.core.github import GitHubCLI, GitHubError
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.core.reopens import ReopenTracker
@@ -53,6 +54,63 @@ def _is_issues_disabled_error(exc: Exception) -> bool:
     if not isinstance(exc, GitHubError):
         return False
     return "has disabled issues" in str(exc).lower()
+
+
+def _created_at(issue: dict[str, Any]) -> datetime | None:
+    """The issue's ``createdAt`` as an aware time, or None when it is
+    missing or cannot be read."""
+    raw = issue.get("createdAt")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        when = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _priority_rank(issue: dict[str, Any], ranks: dict[str, int]) -> int:
+    """Position of the issue's best priority label in the configured
+    list (case-insensitive); ``len(ranks)`` when it carries none."""
+    best = len(ranks)
+    for label in issue.get("labels") or []:
+        name = label.get("name") if isinstance(label, dict) else label
+        rank = ranks.get(str(name or "").lower())
+        if rank is not None and rank < best:
+            best = rank
+    return best
+
+
+def order_batch(
+    items: list[dict[str, Any]], priority_labels: list[str],
+) -> list[dict[str, Any]]:
+    """One poll's batch in the order it should run (#356): by the
+    position of the issue's priority label in ``priority_labels``
+    (unlabeled last; an empty list ranks everything the same), then oldest
+    first by ``createdAt``, then by number. A row whose ``createdAt`` is
+    missing or unreadable goes after the rows that have one, at its label's
+    rank. The repo breaks a tie on number so the order is the same every
+    time."""
+    ranks: dict[str, int] = {}
+    for i, label in enumerate(priority_labels):
+        ranks.setdefault(label.lower(), i)
+
+    def key(item: dict[str, Any]) -> tuple[Any, ...]:
+        issue = item.get("issue") or {}
+        when = _created_at(issue)
+        try:
+            number = int(issue.get("number"))
+        except (TypeError, ValueError):
+            number = 0
+        return (
+            _priority_rank(issue, ranks),
+            when is None,
+            when.timestamp() if when is not None else 0.0,
+            number,
+            str(item.get("repo") or ""),
+        )
+
+    return sorted(items, key=key)
 
 
 def _read_failure_counts(raw: object) -> dict[str, dict[int, int]]:
@@ -299,6 +357,12 @@ class IssuePoller:
     # Records reopens of issues the relay finished (#230), from the open
     # issues each poll's search already returned. None: not looked for.
     reopen_tracker: ReopenTracker | None = None
+    # The order each poll's batch runs in (#356): issues carrying an
+    # earlier label in this list first, unlabeled last, then oldest
+    # first. Empty: oldest first only.
+    priority_labels: list[str] = field(
+        default_factory=lambda: list(DEFAULT_PRIORITY_LABELS),
+    )
 
     def __post_init__(self) -> None:
         if self.archived_tracker is None:
@@ -799,6 +863,20 @@ class IssuePoller:
         # Never propagate a save_state disk failure out of poll() — the
         # caller has work to do with new_issues. Log and move on.
         self._save_state_best_effort()
+        # The batch is final here: sort it once (#356). The recheck
+        # before each dispatch (#326) and the blocker hold (#310) still
+        # run per item, in this order.
+        new_issues = order_batch(new_issues, self.priority_labels)
+        if new_issues:
+            log_event(
+                _logger, "poll.batch.order",
+                count=len(new_issues),
+                priority_labels=list(self.priority_labels),
+                order=[
+                    f"{item.get('repo')}#{(item.get('issue') or {}).get('number')}"
+                    for item in new_issues
+                ],
+            )
         return new_issues
 
     async def _label_added_by_self(
