@@ -34,6 +34,10 @@ class _Poller:
 
     def __init__(self, *batches: list[dict[str, Any]]) -> None:
         self.batches = list(batches)
+        self.unmarked: list[tuple[str, int]] = []
+
+    def unmark_seen(self, repo: str, number: int) -> None:
+        self.unmarked.append((repo, number))
 
     async def poll(self) -> list[dict[str, Any]]:
         return self.batches.pop(0) if self.batches else []
@@ -243,6 +247,104 @@ async def test_cancelling_the_loop_cancels_its_runs() -> None:
     assert slots.busy == 0
 
 
+@pytest.mark.asyncio
+async def test_a_repo_blocked_issue_does_not_stop_the_next_poll() -> None:
+    """A#2 waits behind A#1; the next poll still happens, and C#3 from it
+    starts while both A issues are still in play."""
+    handler = _Handler()
+    slots = AgentSlots(3)
+    poller = _Poller([_item("o/a", 1), _item("o/a", 2)], [_item("o/c", 3)])
+    loop = _loop(poller, handler, slots, iterations=2)
+
+    await _until(lambda: ("o/c", 3) in handler.started)
+    assert handler.started == [("o/a", 1), ("o/c", 3)]
+    handler.finish(1)
+    await _until(lambda: ("o/a", 2) in handler.started)
+    handler.finish_all()
+    await asyncio.wait_for(loop, 5)
+
+
+@pytest.mark.asyncio
+async def test_a_full_node_keeps_polling() -> None:
+    """Every slot busy: the loop still polls, and queues what it finds."""
+    handler = _Handler()
+    slots = AgentSlots(1)
+    poller = _Poller([_item("o/a", 1)], [_item("o/b", 2)], [_item("o/c", 3)])
+    loop = _loop(poller, handler, slots, iterations=3)
+
+    await _until(lambda: not poller.batches)  # all three polls happened
+    assert handler.started == [("o/a", 1)]
+    handler.finish(1)
+    await _until(lambda: len(handler.started) == 2)
+    handler.finish_all()
+    while len(handler.started) < 3:
+        await asyncio.sleep(0.01)
+        handler.finish_all()
+    await asyncio.wait_for(loop, 5)
+    assert handler.started == [("o/a", 1), ("o/b", 2), ("o/c", 3)]
+
+
+@pytest.mark.asyncio
+async def test_stopping_hands_unstarted_issues_back() -> None:
+    """Polled issues are marked seen; one that never started must be
+    offered again after a restart."""
+    handler = _Handler()
+    slots = AgentSlots(1)
+    poller = _Poller([_item("o/a", 1), _item("o/b", 2), _item("o/c", 3)])
+    loop = _loop(poller, handler, slots, iterations=None)
+
+    await _until(lambda: handler.going == 1)
+    loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(loop, 5)
+    assert sorted(poller.unmarked) == [("o/b", 2), ("o/c", 3)]
+
+
+@pytest.mark.asyncio
+async def test_a_shutdown_starts_nothing_in_the_freed_slots() -> None:
+    """Another track waiting for a slot when the loop stops gets
+    cancelled, not the slot the loop's cancelled run gives back."""
+    handler = _Handler()
+    slots = AgentSlots(1)
+    poller = _Poller([_item("o/a", 1)])
+    loop = _loop(poller, handler, slots, iterations=None)
+    await _until(lambda: handler.going == 1)
+
+    started_resume = False
+
+    async def resume_sweeper() -> None:
+        nonlocal started_resume
+        async with slots.hold():
+            started_resume = True
+
+    waiter = asyncio.create_task(resume_sweeper())
+    await asyncio.sleep(0.05)
+    loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(loop, 5)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, 5)
+    assert not started_resume
+    with pytest.raises(asyncio.CancelledError):
+        await slots.acquire()
+
+
+def test_try_acquire_does_not_jump_the_queue() -> None:
+    async def main() -> None:
+        slots = AgentSlots(1)
+        assert slots.try_acquire()
+        assert not slots.try_acquire()
+        waiter = asyncio.create_task(slots.acquire())
+        await asyncio.sleep(0)
+        slots.release()
+        # The slot belongs to the queued waiter, not to a later try.
+        assert not slots.try_acquire()
+        await asyncio.wait_for(waiter, 5)
+        assert slots.busy == 1
+
+    asyncio.run(main())
+
+
 # --- the security sweep --------------------------------------------------------
 
 
@@ -287,3 +389,28 @@ def test_max_parallel_is_unset_by_default_and_at_least_one() -> None:
         AgentConfig(max_parallel=0)
     with pytest.raises(ValueError):
         AgentSlots(0)
+
+
+@pytest.mark.asyncio
+async def test_the_security_sweep_skips_repos_once_new_work_is_held() -> None:
+    """A hold placed while the sweep waited for a slot is asked again per
+    repo: those repos are skipped, one result each, and no lock taken."""
+    from ctrlrelay.pipelines.secops import run_secops_all
+
+    slots = AgentSlots(1)
+    state_db = MagicMock()
+    repos = [MagicMock() for _ in range(2)]
+    for i, r in enumerate(repos):
+        r.name = f"o/r{i}"
+    results = await asyncio.wait_for(run_secops_all(
+        repos=repos, dispatcher=AsyncMock(), github=AsyncMock(),
+        worktree=AsyncMock(), dashboard=None, state_db=state_db,
+        transport=None, contexts_dir=MagicMock(), job_claims=None,
+        slots=slots, held=lambda: "self-update to 0.25.0",
+    ), 5)
+    assert [r.summary for r in results] == [
+        "Skipped o/r0: new work is held (self-update to 0.25.0)",
+        "Skipped o/r1: new work is held (self-update to 0.25.0)",
+    ]
+    state_db.acquire_lock.assert_not_called()
+    assert slots.busy == 0

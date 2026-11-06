@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ctrlrelay.core.archived import ArchivedRepoTracker
 from ctrlrelay.core.checkpoint import CheckpointStatus
@@ -688,11 +688,14 @@ async def run_secops_all(
     hold_repeats: bool = False,
     job_claims: JobClaimer | None,
     slots: AgentSlots | None = None,
+    held: Callable[[], str | None] | None = None,
 ) -> list[PipelineResult]:
     """Run secops pipeline on all configured repos.
 
     ``slots`` (#210) is the node's shared cap on agent runs: each repo's
-    sweep takes one before its lock and gives it back when done.
+    sweep takes one before its lock and gives it back when done. ``held``
+    is asked once a repo has its slot, since the wait can be long: a
+    reason back skips that repo (a self-update is waiting for the node).
 
     ``job_claims`` (#246): with several machines on one account, each
     repo's sweep for this run window is claimed first, and a machine that
@@ -733,12 +736,12 @@ async def run_secops_all(
 
     # One slot per repo, taken before the lock (#210, see core.slots)
     # and given back when the next repo starts or the sweep ends.
-    held = False
+    holding = False
     try:
         for repo_config in repos:
-            if held:
+            if holding:
                 slots.release()
-                held = False
+                holding = False
             repo = repo_config.name
             session_id = f"secops-{repo.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
 
@@ -757,7 +760,15 @@ async def run_secops_all(
 
             if slots is not None:
                 await slots.acquire()
-                held = True
+                holding = True
+                why = held() if held is not None else None
+                if why is not None:
+                    results.append(PipelineResult(
+                        success=True,
+                        session_id=session_id,
+                        summary=f"Skipped {repo}: new work is held ({why})",
+                    ))
+                    continue
 
             if not state_db.acquire_lock(repo, session_id):
                 results.append(PipelineResult(
@@ -1240,7 +1251,7 @@ async def run_secops_all(
                     )
 
     finally:
-        if held and slots is not None:
+        if holding and slots is not None:
             slots.release()
 
     return results

@@ -837,14 +837,21 @@ agent:
   you answer a question, and the scheduled security sweep all take a slot
   from the same pool. A run takes its slot before the repo lock, and gives
   it back when it ends.
-- **New issues side by side.** Each poll's issues start in priority order as
-  slots free up. Two issues of the same repo never run together: the second
-  waits, and an issue of another repo behind it goes first. The loop polls
-  again while runs are going, so one slow issue no longer holds up the next
-  poll.
-- **A run waiting for your answer holds its slot** while it waits in the
-  run. Once it gives up waiting and saves the question, the slot is free
-  again, and the resume takes one when your answer comes.
+- **New issues side by side.** Polled issues wait in a backlog, in priority
+  order, and start as slots free up. Two issues of the same repo never run
+  together: the second waits, and an issue of another repo behind it goes
+  first. The loop keeps polling on its interval whatever is running, so one
+  slow issue never holds up new ones.
+- **A run holds its slot for its whole life**, including the wait for CI
+  and the fix rounds, and while it waits in the run for your answer. Once
+  it gives up waiting and saves the question, the slot is free again, and
+  the resume takes one when your answer comes. Two pull requests waiting on
+  slow CI can fill `max_parallel: 2`.
+- **A hold placed while a run waited for its slot is respected.** The resume
+  sweeper and the security sweep check again once they have a slot, so a
+  `self-update` that started meanwhile is not raced.
+- **On shutdown** no new run starts in a slot a stopping run frees, and
+  issues polled but not started are offered again after the restart.
 - **Unset** keeps the old behaviour: new issues one at a time, and nothing
   limits the total.
 

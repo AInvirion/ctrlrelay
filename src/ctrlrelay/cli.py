@@ -3739,6 +3739,11 @@ def poller_start(
                         window=sweep_window(config.schedules.secops_cron, config.timezone),
                     ),
                     slots=agent_slots,
+                    # Asked again per repo once it has a slot (#210).
+                    held=lambda: (
+                        None if (h := intake_hold.active()) is None
+                        else h.reason
+                    ),
                 )
                 ok = sum(1 for r in results if r.success)
                 console.print(
@@ -3911,6 +3916,25 @@ def poller_start(
         from ctrlrelay.core.slots import AgentSlots
         agent_slots = AgentSlots(config.agent.max_parallel)
 
+        def _resume_no_longer_wanted(row: dict) -> str | None:
+            """Why an answered question should not be resumed right now,
+            read after the wait for a slot (#210), or None to go ahead. A
+            hold placed meanwhile (a self-update) leaves the row for a
+            later tick; a row resumed, expired or answered again meanwhile
+            is not this tick's to run."""
+            hold = intake_hold.active()
+            if hold is not None:
+                return f"new work is held ({hold.reason})"
+            current = state_db.get_pending_resume(row["session_id"])
+            if (
+                current is None
+                or current.get("resumed_at") is not None
+                or current.get("expired_at") is not None
+                or current.get("answered_at") != row.get("answered_at")
+            ):
+                return "the question is no longer waiting for this answer"
+            return None
+
         async def _run_pending_resume_sweeper() -> None:
             """Drain pending_resumes rows that an operator answered via
             Telegram while the original BLOCKED session had already torn
@@ -4017,6 +4041,16 @@ def poller_start(
                             sweep_repo_cfg = repo_cfg_by_name.get(repo)
                             # A slot of the node's cap (#210), before the repo lock.
                             async with agent_slots.hold():
+                                # The wait for a slot can be long (#210):
+                                # ask again whether to go ahead.
+                                gone = _resume_no_longer_wanted(row)
+                                if gone is not None:
+                                    console.print(
+                                        "[dim]pending_resume_sweeper: "
+                                        f"{session_id} not resumed now: "
+                                        f"{gone}[/dim]"
+                                    )
+                                    continue
                                 result = await resume_secops_from_pending(
                                     session_id=session_id,
                                     repo=repo,
@@ -4064,6 +4098,16 @@ def poller_start(
                                 continue
                             # A slot of the node's cap (#210), before the repo lock.
                             async with agent_slots.hold():
+                                # The wait for a slot can be long (#210):
+                                # ask again whether to go ahead.
+                                gone = _resume_no_longer_wanted(row)
+                                if gone is not None:
+                                    console.print(
+                                        "[dim]pending_resume_sweeper: "
+                                        f"{session_id} not resumed now: "
+                                        f"{gone}[/dim]"
+                                    )
+                                    continue
                                 result = await resume_dev_from_pending(
                                     session_id=session_id,
                                     repo=repo,
@@ -4085,6 +4129,16 @@ def poller_start(
                         elif pipeline_name == "task":
                             # A slot of the node's cap (#210), before the repo lock.
                             async with agent_slots.hold():
+                                # The wait for a slot can be long (#210):
+                                # ask again whether to go ahead.
+                                gone = _resume_no_longer_wanted(row)
+                                if gone is not None:
+                                    console.print(
+                                        "[dim]pending_resume_sweeper: "
+                                        f"{session_id} not resumed now: "
+                                        f"{gone}[/dim]"
+                                    )
+                                    continue
                                 result = await resume_task_from_pending(
                                     session_id=session_id,
                                     repo=repo,
