@@ -362,9 +362,10 @@ login, does not):
   snapshots, which your own sessions run or write back (the sandboxed run
   gets an empty, writable one of each);
 - read-only again, over those: `sandbox_readonly_paths` (the agent CLI's
-  settings, rules, hooks, plugins, skills, browser host and install, and each
-  project's memory under `~/.claude/projects/*/memory`, which your own
-  sessions load) and, in the repository, `config`, `config.worktree`,
+  settings, rules, hooks, plugins, skills, browser host and install, and the
+  whole `~/.claude/projects` folder with every project's memory, which your
+  own sessions load; only the run's own transcript folder in it is writable)
+  and, in the repository, `config`, `config.worktree`,
   `hooks`, `modules`, the other runs' worktree directories, a linked
   worktree's `commondir` and `gitdir`, and the worktree's `.git` pointer,
   which every later git command there reads. So the agent cannot change git
@@ -439,7 +440,7 @@ then run the check again. On a single-user laptop this is the whole setup.
 | `sandbox` | `"none"` or `"bwrap"` | `"none"` | `"bwrap"` runs the dev and task agents in the read-only sandbox above. |
 | `sandbox_hide_paths` | list of strings | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc`, `~/.local/share/keyrings`, `$XDG_RUNTIME_DIR/bus`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.config/doctl`, `~/.password-store`, `~/.1password`, `~/.docker/run`, `~/.docker/desktop`, `~/.config/ctrlrelay`, `$XDG_RUNTIME_DIR`, `/run/user/<uid>`, `/run/docker.sock`, `/var/run/docker.sock`, `~/.claude/shell-snapshots`, `~/.claude/session-env`, `~/.claude/ide`, `~/.claude/file-history` | Made empty under `sandbox: bwrap`. A directory becomes an empty tmpfs, a file or socket becomes `/dev/null`, a missing path is skipped. |
 | `sandbox_writable_paths` | list of strings | `~/.claude/*` | Writable under `sandbox: bwrap`, besides the run's own paths. A last part of `*` opens each entry in the directory now (not links), not the directory itself. |
-| `sandbox_readonly_paths` | list of strings | `~/.claude/settings.json`, `settings.local.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `hooks`, `plugins`, `output-styles`, `scripts`, `rules`, `chrome`, `local`, `projects/*/memory` (all under `~/.claude`) | Read-only again inside a writable path. One `*` part matches the directories there at the start of each run; a missing path under a writable one is created first (an empty `memory` directory in each project, for one). |
+| `sandbox_readonly_paths` | list of strings | `~/.claude/settings.json`, `settings.local.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `hooks`, `plugins`, `output-styles`, `scripts`, `rules`, `chrome`, `local`, `projects` (all under `~/.claude`) | Read-only again inside a writable path. One `*` part matches the directories there at the start of each run; a missing path under a writable one is created first. The run's own transcript folder under `projects` is made writable again by the relay. Before 0.25.0 the default had `projects/*/memory`, one mount per project folder; on a home with thousands of them bwrap could not start (#362). A config that still lists that glob has the same problem, so drop it. |
 | `sandbox_cache_dir` | string | `~/.ctrlrelay/agent-cache` | The agent's own package cache under `sandbox: bwrap`. |
 
 ## transport
