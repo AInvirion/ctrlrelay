@@ -38,10 +38,26 @@ Per window, overall and per repo:
   ``issue_finishes`` table was created (then filled from the ``merged``
   events still kept).
 
+- ``cost_per_run``: what the runs that **ended** (``done`` or ``failed``)
+  used, from the usage the token budget (#223) records on the session row
+  (``sessions.usage_detail``). Blocked and running runs are left out: their
+  count still grows when they go on. ``{"tokens", "cost_usd",
+  "runs_without_usage"}``. ``tokens`` is ``{"median", "total", "n"}`` over
+  the ``n`` ended runs whose usage was recorded and read in full, counted
+  the way the budget counts (input + cache writes + output; cache reads
+  left out). ``cost_usd`` is the same over those of them whose agent
+  reported a cost (``total_cost_usd``, summed over the session's spawns),
+  rounded to 4 places, or ``null`` when none did. ``runs_without_usage`` is
+  the ended runs left out: no usage recorded (from before #223, or a
+  backend that is not measured) or usage that could not be read in full.
+  They are never read as 0.
+
 ``null`` where a number cannot be known, with the reason in the window's
 ``unavailable``, never a guess:
 
-- ``cost_per_run``: always ``null``; cost per run is not recorded (#223).
+- ``cost_per_run``: ``null`` when no run that ended in the window has its
+  token usage recorded: the database predates the record (#223), no run
+  has ended, or every ended run is from before it (or was not measured).
 - ``reopened``: ``null`` when the database predates the record of finished
   issues (``issue_finishes``), or it could not be read.
 - ``stuck``: of the runs started in the window, the ones the relay stopped
@@ -65,12 +81,13 @@ Events stamped after ``now`` (a clock that was corrected) are not read.
 
 from __future__ import annotations
 
+import json
 import statistics
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
-from ctrlrelay.core.budget import is_budget_reason
+from ctrlrelay.core.budget import RunUsage, is_budget_reason
 from ctrlrelay.web.links import github_url
 
 WINDOWS = (7, 30)
@@ -79,7 +96,13 @@ WINDOWS = (7, 30)
 CAME_BACK_LIMIT = 50
 _PR_KINDS = ("pr_opened", "merged")
 _OUTCOMES = ("done", "failed", "blocked", "running")
-COST_GAP = "cost per run is not recorded yet (#223)"
+USAGE_COLUMNS = ("usage_tokens", "usage_detail")
+COST_DB_GAP = (
+    "this database predates the record of token usage (#223); restart the "
+    "daemon to add it"
+)
+COST_NO_RUNS_GAP = "no run ended in this window"
+_ENDED = ("done", "failed")
 STUCK_GAP = (
     "this database predates the record of stuck runs (#224); restart the "
     "daemon to add it"
@@ -102,13 +125,15 @@ def read_runs(conn: Any, since: int, now: int) -> list[dict[str, Any]]:
     """Every run started in ``[since, now]``.
 
     Each row carries ``stuck_reason`` only when the database has that
-    column (#224); a database the daemon has not migrated yet does not,
-    and the page then says the stuck count is unknown rather than 0.
+    column (#224), and ``usage_detail`` only when it has the usage columns
+    (#223); a database the daemon has not migrated yet does not, and the
+    page then says the number is unknown rather than 0.
     """
     columns = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
     stuck = ", stuck_reason" if "stuck_reason" in columns else ""
+    usage = ", usage_detail" if set(USAGE_COLUMNS) <= columns else ""
     rows = conn.execute(
-        f"""SELECT id, repo, issue_number, status, started_at{stuck}
+        f"""SELECT id, repo, issue_number, status, started_at{stuck}{usage}
            FROM sessions WHERE started_at >= ? AND started_at <= ?""",
         (int(since), int(now)),
     ).fetchall()
@@ -197,6 +222,71 @@ def _median(values: list[int]) -> dict[str, Any]:
     }
 
 
+def _measured(run: dict[str, Any]) -> RunUsage | None:
+    """The run's recorded usage, or ``None`` when there is none or it
+    cannot be read in full (a floor is not a run's usage)."""
+    raw = run.get("usage_detail")
+    if raw is None:
+        return None
+    try:
+        usage = RunUsage.from_json(json.loads(raw))
+    except (ValueError, RecursionError, TypeError):
+        return None
+    return usage if usage.complete else None
+
+
+def _spend(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """``cost_per_run`` for these runs (see the module docstring), or
+    ``None`` when none of the ended ones has its usage measured."""
+    if not all("usage_detail" in r for r in runs):
+        return None
+    tokens: list[int] = []
+    costs: list[float] = []
+    without = 0
+    for run in runs:
+        if run["status"] not in _ENDED:
+            continue
+        usage = _measured(run)
+        if usage is None:
+            without += 1
+            continue
+        tokens.append(usage.counted)
+        if usage.cost_usd is not None:
+            costs.append(usage.cost_usd)
+    if not tokens:
+        return None
+    return {
+        "tokens": {
+            "median": int(round(statistics.median(tokens))),
+            "total": sum(tokens),
+            "n": len(tokens),
+        },
+        "cost_usd": (
+            {
+                "median": round(statistics.median(costs), 4),
+                "total": round(sum(costs), 4),
+                "n": len(costs),
+            }
+            if costs else None
+        ),
+        "runs_without_usage": without,
+    }
+
+
+def _cost_gap(runs: list[dict[str, Any]]) -> str:
+    """Why ``cost_per_run`` is ``null`` for these runs."""
+    if not all("usage_detail" in r for r in runs):
+        return COST_DB_GAP
+    ended = sum(1 for r in runs if r["status"] in _ENDED)
+    if not ended:
+        return COST_NO_RUNS_GAP
+    return (
+        f"none of the {ended} run(s) that ended has its token usage recorded "
+        "(runs from before #223, on a backend that is not measured, or whose "
+        "usage could not be read); they are not counted as 0"
+    )
+
+
 def _counts(
     runs: list[dict[str, Any]],
     pr_times: dict[str, dict[str, int]] | None,
@@ -241,7 +331,7 @@ def _counts(
             if all("stuck_reason" in r for r in runs)
             else None
         ),
-        "cost_per_run": None,
+        "cost_per_run": _spend(runs),
     }
 
 
@@ -272,7 +362,9 @@ def _window(
         )
     )
 
-    unavailable = {"cost_per_run": COST_GAP}
+    unavailable: dict[str, str] = {}
+    if _spend(runs) is None:
+        unavailable["cost_per_run"] = _cost_gap(runs)
     if reopened is None:
         unavailable["reopened"] = reopens_reason or REOPEN_GAP
     if not all("stuck_reason" in r for r in runs):

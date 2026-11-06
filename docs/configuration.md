@@ -1280,8 +1280,10 @@ schedules:
 Once a week, each node sends one chat message with its own numbers for
 the last 7 days, the same ones its status page shows: runs started, done,
 failed, blocked and stuck, the success rate, the median time to PR and to
-merge, and how many issues the relay finished were reopened. A number the
-node cannot read is written `unknown`, with the reason, never 0.
+merge, how many issues the relay finished were reopened, and the median
+tokens per run (with the cost, when the agent reported one) over the runs
+that ended with their usage recorded. A number the node cannot read is
+written `unknown`, with the reason, never 0.
 
 The daemon checks every five minutes. It sends at the first check after
 `day` at `hour`:00 that finds nothing delivered since then, so a node that

@@ -68,6 +68,14 @@ def _sent_last_week(db: StateDB) -> None:
     db.record_sent(SEND_NAME, MONDAY_9 - 7 * DAY + 60)
 
 
+def _usage(db: StateDB, sid: str, *, tokens: int, cost: float | None) -> None:
+    from ctrlrelay.core.budget import BudgetLimits, RunUsage, record_usage
+
+    record_usage(
+        db, sid, RunUsage(input_tokens=tokens, cost_usd=cost), BudgetLimits(),
+    )
+
+
 def _run(db: StateDB, sid: str, *, started_at: int, status: str, issue: int) -> None:
     db.execute(
         """INSERT INTO sessions (id, pipeline, repo, status, started_at, issue_number)
@@ -161,6 +169,8 @@ async def test_the_message_carries_the_weeks_numbers(tmp_path: Path) -> None:
     _run(db, "a", started_at=now - DAY, status="done", issue=1)
     _run(db, "b", started_at=now - DAY, status="failed", issue=2)
     _run(db, "c", started_at=now - 8 * DAY, status="done", issue=3)  # last week
+    _usage(db, "a", tokens=120_000, cost=1.5)
+    _usage(db, "b", tokens=80_000, cost=0.5)
     db.record_event("restart", ts=now - 2 * DAY)  # events cover the runs
     db.record_event("pr_opened", session_id="a", ts=now - DAY + 600)
     db.record_issue_finish(repo="example-org/alpha", issue_number=1, pr_number=10,
@@ -177,6 +187,10 @@ async def test_the_message_carries_the_weeks_numbers(tmp_path: Path) -> None:
     assert "time to PR: median 10m over 1 runs" in text
     assert "time to merge: none yet" in text
     assert "reopened: 1" in text
+    assert (
+        "tokens per run: median 100,000 over 2 runs (total 200,000), "
+        "cost median $1.00 over 2 runs (total $2.00)"
+    ) in text
     assert "unknown" not in text
     db.close()
 
@@ -196,6 +210,9 @@ def test_a_number_that_cannot_be_read_is_unknown_not_zero(tmp_path: Path) -> Non
     assert "reopened: unknown" in text
     assert "reopened: 0" not in text
     assert "reopened unknown: this database predates" in text
+    # A run from before usage was recorded: unknown, with why, never 0.
+    assert "tokens per run: unknown" in text
+    assert "cost per run unknown: none of the 1 run(s) that ended" in text
     # What could be read still is.
     assert "runs started 1: done 1" in text
     db.close()
@@ -205,6 +222,7 @@ def test_a_number_that_cannot_be_read_is_unknown_not_zero(tmp_path: Path) -> Non
     assert "runs started unknown: done unknown, failed unknown" in text
     assert "success rate unknown" in text
     assert "reopened: unknown" in text
+    assert "tokens per run: unknown" in text
     # No zero anywhere below the heading line (which carries the date).
     assert not re.search(r"\b0\b", text.split("\n", 1)[1])
 
@@ -229,3 +247,19 @@ def test_config_defaults_and_validation() -> None:
     for bad in ({"day": "funday"}, {"day": "mo"}, {"hour": 24}, {"hour": -1}):
         with pytest.raises(ValidationError):
             WeeklySummaryConfig(**bad)
+
+
+def test_tokens_line_counts_runs_without_usage_and_unknown_cost(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.db")
+    now = MONDAY_9 + 60
+    _run(db, "a", started_at=now - DAY, status="done", issue=1)
+    _usage(db, "a", tokens=5_000, cost=None)
+    _run(db, "b", started_at=now - DAY, status="done", issue=2)  # before #223
+
+    text = format_summary("node-a", read_week(db, now), now)
+    assert (
+        "tokens per run: median 5,000 over 1 runs (total 5,000), cost unknown; "
+        "1 more ended without usage recorded"
+    ) in text
+    assert "cost per run unknown" not in text
+    db.close()
