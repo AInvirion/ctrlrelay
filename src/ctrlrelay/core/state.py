@@ -238,6 +238,25 @@ CREATE TABLE IF NOT EXISTS relay_pushes (
 CREATE INDEX IF NOT EXISTS idx_relay_pushes_branch
     ON relay_pushes(repo, branch, id);
 
+-- What a dev run had finished, step by step (#231), so a run whose process
+-- died can continue from the last finished step instead of starting over.
+-- ``data`` is the JSON the later steps need (the plan, the agent's result,
+-- the pull request); ``head_sha`` is the run branch's commit when the step
+-- ended, checked before anything is restored.
+CREATE TABLE IF NOT EXISTS run_steps (
+    session_id TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    step TEXT NOT NULL,
+    head_sha TEXT,
+    data TEXT NOT NULL,
+    finished_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, step)
+);
+CREATE INDEX IF NOT EXISTS idx_run_steps_issue
+    ON run_steps(repo, issue_number);
+
 -- When each scheduled chat message was last delivered (#230), so a
 -- restart does not send this week's summary a second time.
 CREATE TABLE IF NOT EXISTS scheduled_sends (
@@ -390,6 +409,16 @@ class StateDB:
         if "usage_detail" not in existing:
             self._conn.execute(
                 "ALTER TABLE sessions ADD COLUMN usage_detail TEXT"
+            )
+        # #231: set when the poller found the run's process dead, and
+        # the session that continued it, so it is continued once.
+        if "interrupted" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN interrupted INTEGER"
+            )
+        if "resumed_by" not in existing:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN resumed_by TEXT"
             )
 
         pr_watches_cols = {
@@ -745,7 +774,8 @@ class StateDB:
         try:
             cursor = self._conn.execute(
                 "UPDATE sessions SET status = 'failed', summary = ?, "
-                "ended_at = ? WHERE id = ? AND status = 'running'",
+                "ended_at = ?, interrupted = 1 "
+                "WHERE id = ? AND status = 'running'",
                 (summary, int(time.time()), session_id),
             )
             if cursor.rowcount > 0:
@@ -759,6 +789,71 @@ class StateDB:
             if ours and self._conn.in_transaction:
                 self._conn.rollback()
             raise
+        return cursor.rowcount > 0
+
+    # Run steps (#231)
+
+    def record_run_step(
+        self,
+        *,
+        session_id: str,
+        repo: str,
+        issue_number: int,
+        seq: int,
+        step: str,
+        head_sha: str | None,
+        data: str,
+    ) -> None:
+        """Save that ``step`` of a dev run finished, with what later steps
+        need (``data``, JSON). A step recorded twice keeps the later one."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO run_steps (session_id, repo, "
+            "issue_number, seq, step, head_sha, data, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, repo, issue_number, seq, step, head_sha, data,
+             int(time.time())),
+        )
+        self._conn.commit()
+
+    def run_steps_for(self, session_id: str) -> list[dict[str, Any]]:
+        """The steps a run finished, in the order they ran."""
+        rows = self._conn.execute(
+            "SELECT * FROM run_steps WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def latest_dev_session(
+        self, repo: str, issue_number: int, *, with_steps: bool = False,
+    ) -> dict[str, Any] | None:
+        """The newest dev session for an issue, or None.
+
+        ``with_steps`` limits it to sessions that saved at least one step.
+        Newest by start time, then by rowid, so two runs started in the
+        same second still have an order.
+        """
+        sql = (
+            "SELECT s.* FROM sessions s WHERE s.pipeline = 'dev' "
+            "AND s.repo = ? AND s.issue_number = ?"
+        )
+        if with_steps:
+            sql += (
+                " AND EXISTS (SELECT 1 FROM run_steps r "
+                "WHERE r.session_id = s.id)"
+            )
+        sql += " ORDER BY s.started_at DESC, s.rowid DESC LIMIT 1"
+        row = self._conn.execute(sql, (repo, issue_number)).fetchone()
+        return dict(row) if row else None
+
+    def mark_resumed(self, session_id: str, resumed_by: str) -> bool:
+        """Record that ``resumed_by`` continued ``session_id``. Guarded, so
+        two runs cannot both continue it: False when one already did."""
+        cursor = self._conn.execute(
+            "UPDATE sessions SET resumed_by = ? WHERE id = ? "
+            "AND resumed_by IS NULL",
+            (resumed_by, session_id),
+        )
+        self._conn.commit()
         return cursor.rowcount > 0
 
     def record_session_outcome(

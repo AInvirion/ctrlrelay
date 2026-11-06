@@ -2503,6 +2503,16 @@ def run_dev(
         "-c",
         help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
+    from_step: str | None = typer.Option(
+        None,
+        "--from-step",
+        help=(
+            "Start again from a past step of the issue's newest run that "
+            "saved steps: plan, code or publish. The steps before it are "
+            "taken from that run and the branch is moved back to where "
+            "it was then."
+        ),
+    ),
 ) -> None:
     """Run dev pipeline for a GitHub issue."""
     import asyncio
@@ -2598,6 +2608,7 @@ def run_dev(
             steps=repo_config.steps,
             question_on_issue=repo_config.question_on_issue,
             require_proof=repo_config.automation.require_proof,
+            from_step=from_step,
         )
 
     try:

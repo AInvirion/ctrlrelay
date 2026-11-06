@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import os
 import re
 import shlex
@@ -65,7 +66,11 @@ from ctrlrelay.core.stuck import (
     classify_failures,
     format_tests,
 )
-from ctrlrelay.core.worktree import PartialSaveError, WorktreeManager
+from ctrlrelay.core.worktree import (
+    PartialSaveError,
+    WorktreeError,
+    WorktreeManager,
+)
 from ctrlrelay.dashboard.client import DashboardClient, EventPayload
 from ctrlrelay.pipelines.base import (
     PipelineContext,
@@ -1050,6 +1055,22 @@ class DevPipeline:
         self, ctx: PipelineContext, fix_instructions: str
     ) -> PipelineResult:
         """Resume the session with a fix request (failing CI or merge conflict)."""
+        if self.state_db.get_agent_session_id(ctx.session_id) is None:
+            # No session to resume: this run took over an earlier run's
+            # steps (#231), or the first spawn reported no session id. A
+            # fresh agent gets only this prompt, so it carries the issue
+            # and the checkpoint contract, or the agent could fix the code
+            # and still not be able to say it is done.
+            fix_instructions = (
+                f"You are working on issue #{ctx.issue_number} in "
+                f"{ctx.repo}: {ctx.extra.get('issue_title', '')}\n\n"
+                f"{ctx.extra.get('issue_body', '')}\n\n"
+                "The branch you are on already holds the work for this "
+                "issue, and its pull request is open. Do only what is "
+                "asked below.\n\n"
+                f"{fix_instructions}\n\n"
+                f"{self._checkpoint_contract(str(ctx.state_file), ctx.session_id)}"
+            )
         result = await self._spawn(ctx, fix_instructions, resume=True)
         return self._session_to_result(result)
 
@@ -2714,6 +2735,11 @@ class _DevRun:
     proof_claim: Any = None
     proof_report: ProofReport | None = None
 
+    # Steps taken over from an earlier run instead of run again (#231).
+    # Filled by `_restore_steps` before the steps start; empty for a run
+    # that starts from the beginning.
+    restored_steps: frozenset[str] = frozenset()
+
 
 def plan_path_for(contexts_dir: Path, repo: str, issue_number: int) -> Path:
     """``<paths.contexts>/<owner>-<repo>/plans/issue-<n>.md`` (#220)."""
@@ -3227,16 +3253,11 @@ async def _step_code(run: _DevRun) -> None:
     run.result = await _answer_while_blocked(run, result, run.pipeline.resume)
 
 
-async def _step_publish(run: _DevRun) -> None:
-    """Push the branch and open the pull request, if the agent finished."""
-    assert run.result is not None
-    # #219: the agent only committed. The relay pushes the branch and
-    # opens the pull request with its own credentials, after the
-    # agent has exited, and refuses main/master/the default branch.
-    #
-    # Built on every run, not only a successful one, so the exception
-    # path always has a publisher to ask for the PR number.
-    run.publisher = _Publisher(
+def _new_publisher(run: _DevRun) -> _Publisher:
+    """The run's publisher, as the publish step builds it. A run that took
+    over a finished publish step from an earlier run builds the same one
+    and sets what that run's publisher knew (#231)."""
+    return _Publisher(
         github=run.github,
         worktree=run.worktree,
         state_db=run.state_db,
@@ -3251,6 +3272,18 @@ async def _step_publish(run: _DevRun) -> None:
             else _UNPROVEN_PUSH_NOTE
         ),
     )
+
+
+async def _step_publish(run: _DevRun) -> None:
+    """Push the branch and open the pull request, if the agent finished."""
+    assert run.result is not None
+    # #219: the agent only committed. The relay pushes the branch and
+    # opens the pull request with its own credentials, after the
+    # agent has exited, and refuses main/master/the default branch.
+    #
+    # Built on every run, not only a successful one, so the exception
+    # path always has a publisher to ask for the PR number.
+    run.publisher = _new_publisher(run)
     if run.result.success:
         if "proof" in run.result.outputs:
             run.proof_claim = run.result.outputs["proof"]
@@ -3943,6 +3976,349 @@ def _resolve_step_modes(
     return modes["plan"], modes["verify"], modes["review"]
 
 
+# Steps a later run can take over from a run whose process died (#231), in
+# run order. proof and review are left out on purpose: both read the pull
+# request's head on GitHub when they run, and the review step reads the
+# proof's report, so a run that stopped in or after them runs them again
+# rather than trusting a result about a head that may have moved.
+RESUMABLE_STEPS: tuple[str, ...] = ("plan", "code", "publish", "verify")
+
+# What a new run may be started from (`ctrlrelay run dev --from-step`): the
+# steps before a pull request exists. Once it exists the pull request is
+# the run's state, and starting again from a past step would mean
+# rewriting a branch people may already have read.
+FROM_STEPS: tuple[str, ...] = ("plan", "code", "publish")
+
+# The PipelineResult fields a saved step keeps. `session_id` is the new
+# run's on restore; `review` is attached by the frame after the steps.
+_SAVED_RESULT_FIELDS = (
+    "success", "summary", "blocked", "question", "error", "outputs",
+    "timed_out", "exit_code", "stuck_reason", "parked_pr", "parked_note",
+)
+
+
+def _step_finished(run: _DevRun) -> bool:
+    """Whether the step that just ran left work a later run can build on:
+    no outcome yet (the plan step), or a success that is not waiting on a
+    question."""
+    return run.result is None or (
+        run.result.success and not run.result.blocked
+    )
+
+
+def _step_snapshot(run: _DevRun) -> dict[str, Any]:
+    """Everything the later steps read, as it stands now. Each saved step
+    holds the whole picture, so restoring needs only the last one."""
+    data: dict[str, Any] = {
+        "plan_text": run.plan_text,
+        "proof_claim": run.proof_claim,
+        "pr_number_for_review": run.pr_number_for_review,
+    }
+    if run.result is not None:
+        data["result"] = {
+            f: getattr(run.result, f) for f in _SAVED_RESULT_FIELDS
+        }
+    if run.publisher is not None:
+        data["publisher"] = {
+            "default_branch": run.publisher.default_branch,
+            "last_pushed_sha": run.publisher.last_pushed_sha,
+            "pr_number": run.publisher.pr_number,
+            "pr_url": run.publisher.pr_url,
+        }
+    return data
+
+
+def _save_step(run: _DevRun, seq: int, step: str) -> None:
+    """Save that ``step`` finished. Never fails the run: a step that could
+    not be saved only means a later run would start earlier."""
+    head: str | None
+    try:
+        head = run.worktree._worktree_head_sha(run.repo, run.worktree_path)
+    except Exception:
+        head = None
+    try:
+        data = json.dumps(_step_snapshot(run))
+        run.state_db.record_run_step(
+            session_id=run.session_id, repo=run.repo,
+            issue_number=run.issue_number, seq=seq, step=step,
+            head_sha=head, data=data,
+        )
+    except Exception as e:
+        log_event(
+            _logger, "dev.step.save_failed",
+            session_id=run.session_id, repo=run.repo,
+            issue_number=run.issue_number, step=step,
+            error_type=type(e).__name__, error=str(e)[:200],
+        )
+        return
+    log_event(
+        _logger, "dev.step.saved",
+        session_id=run.session_id, repo=run.repo,
+        issue_number=run.issue_number, step=step, head_sha=head,
+    )
+
+
+@dataclass(frozen=True)
+class ResumePoint:
+    """Where a new run takes over from an earlier one (#231).
+
+    ``steps`` are the steps not run again. ``data`` is the last of them's
+    saved snapshot. ``head_sha`` is the commit the run branch must be on
+    for the restore to be trusted. ``rewind`` is set for ``--from-step``:
+    the branch is moved back to ``head_sha`` first (its old head is kept
+    under a ref). ``pr_number`` is the pull request the earlier run had
+    opened, which the new run may reuse.
+    """
+
+    source_session: str
+    steps: tuple[str, ...]
+    data: dict[str, Any]
+    head_sha: str
+    rewind: bool = False
+    pr_number: int | None = None
+    rows: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def last_step(self) -> str | None:
+        return self.steps[-1] if self.steps else None
+
+
+class ResumeRefusedError(Exception):
+    """A ``--from-step`` that cannot be done, with the reason to show."""
+
+
+def find_resume_point(
+    state_db: StateDB,
+    repo: str,
+    issue_number: int,
+    from_step: str | None = None,
+) -> ResumePoint | None:
+    """Where a new run for this issue should start (#231).
+
+    Without ``from_step``: the newest dev run for the issue, only if its
+    process died (``interrupted``), nothing has continued it yet, and it
+    saved at least one step with a known branch head. Anything else is
+    ``None``: the run starts from the beginning, as before.
+
+    With ``from_step``: the newest run for the issue that saved steps,
+    whatever its outcome, and the steps before ``from_step``. Raises
+    :class:`ResumeRefusedError` when that cannot be done.
+    """
+    if from_step is None:
+        row = state_db.latest_dev_session(repo, issue_number)
+        if (
+            row is None
+            or not row.get("interrupted")
+            or row.get("resumed_by")
+        ):
+            return None
+        rows = [
+            r for r in state_db.run_steps_for(row["id"])
+            if r["step"] in RESUMABLE_STEPS
+        ]
+        if not rows:
+            return None
+        last = max(rows, key=lambda r: RESUMABLE_STEPS.index(r["step"]))
+        if not last.get("head_sha"):
+            return None
+        try:
+            data = json.loads(last["data"])
+        except (TypeError, ValueError):
+            return None
+        upto = RESUMABLE_STEPS.index(last["step"])
+        pub = data.get("publisher") or {}
+        pr = pub.get("pr_number")
+        return ResumePoint(
+            source_session=row["id"],
+            steps=RESUMABLE_STEPS[: upto + 1],
+            data=data,
+            head_sha=last["head_sha"],
+            pr_number=pr if isinstance(pr, int) else None,
+            rows=tuple(rows),
+        )
+
+    if from_step not in FROM_STEPS:
+        raise ResumeRefusedError(
+            f"--from-step takes one of {', '.join(FROM_STEPS)}; "
+            f"{from_step!r} comes after the pull request is opened, where "
+            "the pull request is the run's state"
+        )
+    row = state_db.latest_dev_session(repo, issue_number, with_steps=True)
+    if row is None:
+        raise ResumeRefusedError(
+            f"no run of {repo}#{issue_number} saved any steps to start from"
+        )
+    saved = {r["step"]: r for r in state_db.run_steps_for(row["id"])}
+    keep = RESUMABLE_STEPS[: RESUMABLE_STEPS.index(from_step)]
+    # The branch goes back to where it was when the step before
+    # `from_step` ended. For the first step, that is the branch as the
+    # plan step left it, which made no commits.
+    anchor_step = keep[-1] if keep else "plan"
+    anchor = saved.get(anchor_step)
+    missing = [s for s in keep if s not in saved]
+    if anchor is None or missing or not anchor.get("head_sha"):
+        have = ", ".join(sorted(saved, key=RESUMABLE_STEPS.index)) or "none"
+        raise ResumeRefusedError(
+            f"run {row['id']} did not save the steps needed to start from "
+            f"{from_step!r} (saved: {have})"
+        )
+    data: dict[str, Any] = {}
+    if keep:
+        try:
+            data = json.loads(saved[keep[-1]]["data"])
+        except (TypeError, ValueError) as e:
+            raise ResumeRefusedError(
+                f"the saved {keep[-1]!r} step of run {row['id']} is unreadable"
+            ) from e
+    return ResumePoint(
+        source_session=row["id"],
+        steps=keep,
+        data=data,
+        head_sha=anchor["head_sha"],
+        rewind=True,
+        rows=tuple(saved[s] for s in keep),
+    )
+
+
+def _restore_steps(run: _DevRun, point: ResumePoint) -> None:
+    """Take over the saved steps: set what they had set, and copy their
+    rows to this run so a second interruption can be continued too."""
+    data = point.data
+    plan = data.get("plan_text")
+    if isinstance(plan, str) and plan:
+        run.plan_text = plan
+        run.ctx.extra["plan"] = plan
+    saved = data.get("result")
+    if isinstance(saved, dict):
+        kwargs = {f: saved[f] for f in _SAVED_RESULT_FIELDS if f in saved}
+        kwargs["outputs"] = dict(kwargs.get("outputs") or {})
+        run.result = PipelineResult(session_id=run.session_id, **kwargs)
+    run.proof_claim = data.get("proof_claim")
+    pr = data.get("pr_number_for_review")
+    run.pr_number_for_review = pr if isinstance(pr, int) else None
+    pub = data.get("publisher")
+    if isinstance(pub, dict):
+        run.publisher = _new_publisher(run)
+        run.publisher.default_branch = pub.get("default_branch")
+        run.publisher.last_pushed_sha = pub.get("last_pushed_sha")
+        run.publisher.pr_number = pub.get("pr_number")
+        run.publisher.pr_url = pub.get("pr_url")
+    run.restored_steps = frozenset(point.steps)
+    for row in point.rows:
+        if row["step"] not in point.steps:
+            continue
+        head, payload = row.get("head_sha"), row["data"]
+        if row["step"] == point.last_step:
+            # The point may have accepted a newer head than this row saved
+            # (the dead run's own fix push): the copy carries that head and
+            # its lease, so a second interruption can be continued too.
+            head, payload = point.head_sha, json.dumps(point.data)
+        try:
+            run.state_db.record_run_step(
+                session_id=run.session_id, repo=run.repo,
+                issue_number=run.issue_number, seq=row["seq"],
+                step=row["step"], head_sha=head, data=payload,
+            )
+        except Exception as e:
+            log_event(
+                _logger, "dev.step.save_failed",
+                session_id=run.session_id, repo=run.repo,
+                issue_number=run.issue_number, step=row["step"],
+                error_type=type(e).__name__, error=str(e)[:200],
+            )
+
+
+def resume_comment(point: ResumePoint, session_id: str) -> str:
+    """The issue comment for a run that takes over saved steps."""
+    if point.rewind:
+        start = (
+            RESUMABLE_STEPS[len(point.steps)]
+            if len(point.steps) < len(RESUMABLE_STEPS) else "review"
+        )
+        return (
+            f"Run `{session_id}` starts again from the `{start}` step, "
+            f"using what run `{point.source_session}` saved before it. "
+            f"The branch was moved back to `{point.head_sha[:12]}`; its "
+            "previous head is kept in the relay's clone."
+        )
+    return (
+        f"Run `{point.source_session}` stopped before it finished (the "
+        f"relay process running it went away). Run `{session_id}` "
+        f"continues it after the `{point.last_step}` step, so the steps "
+        f"up to there ({', '.join(point.steps)}) are not run again."
+    )
+
+
+def _check_resume_head(
+    worktree: WorktreeManager,
+    repo: str,
+    worktree_path: Path,
+    point: ResumePoint,
+    *,
+    created_fresh: bool,
+    session_id: str,
+    issue_number: int,
+    state_db: StateDB | None = None,
+    branch: str | None = None,
+) -> ResumePoint | None:
+    """Trust the saved steps only if the branch is where they left it.
+
+    After publish, the run's verify step may have pushed fix commits
+    before it died; that head is not the saved one but is still the
+    run's own. It is accepted when it is the last commit the dead run
+    itself pushed (``relay_pushes``), and the restored push lease is
+    moved to it, so the next push is leased against what is on GitHub.
+
+    A worktree cut fresh from the default branch is fine while no code
+    step is being taken over: there is no code to lose, only the plan.
+    Otherwise the head must be the saved one. When it is not, an
+    automatic resume with no pull request starts from the beginning; one
+    that would reuse a pull request, or a ``--from-step`` the operator
+    asked for, stops with the reason, because going on would build on a
+    branch nobody checked.
+    """
+    try:
+        head: str | None = worktree._worktree_head_sha(repo, worktree_path)
+    except Exception:
+        head = None
+    if head == point.head_sha or (created_fresh and "code" not in point.steps):
+        return point
+    if (
+        head is not None
+        and point.pr_number is not None
+        and state_db is not None
+        and branch is not None
+        and state_db.last_relay_push(
+            repo=repo, branch=branch, session_id=point.source_session,
+        ) == head
+    ):
+        data = dict(point.data)
+        pub = dict(data.get("publisher") or {})
+        pub["last_pushed_sha"] = head
+        data["publisher"] = pub
+        return dataclasses.replace(point, data=data, head_sha=head)
+    log_event(
+        _logger, "dev.resume.head_moved",
+        session_id=session_id, repo=repo, issue_number=issue_number,
+        source_session=point.source_session, saved_sha=point.head_sha,
+        current_sha=head, rewind=point.rewind, pr_number=point.pr_number,
+    )
+    if point.rewind or point.pr_number is not None:
+        where = f"`{head}`" if head else "a commit that could not be read"
+        raise WorktreeError(
+            f"the run branch is at {where}, not at `{point.head_sha}` where "
+            f"run {point.source_session} saved its steps, so they were not "
+            "taken over"
+            + (
+                f" (pull request #{point.pr_number} may have new commits)"
+                if point.pr_number is not None else
+                " (a branch that is also on GitHub is synced to it; delete "
+                "the remote branch to start again from a past step)"
+            )
+        )
+    return None
+
+
 async def _run_work_steps(run: _DevRun) -> PipelineResult:
     """Run each work step in order and return the outcome they leave.
 
@@ -3952,8 +4328,20 @@ async def _run_work_steps(run: _DevRun) -> PipelineResult:
     step got. The list is read when the run starts, not bound when this
     module loads.
     """
-    for step in DEV_WORK_STEPS:
+    saving = True
+    for seq, step in enumerate(DEV_WORK_STEPS):
+        if step.name in run.restored_steps:
+            continue
         await step.run(run)
+        if not saving or step.name not in RESUMABLE_STEPS:
+            continue
+        if _step_finished(run):
+            _save_step(run, seq, step.name)
+        else:
+            # The run stopped here (a question, a failure). The steps
+            # after it still run, as before, to report and clean up, but
+            # none of them finished work a later run could build on.
+            saving = False
     assert run.result is not None
     return run.result
 
@@ -3979,6 +4367,7 @@ async def run_dev_issue(
     steps: Any = None,
     question_on_issue: str | None = "auto",
     require_proof: bool | None = None,
+    from_step: str | None = None,
 ) -> PipelineResult:
     """Run dev pipeline for a single issue.
 
@@ -3992,6 +4381,10 @@ async def run_dev_issue(
     ``require_proof`` is the repo's ``automation.require_proof`` (#221).
     ``None`` runs no proof step, as before it existed; the daemon and the
     ``dev`` command always pass the config's value, which defaults on.
+
+    A run whose process died is continued after its last saved step
+    (#231, :func:`find_resume_point`). ``from_step`` starts a new run from
+    a past step of the newest run that saved steps instead.
     """
     # Before the lock: a refused mode is a caller error, not a run.
     plan_mode, verify_mode, review_mode = _resolve_step_modes(
@@ -4077,7 +4470,38 @@ async def run_dev_issue(
     # retrying is only offered where nothing could have run.
     dispatched = False
 
+    # Where this run starts (#231): after the saved steps of a run whose
+    # process died, from a step the operator named, or from the beginning.
+    resume_point: ResumePoint | None = None
+    # The pull request the run being continued had opened, kept for the
+    # failure comment even after `resume_point` is dropped.
+    resume_pr: int | None = None
+
     try:
+        try:
+            resume_point = find_resume_point(
+                state_db, repo, issue_number, from_step,
+            )
+        except ResumeRefusedError as e:
+            return PipelineResult(
+                success=False,
+                session_id=session_id,
+                summary=f"Not started from step {from_step!r}",
+                error=str(e),
+            )
+        except Exception as e:
+            if from_step is not None:
+                raise
+            # Could not read what an earlier run saved: start from the
+            # beginning, which is what every run did before #231.
+            log_event(
+                _logger, "dev.resume.lookup_failed",
+                session_id=session_id, repo=repo, issue_number=issue_number,
+                error_type=type(e).__name__, error=str(e)[:200],
+            )
+        if resume_point is not None:
+            resume_pr = resume_point.pr_number
+
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
 
@@ -4131,12 +4555,32 @@ async def run_dev_issue(
         branch_existed_before = await worktree.branch_exists_locally(
             repo, branch_name,
         )
+        if resume_point is not None and resume_point.rewind:
+            # Refuse before moving anything: a branch behind an open pull
+            # request is not rewound.
+            await worktree.refuse_if_branch_backs_open_pr(
+                github, repo, branch_name,
+            )
+            await worktree.rewind_branch(
+                repo, branch_name, resume_point.head_sha,
+                backup_ref=f"refs/ctrlrelay/before-retry/{session_id}",
+            )
         worktree_path, created_fresh = await worktree.create_worktree_with_new_branch(
             repo=repo,
             session_id=session_id,
             new_branch=branch_name,
             github=github,
+            allow_pr=(
+                resume_point.pr_number if resume_point is not None else None
+            ),
         )
+        if resume_point is not None:
+            resume_point = _check_resume_head(
+                worktree, repo, worktree_path, resume_point,
+                created_fresh=created_fresh, session_id=session_id,
+                issue_number=issue_number, state_db=state_db,
+                branch=branch_name,
+            )
 
         # Symlink context
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
@@ -4225,6 +4669,34 @@ async def run_dev_issue(
             answer_poll_seconds=ANSWER_POLL_SECONDS,
             require_proof=require_proof,
         )
+        if (
+            resume_point is not None
+            and not resume_point.rewind
+            and not state_db.mark_resumed(
+                resume_point.source_session, session_id,
+            )
+        ):
+            # Another run took it over first. Marked here, not when the
+            # point was found: a run that fails before this line (a `gh`
+            # error, a lost claim) leaves the steps for its retry. Stops
+            # rather than starting over, because the worktree may sit on
+            # a branch behind the earlier run's open pull request.
+            raise WorktreeError(
+                f"run {resume_point.source_session} was already continued "
+                "by another run"
+            )
+        if resume_point is not None:
+            _restore_steps(run, resume_point)
+            log_event(
+                _logger, "dev.resume.restored",
+                session_id=session_id, repo=repo, issue_number=issue_number,
+                source_session=resume_point.source_session,
+                steps=list(resume_point.steps), rewind=resume_point.rewind,
+                pr_number=resume_point.pr_number,
+            )
+            await _comment_best_effort(
+                run, resume_comment(resume_point, session_id),
+            )
         dispatched = True
         # The work: plan, code, publish, verify, review (DEV_WORK_STEPS). Everything
         # before this line and after it is the frame.
@@ -4596,10 +5068,13 @@ async def run_dev_issue(
             pr_number=(
                 run.publisher.pr_number
                 if run is not None and run.publisher is not None
-                else None
+                else resume_pr
             ),
             claim_posted=claim_may_stand,
             claim_id=claim_id,
+            # Before the run was built, a pull request an earlier run
+            # opened may exist that this run never looked up (#231).
+            pr_known=run is not None,
         )
 
         return PipelineResult(

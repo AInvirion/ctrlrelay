@@ -192,7 +192,7 @@ without waiting for a real pipeline run.
 ### `run dev`
 
 ```bash
-ctrlrelay run dev -i ISSUE [-r REPO] [-c PATH]
+ctrlrelay run dev -i ISSUE [-r REPO] [-c PATH] [--from-step STEP]
 ```
 
 | Flag | Required | Default | Description |
@@ -200,6 +200,7 @@ ctrlrelay run dev -i ISSUE [-r REPO] [-c PATH]
 | `--issue` / `-i` | yes | — | GitHub issue number. |
 | `--repo` / `-r` | when more than one repo is configured | — | Limit to a single `owner/repo`. |
 | `--config` / `-c` | no | `config/orchestrator.yaml` | Config path. |
+| `--from-step` | no | — | Start again from `plan`, `code` or `publish`, taking the earlier steps from the issue's newest run that saved them and moving the branch back. See [A run whose process died](operations.md#a-run-whose-process-died). |
 
 Acquires the per-repo lock, creates the worktree, spawns the repo's agent
 (Claude Code or OpenCode, per `agent.type` / `repos[].agent_type`) with the

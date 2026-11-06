@@ -219,6 +219,27 @@ async def _open_pr_for(github: Any, repo: str, branch: str | None) -> int | None
     return None
 
 
+def _saved_pr(state_db: Any, session_id: str) -> int | None:
+    """The pull request a dev run saved as published (#231), or None when
+    it saved none or the saved steps cannot be read."""
+    import json
+
+    try:
+        rows = state_db.run_steps_for(session_id)
+    except Exception:
+        return None
+    for row in reversed(rows):
+        if row.get("step") not in ("publish", "verify"):
+            continue
+        try:
+            pub = (json.loads(row["data"]) or {}).get("publisher") or {}
+        except (TypeError, ValueError, AttributeError):
+            return None
+        pr = pub.get("pr_number")
+        return pr if isinstance(pr, int) else None
+    return None
+
+
 async def reap_orphaned_sessions(
     state_db: Any,
     *,
@@ -241,9 +262,12 @@ async def reap_orphaned_sessions(
     - a dev or task issue is removed from ``seen_issues`` so the next
       poll takes it again, unless an open pull request was found for the
       branch: then the pull request is the outcome and the issue stays
-      seen. When the lookup could not be made, the issue is handed back
-      anyway; the next run refuses a branch that backs an open pull
-      request on its own (``create_worktree_with_new_branch``);
+      seen. The exception is the pull request the run itself saved as
+      published (#231): the next run continues that run after its last
+      saved step, so the issue is handed back. When the lookup could
+      not be made, the issue is handed back anyway; the next run
+      refuses a branch that backs an open pull request on its own
+      (``create_worktree_with_new_branch``);
     - a comment on the issue names the worktree, and releases this
       machine's claim by id where the row has one. A task run on a
       single machine claims nothing and gets no comment.
@@ -346,7 +370,13 @@ async def reap_orphaned_sessions(
         handed_back = False
         if issue_number is not None and pipeline in _ISSUE_PIPELINES:
             pr_number = await _open_pr_for(github, repo, branch)
-            if pr_number is None:
+            if pr_number is None or (
+                pipeline == "dev"
+                and _saved_pr(state_db, session_id) == pr_number
+            ):
+                # No pull request, or the one this run opened and saved
+                # (#231): the next run continues it after its last saved
+                # step, so the issue goes back to the poller.
                 poller.unmark_seen(repo, int(issue_number))
                 handed_back = True
             claim_id = row.get("claim_id")

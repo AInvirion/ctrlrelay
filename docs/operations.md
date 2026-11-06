@@ -781,6 +781,49 @@ limit until one is set.
   read. A run on `opencode` is not measured; with a limit set, the log gets
   `dispatcher.budget.unmeasured` and nothing is enforced.
 
+## A run whose process died
+
+A dev run saves each step it finishes: `plan`, `code`, `publish` and
+`verify` (#231). Each is a row in the `run_steps` table of the state DB,
+with the run branch's commit at that moment and what the later steps need
+(the plan, the agent's result, the pull request). No commit is added to the
+branch for it.
+
+When the relay process dies in the middle of a run (out of memory, a
+restart, a power cut), the poller settles that run when it starts again and
+hands the issue back. The next run for the issue then continues after the
+last saved step:
+
+- it checks that the branch is still at the saved commit, and starts from
+  the beginning if not (or stops with the reason, when the dead run had
+  already opened its pull request);
+- it does not run those steps again: no new agent session for a saved code
+  step, no second push or pull request for a saved publish step;
+- it comments on the issue which run it continues and from where;
+- `proof` and `review` always run again, because they read the pull
+  request as it is now.
+
+A dead run that had opened its pull request is handed back too, and only
+that pull request is reused. A run that failed for its own reasons is not
+continued; the next run starts from the beginning, as before.
+
+To start again from a past step by hand, for example to redo the code with
+the same plan:
+
+```bash
+ctrlrelay run dev --issue 42 --repo your-org/your-repo --from-step code
+```
+
+`--from-step` takes `plan`, `code` or `publish`, uses the newest run of the
+issue that saved steps, and moves the branch back to where it was before
+that step. The old head is kept at `refs/ctrlrelay/before-retry/<run id>`
+in the relay's clone. It refuses a branch behind an open pull request, and a
+branch that is on GitHub is synced back to GitHub's head; delete the remote
+branch first in that case.
+
+The log events are `dev.step.saved`, `dev.resume.restored` and
+`dev.resume.head_moved`.
+
 ## When to restart
 
 | You changed... | Restart... |
