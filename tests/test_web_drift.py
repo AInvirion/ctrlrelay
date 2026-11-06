@@ -560,14 +560,14 @@ def _render_fleet(peers: list[dict]) -> list[dict]:
         pytest.skip("node is not installed, so the page's script cannot run here")
     script = _script()
     defs = []
-    for name in ("el", "put", "safePeerUrl", "peerLink", "pct", "usagePct",
+    for name in ("el", "put", "safePeerUrl", "peerLink", "pct", "noFiveHour", "usagePct",
                  "machineCard", "sandboxLine", "versionDiffers", "isBad",
                  "driftLines", "renderFleet"):
         m = re.search(r"\bfunction\s+" + name + r"\s*\(([^)]*)\)", script)
         assert m, name
         defs.append(f"function {name}({m.group(1)}) {{{_js_function(script, name)}}}")
-    consts = "\n".join(re.findall(r"^var (?:PEER_URL|BAD_STATES) = .*;$", script, re.M))
-    assert consts.count("var ") == 2
+    consts = "\n".join(re.findall(r"^var (?:PEER_URL|BAD_STATES|NO_FIVE_HOUR) = .*;$", script, re.M))
+    assert consts.count("var ") == 3
     data = {"version": "0.23.0", "host": "node-a",
             "node": {"name": "node-a", "state": "idle", "version": "0.23.0"},
             "fleet": {"peers": peers}}
@@ -582,11 +582,14 @@ def _render_fleet(peers: list[dict]) -> list[dict]:
     return json.loads(done.stdout)
 
 
-def _peer(drift: dict | None) -> dict:
+def _peer(drift: dict | None, usage: object = None) -> dict:
+    node = {"name": "node-b", "state": "idle", "version": "0.23.0",
+            "heartbeat_at": "2026-11-05T00:00:00Z"}
+    if usage is not None:
+        node["usage"] = usage
     return {"url": "http://node-b:8787", "name": "node-b", "reachable": True,
             "state": "idle", "page_url": "http://node-b:8787/", "drift": drift,
-            "node": {"name": "node-b", "state": "idle", "version": "0.23.0",
-                     "heartbeat_at": "2026-11-05T00:00:00Z"}}
+            "node": node}
 
 
 def test_render_fleet_marks_a_drifted_peer_and_lists_its_lines() -> None:
@@ -611,3 +614,27 @@ def test_render_fleet_shows_an_unknown_comparison_as_unknown() -> None:
     assert peer["cls"] == "machine"
     assert ("config drift unknown: it sends no config fingerprint this version can read"
             in peer["texts"])
+
+
+def _usage_line(usage: object) -> str:
+    _, peer = _render_fleet([_peer({"status": "same", "lines": []}, usage)])
+    [line] = [t for t in peer["texts"] if t.startswith("5-hour ")]
+    return line
+
+
+def test_a_reading_with_no_five_hour_window_says_ultra_plan() -> None:
+    # What /fleet sends for a peer whose agent reports only the 7-day window.
+    usage = {"five_hour": "unknown", "seven_day": {"used": 0.56, "resets_at": None}}
+    assert _usage_line(usage) == "5-hour none (ultra plan), 7-day 56%"
+
+
+def test_no_reading_at_all_is_still_unknown() -> None:
+    assert _usage_line("unknown") == "5-hour unknown, 7-day unknown"
+    both_missing = {"five_hour": "unknown", "seven_day": "unknown"}
+    assert _usage_line(both_missing) == "5-hour unknown, 7-day unknown"
+
+
+def test_a_five_hour_number_is_shown_as_a_number() -> None:
+    usage = {"five_hour": {"used": 0.28, "resets_at": None},
+             "seven_day": {"used": 0.56, "resets_at": None}}
+    assert _usage_line(usage) == "5-hour 28%, 7-day 56%"
