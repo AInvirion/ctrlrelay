@@ -556,3 +556,91 @@ def test_the_outcome_event_names_a_budget_stop(tmp_path: Path):
     detail = db.list_events()[0]["detail"]
     assert detail["budget"] == reason
     assert "stuck" not in detail
+
+
+@pytest.mark.asyncio
+async def test_task_lane_records_a_budget_stop(tmp_path: Path):
+    from unittest.mock import MagicMock
+
+    from ctrlrelay.core.dispatcher import SessionResult
+    from ctrlrelay.pipelines.task import run_task_issue
+
+    reason = budget_reason(1_100, 1_000)
+    dispatcher = AsyncMock()
+    dispatcher.spawn_session.side_effect = lambda **kw: SessionResult(
+        session_id=kw["session_id"], exit_code=-9, state=None, stuck_reason=reason,
+    )
+    worktree = AsyncMock()
+    worktree.create_worktree.return_value = tmp_path / "wt"
+    worktree.symlink_context = MagicMock()
+    worktree.remove_context_symlink = MagicMock()
+    github = AsyncMock()
+    github.get_issue.return_value = {"number": 5, "title": "t", "body": ""}
+    db = StateDB(tmp_path / "state.db")
+    result = await run_task_issue(
+        claims=None, repo="o/r", issue_number=5, dispatcher=dispatcher,
+        github=github, worktree=worktree, dashboard=None, state_db=db,
+        transport=None, contexts_dir=tmp_path / "contexts",
+    )
+    assert result.stuck_reason == reason
+    row = db.execute("SELECT status, stuck_reason FROM sessions").fetchone()
+    assert (row[0], row[1]) == ("failed", reason)
+    failed = [e for e in db.list_events() if e["kind"] == "failed"]
+    assert failed[0]["detail"]["budget"] == reason
+
+
+class TestMeterCost:
+    def test_a_second_poll_reads_only_the_appended_bytes(self, tmp_path: Path):
+        path = tmp_path / "s.jsonl"
+        _write(path, *[_assistant(f"m{i}", inp=1) for i in range(200)])
+        meter = TranscriptMeter([tmp_path], since=T0)
+        meter.read()
+        first = meter.bytes_read
+        assert first == path.stat().st_size
+        row = _assistant("new", inp=5)
+        _write(path, row)
+        usage = meter.read()
+        assert meter.bytes_read - first == len(row) + 1
+        assert usage.counted == 205
+
+    def test_a_replaced_file_is_read_again_without_double_counting(
+        self, tmp_path: Path
+    ):
+        path = tmp_path / "s.jsonl"
+        _write(path, _assistant("m1", inp=10), _assistant("m2", inp=20))
+        meter = TranscriptMeter([tmp_path], since=T0)
+        assert meter.read().counted == 30
+        # Rewritten shorter (compacted, or replaced by a new file).
+        tmp = tmp_path / "s.jsonl.new"
+        _write(tmp, _assistant("m2", inp=20), _assistant("m3", inp=1))
+        tmp.replace(path)
+        assert meter.read().counted == 31
+
+    def test_a_truncated_file_restarts_and_drops_its_old_unreadable_rows(
+        self, tmp_path: Path
+    ):
+        path = tmp_path / "s.jsonl"
+        _write(path, "{broken", _assistant("m1", inp=10), _assistant("m2", inp=1))
+        meter = TranscriptMeter([tmp_path], since=T0)
+        assert meter.read().unreadable == 1
+        path.write_text(_assistant("m1", inp=10) + "\n")
+        usage = meter.read()
+        assert usage.unreadable == 0 and usage.counted == 11
+
+    @pytest.mark.asyncio
+    async def test_the_watch_reads_off_the_event_loop(self, tmp_path: Path):
+        import threading
+
+        watch, _, _ = _watch(tmp_path, BudgetLimits(hard=10))
+        _write(tmp_path / "s.jsonl", _assistant("m1", inp=1))
+        seen: list[threading.Thread] = []
+        real = watch.meter.read
+
+        def read():
+            seen.append(threading.current_thread())
+            return real()
+
+        watch.meter.read = read
+        await watch.check()
+        await watch.finish(None)
+        assert seen and all(t is not threading.main_thread() for t in seen)

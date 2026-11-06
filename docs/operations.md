@@ -753,8 +753,19 @@ limit until one is set.
   `Stopped:`, the issue comment gives the reason, and chat gets
   `💸 Over budget on #<n>, stopped: <reason>`. A checkpoint the agent wrote
   just before the stop is not used: the work is not handed over as ready.
-  Unfinished work is not saved to a branch (only a timeout does that), and
-  the status page's numbers count the run in `failed`, not in `stuck`.
+  When no pull request exists yet, the unfinished work is not saved to a
+  branch (only a timeout does that). The status page's numbers count the
+  run in `failed`, not in `stuck`.
+- **A stop after the PR was opened** (over budget in a CI fix round, or
+  stuck there): the PR is put back to draft and kept with the work so far,
+  no merge watcher is started for it, and chat and the issue comment say
+  `PR #<n> was kept as a draft with the work so far.` If GitHub refuses the
+  draft, a "Do not merge" comment goes on the PR instead, and the messages
+  say so.
+- **A floor, not an exact bill.** Only API calls that write an assistant
+  row to the transcript are counted; calls the CLI makes on its own without
+  one (for example, short helper calls) are not. The count can be a little
+  under what the subscription was charged.
 - **Unknown is not zero.** A transcript row whose usage cannot be read adds
   nothing and is counted as unreadable; the log gets `budget.usage_unreadable`
   and the page shows the total as unknown. What could be read is still a

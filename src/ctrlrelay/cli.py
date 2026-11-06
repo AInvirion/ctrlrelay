@@ -590,6 +590,21 @@ async def announce_dev_success(
     return sent
 
 
+def pr_to_watch(result) -> int | None:
+    """The PR whose merge the watcher should wait on after an issue run, or
+    None. A PR a stopped run parked as a draft (#223) is not handed over,
+    so nothing waits on its merge."""
+    if getattr(result, "parked_pr", None) is not None:
+        return None
+    raw = result.outputs.get("pr_number")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 async def announce_issue_outcome(
     transport, *, repo: str, issue_number: int, is_task: bool, result
 ) -> list[str]:
@@ -652,6 +667,10 @@ async def announce_issue_outcome(
             line = (
                 f"🔁 Stuck on #{issue_number}, stopped: {result.stuck_reason}"
             )
+        # The PR it had opened, now a draft (#223).
+        parked = getattr(result, "parked_note", None)
+        if isinstance(parked, str) and parked:
+            line += f". {parked}"
         await transport.send(line)
         sent.append(line)
     else:
@@ -3549,21 +3568,16 @@ def poller_start(
                 # transport.send failure below raised through the outer
                 # finally, we'd permanently lose the watcher and the
                 # issue would never auto-close on merge.
-                pr_number_raw = result.outputs.get("pr_number")
                 pr_url_str = result.outputs.get("pr_url", "")
-                if pr_number_raw is not None:
-                    try:
-                        pr_number = int(pr_number_raw)
-                    except (TypeError, ValueError):
-                        pr_number = None
-                    if pr_number is not None:
-                        _spawn_pr_watch(
-                            repo=repo,
-                            issue_number=issue_number,
-                            pr_url=pr_url_str,
-                            pr_number=pr_number,
-                            session_id=result.session_id,
-                        )
+                pr_number = pr_to_watch(result)
+                if pr_number is not None:
+                    _spawn_pr_watch(
+                        repo=repo,
+                        issue_number=issue_number,
+                        pr_url=pr_url_str,
+                        pr_number=pr_number,
+                        session_id=result.session_id,
+                    )
 
                 # Send result notification — best-effort. A failed send
                 # must NOT prevent the merge watcher (spawned above)

@@ -47,7 +47,7 @@ def _no_settle(monkeypatch):
 
 
 async def _run(tmp_path: Path, *, verifications: list, logs: list[str],
-               spawns: list | None = None):
+               spawns: list | None = None, setup=None):
     dispatcher = AsyncMock()
     dispatcher.spawn_session.side_effect = spawns or (lambda *a, **k: _done())
 
@@ -68,6 +68,8 @@ async def _run(tmp_path: Path, *, verifications: list, logs: list[str],
     log_iter = iter(logs)
     github.get_failed_job_log = AsyncMock(side_effect=lambda *a, **k: next(log_iter))
     github.rerun_failed_jobs = AsyncMock(return_value=None)
+    if setup is not None:
+        setup(github)
 
     verifier = AsyncMock()
     verifier.verify.side_effect = verifications
@@ -242,3 +244,92 @@ async def test_a_log_that_could_not_be_fetched_is_unknown_so_code():
     github.get_failed_job_log = AsyncMock(side_effect=RuntimeError("503"))
     _, job_logs = await dev_mod._failed_check_logs(github, "owner/repo", FAILING)
     assert job_logs == [None]
+
+
+# --- a run stopped after its PR exists keeps the PR, as a draft (#223) -------
+
+
+def _over_budget(sid: str = "dev-a") -> SessionResult:
+    from ctrlrelay.core.budget import budget_reason
+
+    return SessionResult(
+        session_id=sid, exit_code=-9, stdout="", stderr="", state=None,
+        stuck_reason=budget_reason(1_100, 1_000),
+    )
+
+
+async def _budget_stop_in_fix_round(tmp_path, monkeypatch, *, draft_fails=False):
+    reconcile = AsyncMock()
+    monkeypatch.setattr(dev_mod, "reconcile_claim_on_failure", reconcile)
+    spawns = iter([_done(), _over_budget()])
+
+    def _set_draft(github):
+        if draft_fails:
+            github.set_pr_draft.side_effect = RuntimeError("drafts not allowed")
+
+    result, row, _, github = await _run(
+        tmp_path, verifications=[_failed()], logs=[CODE_LOG],
+        spawns=lambda *a, **k: next(spawns), setup=_set_draft,
+    )
+    return result, row, github, reconcile
+
+
+@pytest.mark.asyncio
+async def test_budget_stop_in_a_fix_round_puts_the_pr_back_to_draft(
+    tmp_path, monkeypatch
+):
+    result, row, github, reconcile = await _budget_stop_in_fix_round(
+        tmp_path, monkeypatch,
+    )
+    assert result.stuck_reason.startswith("budget: ")
+    assert result.parked_pr == 42
+    github.set_pr_draft.assert_any_await("owner/repo", 42, True)
+    assert result.parked_note == "PR #42 was kept as a draft with the work so far."
+    assert result.parked_note in reconcile.await_args.kwargs["reason"]
+    assert row["stuck_reason"] == result.stuck_reason
+
+
+@pytest.mark.asyncio
+async def test_a_pr_that_cannot_be_drafted_gets_a_do_not_merge_comment(
+    tmp_path, monkeypatch
+):
+    result, _, github, _ = await _budget_stop_in_fix_round(
+        tmp_path, monkeypatch, draft_fails=True,
+    )
+    assert result.parked_pr == 42
+    body = github.comment_on_pr.await_args.args[2]
+    assert "Do not merge" in body and "over budget" in body
+    assert "do-not-merge comment" in result.parked_note
+
+
+def test_a_parked_pr_gets_no_merge_watcher():
+    from ctrlrelay.cli import pr_to_watch
+    from ctrlrelay.pipelines.base import PipelineResult
+
+    handed = PipelineResult(
+        success=True, session_id="s", summary="ok", outputs={"pr_number": 42},
+    )
+    assert pr_to_watch(handed) == 42
+    parked = PipelineResult(
+        success=False, session_id="s", summary="Stopped", outputs={"pr_number": 42},
+        stuck_reason="budget: x", parked_pr=42, parked_note="n",
+    )
+    assert pr_to_watch(parked) is None
+
+
+@pytest.mark.asyncio
+async def test_chat_names_the_parked_pr():
+    from ctrlrelay.cli import announce_issue_outcome
+    from ctrlrelay.pipelines.base import PipelineResult
+
+    transport = AsyncMock()
+    note = "PR #42 was kept as a draft with the work so far."
+    sent = await announce_issue_outcome(
+        transport, repo="o/r", issue_number=7, is_task=False,
+        result=PipelineResult(
+            success=False, session_id="s", summary="Stopped",
+            stuck_reason="budget: used 1,100 tokens, hard limit 1,000",
+            parked_pr=42, parked_note=note,
+        ),
+    )
+    assert sent[0].endswith(note)

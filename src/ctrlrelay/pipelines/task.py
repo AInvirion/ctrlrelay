@@ -584,10 +584,12 @@ async def run_task_issue(
         status = "done" if result.success else (
             "blocked" if result.blocked else "failed"
         )
+        # Over budget (#223) is recorded like dev's stuck runs.
+        stuck_reason = result.stuck_reason if status == "failed" else None
         state_db.execute(
-            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
-            "WHERE id = ?",
-            (status, result.summary, int(time.time()), session_id),
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ?, "
+            "stuck_reason = ? WHERE id = ?",
+            (status, result.summary, int(time.time()), stuck_reason, session_id),
         )
         state_db.commit()
 
@@ -620,6 +622,7 @@ async def run_task_issue(
                 "session_id": session_id,
                 "exit_code": result.exit_code,
                 "question": result.question,
+                "stuck_reason": stuck_reason,
             },
         )
 
@@ -914,10 +917,12 @@ async def resume_task_from_pending(
         status = "done" if result.success else (
             "blocked" if result.blocked else "failed"
         )
+        # Over budget (#223) is recorded like dev's stuck runs.
+        stuck_reason = result.stuck_reason if status == "failed" else None
         state_db.execute(
-            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
-            "WHERE id = ?",
-            (status, result.summary, int(time.time()), session_id),
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ?, "
+            "stuck_reason = ? WHERE id = ?",
+            (status, result.summary, int(time.time()), stuck_reason, session_id),
         )
         state_db.commit()
 
@@ -950,6 +955,7 @@ async def resume_task_from_pending(
                 "session_id": session_id,
                 "exit_code": result.exit_code,
                 "question": result.question,
+                "stuck_reason": stuck_reason,
             },
         )
         return result

@@ -42,6 +42,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import threading
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -225,14 +227,25 @@ class TranscriptMeter:
     Rows stamped before ``since`` are left out, so a resumed session (whose
     transcript repeats the earlier conversation) is not charged again for
     what an earlier spawn already counted.
+
+    Each file is read from where the last call stopped, so a poll costs
+    what was appended since, not the whole transcript. A file that shrank
+    or was replaced (another inode) is read again from the start; the
+    message ids already seen keep that from counting anything twice.
+    :meth:`read` is safe to call from a worker thread, one call at a time
+    (a lock makes a second caller wait).
     """
 
     def __init__(self, folders: Sequence[Path], *, since: float) -> None:
         self.folders = list(folders)
         self.since = since
         self._offsets: dict[Path, int] = {}
+        self._inodes: dict[Path, int] = {}
         self._by_message: dict[str, dict[str, int]] = {}
         self._unreadable: set[str] = set()
+        self._lock = threading.Lock()
+        # Bytes read from disk over every call, for tests and the log.
+        self.bytes_read = 0
 
     def _files(self) -> Iterable[Path]:
         for folder in self.folders:
@@ -245,6 +258,10 @@ class TranscriptMeter:
     def read(self) -> RunUsage:
         """Usage so far. Raises :class:`OSError` only when a file it already
         started reading can no longer be read."""
+        with self._lock:
+            return self._read_locked()
+
+    def _read_locked(self) -> RunUsage:
         for path in self._files():
             try:
                 if not path.is_file() or path.stat().st_mtime < self.since:
@@ -267,8 +284,21 @@ class TranscriptMeter:
     def _read_new(self, path: Path) -> None:
         start = self._offsets.get(path, 0)
         with open(path, "rb") as fh:
+            info = os.fstat(fh.fileno())
+            if start and (
+                info.st_size < start or self._inodes.get(path) != info.st_ino
+            ):
+                # Truncated or replaced: read it again from the start. Its
+                # unreadable rows are judged again too.
+                prefix = f"{path}:"
+                self._unreadable = {
+                    k for k in self._unreadable if not k.startswith(prefix)
+                }
+                start = 0
+            self._inodes[path] = info.st_ino
             fh.seek(start)
             data = fh.read()
+        self.bytes_read += len(data)
         end = data.rfind(b"\n")
         if end < 0:
             return  # no complete row yet
@@ -503,7 +533,9 @@ class BudgetWatch:
         """One poll. Returns the stop reason when the hard limit is reached."""
         if spawn is None:
             try:
-                spawn = self.meter.read()
+                # Off the event loop: a first read of a long transcript
+                # can take a while.
+                spawn = await asyncio.to_thread(self.meter.read)
             except Exception as e:  # noqa: BLE001 - must never stop a run
                 _logger.warning(
                     "budget.transcript_unreadable",
@@ -550,7 +582,7 @@ class BudgetWatch:
         result event reported. Returns this spawn's usage, or None when it
         could not be read at all."""
         try:
-            spawn = self.meter.read()
+            spawn = await asyncio.to_thread(self.meter.read)
         except Exception as e:  # noqa: BLE001
             _logger.warning(
                 "budget.transcript_unreadable",

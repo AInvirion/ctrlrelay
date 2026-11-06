@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until a limit is set. The count is input + cache writes + output tokens,
   read live from the agent's transcript, and covers the whole issue session
   across resumes and fix rounds. Cache reads are recorded but not counted.
+  A run stopped over budget or as stuck after it opened a PR puts the PR back
+  to draft (or posts a "Do not merge" comment when that fails), starts no
+  merge watcher for it, and names it in chat and the issue comment.
 - Each session records the tokens it used (`sessions.usage_tokens` and
   `sessions.usage_detail`, with the cost the agent CLI reported). Running
   cards on the status page and `/api/status` show `tokens_used`,

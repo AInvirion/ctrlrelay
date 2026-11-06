@@ -65,6 +65,12 @@ class PipelineResult:
     # `timed_out`: set only by the relay, never read from the agent's own
     # checkpoint. The session is recorded as failed, with this reason.
     stuck_reason: str | None = None
+    # A pull request the relay put back to draft (or marked do-not-merge)
+    # because the run was stopped after opening it (#223), and the
+    # sentence saying so for chat and the issue comment. Set only by the
+    # relay; a parked PR gets no merge watcher.
+    parked_pr: int | None = None
+    parked_note: str | None = None
 
 
 def failure_text(result: PipelineResult) -> str:

@@ -418,6 +418,62 @@ def claim_failure_comment(
     )
 
 
+async def park_stopped_pr(
+    github: GitHubCLI,
+    result: PipelineResult,
+    *,
+    repo: str,
+    pr_number: int | None,
+) -> PipelineResult:
+    """A run stopped over budget (#223) or as stuck (#224) after its pull
+    request was opened: put the PR back to draft so it does not read as
+    ready, and say so. When that fails, a do-not-merge comment goes on the
+    PR instead. ``pr_number`` must be the number the relay recorded when it
+    published, never one from the agent's checkpoint. Raises nothing but a
+    cancellation: this runs on a failure path."""
+    if result.success or result.blocked or not result.stuck_reason:
+        return result
+    if pr_number is None:
+        return result
+    why = "over budget" if is_budget_reason(result.stuck_reason) else "as stuck"
+    try:
+        await github.set_pr_draft(repo, pr_number, True)
+        note = f"PR #{pr_number} was kept as a draft with the work so far."
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log_event(
+            _logger, "dev.stopped.draft_failed", repo=repo,
+            session_id=result.session_id, pr_number=pr_number,
+            error_type=type(e).__name__, error=str(e)[:200],
+        )
+        try:
+            await github.comment_on_pr(
+                repo, pr_number,
+                f"**Do not merge.** ctrlrelay stopped this run {why} "
+                f"({result.stuck_reason}) and could not put this pull "
+                "request back to draft. It holds the work so far: not "
+                "finished and not reviewed.",
+            )
+            note = (
+                f"PR #{pr_number} could not be put back to draft; a "
+                "do-not-merge comment was posted on it."
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e2:
+            log_event(
+                _logger, "dev.stopped.comment_failed", repo=repo,
+                session_id=result.session_id, pr_number=pr_number,
+                error_type=type(e2).__name__, error=str(e2)[:200],
+            )
+            note = (
+                f"PR #{pr_number} could not be put back to draft or "
+                "commented on: do not merge it."
+            )
+    return dataclasses.replace(result, parked_pr=pr_number, parked_note=note)
+
+
 def wip_branch_name(issue_number: int, session_id: str) -> str:
     """Where a timed-out run's unfinished work is pushed (#311): never the
     run's own branch. The run id is the session id's random tail, so the
@@ -3958,6 +4014,12 @@ async def run_dev_issue(
                 merged_outputs["cleanup_deferred"] = True
                 result = dataclasses.replace(result, outputs=merged_outputs)
 
+        # A run stopped after its PR was opened keeps the PR, as a draft
+        # (#223).
+        result = await park_stopped_pr(
+            github, result, repo=repo, pr_number=run.pr_number_for_review,
+        )
+
         # Update session status
         status = "done" if result.success else ("blocked" if result.blocked else "failed")
         # A stuck run is a failed run that also says it was stuck (#224).
@@ -4116,7 +4178,8 @@ async def run_dev_issue(
                 issue_number=issue_number,
                 session_id=session_id,
                 reason=failure_text(result)
-                + (f" {timeout_note}" if timeout_note else ""),
+                + (f" {timeout_note}" if timeout_note else "")
+                + (f" {result.parked_note}" if result.parked_note else ""),
                 exit_code=result.exit_code,
                 pr_number=pr_for_comment,
                 claim_posted=claim_may_stand,
@@ -4505,15 +4568,19 @@ async def resume_dev_from_pending(
                     review=run.review_report or REVIEW_NOT_REPORTED,
                 )
         assert run.result is not None
-        result = run.result
+        result = await park_stopped_pr(
+            github, run.result, repo=repo, pr_number=run.pr_number_for_review,
+        )
 
         status = "done" if result.success else (
             "blocked" if result.blocked else "failed"
         )
+        # Stuck or over budget (#224, #223), as in run_dev_issue.
+        stuck_reason = result.stuck_reason if status == "failed" else None
         state_db.execute(
-            "UPDATE sessions SET status = ?, summary = ?, ended_at = ? "
-            "WHERE id = ?",
-            (status, result.summary, int(time.time()), session_id),
+            "UPDATE sessions SET status = ?, summary = ?, ended_at = ?, "
+            "stuck_reason = ? WHERE id = ?",
+            (status, result.summary, int(time.time()), stuck_reason, session_id),
         )
         state_db.commit()
         await _note_no_change_on_issue(
@@ -4554,6 +4621,7 @@ async def resume_dev_from_pending(
                 "session_id": session_id,
                 "exit_code": result.exit_code,
                 "question": result.question,
+                "stuck_reason": stuck_reason,
             },
         )
         return result
