@@ -937,6 +937,51 @@ printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
 ```"""
 
 
+# What the planner is told about proof of done (#221), only when the repo
+# requires it.
+_PLAN_PROOF_NOTE = """The relay will hold the pull request until a test fails before the change
+and passes after it, and will refuse a change that deletes, skips or
+loosens tests. If the work really must remove or skip a test, add an item
+`Test removal intended: <why>`. If no test can show the change, add an
+item `No test possible: <why>`; a person then decides on the pull request.
+"""
+
+
+# The proof output line of the DONE checkpoint (#221).
+_PROOF_OUTPUT = """
+        "proof": {
+            "command": ["<ARGV>", "<OF THE TEST COMMAND>"],
+            "tests": ["<TEST FILE PATH>::<TEST NAME>"],
+        },"""
+
+# What the agent is told about proof of done (#221), only when the repo
+# requires it (see DevPipeline.require_proof).
+_PROOF_CONTRACT = """**Proof.** Name in `proof` the test that shows your change works. The
+relay does not take your word for it: it runs `command` itself, as an
+argument list with no shell, in a fresh checkout of the commit it pushed
+(must pass) and of the base commit with only your changes to test files
+applied (must fail). Each run has no network, no GitHub credentials and a
+time limit, and starts without the untracked files of this worktree, so
+the command must set up what it needs offline, for example
+`["uv", "run", "--offline", "pytest", "tests/test_x.py::test_y"]`. Each
+entry in `tests` starts with the path of the test file. A result counts
+only with evidence that the named tests ran. For pytest the relay adds
+`--junitxml` and reads it: on the branch each named test must pass, on
+the base each must fail or error; pytest exiting 2 to 5 (a collection
+error, a usage error, no tests collected) or a named test missing from
+the report counts as not proven. On the base only, a collection error in
+the file of a named test (it imports code only the branch has) counts as
+failing before. For any other runner, the command must exit 0 on the branch
+and 1 on the base, and the part of each `tests` entry after the last `::`
+must appear in its output. A PR without a proof that fails before and
+passes after stays a draft. Do not delete,
+skip or loosen tests to get there: the relay scans the diff for that, and
+holds the PR unless the plan says the removal is intended. A change that
+only touches docs needs no proof.
+
+"""
+
+
 @dataclass
 class DevPipeline:
     """Dev pipeline for implementing issues and opening PRs."""
@@ -949,6 +994,9 @@ class DevPipeline:
     transport: Transport | None
 
     name: str = "dev"
+    # Proof of done (#221): the agent is asked to name its proof only when
+    # the repo requires it, so a repo with it off spends nothing on it.
+    require_proof: bool = False
 
     async def run(self, ctx: PipelineContext) -> PipelineResult:
         """Run dev pipeline on a single issue."""
@@ -1083,12 +1131,7 @@ What could break, and anything the coding session must be careful with.
 ## Acceptance criteria
 A numbered list (`1.`, `2.`, ...). Each item must be checkable, either by
 running a command or by reading the diff. These are what "done" means.
-The relay will hold the pull request until a test fails before the change
-and passes after it, and will refuse a change that deletes, skips or
-loosens tests. If the work really must remove or skip a test, add an item
-`Test removal intended: <why>`. If no test can show the change, add an
-item `No test possible: <why>`; a person then decides on the pull request.
-
+{_PLAN_PROOF_NOTE if self.require_proof else ""}
 If the issue is too vague to plan, do not guess: signal BLOCKED with
 **one** clear question.
 
@@ -1292,6 +1335,8 @@ it resumes this session with the details.
         # the shell takes the word after `>` as a filename.
         quoted_path = shlex.quote(state_file_path)
         quoted_dir = shlex.quote(str(Path(state_file_path).parent))
+        proof_output = _PROOF_OUTPUT if self.require_proof else ""
+        proof_block = _PROOF_CONTRACT if self.require_proof else ""
         return f"""{_NO_GITHUB_ACCESS}
 
 ## Signaling Completion
@@ -1319,11 +1364,7 @@ state = {{
     "summary": "<ONE-LINE SUMMARY>",
     "outputs": {{
         "pr_title": "<PR TITLE>",
-        "pr_body": r'''<PR DESCRIPTION>''',
-        "proof": {{
-            "command": ["<ARGV>", "<OF THE TEST COMMAND>"],
-            "tests": ["<TEST FILE PATH>::<TEST NAME>"],
-        }},
+        "pr_body": r'''<PR DESCRIPTION>''',{proof_output}
     }},
 }}
 with open(sys.argv[1], "w") as f:
@@ -1331,30 +1372,7 @@ with open(sys.argv[1], "w") as f:
 CTRLRELAY_DONE
 ```
 
-**Proof.** Name in `proof` the test that shows your change works. The
-relay does not take your word for it: it runs `command` itself, as an
-argument list with no shell, in a fresh checkout of the commit it pushed
-(must pass) and of the base commit with only your changes to test files
-applied (must fail). Each run has no network, no GitHub credentials and a
-time limit, and starts without the untracked files of this worktree, so
-the command must set up what it needs offline, for example
-`["uv", "run", "--offline", "pytest", "tests/test_x.py::test_y"]`. Each
-entry in `tests` starts with the path of the test file. A result counts
-only with evidence that the named tests ran. For pytest the relay adds
-`--junitxml` and reads it: on the branch each named test must pass, on
-the base each must fail or error; pytest exiting 2 to 5 (a collection
-error, a usage error, no tests collected) or a named test missing from
-the report counts as not proven. On the base only, a collection error in
-the file of a named test (it imports code only the branch has) counts as
-failing before. For any other runner, the command must exit 0 on the branch
-and 1 on the base, and the part of each `tests` entry after the last `::`
-must appear in its output. A PR without a proof that fails before and
-passes after stays a draft. Do not delete,
-skip or loosen tests to get there: the relay scans the diff for that, and
-holds the PR unless the plan says the removal is intended. A change that
-only touches docs needs no proof.
-
-**DONE with no change** (only when the right outcome is to change nothing,
+{proof_block}**DONE with no change** (only when the right outcome is to change nothing,
 for example the work is already on the default branch, or the operator told
 you to stop without a pull request). Commit nothing, and write the DONE
 block above with these two outputs in place of the pull request ones:
@@ -3431,11 +3449,11 @@ async def _step_proof(run: _DevRun) -> None:
         return
     pr = run.pr_number_for_review
     if not run.require_proof:
-        report = ProofReport(
+        # Off is the default, so nothing is posted: a comment on every PR
+        # saying proof was not asked for would be noise.
+        run.proof_report = ProofReport(
             outcome=NOT_REQUIRED, reason="proof not required by config",
         )
-        run.proof_report = report
-        await _post_proof(run, report)
         return
     assert run.publisher is not None
     head = run.publisher.last_pushed_sha
@@ -4178,6 +4196,7 @@ async def run_dev_issue(
             dashboard=dashboard,
             state_db=state_db,
             transport=transport,
+            require_proof=bool(require_proof),
         )
         run = _DevRun(
             repo=repo,
@@ -4757,6 +4776,7 @@ async def resume_dev_from_pending(
             dashboard=dashboard,
             state_db=state_db,
             transport=transport,
+            require_proof=bool(require_proof),
         )
 
         # A plan that was waiting on this answer (#220) resumes as a plan:

@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only `proven` (or a docs-only diff) lets the PR go ready. Otherwise the PR
   stays a draft and the run fails with `PR #N held as a draft`. The PR gets
   one comment, edited in place, with the test, the command and both results.
-  On by default; `repos[].automation.require_proof: false` turns it off for
-  a repo, and the PR then says proof was not required by config.
+  Off by default: set `repos[].automation.require_proof: true` for a repo
+  whose tests can run offline in a fresh copy. With it off, the agent is not
+  asked for a proof and nothing is posted.
 
 - Each machine's agent sandbox mode is shown (#305). `/api/status` carries
   `node.sandbox` (`"none"` or `"bwrap"`; `null` for a peer on an older

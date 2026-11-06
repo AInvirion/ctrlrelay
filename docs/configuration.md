@@ -762,7 +762,7 @@ and ask the operator), or `never` (skip).
 | `include_labels` | `[]` | Issue labels that opt an issue **into** the dev pipeline regardless of who is (or isn't) assigned. See [include_labels](#reposautomationinclude_labels) below. |
 | `require_labels` | `[]` | Issue labels that gate the plain-assignment trigger: when set, assignment alone is no longer enough — the issue must also carry one of these labels. See [require_labels](#reposautomationrequire_labels) below. |
 | `ci_wait_timeout_seconds` | `600` | Unused since #219 (the agent no longer waits on CI; ctrlrelay does). Still accepted so existing configs load. See [ci_wait_timeout_seconds](#reposautomationci_wait_timeout_seconds) below. |
-| `require_proof` | `true` | A dev run's PR goes ready only when the relay itself proved the change: a test that fails on the base and passes on the branch, and no weakened tests. See [require_proof](#reposautomationrequire_proof) below. |
+| `require_proof` | `false` | A dev run's PR goes ready only when the relay itself proved the change: a test that fails on the base and passes on the branch, and no weakened tests. See [require_proof](#reposautomationrequire_proof) below. |
 
 The current secops and dev pipelines read the policy settings to bias their
 prompts to the agent — they're not enforced by hard-coded checks.
@@ -969,7 +969,7 @@ repos:
 
 ### repos[].automation.require_proof
 
-On by default (#221). Green CI says a change did not break what was already
+Off by default (#221). Green CI says a change did not break what was already
 tested; it does not say the issue was fixed. With `require_proof` the relay
 checks real evidence before it hands a dev run's PR over as ready.
 
@@ -1067,8 +1067,9 @@ ready, the relay reads the PR's head from GitHub: if it is not the commit the
 proof ran on, or cannot be read, the run is `not proven` and the PR stays a
 draft.
 
-Set `require_proof: false` for a repo with no runnable tests. The PR is then
-opened as before and its comment says `proof not required by config`.
+Turn it on only for a repo whose tests can run offline in a fresh copy of
+the commit. With it off (the default) the agent is not asked for a proof,
+the PR is opened as before, and no proof comment is posted.
 
 ### repos[].steps
 

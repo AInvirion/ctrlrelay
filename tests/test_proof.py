@@ -623,7 +623,9 @@ def _proof_dispatcher():
     return d
 
 
-async def _gate_run(tmp_path: Path, monkeypatch, report, *, require_proof=True, **kw):
+async def _gate_run(
+    tmp_path: Path, monkeypatch, report, *, require_proof=True, dispatcher=None, **kw,
+):
     fake = AsyncMock(return_value=report)
     monkeypatch.setattr(dev, "prove", fake)
     worktree, github = _fakes(tmp_path)
@@ -635,7 +637,7 @@ async def _gate_run(tmp_path: Path, monkeypatch, report, *, require_proof=True, 
         repo="owner/repo",
         issue_number=123,
         branch_template="fix/issue-{n}",
-        dispatcher=_proof_dispatcher(),
+        dispatcher=dispatcher or _proof_dispatcher(),
         github=github,
         worktree=worktree,
         dashboard=None,
@@ -780,17 +782,55 @@ async def test_a_check_the_relay_could_not_run_is_not_proven(
 
 
 @pytest.mark.asyncio
-async def test_config_opt_out_says_so_on_the_pr_and_hands_over(
+async def test_proof_off_hands_over_and_posts_nothing(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """Off is the default, so it must cost nothing: no proof run, no draft,
+    no comment, and the agent is not asked for a proof."""
+    dispatcher = _proof_dispatcher()
     result, github, fake = await _gate_run(
-        tmp_path, monkeypatch, None, require_proof=False,
+        tmp_path, monkeypatch, None, require_proof=False, dispatcher=dispatcher,
     )
     assert result.success, result
     fake.assert_not_awaited()
     assert "draft" not in github.create_pr.await_args.kwargs
-    [body] = _proof_comments(github)
-    assert "proof not required by config" in body
+    assert _proof_comments(github) == []
+    prompt = dispatcher.spawn_session.await_args.kwargs["prompt"]
+    assert "**Proof.**" not in prompt
+    assert '"proof"' not in prompt
+
+
+@pytest.mark.asyncio
+async def test_proof_on_asks_the_agent_for_its_proof(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dispatcher = _proof_dispatcher()
+    await _gate_run(
+        tmp_path, monkeypatch,
+        ProofReport(outcome=PROVEN, reason="ok", head_sha="x"),
+        require_proof=True, dispatcher=dispatcher,
+    )
+    prompt = dispatcher.spawn_session.await_args_list[0].kwargs["prompt"]
+    assert "**Proof.**" in prompt
+    assert '"proof": {' in prompt
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_the_plan_mentions_proof_only_when_on(on: bool) -> None:
+    from unittest.mock import MagicMock
+
+    p = dev.DevPipeline(
+        dispatcher=MagicMock(), github=MagicMock(), worktree=MagicMock(),
+        dashboard=None, state_db=MagicMock(), transport=None, require_proof=on,
+    )
+    contract = p._checkpoint_contract("/tmp/x/state.json", "s1")
+    assert ("**Proof.**" in contract) is on
+    assert "DONE with no change" in contract
+    plan = p._build_plan_prompt(
+        "o/r", 1, {}, session_id="s1", state_file=Path("/tmp/x/state.json"),
+    )
+    assert "## Acceptance criteria" in plan
+    assert ("Test removal intended" in plan) is on
 
 
 @pytest.mark.asyncio
@@ -805,9 +845,9 @@ async def test_a_caller_that_does_not_say_runs_no_proof_step(
     assert _proof_comments(github) == []
 
 
-def test_proof_is_required_by_default() -> None:
-    assert AutomationConfig().require_proof is True
-    assert AutomationConfig(require_proof=False).require_proof is False
+def test_proof_is_off_by_default() -> None:
+    assert AutomationConfig().require_proof is False
+    assert AutomationConfig(require_proof=True).require_proof is True
 
 
 def test_every_cli_dev_run_passes_the_repo_setting() -> None:

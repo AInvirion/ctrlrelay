@@ -144,7 +144,7 @@ Then the proof step
 ([`src/ctrlrelay/core/proof.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/proof.py),
 #221) runs the test the agent named, in fresh copies of the pushed commit
 (must pass) and of the base with only the branch's test changes (must fail),
-and scans the diff for weakened tests. Only a proven run's PR is marked
+and scans the diff for weakened tests, when the repo turns it on. Only a proven run's PR is marked
 ready; any other outcome leaves it a draft and fails the run. See
 [`automation.require_proof`](configuration.md#reposautomationrequire_proof).
 
