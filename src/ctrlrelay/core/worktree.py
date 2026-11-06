@@ -667,6 +667,8 @@ class WorktreeManager:
         new_branch: str,
         base_branch: str | None = None,
         github: GitHubCLI | None = None,
+        *,
+        allow_pr: int | None = None,
     ) -> tuple[Path, bool]:
         """Create a worktree for ``new_branch``.
 
@@ -700,6 +702,10 @@ class WorktreeManager:
         exists" (issue #52). Raises :class:`WorktreeError` with the PR
         number and a concrete operator action. The probe runs BEFORE
         any ref mutations so a concurrent PR is surfaced cleanly.
+
+        ``allow_pr`` is the one open PR the caller already owns: a run
+        continuing an interrupted one that had opened it (#231). Only that
+        number is let through; any other open PR still refuses.
         """
         # Per-call flag: tracks whether we committed to the stale-merged
         # delete+recreate path. Must stay local to this coroutine call —
@@ -740,7 +746,7 @@ class WorktreeManager:
             # PR. See _refuse_if_branch_backs_open_pr.
             if github is not None:
                 await self._refuse_if_branch_backs_open_pr(
-                    github, repo, new_branch,
+                    github, repo, new_branch, allow_pr=allow_pr,
                 )
 
             # Remote presence has to be KNOWN to take either sync-to-origin
@@ -826,8 +832,69 @@ class WorktreeManager:
             raise
         return worktree_path, True
 
+    async def rewind_branch(
+        self, repo: str, branch: str, sha: str, *, backup_ref: str,
+    ) -> str:
+        """Move ``branch`` back to ``sha`` in the bare repo, before any
+        worktree is made from it, for a run that starts again from a past
+        step (#231). Returns the commit the branch was on.
+
+        The old head is kept first under ``backup_ref``, so nothing the
+        branch held is lost. Refused when ``sha`` is not a commit here,
+        when the branch is checked out in a worktree (moving it would pull
+        a live worktree's HEAD out from under it), or when the branch moved
+        between the read and the write.
+        """
+        if not _is_safe_branch(branch):
+            raise WorktreeError(f"refusing to rewind unsafe branch {branch!r}")
+        if not _HEX_SHA.match(sha):
+            raise WorktreeError(f"not a commit id: {sha!r}")
+        bare_path = self._get_bare_repo_path(repo)
+        if await self._branch_is_checked_out_elsewhere(bare_path, branch):
+            raise WorktreeError(
+                f"Branch {branch!r} is checked out in a worktree of {repo!r}; "
+                "it cannot be rewound while that worktree uses it."
+            )
+        try:
+            await self._run_git(
+                "cat-file", "-e", f"{sha}^{{commit}}", cwd=bare_path, timeout=10,
+            )
+        except WorktreeError as e:
+            raise WorktreeError(
+                f"commit {sha} is no longer in the clone of {repo!r}"
+            ) from e
+        try:
+            old = _read_branch_head(bare_path, branch)
+        except WorktreeError:
+            # The branch is gone (deleted after an earlier run). Make it
+            # again at the saved commit; the empty old value makes git
+            # refuse if something created it meanwhile.
+            await self._run_git(
+                "update-ref", f"refs/heads/{branch}", sha, "",
+                cwd=bare_path, timeout=10,
+            )
+            return ""
+        if old == sha:
+            return old
+        await self._run_git(
+            "update-ref", backup_ref, old, cwd=bare_path, timeout=10,
+        )
+        await self._run_git(
+            "update-ref", f"refs/heads/{branch}", sha, old,
+            cwd=bare_path, timeout=10,
+        )
+        return old
+
+    async def refuse_if_branch_backs_open_pr(
+        self, github: GitHubCLI, repo: str, branch: str,
+    ) -> None:
+        """Raise :class:`WorktreeError` when ``branch`` backs an open PR.
+        The same fail-closed probe as branch reuse (#52)."""
+        await self._refuse_if_branch_backs_open_pr(github, repo, branch)
+
     async def _refuse_if_branch_backs_open_pr(
         self, github: GitHubCLI, repo: str, branch: str,
+        *, allow_pr: int | None = None,
     ) -> None:
         """Issue #52: raise WorktreeError if ``branch`` is the head of an
         open PR on ``repo``. Probe is fail-closed (on repeated probe
@@ -886,6 +953,10 @@ class WorktreeManager:
             )
 
         same_repo_prs = [p for p in prs if _same_repo(p)]
+        if allow_pr is not None:
+            same_repo_prs = [
+                p for p in same_repo_prs if p.get("number") != allow_pr
+            ]
         if not same_repo_prs:
             return
         pr_number = same_repo_prs[0].get("number")
