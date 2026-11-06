@@ -1122,6 +1122,43 @@ def _validate_cron_expression(v: str, field: str) -> str:
     return v
 
 
+# The default order of a poll's batch (#356): earlier labels run first.
+DEFAULT_PRIORITY_LABELS: tuple[str, ...] = ("P0", "P1", "P2", "P3")
+
+
+class IntakeConfig(BaseModel):
+    """How each poll orders the new issues it found (#356)."""
+
+    model_config = {"extra": "forbid"}
+
+    # Issues carrying an earlier label run first (compared without case);
+    # issues carrying none of them run last. Within a label, oldest
+    # first. An empty list keeps the oldest-first order only.
+    priority_labels: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_PRIORITY_LABELS),
+    )
+
+    @field_validator("priority_labels")
+    @classmethod
+    def _labels_distinct(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for x in v:
+            if not isinstance(x, str) or not x.strip():
+                raise ValueError(
+                    "intake.priority_labels: every label must be a non-empty string"
+                )
+            name = x.strip()
+            if name.lower() in seen:
+                raise ValueError(
+                    f"intake.priority_labels: {name!r} is listed twice "
+                    "(labels are compared without case)"
+                )
+            seen.add(name.lower())
+            out.append(name)
+        return out
+
+
 class ClaimsConfig(BaseModel):
     """Timings for claims on a shared account (#245).
 
@@ -1269,6 +1306,7 @@ class Config(BaseModel):
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     schedules: SchedulesConfig = Field(default_factory=SchedulesConfig)
     web: WebConfig = Field(default_factory=WebConfig)
+    intake: IntakeConfig = Field(default_factory=IntakeConfig)
     claims: ClaimsConfig = Field(default_factory=ClaimsConfig)
     usage: UsageConfig = Field(default_factory=UsageConfig)
     github_api: GitHubApiConfig = Field(default_factory=GitHubApiConfig)
