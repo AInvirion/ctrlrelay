@@ -299,6 +299,12 @@ OUR_COMMENT_MARKERS = (
     RELEASE_MARKER_PREFIX,
 )
 
+# A run that finished with no change (#336), possibly with the agent's
+# reply (#368). Posted under the operator's account, but the text is an
+# earlier agent's, so a later run sees it labelled as that, never as the
+# operator's word (the prompt says an operator comment wins over the body).
+NO_CHANGE_MARKER = "<!-- ctrlrelay:no-change"
+
 
 def claim_is_live(comments: list[dict[str, Any]] | None) -> bool:
     """Whether a claim stands on this issue with no retraction after it.
@@ -891,6 +897,12 @@ def format_issue_comments(
         body = (c.get("body") or "").strip() or "_(empty)_"
         if len(body) > max_chars:
             body = body[:max_chars] + "\n_[...truncated]_"
+        if NO_CHANGE_MARKER in body:
+            blocks.append(
+                f"--- an earlier agent run's reply, NOT the operator "
+                f"({created}) ---\n{body}"
+            )
+            continue
         blocks.append(f"--- @{author} ({created}) ---\n{body}")
 
     return "\n\n".join(blocks)
@@ -1405,7 +1417,8 @@ investigation, a plan, a proposed split into smaller issues): if the result
 is a document that belongs in the repository, commit it and finish with a
 pull request as usual. Otherwise commit nothing, finish DONE with no change
 as above, and add a third output, `"reply": r'''<YOUR ANSWER, MARKDOWN>'''`
-(a raw triple-quoted string, like a pull request description). The
+(a raw triple-quoted string, like a pull request description: no three
+single quotes in a row, and no backslash at the very end). The
 orchestrator posts the reply on the issue as a comment, in full. You cannot
 create issues, so for a split, list each proposed issue with its title and
 description in the reply.
@@ -1729,7 +1742,7 @@ def no_change_comment(
     ``reply`` is the agent's answer (#368), posted in full. ``reply_held``
     says the agent wrote one but this repository does not get it.
     """
-    marker = f"<!-- ctrlrelay:no-change session={session_id} -->"
+    marker = f"{NO_CHANGE_MARKER} session={session_id} -->"
     if reply is not None:
         return f"{reply}\n\n---\n_Reply from the agent run, no pull request._\n\n{marker}"
     held = (
