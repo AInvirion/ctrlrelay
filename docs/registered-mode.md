@@ -8,10 +8,10 @@ permalink: /registered-mode/
 
 # Registered mode: design
 
-**Status: proposal, not built.** This is the ctrlrelay side of issue #251. The
-control plane is a separate project; this page only says what a node sends,
-what it accepts, and what it refuses. Nothing here is implemented. Open
-questions are at the end.
+**Status: agreed 2026-11-06, not built.** This is the ctrlrelay side of issue
+#251. The control plane is a separate project; this page only says what a node
+sends, what it accepts, and what it refuses. Nothing here is implemented. The
+owner's decisions are at the end, under "Decisions".
 
 ## The model in one paragraph
 
@@ -44,7 +44,8 @@ them and changes none of them.
 The constraints from #251, plus one this design adds:
 
 1. The node calls out over HTTPS; the control plane never calls in. No port.
-2. The node keeps its own allowlist (`repos`) and refuses work outside it.
+2. The node refuses work outside its `repos` allowlist. The allowlist may
+   come from the control plane's config (see "Config from the control plane").
 3. GitHub and agent credentials never leave the node. No message carries one.
 4. Each node has its own key, revocable alone.
 5. The node still writes its claim on the GitHub issue, with the same marker.
@@ -335,9 +336,13 @@ Three layers, and only the last has to be right:
 3. The race check on GitHub: lowest comment id wins, whatever either side
    believes.
 
-So a mixed fleet is safe: standalone nodes and registered nodes on the same
-account and repos keep off each other through the claims, as two standalone
-nodes do today. The mixed-version limit in
+**Decided (question 8): no mixed fleets.** On one account, every node is
+standalone or every node is registered; moving to registered mode moves all
+of them. The only exception is the opt-in outage fallback (question 1),
+during which a registered node polls on its own for a while. The claims keep
+that safe. The control plane flags any claim on a watched repo made by a
+`node_id` it has not registered, since that means a standalone node is still
+running. The mixed-version limit in
 [Operations]({{ '/operations/' | relative_url }}#several-machines-on-one-account)
 still holds: every node must be on a version with named claims.
 
@@ -361,43 +366,52 @@ the same `dedupe_key` first and comments there instead. The issue then goes
 through the normal path: triage (#227), claim, run. So all work is still a
 GitHub issue, and webhook text reaches an agent only as issue text, which is
 already untrusted. Whether such an issue may start a run without the
-operator's assignment is open question 4.
+operator's assignment: no (decision 4).
 
 **Numbers across nodes (#230).** Each node keeps its own numbers, as #230
 builds them. Reports carry the per-run figures (`numbers`), and the heartbeat
 carries the node's totals. The control plane adds them up; it computes
 nothing a node cannot also show for itself.
 
-**Shared per-repo learning (#225).** The learning is input to the agent's
-prompt, so it must not come from the control plane (see "Threat model"). It
-lives **in the repository on GitHub**, readable by every node with the token it
+**Shared per-repo learning (#225).** **Decided (question 5): for now it lives
+in the repository on GitHub**, readable by every node with the token it
 already has, and changes only after the operator approves them, as #225 asks.
 The control plane may show it, and may say a new version exists; the node
-reads it from GitHub.
+reads it from GitHub. **Later direction:** the control plane is meant to hold
+and hand out memory: history, learnings, design, context, and in some cases
+credentials and config for the agent. That reverses rule 3 and the "put its
+own instructions in front of the agent" row of the threat model, so it needs
+its own design and threat model before it is built.
 
 **Routing by backend (#286).** Nodes declare `capabilities.agents` and
 `labels` at register. The control plane only offers work a node says it can
 run; the node checks again on accept and answers `agent_not_available` if it
 cannot. Routing by usage headroom uses the `usage` in the heartbeat.
 
-**Scheduled jobs.** In the first version the node keeps its own cron, and
-job claims split the sweep as today. Later the control plane may send
-`scheduled_job` assignments instead; the ref claim still decides.
+**Scheduled jobs.** **Decided (question 7): configurable by the control
+plane.** Schedules are part of the pushed config, and the control plane may
+also send `scheduled_job` assignments directly. Either way the
+`refs/ctrlrelay/claims/<job>/<window>` ref is still the lock, so a job runs
+once across nodes.
 
 ## Config from the control plane
 
-The epic asks for config handed to every node. A heartbeat answer may carry a
-`config` object, and it may only **tighten**:
+The epic asks for config handed to every node. **Decided (question 6): the
+control plane may set the full config**, so it is the one place every node's
+settings are managed. A heartbeat answer may carry a `config` object with any
+key of the node config: repos, labels, usage, slots, schedules, `agent`,
+sandbox paths, transport.
 
-- lower `usage.pause_at`, fewer `slots`;
-- add `exclude_labels` for a repo the node already has;
-- pause or drain.
+Three things stay local, because without them the node cannot reach the
+control plane or prove who it is: the `control_plane` block itself, the
+node's key, and `node_id`. A pushed object that sets any of them is refused
+whole, logged, and the last good config is kept.
 
-It may never add a repo, widen a label rule, change `agent`, sandbox paths,
-`transport`, `control_plane` itself, or anything naming a file or a command.
-A key outside that list refuses the whole object, logs it and keeps the local
-config. Pushed values live in memory and are shown on the status page; the
-file on disk is never edited.
+A pushed config is validated exactly like the file (unknown keys and bad
+values refuse the whole object). It is applied between runs, never under a
+run in progress, and shown on the status page with its version. The file on
+disk is never edited: it is the config used before the first push, and after
+a restart until the control plane answers.
 
 ## Threat model
 
@@ -408,18 +422,22 @@ file on disk is never edited.
 - withhold work, or send all work to one node;
 - offer an eligible issue to a node that would not otherwise have picked it;
 - pause or drain nodes;
-- with webhook tasks enabled for a repo, open issues there through a node.
+- with webhook tasks enabled for a repo, open issues there through a node;
+- **change any node's config** (question 6): add repos, loosen label rules,
+  change the agent, its sandbox paths and the schedules. This is the price of
+  managing every node from one place. The checks below that read GitHub
+  (the issue must be marked by the operator, the claim decides) still hold,
+  and the GitHub token and agent login are still never sent to it.
 
 What it cannot do, and what stops it:
 
 | It cannot | Because |
 |---|---|
-| make a node work on a repo outside its allowlist | check 1 on accept, against the node's own `repos` |
+| make a node work on a repo outside its allowlist without it showing | check 1 on accept, against the node's current `repos`. It can change that list by config (decision 6), but every applied config is logged and shown on the status page with its version |
 | make a node work an issue the operator did not mark | check 3 reruns today's intake rules on the issue as GitHub serves it |
 | put its own instructions in front of the agent | assignments carry no prompt, command, URL or branch; the node reads the issue from GitHub; learning comes from GitHub; webhook text enters only as a fenced issue body, only for opted-in repos |
 | run a command on the node | the command list is fixed and has no arguments beyond an assignment id; there is no inbound port |
 | get a credential | no message carries one; the private key, GitHub token and agent login stay on the node; free text goes through `redact.py`; output tails and transcripts are not sent |
-| widen the node's config | pushed config may only tighten (above) |
 | make two nodes work one issue | the GitHub claim decides, not the assignment |
 | throw away a run in progress | a `release` stops at the next safe point and never kills an agent |
 | impersonate another node | requests are signed per node; `409` on a `node_id` held by another key |
@@ -448,29 +466,25 @@ and its token on GitHub; the others carry on.
 - Several GitHub accounts, or a public hosted control plane.
 - Forecasting token use; routing reacts to measured usage only.
 
-## Open questions for Oscar
+## Decisions
 
-Questions 1, 3 and 4 were decided on 2026-11-03 (see #251). The rest are
-still open, with the recommended answer shown.
+Made by the owner: 1, 3 and 4 on 2026-11-03, the rest on 2026-11-06 (see #251).
 
-1. **Outage default: hold, or fall back to standalone?** **Decided:** `hold`
-   by default, `standalone` opt-in per node. Holding is the quiet failure you
-   can see; falling back is safe for double work but ignores routing.
-2. **Request signing or mutual TLS?** Recommended: signed requests (RFC 9421,
-   Ed25519). They pass through proxies and load balancers, and rotation needs
-   no certificate authority.
-3. **Must an issue still be marked by you (assignment or trigger label) before
-   a node will take it from the control plane?** **Decided:** yes, for now.
-   It is the check that keeps a compromised control plane to issues you
-   already chose. Revisit when the control plane has its own permission model.
-4. **Webhook work: may a node open the issue and run it without your
-   assignment?** **Decided:** no. The node opens it, only for opted-in repos, and
-   it waits for your assignment or for #227's triage to mark it ready.
-5. **Where does shared per-repo learning live?** Recommended: in the repository
-   on GitHub, not on the control plane, because it is prompt input.
-6. **May config from the control plane only tighten?** Recommended: yes, with
-   the fixed list above.
-7. **Scheduled jobs in registered mode: node cron or control plane?**
-   Recommended: node cron first; the ref claim stays the lock either way.
-8. **Mixed fleets (standalone and registered on one account)?** Recommended:
-   allowed; the claims already make it safe.
+1. **Outage default:** `hold`, with `standalone` opt-in per node.
+2. **Auth:** signed requests (RFC 9421, Ed25519), one key per node, as in
+   "Auth" above. No mutual TLS.
+3. **An issue must still be marked by the operator** (assignment or trigger
+   label) before a node takes it from the control plane. Revisit when the
+   control plane has its own permission model.
+4. **Webhook work** never runs without the operator's assignment. The node
+   opens the issue, only for opted-in repos, and it waits for assignment or
+   triage (#227).
+5. **Shared per-repo learning:** in the repository on GitHub for now. Later
+   the control plane holds memory, and possibly agent credentials and config,
+   under its own design (see "Shared per-repo learning").
+6. **Config from the control plane:** full config, except the `control_plane`
+   block, the node key and `node_id`.
+7. **Scheduled jobs:** configurable by the control plane; the ref claim stays
+   the lock.
+8. **Mixed fleets:** not allowed. One account is all standalone or all
+   registered, apart from the outage fallback.
