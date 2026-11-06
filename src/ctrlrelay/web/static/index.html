@@ -626,8 +626,21 @@ function machineCard(name, node, state, bad, now, extra, pageUrl) {
     box.appendChild(el("div", "line", "heartbeat " + ago(node.heartbeat_at, now)));
     if (node.account_label) { box.appendChild(el("div", "muted", node.account_label)); }
     box.appendChild(el("div", "muted", "version " + (node.version || "unknown")));
+    box.appendChild(sandboxLine(node.sandbox));
   }
   return box;
+}
+
+// #305: whether the coding agent runs confined on that machine. "none"
+// means it has the user's full access, so it is said in the warning
+// colour with the setting that controls it; an older peer sends nothing,
+// which is unknown, not off.
+function sandboxLine(mode) {
+  if (mode === "bwrap") { return el("div", "muted", "sandbox bwrap"); }
+  if (mode === "none") {
+    return el("div", "drift", "sandbox off: the agent has this user's full access (agent.sandbox: none)");
+  }
+  return el("div", "muted", "sandbox unknown");
 }
 
 // #306: a peer on another version than this machine. Only when both are

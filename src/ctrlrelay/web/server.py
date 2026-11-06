@@ -493,6 +493,9 @@ class StatusServer(ThreadingHTTPServer):
                 low_at=api.low_at, now=time.time(),
             ),
             "account_label": self.config.fleet.account_label,
+            # #305: "none" means the agent runs with this user's full
+            # access, so the page says so on this machine's card.
+            "sandbox": self.config.agent.sandbox,
             "chat": self._chat(),
             "usage": usage_json(reading),
             "pause_at": self.config.usage.pause_at,

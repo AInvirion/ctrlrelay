@@ -28,6 +28,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from ctrlrelay.core.config import SANDBOX_MODES
 from ctrlrelay.core.obs import get_logger, log_event
 from ctrlrelay.web.drift import clean_fingerprint
 from ctrlrelay.web.links import peer_page_url
@@ -274,6 +275,9 @@ def _clean_node(raw: Any) -> dict[str, Any] | None:
         "state": _text(raw.get("state"), 40),
         "version": _text(raw.get("version"), 40),
         "account_label": _text(raw.get("account_label"), 100),
+        # #305: None (unknown) from a version that does not send one, or
+        # anything other than the two modes there are.
+        "sandbox": raw.get("sandbox") if raw.get("sandbox") in SANDBOX_MODES else None,
         "heartbeat_at": _text(raw.get("heartbeat_at"), 40),
         "last_poll_at": _text(raw.get("last_poll_at"), 40),
         "slots": {"total": slots["total"], "busy": slots["busy"]}
