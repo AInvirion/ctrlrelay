@@ -10,10 +10,10 @@ permalink: /control-plane-brain/
 
 **Status: agreed 2026-11-06, not built.** This is issue #372. It builds on
 [Registered mode]({{ '/registered-mode/' | relative_url }}) (#251), which
-fixes the protocol between a node and the control plane. That page assumes
-the control plane never puts text in front of an agent and never holds a
-credential. This page drops that assumption, on purpose, and says what
-replaces it. The owner's decisions are at the end, under "Decisions".
+fixes the protocol between a node and the control plane. That protocol was
+first written on the assumption that the control plane never puts text in
+front of an agent and never holds a credential. This page drops that
+assumption, on purpose, and says what replaces it. The owner's decisions are at the end, under "Decisions".
 
 ## The idea in one paragraph
 
@@ -70,14 +70,21 @@ it says **what** to work on, never **how**.
   by the SHA-256 of its content, with `name`, `version`, `not_after` and the
   operator's signature over all of it.
 - A node refuses a bundle that is unsigned, signed by a key it does not pin,
-  past `not_after`, or older than a version of the same name it has already
-  used (no rollback). A refused bundle fails the assignment with
-  `bundle_refused`, which the node reports and posts in chat. It never runs
-  without it.
-- Revoking a bundle is a signed revocation list, fetched with the heartbeat.
-  An unreachable list is "could not check", not "nothing revoked": the node
-  keeps using what it has until `not_after`, and takes no new role it cannot
-  check.
+  past `not_after`, revoked, or below the floor (next point). A refused
+  bundle fails the assignment with `bundle_refused`, which the node reports
+  and posts in chat. It never runs without it.
+- **The policy list** stops replays. It is one small signed document: a
+  sequence number, a `not_after` (default 7 days), the **minimum version**
+  of each bundle name and of the config, and the revoked digests. The node
+  fetches it with the heartbeat and keeps the highest sequence number it has
+  seen; it refuses a list with a lower number or past its `not_after`.
+  Because the floor is signed, a wiped node that remembers nothing still
+  refuses an old role or config. The operator re-signs the list at least
+  every `not_after` (one `ctrlrelay` command on the operator's machine),
+  and whenever a bundle is revoked or a floor is raised.
+- No valid policy list (unreachable, or expired) is "could not check", not
+  "nothing revoked": the node finishes runs already going, and takes no new
+  assignment with a role until it has a valid list again.
 
 Signing is the approval step. The operator approves a role change, a context
 edit or a learning in the control plane's UI, the UI asks the operator's key
@@ -159,8 +166,9 @@ pipeline), **reviewer** (the review step), **triager** (#227), **planner**
 ```
 
 The node fetches both by digest (`GET /v1/bundles/<digest>`), unless cached,
-verifies them, and checks the role against the assignment: the pipeline and
-repo must be in the role's lists. It writes the skills into a fresh
+verifies them, and checks both against the assignment: the pipeline and
+repo must be in the role's lists, and the knowledge snapshot must be for the
+assignment's repo. It writes the skills into a fresh
 directory for this run only, outside `~/.claude/skills`, and points the agent
 at it. The directory is removed when the run ends. Nothing a role brings
 outlives its run.
@@ -196,8 +204,8 @@ still applies to every run.
 | the state database, worktrees, the report queue | work in progress; claims on GitHub say who holds an issue |
 | a bundle cache, by digest | speed only; safe to delete at any time |
 
-**What it gets:** at register, the config (decision 6 of #251) and the
-revocation list; at each assignment, the role and knowledge snapshot it
+**What it gets:** with its first heartbeat after registering, the signed
+config (decision 6 of #251) and the policy list; at each assignment, the role and knowledge snapshot it
 names, and any role credentials.
 
 **What losing a node costs:** its runs in progress (their claims go stale and
@@ -226,8 +234,9 @@ digest.
 1. The role names it (`"credentials": ["sentry-read"]`). A node takes only
    credentials named by the signed role it is running, and only if its
    `role_limits.credentials` is true.
-2. At enrolment the node makes a second key pair, X25519, for receiving
-   secrets. The control plane seals each credential to that one node's key,
+2. At enrolment (`ctrlrelay node enroll`) the node also makes a second key
+   pair, X25519, for receiving secrets, and sends its public half at
+   register. The control plane seals each credential to that one node's key,
    for that one assignment (`assignment_id` and an expiry inside the sealed
    box). Nothing in transit or in the control plane's logs is readable.
 3. The node opens it, gives it only to the step that needs it, as an
@@ -264,7 +273,7 @@ main security job. Three attackers:
 | insert false history | history is data, fenced, like issue text |
 | | change a role, a skill, context or an approved learning: no operator signature |
 | | hand an agent a new instruction: only signed content is shown as instructions |
-| | roll a node back to an older, weaker role: nodes refuse lower versions |
+| | roll a node back to an older, weaker role or config: the signed policy list sets a floor, and a node refuses a list older than one it has seen |
 | | widen what a role may do on a node: `role_limits` is local |
 | | plant a learning: proposals need the operator's approval and signature |
 | | give a node a credential its role does not name |
@@ -288,7 +297,7 @@ second factor; an append-only audit log of every approval, signature, config
 push and credential handed out; role credentials encrypted at rest; the
 signing step on the operator's side, never a server job.
 
-## Changes to registered mode, once agreed
+## Changes to registered mode
 
 - **Rule 3** becomes: "Node credentials (the node key, the GitHub token, the
   agent login) never leave the node. Role credentials may come from the

@@ -37,8 +37,8 @@ knowledge, brain, coordinator and role definition** of the factory:
   needed, the credentials and agent config that role needs.
 
 **Nodes are smart but can start clean.** A node brings the runtime: the
-agent CLI, the sandbox, its skills, the pipeline steps, its claims and its
-own GitHub access. It does not need to carry knowledge between runs: a fresh
+agent CLI, the sandbox, the pipeline steps, its claims and its own GitHub
+access. Skills come with roles. It does not need to carry knowledge between runs: a fresh
 machine, or one wiped, gets what it needs from the control plane when it
 registers and when it takes work. Losing a node loses no knowledge.
 
@@ -122,6 +122,7 @@ POST /v1/register
   "protocol": 1,
   "node_id": "node-a",
   "key_id": "ed25519:9f2c...",          # fingerprint of the public key
+  "seal_key": "x25519:3a7d...",          # public key role credentials are sealed to
   "version": "0.18.0",
   "account_label": "max-2",              # fleet.account_label, never an email
   "capabilities": {
@@ -181,7 +182,10 @@ POST /v1/work/next
 ```
 
 An assignment names **what**, never **how**: no prompt, no command, no URL to
-fetch, no branch name, no file. The node reads the issue from GitHub itself,
+fetch, no branch name, no file. With brain content it also names a `role`
+and a `knowledge` snapshot by digest, and the node runs them only if they
+carry an operator signature
+([brain design]({{ '/control-plane-brain/' | relative_url }}#roles)). The node reads the issue from GitHub itself,
 with its own token, exactly as a standalone poll would. A `scheduled_job`
 names the job and its due time (`window`), and the node creates the same
 `refs/ctrlrelay/claims/<job>/<window>` ref. A `webhook_task` is described
@@ -270,7 +274,8 @@ only the latest state is kept), and its length shows on the status page.
 
 **Enrolment.** `ctrlrelay node enroll` creates an Ed25519 key pair on the
 node, writes the private key to `control_plane.key_file` (mode `0600`) and
-prints the public key and its fingerprint. The operator adds the public key to
+prints the public key and its fingerprint. It also creates the X25519 pair
+that role credentials are sealed to (sent as `seal_key` at register). The operator adds the public key to
 the control plane under the node's name. The private key never leaves the
 node and never appears in a log, chat message or status page.
 
@@ -368,9 +373,9 @@ Three layers, and only the last has to be right:
 3. The race check on GitHub: lowest comment id wins, whatever either side
    believes.
 
-**Decided (question 8): no mixed fleets.** On one account, every node is
+**Decided (decision 8): no mixed fleets.** On one account, every node is
 standalone or every node is registered; moving to registered mode moves all
-of them. The only exception is the opt-in outage fallback (question 1),
+of them. The only exception is the opt-in outage fallback (decision 1),
 during which a registered node polls on its own for a while. The claims keep
 that safe. The control plane flags any claim on a watched repo made by a
 `node_id` it has not registered, since that means a standalone node is still
@@ -405,7 +410,7 @@ builds them. Reports carry the per-run figures (`numbers`), and the heartbeat
 carries the node's totals. The control plane adds them up; it computes
 nothing a node cannot also show for itself.
 
-**Shared per-repo learning (#225).** **Decided (question 5): for now it lives
+**Shared per-repo learning (#225).** **Decided (decision 5): for now it lives
 in the repository on GitHub**, readable by every node with the token it
 already has, and changes only after the operator approves them, as #225 asks.
 The control plane may show it, and may say a new version exists; the node
@@ -418,7 +423,7 @@ in #372.
 run; the node checks again on accept and answers `agent_not_available` if it
 cannot. Routing by usage headroom uses the `usage` in the heartbeat.
 
-**Scheduled jobs.** **Decided (question 7): configurable by the control
+**Scheduled jobs.** **Decided (decision 7): configurable by the control
 plane.** Schedules are part of the pushed config, and the control plane may
 also send `scheduled_job` assignments directly. Either way the
 `refs/ctrlrelay/claims/<job>/<window>` ref is still the lock, so a job runs
@@ -426,7 +431,7 @@ once across nodes.
 
 ## Config from the control plane
 
-The epic asks for config handed to every node. **Decided (question 6): the
+The epic asks for config handed to every node. **Decided (decision 6): the
 control plane may set the full config**, so it is the one place every node's
 settings are managed. A heartbeat answer may carry a `config` object with any
 key of the node config: repos, labels, usage, slots, schedules, `agent`,
@@ -439,7 +444,11 @@ sets any of them is refused whole, logged, and the last good config is kept.
 
 **A pushed config must be signed with an operator key** (decision 2 of the
 [brain design]({{ '/control-plane-brain/' | relative_url }})). An unsigned
-or wrongly signed one is refused whole, like an invalid one.
+or wrongly signed one is refused whole, like an invalid one. It also carries
+a version and a `not_after`, and a node refuses one past its `not_after` or
+below the config floor in the signed policy list, so an older, wider config
+cannot be replayed
+([brain design]({{ '/control-plane-brain/' | relative_url }}#signing)).
 
 A pushed config is validated exactly like the file (unknown keys and bad
 values refuse the whole object). It is applied between runs, never under a
@@ -490,7 +499,7 @@ and its token on GitHub; the others carry on.
 
 - Building the control plane. This page fixes the protocol it must speak.
 - The control plane calling a node, or a node calling another node.
-- The control plane holding or brokering GitHub or agent credentials.
+- The control plane holding or brokering GitHub tokens or agent logins, for now (decision 3 of the brain design, #372).
 - Remote commands beyond the fixed list; any free-form instruction channel.
 - Answering agent questions through the control plane. Chat stays on the node
   in the first version.
@@ -513,7 +522,7 @@ Made by the owner: 1, 3 and 4 on 2026-11-03, the rest on 2026-11-06 (see #251).
    triage (#227).
 5. **Shared per-repo learning:** in the repository on GitHub for now. The
    direction is the control plane as the brain: knowledge, memory, roles, and
-   where needed agent credentials and config, with nodes able to start clean
+   where needed role credentials and config, with nodes able to start clean
    (see "Direction: the control plane is the brain", designed in #372).
 6. **Config from the control plane:** full config, except the `control_plane`
    block, the node key and `node_id`. Amended 2026-11-06: it must be signed
