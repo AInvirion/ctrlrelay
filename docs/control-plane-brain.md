@@ -84,7 +84,12 @@ it says **what** to work on, never **how**.
   and whenever a bundle is revoked or a floor is raised.
 - No valid policy list (unreachable, or expired) is "could not check", not
   "nothing revoked": the node finishes runs already going, and takes no new
-  assignment with a role until it has a valid list again.
+  assignment with a role, and applies no new pushed config, until it has a
+  valid list again. It keeps the last good config meanwhile.
+- **Known limit:** a node wiped of its state remembers no sequence number, so
+  until its first valid list it can be handed an older one that has not yet
+  expired. The window is the list's `not_after`, at most 7 days by default;
+  a shorter `not_after` narrows it at the cost of re-signing more often.
 
 Signing is the approval step. The operator approves a role change, a context
 edit or a learning in the control plane's UI, the UI asks the operator's key
