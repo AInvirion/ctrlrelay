@@ -40,11 +40,15 @@ pipeline work.
 ## Dispatcher ↔ agent interaction
 
 [`src/ctrlrelay/core/dispatcher.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/dispatcher.py)
-is the only place ctrlrelay calls out to a coding agent. It has two adapters
-with the same async `spawn_session` shape, so pipelines stay agent-agnostic:
-`ClaudeDispatcher` (Claude Code) and `OpenCodeDispatcher` (OpenCode).
-`make_repo_agent_dispatcher` picks one per repo: `agent.type` is the default,
-`repos[].agent_type` overrides it for a single repo.
+owns the shared subprocess lifecycle. Thin adapters provide CLI-specific argv
+and native-session parsing: `ClaudeDispatcher`, `OpenCodeDispatcher`, and
+`GenericCliDispatcher` for local manifests. All expose the same async
+`spawn_session` shape, so pipelines stay agent-agnostic.
+`make_repo_agent_dispatcher` enrolls the configured plugins and selects the
+standalone default per repo: `agent.type` is the global default and
+`repos[].agent_type` overrides it. `select_agent` additionally resolves an
+allowlisted assignment override or a previously pinned identity to one concrete
+adapter at the run boundary.
 
 - **Spawn shape:** Claude Code runs
   `claude -p <prompt> --output-format stream-json --verbose --dangerously-skip-permissions [--resume <id>]`;
@@ -70,11 +74,20 @@ with the same async `spawn_session` shape, so pipelines stay agent-agnostic:
   exposes `.success`, `.blocked`, `.failed` properties for pattern-matching
   pipelines.
 - **Resume:** `resume_session_id` translates to `--resume <id>` (Claude
-  Code) or `--session <id>` (OpenCode). Pipelines look up the agent's own id
-  (persisted as `sessions.agent_session_id` by the prior spawn) and pass it
-  through — newer `claude` CLI builds reject non-UUID values. If state_db
-  has no id (session predates capture or stdout wasn't JSON), the spawn falls back to a fresh session rather than
-  hard-failing.
+  Code), `--session <id>` (OpenCode), or a generic manifest's `resume_args`.
+  Pipelines look up the agent's own id (persisted as
+  `sessions.agent_session_id` by the prior spawn) and pass it through. A
+  generic plugin without a resume mapping refuses the request instead of
+  silently starting fresh. Claude retains its existing fresh-session fallback
+  when no native id was captured.
+- **Identity and capabilities (#379):** every concrete adapter reports an
+    `AgentIdentity` (`agent_type`, plugin id/version, model, provider and an
+  invocation fingerprint) and conservative `AgentCapabilities` (resume,
+  structured events, usage and sandbox). The selected identity is written to
+ `sessions` before dispatch and
+  checked again before storing a native session id. A conflicting identity is
+  an error, never a silent backend switch. Capabilities default to false;
+  missing usage or structured-event support is not guessed.
 
 The dispatcher does NOT proxy or wrap the agent session — it shells out the
 same way you'd shell out to `gh` or `git`. This is deliberate.
@@ -87,7 +100,7 @@ SQLite, single file at `paths.state_db`.
 
 | Table | Columns | Notes |
 |---|---|---|
-| `sessions` | `id`, `pipeline`, `repo`, `issue_number`, `worktree_path`, `status`, `blocked_question`, `started_at`, `ended_at`, `claude_exit_code`, `summary`, `agent_session_id`, `output_tail` | Indexed on `repo` and `status`. One row per pipeline run. `agent_session_id` stores the agent's own session id for resume; `claude_exit_code` holds the worker's exit code whichever backend ran; `output_tail` is a scrubbed, capped tail of its output (#204). |
+| `sessions` | `id`, `pipeline`, `repo`, `issue_number`, `worktree_path`, `status`, `blocked_question`, `started_at`, `ended_at`, `claude_exit_code`, `summary`, `agent_session_id`, `agent_type`, `agent_plugin_id`, `agent_plugin_version`, `agent_model`, `agent_provider`, `agent_fingerprint`, `output_tail` | Indexed on `repo` and `status`. One row per pipeline run. `agent_session_id` stores the agent's own session id for resume; the `agent_*` columns pin the selected plugin identity and invocation fingerprint (#379); `claude_exit_code` holds the worker's exit code whichever backend ran; `output_tail` is a scrubbed, capped tail of its output (#204). |
 | `repo_locks` | `repo` (PK), `session_id`, `acquired_at` | Acquired with `acquire_lock`, released in the pipeline's `finally`. |
 | `github_cursor` | `repo`, `last_checked_at`, `last_seen_issue_update` | Bounds GitHub API calls in the poller. |
 | `pending_resumes` | `session_id` (PK), `pipeline`, `repo`, `question`, `created_at`, `answer`, `answered_at`, `resumed_at`, `expired_at`, `expired_reason`, `held_until`, `posted`, `last_answered_at` | One row per BLOCKED session awaiting an answer, whichever chat it was asked on. An answer arriving after the in-session wait lands here and the poller's sweeper drives the resume. |
@@ -99,8 +112,9 @@ SQLite, single file at `paths.state_db`.
 | `telegram_pending` | `request_id`, `session_id`, `question`, `asked_at`, `answered_at`, `answer` | Legacy: still created by the schema, but no code reads or writes it. Outstanding questions live in `pending_resumes`. |
 
 Methods on `StateDB`: `acquire_lock`, `release_lock`, `get_lock_holder`,
-`list_locks`, `set_agent_session_id`, `get_agent_session_id`, plus raw
-`execute` / `commit`. The pipeline code uses raw SQL for the `sessions`
+`list_locks`, `set_agent_session_id`, `get_agent_session_id`,
+`pin_agent_identity`, `get_agent_identity`, plus raw `execute` / `commit`.
+ The pipeline code uses raw SQL for the `sessions`
 table on purpose — kept thin and grep-able.
 
 ## Worktree lifecycle

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A plugin identity and capability contract for coding-agent CLIs (#379).
+  Claude and OpenCode now expose the same identity metadata, and local
+  `agent.plugins` manifests can enroll simple non-interactive CLIs with fixed
+  argv, prompt-over-argument or stdin, checkpoint handling, and optional
+  native-session mapping. `agent.assignable_types` defines the smaller set a
+  future control-plane assignment may select; assignments cannot supply a
+  binary or arbitrary arguments. The selected plugin, model, and canonical
+  invocation fingerprint are persisted before dispatch and pinned across CI
+  fixes, retries, and pending resumes. Generic executables must resolve to an
+  absolute path, native session IDs are validated before argv substitution,
+  and a pre-#379 native session with unknown identity is refused rather than
+  resumed through the current default backend.
+
 ## [0.27.0] - 2026-11-06
 
 ### Added

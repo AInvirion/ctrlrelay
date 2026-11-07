@@ -112,6 +112,41 @@ class OpenCodeConfig(BaseModel):
     default_timeout_seconds: int | None = Field(default=None, ge=1)
 
 
+class GenericCliConfig(BaseModel):
+    """A locally trusted manifest for a simple non-interactive CLI (#379).
+
+    The manifest is configuration, never assignment data. It may construct
+    argv only from the fixed placeholders understood by GenericCliDispatcher;
+    assignments select its name through ``assignable_types`` and cannot add
+    an executable, flag, or environment variable.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    binary: str
+    args: list[str] = Field(default_factory=list)
+    prompt_mode: Literal["arg", "stdin"] = "arg"
+    resume_args: list[str] | None = None
+    session_id_path: str | None = None
+    default_timeout_seconds: int | None = Field(default=None, ge=1)
+    model: str | None = None
+    provider: str | None = None
+    plugin_version: str = "1"
+
+    @field_validator("binary", "plugin_version")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty")
+        return v
+
+    @model_validator(mode="after")
+    def _resume_can_be_recovered(self) -> GenericCliConfig:
+        if self.resume_args is not None and not self.session_id_path:
+            raise ValueError("resume_args requires session_id_path")
+        return self
+
+
 class BudgetRule(BaseModel):
     """Limits for runs on issues carrying any of ``labels`` (#223).
 
@@ -228,6 +263,13 @@ class AgentConfig(BaseModel):
     # Read only when a backend of this type is built, so it is inert on
     # a claude-only deployment and harmless to leave in a config file.
     opencode: OpenCodeConfig = Field(default_factory=OpenCodeConfig)
+    # Locally enrolled generic CLI manifests, keyed by the agent_type used in
+    # repo defaults or an assignment. Reserved built-in names cannot be replaced.
+    plugins: dict[str, GenericCliConfig] = Field(default_factory=dict)
+    # Agent types a future control-plane assignment may explicitly select.
+    # Empty preserves standalone-only behavior. The type must still be locally
+    # enrolled as a built-in or a generic manifest.
+    assignable_types: list[str] = Field(default_factory=list)
     # #223. Off until a limit is set.
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     # #210: how many agent runs this node may have going at once, over
@@ -235,6 +277,24 @@ class AgentConfig(BaseModel):
     # Unset: no shared limit, and the poll loop takes one issue at a time,
     # as before the setting existed.
     max_parallel: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _plugin_names_and_assignments_are_valid(self) -> AgentConfig:
+        for name in self.plugins:
+            if not re.fullmatch(r"[a-z][a-z0-9_-]*", name):
+                raise ValueError(
+                    f"agent.plugins[{name!r}]: use lowercase letters, digits, "
+                    "'_' or '-', starting with a letter"
+                )
+            if name in ("claude", "opencode"):
+                raise ValueError(f"agent.plugins[{name!r}] replaces a built-in adapter")
+        known = {"claude", "opencode", *self.plugins}
+        for wanted in self.assignable_types:
+            if wanted not in known:
+                raise ValueError(
+                    f"agent.assignable_types contains unenrolled type {wanted!r}"
+                )
+        return self
 
 
 # Backwards-compat alias. Older code and docs reference ``ClaudeConfig``;

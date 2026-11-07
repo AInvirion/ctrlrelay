@@ -1362,6 +1362,7 @@ class TestSecopsDecisionPersistence:
 
         mock_db = MagicMock()
         mock_db.acquire_lock.return_value = True
+        mock_db.get_session_row.return_value = {}
 
         await resume_secops_from_pending(
             session_id="s",

@@ -2,6 +2,9 @@
 
 from pathlib import Path
 
+import pytest
+
+from ctrlrelay.core.agent_plugins import AgentIdentity, AgentIdentityConflictError
 from ctrlrelay.core.state import StateDB
 
 
@@ -170,6 +173,87 @@ class TestAgentSessionId:
         }
         assert "agent_session_id" in cols
         assert db.get_agent_session_id("old-session") is None
+        db.close()
+
+
+class TestAgentIdentity:
+    def _session(self, db: StateDB, session_id: str = "dev-owner-repo-1-deadbeef") -> str:
+        db.execute(
+            "INSERT INTO sessions (id, pipeline, repo, status, started_at) "
+            "VALUES (?, 'dev', 'owner/repo', 'running', 1)",
+            (session_id,),
+        )
+        db.commit()
+        return session_id
+
+    def test_identity_columns_exist_on_fresh_and_migrated_databases(
+        self, tmp_path: Path,
+    ) -> None:
+        import sqlite3
+
+        expected = {
+            "agent_type", "agent_plugin_id", "agent_plugin_version",
+            "agent_model", "agent_provider", "agent_fingerprint",
+        }
+        db = StateDB(tmp_path / "fresh.db")
+        fresh = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+        assert expected <= fresh
+        db.close()
+
+        path = tmp_path / "old.db"
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, pipeline TEXT NOT NULL, "
+            "repo TEXT NOT NULL, status TEXT NOT NULL, started_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO sessions VALUES ('old', 'dev', 'owner/repo', 'done', 1)"
+        )
+        conn.commit()
+        conn.close()
+        db = StateDB(path)
+        migrated = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+        assert expected <= migrated
+        assert db.get_agent_identity("old") is None
+        db.close()
+
+    def test_identity_and_native_session_id_round_trip(self, tmp_path: Path) -> None:
+        db = StateDB(tmp_path / "state.db")
+        sid = self._session(db)
+        identity = AgentIdentity(
+            agent_type="example",
+            plugin_id="generic:example",
+            plugin_version="2",
+            model="model-x",
+            provider="provider-y",
+            fingerprint="abc123",
+        )
+        db.set_agent_session_id(sid, "native-1", agent=identity)
+        assert db.get_agent_identity(sid) == identity
+        assert db.get_agent_session_id(sid) == "native-1"
+        # Repeating the same result is idempotent.
+        db.pin_agent_identity(sid, identity)
+        db.close()
+
+    def test_identity_conflict_does_not_overwrite_the_native_id(
+        self, tmp_path: Path,
+    ) -> None:
+        db = StateDB(tmp_path / "state.db")
+        sid = self._session(db)
+        claude = AgentIdentity(agent_type="claude", plugin_id="claude")
+        opencode = AgentIdentity(agent_type="opencode", plugin_id="opencode")
+        db.set_agent_session_id(sid, "claude-native", agent=claude)
+        with pytest.raises(AgentIdentityConflictError):
+            db.set_agent_session_id(sid, "other-native", agent=opencode)
+        assert db.get_agent_identity(sid) == claude
+        assert db.get_agent_session_id(sid) == "claude-native"
+        db.close()
+
+    def test_a_missing_session_cannot_be_pinned(self, tmp_path: Path) -> None:
+        db = StateDB(tmp_path / "state.db")
+        identity = AgentIdentity(agent_type="claude", plugin_id="claude")
+        with pytest.raises(AgentIdentityConflictError, match="could not pin"):
+            db.pin_agent_identity("missing", identity)
         db.close()
 
 

@@ -16,8 +16,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from ctrlrelay.core.agent_plugins import AgentIdentity
 from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
-from ctrlrelay.core.dispatcher import SessionResult
+from ctrlrelay.core.dispatcher import RepoAgentRouter, SessionResult
 from ctrlrelay.core.state import StateDB
 from ctrlrelay.pipelines.dev import resume_dev_from_pending, run_dev_issue
 from tests._publish_fakes import fake_relay_publish
@@ -172,6 +173,77 @@ async def test_the_answer_after_a_restart_resumes_the_same_agent_session(
     assert call["session_id"] == sid
     assert "pin it" in call["prompt"]
     again.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_native_session_without_identity_refuses_resume(
+    tmp_path: Path,
+) -> None:
+    state_db = StateDB(tmp_path / "state.db")
+    worktree_path = tmp_path / "wt"
+    wt = _worktree(worktree_path)
+    state_db.execute(
+        "INSERT INTO sessions (id, pipeline, repo, issue_number, worktree_path, "
+        "status, started_at, agent_session_id) VALUES (?, 'dev', ?, 13, ?, "
+        "'blocked', 1, ?)",
+        ("dev-legacy", REPO, str(worktree_path), AGENT_UUID),
+    )
+    state_db.commit()
+    dispatcher = AsyncMock()
+
+    result = await resume_dev_from_pending(
+        session_id="dev-legacy", repo=REPO, answer="continue",
+        branch_template="fix/issue-{n}", dispatcher=dispatcher,
+        github=_github(), worktree=wt, dashboard=None, state_db=state_db,
+        transport=None, contexts_dir=tmp_path / "contexts",
+    )
+
+    assert result.success is False
+    assert result.error == "agent_identity_unknown"
+    dispatcher.spawn_session.assert_not_awaited()
+    state_db.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_resume_uses_the_pinned_plugin_not_the_repo_default(
+    tmp_path: Path,
+) -> None:
+    state_db = StateDB(tmp_path / "state.db")
+    identity = AgentIdentity(agent_type="opencode", plugin_id="opencode")
+    worktree_path = tmp_path / "wt"
+    wt = _worktree(worktree_path)
+    state_db.execute(
+        "INSERT INTO sessions (id, pipeline, repo, issue_number, worktree_path, "
+        "status, started_at, agent_session_id, agent_type, agent_plugin_id, "
+        "agent_plugin_version) VALUES (?, 'dev', ?, 13, ?, 'blocked', 1, ?, ?, ?, '1')",
+        ("dev-pinned", REPO, str(worktree_path), AGENT_UUID,
+         identity.agent_type, identity.plugin_id),
+    )
+    state_db.commit()
+
+    claude = AsyncMock()
+    claude.agent_type = "claude"
+    claude.agent_identity = AgentIdentity(agent_type="claude", plugin_id="claude")
+    opencode = AsyncMock()
+    opencode.agent_type = "opencode"
+    opencode.agent_identity = identity
+    opencode.spawn_session.side_effect = lambda **kw: _resumed(kw["session_id"])
+    router = RepoAgentRouter(
+        default=claude,
+        by_type={"claude": claude, "opencode": opencode},
+    )
+
+    await resume_dev_from_pending(
+        session_id="dev-pinned", repo=REPO, answer="continue",
+        branch_template="fix/issue-{n}", dispatcher=router,
+        github=_github(), worktree=wt, dashboard=None, state_db=state_db,
+        transport=None, contexts_dir=tmp_path / "contexts",
+    )
+
+    opencode.spawn_session.assert_awaited()
+    claude.spawn_session.assert_not_awaited()
+    assert state_db.get_agent_identity("dev-pinned") == identity
+    state_db.close()
 
 
 def test_a_dead_blocked_runs_lock_is_dropped_and_no_live_ones_are(

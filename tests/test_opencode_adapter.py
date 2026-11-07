@@ -432,6 +432,38 @@ class TestAgentSessionId:
                     github_access=False,
                 )
             assert result.agent_session_id == want
+    @pytest.mark.asyncio
+    async def test_option_like_session_metadata_is_not_a_native_id(
+        self, tmp_path: Path,
+    ) -> None:
+        adapter = _adapter()
+        proc = _proc(b'{"sessionID":"--config=/tmp/evil"}\n')
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            result = await adapter.spawn_session(
+                session_id="s1",
+                prompt="p",
+                working_dir=tmp_path,
+                state_file=tmp_path / "state.json",
+                github_access=False,
+            )
+        assert result.agent_session_id is None
+
+    @pytest.mark.asyncio
+    async def test_option_like_stored_resume_value_is_refused_before_spawn(
+        self, tmp_path: Path,
+    ) -> None:
+        adapter = _adapter()
+        with patch("asyncio.create_subprocess_exec") as ex:
+            with pytest.raises(ValueError, match="unsafe native"):
+                await adapter.spawn_session(
+                    session_id="s1",
+                    prompt="continue",
+                    working_dir=tmp_path,
+                    state_file=tmp_path / "state.json",
+                    resume_session_id="--config=/tmp/evil",
+                    github_access=False,
+                )
+        ex.assert_not_called()
 
 
 class TestEnvironment:

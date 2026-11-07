@@ -9,6 +9,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from ctrlrelay.core.agent_plugins import (
+    AgentIdentity,
+    AgentIdentityConflictError,
+    agent_identity_from_mapping,
+)
 from ctrlrelay.core.obs import get_logger, log_event
 
 _logger = get_logger("core.state")
@@ -31,6 +36,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     claude_exit_code INTEGER,
     summary TEXT,
     agent_session_id TEXT,
+    -- Concrete plugin selected before the first dispatch (#379). Nullable
+    -- for rows written before identity pinning; do not backfill by guessing
+    -- from today's configuration.
+    agent_type TEXT,
+    agent_plugin_id TEXT,
+    agent_plugin_version TEXT,
+    agent_model TEXT,
+    agent_provider TEXT,
+    agent_fingerprint TEXT,
     -- Scrubbed, capped tail of the worker's final stdout/stderr (#204).
     -- The exit-code column above was declared from the start and left
     -- NULL on the failure path, so the row for the session that broke
@@ -382,6 +396,21 @@ class StateDB:
             self._conn.execute(
                 "ALTER TABLE sessions ADD COLUMN agent_session_id TEXT"
             )
+        for column in (
+            "agent_type", "agent_plugin_id", "agent_plugin_version",
+            "agent_model", "agent_provider", "agent_fingerprint",
+        ):
+            if column not in existing:
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE sessions ADD COLUMN {column} TEXT"
+                    )
+                except sqlite3.OperationalError as e:
+                    # Another process may complete the same additive migration
+                    # between our PRAGMA read and ALTER. Only that race is safe
+                    # to ignore; every other schema error still fails startup.
+                    if "duplicate column name" not in str(e).lower():
+                        raise
         if "output_tail" not in existing:
             self._conn.execute(
                 "ALTER TABLE sessions ADD COLUMN output_tail TEXT"
@@ -715,12 +744,58 @@ class StateDB:
 
     # Agent session ids
 
-    def set_agent_session_id(self, session_id: str, agent_session_id: str) -> None:
-        """Persist Claude's session UUID against our composite session id.
+    def get_agent_identity(self, session_id: str) -> AgentIdentity | None:
+        """The plugin pinned to this run, or None for a pre-#379 row."""
+        row = self._conn.execute(
+            "SELECT agent_type, agent_plugin_id, agent_plugin_version, "
+            "agent_model, agent_provider, agent_fingerprint FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        return agent_identity_from_mapping(dict(row) if row else None)
 
-        ``agent_session_id`` is what ``claude --resume`` needs — our
-        composite id fails validation on newer CLI versions.
+    def pin_agent_identity(self, session_id: str, identity: AgentIdentity) -> None:
+        """First-write-wins identity persistence for one logical run.
+
+        A conflict is never swallowed: writing the other backend's native
+        session id afterwards would make an accidental switch much harder to
+        diagnose. Legacy rows are pinned only after the caller explicitly
+        resolves their compatibility policy.
         """
+        existing = self.get_agent_identity(session_id)
+        if existing is not None:
+            if existing != identity:
+                raise AgentIdentityConflictError(
+                    f"session {session_id} is pinned to {existing!r}, "
+                    f"not {identity!r}"
+                )
+            return
+        cursor = self._conn.execute(
+            "UPDATE sessions SET agent_type = ?, agent_plugin_id = ?, "
+            "agent_plugin_version = ?, agent_model = ?, agent_provider = ?, "
+            "agent_fingerprint = ? WHERE id = ? AND agent_type IS NULL",
+            (
+                identity.agent_type, identity.plugin_id, identity.plugin_version,
+                identity.model, identity.provider, identity.fingerprint, session_id,
+            ),
+        )
+        self._conn.commit()
+        if cursor.rowcount != 1:
+            current = self.get_agent_identity(session_id)
+            if current != identity:
+                raise AgentIdentityConflictError(
+                    f"could not pin agent identity for session {session_id}"
+                )
+
+    def set_agent_session_id(
+        self,
+        session_id: str,
+        agent_session_id: str,
+        *,
+        agent: AgentIdentity | None = None,
+    ) -> None:
+        """Persist the CLI's native session id after checking its identity."""
+        if agent is not None:
+            self.pin_agent_identity(session_id, agent)
         self._conn.execute(
             "UPDATE sessions SET agent_session_id = ? WHERE id = ?",
             (agent_session_id, session_id),

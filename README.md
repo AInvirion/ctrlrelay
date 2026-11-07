@@ -41,8 +41,9 @@ work you don't want to sit and watch.
 - **Done means done.** It waits for CI, fixes failing checks, and posts an
   independent review on the pull request — so what reaches you is ready to
   read, not a first draft.
-- **Pick your agent per repo.** Claude Code today, or OpenCode — which can
-  run on a local model — for the repos where that fits.
+- **Pick your agent per repo.** Claude Code or OpenCode today, plus simple
+  non-interactive CLIs enrolled through a local plugin manifest. Choose the
+  default per repo; a future control plane can select from the agents you allow.
 - **Grows with you.** Start on one laptop. Add more machines later; they share
   the work without stepping on each other.
 - **Open source.** Apache 2.0. Read every line of what runs on your machine.

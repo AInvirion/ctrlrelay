@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,14 @@ from ctrlrelay.core.agent_env import (
     bwrap_prefix,
     git_dirs,
     resolve_bwrap,
+)
+from ctrlrelay.core.agent_plugins import (
+    AgentCapabilities,
+    AgentIdentity,
+    AgentIdentityConflictError,
+    AgentSelection,
+    AgentSelectionError,
+    native_session_id_is_safe,
 )
 from ctrlrelay.core.binaries import resolve_binary
 from ctrlrelay.core.budget import (
@@ -85,6 +94,27 @@ def _find_claude() -> str:
     return resolve_binary(
         "claude", logger=_logger, event_prefix="dispatcher.binary"
     )
+
+
+def _normalise_builtin_binary(binary: str, *, label: str) -> str:
+    """Anchor a bare built-in name; refuse ambiguous relative paths.
+
+    A relative path is resolved by the child against its worktree, which
+    the identity pin cannot see before the worktree exists. Refusing it is
+    the only way to keep the pinned executable and the exec'd executable
+    the same file. An unresolved bare name is left alone: the spawn will
+    fail exactly as before, and no other program can appear without PATH
+    changing under the daemon.
+    """
+    if Path(binary).is_absolute():
+        return binary
+    if "/" in binary or "\\" in binary:
+        raise ValueError(
+            f"{label} must be absolute or a bare name, got {binary!r}; "
+            "a relative path would resolve against the run's worktree"
+        )
+    found = shutil.which(binary)
+    return str(Path(found).resolve()) if found else binary
 
 
 @dataclass(frozen=True)
@@ -160,6 +190,9 @@ class SessionResult:
     # What the session has used so far, this spawn included (#223). None
     # when nothing could be measured (a backend with no known transcript).
     usage: RunUsage | None = None
+    # Concrete identity selected at the run boundary (#379). Pipelines
+    # compare this with the sessions-row pin before storing a native id.
+    agent: AgentIdentity | None = None
 
     @property
     def success(self) -> bool:
@@ -211,6 +244,71 @@ class CliAgentAdapter:
     # Set by each subclass. Declared here so the base's own events can
     # name the backend without every subclass remembering to.
     agent_type: ClassVar[str] = "unknown"
+    plugin_id: ClassVar[str] = "builtin"
+    plugin_version: ClassVar[str] = "1"
+    capabilities: ClassVar[AgentCapabilities] = AgentCapabilities()
+
+    @property
+    def manifest_fingerprint(self) -> str:
+        """Built-in invocation identity: adapter contract plus executable bytes."""
+        payload = {
+            "plugin_id": self.plugin_id,
+            "plugin_version": self.plugin_version,
+            "binary": self.agent_binary,
+            "executable": self._executable_fingerprint(),
+        }
+        encoded = json.dumps(payload, sort_keys=True).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _executable_fingerprint(self) -> dict[str, Any]:
+        """Identify the file that would actually be exec'd.
+
+        The configured path alone is not enough: a symlink can retarget or
+        the file at that path can be replaced while the pin keeps the old
+        string. Hash the resolved target and its current bytes, cached by
+        stable file identity so a normal run does not reread a large binary.
+        """
+        path = Path(self.agent_binary)
+        try:
+            target = path.resolve(strict=True)
+            stat = target.stat()
+            key = (
+                str(target),
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+        except OSError:
+            return {"path": str(path), "missing": True}
+
+        cached = getattr(self, "_binary_fingerprint_cache", None)
+        if cached is not None and cached[0] == key:
+            return {"path": str(target), "sha256": cached[1]}
+
+        try:
+            digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        except OSError:
+            return {"path": str(target), "missing": True}
+        self._binary_fingerprint_cache = (key, digest)
+        return {"path": str(target), "sha256": digest}
+
+    @property
+    def agent_identity(self) -> AgentIdentity:
+        """The actual plugin/configuration this adapter would run."""
+        model = getattr(self, "model", None)
+        provider = getattr(self, "provider", None)
+        if provider is None and isinstance(model, str) and "/" in model:
+            provider = model.split("/", 1)[0]
+        return AgentIdentity(
+            agent_type=str(self.agent_type),
+            plugin_id=str(self.plugin_id),
+            plugin_version=str(self.plugin_version),
+            model=model if isinstance(model, str) else None,
+            provider=provider if isinstance(provider, str) else None,
+            fingerprint=getattr(self, "manifest_fingerprint", None),
+        )
 
     # How the live transcript is watched for a run going in circles (#224).
     # A plain class attribute, not a dataclass field: every adapter gets
@@ -228,6 +326,34 @@ class CliAgentAdapter:
         """The executable this adapter runs. Subclasses override."""
         raise NotImplementedError
 
+    def _session_environment(
+        self, session_id: str, state_file: Path, github_access: bool
+    ) -> tuple[dict[str, str], list[str], Path | None]:
+        """Build one CLI-neutral environment and its cleanup handle.
+
+        The temporary root exists only when GitHub credentials are stripped.
+        The caller owns its cleanup so every adapter gets the same credential
+        boundary without duplicating the private-directory lifecycle.
+        """
+        base_env = os.environ.copy()
+        base_env.update(getattr(self, "extra_env", {}))
+        private_root: Path | None = None
+        if github_access:
+            env = base_env
+            stripped: list[str] = []
+        else:
+            private_root = Path(tempfile.mkdtemp(prefix="ctrlrelay-agent-"))
+            gh_config_dir = private_root / "gh"
+            runtime_dir = private_root / "run"
+            gh_config_dir.mkdir()
+            runtime_dir.mkdir(mode=0o700)
+            env, stripped = build_agent_env(
+                base_env, gh_config_dir=gh_config_dir, runtime_dir=runtime_dir,
+            )
+        env["CTRLRELAY_SESSION_ID"] = session_id
+        env["CTRLRELAY_STATE_FILE"] = str(state_file)
+        return env, stripped, private_root
+
     def _transcript_dirs(
         self, working_dir: Path, env: dict[str, str]
     ) -> list[Path]:
@@ -243,6 +369,7 @@ class CliAgentAdapter:
         watches: list[tuple[str, Callable[[], Awaitable[str]]]],
         ident: dict[str, Any],
         stops: list[tuple[str, str]],
+        stdin_text: str | None = None,
     ) -> tuple[bytes, bytes]:
         """``proc.communicate()``, while the watches run.
 
@@ -253,8 +380,11 @@ class CliAgentAdapter:
         is killed, which ends ``communicate()`` the normal way. Every watch
         is cancelled however this returns, the time limit included.
         """
+        stdin_data = stdin_text.encode() if stdin_text is not None else None
         if not watches:
-            return await proc.communicate()
+            if stdin_data is None:
+                return await proc.communicate()
+            return await proc.communicate(input=stdin_data)
 
         async def _watch(kind: str, watch: Callable[[], Awaitable[str]]) -> None:
             reason = await watch()
@@ -274,7 +404,9 @@ class CliAgentAdapter:
 
         watchers = [asyncio.create_task(_watch(k, w)) for k, w in watches]
         try:
-            return await proc.communicate()
+            if stdin_data is None:
+                return await proc.communicate()
+            return await proc.communicate(input=stdin_data)
         finally:
             for watcher in watchers:
                 watcher.cancel()
@@ -391,6 +523,7 @@ class CliAgentAdapter:
         issue_number: int | None,
         budget_scope: BudgetScope | None = None,
         sandbox_prefix_len: int = 0,
+        stdin_text: str | None = None,
     ) -> SessionResult:
         """Run the child built by :meth:`spawn_session` to completion.
 
@@ -445,6 +578,9 @@ class CliAgentAdapter:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     pass_fds=pass_fds,
+                    **({} if stdin_text is None else {
+                        "stdin": asyncio.subprocess.PIPE
+                    }),
                 )
             finally:
                 # The child has its own copy now; bwrap reads it at start.
@@ -486,6 +622,7 @@ class CliAgentAdapter:
             stdout, stderr = await asyncio.wait_for(
                 self._communicate_watched(
                     proc, watches=watches, ident=ident, stops=stops,
+                    stdin_text=stdin_text,
                 ),
                 timeout=timeout,
             )
@@ -515,6 +652,7 @@ class CliAgentAdapter:
                 state=None,
                 stderr="Session timed out",
                 timed_out=True,
+                agent=self.agent_identity,
             )
         except asyncio.CancelledError as e:
             # Scheduler/shutdown cancel: kill the child BEFORE re-raising
@@ -696,6 +834,7 @@ class CliAgentAdapter:
             agent_session_id=agent_session_id,
             stuck_reason=stuck_reason,
             usage=usage,
+            agent=self.agent_identity,
         )
 
     def _budget_watch(
@@ -731,6 +870,10 @@ class ClaudeDispatcher(CliAgentAdapter):
     """Spawns and manages Claude subprocess sessions."""
 
     agent_type: ClassVar[str] = "claude"
+    plugin_id: ClassVar[str] = "claude"
+    capabilities: ClassVar[AgentCapabilities] = AgentCapabilities(
+        resume=True, structured_events=True, usage=True, sandbox=True,
+    )
 
     claude_binary: str = field(default_factory=_find_claude)
     default_timeout: int = 1800
@@ -771,7 +914,8 @@ class ClaudeDispatcher(CliAgentAdapter):
         return self.claude_binary
 
     def _parse_agent_session_id(self, stdout_text: str) -> str | None:
-        return _extract_agent_session_id(stdout_text)
+        value = _extract_agent_session_id(stdout_text)
+        return value if value is not None and native_session_id_is_safe(value) else None
 
     def _transcript_dirs(
         self, working_dir: Path, env: dict[str, str]
@@ -789,12 +933,19 @@ class ClaudeDispatcher(CliAgentAdapter):
         return out
 
     def __post_init__(self) -> None:
-        # Only auto-resolve the bare default. Absolute paths, relative paths
-        # (resolved vs. working_dir by the child), and custom bare names pass
-        # through so explicit config is never silently overridden.
+        # Only auto-resolve the bare default. Custom bare names are anchored
+        # through PATH so the pinned file and the executed file are one and
+        # the same. Relative paths are refused because the child resolves
+        # them against the worktree, which the pin cannot see.
         if self.claude_binary == "claude":
-            resolved = shutil.which("claude")
-            self.claude_binary = resolved or _find_claude()
+            resolved = shutil.which("claude") or _find_claude()
+            self.claude_binary = _normalise_builtin_binary(
+                resolved or "claude", label="agent.binary",
+            )
+        else:
+            self.claude_binary = _normalise_builtin_binary(
+                self.claude_binary, label="agent.binary",
+            )
         if self.sandbox not in ("none", "bwrap"):
             raise ValueError(
                 f"agent.sandbox must be 'none' or 'bwrap', got {self.sandbox!r}"
@@ -947,6 +1098,7 @@ class ClaudeDispatcher(CliAgentAdapter):
         *,
         github_access: bool,
         budget_scope: BudgetScope | None = None,
+        resume_requested: bool = False,
     ) -> SessionResult:
         """Spawn a Claude session and wait for completion.
 
@@ -961,6 +1113,10 @@ class ClaudeDispatcher(CliAgentAdapter):
         would let a new lane inherit whichever answer was written here
         first without anybody deciding it.
         """
+        if resume_session_id is not None and not native_session_id_is_safe(
+            resume_session_id,
+        ):
+            raise ValueError("unsafe native agent session id")
         timeout = timeout or self.default_timeout
 
         # Identity fields repeated on every event of this session, so a
@@ -1110,7 +1266,7 @@ def _extract_opencode_session_id(stdout_text: str) -> str | None:
                 continue
             for key in _OPENCODE_SESSION_KEYS:
                 value = scope.get(key)
-                if isinstance(value, str) and value:
+                if isinstance(value, str) and native_session_id_is_safe(value):
                     return value
     return None
 
@@ -1157,6 +1313,10 @@ class OpenCodeDispatcher(CliAgentAdapter):
     """
 
     agent_type: ClassVar[str] = "opencode"
+    plugin_id: ClassVar[str] = "opencode"
+    capabilities: ClassVar[AgentCapabilities] = AgentCapabilities(
+        resume=True, structured_events=False, usage=False, sandbox=False,
+    )
 
     # Its own binary, NOT ``agent.binary``. Most deployed configs set
     # ``agent.binary: "claude"`` explicitly, so reading that field here
@@ -1185,14 +1345,16 @@ class OpenCodeDispatcher(CliAgentAdapter):
     started: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
-        # Only the bare default is auto-resolved, exactly as the claude
-        # adapter does it: an absolute path, a relative path and a
-        # custom bare name are the operator being explicit, and
-        # overriding them would hand the child a different program.
+        # Anchor the bare default exactly as the claude adapter does, and
+        # refuse relative paths for the same reason: the child would resolve
+        # them against the worktree, so the pinned file could differ.
         if self.opencode_binary == "opencode":
             self.opencode_binary = resolve_binary(
                 "opencode", logger=_logger, event_prefix="dispatcher.binary"
             )
+        self.opencode_binary = _normalise_builtin_binary(
+            self.opencode_binary, label="agent.opencode.binary",
+        )
         if self.sandbox != "none":
             raise ValueError(
                 f"agent.sandbox={self.sandbox!r} is not implemented for "
@@ -1226,6 +1388,7 @@ class OpenCodeDispatcher(CliAgentAdapter):
         *,
         github_access: bool,
         budget_scope: BudgetScope | None = None,
+        resume_requested: bool = False,
     ) -> SessionResult:
         """Spawn an ``opencode run`` session and wait for completion.
 
@@ -1237,6 +1400,10 @@ class OpenCodeDispatcher(CliAgentAdapter):
         token would be a credential regression wearing a feature's
         clothes.
         """
+        if resume_session_id is not None and not native_session_id_is_safe(
+            resume_session_id,
+        ):
+            raise ValueError("unsafe native agent session id")
         timeout = timeout or self.default_timeout
 
         ident: dict[str, Any] = {
@@ -1245,24 +1412,9 @@ class OpenCodeDispatcher(CliAgentAdapter):
             "issue_number": issue_number,
         }
 
-        base_env = os.environ.copy()
-        base_env.update(self.extra_env)
-
-        private_root: Path | None = None
-        if github_access:
-            env = base_env
-            stripped: list[str] = []
-        else:
-            private_root = Path(tempfile.mkdtemp(prefix="ctrlrelay-agent-"))
-            gh_config_dir = private_root / "gh"
-            runtime_dir = private_root / "run"
-            gh_config_dir.mkdir()
-            runtime_dir.mkdir(mode=0o700)
-            env, stripped = build_agent_env(
-                base_env, gh_config_dir=gh_config_dir, runtime_dir=runtime_dir,
-            )
-        env["CTRLRELAY_SESSION_ID"] = session_id
-        env["CTRLRELAY_STATE_FILE"] = str(state_file)
+        env, stripped, private_root = self._session_environment(
+            session_id, state_file, github_access
+        )
 
         log_event(
             _logger,
@@ -1369,6 +1521,16 @@ class RepoAgentRouter:
     # every repo that names it: each holds the session counters the idle
     # usage probe reads, and a copy per repo would see only its own runs.
     by_repo: dict[str, AgentAdapter] = field(default_factory=dict)
+    # Every locally enrolled plugin, including assignment-only plugins.
+    by_type: dict[str, AgentAdapter] = field(default_factory=dict)
+    # Explicit assignment overrides are denied by default. A pinned resume
+    # is not a new override and does not need to be in this set.
+    assignable_types: frozenset[str] = frozenset()
+    # Built only if a persisted run needs that backend again. Not counted as
+    # actively routed until selected, so the idle subscription probe is honest.
+    resume_factories: dict[str, Callable[[], AgentAdapter]] = field(
+        default_factory=dict,
+    )
 
     def __post_init__(self) -> None:
         # Normalised HERE rather than trusted from the caller. The
@@ -1377,16 +1539,73 @@ class RepoAgentRouter:
         # a repo running on the default backend, which looks exactly
         # like a repo that was never configured.
         self.by_repo = {_route_key(k): v for k, v in self.by_repo.items()}
+        enrolled = dict(self.by_type)
+        for backend in [self.default, *self.by_repo.values()]:
+            agent_type = getattr(backend, "agent_type", None)
+            if isinstance(agent_type, str):
+                enrolled.setdefault(agent_type, backend)
+        self.by_type = enrolled
+        self.assignable_types = frozenset(self.assignable_types)
 
     def _backend(self, repo: str | None) -> AgentAdapter:
         return self.by_repo.get(_route_key(repo), self.default)
+
+    def select(
+        self,
+        repo: str | None,
+        *,
+        requested_type: str | None = None,
+        pinned: AgentIdentity | None = None,
+    ) -> AgentSelection:
+        """Resolve one run without re-routing its later fix/resume rounds."""
+        if pinned is not None and requested_type not in (None, pinned.agent_type):
+            raise AgentIdentityConflictError(
+                f"requested agent {requested_type!r} conflicts with the pinned "
+                f"agent {pinned.agent_type!r}"
+            )
+        if pinned is not None:
+            backend = self.by_type.get(pinned.agent_type)
+            if backend is None and pinned.agent_type in self.resume_factories:
+                backend = self.resume_factories[pinned.agent_type]()
+                self.by_type[pinned.agent_type] = backend
+            if backend is None:
+                raise AgentSelectionError(
+                    f"pinned agent {pinned.agent_type!r} is not enrolled on this node"
+                )
+            identity = agent_identity_for(backend)
+            _ensure_identity_pin(pinned, identity)
+            return AgentSelection(backend, identity)
+        if requested_type is not None:
+            if (
+                requested_type not in self.by_type
+                and requested_type not in self.resume_factories
+            ):
+                raise AgentSelectionError(
+                    f"requested agent {requested_type!r} is not enrolled on this node"
+                )
+            if requested_type not in self.assignable_types:
+                raise AgentSelectionError(
+                    f"requested agent {requested_type!r} is not in "
+                    "agent.assignable_types"
+                )
+            backend = self.by_type.get(requested_type)
+            if backend is None and requested_type in self.resume_factories:
+                backend = self.resume_factories[requested_type]()
+                self.by_type[requested_type] = backend
+            if backend is None:
+                raise AgentSelectionError(
+                    f"requested agent {requested_type!r} is not enrolled on this node"
+                )
+            return AgentSelection(backend, agent_identity_for(backend))
+        backend = self._backend(repo)
+        return AgentSelection(backend, agent_identity_for(backend))
 
     @property
     def _backends(self) -> list[AgentAdapter]:
         """``default`` first, then each distinct override. Order matters
         for :attr:`claude_binary`: the default backend's answer wins."""
         seen: list[AgentAdapter] = [self.default]
-        for backend in self.by_repo.values():
+        for backend in [*self.by_repo.values(), *self.by_type.values()]:
             if not any(backend is s for s in seen):
                 seen.append(backend)
         return seen
@@ -1434,6 +1653,7 @@ class RepoAgentRouter:
         *,
         github_access: bool,
         budget_scope: BudgetScope | None = None,
+        resume_requested: bool = False,
     ) -> SessionResult:
         backend = self._backend(repo)
         if backend is not self.default:
@@ -1458,7 +1678,83 @@ class RepoAgentRouter:
             issue_number=issue_number,
             github_access=github_access,
             budget_scope=budget_scope,
+            resume_requested=resume_requested,
         )
+
+
+def agent_identity_for(dispatcher: AgentAdapter) -> AgentIdentity:
+    """Read a concrete adapter identity, including lightweight test doubles."""
+    identity = getattr(dispatcher, "agent_identity", None)
+    if isinstance(identity, AgentIdentity):
+        return identity
+    agent_type = getattr(dispatcher, "agent_type", "unknown")
+    if not isinstance(agent_type, str) or not agent_type:
+        agent_type = "unknown"
+    return AgentIdentity(agent_type=agent_type, plugin_id=agent_type)
+
+
+def _ensure_identity_pin(pinned: AgentIdentity, actual: AgentIdentity) -> None:
+    differences = [
+        field_name
+        for field_name in (
+            "agent_type", "plugin_id", "plugin_version", "model", "provider",
+            "fingerprint",
+        )
+        if getattr(pinned, field_name) != getattr(actual, field_name)
+    ]
+    if differences:
+        raise AgentIdentityConflictError(
+            "pinned agent identity no longer matches the enrolled plugin: "
+            + ", ".join(differences)
+        )
+
+
+def select_agent(
+    dispatcher: AgentAdapter,
+    *,
+    repo: str | None,
+    requested_type: str | None = None,
+    pinned: AgentIdentity | None = None,
+) -> AgentSelection:
+    """Select a concrete plugin once at a run or resume boundary.
+
+    Standalone callers omit ``requested_type`` and keep the existing
+    repo/global defaults. A future assignment may request only an enrolled
+    and allowlisted type; it cannot supply a binary or argv.
+    """
+    if isinstance(dispatcher, RepoAgentRouter):
+        return dispatcher.select(
+            repo, requested_type=requested_type, pinned=pinned,
+        )
+    identity = agent_identity_for(dispatcher)
+    if pinned is not None and requested_type not in (None, pinned.agent_type):
+        raise AgentIdentityConflictError(
+            f"requested agent {requested_type!r} conflicts with the pinned "
+            f"agent {pinned.agent_type!r}"
+        )
+    if pinned is not None:
+        if pinned.agent_type != identity.agent_type:
+            factory = getattr(dispatcher, "resume_factories", {}).get(
+                pinned.agent_type,
+            )
+            if factory is not None:
+                backend = factory()
+                actual = agent_identity_for(backend)
+                _ensure_identity_pin(pinned, actual)
+                return AgentSelection(backend, actual)
+        _ensure_identity_pin(pinned, identity)
+        return AgentSelection(dispatcher, identity)
+    if requested_type is not None:
+        if requested_type != identity.agent_type:
+            raise AgentSelectionError(
+                f"requested agent {requested_type!r} is not enrolled on this node; "
+                f"only {identity.agent_type!r} is available"
+            )
+        raise AgentSelectionError(
+            "explicit agent selection requires a router with "
+            "agent.assignable_types policy"
+        )
+    return AgentSelection(dispatcher, identity)
 
 
 def _elapsed_ms(started: float) -> int:
@@ -1504,6 +1800,7 @@ class AgentAdapter(Protocol):
         *,
         github_access: bool,
         budget_scope: BudgetScope | None = None,
+        resume_requested: bool = False,
     ) -> SessionResult:
         ...
 
@@ -1585,11 +1882,38 @@ def _make_adapter(
             sandbox=agent_config.sandbox,
             usage_store=usage_store,
         )
+    manifest = getattr(agent_config, "plugins", {}).get(t)
+    if manifest is not None:
+        from ctrlrelay.core.generic_cli import GenericCliDispatcher
+
+        return GenericCliDispatcher(
+            agent_type=t,
+            binary=manifest.binary,
+            args=tuple(manifest.args),
+            prompt_mode=manifest.prompt_mode,
+            resume_args=(
+                tuple(manifest.resume_args)
+                if manifest.resume_args is not None else None
+            ),
+            session_id_path=manifest.session_id_path,
+            default_timeout=(
+                manifest.default_timeout_seconds
+                if manifest.default_timeout_seconds is not None
+                else agent_config.default_timeout_seconds
+            ),
+            model=manifest.model,
+            provider=manifest.provider,
+            plugin_version=manifest.plugin_version,
+            outcome_hook=outcome_hook,
+            sandbox=agent_config.sandbox,
+            usage_store=usage_store,
+        )
+    supported = ["claude", "opencode", *sorted(getattr(agent_config, "plugins", {}))]
     raise NotImplementedError(
         f"agent.type={t!r} has no adapter yet. Implement one that "
         "satisfies the AgentAdapter protocol in "
         "src/ctrlrelay/core/dispatcher.py and register it here, then "
-        "open a PR. Supported today: 'claude', 'opencode'."
+        f"open a PR. Supported today: {', '.join(repr(x) for x in supported)}."
     )
 
 
@@ -1624,20 +1948,21 @@ def make_repo_agent_dispatcher(
         config.agent, outcome_hook=outcome_hook, usage_store=usage_store
     )
     global_type = config.agent.type
-
+    by_type: dict[str, AgentAdapter] = {global_type: default}
     by_repo: dict[str, AgentAdapter] = {}
-    by_type: dict[str, AgentAdapter] = {}
-    for repo in config.repos:
-        wanted = getattr(repo, "agent_type", None)
-        if not wanted or wanted == global_type:
+
+    requested = [(repo.name, getattr(repo, "agent_type", None)) for repo in config.repos]
+    requested += [
+        ("agent.assignable_types", wanted)
+        for wanted in getattr(config.agent, "assignable_types", [])
+    ]
+    # Every generic manifest stays resumable after an allowlist change. Being
+    # assignable is a routing decision; being enrolled is a compatibility one.
+    requested += [("agent.plugins", name) for name in config.agent.plugins]
+    for repo_name, wanted in requested:
+        if not wanted:
             continue
         if wanted not in by_type:
-            # A copy of the agent config with only `type` changed, so
-            # every other knob — the timeouts, the sandbox settings, the
-            # opencode block — keeps its configured value and the
-            # per-backend validation in `make_agent_dispatcher` still
-            # runs. `outcome_hook` and `usage_store` are handed on, so a
-            # second backend is never exempt from #204 or #247.
             per_repo_config = config.agent.model_copy(update={"type": wanted})
             try:
                 by_type[wanted] = make_agent_dispatcher(
@@ -1646,14 +1971,33 @@ def make_repo_agent_dispatcher(
                     usage_store=usage_store,
                 )
             except NotImplementedError as e:
-                raise NotImplementedError(
-                    f"repos[{repo.name!r}].agent_type={wanted!r}: {e}"
-                ) from e
-        # One adapter per backend, shared by every repo naming it: each
-        # holds the session counters the idle usage probe reads, and a
-        # copy per repo would see only its own runs.
-        by_repo[_route_key(repo.name)] = by_type[wanted]
+                raise NotImplementedError(f"{repo_name}: {e}") from e
+        if repo_name not in ("agent.assignable_types", "agent.plugins") and wanted != global_type:
+            by_repo[_route_key(repo_name)] = by_type[wanted]
 
-    if not by_repo:
+    resume_factories: dict[str, Callable[[], AgentAdapter]] = {}
+    for wanted in ("claude", "opencode"):
+        if wanted in by_type:
+            continue
+
+        def resume_factory(wanted: str = wanted) -> AgentAdapter:
+            return make_agent_dispatcher(
+                config.agent.model_copy(update={"type": wanted}),
+                outcome_hook=outcome_hook,
+                usage_store=usage_store,
+            )
+
+        resume_factories[wanted] = resume_factory
+    # A single-backend deployment keeps its historical bare-adapter shape while
+    # retaining a way to reconstruct an older pinned backend if it ever resumes.
+    default.resume_factories = resume_factories
+
+    if not by_repo and len(by_type) == 1 and not config.agent.assignable_types:
         return default
-    return RepoAgentRouter(default=default, by_repo=by_repo)
+    return RepoAgentRouter(
+        default=default,
+        by_repo=by_repo,
+        by_type=by_type,
+        assignable_types=frozenset(config.agent.assignable_types),
+        resume_factories=resume_factories,
+    )

@@ -32,6 +32,11 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from ctrlrelay.core.agent_plugins import (
+    AgentIdentityConflictError,
+    AgentSelectionError,
+    agent_identity_from_mapping,
+)
 from ctrlrelay.core.budget import is_budget_reason, label_names, session_scope
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.claims import (
@@ -40,7 +45,7 @@ from ctrlrelay.core.claims import (
     ClaimSettings,
     acquire_claim,
 )
-from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
+from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult, select_agent
 from ctrlrelay.core.events import EventKind, emit_event, emit_outcome
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.obs import get_logger, hash_text, log_event
@@ -218,13 +223,16 @@ class TaskPipeline:
                 transport=self.transport, repo=ctx.repo,
                 issue_number=ctx.issue_number,
             ),
+            resume_requested=resume,
         )
 
         if result.agent_session_id:
             try:
                 self.state_db.set_agent_session_id(
-                    ctx.session_id, result.agent_session_id
+                    ctx.session_id, result.agent_session_id, agent=result.agent,
                 )
+            except AgentIdentityConflictError:
+                raise
             except Exception:
                 pass
         return result
@@ -446,6 +454,7 @@ async def run_task_issue(
     max_blocked_rounds: int = DEFAULT_MAX_BLOCKED_ROUNDS,
     *,
     claims: ClaimSettings | None,
+    agent_type: str | None = None,
 ) -> PipelineResult:
     """Run the task pipeline for a single issue. Mirrors run_dev_issue's
     lock/worktree/BLOCKED-loop pattern minus the branch-and-PR work.
@@ -475,6 +484,20 @@ async def run_task_issue(
     claim_id: str | None = None
 
     try:
+        try:
+            selection = select_agent(
+                dispatcher, repo=repo, requested_type=agent_type,
+            )
+        except AgentSelectionError as e:
+            return PipelineResult(
+                success=False,
+                session_id=session_id,
+                summary="Agent selection refused",
+                error=str(e),
+            )
+        dispatcher = selection.dispatcher
+        agent_identity = selection.identity
+
         issue = await github.get_issue(repo, issue_number)
 
         if claims is not None:
@@ -520,12 +543,17 @@ async def run_task_issue(
         state_db.execute(
             """INSERT INTO sessions
                (id, pipeline, repo, worktree_path, status, started_at,
-                issue_number, owner_pid, owner_run, claim_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                issue_number, owner_pid, owner_run, claim_id,
+                agent_type, agent_plugin_id, agent_plugin_version,
+                agent_model, agent_provider, agent_fingerprint)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id, "task", repo, str(worktree_path),
                 "running", int(time.time()), issue_number,
                 os.getpid(), PROCESS_RUN, claim_id,
+                agent_identity.agent_type, agent_identity.plugin_id,
+                agent_identity.plugin_version, agent_identity.model,
+                agent_identity.provider, agent_identity.fingerprint,
             ),
         )
         state_db.commit()
@@ -829,6 +857,33 @@ async def resume_task_from_pending(
             ),
             error="session_issue_number_missing",
         )
+
+    pinned_identity = agent_identity_from_mapping(session_row)
+    if pinned_identity is None and session_row.get("agent_session_id"):
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=(
+                f"Cannot resume task session {session_id}: its pre-#379 "
+                "agent identity is unknown"
+            ),
+            error="agent_identity_unknown",
+        )
+    try:
+        selection = select_agent(
+            dispatcher,
+            repo=repo,
+            pinned=pinned_identity,
+        )
+        state_db.pin_agent_identity(session_id, selection.identity)
+    except AgentSelectionError as e:
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=f"Cannot resume task session {session_id}: agent selection refused",
+            error=str(e),
+        )
+    dispatcher = selection.dispatcher
 
     if not state_db.acquire_lock(repo, session_id):
         return PipelineResult(

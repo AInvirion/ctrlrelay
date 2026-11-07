@@ -74,12 +74,14 @@ paths:
 ## agent backends
 
 `agent.type` picks the adapter ctrlrelay uses to talk to a coding-agent
-CLI. Two are implemented:
+CLI. Claude and OpenCode are built in; additional non-interactive CLIs can be
+enrolled through a local manifest:
 
 | `agent.type` | CLI it runs | notes |
 |---|---|---|
 | `claude` (default) | `claude -p --output-format stream-json --verbose --dangerously-skip-permissions` | Reads the subscription usage; supports `sandbox: "bwrap"`. |
 | `opencode` | `opencode run --format json --dangerously-skip-permissions` | Can target a self-hosted OpenAI-compatible endpoint. No usage reading; no bwrap yet. |
+| a key under `agent.plugins` | The manifest's binary and fixed argv | Generic checkpoint and optional native-session mapping. No live transcript, usage reading, or bwrap. |
 
 Anything else raises at startup with a message naming the type. That is
 deliberate: a typo must stop the daemon rather than silently fall back
@@ -112,6 +114,86 @@ Repo names are matched case-insensitively — GitHub treats `owner/repo`
 that way and the config, an issue payload and `gh` output do not
 reliably agree on the case.
 
+### Generic CLI plugins and assignment policy
+
+`agent.plugins` enrolls a simple non-interactive CLI under a new `agent_type`.
+The manifest is **local, trusted configuration**. An issue or future
+control-plane assignment can select its name only when it also appears in
+`agent.assignable_types`; even explicitly naming the current default requires
+that allowlist entry. It cannot supply an executable or extra arguments.
+
+```yaml
+agent:
+  type: "claude"
+  sandbox: "none"                 # generic plugins do not support bwrap
+  assignable_types: ["example"]  # empty by default: no assignment overrides
+
+  plugins:
+    example:
+      binary: "/opt/example/bin/agent"
+      args: ["run", "--session-name={session_id}", "{prompt}"]
+      prompt_mode: "arg"          # "arg" (default) or "stdin"
+      resume_args: ["resume", "{resume_session_id}", "{prompt}"]
+      session_id_path: "info.session.id"
+      model: "model-x"            # optional; used by {model}
+      provider: "provider-y"      # optional; used by {provider}
+      plugin_version: "1"         # manifest/adapter compatibility version
+      default_timeout_seconds: 1800
+
+repos:
+  - name: "your-org/scratchpad"
+    agent_type: "example"        # standalone default; no control plane needed
+```
+
+Arguments are executed directly, never through a shell. Unsupported
+placeholder-shaped tokens are rejected at startup. `binary` must be absolute,
+or a bare name that the shared resolver turns into an absolute path before any
+run starts; a relative path is never resolved inside the repository worktree.
+These placeholders are substituted in `args` and `resume_args`:
+
+| Placeholder | Value |
+|---|---|
+| `{prompt}` | The complete run prompt. With `prompt_mode: "arg"`, it is appended when no placeholder is present. With `stdin`, the placeholder is forbidden and the prompt goes to standard input. |
+| `{session_id}` | ctrlrelay's orchestrator session id. |
+| `{state_file}` | The checkpoint path the CLI must write. |
+| `{resume_session_id}` | The CLI's native id, allowed only in `resume_args`. |
+| `{model}`, `{provider}` | The manifest's static values; using either placeholder without configuring it is refused. |
+
+`session_id_path` is a dotted path read from JSONL output (or one JSON object).
+It is required with `resume_args`, and `resume_args` must contain
+`{resume_session_id}`. A resume request without that mapping fails rather than
+silently starting a fresh conversation. `resume_args` replaces `args` for the
+resume invocation, so repeat any flags the CLI needs in both. Native ids are
+restricted to a bounded alphanumeric/`._:-` form; whitespace, paths and
+option-like values are refused before argv construction. A logical resume with
+no captured native id fails closed rather than invoking fresh `args`.
+
+Each manifest gets a SHA-256 fingerprint over its resolved binary, argv,
+prompt/session mapping, model/provider and environment. Built-in adapters
+fingerprint the resolved executable target and its current bytes, so a
+symlink retarget, an updated file, or a changed PATH lookup changes the pin.
+That fingerprint is pinned with the run, so editing a manifest or switching a
+built-in binary cannot silently hand an old native session to a different
+executable. Generic manifests remain resumable when they are removed from
+`assignable_types`; assignment permission and resume compatibility are
+separate decisions.
+
+The shared runtime still supplies checkpoint reading, credential stripping,
+timeout/cancellation, and dispatch-health reporting. Generic plugins honestly
+report **no live transcript events, usage measurement, or sandbox**. The CLI
+must be able to write the normal `DONE`, `BLOCKED_NEEDS_INPUT`, or `FAILED`
+checkpoint to `CTRLRELAY_STATE_FILE`; merely exiting zero is not success.
+
+Standalone selection is unchanged: `repos[].agent_type`, then `agent.type`.
+For a future registered assignment, an explicit override must be enrolled and
+allowlisted, otherwise the node refuses it—there is no silent substitution.
+The selected plugin identity and model are persisted in the session before the
+first dispatch, and pending answers, CI fixes, and interrupted-run continuations
+stay on that identity. Pre-#379 rows are not backfilled during migration. A
+legacy row with a native session id but no identity is refused as
+`agent_identity_unknown` rather than risking a cross-backend resume; a row with
+no native id can start a fresh session under the current local defaults.
+
 ### agent.opencode
 
 ```yaml
@@ -125,7 +207,7 @@ agent:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `binary` | string | `"opencode"` | The `opencode` executable. The bare name is resolved like every other tool (PATH, then `~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`), which matters under systemd where the unit's PATH is minimal. An absolute or relative path is used exactly as written. |
+| `binary` | string | `"opencode"` | The `opencode` executable. The bare name is resolved like every other tool (PATH, then `~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`), which matters under systemd where the unit's PATH is minimal. A custom bare name is anchored through PATH at startup. An absolute path is used as written; a relative path is refused because the child would resolve it inside the worktree. |
 | `model` | string | `null` | `provider/model` as opencode spells it, passed as `--model`. Unset leaves the choice to opencode's own config, which is usually right. |
 | `default_timeout_seconds` | int | `null` | Falls back to `agent.default_timeout_seconds`. A local model is usually slower per token than a hosted one. |
 
@@ -206,8 +288,10 @@ agent:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `type` | string | `"claude"` | Default backend for every repo: `"claude"` or `"opencode"`. See [agent backends](#agent-backends). |
-| `binary` | string | `"claude"` | Path to the `claude` executable. The bare name `"claude"` is auto-resolved at startup using `shutil.which("claude")`, then `~/.local/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude`. Set an absolute path to skip lookup (useful under launchd/systemd where PATH is minimal). |
+| `type` | string | `"claude"` | Default backend for every repo: `"claude"`, `"opencode"`, or a key under `agent.plugins`. See [agent backends](#agent-backends). |
+| `plugins` | object | `{}` | Locally trusted generic CLI manifests. Keys use lowercase letters, digits, `_` and `-`, start with a letter, and cannot replace `claude` or `opencode`. See [Generic CLI plugins and assignment policy](#generic-cli-plugins-and-assignment-policy). |
+| `assignable_types` | list[string] | `[]` | Enrolled agent types a future control-plane assignment may explicitly select. Empty permits no assignment override. It does not change standalone defaults or block a previously pinned resume. |
+| `binary` | string | `"claude"` | Path to the `claude` executable. The bare name `"claude"` is auto-resolved at startup using `shutil.which("claude")`, then `~/.local/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude`. Set an absolute path to skip lookup (useful under launchd/systemd where PATH is minimal). A relative path is refused because the child would resolve it inside the worktree. |
 | `default_timeout_seconds` | int | `1800` | Per-session timeout passed to `asyncio.wait_for`. Sessions that exceed this are killed and reported as failed. A session going in circles is stopped before this; see [stuck runs](operations.md#stuck-runs). |
 | `max_parallel` | int (at least 1) | unset | How many agent runs this machine may have going at once, counted over new issues, resumed answers and the security sweep together. With it set, each poll's issues start side by side up to the free slots, in priority order, and never two of one repo at once; the poll loop polls again while they run. Unset keeps the old behaviour: new issues one at a time, and no shared limit. The status page shows `slots busy/max_parallel`, or `slots N (no cap)` when unset. See [running several agents at once](operations.md#running-several-agents-at-once). |
 | `output_format` | string | `"json"` | Not used. The relay always runs `claude -p --output-format stream-json --verbose`, because only that output carries the subscription usage it reads (see [usage](#usage)). Kept so existing configs still load. |
