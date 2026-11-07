@@ -49,7 +49,9 @@ control plane to a node is the direction, not yet designed. It reverses rule
 3 below, and it turns the threat model around: once the control plane writes
 into the agent's prompt and holds credentials, a compromised control plane
 can steer every node. Protecting the control plane then becomes the main
-security job, and that needs its own design (#372) before it is built.
+security job, and that needs its own design before it is built: proposed in
+[The control plane as the brain]({{ '/control-plane-brain/' | relative_url }})
+(#372). Rule 3 and the threat model below change only once that is agreed.
 
 ## What already exists and is reused
 
