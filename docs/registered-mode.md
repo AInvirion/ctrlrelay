@@ -45,13 +45,12 @@ registers and when it takes work. Losing a node loses no knowledge.
 **What this page covers and what it does not.** The protocol below (register,
 heartbeat, get work, report, release, auth, outage, claims) is agreed and is
 the first thing to build. Handing knowledge, roles and credentials from the
-control plane to a node is the direction, not yet designed. It reverses rule
-3 below, and it turns the threat model around: once the control plane writes
-into the agent's prompt and holds credentials, a compromised control plane
-can steer every node. Protecting the control plane then becomes the main
-security job, and that needs its own design before it is built: proposed in
+control plane to a node changes rule 3 below and turns the threat model
+around: once the control plane holds what agents are told and some
+credentials, protecting it becomes the main security job. That design is
 [The control plane as the brain]({{ '/control-plane-brain/' | relative_url }})
-(#372). Rule 3 and the threat model below change only once that is agreed.
+(#372, agreed): what steers an agent, and config, is signed with an operator
+key the server does not hold.
 
 ## What already exists and is reused
 
@@ -76,7 +75,10 @@ The constraints from #251, plus one this design adds:
 1. The node calls out over HTTPS; the control plane never calls in. No port.
 2. The node refuses work outside its `repos` allowlist. The allowlist may
    come from the control plane's config (see "Config from the control plane").
-3. GitHub and agent credentials never leave the node. No message carries one.
+3. Node credentials (the node key, the GitHub token, the agent login) never
+   leave the node. Role credentials may come from the control plane, sealed
+   to one node for one assignment
+   ([brain design]({{ '/control-plane-brain/' | relative_url }}#credentials)).
 4. Each node has its own key, revocable alone.
 5. The node still writes its claim on the GitHub issue, with the same marker.
 6. With no `control_plane:` block, standalone mode runs exactly as today.
@@ -431,9 +433,13 @@ key of the node config: repos, labels, usage, slots, schedules, `agent`,
 sandbox paths, transport.
 
 Three things stay local, because without them the node cannot reach the
-control plane or prove who it is: the `control_plane` block itself, the
-node's key, and `node_id`. A pushed object that sets any of them is refused
-whole, logged, and the last good config is kept.
+control plane or prove who it is: the `control_plane` block itself (with the
+pinned operator keys), the node's key, and `node_id`. A pushed object that
+sets any of them is refused whole, logged, and the last good config is kept.
+
+**A pushed config must be signed with an operator key** (decision 2 of the
+[brain design]({{ '/control-plane-brain/' | relative_url }})). An unsigned
+or wrongly signed one is refused whole, like an invalid one.
 
 A pushed config is validated exactly like the file (unknown keys and bad
 values refuse the whole object). It is applied between runs, never under a
@@ -451,21 +457,19 @@ a restart until the control plane answers.
 - offer an eligible issue to a node that would not otherwise have picked it;
 - pause or drain nodes;
 - with webhook tasks enabled for a repo, open issues there through a node;
-- **change any node's config** (question 6): add repos, loosen label rules,
-  change the agent, its sandbox paths and the schedules. This is the price of
-  managing every node from one place. The checks below that read GitHub
-  (the issue must be marked by the operator, the claim decides) still hold,
-  and the GitHub token and agent login are still never sent to it.
+- read the knowledge, roles and role credentials it stores (see the
+  [brain design]({{ '/control-plane-brain/' | relative_url }}#threat-model)).
 
 What it cannot do, and what stops it:
 
 | It cannot | Because |
 |---|---|
-| make a node work on a repo outside its allowlist without it showing | check 1 on accept, against the node's current `repos`. It can change that list by config (decision 6), but every applied config is logged and shown on the status page with its version |
+| make a node work on a repo outside its allowlist | check 1 on accept, against the node's current `repos`; that list changes only by a config signed with an operator key |
+| change a node's config | a pushed config must carry an operator signature |
 | make a node work an issue the operator did not mark | check 3 reruns today's intake rules on the issue as GitHub serves it |
-| put its own instructions in front of the agent | assignments carry no prompt, command, URL or branch; the node reads the issue from GitHub; learning comes from GitHub; webhook text enters only as a fenced issue body, only for opted-in repos |
+| put its own instructions in front of the agent | assignments carry no prompt, command, URL or branch; roles, skills, context and learnings are shown as instructions only when signed with an operator key; history is shown only as fenced data; webhook text enters only as a fenced issue body, only for opted-in repos |
 | run a command on the node | the command list is fixed and has no arguments beyond an assignment id; there is no inbound port |
-| get a credential | no message carries one; the private key, GitHub token and agent login stay on the node; free text goes through `redact.py`; output tails and transcripts are not sent |
+| get a node credential | the private key, GitHub token and agent login never leave the node; free text goes through `redact.py`; output tails and transcripts are not sent. Role credentials it holds are exposed if it is compromised, so they are scoped and short-lived ([brain design]({{ '/control-plane-brain/' | relative_url }}#threat-model)) |
 | make two nodes work one issue | the GitHub claim decides, not the assignment |
 | throw away a run in progress | a `release` stops at the next safe point and never kills an agent |
 | impersonate another node | requests are signed per node; `409` on a `node_id` held by another key |
@@ -512,7 +516,8 @@ Made by the owner: 1, 3 and 4 on 2026-11-03, the rest on 2026-11-06 (see #251).
    where needed agent credentials and config, with nodes able to start clean
    (see "Direction: the control plane is the brain", designed in #372).
 6. **Config from the control plane:** full config, except the `control_plane`
-   block, the node key and `node_id`.
+   block, the node key and `node_id`. Amended 2026-11-06: it must be signed
+   with an operator key (#372).
 7. **Scheduled jobs:** configurable by the control plane; the ref claim stays
    the lock.
 8. **Mixed fleets:** not allowed. One account is all standalone or all

@@ -2,18 +2,18 @@
 title: Control plane as the brain (design)
 layout: default
 nav_order: 13
-description: "Proposal: how the control plane holds knowledge, memory, roles and credentials for every node, so a node can start clean, and how that is kept safe."
+description: "Design: how the control plane holds knowledge, memory, roles and credentials for every node, so a node can start clean, and how that is kept safe."
 permalink: /control-plane-brain/
 ---
 
 # The control plane as the brain: design
 
-**Status: proposed, not agreed, not built.** This is issue #372. It builds on
+**Status: agreed 2026-11-06, not built.** This is issue #372. It builds on
 [Registered mode]({{ '/registered-mode/' | relative_url }}) (#251), which
 fixes the protocol between a node and the control plane. That page assumes
 the control plane never puts text in front of an agent and never holds a
 credential. This page drops that assumption, on purpose, and says what
-replaces it. The choices still open are at the end, under "Open choices".
+replaces it. The owner's decisions are at the end, under "Decisions".
 
 ## The idea in one paragraph
 
@@ -106,7 +106,7 @@ to sign it, and only then does it become something a node will use.
 - **Agents** may suggest a learning in their checkpoint. The node forwards it
   as a proposal marked "agent suggestion", with the run it came from.
 - Nothing proposed reaches a later run until the operator approves it (see
-  "Open choices", question 4).
+  "Decisions", decision 4).
 
 **How it reaches a run.** The assignment names a **knowledge snapshot** for
 the repo: one signed bundle holding the context, approved learnings and
@@ -190,7 +190,7 @@ still applies to every run.
 | Kept on the node | Why |
 |---|---|
 | ctrlrelay, the agent CLI, bwrap | the runtime; the control plane sends no code |
-| the agent login | it is an account, not a role credential (see question 3) |
+| the agent login | it is an account, not a role credential (decision 3) |
 | its GitHub token | the node reads issues and opens PRs with its own access (#251, rule 3) |
 | node key, `node_id`, the `control_plane` block with `operator_keys` and `role_limits` | without them the node cannot reach the control plane, prove who it is, or check what it is sent |
 | the state database, worktrees, the report queue | work in progress; claims on GitHub say who holds an issue |
@@ -241,8 +241,11 @@ digest.
 A long-lived secret is allowed, with its scope written in the role, and is
 rotated at its source when a node holding it is revoked.
 
-**What this does not cover:** the GitHub token and the agent login. Moving
-those to the control plane is question 3.
+**What this does not cover:** the GitHub token and the agent login. They
+stay on the node for now (decision 3). That may change: some tokens may be
+better held centrally, and one shape for that is the control plane acting as
+a hub, where the agent asks it to perform an action and it acts with a token
+the node never sees. That needs its own design before it is built.
 
 ## Threat model
 
@@ -266,8 +269,8 @@ main security job. Three attackers:
 | | plant a learning: proposals need the operator's approval and signature |
 | | give a node a credential its role does not name |
 
-If config is not signed (question 2), this attacker can also change any
-node's config, as decision 6 of #251 already accepts.
+Config is signed too (decision 2), so this attacker cannot change a node's
+repos, sandbox paths or schedules either.
 
 **2. Someone holds the operator key.** They control what every agent is told.
 So the key lives off the server, ideally on a hardware key; there can be two
@@ -295,8 +298,10 @@ signing step on the operator's side, never a server job.
 - **Threat model:** the row "put its own instructions in front of the agent"
   changes to "unless signed with an operator key"; the row "get a credential"
   narrows to node credentials.
+- **Config from the control plane** (decision 6 of #251) must be signed with
+  an operator key (decision 2 here). An unsigned config is refused whole.
 - **Non-goal** "the control plane holding or brokering GitHub or agent
-  credentials" stays, unless question 3 changes it.
+  credentials" stays for now (decision 3).
 
 ## Build order
 
@@ -312,22 +317,20 @@ signing step on the operator's side, never a server job.
    per-run skill directories.
 5. **Role credentials:** the second key, sealed delivery, redaction.
 
-## Open choices
+## Decisions
 
-For the owner to decide.
+Made by the owner on 2026-11-06 (see #372).
 
-1. **Signing.** Proposed: everything that steers an agent is signed by an
-   operator key held off the server. Other option: trust the control plane
-   and rely on access control and the audit log; simpler, but a hacked
-   server steers every node.
-2. **Is config signed too?** Proposed: yes, so a hacked server cannot change
-   repos, sandbox paths or schedules either. This adds a signature to
-   decision 6 of #251. Other option: keep config unsigned, as decided.
-3. **GitHub token and agent login.** Proposed: they stay on the node for now,
-   so a node is "clean" of knowledge but not of its own accounts. Other
-   option: the control plane hands those out too, for a fully blank node,
-   at the price of the server holding every account.
-4. **Approving learnings.** Proposed: every learning, measured or suggested,
-   needs the operator's approval before a run sees it. Other option: facts a
-   node measured are used at once and only agent suggestions wait; faster,
-   but a hacked server could plant a "fact" such as a test command.
+1. **Signing:** everything that steers an agent (roles, skills, repo
+   context, approved learnings, decisions) is signed by an operator key held
+   off the control plane server.
+2. **Config is signed too.** This adds a signature to decision 6 of #251: the
+   control plane may still set the full config, but a node applies only a
+   config signed with an operator key.
+3. **GitHub token and agent login stay on the node, for now.** A node starts
+   clean of knowledge, not of its own accounts. This may change: some tokens
+   could be set centrally, possibly with the control plane as a hub that
+   performs an action for the agent instead of handing over the token.
+   Revisit with its own design.
+4. **Every learning needs the operator's approval**, measured or suggested,
+   before a later run sees it.
