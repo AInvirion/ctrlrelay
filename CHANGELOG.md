@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Built-in identity pins use the stable launcher path, so Claude's normal
   self-update does not invalidate a pending resume. Generic manifests still
   pin their full invocation mapping (#379).
+- A checked GitHub Copilot CLI manifest in `docs/configuration.md` and the
+  example config, with resume through its `sessionId`. It passes
+  `--disable-builtin-mcps`, because Copilot's built-in GitHub MCP server
+  otherwise gives the agent GitHub access under Copilot's own login,
+  bypassing credential stripping (#379).
 
 ### Fixed
 
@@ -37,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a deletion after cleanup, so an agent that staged everything could put
   either into its pull request. Cleanup now removes only links the relay
   made (#379).
+- A plugin listed under `agent.plugins` but not routed to by any repo or by
+  `agent.assignable_types` is built only when a pinned run selects it, so
+  one that cannot run under `agent.sandbox: bwrap` no longer stops the
+  daemon at startup. A routed one still does, naming where it was routed
+  from. A backend that fails to build on demand is refused for that run
+  instead of raising out of the pipeline (#379).
 
 ### Upgrade notes
 

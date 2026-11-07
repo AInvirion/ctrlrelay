@@ -312,17 +312,106 @@ class TestGenericManifestRegistration:
         dispatcher = make_repo_agent_dispatcher(
             cfg, outcome_hook=None, usage_store=None,
         )
-        assert isinstance(dispatcher, RepoAgentRouter)
+        # Listed but not routed: built only when a pinned run needs it.
+        fingerprint = dispatcher.resume_factories["example"]().agent_identity.fingerprint
         selected = select_agent(
             dispatcher,
             repo="owner/repo",
             pinned=AgentIdentity(
                 agent_type="example",
                 plugin_id="generic:example",
-                fingerprint=selected_fingerprint(dispatcher),
+                fingerprint=fingerprint,
             ),
         )
         assert selected.identity.agent_type == "example"
+        assert isinstance(selected.dispatcher, GenericCliDispatcher)
+
+    def test_a_listed_plugin_that_cannot_run_under_bwrap_does_not_stop_startup(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _fake_bwrap(monkeypatch)
+        cfg = _config_with_agent({
+            "type": "claude",
+            "sandbox": "bwrap",
+            "plugins": {"example": {"binary": "/opt/example"}},
+        })
+        dispatcher = make_repo_agent_dispatcher(
+            cfg, outcome_hook=None, usage_store=None,
+        )
+        assert dispatcher.agent_type == "claude"
+        # Selecting it later is a clean refusal, not an unhandled ValueError.
+        with pytest.raises(AgentSelectionError, match="cannot be built"):
+            select_agent(
+                dispatcher,
+                repo="owner/repo",
+                pinned=AgentIdentity(
+                    agent_type="example", plugin_id="generic:example",
+                ),
+            )
+
+    def test_a_routed_plugin_that_cannot_run_under_bwrap_stops_startup(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _fake_bwrap(monkeypatch)
+        cfg = _config_with_agent({
+            "type": "claude",
+            "sandbox": "bwrap",
+            "plugins": {"example": {"binary": "/opt/example"}},
+            "assignable_types": ["example"],
+        })
+        with pytest.raises(ValueError, match="agent.assignable_types"):
+            make_repo_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
+
+    def test_a_router_turns_a_lazy_build_failure_into_a_refusal(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _fake_bwrap(monkeypatch)
+        cfg = _config_with_agent({
+            "type": "claude",
+            "sandbox": "bwrap",
+            "plugins": {"example": {"binary": "/opt/example"}},
+        })
+        bare = make_repo_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
+        router = RepoAgentRouter(
+            default=bare, resume_factories=bare.resume_factories,
+        )
+        with pytest.raises(AgentSelectionError, match="cannot be built"):
+            router.select(
+                "owner/repo",
+                pinned=AgentIdentity(
+                    agent_type="example", plugin_id="generic:example",
+                ),
+            )
+
+
+def _fake_bwrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let the claude default accept bwrap on a machine without it."""
+    monkeypatch.setattr(
+        "ctrlrelay.core.dispatcher.resolve_bwrap", lambda: "/usr/bin/bwrap",
+    )
+
+
+def _config_with_agent(agent: dict) -> Config:
+    return Config.model_validate({
+        "node_id": "testbox",
+        "paths": {
+            "state_db": "/tmp/ctrlrelay-test/state.db",
+            "worktrees": "/tmp/ctrlrelay-test/worktrees",
+            "bare_repos": "/tmp/ctrlrelay-test/bare",
+            "contexts": "/tmp/ctrlrelay-test/contexts",
+            "skills": "/tmp/ctrlrelay-test/skills",
+            "repo_root": "/tmp/ctrlrelay-test/projects",
+        },
+        "transport": {
+            "type": "file_mock",
+            "file_mock": {
+                "inbox": "/tmp/ctrlrelay-test/inbox.txt",
+                "outbox": "/tmp/ctrlrelay-test/outbox.txt",
+            },
+        },
+        "agent": agent,
+        "repos": [{"name": "owner/repo"}],
+    })
 
 
 def selected_fingerprint(dispatcher: RepoAgentRouter) -> str:

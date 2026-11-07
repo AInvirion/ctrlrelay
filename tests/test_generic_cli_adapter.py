@@ -546,3 +546,56 @@ class TestEnvironmentAndIsolation:
         assert fields["github_access"] is False
         assert "GH_TOKEN" in fields["stripped_env"]
         assert fields["sandbox"] == "none"
+
+
+class TestCopilotManifest:
+    """The documented Copilot manifest against Copilot CLI's real output.
+
+    The JSONL below is trimmed from a Copilot CLI 1.0.107 run: many events
+    carry an ``id``, only the final ``result`` event carries ``sessionId``.
+    """
+
+    ARGS = (
+        "-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps",
+        "--output-format", "json",
+    )
+
+    def _copilot(self):
+        return _adapter(
+            agent_type="copilot",
+            binary="/opt/copilot",
+            args=self.ARGS,
+            resume_args=(*self.ARGS, "--resume", "{resume_session_id}"),
+            session_id_path="sessionId",
+            instructions_files=(".github/copilot-instructions.md", "AGENTS.md"),
+        )
+
+    def test_the_session_id_comes_from_the_result_event(self) -> None:
+        stdout = "\n".join([
+            '{"type":"session.mcp_servers_loaded","data":{},"ephemeral":true,'
+            '"id":"59ffeac8-d98f-4a25-adee-897873d7cde0"}',
+            '{"type":"assistant.message","data":{"content":"OK"},'
+            '"id":"0eddbbb8-b1f6-45bd-a578-7ab4fa608fd1"}',
+            '{"type":"result","timestamp":"2026-11-07T18:44:59.436Z",'
+            '"sessionId":"8e34dff3-65de-4e73-bd7b-5b56f3b8c8c7","exitCode":0,'
+            '"usage":{"premiumRequests":1}}',
+        ])
+        assert self._copilot()._parse_agent_session_id(stdout) == (
+            "8e34dff3-65de-4e73-bd7b-5b56f3b8c8c7"
+        )
+
+    def test_fresh_and_resume_argv_keep_the_github_mcp_off(self, tmp_path) -> None:
+        adapter = self._copilot()
+        fresh = adapter._build_argv(
+            prompt="do it", session_id="s1", state_file=tmp_path / "s.json",
+            resume_session_id=None,
+        )
+        resumed = adapter._build_argv(
+            prompt="answer", session_id="s1", state_file=tmp_path / "s.json",
+            resume_session_id="8e34dff3-65de-4e73-bd7b-5b56f3b8c8c7",
+        )
+        assert fresh[:3] == ["/opt/copilot", "-p", "do it"]
+        assert resumed[-2:] == ["--resume", "8e34dff3-65de-4e73-bd7b-5b56f3b8c8c7"]
+        for argv in (fresh, resumed):
+            assert "--disable-builtin-mcps" in argv
+        assert adapter.capabilities.resume is True

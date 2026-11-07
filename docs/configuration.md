@@ -186,6 +186,36 @@ different executable. Generic manifests remain resumable when they are removed
 from `assignable_types`; assignment permission and resume compatibility are
 separate decisions.
 
+#### Example: GitHub Copilot CLI
+
+Checked against Copilot CLI 1.0.107: it starts and answers with GitHub
+credentials stripped (it uses its own stored login), its JSONL output ends with
+a `result` event carrying a top-level `sessionId`, and `--resume` continues
+that conversation.
+
+```yaml
+agent:
+  sandbox: "none"
+  plugins:
+    copilot:
+      binary: "copilot"
+      args: ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps",
+             "--output-format", "json"]
+      resume_args: ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps",
+                    "--output-format", "json", "--resume", "{resume_session_id}"]
+      session_id_path: "sessionId"
+      instructions_files: [".github/copilot-instructions.md", "AGENTS.md"]
+```
+
+`--disable-builtin-mcps` matters. Without it Copilot connects its built-in
+GitHub MCP server with **its own** GitHub login, which hands the agent GitHub
+access that credential stripping (#219) exists to withhold. MCP servers you add
+in `~/.copilot/mcp-config.json` still load; keep that file empty on a relay
+node. `--allow-all-tools` lets the agent run any command unconfined, which is
+true of every generic plugin until the container runner (#352) lands. Copilot's
+`result` event also reports premium requests used, but the relay does not read
+it yet, so the token budget does not apply.
+
 The shared runtime still supplies checkpoint reading, credential stripping,
 timeout/cancellation, and dispatch-health reporting. Generic plugins honestly
 report **no live transcript events, usage measurement, or sandbox**. The CLI

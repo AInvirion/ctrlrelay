@@ -1503,7 +1503,8 @@ class RepoAgentRouter:
     # every repo that names it: each holds the session counters the idle
     # usage probe reads, and a copy per repo would see only its own runs.
     by_repo: dict[str, AgentAdapter] = field(default_factory=dict)
-    # Every locally enrolled plugin, including assignment-only plugins.
+    # Every backend built at startup: the default, repo overrides and
+    # assignable types. Other enrolled plugins join on first selection.
     by_type: dict[str, AgentAdapter] = field(default_factory=dict)
     # Explicit assignment overrides are denied by default. A pinned resume
     # is not a new override and does not need to be in this set.
@@ -1548,7 +1549,9 @@ class RepoAgentRouter:
         if pinned is not None:
             backend = self.by_type.get(pinned.agent_type)
             if backend is None and pinned.agent_type in self.resume_factories:
-                backend = self.resume_factories[pinned.agent_type]()
+                backend = _build_lazily(
+                    pinned.agent_type, self.resume_factories[pinned.agent_type],
+                )
                 self.by_type[pinned.agent_type] = backend
             if backend is None:
                 raise AgentSelectionError(
@@ -1572,7 +1575,9 @@ class RepoAgentRouter:
                 )
             backend = self.by_type.get(requested_type)
             if backend is None and requested_type in self.resume_factories:
-                backend = self.resume_factories[requested_type]()
+                backend = _build_lazily(
+                    requested_type, self.resume_factories[requested_type],
+                )
                 self.by_type[requested_type] = backend
             if backend is None:
                 raise AgentSelectionError(
@@ -1664,6 +1669,23 @@ class RepoAgentRouter:
         )
 
 
+def _build_lazily(
+    agent_type: str, factory: Callable[[], AgentAdapter],
+) -> AgentAdapter:
+    """Build an enrolled backend on first use, refusing cleanly if it can't run.
+
+    A lazily built backend was never checked at startup, so a sandbox it
+    does not support or a binary that no longer resolves surfaces here.
+    That is a refusal for this run, never an unhandled error in a pipeline.
+    """
+    try:
+        return factory()
+    except (ValueError, NotImplementedError, OSError) as e:
+        raise AgentSelectionError(
+            f"agent {agent_type!r} cannot be built on this node: {e}"
+        ) from e
+
+
 def agent_identity_for(dispatcher: AgentAdapter) -> AgentIdentity:
     """Read a concrete adapter identity, including lightweight test doubles."""
     identity = getattr(dispatcher, "agent_identity", None)
@@ -1720,7 +1742,7 @@ def select_agent(
                 pinned.agent_type,
             )
             if factory is not None:
-                backend = factory()
+                backend = _build_lazily(pinned.agent_type, factory)
                 actual = agent_identity_for(backend)
                 _ensure_identity_pin(pinned, actual)
                 return AgentSelection(backend, actual)
@@ -1935,13 +1957,12 @@ def make_repo_agent_dispatcher(
     by_repo: dict[str, AgentAdapter] = {}
 
     requested = [(repo.name, getattr(repo, "agent_type", None)) for repo in config.repos]
+    # Built now, so a routed type that cannot run here (a sandbox it does
+    # not support, a binary that does not resolve) stops startup by name.
     requested += [
         ("agent.assignable_types", wanted)
         for wanted in getattr(config.agent, "assignable_types", [])
     ]
-    # Every generic manifest stays resumable after an allowlist change. Being
-    # assignable is a routing decision; being enrolled is a compatibility one.
-    requested += [("agent.plugins", name) for name in config.agent.plugins]
     for repo_name, wanted in requested:
         if not wanted:
             continue
@@ -1955,11 +1976,17 @@ def make_repo_agent_dispatcher(
                 )
             except NotImplementedError as e:
                 raise NotImplementedError(f"{repo_name}: {e}") from e
-        if repo_name not in ("agent.assignable_types", "agent.plugins") and wanted != global_type:
+            except ValueError as e:
+                raise ValueError(f"{repo_name}: {e}") from e
+        if repo_name != "agent.assignable_types" and wanted != global_type:
             by_repo[_route_key(repo_name)] = by_type[wanted]
 
+    # Every other enrolled backend is built only if a run selects it again
+    # (a pinned resume after an allowlist or repo change). Being enrolled is
+    # a compatibility promise, not a routing one, so a listed plugin that
+    # cannot run under this node's sandbox must not stop the daemon.
     resume_factories: dict[str, Callable[[], AgentAdapter]] = {}
-    for wanted in ("claude", "opencode"):
+    for wanted in ("claude", "opencode", *config.agent.plugins):
         if wanted in by_type:
             continue
 
