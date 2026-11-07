@@ -1619,6 +1619,42 @@ class TestWorktreeManager:
 
         assert (outside / "copilot-instructions.md").is_symlink()
 
+    def test_a_cleanup_that_skipped_a_link_can_finish_later(
+        self, tmp_path: Path,
+    ) -> None:
+        """A parent the agent locked is skipped, and the target is kept."""
+        import os
+        import stat as stat_mod
+
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Relay context")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        names = ("AGENTS.md", "locked/B.md")
+        manager.symlink_context(worktree_path, context_file, filenames=names)
+        locked = worktree_path / "locked"
+        locked.chmod(0)
+        try:
+            if os.access(locked, os.X_OK):
+                pytest.skip("running as a user that ignores permissions")
+            manager.remove_context_symlink(worktree_path, filenames=names)
+        finally:
+            locked.chmod(stat_mod.S_IRWXU)
+        assert not (worktree_path / "AGENTS.md").is_symlink()
+        assert (locked / "B.md").is_symlink()
+
+        manager.remove_context_symlink(worktree_path, filenames=names)
+
+        assert not (locked / "B.md").is_symlink()
+        assert manager._context_targets == {}
+
     def test_cleanup_forgets_the_worktree(self, tmp_path: Path) -> None:
         """The daemon shares one manager; finished runs must not pile up."""
         from ctrlrelay.core.worktree import WorktreeManager

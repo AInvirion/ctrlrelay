@@ -180,10 +180,18 @@ cleanup outside the checkout. A link left behind by a run the daemon restarted
 during stays until the next run on that worktree replaces it; it is listed in the
 worktree's `info/exclude` meanwhile, so `git add -A` does not pick it up.
 
-A bare `binary` name is looked up at spawn time through **absolute** `PATH`
-entries only. The agent runs inside the repository worktree, so a relative entry
-(`.`, an empty entry, `bin`) would let a file committed to the repository run as
-the agent.
+Every agent is started with relative entries (`.`, an empty entry, `bin`)
+removed from its `PATH`. The agent runs inside the repository worktree, so a
+relative entry would let a file committed to the repository run in place of the
+agent, of an `#!/usr/bin/env` interpreter its launcher names, or of any command
+the agent runs. A bare `binary` that exists only through such an entry fails as a
+missing binary.
+
+Known limit: the cleanup walk starts at the worktree directory itself. An agent
+that renames the whole worktree and puts a symlink in its place can point the
+cleanup at another directory, where only a link to this repo's context file
+could be removed. An unconfined agent already runs as the same user, so this
+needs no new access; confinement (#352) is what closes it.
 
 Each manifest gets a SHA-256 fingerprint over its resolved binary, argv,
 prompt/session mapping, model/provider and environment. Built-in adapters

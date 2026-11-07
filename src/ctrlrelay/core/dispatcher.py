@@ -116,32 +116,23 @@ def _normalise_builtin_binary(binary: str, *, label: str) -> str:
     return str(Path(found).absolute()) if found else binary
 
 
-def _program_outside_worktree(program: str, env: dict[str, str]) -> str:
-    """The agent executable to exec, never one found inside the worktree.
+def _absolute_path_only(env: dict[str, str]) -> dict[str, str]:
+    """``env`` with every relative ``PATH`` entry removed.
 
-    ``exec`` searches a bare name through ``PATH`` from the CHILD's
-    directory, which for an agent is the run's worktree: repository
-    content. A relative entry (``.``, an empty entry, ``bin``) would let a
-    file committed to the repository run as the agent. A bare name is
-    therefore searched through absolute ``PATH`` entries only; a name
-    found nowhere raises the ``FileNotFoundError`` a missing binary always
-    raised. Absolute paths pass through; relative paths were refused when
-    the adapter was built.
+    An agent starts in the run's worktree, which is repository content.
+    Any lookup through a relative entry (``.``, an empty entry, ``bin``)
+    is a lookup inside the repository: ``exec`` finding a bare agent name,
+    bwrap's own search inside the sandbox, an ``#!/usr/bin/env node``
+    launcher finding its interpreter, and every command the agent runs
+    after that. Dropping those entries from the child's environment covers
+    all of them at once; a name found nowhere else fails as a missing
+    binary always did.
     """
-    if os.path.isabs(program) or os.sep in program:
-        return program
-    absolute = os.pathsep.join(
-        entry for entry in env.get("PATH", "").split(os.pathsep)
-        if os.path.isabs(entry)
-    )
-    found = shutil.which(program, path=absolute)
-    if found is None:
-        raise FileNotFoundError(
-            f"{program!r} was not found on any absolute PATH entry; "
-            "relative entries are skipped because the agent runs in the "
-            "repository worktree"
-        )
-    return found
+    entries = env.get("PATH", "").split(os.pathsep)
+    kept = [entry for entry in entries if os.path.isabs(entry)]
+    if kept == entries:
+        return env
+    return {**env, "PATH": os.pathsep.join(kept)}
 
 
 @dataclass(frozen=True)
@@ -577,22 +568,13 @@ class CliAgentAdapter:
         try:
             # The sandbox's options go through a file descriptor, not the
             # command line, so no number of mounts can pass ARG_MAX (#362).
-            # The agent program sits right after the sandbox prefix (or
-            # first, unsandboxed). bwrap also starts it from the worktree,
-            # so it gets the same lookup either way.
-            if sandbox_prefix_len < len(cmd):
-                cmd = [
-                    *cmd[:sandbox_prefix_len],
-                    _program_outside_worktree(cmd[sandbox_prefix_len], env),
-                    *cmd[sandbox_prefix_len + 1:],
-                ]
             short, args_fd = bwrap_args_via_fd(cmd[:sandbox_prefix_len])
             pass_fds = () if args_fd is None else (args_fd,)
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *short, *cmd[sandbox_prefix_len:],
                     cwd=working_dir,
-                    env=env,
+                    env=_absolute_path_only(env),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     pass_fds=pass_fds,

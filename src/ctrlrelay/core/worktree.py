@@ -2586,9 +2586,11 @@ class WorktreeManager:
         ``worktree_path`` are removed; a repository's own file or link under
         the same name is part of the checkout and stays.
         """
-        destination = self._context_targets.pop(Path(worktree_path), None)
+        key = Path(worktree_path)
+        destination = self._context_targets.get(key)
         if destination is None:
             return
+        complete = True
         for name in filenames:
             try:
                 with _context_parent(
@@ -2596,7 +2598,13 @@ class WorktreeManager:
                 ) as (fd, base):
                     if _link_points_to(fd, base, destination):
                         os.unlink(base, dir_fd=fd)
-            except (FileNotFoundError, ValueError):
-                # Nothing of ours there, or a parent the agent replaced:
-                # either way, nothing outside the checkout is touched.
+            except FileNotFoundError:
+                # No parent directory: nothing of ours can be there.
                 continue
+            except (OSError, ValueError):
+                # A parent the agent replaced or locked. Nothing outside
+                # the checkout is touched, and the target is kept so a
+                # later cleanup of this worktree can still finish.
+                complete = False
+        if complete:
+            del self._context_targets[key]
