@@ -11,10 +11,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ctrlrelay.core.agent_plugins import (
+    AgentIdentityConflictError,
+    AgentSelectionError,
+    agent_identity_from_mapping,
+)
 from ctrlrelay.core.archived import ArchivedRepoTracker
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.claims import PROCESS_RUN
-from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
+from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult, select_agent
 from ctrlrelay.core.events import EventKind, emit_event, emit_outcome
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.job_claims import JobClaimer
@@ -254,13 +259,16 @@ class SecopsPipeline:
             # returns; until then this lane keeps the pre-#219
             # behaviour, on purpose and in one visible place.
             github_access=True,
+            resume_requested=resume,
         )
 
         if result.agent_session_id:
             try:
                 self.state_db.set_agent_session_id(
-                    ctx.session_id, result.agent_session_id
+                    ctx.session_id, result.agent_session_id, agent=result.agent,
                 )
+            except AgentIdentityConflictError:
+                raise
             except Exception:
                 pass
 
@@ -689,6 +697,7 @@ async def run_secops_all(
     job_claims: JobClaimer | None,
     slots: AgentSlots | None = None,
     held: Callable[[], str | None] | None = None,
+    agent_type: str | None = None,
 ) -> list[PipelineResult]:
     """Run secops pipeline on all configured repos.
 
@@ -725,15 +734,6 @@ async def run_secops_all(
     """
     results = []
 
-    pipeline = SecopsPipeline(
-        dispatcher=dispatcher,
-        github=github,
-        worktree=worktree,
-        dashboard=dashboard,
-        state_db=state_db,
-        transport=transport,
-    )
-
     # One slot per repo, taken before the lock (#210, see core.slots)
     # and given back when the next repo starts or the sweep ends.
     holding = False
@@ -744,6 +744,23 @@ async def run_secops_all(
                 holding = False
             repo = repo_config.name
             session_id = f"secops-{repo.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
+            try:
+                selection = select_agent(
+                    dispatcher, repo=repo, requested_type=agent_type,
+                )
+            except AgentSelectionError as e:
+                results.append(PipelineResult(
+                    success=False,
+                    session_id=session_id,
+                    summary=f"Skipped {repo}: agent selection refused",
+                    error=str(e),
+                ))
+                continue
+            repo_dispatcher = selection.dispatcher
+            instruction_files = getattr(
+                selection.dispatcher, "instructions_files", ("CLAUDE.md",),
+            )
+            agent_identity = selection.identity
 
             # Archived repos accept no security work: the Dependabot alerts
             # API returns 403 for them, so a sweep burns a full agent session
@@ -822,7 +839,10 @@ async def run_secops_all(
 
                 context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
                 if context_path.exists():
-                    worktree.symlink_context(worktree_path, context_path)
+                    worktree.symlink_context(
+                        worktree_path, context_path,
+                        filenames=instruction_files,
+                    )
 
                 state_file = worktree_path / ".ctrlrelay" / "state.json"
                 state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -864,11 +884,16 @@ async def run_secops_all(
                 state_db.execute(
                     """INSERT INTO sessions
                        (id, pipeline, repo, worktree_path, status, started_at,
-                        owner_pid, owner_run)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        owner_pid, owner_run, agent_type, agent_plugin_id,
+                        agent_plugin_version, agent_model, agent_provider,
+                        agent_fingerprint)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id, "secops", repo, str(worktree_path),
                         "running", int(time.time()), os.getpid(), PROCESS_RUN,
+                        agent_identity.agent_type, agent_identity.plugin_id,
+                        agent_identity.plugin_version, agent_identity.model,
+                        agent_identity.provider, agent_identity.fingerprint,
                     ),
                 )
                 state_db.commit()
@@ -882,6 +907,14 @@ async def run_secops_all(
                     },
                 )
 
+                pipeline = SecopsPipeline(
+                    dispatcher=repo_dispatcher,
+                    github=github,
+                    worktree=worktree,
+                    dashboard=dashboard,
+                    state_db=state_db,
+                    transport=transport,
+                )
                 result = await pipeline.run(ctx)
 
                 # BLOCKED loop: when the agent ends BLOCKED_NEEDS_INPUT, push
@@ -1181,7 +1214,9 @@ async def run_secops_all(
                 # the inner cleanup kept running untracked — leaking state.
                 if worktree_path is not None:
                     try:
-                        worktree.remove_context_symlink(worktree_path)
+                        worktree.remove_context_symlink(
+                            worktree_path, filenames=instruction_files,
+                        )
                     except Exception as cleanup_exc:
                         log_event(
                             _logger,
@@ -1321,6 +1356,44 @@ async def resume_secops_from_pending(
             summary=summary,
         )
 
+    session_row = state_db.get_session_row(session_id)
+    if session_row is None:
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=f"Cannot resume secops session {session_id}: session row missing",
+            error="session_row_missing",
+        )
+    pinned_identity = agent_identity_from_mapping(session_row)
+    if pinned_identity is None and session_row.get("agent_session_id"):
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=(
+                f"Cannot resume secops session {session_id}: its pre-#379 "
+                "agent identity is unknown"
+            ),
+            error="agent_identity_unknown",
+        )
+    try:
+        selection = select_agent(
+            dispatcher,
+            repo=repo,
+            pinned=pinned_identity,
+        )
+        state_db.pin_agent_identity(session_id, selection.identity)
+    except AgentSelectionError as e:
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=f"Cannot resume secops session {session_id}: agent selection refused",
+            error=str(e),
+        )
+    dispatcher = selection.dispatcher
+    instruction_files = getattr(
+        selection.dispatcher, "instructions_files", ("CLAUDE.md",),
+    )
+
     if question:
         _record_decisions_from_answer(
             state_db,
@@ -1353,7 +1426,9 @@ async def resume_secops_from_pending(
 
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
         if context_path.exists():
-            worktree.symlink_context(worktree_path, context_path)
+            worktree.symlink_context(
+                worktree_path, context_path, filenames=instruction_files,
+            )
 
         state_file = worktree_path / ".ctrlrelay" / "state.json"
         state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1451,7 +1526,9 @@ async def resume_secops_from_pending(
         # lock, bounded timeouts, log-don't-crash.
         if worktree_path is not None:
             try:
-                worktree.remove_context_symlink(worktree_path)
+                worktree.remove_context_symlink(
+                    worktree_path, filenames=instruction_files,
+                )
             except Exception as cleanup_exc:
                 log_event(
                     _logger,

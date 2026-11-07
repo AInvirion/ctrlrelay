@@ -127,6 +127,15 @@ POST /v1/register
   "account_label": "max-2",              # fleet.account_label, never an email
   "capabilities": {
     "agents": ["claude"],                # agent.type values this node can run (#286)
+    "agent_plugins": {                   # concrete identities/capabilities (#379)
+      "claude": {
+        "plugin_id": "claude", "plugin_version": "1",
+        "resume": true, "structured_events": true,
+        "usage": true, "sandbox": true,
+        "models": [null]
+      }
+    },
+    "assignable_agents": ["claude"],     # local agent.assignable_types policy
     "pipelines": ["dev", "task", "secops"],
     "slots": 1,
     "labels": ["needs:docker"]           # optional, free-form, for routing
@@ -141,6 +150,12 @@ POST /v1/register
        "lease_seconds": 2100, "commands": []}
 → 401 unknown or revoked key   → 409 node_id held by another key
 ```
+
+`agent_plugins` is the local enrollment inventory, not permission for the
+control plane to invent a CLI. `assignable_agents` is the smaller set an
+assignment may explicitly select. A plugin without `structured_events` gets no
+live activity/loop detection, one without `usage` is never counted as zero, and
+one without `sandbox` remains visibly unconfined.
 
 `holding` lets the control plane reconcile after a restart (see "Node death").
 
@@ -175,6 +190,7 @@ POST /v1/work/next
   "repo": "owner/app",
   "issue_number": 42,                   # issue only
   "pipeline": "dev",
+  "agent": {"type": "opencode"},       # optional; must be locally assignable
   "attempt": 1,
   "replaces_claim_id": null,            # set when a stale claim is being taken over
   "lease_seconds": 2100
@@ -182,7 +198,15 @@ POST /v1/work/next
 ```
 
 An assignment names **what**, never **how**: no prompt, no command, no URL to
-fetch, no branch name, no file. With brain content it also names a `role`
+fetch, no branch name, no file, no executable and no free-form CLI arguments.
+Its optional `agent.type` selects only a locally enrolled type present in
+`assignable_agents`; omitting it uses the node's repository/global default. A
+signed role may additionally select a model and agent settings within local
+`role_limits`. The node refuses an unknown or disallowed selection and never
+silently substitutes another plugin. The concrete identity is pinned to the run
+before dispatch and reused for reports, CI fixes, retries and native resumes.
+
+With brain content the assignment also names a `role`
 and a `knowledge` snapshot by digest, and the node runs them only if they
 carry an operator signature
 ([brain design]({{ '/control-plane-brain/' | relative_url }}#roles)). The node reads the issue from GitHub itself,
@@ -235,12 +259,19 @@ POST /v1/work/asg_7Hq.../report
   "state": "working",                   # working | held | blocked | done | failed | dropped
   "phase": "review",
   "claim_id": "3f9c0a1b2c4d",
+  "agent": {"type": "opencode", "plugin_id": "opencode",
+            "plugin_version": "1", "model": "local/qwen3-coder:30b",
+            "provider": "local", "fingerprint": "9f2c..."},
   "pr": {"number": 88},                 # once known; a URL is built by the reader
   "question": "Which config key ...",   # blocked only, scrubbed, at most 500 characters
   "numbers": {"seconds": 1840, "cost_usd": null, "ci_rounds": 2}
 }
 → 200 {"lease_until": 1793000000}   → 410 assignment withdrawn (see "Release")
 ```
+
+`agent` reports the concrete selection that actually ran, including its
+plugin/model identity, rather than merely echoing the request. A retry or
+resume keeps that identity even if the node's defaults later change.
 
 `held` means what it means for a claim: the run finished or waits for an
 answer, and the lease no longer expires. Agent output, transcripts and output

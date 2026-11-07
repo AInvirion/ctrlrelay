@@ -11,7 +11,7 @@ import shutil
 import stat
 import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -387,6 +387,42 @@ def _read_branch_head(bare_path: Path, branch: str) -> str:
 class _UnsafeExcludeError(Exception):
     """``info/exclude`` is there but is not a plain file reached without
     a link."""
+
+
+def _safe_context_target(worktree_path: Path, name: str) -> Path:
+    """Resolve an adapter's instruction filename inside the worktree."""
+    path = Path(name)
+    if (
+        not name.strip()
+        or path.is_absolute()
+        or not path.parts
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise ValueError(f"unsafe context filename {name!r}")
+    return worktree_path.joinpath(*path.parts)
+
+
+def _is_relay_context_link(worktree_path: Path, target: Path) -> bool:
+    """Whether ``target`` is a context link the relay itself made.
+
+    The relay always links to the absolute, resolved context file, which
+    lives outside the worktree. A repository's own instruction file is a
+    regular file or, when it is a link (``AGENTS.md -> CLAUDE.md`` is a
+    common pattern), a relative one inside the checkout. Only the first
+    kind may be replaced or removed: touching the second would change a
+    tracked file, and an agent that stages everything would put the
+    host-path link, or the deletion, into the pull request.
+    """
+    if not target.is_symlink():
+        return False
+    try:
+        dest = Path(os.readlink(target))
+    except OSError:
+        return False
+    if not dest.is_absolute():
+        return False
+    root = worktree_path.resolve()
+    return dest != root and root not in dest.parents
 
 
 def _add_exclude_line(admin_fd: int, where: Path, line: str) -> None:
@@ -2356,17 +2392,49 @@ class WorktreeManager:
         self,
         worktree_path: Path,
         context_path: Path,
-    ) -> None:
-        """Symlink CLAUDE.md into worktree."""
-        target = worktree_path / "CLAUDE.md"
+        filenames: Sequence[str] = ("CLAUDE.md",),
+    ) -> list[str]:
+        """Link the relay's repo context under every instruction filename.
 
-        if target.exists() or target.is_symlink():
-            target.unlink()
+        Agents disagree on the name: Claude reads ``CLAUDE.md``, Codex reads
+        ``AGENTS.md``, and Copilot can read ``.github/copilot-instructions.md``.
+        The selected adapter supplies the names it actually reads.
 
-        target.symlink_to(context_path.resolve())
+        A name the repository already has is left exactly as it is: its own
+        instructions win over the relay's under that name, and the checkout
+        stays clean so nothing of the relay's can reach a commit. The relay
+        context still goes under every name that is free. Returns the names
+        that were linked.
+        """
+        linked: list[str] = []
+        for name in filenames:
+            target = _safe_context_target(worktree_path, name)
+            cursor = worktree_path
+            for part in target.parent.relative_to(worktree_path).parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    raise ValueError(
+                        f"context directory {cursor} is a symlink"
+                    )
+                cursor.mkdir(exist_ok=True)
 
+            if _is_relay_context_link(worktree_path, target):
+                # Ours, from an earlier round on a reused worktree.
+                target.unlink()
+            elif target.exists() or target.is_symlink():
+                log_event(
+                    _logger, "worktree.context.kept_repo_file",
+                    worktree=str(worktree_path), context_name=name,
+                )
+                continue
+
+            target.symlink_to(context_path.resolve())
+            linked.append(name)
+
+        if not linked:
+            return linked
         try:
-            self._add_context_exclude(worktree_path)
+            self._add_context_exclude(worktree_path, linked)
         except (_UnsafeExcludeError, OSError, ValueError) as e:
             # Refused, not followed, and never raised out of a resume: the
             # line only keeps the link out of `git status`, so the run
@@ -2377,10 +2445,13 @@ class WorktreeManager:
                 worktree=str(worktree_path),
                 reason=f"{type(e).__name__}: {e}"[:300],
             )
+        return linked
 
-    def _add_context_exclude(self, worktree_path: Path) -> None:
-        """Add ``CLAUDE.md`` to the worktree's ``info/exclude``, found from
-        the relay's own data only (#263).
+    def _add_context_exclude(
+        self, worktree_path: Path, filenames: Sequence[str] = ("CLAUDE.md",),
+    ) -> None:
+        """Add the context links to the worktree's ``info/exclude``, found
+        from the relay's own data only (#263).
 
         The worktree's ``.git`` file is never read: the agent can rewrite
         it when there is no sandbox. Git names a worktree's directory
@@ -2455,14 +2526,24 @@ class WorktreeManager:
                     f"point back at {worktree_path}"
                 )
             admin_fd, admin = matches[0]
-            _add_exclude_line(admin_fd, admin, "CLAUDE.md")
+            for name in filenames:
+                _add_exclude_line(admin_fd, admin, Path(name).as_posix())
         finally:
             os.close(root_fd)
             for fd, _ in matches:
                 os.close(fd)
 
-    def remove_context_symlink(self, worktree_path: Path) -> None:
-        """Remove CLAUDE.md symlink before git operations."""
-        target = worktree_path / "CLAUDE.md"
-        if target.is_symlink():
-            target.unlink()
+    def remove_context_symlink(
+        self,
+        worktree_path: Path,
+        filenames: Sequence[str] = ("CLAUDE.md",),
+    ) -> None:
+        """Remove the context links before git operations.
+
+        Only links the relay made are removed; a repository's own file or
+        link under the same name is part of the checkout and stays.
+        """
+        for name in filenames:
+            target = _safe_context_target(worktree_path, name)
+            if _is_relay_context_link(worktree_path, target):
+                target.unlink()

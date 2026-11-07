@@ -1,5 +1,11 @@
 """Core functionality for ctrlrelay orchestrator."""
 
+from ctrlrelay.core.agent_plugins import (
+    AgentCapabilities,
+    AgentIdentity,
+    AgentSelection,
+    AgentSelectionError,
+)
 from ctrlrelay.core.checkpoint import (
     CheckpointError,
     CheckpointState,
@@ -24,7 +30,9 @@ from ctrlrelay.core.dispatcher import (
     SessionResult,
     make_agent_dispatcher,
     make_repo_agent_dispatcher,
+    select_agent,
 )
+from ctrlrelay.core.generic_cli import GenericCliDispatcher
 from ctrlrelay.core.github import GitHubCLI
 from ctrlrelay.core.poller import IssuePoller
 from ctrlrelay.core.pr_verifier import PRVerifier, VerificationResult
@@ -37,12 +45,18 @@ __all__ = [
     "CheckpointState",
     "CheckpointStatus",
     "AgentAdapter",
+    "AgentCapabilities",
+    "AgentIdentity",
+    "AgentSelection",
+    "AgentSelectionError",
     "ClaudeDispatcher",
     "CliAgentAdapter",
+    "GenericCliDispatcher",
     "OpenCodeDispatcher",
     "RepoAgentRouter",
     "make_agent_dispatcher",
     "make_repo_agent_dispatcher",
+    "select_agent",
     "Config",
     "ConfigError",
     "GitHubCLI",

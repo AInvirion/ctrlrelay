@@ -1358,6 +1358,175 @@ class TestWorktreeManager:
         assert link.resolve() == context_file.resolve()
 
     @pytest.mark.asyncio
+    async def test_symlink_context_links_every_agent_instruction_name(
+        self, tmp_path: Path,
+    ) -> None:
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Context")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+
+        names = ("CLAUDE.md", "AGENTS.md", ".github/copilot-instructions.md")
+        manager.symlink_context(
+            worktree_path, context_file, filenames=names,
+        )
+
+        for name in names:
+            link = worktree_path / name
+            assert link.is_symlink(), name
+            assert link.resolve() == context_file.resolve()
+
+        manager.remove_context_symlink(worktree_path, filenames=names)
+        for name in names:
+            assert not (worktree_path / name).is_symlink(), name
+
+    @pytest.mark.asyncio
+    async def test_symlink_context_keeps_the_repos_own_instruction_files(
+        self, tmp_path: Path,
+    ) -> None:
+        """A file the repository already has is never replaced or removed.
+
+        Replacing a tracked AGENTS.md with a link to a host path turns it
+        into a type change, and removing the link afterwards turns it into
+        a deletion; an agent that stages everything would put either into
+        the pull request.
+        """
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Relay context")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        (worktree_path / "AGENTS.md").write_text("# Repo rules")
+        # A common pattern: one file, linked under the other name.
+        (worktree_path / "CLAUDE.md").symlink_to("AGENTS.md")
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        names = ("CLAUDE.md", "AGENTS.md", ".github/copilot-instructions.md")
+
+        linked = manager.symlink_context(
+            worktree_path, context_file, filenames=names,
+        )
+
+        assert linked == [".github/copilot-instructions.md"]
+        assert not (worktree_path / "AGENTS.md").is_symlink()
+        assert (worktree_path / "AGENTS.md").read_text() == "# Repo rules"
+        assert str((worktree_path / "CLAUDE.md").readlink()) == "AGENTS.md"
+        free = worktree_path / ".github" / "copilot-instructions.md"
+        assert free.resolve() == context_file.resolve()
+
+        manager.remove_context_symlink(worktree_path, filenames=names)
+
+        assert (worktree_path / "AGENTS.md").read_text() == "# Repo rules"
+        assert str((worktree_path / "CLAUDE.md").readlink()) == "AGENTS.md"
+        assert not free.exists() and not free.is_symlink()
+
+    @pytest.mark.asyncio
+    async def test_symlink_context_replaces_its_own_stale_link(
+        self, tmp_path: Path,
+    ) -> None:
+        """A reused worktree still has the link from the round before."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Relay context")
+        old_context = tmp_path / "old-contexts" / "CLAUDE.md"
+        old_context.parent.mkdir(parents=True)
+        old_context.write_text("# Old")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        (worktree_path / "AGENTS.md").symlink_to(old_context.resolve())
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+
+        linked = manager.symlink_context(
+            worktree_path, context_file, filenames=("AGENTS.md",),
+        )
+
+        assert linked == ["AGENTS.md"]
+        assert (worktree_path / "AGENTS.md").resolve() == context_file.resolve()
+
+    @pytest.mark.asyncio
+    async def test_a_tracked_instruction_file_leaves_the_checkout_clean(
+        self, tmp_path: Path,
+    ) -> None:
+        """End to end against git: no type change, no deletion."""
+        import subprocess
+
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Relay context")
+        repo = tmp_path / "worktree"
+        repo.mkdir()
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", *args], cwd=repo, check=True,
+                capture_output=True, text=True,
+            ).stdout
+
+        git("init", "-q")
+        (repo / "AGENTS.md").write_text("# Repo rules")
+        git("add", "AGENTS.md")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+
+        manager.symlink_context(
+            repo, context_file, filenames=("CLAUDE.md", "AGENTS.md"),
+        )
+        assert " AGENTS.md" not in git("status", "--porcelain")
+
+        manager.remove_context_symlink(
+            repo, filenames=("CLAUDE.md", "AGENTS.md"),
+        )
+        assert git("status", "--porcelain") == ""
+
+    @pytest.mark.asyncio
+    async def test_symlink_context_refuses_a_nested_symlink_parent(
+        self, tmp_path: Path,
+    ) -> None:
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Context")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (worktree_path / ".github").symlink_to(outside)
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+
+        with pytest.raises(ValueError, match="symlink"):
+            manager.symlink_context(
+                worktree_path,
+                context_file,
+                filenames=(".github/copilot-instructions.md",),
+            )
+        assert not (outside / "copilot-instructions.md").exists()
+
+    @pytest.mark.asyncio
     async def test_branch_exists_locally_true(self, tmp_path: Path) -> None:
         """show-ref returning 0 means the branch is a local ref."""
         from ctrlrelay.core.worktree import WorktreeManager

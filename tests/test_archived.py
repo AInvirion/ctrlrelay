@@ -287,6 +287,7 @@ class TestResumeIsGatedToo:
 
         state_db = MagicMock()
         state_db.acquire_lock.return_value = False  # stop right after the gate
+        state_db.get_session_row.return_value = {}
 
         result = await resume_secops_from_pending(
             session_id="secops-o-r-1",

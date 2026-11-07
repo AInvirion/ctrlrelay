@@ -39,6 +39,9 @@ agent:
   binary: "claude"
   default_timeout_seconds: 1800
   output_format: "json"
+  # Enrolled types a future control-plane assignment may explicitly select.
+  # Empty keeps selection entirely local. Standalone repo defaults are unaffected.
+  assignable_types: []
 
   # Read only when a backend of type "opencode" is built, so this block
   # is inert on a claude-only deployment and harmless to leave in place.
@@ -66,6 +69,31 @@ agent:
   #   # Falls back to agent.default_timeout_seconds when unset. A local
   #   # model is usually slower per token than a hosted one.
   #   default_timeout_seconds: 3600
+
+  # Optional generic CLI manifests (#379). Each key becomes an agent_type you
+  # can use as agent.type, repos[].agent_type, or an allowlisted assignment.
+  # Arguments run directly (no shell). Supported placeholders: {prompt},
+  # {session_id}, {state_file}, {resume_session_id}, {model}, {provider}.
+  # Generic plugins have no live transcript, usage reading, or bwrap support.
+  # plugins:
+  #   example:
+  #     binary: "/opt/example/bin/agent"
+  #     args: ["run", "{prompt}"]
+  #     prompt_mode: "arg"  # or "stdin"
+  #     resume_args: ["resume", "{resume_session_id}", "{prompt}"]
+  #     session_id_path: "info.session.id"  # required with resume_args
+  #     model: "model-x"
+  #     provider: "provider-y"
+  #     plugin_version: "1"
+  #     instructions_files: ["AGENTS.md"]  # names the CLI reads for context
+  #     default_timeout_seconds: 1800
+  #   # GitHub Copilot CLI; see docs/configuration.md for why each flag is there.
+  #   copilot:
+  #     binary: "copilot"
+  #     args: ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps", "--output-format", "json"]
+  #     resume_args: ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps", "--output-format", "json", "--resume", "{resume_session_id}"]
+  #     session_id_path: "sessionId"
+  #     instructions_files: [".github/copilot-instructions.md", "AGENTS.md"]
 
 # EXACTLY ONE transport is active, and it is the one named by `type`.
 # The other blocks below are inert: they may stay in the file, but nothing

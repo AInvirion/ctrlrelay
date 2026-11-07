@@ -194,6 +194,7 @@ class TestRouter:
             issue_number=286,
             github_access=True,
             budget_scope=scope,
+            resume_requested=True,
         )
         kwargs = local.spawn_session.await_args.kwargs
         assert kwargs == {
@@ -207,6 +208,7 @@ class TestRouter:
             "issue_number": 286,
             "github_access": True,
             "budget_scope": scope,
+            "resume_requested": True,
         }
 
 

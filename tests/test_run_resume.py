@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import ctrlrelay.pipelines.dev as dev
+from ctrlrelay.core.agent_plugins import AgentIdentity
 from ctrlrelay.core.checkpoint import CheckpointState, CheckpointStatus
 from ctrlrelay.core.config import CodeReviewConfig
 from ctrlrelay.core.dispatcher import SessionResult
@@ -372,6 +373,34 @@ def test_an_interrupted_run_is_continued_once(tmp_path) -> None:
     assert db.mark_resumed("dev-a", "dev-b")
     assert not db.mark_resumed("dev-a", "dev-c")
     assert dev.find_resume_point(db, REPO, ISSUE) is None
+
+
+def test_resume_point_carries_the_source_agent_identity(tmp_path) -> None:
+    db = StateDB(tmp_path / "s.db")
+    _saved(db, "dev-a")
+    identity = AgentIdentity(
+        agent_type="example", plugin_id="generic:example", model="model-x",
+    )
+    db.pin_agent_identity("dev-a", identity)
+    point = dev.find_resume_point(db, REPO, ISSUE)
+    assert point is not None
+    assert point.agent == identity
+
+
+@pytest.mark.asyncio
+async def test_interrupted_legacy_native_run_cannot_adopt_current_default(
+    tmp_path,
+) -> None:
+    db = StateDB(tmp_path / "s.db")
+    _saved(db, "dev-a")
+    db.set_agent_session_id("dev-a", "legacy-native-id")
+    agent = _Agent()
+    result = await _run_dev(
+        tmp_path, agent, _github(), AsyncMock(), state_db=db,
+    )
+    assert result.success is False
+    assert result.error == "agent_identity_unknown"
+    assert agent.prompts == []
 
 
 def test_only_the_newest_run_of_the_issue_counts(tmp_path) -> None:

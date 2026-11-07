@@ -15,6 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from ctrlrelay.core.agent_plugins import (
+    AgentIdentity,
+    AgentIdentityConflictError,
+    AgentSelectionError,
+    agent_identity_from_mapping,
+)
 from ctrlrelay.core.budget import is_budget_reason, label_names, session_scope
 from ctrlrelay.core.checkpoint import CheckpointStatus
 from ctrlrelay.core.claims import (
@@ -34,7 +40,7 @@ from ctrlrelay.core.code_review import (
     run_code_review,
 )
 from ctrlrelay.core.config import check_dev_step_mode
-from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult
+from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult, select_agent
 from ctrlrelay.core.events import (
     EventKind,
     emit_event,
@@ -1248,13 +1254,16 @@ CTRLRELAY_DONE
                 transport=self.transport, repo=ctx.repo,
                 issue_number=ctx.issue_number,
             ),
+            resume_requested=resume,
         )
 
         if result.agent_session_id:
             try:
                 self.state_db.set_agent_session_id(
-                    ctx.session_id, result.agent_session_id
+                    ctx.session_id, result.agent_session_id, agent=result.agent,
                 )
+            except AgentIdentityConflictError:
+                raise
             except Exception:
                 # state_db write failures must not mask the session result.
                 pass
@@ -4167,6 +4176,8 @@ class ResumePoint:
     rewind: bool = False
     pr_number: int | None = None
     rows: tuple[dict[str, Any], ...] = ()
+    agent: AgentIdentity | None = None
+    source_has_native_id: bool = False
 
     @property
     def last_step(self) -> str | None:
@@ -4225,6 +4236,8 @@ def find_resume_point(
             head_sha=last["head_sha"],
             pr_number=pr if isinstance(pr, int) else None,
             rows=tuple(rows),
+            agent=agent_identity_from_mapping(row),
+            source_has_native_id=bool(row.get("agent_session_id")),
         )
 
     if from_step not in FROM_STEPS:
@@ -4267,6 +4280,8 @@ def find_resume_point(
         head_sha=anchor["head_sha"],
         rewind=True,
         rows=tuple(saved[s] for s in keep),
+        agent=agent_identity_from_mapping(row),
+        source_has_native_id=bool(row.get("agent_session_id")),
     )
 
 
@@ -4458,6 +4473,7 @@ async def run_dev_issue(
     question_on_issue: str | None = "auto",
     require_proof: bool | None = None,
     from_step: str | None = None,
+    agent_type: str | None = None,
 ) -> PipelineResult:
     """Run dev pipeline for a single issue.
 
@@ -4591,6 +4607,37 @@ async def run_dev_issue(
             )
         if resume_point is not None:
             resume_pr = resume_point.pr_number
+        if (
+            resume_point is not None
+            and resume_point.agent is None
+            and resume_point.source_has_native_id
+        ):
+            return PipelineResult(
+                success=False,
+                session_id=session_id,
+                summary="Cannot continue a run whose agent identity is unknown",
+                error="agent_identity_unknown",
+            )
+
+        try:
+            selection = select_agent(
+                dispatcher,
+                repo=repo,
+                requested_type=agent_type,
+                pinned=resume_point.agent if resume_point is not None else None,
+            )
+        except AgentSelectionError as e:
+            return PipelineResult(
+                success=False,
+                session_id=session_id,
+                summary="Agent selection refused",
+                error=str(e),
+            )
+        dispatcher = selection.dispatcher
+        instruction_files = getattr(
+            selection.dispatcher, "instructions_files", ("CLAUDE.md",),
+        )
+        agent_identity = selection.identity
 
         # Get issue details
         issue = await github.get_issue(repo, issue_number)
@@ -4675,7 +4722,9 @@ async def run_dev_issue(
         # Symlink context
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
         if context_path.exists():
-            worktree.symlink_context(worktree_path, context_path)
+            worktree.symlink_context(
+                worktree_path, context_path, filenames=instruction_files,
+            )
 
         # Setup state file
         state_file = worktree_path / ".ctrlrelay" / "state.json"
@@ -4702,12 +4751,17 @@ async def run_dev_issue(
         state_db.execute(
             """INSERT INTO sessions
                (id, pipeline, repo, worktree_path, status, started_at,
-                issue_number, owner_pid, owner_run, claim_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                issue_number, owner_pid, owner_run, claim_id,
+                agent_type, agent_plugin_id, agent_plugin_version,
+                agent_model, agent_provider, agent_fingerprint)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id, "dev", repo, str(worktree_path),
                 "running", int(time.time()), issue_number,
                 os.getpid(), PROCESS_RUN, claim_id,
+                agent_identity.agent_type, agent_identity.plugin_id,
+                agent_identity.plugin_version, agent_identity.model,
+                agent_identity.provider, agent_identity.fingerprint,
             ),
         )
         state_db.commit()
@@ -4957,7 +5011,9 @@ async def run_dev_issue(
         timeout_note: str | None = None
         if lock.held:
             if result.success:
-                worktree.remove_context_symlink(worktree_path)
+                worktree.remove_context_symlink(
+                    worktree_path, filenames=instruction_files,
+                )
                 await worktree.remove_worktree(repo, session_id)
             elif not result.blocked:
                 keep_worktree = False
@@ -4966,7 +5022,9 @@ async def run_dev_issue(
                     # would commit it (it is excluded only in the
                     # worktree's own exclude file, which the save's
                     # private git dir does not read).
-                    worktree.remove_context_symlink(worktree_path)
+                    worktree.remove_context_symlink(
+                        worktree_path, filenames=instruction_files,
+                    )
                     keep_worktree, timeout_note = await save_timed_out_work(
                         worktree, github, state_db,
                         repo=repo, issue_number=issue_number,
@@ -4974,7 +5032,9 @@ async def run_dev_issue(
                         branch_name=branch_name,
                     )
                 if not keep_worktree:
-                    worktree.remove_context_symlink(worktree_path)
+                    worktree.remove_context_symlink(
+                        worktree_path, filenames=instruction_files,
+                    )
                     await worktree.remove_worktree(repo, session_id)
                 # A branch the relay failed to publish holds the agent's
                 # finished commits and exists nowhere else (#219), so it
@@ -5089,7 +5149,9 @@ async def run_dev_issue(
         if lock.held:
             if worktree_path is not None:
                 try:
-                    worktree.remove_context_symlink(worktree_path)
+                    worktree.remove_context_symlink(
+                        worktree_path, filenames=instruction_files,
+                    )
                 except Exception:
                     pass
             # Always attempt remove_worktree + prune — handles the case where
@@ -5255,6 +5317,36 @@ async def resume_dev_from_pending(
             error="session_issue_number_missing",
         )
 
+    pinned_identity = agent_identity_from_mapping(session_row)
+    if pinned_identity is None and session_row.get("agent_session_id"):
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=(
+                f"Cannot resume dev session {session_id}: its pre-#379 "
+                "agent identity is unknown"
+            ),
+            error="agent_identity_unknown",
+        )
+    try:
+        selection = select_agent(
+            dispatcher,
+            repo=repo,
+            pinned=pinned_identity,
+        )
+        state_db.pin_agent_identity(session_id, selection.identity)
+    except AgentSelectionError as e:
+        return PipelineResult(
+            success=False,
+            session_id=session_id,
+            summary=f"Cannot resume dev session {session_id}: agent selection refused",
+            error=str(e),
+        )
+    dispatcher = selection.dispatcher
+    instruction_files = getattr(
+        selection.dispatcher, "instructions_files", ("CLAUDE.md",),
+    )
+
     branch_name = branch_template.replace("{n}", str(issue_number))
     plan_mode, verify_mode, review_mode = _resolve_step_modes(
         steps, code_review
@@ -5303,7 +5395,9 @@ async def resume_dev_from_pending(
 
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
         if context_path.exists():
-            worktree.symlink_context(worktree_path, context_path)
+            worktree.symlink_context(
+                worktree_path, context_path, filenames=instruction_files,
+            )
 
         state_file = worktree_path / ".ctrlrelay" / "state.json"
         state_file.parent.mkdir(parents=True, exist_ok=True)

@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A plugin identity and capability contract for coding-agent CLIs (#379).
+  Claude and OpenCode now expose the same identity metadata, and local
+  `agent.plugins` manifests can enroll simple non-interactive CLIs with fixed
+  argv, prompt-over-argument or stdin, checkpoint handling, and optional
+  native-session mapping. `agent.assignable_types` defines the smaller set a
+  future control-plane assignment may select; assignments cannot supply a
+  binary or arbitrary arguments. The selected plugin, model, and canonical
+  invocation fingerprint are persisted before dispatch and pinned across CI
+  fixes, retries, and pending resumes. Generic executables must resolve to an
+  absolute path, native session IDs are validated before argv substitution,
+  and a pre-#379 native session with unknown identity is refused rather than
+  resumed through the current default backend.
+- Repo context is linked under each backend's own instruction filename, so
+  Codex and Copilot see `AGENTS.md` or `.github/copilot-instructions.md`
+  instead of only Claude's `CLAUDE.md` (#379). A name the repository already
+  has is left alone: the repo's own file wins under that name, and the relay
+  context goes only under names that are free.
+- Built-in identity pins use the stable launcher path, so Claude's normal
+  self-update does not invalidate a pending resume. Generic manifests still
+  pin their full invocation mapping (#379).
+- A checked GitHub Copilot CLI manifest in `docs/configuration.md` and the
+  example config, with resume through its `sessionId`. It passes
+  `--disable-builtin-mcps`, because Copilot's built-in GitHub MCP server
+  otherwise gives the agent GitHub access under Copilot's own login,
+  bypassing credential stripping (#379).
+
+### Fixed
+
+- The relay no longer replaces a repository's own `CLAUDE.md` with its repo
+  context link. The tracked file became a type change while the agent ran
+  and a deletion after cleanup, so an agent that staged everything could put
+  either into its pull request. Cleanup now removes only links the relay
+  made (#379).
+- A plugin listed under `agent.plugins` but not routed to by any repo or by
+  `agent.assignable_types` is built only when a pinned run selects it, so
+  one that cannot run under `agent.sandbox: bwrap` no longer stops the
+  daemon at startup. A routed one still does, naming where it was routed
+  from. A backend that fails to build on demand is refused for that run
+  instead of raising out of the pipeline (#379).
+
+### Upgrade notes
+
+- A run waiting on a question from before this release has no recorded
+  agent identity. If its agent session had already started, it is refused
+  with `agent_identity_unknown` instead of being resumed on whatever backend
+  is configured now. Answer or close those questions before upgrading, or
+  re-run the issue afterwards (#379).
+- A repo that commits its own `CLAUDE.md` now runs with that file instead of
+  the relay's context under that name. Move anything the agent must see into
+  the repo's file, or into the contexts entry for a name the repo does not
+  use (#379).
+
 ## [0.27.0] - 2026-11-06
 
 ### Added
