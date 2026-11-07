@@ -85,6 +85,7 @@ agent:
   #     model: "model-x"
   #     provider: "provider-y"
   #     plugin_version: "1"
+  #     instructions_files: ["AGENTS.md"]  # names the CLI reads for context
   #     default_timeout_seconds: 1800
 
 # EXACTLY ONE transport is active, and it is the one named by `type`.

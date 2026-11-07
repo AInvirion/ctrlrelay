@@ -1358,6 +1358,63 @@ class TestWorktreeManager:
         assert link.resolve() == context_file.resolve()
 
     @pytest.mark.asyncio
+    async def test_symlink_context_links_every_agent_instruction_name(
+        self, tmp_path: Path,
+    ) -> None:
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Context")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+
+        names = ("CLAUDE.md", "AGENTS.md", ".github/copilot-instructions.md")
+        manager.symlink_context(
+            worktree_path, context_file, filenames=names,
+        )
+
+        for name in names:
+            link = worktree_path / name
+            assert link.is_symlink(), name
+            assert link.resolve() == context_file.resolve()
+
+        manager.remove_context_symlink(worktree_path, filenames=names)
+        for name in names:
+            assert not (worktree_path / name).is_symlink(), name
+
+    @pytest.mark.asyncio
+    async def test_symlink_context_refuses_a_nested_symlink_parent(
+        self, tmp_path: Path,
+    ) -> None:
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Context")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (worktree_path / ".github").symlink_to(outside)
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+
+        with pytest.raises(ValueError, match="symlink"):
+            manager.symlink_context(
+                worktree_path,
+                context_file,
+                filenames=(".github/copilot-instructions.md",),
+            )
+        assert not (outside / "copilot-instructions.md").exists()
+
+    @pytest.mark.asyncio
     async def test_branch_exists_locally_true(self, tmp_path: Path) -> None:
         """show-ref returning 0 means the branch is a local ref."""
         from ctrlrelay.core.worktree import WorktreeManager

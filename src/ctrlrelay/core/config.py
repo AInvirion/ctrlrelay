@@ -132,12 +132,31 @@ class GenericCliConfig(BaseModel):
     model: str | None = None
     provider: str | None = None
     plugin_version: str = "1"
+    instructions_files: list[str] = Field(default_factory=lambda: ["AGENTS.md"])
 
     @field_validator("binary", "plugin_version")
     @classmethod
     def _not_blank(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("must not be empty")
+        return v
+
+    @field_validator("instructions_files")
+    @classmethod
+    def _safe_instruction_files(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("must contain at least one file")
+        for name in v:
+            path = Path(name)
+            if (
+                not name.strip()
+                or path.is_absolute()
+                or not path.parts
+                or any(part in ("", ".", "..") for part in path.parts)
+            ):
+                raise ValueError(
+                    f"{name!r} must be a safe relative path"
+                )
         return v
 
     @model_validator(mode="after")

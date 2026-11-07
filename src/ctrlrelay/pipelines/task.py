@@ -496,6 +496,9 @@ async def run_task_issue(
                 error=str(e),
             )
         dispatcher = selection.dispatcher
+        instruction_files = getattr(
+            selection.dispatcher, "instructions_files", ("CLAUDE.md",),
+        )
         agent_identity = selection.identity
 
         issue = await github.get_issue(repo, issue_number)
@@ -521,7 +524,9 @@ async def run_task_issue(
 
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
         if context_path.exists():
-            worktree.symlink_context(worktree_path, context_path)
+            worktree.symlink_context(
+                worktree_path, context_path, filenames=instruction_files,
+            )
 
         state_file = worktree_path / ".ctrlrelay" / "state.json"
         state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -730,7 +735,9 @@ async def run_task_issue(
         # lock release below.
         if worktree_path is not None:
             try:
-                worktree.remove_context_symlink(worktree_path)
+                worktree.remove_context_symlink(
+                    worktree_path, filenames=instruction_files,
+                )
             except Exception as cleanup_exc:
                 log_event(
                     _logger,
@@ -884,6 +891,9 @@ async def resume_task_from_pending(
             error=str(e),
         )
     dispatcher = selection.dispatcher
+    instruction_files = getattr(
+        selection.dispatcher, "instructions_files", ("CLAUDE.md",),
+    )
 
     if not state_db.acquire_lock(repo, session_id):
         return PipelineResult(
@@ -901,7 +911,9 @@ async def resume_task_from_pending(
 
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
         if context_path.exists():
-            worktree.symlink_context(worktree_path, context_path)
+            worktree.symlink_context(
+                worktree_path, context_path, filenames=instruction_files,
+            )
 
         state_file = worktree_path / ".ctrlrelay" / "state.json"
         state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1045,7 +1057,9 @@ async def resume_task_from_pending(
         # task/dev/secops on this repo if release_lock was skipped.
         if worktree_path is not None:
             try:
-                worktree.remove_context_symlink(worktree_path)
+                worktree.remove_context_symlink(
+                    worktree_path, filenames=instruction_files,
+                )
             except Exception:
                 pass
             try:

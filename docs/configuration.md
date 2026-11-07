@@ -66,7 +66,7 @@ paths:
 | `state_db` | path | **yes** | SQLite database for sessions, locks, outstanding questions (`pending_resumes`), PR watches, automation decisions and the status-page event feed. |
 | `worktrees` | path | **yes** | Where ctrlrelay creates per-session `git worktree` directories. |
 | `bare_repos` | path | **yes** | Where ctrlrelay clones bare mirrors of each configured repo. |
-| `contexts` | path | **yes** | Per-repo context directory (looked up as `<contexts>/<owner-repo>/CLAUDE.md`). If a `CLAUDE.md` exists, it is symlinked into the worktree at session start. |
+| `contexts` | path | **yes** | Per-repo context directory (looked up as `<contexts>/<owner-repo>/CLAUDE.md`). If it exists, it is linked into the worktree under every instruction filename the selected agent reads (`CLAUDE.md`, `AGENTS.md`, or the manifest's `instructions_files`). |
 | `skills` | path | **yes** | Claude Code skills directory used by `ctrlrelay skills audit` and `ctrlrelay skills list`. |
 | `repo_root` | path | no | Convention root for repo clones. When set, `repos[].local_path` may be omitted and is derived as `${repo_root}/${owner.lower()}/${repo}` (since v0.4.0). Without `repo_root`, every repo entry must declare its own `local_path` (legacy behaviour). |
 | `owner_aliases` | object | no | **Deprecated since v0.4.0.** Pre-0.4.0 this remapped the on-disk folder name (e.g. `SemClone` -> `SEMCL.ONE`). The path resolver now always uses `owner.lower()`, so aliases are no longer consulted. Parsing is retained so 0.3.x configs still load; a `DeprecationWarning` is emitted when a non-empty mapping is supplied. To silence: drop the `owner_aliases` block, rename your on-disk folder to match `owner.lower()`, or set a per-repo `local_path` override for any that genuinely deviate. |
@@ -138,6 +138,7 @@ agent:
       model: "model-x"            # optional; used by {model}
       provider: "provider-y"      # optional; used by {provider}
       plugin_version: "1"         # manifest/adapter compatibility version
+      instructions_files: ["AGENTS.md"]  # names this CLI reads for context
       default_timeout_seconds: 1800
 
 repos:
@@ -167,15 +168,20 @@ resume invocation, so repeat any flags the CLI needs in both. Native ids are
 restricted to a bounded alphanumeric/`._:-` form; whitespace, paths and
 option-like values are refused before argv construction. A logical resume with
 no captured native id fails closed rather than invoking fresh `args`.
+`instructions_files` names where the CLI reads repository instructions; the
+relay links the repo context under each one (for example `AGENTS.md`, or
+`.github/copilot-instructions.md` for Copilot). Each name must stay inside the
+worktree.
 
 Each manifest gets a SHA-256 fingerprint over its resolved binary, argv,
 prompt/session mapping, model/provider and environment. Built-in adapters
-fingerprint the resolved executable target and its current bytes, so a
-symlink retarget, an updated file, or a changed PATH lookup changes the pin.
-That fingerprint is pinned with the run, so editing a manifest or switching a
-built-in binary cannot silently hand an old native session to a different
-executable. Generic manifests remain resumable when they are removed from
-`assignable_types`; assignment permission and resume compatibility are
+fingerprint the stable launcher path, not the versioned target or its bytes, so
+Claude's normal self-update does not invalidate a pinned resume. Changing the
+configured launcher, or resolving a bare name somewhere else, does change the
+pin. That fingerprint is pinned with the run, so editing a manifest or switching
+a built-in binary path cannot silently hand an old native session to a
+different executable. Generic manifests remain resumable when they are removed
+from `assignable_types`; assignment permission and resume compatibility are
 separate decisions.
 
 The shared runtime still supplies checkpoint reading, credential stripping,

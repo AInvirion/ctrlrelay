@@ -52,6 +52,7 @@ class GenericCliDispatcher(CliAgentAdapter):
     provider: str | None = None
     plugin_version: str = "1"
     extra_env: dict[str, str] = field(default_factory=dict)
+    instructions_files: tuple[str, ...] = ("AGENTS.md",)
     outcome_hook: DispatchOutcomeHook | None = None
     sandbox: str = "none"
     usage_store: UsageStore | None = field(kw_only=True)
@@ -61,6 +62,21 @@ class GenericCliDispatcher(CliAgentAdapter):
     def __post_init__(self) -> None:
         if not self.binary or not self.binary.strip():
             raise ValueError("generic CLI binary must not be empty")
+        self.instructions_files = tuple(self.instructions_files)
+        if not self.instructions_files:
+            raise ValueError("generic CLI instructions_files must not be empty")
+        for name in self.instructions_files:
+            path = Path(name)
+            if (
+                not name.strip()
+                or path.is_absolute()
+                or not path.parts
+                or any(part in ("", ".", "..") for part in path.parts)
+            ):
+                raise ValueError(
+                    f"generic CLI instructions file {name!r} must be a safe "
+                    "relative path"
+                )
         if self.prompt_mode not in ("arg", "stdin"):
             raise ValueError(
                 f"generic CLI prompt_mode must be 'arg' or 'stdin', "

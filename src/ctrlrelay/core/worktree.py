@@ -11,7 +11,7 @@ import shutil
 import stat
 import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -387,6 +387,19 @@ def _read_branch_head(bare_path: Path, branch: str) -> str:
 class _UnsafeExcludeError(Exception):
     """``info/exclude`` is there but is not a plain file reached without
     a link."""
+
+
+def _safe_context_target(worktree_path: Path, name: str) -> Path:
+    """Resolve an adapter's instruction filename inside the worktree."""
+    path = Path(name)
+    if (
+        not name.strip()
+        or path.is_absolute()
+        or not path.parts
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise ValueError(f"unsafe context filename {name!r}")
+    return worktree_path.joinpath(*path.parts)
 
 
 def _add_exclude_line(admin_fd: int, where: Path, line: str) -> None:
@@ -2356,17 +2369,32 @@ class WorktreeManager:
         self,
         worktree_path: Path,
         context_path: Path,
+        filenames: Sequence[str] = ("CLAUDE.md",),
     ) -> None:
-        """Symlink CLAUDE.md into worktree."""
-        target = worktree_path / "CLAUDE.md"
+        """Link the relay's repo context under every instruction filename.
 
-        if target.exists() or target.is_symlink():
-            target.unlink()
+        Agents disagree on the name: Claude reads ``CLAUDE.md``, Codex reads
+        ``AGENTS.md``, and Copilot can read ``.github/copilot-instructions.md``.
+        The selected adapter supplies the names it actually reads.
+        """
+        for name in filenames:
+            target = _safe_context_target(worktree_path, name)
+            cursor = worktree_path
+            for part in target.parent.relative_to(worktree_path).parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    raise ValueError(
+                        f"context directory {cursor} is a symlink"
+                    )
+                cursor.mkdir(exist_ok=True)
 
-        target.symlink_to(context_path.resolve())
+            if target.exists() or target.is_symlink():
+                target.unlink()
+
+            target.symlink_to(context_path.resolve())
 
         try:
-            self._add_context_exclude(worktree_path)
+            self._add_context_exclude(worktree_path, filenames)
         except (_UnsafeExcludeError, OSError, ValueError) as e:
             # Refused, not followed, and never raised out of a resume: the
             # line only keeps the link out of `git status`, so the run
@@ -2378,9 +2406,11 @@ class WorktreeManager:
                 reason=f"{type(e).__name__}: {e}"[:300],
             )
 
-    def _add_context_exclude(self, worktree_path: Path) -> None:
-        """Add ``CLAUDE.md`` to the worktree's ``info/exclude``, found from
-        the relay's own data only (#263).
+    def _add_context_exclude(
+        self, worktree_path: Path, filenames: Sequence[str] = ("CLAUDE.md",),
+    ) -> None:
+        """Add the context links to the worktree's ``info/exclude``, found
+        from the relay's own data only (#263).
 
         The worktree's ``.git`` file is never read: the agent can rewrite
         it when there is no sandbox. Git names a worktree's directory
@@ -2455,14 +2485,20 @@ class WorktreeManager:
                     f"point back at {worktree_path}"
                 )
             admin_fd, admin = matches[0]
-            _add_exclude_line(admin_fd, admin, "CLAUDE.md")
+            for name in filenames:
+                _add_exclude_line(admin_fd, admin, Path(name).as_posix())
         finally:
             os.close(root_fd)
             for fd, _ in matches:
                 os.close(fd)
 
-    def remove_context_symlink(self, worktree_path: Path) -> None:
-        """Remove CLAUDE.md symlink before git operations."""
-        target = worktree_path / "CLAUDE.md"
-        if target.is_symlink():
-            target.unlink()
+    def remove_context_symlink(
+        self,
+        worktree_path: Path,
+        filenames: Sequence[str] = ("CLAUDE.md",),
+    ) -> None:
+        """Remove the context links before git operations."""
+        for name in filenames:
+            target = _safe_context_target(worktree_path, name)
+            if target.is_symlink():
+                target.unlink()

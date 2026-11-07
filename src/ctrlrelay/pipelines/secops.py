@@ -757,6 +757,9 @@ async def run_secops_all(
                 ))
                 continue
             repo_dispatcher = selection.dispatcher
+            instruction_files = getattr(
+                selection.dispatcher, "instructions_files", ("CLAUDE.md",),
+            )
             agent_identity = selection.identity
 
             # Archived repos accept no security work: the Dependabot alerts
@@ -836,7 +839,10 @@ async def run_secops_all(
 
                 context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
                 if context_path.exists():
-                    worktree.symlink_context(worktree_path, context_path)
+                    worktree.symlink_context(
+                        worktree_path, context_path,
+                        filenames=instruction_files,
+                    )
 
                 state_file = worktree_path / ".ctrlrelay" / "state.json"
                 state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1208,7 +1214,9 @@ async def run_secops_all(
                 # the inner cleanup kept running untracked — leaking state.
                 if worktree_path is not None:
                     try:
-                        worktree.remove_context_symlink(worktree_path)
+                        worktree.remove_context_symlink(
+                            worktree_path, filenames=instruction_files,
+                        )
                     except Exception as cleanup_exc:
                         log_event(
                             _logger,
@@ -1382,6 +1390,9 @@ async def resume_secops_from_pending(
             error=str(e),
         )
     dispatcher = selection.dispatcher
+    instruction_files = getattr(
+        selection.dispatcher, "instructions_files", ("CLAUDE.md",),
+    )
 
     if question:
         _record_decisions_from_answer(
@@ -1415,7 +1426,9 @@ async def resume_secops_from_pending(
 
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
         if context_path.exists():
-            worktree.symlink_context(worktree_path, context_path)
+            worktree.symlink_context(
+                worktree_path, context_path, filenames=instruction_files,
+            )
 
         state_file = worktree_path / ".ctrlrelay" / "state.json"
         state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1513,7 +1526,9 @@ async def resume_secops_from_pending(
         # lock, bounded timeouts, log-don't-crash.
         if worktree_path is not None:
             try:
-                worktree.remove_context_symlink(worktree_path)
+                worktree.remove_context_symlink(
+                    worktree_path, filenames=instruction_files,
+                )
             except Exception as cleanup_exc:
                 log_event(
                     _logger,

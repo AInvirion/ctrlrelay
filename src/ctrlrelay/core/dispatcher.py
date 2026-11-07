@@ -114,7 +114,7 @@ def _normalise_builtin_binary(binary: str, *, label: str) -> str:
             "a relative path would resolve against the run's worktree"
         )
     found = shutil.which(binary)
-    return str(Path(found).resolve()) if found else binary
+    return str(Path(found).absolute()) if found else binary
 
 
 @dataclass(frozen=True)
@@ -247,10 +247,13 @@ class CliAgentAdapter:
     plugin_id: ClassVar[str] = "builtin"
     plugin_version: ClassVar[str] = "1"
     capabilities: ClassVar[AgentCapabilities] = AgentCapabilities()
+    # Context filenames this CLI reads for repository instructions. The
+    # pipeline links the same context file under each name.
+    instructions_files: ClassVar[tuple[str, ...]] = ("CLAUDE.md",)
 
     @property
     def manifest_fingerprint(self) -> str:
-        """Built-in invocation identity: adapter contract plus executable bytes."""
+        """Built-in invocation identity: adapter contract plus launcher."""
         payload = {
             "plugin_id": self.plugin_id,
             "plugin_version": self.plugin_version,
@@ -261,38 +264,17 @@ class CliAgentAdapter:
         return hashlib.sha256(encoded).hexdigest()
 
     def _executable_fingerprint(self) -> dict[str, Any]:
-        """Identify the file that would actually be exec'd.
+        """Identify the stable launcher the operator configured.
 
-        The configured path alone is not enough: a symlink can retarget or
-        the file at that path can be replaced while the pin keeps the old
-        string. Hash the resolved target and its current bytes, cached by
-        stable file identity so a normal run does not reread a large binary.
+        The launcher path, not the resolved versioned target or its bytes,
+        is the compatibility boundary. Claude's installer updates by
+        retargeting its launcher to a new version directory, and pinning
+        either the target or the contents would turn every self-update
+        into a false identity conflict on the next resume. Changing the
+        launcher itself — or a bare name resolving somewhere else at
+        startup — still changes the pin.
         """
-        path = Path(self.agent_binary)
-        try:
-            target = path.resolve(strict=True)
-            stat = target.stat()
-            key = (
-                str(target),
-                stat.st_dev,
-                stat.st_ino,
-                stat.st_size,
-                stat.st_mtime_ns,
-                stat.st_ctime_ns,
-            )
-        except OSError:
-            return {"path": str(path), "missing": True}
-
-        cached = getattr(self, "_binary_fingerprint_cache", None)
-        if cached is not None and cached[0] == key:
-            return {"path": str(target), "sha256": cached[1]}
-
-        try:
-            digest = hashlib.sha256(target.read_bytes()).hexdigest()
-        except OSError:
-            return {"path": str(target), "missing": True}
-        self._binary_fingerprint_cache = (key, digest)
-        return {"path": str(target), "sha256": digest}
+        return {"launcher": self.agent_binary}
 
     @property
     def agent_identity(self) -> AgentIdentity:
@@ -1317,6 +1299,7 @@ class OpenCodeDispatcher(CliAgentAdapter):
     capabilities: ClassVar[AgentCapabilities] = AgentCapabilities(
         resume=True, structured_events=False, usage=False, sandbox=False,
     )
+    instructions_files: ClassVar[tuple[str, ...]] = ("CLAUDE.md", "AGENTS.md")
 
     # Its own binary, NOT ``agent.binary``. Most deployed configs set
     # ``agent.binary: "claude"`` explicitly, so reading that field here
@@ -1904,6 +1887,7 @@ def _make_adapter(
             model=manifest.model,
             provider=manifest.provider,
             plugin_version=manifest.plugin_version,
+            instructions_files=tuple(manifest.instructions_files),
             outcome_hook=outcome_hook,
             sandbox=agent_config.sandbox,
             usage_store=usage_store,

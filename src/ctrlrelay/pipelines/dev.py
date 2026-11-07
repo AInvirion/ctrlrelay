@@ -4634,6 +4634,9 @@ async def run_dev_issue(
                 error=str(e),
             )
         dispatcher = selection.dispatcher
+        instruction_files = getattr(
+            selection.dispatcher, "instructions_files", ("CLAUDE.md",),
+        )
         agent_identity = selection.identity
 
         # Get issue details
@@ -4719,7 +4722,9 @@ async def run_dev_issue(
         # Symlink context
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
         if context_path.exists():
-            worktree.symlink_context(worktree_path, context_path)
+            worktree.symlink_context(
+                worktree_path, context_path, filenames=instruction_files,
+            )
 
         # Setup state file
         state_file = worktree_path / ".ctrlrelay" / "state.json"
@@ -5006,7 +5011,9 @@ async def run_dev_issue(
         timeout_note: str | None = None
         if lock.held:
             if result.success:
-                worktree.remove_context_symlink(worktree_path)
+                worktree.remove_context_symlink(
+                    worktree_path, filenames=instruction_files,
+                )
                 await worktree.remove_worktree(repo, session_id)
             elif not result.blocked:
                 keep_worktree = False
@@ -5015,7 +5022,9 @@ async def run_dev_issue(
                     # would commit it (it is excluded only in the
                     # worktree's own exclude file, which the save's
                     # private git dir does not read).
-                    worktree.remove_context_symlink(worktree_path)
+                    worktree.remove_context_symlink(
+                        worktree_path, filenames=instruction_files,
+                    )
                     keep_worktree, timeout_note = await save_timed_out_work(
                         worktree, github, state_db,
                         repo=repo, issue_number=issue_number,
@@ -5023,7 +5032,9 @@ async def run_dev_issue(
                         branch_name=branch_name,
                     )
                 if not keep_worktree:
-                    worktree.remove_context_symlink(worktree_path)
+                    worktree.remove_context_symlink(
+                        worktree_path, filenames=instruction_files,
+                    )
                     await worktree.remove_worktree(repo, session_id)
                 # A branch the relay failed to publish holds the agent's
                 # finished commits and exists nowhere else (#219), so it
@@ -5138,7 +5149,9 @@ async def run_dev_issue(
         if lock.held:
             if worktree_path is not None:
                 try:
-                    worktree.remove_context_symlink(worktree_path)
+                    worktree.remove_context_symlink(
+                        worktree_path, filenames=instruction_files,
+                    )
                 except Exception:
                     pass
             # Always attempt remove_worktree + prune — handles the case where
@@ -5330,6 +5343,9 @@ async def resume_dev_from_pending(
             error=str(e),
         )
     dispatcher = selection.dispatcher
+    instruction_files = getattr(
+        selection.dispatcher, "instructions_files", ("CLAUDE.md",),
+    )
 
     branch_name = branch_template.replace("{n}", str(issue_number))
     plan_mode, verify_mode, review_mode = _resolve_step_modes(
@@ -5379,7 +5395,9 @@ async def resume_dev_from_pending(
 
         context_path = contexts_dir / repo.replace("/", "-") / "CLAUDE.md"
         if context_path.exists():
-            worktree.symlink_context(worktree_path, context_path)
+            worktree.symlink_context(
+                worktree_path, context_path, filenames=instruction_files,
+            )
 
         state_file = worktree_path / ".ctrlrelay" / "state.json"
         state_file.parent.mkdir(parents=True, exist_ok=True)

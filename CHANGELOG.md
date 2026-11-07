@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absolute path, native session IDs are validated before argv substitution,
   and a pre-#379 native session with unknown identity is refused rather than
   resumed through the current default backend.
+- Repo context is linked under each backend's own instruction filename, so
+  Codex and Copilot see `AGENTS.md` or `.github/copilot-instructions.md`
+  instead of only Claude's `CLAUDE.md` (#379).
+- Built-in identity pins use the stable launcher path, so Claude's normal
+  self-update does not invalidate a pending resume. Generic manifests still
+  pin their full invocation mapping (#379).
 
 ## [0.27.0] - 2026-11-06
 

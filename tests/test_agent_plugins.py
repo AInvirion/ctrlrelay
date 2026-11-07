@@ -127,7 +127,7 @@ class TestAssignmentSelection:
         assert claude_a.agent_identity.fingerprint != claude_b.agent_identity.fingerprint
         assert opencode_a.agent_identity.fingerprint != opencode_b.agent_identity.fingerprint
 
-    def test_replacing_the_builtin_binary_changes_the_pin(self, tmp_path) -> None:
+    def test_a_builtin_self_update_keeps_the_same_pin(self, tmp_path) -> None:
         binary = tmp_path / "claude"
         binary.write_bytes(b"first build")
         first = ClaudeDispatcher(claude_binary=str(binary), usage_store=None)
@@ -136,11 +136,36 @@ class TestAssignmentSelection:
         binary.write_bytes(b"second build, different bytes")
         second = ClaudeDispatcher(claude_binary=str(binary), usage_store=None)
 
-        assert second.agent_identity.fingerprint != fingerprint
+        assert second.agent_identity.fingerprint == fingerprint
 
     def test_relative_builtin_binary_is_refused(self) -> None:
         with pytest.raises(ValueError, match="absolute or a bare name"):
             ClaudeDispatcher(claude_binary="./claude", usage_store=None)
+
+    def test_a_versioned_launcher_self_update_keeps_the_same_pin(
+        self, tmp_path,
+    ) -> None:
+        launcher = tmp_path / "bin" / "claude"
+        launcher.parent.mkdir()
+        first = tmp_path / "versions" / "1" / "claude"
+        second = tmp_path / "versions" / "2" / "claude"
+        first.parent.mkdir(parents=True)
+        second.parent.mkdir(parents=True)
+        first.write_bytes(b"v1")
+        second.write_bytes(b"v2")
+        launcher.symlink_to(first)
+
+        pinned = ClaudeDispatcher(
+            claude_binary=str(launcher), usage_store=None,
+        ).agent_identity.fingerprint
+
+        launcher.unlink()
+        launcher.symlink_to(second)
+        self_updated = ClaudeDispatcher(
+            claude_binary=str(launcher), usage_store=None,
+        ).agent_identity.fingerprint
+
+        assert self_updated == pinned
 
 
 class TestGenericManifestRegistration:
@@ -169,6 +194,40 @@ class TestGenericManifestRegistration:
         assert identity.fingerprint
         assert adapter.capabilities.resume is True
         assert adapter.capabilities.usage is False
+        assert adapter.instructions_files == ("AGENTS.md",)
+
+    def test_factory_passes_the_manifest_instruction_filenames(self) -> None:
+        cfg = AgentConfig(
+            type="copilot",
+            plugins={
+                "copilot": {
+                    "binary": "/opt/copilot",
+                    "instructions_files": [
+                        ".github/copilot-instructions.md",
+                        "AGENTS.md",
+                    ],
+                },
+            },
+        )
+        adapter = make_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
+        assert adapter.instructions_files == (
+            ".github/copilot-instructions.md",
+            "AGENTS.md",
+        )
+
+    @pytest.mark.parametrize("name", ["/abs/AGENTS.md", "../AGENTS.md", "."])
+    def test_manifest_instruction_filenames_must_stay_in_the_worktree(
+        self, name,
+    ) -> None:
+        with pytest.raises(ValueError, match="safe relative path"):
+            AgentConfig(
+                plugins={
+                    "example": {
+                        "binary": "/opt/example",
+                        "instructions_files": [name],
+                    },
+                },
+            )
 
     @pytest.mark.parametrize("name", ["claude", "opencode", "Bad Name", "9lives"])
     def test_plugin_names_cannot_replace_builtins_or_be_ambiguous(self, name) -> None:
