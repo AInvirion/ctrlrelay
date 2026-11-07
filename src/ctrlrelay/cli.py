@@ -2979,6 +2979,7 @@ def poller_start(
             repos=repo_names,
             state_file=state_file,
             accept_foreign_assignments=accept_foreign,
+            allowed_accounts_by_repo=config.allowed_accounts_by_repo(),
             exclude_labels_by_repo=exclude_labels_by_repo,
             include_labels_by_repo=include_labels_by_repo,
             require_labels_by_repo=require_labels_by_repo,

@@ -333,6 +333,10 @@ class IssuePoller:
     # it back.
     blocked: dict[str, dict[int, dict[str, Any]]] = field(default_factory=dict)
     accept_foreign_assignments: set[str] = field(default_factory=set)
+    # Per repo, lower-cased accounts besides ``username`` whose assignment
+    # or trigger label counts (#374). A repo not listed allows only
+    # ``username``.
+    allowed_accounts_by_repo: dict[str, set[str]] = field(default_factory=dict)
     exclude_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
     include_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
     require_labels_by_repo: dict[str, list[str]] = field(default_factory=dict)
@@ -885,9 +889,10 @@ class IssuePoller:
     ) -> bool:
         """Whether the operator added any of ``labels`` (the trigger labels
         the issue carries) to it: for each, the latest ``labeled`` event,
-        whose ``actor`` is the account that added it. No repo setting
-        widens this: ``accept_foreign_assignments`` is about assignments
-        only. A failed lookup is not a yes; it is logged and the issue is
+        whose ``actor`` is the account that added it. The accounts in
+        ``allowed_accounts_by_repo`` count too (#374);
+        ``accept_foreign_assignments`` does not widen this, it is about
+        assignments only. A failed lookup is not a yes; it is logged and the issue is
         looked at again next poll."""
         label = ", ".join(labels)
         try:
@@ -910,9 +915,7 @@ class IssuePoller:
             added_by[wanted] = (
                 (matching[-1].get("actor") or {}).get("login") if matching else None
             )
-        # GitHub logins are not case-sensitive.
-        me = self.username.lower()
-        if any(isinstance(v, str) and v.lower() == me for v in added_by.values()):
+        if any(self._allowed(repo, v) for v in added_by.values()):
             return True
         log_event(
             _logger, "poll.issue.foreign_label", repo=repo,
@@ -963,9 +966,22 @@ class IssuePoller:
         assert last is not None
         raise last
 
+    def _allowed(self, repo: str, login: object) -> bool:
+        """Whether ``login`` may hand ``repo``'s issues to the relay: the
+        relay's own account, or one in ``allowed_accounts_by_repo`` (#374).
+        GitHub logins are not case-sensitive. A missing login is never
+        allowed."""
+        if not isinstance(login, str) or not login:
+            return False
+        name = login.lower()
+        return name == self.username.lower() or name in (
+            self.allowed_accounts_by_repo.get(repo) or ()
+        )
+
     async def _is_self_assigned(self, repo: str, issue_number: int) -> bool:
         """Check if the most recent ``assigned`` event naming ``self.username``
-        was performed by ``self.username`` themselves.
+        was performed by ``self.username`` themselves, or by an account in
+        ``allowed_accounts_by_repo`` for the repo (#374).
 
         Repos in ``accept_foreign_assignments`` short-circuit to ``True``.
         Foreign assignments (or an empty event list) emit a
@@ -1019,7 +1035,7 @@ class IssuePoller:
         # ``assigner`` is treated as foreign.
         latest = relevant[-1]
         assigner_login = (latest.get("assigner") or {}).get("login")
-        if isinstance(assigner_login, str) and assigner_login.lower() == self.username.lower():
+        if self._allowed(repo, assigner_login):
             return True
 
         log_event(

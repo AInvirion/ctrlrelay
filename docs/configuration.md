@@ -593,17 +593,19 @@ questions agents asked. **Never expose it to the internet.**
 
 ## intake
 
-The order each poll's new issues run in (#356). A poll gathers one batch of
-new issues and works through it before the next poll; this sets the order of
-that batch.
+Who can hand the relay work (#374), and the order each poll's new issues run
+in (#356). A poll gathers one batch of new issues and works through it before
+the next poll; `priority_labels` sets the order of that batch.
 
 ```yaml
 intake:
+  allowed_accounts: ["teammate-1", "teammate-2"]
   priority_labels: ["P0", "P1", "P2", "P3"]
 ```
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `allowed_accounts` | list of GitHub logins | `[]` | Accounts, besides the relay's own (the account its `gh` token belongs to), that can hand it work: an issue assigned to the relay's account **by** one of them is taken, and a trigger label from `include_labels` **added by** one of them starts a run. Logins match without case; each must be a real login (no `@`) and listed once, or the config refuses to load. `[]` keeps today's rule: only the relay's own account. A repo's `automation.allowed_accounts` replaces this list for that repo. `accept_foreign_assignments: true` still takes an assignment from anyone. |
 | `priority_labels` | list of strings | `["P0", "P1", "P2", "P3"]` | Issues carrying an earlier label in this list run first; labels are compared without case, and an issue carrying several runs at its earliest. Issues carrying none of them run last. Within the same label, the oldest issue runs first (by when it was opened, then by number). An issue whose creation time cannot be read runs after the others with its label. `[]` keeps the oldest-first order only. Each label must be a non-empty string and listed once. |
 
 Each poll that found new issues logs the order it will run them in, as one
@@ -783,7 +785,8 @@ and ask the operator), or `never` (skip).
 | `secret_alerts` | `never` | Secret-scan alerts. |
 | `deploy_after_merge` | `auto` | Whether to deploy after a merged PR. |
 | `operator_prs` | `ask` | `ask` or `ignore`. What the secops sweep does with your own open PRs that touch more than `.github/dependabot.yml`. See [operator_prs](#reposautomationoperator_prs) below. |
-| `accept_foreign_assignments` | `false` | When `true`, the poller also picks up issues assigned to you by someone else. Default (`false`) runs the dev pipeline only on issues you self-assigned. |
+| `accept_foreign_assignments` | `false` | When `true`, the poller also picks up issues assigned to you by anyone else. Default (`false`) runs the dev pipeline only on issues you self-assigned, or that an account in `allowed_accounts` assigned to you. |
+| `allowed_accounts` | `null` | Accounts whose assignment or trigger label hands this repo's issues to the relay, besides the relay's own account. `null` uses [`intake.allowed_accounts`](#intake); a list, even `[]`, replaces it for this repo. |
 | `exclude_labels` | `["manual", "operator", "instruction"]` | Issue labels that tell the poller "this isn't for the agent". See [exclude_labels](#reposautomationexclude_labels) below. |
 | `include_labels` | `[]` | Issue labels that opt an issue **into** the dev pipeline regardless of who is (or isn't) assigned. See [include_labels](#reposautomationinclude_labels) below. |
 | `require_labels` | `[]` | Issue labels that gate the plain-assignment trigger: when set, assignment alone is no longer enough — the issue must also carry one of these labels. See [require_labels](#reposautomationrequire_labels) below. |
@@ -879,10 +882,11 @@ repos:
 - An issue is accepted when **either** (a) it's assigned to the configured
   user (subject to the self-assignment filter from #79 and
   `accept_foreign_assignments`) **or** (b) it carries any label in
-  `include_labels` **that the configured user added** (the latest
-  `labeled` event for that label names that account; `accept_foreign_assignments`
-  does not widen this). A label someone else added does not start a run;
-  the issue is still taken if the user also assigned it to themselves.
+  `include_labels` **that the configured user, or an account in
+  `allowed_accounts`, added** (the latest `labeled` event for that label
+  names one of them; `accept_foreign_assignments` does not widen this). A
+  label anyone else added does not start a run; the issue is still taken
+  if the user also assigned it to themselves.
 - Dedup: an issue that is **both** labeled and assigned is picked up exactly
   once per poll cycle — no duplicate entries in `seen_issues` and no double
   pipeline spawn.

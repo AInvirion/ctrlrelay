@@ -624,6 +624,21 @@ async def test_self_assigned_answer_is_cached(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_an_assignment_by_an_allowed_account_waits_normally(tmp_path: Path) -> None:
+    """#374: the waiting line asks the same allowlist the poller does."""
+    ri = [i for i in _issues() if i["repo"] == GAMMA]
+    gh = _FakeGitHub([ri], events={(GAMMA, 366): _assigned_by("Teammate")})
+    clock = [1_800_000_000]
+    tracker = _tracker(tmp_path, gh, clock, repos=[
+        {"name": GAMMA, "automation": {"allowed_accounts": ["teammate"]}},
+    ])
+
+    await tracker.refresh()
+    assert [(i["issue_number"], i["reason"]) for i in tracker.snapshot()["items"]] \
+        == [(366, "next poll")]
+
+
+@pytest.mark.asyncio
 async def test_foreign_answer_is_rechecked_after_ten_minutes(tmp_path: Path) -> None:
     ri = [i for i in _issues() if i["repo"] == GAMMA]
     gh = _FakeGitHub(
