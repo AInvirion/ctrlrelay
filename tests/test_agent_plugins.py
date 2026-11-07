@@ -418,3 +418,96 @@ def selected_fingerprint(dispatcher: RepoAgentRouter) -> str:
     identity = dispatcher.by_type["example"].agent_identity
     assert identity.fingerprint is not None
     return identity.fingerprint
+
+
+class TestAgentProgramIsNeverTakenFromTheWorktree:
+    """The child's PATH has no relative entries, so no lookup reaches the worktree."""
+
+    def _planted(self, tmp_path, name="fake-agent-xyz"):
+        worktree = tmp_path / "wt"
+        worktree.mkdir(exist_ok=True)
+        planted = worktree / name
+        planted.write_text("#!/bin/sh\ntouch \"$PWD/PWNED\"\n")
+        planted.chmod(0o755)
+        return worktree
+
+    def test_relative_entries_are_dropped(self) -> None:
+        from ctrlrelay.core.dispatcher import _absolute_path_only
+
+        env = _absolute_path_only({"PATH": ".::bin:/usr/bin", "HOME": "/h"})
+        assert env == {"PATH": "/usr/bin", "HOME": "/h"}
+
+    def test_an_all_absolute_path_is_left_alone(self) -> None:
+        from ctrlrelay.core.dispatcher import _absolute_path_only
+
+        env = {"PATH": "/usr/bin:/bin"}
+        assert _absolute_path_only(env) is env
+
+    def _run(self, adapter, worktree, **kw):
+        import asyncio
+
+        return asyncio.run(adapter.spawn_session(
+            "s1", "hi", worktree, worktree / ".ctrlrelay" / "state.json",
+            timeout=10, github_access=False, **kw,
+        ))
+
+    def test_a_bare_agent_name_is_not_found_in_the_worktree(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        import os
+
+        from ctrlrelay.core.dispatcher import OpenCodeDispatcher
+
+        worktree = self._planted(tmp_path)
+        monkeypatch.setenv("PATH", "." + os.pathsep + os.environ["PATH"])
+        adapter = OpenCodeDispatcher(
+            opencode_binary="fake-agent-xyz", usage_store=None,
+        )
+        with pytest.raises(FileNotFoundError):
+            self._run(adapter, worktree)
+        assert not (worktree / "PWNED").exists()
+
+    def test_an_env_shebang_launcher_does_not_find_its_interpreter_in_the_worktree(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """``#!/usr/bin/env fake-interp`` searches the child's PATH."""
+        import os
+
+        from ctrlrelay.core.dispatcher import OpenCodeDispatcher
+
+        worktree = self._planted(tmp_path, name="fake-interp")
+        launcher = tmp_path / "bin" / "agent-launcher"
+        launcher.parent.mkdir()
+        launcher.write_text("#!/usr/bin/env fake-interp\n")
+        launcher.chmod(0o755)
+        monkeypatch.setenv("PATH", "." + os.pathsep + os.environ["PATH"])
+        adapter = OpenCodeDispatcher(
+            opencode_binary=str(launcher), usage_store=None,
+        )
+        self._run(adapter, worktree)
+        assert not (worktree / "PWNED").exists()
+
+    def test_a_sandboxed_spawn_gets_the_same_path(self, tmp_path) -> None:
+        """bwrap searches the PATH it is given, from the worktree too."""
+        import asyncio
+        import os
+        from unittest.mock import patch
+
+        from ctrlrelay.core.dispatcher import OpenCodeDispatcher
+
+        worktree = self._planted(tmp_path)
+        adapter = OpenCodeDispatcher(opencode_binary="/bin/echo", usage_store=None)
+        env = {"PATH": "." + os.pathsep + "/usr/bin"}
+        with patch(
+            "asyncio.create_subprocess_exec", side_effect=FileNotFoundError("stop"),
+        ) as spawn:
+            with pytest.raises(FileNotFoundError):
+                asyncio.run(adapter._run_session(
+                    cmd=["/usr/bin/bwrap", "--die-with-parent", "--", "fake-agent-xyz"],
+                    env=env, ident={}, session_id="s1", prompt="hi",
+                    working_dir=worktree,
+                    state_file=worktree / ".ctrlrelay" / "state.json",
+                    timeout=10, resume_session_id=None, repo=None,
+                    issue_number=None, sandbox_prefix_len=3,
+                ))
+        assert spawn.call_args.kwargs["env"]["PATH"] == "/usr/bin"
