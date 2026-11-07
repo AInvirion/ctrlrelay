@@ -565,6 +565,7 @@ class WaitingTracker:
                 username=username,
                 repos=[r.name for r in self._config.repos],
                 state_file=self._poller_state_file,
+                allowed_accounts_by_repo=self._config.allowed_accounts_by_repo(),
             )
         value = await self._poller._is_self_assigned(repo, number)
         self._assignment_cache[key] = (value, now, updated_ts)

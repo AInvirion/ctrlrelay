@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- An allowlist of accounts that can hand the relay work (#374).
+  `intake.allowed_accounts` lists GitHub logins, besides the relay's own
+  account, whose assignment to the relay or whose trigger label starts a
+  run. A repo can replace the list with `automation.allowed_accounts`.
+  Empty by default, so nothing changes until you set it.
+
 ## [0.26.0] - 2026-11-06
 
 ### Added

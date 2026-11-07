@@ -526,6 +526,31 @@ class CodeReviewConfig(BaseModel):
         return "cli"
 
 
+# A GitHub login: letters, digits and single hyphens, not at either end,
+# at most 39 characters. Matched without case, as GitHub does.
+_GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
+
+
+def _check_accounts(where: str, v: list[str]) -> list[str]:
+    """Refuse an allowlist entry that is not a GitHub login, or one listed
+    twice. A typo here would quietly keep a teammate out (or, with ``@``,
+    never match), so it fails at load instead."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in v:
+        if not isinstance(x, str) or not _GITHUB_LOGIN_RE.match(x.strip()):
+            raise ValueError(
+                f"{where}: {x!r} is not a GitHub login (no @, letters, digits "
+                "and single hyphens only)"
+            )
+        name = x.strip()
+        if name.lower() in seen:
+            raise ValueError(f"{where}: {name!r} is listed twice")
+        seen.add(name.lower())
+        out.append(name)
+    return out
+
+
 class AutomationConfig(BaseModel):
     """Automation policies for a repo."""
 
@@ -580,6 +605,18 @@ class AutomationConfig(BaseModel):
     # branch, run by the relay, and no weakened tests. Off by default:
     # a repo turns it on once its tests can run offline in a fresh copy.
     require_proof: bool = False
+    # Accounts whose assignment, or whose trigger label, hands this repo's
+    # issues to the relay (#374), besides the relay's own account. ``None``
+    # uses ``intake.allowed_accounts``; a list (even empty) replaces it for
+    # this repo.
+    allowed_accounts: list[str] | None = None
+
+    @field_validator("allowed_accounts")
+    @classmethod
+    def _accounts_are_logins(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else _check_accounts(
+            "repos[].automation.allowed_accounts", v,
+        )
 
 
 _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
@@ -1142,6 +1179,16 @@ class IntakeConfig(BaseModel):
     priority_labels: list[str] = Field(
         default_factory=lambda: list(DEFAULT_PRIORITY_LABELS),
     )
+    # Accounts whose assignment to the relay's account, or whose trigger
+    # label, starts work (#374). The relay's own account is always allowed;
+    # empty keeps that the only one. A repo's ``automation.allowed_accounts``
+    # replaces this list for that repo.
+    allowed_accounts: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_accounts")
+    @classmethod
+    def _accounts_are_logins(cls, v: list[str]) -> list[str]:
+        return _check_accounts("intake.allowed_accounts", v)
 
     @field_validator("priority_labels")
     @classmethod
@@ -1318,6 +1365,20 @@ class Config(BaseModel):
     fleet: FleetConfig = Field(default_factory=FleetConfig)
     personalization: Personalization | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
+
+    def allowed_accounts_by_repo(self) -> dict[str, set[str]]:
+        """Per repo, the lower-cased accounts besides the relay's own whose
+        assignment or trigger label starts work (#374)."""
+        return {
+            r.name: {
+                a.lower() for a in (
+                    r.automation.allowed_accounts
+                    if r.automation.allowed_accounts is not None
+                    else self.intake.allowed_accounts
+                )
+            }
+            for r in self.repos
+        }
 
     @field_validator("node_id")
     @classmethod
