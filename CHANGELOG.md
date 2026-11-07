@@ -23,10 +23,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resumed through the current default backend.
 - Repo context is linked under each backend's own instruction filename, so
   Codex and Copilot see `AGENTS.md` or `.github/copilot-instructions.md`
-  instead of only Claude's `CLAUDE.md` (#379).
+  instead of only Claude's `CLAUDE.md` (#379). A name the repository already
+  has is left alone: the repo's own file wins under that name, and the relay
+  context goes only under names that are free.
 - Built-in identity pins use the stable launcher path, so Claude's normal
   self-update does not invalidate a pending resume. Generic manifests still
   pin their full invocation mapping (#379).
+
+### Fixed
+
+- The relay no longer replaces a repository's own `CLAUDE.md` with its repo
+  context link. The tracked file became a type change while the agent ran
+  and a deletion after cleanup, so an agent that staged everything could put
+  either into its pull request. Cleanup now removes only links the relay
+  made (#379).
+
+### Upgrade notes
+
+- A run waiting on a question from before this release has no recorded
+  agent identity. If its agent session had already started, it is refused
+  with `agent_identity_unknown` instead of being resumed on whatever backend
+  is configured now. Answer or close those questions before upgrading, or
+  re-run the issue afterwards (#379).
+- A repo that commits its own `CLAUDE.md` now runs with that file instead of
+  the relay's context under that name. Move anything the agent must see into
+  the repo's file, or into the contexts entry for a name the repo does not
+  use (#379).
 
 ## [0.27.0] - 2026-11-06
 

@@ -66,7 +66,7 @@ paths:
 | `state_db` | path | **yes** | SQLite database for sessions, locks, outstanding questions (`pending_resumes`), PR watches, automation decisions and the status-page event feed. |
 | `worktrees` | path | **yes** | Where ctrlrelay creates per-session `git worktree` directories. |
 | `bare_repos` | path | **yes** | Where ctrlrelay clones bare mirrors of each configured repo. |
-| `contexts` | path | **yes** | Per-repo context directory (looked up as `<contexts>/<owner-repo>/CLAUDE.md`). If it exists, it is linked into the worktree under every instruction filename the selected agent reads (`CLAUDE.md`, `AGENTS.md`, or the manifest's `instructions_files`). |
+| `contexts` | path | **yes** | Per-repo context directory (looked up as `<contexts>/<owner-repo>/CLAUDE.md`). If it exists, it is linked into the worktree under every instruction filename the selected agent reads (`CLAUDE.md`, `AGENTS.md`, or the manifest's `instructions_files`). A name the repository already has is never replaced; the repo's own file wins under that name. |
 | `skills` | path | **yes** | Claude Code skills directory used by `ctrlrelay skills audit` and `ctrlrelay skills list`. |
 | `repo_root` | path | no | Convention root for repo clones. When set, `repos[].local_path` may be omitted and is derived as `${repo_root}/${owner.lower()}/${repo}` (since v0.4.0). Without `repo_root`, every repo entry must declare its own `local_path` (legacy behaviour). |
 | `owner_aliases` | object | no | **Deprecated since v0.4.0.** Pre-0.4.0 this remapped the on-disk folder name (e.g. `SemClone` -> `SEMCL.ONE`). The path resolver now always uses `owner.lower()`, so aliases are no longer consulted. Parsing is retained so 0.3.x configs still load; a `DeprecationWarning` is emitted when a non-empty mapping is supplied. To silence: drop the `owner_aliases` block, rename your on-disk folder to match `owner.lower()`, or set a per-repo `local_path` override for any that genuinely deviate. |
@@ -171,7 +171,9 @@ no captured native id fails closed rather than invoking fresh `args`.
 `instructions_files` names where the CLI reads repository instructions; the
 relay links the repo context under each one (for example `AGENTS.md`, or
 `.github/copilot-instructions.md` for Copilot). Each name must stay inside the
-worktree.
+worktree. A name the repository already has, as a file or its own link, is left
+untouched, so the agent reads the repo's instructions there and the checkout
+stays clean.
 
 Each manifest gets a SHA-256 fingerprint over its resolved binary, argv,
 prompt/session mapping, model/provider and environment. Built-in adapters
