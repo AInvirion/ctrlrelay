@@ -32,7 +32,8 @@ flowchart LR
     PR -->|CI + review| YOU(["You merge"])
 ```
 
-1. **You assign an issue** to yourself, or add a label you pick.
+1. **You assign an issue** to yourself, or add a label you pick. Teammates
+   on your [`allowed_accounts`]({{ '/configuration/' | relative_url }}#intake) list can do the same.
 2. **ctrlrelay starts the agent** in a fresh, isolated copy of the repo.
 3. **If the agent has a question**, it lands in your chat. Your reply goes
    straight back to the same session — no restart, no lost context.

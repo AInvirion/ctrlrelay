@@ -263,7 +263,9 @@ ctrlrelay poller start [-c PATH] [-F|--foreground] [-i SECONDS]
 | `--config` / `-c` | `config/orchestrator.yaml` | Config path. |
 
 Polls each configured repo for issues assigned to your GitHub user (resolved
-via `gh api user --jq .login`). On the first run, seeds the seen-issue set
+via `gh api user --jq .login`), by you or by an account in
+`allowed_accounts`, plus issues carrying a trigger label one of those
+accounts added. On the first run, seeds the seen-issue set
 with current assignments so it does not replay your existing backlog.
 
 For each newly assigned issue, runs `run_dev_issue(...)` (i.e. the dev pipeline)

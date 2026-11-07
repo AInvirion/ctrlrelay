@@ -856,17 +856,14 @@ input is the source of truth).
 ### repos[].automation.include_labels
 
 Out of the box, an issue enters the dev pipeline only when it's assigned to
-the configured GitHub user (and, with the pre-#79 self-assignment filter, only
-when *you* were the one who assigned it). That works for a personal to-do
-list; it doesn't cover the "team-coordinated" workflow where a teammate without
-rights on your account wants to say "this issue is safe for the agent to take
-a shot at."
+the configured GitHub user, by that user or by an account in
+[`allowed_accounts`](#intake).
 
-`include_labels` is the opt-in complement to `exclude_labels`. Any issue
-carrying one of the configured labels is handed to the dev pipeline,
-**regardless of assignment**. The label itself is the trust signal — you opt
-in by configuring the label; anyone with triage permission on the repo can
-then flag an issue for the bot.
+`include_labels` is the opt-in complement to `exclude_labels`. An issue
+carrying one of the configured labels is handed to the dev pipeline
+**without being assigned**, as long as the label was added by the configured
+user or an account in `allowed_accounts` (#282, #374). A label anyone else
+adds does nothing.
 
 ```yaml
 repos:
