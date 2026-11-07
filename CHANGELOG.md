@@ -37,6 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A repository's own instruction link that points outside the checkout,
+  such as `AGENTS.md -> /opt/shared/AGENTS.md`, was taken for the relay's
+  context link: it was replaced while the agent ran and deleted at cleanup.
+  Only links to the repo's context file are now replaced or removed (#379).
+- An agent named by a bare `binary` could run a file committed to the
+  repository when the daemon's `PATH` held a relative entry (`.`, an empty
+  entry, `bin`), because the agent starts inside the worktree. The name is
+  now looked up through absolute `PATH` entries only, and a name found
+  nowhere fails as a missing binary always did. This predates the plugin
+  runtime.
 - The relay no longer replaces a repository's own `CLAUDE.md` with its repo
   context link. The tracked file became a type change while the agent ran
   and a deletion after cleanup, so an agent that staged everything could put

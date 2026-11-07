@@ -1441,12 +1441,10 @@ class TestWorktreeManager:
         context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
         context_file.parent.mkdir(parents=True)
         context_file.write_text("# Relay context")
-        old_context = tmp_path / "old-contexts" / "CLAUDE.md"
-        old_context.parent.mkdir(parents=True)
-        old_context.write_text("# Old")
         worktree_path = tmp_path / "worktree"
         worktree_path.mkdir()
-        (worktree_path / "AGENTS.md").symlink_to(old_context.resolve())
+        # Left by an earlier round, possibly by another process.
+        (worktree_path / "AGENTS.md").symlink_to(context_file.resolve())
         manager = WorktreeManager(
             worktrees_dir=tmp_path / "worktrees",
             bare_repos_dir=tmp_path / "repos",
@@ -1458,6 +1456,59 @@ class TestWorktreeManager:
 
         assert linked == ["AGENTS.md"]
         assert (worktree_path / "AGENTS.md").resolve() == context_file.resolve()
+        manager.remove_context_symlink(worktree_path, filenames=("AGENTS.md",))
+        assert not (worktree_path / "AGENTS.md").is_symlink()
+
+    @pytest.mark.asyncio
+    async def test_a_repos_absolute_link_elsewhere_is_never_touched(
+        self, tmp_path: Path,
+    ) -> None:
+        """``AGENTS.md -> /opt/shared/AGENTS.md`` is the repository's, not ours."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Relay context")
+        shared = tmp_path / "opt-shared" / "AGENTS.md"
+        shared.parent.mkdir()
+        shared.write_text("# Shared rules")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        (worktree_path / "AGENTS.md").symlink_to(shared.resolve())
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+
+        linked = manager.symlink_context(
+            worktree_path, context_file, filenames=("AGENTS.md",),
+        )
+        assert linked == []
+        manager.remove_context_symlink(worktree_path, filenames=("AGENTS.md",))
+
+        assert (worktree_path / "AGENTS.md").readlink() == shared.resolve()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_without_linking_removes_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        """A manager that never linked this worktree has no link it may remove."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Relay context")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        (worktree_path / "CLAUDE.md").symlink_to(context_file.resolve())
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+
+        manager.remove_context_symlink(worktree_path)
+
+        assert (worktree_path / "CLAUDE.md").is_symlink()
 
     @pytest.mark.asyncio
     async def test_a_tracked_instruction_file_leaves_the_checkout_clean(

@@ -171,9 +171,15 @@ no captured native id fails closed rather than invoking fresh `args`.
 `instructions_files` names where the CLI reads repository instructions; the
 relay links the repo context under each one (for example `AGENTS.md`, or
 `.github/copilot-instructions.md` for Copilot). Each name must stay inside the
-worktree. A name the repository already has, as a file or its own link, is left
-untouched, so the agent reads the repo's instructions there and the checkout
-stays clean.
+worktree. A name the repository already has, as a file or its own link (relative
+or absolute), is left untouched, so the agent reads the repo's instructions there
+and the checkout stays clean. Only links pointing at the repo's context file are
+ever replaced or removed.
+
+A bare `binary` name is looked up at spawn time through **absolute** `PATH`
+entries only. The agent runs inside the repository worktree, so a relative entry
+(`.`, an empty entry, `bin`) would let a file committed to the repository run as
+the agent.
 
 Each manifest gets a SHA-256 fingerprint over its resolved binary, argv,
 prompt/session mapping, model/provider and environment. Built-in adapters
@@ -185,6 +191,11 @@ a built-in binary path cannot silently hand an old native session to a
 different executable. Generic manifests remain resumable when they are removed
 from `assignable_types`; assignment permission and resume compatibility are
 separate decisions.
+
+The pin is a **compatibility check, not tamper protection**. It stops a
+configuration change from resuming a run on a different backend; it does not
+stop someone who can write the launcher file itself, and an unconfined agent
+runs as the same user that owns it. Confinement is #352's job.
 
 #### Example: GitHub Copilot CLI
 

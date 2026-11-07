@@ -12,7 +12,7 @@ import stat
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -402,27 +402,21 @@ def _safe_context_target(worktree_path: Path, name: str) -> Path:
     return worktree_path.joinpath(*path.parts)
 
 
-def _is_relay_context_link(worktree_path: Path, target: Path) -> bool:
-    """Whether ``target`` is a context link the relay itself made.
+def _is_link_to(target: Path, destination: str) -> bool:
+    """Whether ``target`` is a symlink whose stored target is ``destination``.
 
-    The relay always links to the absolute, resolved context file, which
-    lives outside the worktree. A repository's own instruction file is a
-    regular file or, when it is a link (``AGENTS.md -> CLAUDE.md`` is a
-    common pattern), a relative one inside the checkout. Only the first
-    kind may be replaced or removed: touching the second would change a
-    tracked file, and an agent that stages everything would put the
-    host-path link, or the deletion, into the pull request.
+    The relay's context links store the absolute, resolved path of the
+    repo's context file, and nothing else in a checkout has a reason to
+    point there. Matching that exact string is what tells a relay link
+    from a repository's own instruction file or link (relative, or
+    absolute to somewhere else such as ``/opt/shared/AGENTS.md``): those
+    are tracked, and replacing or removing them would put a type change or
+    a deletion in front of an agent that stages everything.
     """
-    if not target.is_symlink():
-        return False
     try:
-        dest = Path(os.readlink(target))
+        return target.is_symlink() and os.readlink(target) == destination
     except OSError:
         return False
-    if not dest.is_absolute():
-        return False
-    root = worktree_path.resolve()
-    return dest != root and root not in dest.parents
 
 
 def _add_exclude_line(admin_fd: int, where: Path, line: str) -> None:
@@ -523,6 +517,13 @@ class WorktreeManager:
     # repo and where the old clone went. Best-effort: a failure is
     # logged and never fails the run.
     on_reclone: Callable[[str, Path], Awaitable[None]] | None = None
+    # The context file each worktree's links point at, recorded by
+    # symlink_context so remove_context_symlink deletes only those links.
+    # Every pipeline links before it cleans up, in the same process; a
+    # worktree this process never linked has nothing it may remove.
+    _context_targets: dict[Path, str] = field(
+        default_factory=dict, init=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.worktrees_dir = Path(self.worktrees_dir)
@@ -2406,6 +2407,8 @@ class WorktreeManager:
         context still goes under every name that is free. Returns the names
         that were linked.
         """
+        destination = str(context_path.resolve())
+        self._context_targets[Path(worktree_path)] = destination
         linked: list[str] = []
         for name in filenames:
             target = _safe_context_target(worktree_path, name)
@@ -2418,7 +2421,7 @@ class WorktreeManager:
                     )
                 cursor.mkdir(exist_ok=True)
 
-            if _is_relay_context_link(worktree_path, target):
+            if _is_link_to(target, destination):
                 # Ours, from an earlier round on a reused worktree.
                 target.unlink()
             elif target.exists() or target.is_symlink():
@@ -2428,7 +2431,7 @@ class WorktreeManager:
                 )
                 continue
 
-            target.symlink_to(context_path.resolve())
+            target.symlink_to(destination)
             linked.append(name)
 
         if not linked:
@@ -2540,10 +2543,14 @@ class WorktreeManager:
     ) -> None:
         """Remove the context links before git operations.
 
-        Only links the relay made are removed; a repository's own file or
-        link under the same name is part of the checkout and stays.
+        Only links pointing at the context file this manager linked into
+        ``worktree_path`` are removed; a repository's own file or link under
+        the same name is part of the checkout and stays.
         """
+        destination = self._context_targets.get(Path(worktree_path))
+        if destination is None:
+            return
         for name in filenames:
             target = _safe_context_target(worktree_path, name)
-            if _is_relay_context_link(worktree_path, target):
+            if _is_link_to(target, destination):
                 target.unlink()

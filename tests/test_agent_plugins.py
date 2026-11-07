@@ -418,3 +418,60 @@ def selected_fingerprint(dispatcher: RepoAgentRouter) -> str:
     identity = dispatcher.by_type["example"].agent_identity
     assert identity.fingerprint is not None
     return identity.fingerprint
+
+
+class TestAgentProgramIsNeverTakenFromTheWorktree:
+    """A bare agent name is looked up through absolute PATH entries only."""
+
+    def _planted(self, tmp_path):
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        planted = worktree / "fake-agent-xyz"
+        planted.write_text("#!/bin/sh\ntouch \"$PWD/PWNED\"\n")
+        planted.chmod(0o755)
+        return worktree
+
+    def test_relative_path_entries_are_skipped(self, tmp_path) -> None:
+        from ctrlrelay.core.dispatcher import _program_outside_worktree
+
+        self._planted(tmp_path)
+        with pytest.raises(FileNotFoundError, match="absolute PATH"):
+            _program_outside_worktree("fake-agent-xyz", {"PATH": ".::bin"})
+
+    def test_absolute_entries_still_resolve(self, tmp_path) -> None:
+        from ctrlrelay.core.dispatcher import _program_outside_worktree
+
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        real = bindir / "fake-agent-xyz"
+        real.write_text("#!/bin/sh\n")
+        real.chmod(0o755)
+        found = _program_outside_worktree(
+            "fake-agent-xyz", {"PATH": f".:{bindir}"},
+        )
+        assert found == str(real)
+
+    def test_absolute_program_passes_through(self) -> None:
+        from ctrlrelay.core.dispatcher import _program_outside_worktree
+
+        assert _program_outside_worktree("/opt/agent", {"PATH": "."}) == "/opt/agent"
+
+    def test_a_spawn_never_runs_a_file_from_the_worktree(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        import asyncio
+        import os
+
+        from ctrlrelay.core.dispatcher import OpenCodeDispatcher
+
+        worktree = self._planted(tmp_path)
+        monkeypatch.setenv("PATH", "." + os.pathsep + os.environ["PATH"])
+        adapter = OpenCodeDispatcher(
+            opencode_binary="fake-agent-xyz", usage_store=None,
+        )
+        with pytest.raises(FileNotFoundError):
+            asyncio.run(adapter.spawn_session(
+                "s1", "hi", worktree, worktree / ".ctrlrelay" / "state.json",
+                timeout=10, github_access=False,
+            ))
+        assert not (worktree / "PWNED").exists()

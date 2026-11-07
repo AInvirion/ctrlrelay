@@ -116,6 +116,34 @@ def _normalise_builtin_binary(binary: str, *, label: str) -> str:
     return str(Path(found).absolute()) if found else binary
 
 
+def _program_outside_worktree(program: str, env: dict[str, str]) -> str:
+    """The agent executable to exec, never one found inside the worktree.
+
+    ``exec`` searches a bare name through ``PATH`` from the CHILD's
+    directory, which for an agent is the run's worktree: repository
+    content. A relative entry (``.``, an empty entry, ``bin``) would let a
+    file committed to the repository run as the agent. A bare name is
+    therefore searched through absolute ``PATH`` entries only; a name
+    found nowhere raises the ``FileNotFoundError`` a missing binary always
+    raised. Absolute paths pass through; relative paths were refused when
+    the adapter was built.
+    """
+    if os.path.isabs(program) or os.sep in program:
+        return program
+    absolute = os.pathsep.join(
+        entry for entry in env.get("PATH", "").split(os.pathsep)
+        if os.path.isabs(entry)
+    )
+    found = shutil.which(program, path=absolute)
+    if found is None:
+        raise FileNotFoundError(
+            f"{program!r} was not found on any absolute PATH entry; "
+            "relative entries are skipped because the agent runs in the "
+            "repository worktree"
+        )
+    return found
+
+
 @dataclass(frozen=True)
 class DispatchOutcome:
     """What one spawn did, handed to the outcome hook (#204).
@@ -549,6 +577,8 @@ class CliAgentAdapter:
         try:
             # The sandbox's options go through a file descriptor, not the
             # command line, so no number of mounts can pass ARG_MAX (#362).
+            if sandbox_prefix_len == 0 and cmd:
+                cmd = [_program_outside_worktree(cmd[0], env), *cmd[1:]]
             short, args_fd = bwrap_args_via_fd(cmd[:sandbox_prefix_len])
             pass_fds = () if args_fd is None else (args_fd,)
             try:
