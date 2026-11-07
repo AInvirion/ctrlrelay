@@ -578,9 +578,14 @@ class CliAgentAdapter:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     pass_fds=pass_fds,
-                    **({} if stdin_text is None else {
-                        "stdin": asyncio.subprocess.PIPE
-                    }),
+                    # Never the daemon's own stdin. A CLI that appends
+                    # piped stdin to its prompt (codex exec does) waits
+                    # for an end-of-file that an inherited pipe never
+                    # sends, and the run sits until the timeout.
+                    stdin=(
+                        asyncio.subprocess.DEVNULL if stdin_text is None
+                        else asyncio.subprocess.PIPE
+                    ),
                 )
             finally:
                 # The child has its own copy now; bwrap reads it at start.
