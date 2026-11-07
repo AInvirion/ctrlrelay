@@ -159,6 +159,28 @@ Hit Ctrl+C to stop. The poller's seen-issue state is persisted to
 
 To run the poller as a long-lived background service, see [Operations]({{ '/operations/' | relative_url }}).
 
+## Let teammates hand it work
+
+By default only your own account (the one `gh` is logged in as) can start a
+run: by assigning an issue to itself, or by adding a trigger label. To let a
+teammate do the same, list their GitHub login:
+
+```yaml
+intake:
+  allowed_accounts: ["teammate-login"]     # every repo
+
+repos:
+  - name: "your-org/your-repo"
+    automation:
+      allowed_accounts: ["teammate-login"] # this repo only; replaces the list above
+```
+
+The teammate then assigns the issue **to your account**, or adds one of your
+`include_labels`. If the repo uses `require_labels`, the issue must carry
+that label too. Anyone not on the list is ignored, and the status page shows
+their issue as "assigned by someone else". Restart the poller after editing
+the file. Details: [Configuration: intake]({{ '/configuration/' | relative_url }}#intake).
+
 ## Where to next
 
 - [Configuration]({{ '/configuration/' | relative_url }}) — every key in `orchestrator.yaml`.

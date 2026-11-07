@@ -12,6 +12,7 @@ Key facts:
 - Pipelines: `dev` (issue to pull request), `task` (issue with a task label, written report, no pull request), `secops` (scheduled Dependabot alert and pull request review), `post_merge`.
 - Automatic review: `code_review.method` is `"cli"` (default) or `"off"`.
 - Status page: `ctrlrelay web start`. Read-only, no login; never expose it to the internet.
+- Who can start work: the account `gh` is logged in as, plus GitHub logins in `intake.allowed_accounts` (or per repo, `repos[].automation.allowed_accounts`). An issue assigned to that account by one of them, or a trigger label one of them added, starts a run.
 - Several machines can share one GitHub account and one chat; see Adding a machine.
 - State is a local SQLite file. There is no hosted service.
 

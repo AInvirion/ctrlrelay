@@ -25,7 +25,8 @@ Coding agents are great when you sit and watch them. ctrlrelay is for the
 work you don't want to sit and watch.
 
 - **Your backlog is the to-do list.** No new tool to learn. Assign an issue
-  (or add a label) and the work starts. The result is a normal pull request
+  (or add a label) and the work starts. Teammates you allow can hand it work
+  the same way. The result is a normal pull request
   your team already knows how to review.
 - **Runs where your code already lives.** ctrlrelay is a small program on your
   laptop or server — not a cloud service. Nothing leaves your machine except
@@ -75,7 +76,8 @@ flowchart LR
     PR -->|CI + review| YOU(["You merge"])
 ```
 
-1. **You assign an issue** to yourself, or add a label you pick.
+1. **You assign an issue** to yourself, or add a label you pick. Teammates
+   on your `allowed_accounts` list can do the same.
 2. **ctrlrelay starts the agent** in a fresh, isolated copy of the repo.
 3. **If the agent has a question**, it lands in your chat. Your reply goes
    straight back to the same session.
