@@ -1551,6 +1551,93 @@ class TestWorktreeManager:
         assert git("status", "--porcelain") == ""
 
     @pytest.mark.asyncio
+    async def test_cleanup_is_not_redirected_by_a_parent_swapped_mid_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The agent swaps ``.github`` for a link between check and unlink.
+
+        The unlink goes through the directory opened before the swap, so a
+        file of the same name outside the checkout survives.
+        """
+        from ctrlrelay.core import worktree as wt_mod
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Relay context")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "copilot-instructions.md"
+        victim.write_text("not the relay's")
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        name = ".github/copilot-instructions.md"
+        manager.symlink_context(worktree_path, context_file, filenames=(name,))
+
+        real_check = wt_mod._link_points_to
+
+        def check_then_swap(dir_fd: int, base: str, destination: str) -> bool:
+            result = real_check(dir_fd, base, destination)
+            (worktree_path / ".github").rename(worktree_path / ".github-moved")
+            (worktree_path / ".github").symlink_to(outside)
+            return result
+
+        monkeypatch.setattr(wt_mod, "_link_points_to", check_then_swap)
+        manager.remove_context_symlink(worktree_path, filenames=(name,))
+
+        assert victim.read_text() == "not the relay's"
+        assert not (worktree_path / ".github-moved" / "copilot-instructions.md").is_symlink()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_skips_a_parent_replaced_before_it_starts(
+        self, tmp_path: Path,
+    ) -> None:
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Relay context")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        name = ".github/copilot-instructions.md"
+        manager.symlink_context(worktree_path, context_file, filenames=(name,))
+        (worktree_path / ".github").rename(worktree_path / ".github-moved")
+        (worktree_path / ".github").symlink_to(outside)
+        (outside / "copilot-instructions.md").symlink_to(context_file.resolve())
+
+        manager.remove_context_symlink(worktree_path, filenames=(name,))
+
+        assert (outside / "copilot-instructions.md").is_symlink()
+
+    def test_cleanup_forgets_the_worktree(self, tmp_path: Path) -> None:
+        """The daemon shares one manager; finished runs must not pile up."""
+        from ctrlrelay.core.worktree import WorktreeManager
+
+        context_file = tmp_path / "contexts" / "owner-repo" / "CLAUDE.md"
+        context_file.parent.mkdir(parents=True)
+        context_file.write_text("# Relay context")
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        manager = WorktreeManager(
+            worktrees_dir=tmp_path / "worktrees",
+            bare_repos_dir=tmp_path / "repos",
+        )
+        manager.symlink_context(worktree_path, context_file)
+        manager.remove_context_symlink(worktree_path)
+
+        assert manager._context_targets == {}
+
+    @pytest.mark.asyncio
     async def test_symlink_context_refuses_a_nested_symlink_parent(
         self, tmp_path: Path,
     ) -> None:

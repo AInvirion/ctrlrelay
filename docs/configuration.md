@@ -174,7 +174,11 @@ relay links the repo context under each one (for example `AGENTS.md`, or
 worktree. A name the repository already has, as a file or its own link (relative
 or absolute), is left untouched, so the agent reads the repo's instructions there
 and the checkout stays clean. Only links pointing at the repo's context file are
-ever replaced or removed.
+ever replaced or removed, and they are reached by walking the worktree without
+following any symlink, so a directory swapped for a link cannot redirect the
+cleanup outside the checkout. A link left behind by a run the daemon restarted
+during stays until the next run on that worktree replaces it; it is listed in the
+worktree's `info/exclude` meanwhile, so `git add -A` does not pick it up.
 
 A bare `binary` name is looked up at spawn time through **absolute** `PATH`
 entries only. The agent runs inside the repository worktree, so a relative entry

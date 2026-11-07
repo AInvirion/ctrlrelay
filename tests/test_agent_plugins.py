@@ -475,3 +475,30 @@ class TestAgentProgramIsNeverTakenFromTheWorktree:
                 timeout=10, github_access=False,
             ))
         assert not (worktree / "PWNED").exists()
+
+    def test_a_sandboxed_spawn_resolves_the_program_after_the_prefix(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """bwrap starts the agent from the worktree too."""
+        import asyncio
+        import os
+        from unittest.mock import patch
+
+        from ctrlrelay.core.dispatcher import OpenCodeDispatcher
+
+        worktree = self._planted(tmp_path)
+        adapter = OpenCodeDispatcher(
+            opencode_binary="/bin/echo", usage_store=None,
+        )
+        env = {"PATH": "." + os.pathsep + os.environ["PATH"]}
+        with patch("asyncio.create_subprocess_exec") as spawn:
+            with pytest.raises(FileNotFoundError, match="absolute PATH"):
+                asyncio.run(adapter._run_session(
+                    cmd=["/usr/bin/bwrap", "--die-with-parent", "fake-agent-xyz", "run"],
+                    env=env, ident={}, session_id="s1", prompt="hi",
+                    working_dir=worktree,
+                    state_file=worktree / ".ctrlrelay" / "state.json",
+                    timeout=10, resume_session_id=None, repo=None,
+                    issue_number=None, sandbox_prefix_len=2,
+                ))
+        spawn.assert_not_called()

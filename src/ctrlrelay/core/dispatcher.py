@@ -577,8 +577,15 @@ class CliAgentAdapter:
         try:
             # The sandbox's options go through a file descriptor, not the
             # command line, so no number of mounts can pass ARG_MAX (#362).
-            if sandbox_prefix_len == 0 and cmd:
-                cmd = [_program_outside_worktree(cmd[0], env), *cmd[1:]]
+            # The agent program sits right after the sandbox prefix (or
+            # first, unsandboxed). bwrap also starts it from the worktree,
+            # so it gets the same lookup either way.
+            if sandbox_prefix_len < len(cmd):
+                cmd = [
+                    *cmd[:sandbox_prefix_len],
+                    _program_outside_worktree(cmd[sandbox_prefix_len], env),
+                    *cmd[sandbox_prefix_len + 1:],
+                ]
             short, args_fd = bwrap_args_via_fd(cmd[:sandbox_prefix_len])
             pass_fds = () if args_fd is None else (args_fd,)
             try:
