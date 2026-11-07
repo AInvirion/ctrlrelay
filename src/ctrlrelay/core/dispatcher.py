@@ -100,11 +100,10 @@ def _normalise_builtin_binary(binary: str, *, label: str) -> str:
     """Anchor a bare built-in name; refuse ambiguous relative paths.
 
     A relative path is resolved by the child against its worktree, which
-    the identity pin cannot see before the worktree exists. Refusing it is
-    the only way to keep the pinned executable and the exec'd executable
-    the same file. An unresolved bare name is left alone: the spawn will
-    fail exactly as before, and no other program can appear without PATH
-    changing under the daemon.
+    the identity pin cannot see before the worktree exists. Refusing it
+    keeps the pinned launcher stable. An unresolved bare name is left
+    alone: the spawn will fail exactly as before, and no other program can
+    appear without PATH changing under the daemon.
     """
     if Path(binary).is_absolute():
         return binary
