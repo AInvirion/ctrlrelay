@@ -152,10 +152,35 @@ def read_checkpoint(path: Path, delete_after: bool = False) -> CheckpointState:
         CheckpointError: If the file is missing, is not a small regular
             file, or does not parse as a checkpoint.
     """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    # The directory too: the agent owns `.ctrlrelay`, and a symlink there to
+    # another run's would hand this run that run's result — and the delete
+    # below would remove it. Everything above it is the relay's.
+    try:
+        dir_fd = os.open(
+            path.parent, os.O_RDONLY | os.O_DIRECTORY | nofollow | cloexec,
+        )
+    except FileNotFoundError as e:
+        raise CheckpointError(f"Checkpoint file not found: {path}") from e
+    except OSError as e:
+        raise CheckpointError(
+            f"Checkpoint directory could not be opened as a directory: {e}"
+        ) from e
+    try:
+        return _read_checkpoint_at(dir_fd, path, delete_after)
+    finally:
+        os.close(dir_fd)
+
+
+def _read_checkpoint_at(
+    dir_fd: int, path: Path, delete_after: bool,
+) -> CheckpointState:
+    """:func:`read_checkpoint` once its directory is open as ``dir_fd``."""
     flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
+        fd = os.open(path.name, flags, dir_fd=dir_fd)
     except FileNotFoundError as e:
         raise CheckpointError(f"Checkpoint file not found: {path}") from e
     except OSError as e:
@@ -205,6 +230,13 @@ def read_checkpoint(path: Path, delete_after: bool = False) -> CheckpointState:
         raise CheckpointError(f"Invalid checkpoint data: {e}") from e
 
     if delete_after:
-        path.unlink()
+        # Only the file that was read: if the name was swapped since, the
+        # new entry is not this function's to remove.
+        try:
+            now = os.stat(path.name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return state
+        if (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino):
+            os.unlink(path.name, dir_fd=dir_fd)
 
     return state

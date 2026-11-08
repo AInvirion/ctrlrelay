@@ -76,21 +76,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - An agent can no longer outlive its session or stall the relay through
   what it leaves behind (#394). Agents are spawned in their own session, so
-  each leads its own process group, and on every exit path — normal exit,
-  timeout, cancellation, a stuck or over-budget stop, a pipe error — the
-  relay signals that group (SIGTERM, a 3-second grace, then SIGKILL) rather
-  than the direct child alone. A job the agent put in the background used
+  each leads its own process group, and every exit path signals that group
+  rather than the direct child alone: after a normal exit and on a timeout
+  with SIGTERM, a 3-second grace, then SIGKILL; on cancellation, a stuck or
+  over-budget stop and a pipe error with an immediate SIGKILL, as the child
+  alone was before. A job the agent put in the background used
   to keep running as the relay user after the run was reported done; and
   because agents shared the relay's own process group, an agent that
   signalled its group stopped the relay with it. The relay never signals a
   group that is not provably the agent's own. The checkpoint read now opens
   only a small regular file (`O_NOFOLLOW | O_NONBLOCK`, `fstat` on the same
-  descriptor, a 256 KiB cap): a FIFO at the state path blocked the read
+  descriptor, a 256 KiB cap, and the `.ctrlrelay` directory itself opened
+  without following a symlink, so an agent cannot point it at another run's
+  and have the relay read — and delete — that run's checkpoint): a FIFO at the state path blocked the read
   forever, past the session timeout and with every other run on the event
   loop stalled behind it, and a huge file or a symlink to `/dev/zero` was
   read whole. A checkpoint that breaks the JSON parser (an integer past the
   int-string limit, deep nesting, bad UTF-8) is now an unreadable checkpoint
-  rather than an exception.
+  rather than an exception. Known limit: a process group does not contain a
+  process that leaves it on purpose — one that calls `setsid` or
+  `setpgid` survives without a sandbox. Under `sandbox: "bwrap"` the PID
+  namespace ends it with the sandbox; full containment for the other
+  backends is #352.
 - An agent no longer inherits the daemon's stdin; it gets `/dev/null`
   unless its prompt is sent on stdin. `codex exec` appends piped stdin to
   its prompt and waits for end-of-file, so with the daemon's stdin an open

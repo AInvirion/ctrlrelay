@@ -215,14 +215,14 @@ print(json.dumps(asyncio.run(main())))
 
 def _spawn_isolated(
     tmp_path: Path, request: pytest.FixtureRequest, *, timeout: int = 30,
-    hangs: bool = False,
+    hangs: bool = False, agent: str = _AGENT,
 ) -> tuple[dict, Path]:
     probe = tmp_path / "probe"
     probe.mkdir()
     work = tmp_path / "work"
     work.mkdir()
     script = tmp_path / "agent.sh"
-    script.write_text(_AGENT)
+    script.write_text(agent)
     script.chmod(0o755)
     env = {**os.environ, "AGENT_PROBE": str(probe)}
     if hangs:
@@ -313,3 +313,48 @@ class TestLeftoverProcessesAreReaped:
 
         assert shared_group is None
         assert own_group is not None and own_group != os.getpgrp()
+
+
+class TestTheStateDirectoryIsNotFollowed:
+    def test_a_symlinked_state_directory_is_refused_and_nothing_is_deleted(
+        self, tmp_path: Path
+    ) -> None:
+        """The agent controls its `.ctrlrelay` directory. Replaced with a
+        symlink to another run's, the relay used to read that run's
+        checkpoint as this one's result — and delete it."""
+        other = tmp_path / "other-run" / ".ctrlrelay"
+        other.mkdir(parents=True)
+        (other / "state.json").write_text(_VALID)
+        mine = tmp_path / "this-run"
+        mine.mkdir()
+        (mine / ".ctrlrelay").symlink_to(other)
+
+        with pytest.raises(CheckpointError):
+            read_checkpoint(mine / ".ctrlrelay" / "state.json", delete_after=True)
+
+        assert (other / "state.json").read_text() == _VALID
+
+
+_IGNORES_TERM = """#!/bin/sh
+# A background job that ignores SIGTERM: only the KILL escalation stops it.
+sh -c 'trap "" TERM; while :; do sleep 1; done' </dev/null >/dev/null 2>&1 &
+printf '%s' "$!" > "$AGENT_PROBE/background.pid"
+printf '%s' "$$" > "$AGENT_PROBE/agent.pid"
+mkdir -p -- "$(dirname "$CTRLRELAY_STATE_FILE")"
+printf '{"version":"1","status":"DONE","session_id":"%s",' \\
+  "$CTRLRELAY_SESSION_ID" > "$CTRLRELAY_STATE_FILE"
+printf '"timestamp":"2026-11-07T00:00:00Z","summary":"done"}' \\
+  >> "$CTRLRELAY_STATE_FILE"
+exit 0
+"""
+
+
+class TestTheGraceEndsInAKill:
+    def test_a_member_that_ignores_sigterm_is_killed(
+        self, tmp_path: Path, request: pytest.FixtureRequest
+    ) -> None:
+        result, probe = _spawn_isolated(tmp_path, request, agent=_IGNORES_TERM)
+
+        assert result["status"] == "DONE"
+        background = int((probe / "background.pid").read_text())
+        assert _wait_dead(background), "a TERM-ignoring job outlived the grace"

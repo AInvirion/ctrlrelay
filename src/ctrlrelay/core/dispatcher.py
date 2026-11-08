@@ -109,6 +109,11 @@ def _agent_group(proc: Any) -> int | None:
         # Already reaped. It was spawned as the leader of its own session,
         # and the kernel does not reuse a pid that still names a live
         # group, so the group — if anything of it is left — is still `pid`.
+        # Once that group is empty the number is free again, and a new
+        # group could in principle take it between here and the signal.
+        # Pids are allocated in sequence, so that needs a full wrap of the
+        # pid space inside a window of at most the grace period — accepted,
+        # and the price of reaching leftovers at all.
         return pid
     except OSError:
         return None
