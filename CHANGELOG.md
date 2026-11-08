@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An agent no longer inherits the daemon's stdin; it gets `/dev/null`
+  unless its prompt is sent on stdin. `codex exec` appends piped stdin to
+  its prompt and waits for end-of-file, so with the daemon's stdin an open
+  pipe every Codex run sat until the timeout without starting (#379).
 - A repository's own instruction link that points outside the checkout,
   such as `AGENTS.md -> /opt/shared/AGENTS.md`, was taken for the relay's
   context link: it was replaced while the agent ran and deleted at cleanup.

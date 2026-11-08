@@ -599,3 +599,71 @@ class TestCopilotManifest:
         for argv in (fresh, resumed):
             assert "--disable-builtin-mcps" in argv
         assert adapter.capabilities.resume is True
+
+
+class TestTheAgentNeverInheritsTheDaemonsStdin:
+    """A CLI that appends piped stdin to its prompt waits for end-of-file.
+
+    ``codex exec`` does: with stdin an open pipe it never starts, and the
+    run sits until the timeout. Every spawn without a stdin prompt gets
+    /dev/null instead of the daemon's stdin.
+    """
+
+    @pytest.mark.asyncio
+    async def test_arg_mode_spawns_with_devnull(self, tmp_path: Path) -> None:
+        adapter = _adapter(args=("run", "{prompt}"))
+        _, ex = await _spawn(adapter, tmp_path)
+        assert ex.call_args.kwargs["stdin"] is asyncio.subprocess.DEVNULL
+
+    @pytest.mark.asyncio
+    async def test_builtins_spawn_with_devnull(self, tmp_path: Path) -> None:
+        from ctrlrelay.core.dispatcher import ClaudeDispatcher, OpenCodeDispatcher
+
+        for adapter in (
+            ClaudeDispatcher(claude_binary="/bin/echo", usage_store=None),
+            OpenCodeDispatcher(opencode_binary="/bin/echo", usage_store=None),
+        ):
+            with patch(
+                "asyncio.create_subprocess_exec", return_value=_proc(),
+            ) as ex:
+                await adapter.spawn_session(
+                    session_id="s1", prompt="p", working_dir=tmp_path,
+                    state_file=tmp_path / "state.json", github_access=False,
+                )
+            assert ex.call_args.kwargs["stdin"] is asyncio.subprocess.DEVNULL, adapter
+
+    @pytest.mark.asyncio
+    async def test_a_cli_that_reads_stdin_finishes_under_an_open_pipe(
+        self, tmp_path: Path,
+    ) -> None:
+        """End to end: the parent's stdin is a pipe that never closes."""
+        import os
+
+        script = tmp_path / "reads-stdin"
+        script.write_text(
+            "#!/bin/sh\n"
+            # The shell's own read, not `cat`: one process the timeout can
+            # kill, so a regression fails in seconds instead of hanging.
+            "while read -r _; do :; done\n"
+            "mkdir -p \"$(dirname \"$CTRLRELAY_STATE_FILE\")\"\n"
+            "printf '{\"version\":\"1\",\"status\":\"DONE\",\"session_id\":\"s1\","
+            "\"timestamp\":\"2026-01-01T00:00:00Z\"}' > \"$CTRLRELAY_STATE_FILE\"\n"
+        )
+        script.chmod(0o755)
+        adapter = _adapter(binary=str(script), args=("{prompt}",))
+        read_end, write_end = os.pipe()
+        saved = os.dup(0)
+        os.dup2(read_end, 0)
+        try:
+            result = await adapter.spawn_session(
+                session_id="s1", prompt="p", working_dir=tmp_path,
+                state_file=tmp_path / ".ctrlrelay" / "state.json",
+                timeout=5, github_access=False,
+            )
+        finally:
+            os.dup2(saved, 0)
+            for fd in (saved, read_end, write_end):
+                os.close(fd)
+        assert not result.timed_out
+        assert result.state is not None and result.state.status.value == "DONE"
+
