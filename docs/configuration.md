@@ -87,6 +87,60 @@ Anything else raises at startup with a message naming the type. That is
 deliberate: a typo must stop the daemon rather than silently fall back
 to claude.
 
+### Proving a backend works: `ctrlrelay agent check`
+
+A backend being configured is not the same as a backend being usable. A
+run only counts when the agent writes the `DONE`,
+`BLOCKED_NEEDS_INPUT` or `FAILED` checkpoint to `CTRLRELAY_STATE_FILE` by
+running the shell snippet its prompt gives it; a CLI that exits zero
+having written nothing is a failed run that looks like a clean one.
+
+```
+ctrlrelay agent check copilot
+ctrlrelay agent check claude --timeout 120
+ctrlrelay agent check opencode --json
+```
+
+It creates a throwaway git repository in a temporary directory — one
+commit and a `README.md` — spawns one session there with GitHub
+credentials stripped, and hands it a prompt whose entire content is that
+checkpoint snippet. The throwaway repository is the agent's working
+directory, not a sandbox: with `agent.sandbox: none`, which is the only
+mode a generic plugin has today, the CLI runs as you and can reach
+anything you can, exactly as it does on a dev run. Check only a backend
+you would let run on this machine anyway. Then it reports, one
+line each:
+
+```
+exit code: 0
+checkpoint: written, status DONE
+native session id: 0c5f0a4e-2f1a-4a47-9d6c-7b2f1f0a9e31
+agent: type=copilot plugin=generic:copilot fingerprint=4f1c9a07b2de
+elapsed: 11.4s
+```
+
+Each line is a separate observation because they fail separately. A CLI
+that writes the checkpoint but reports no native session id looks
+resumable and is not; one that reports an id and writes nothing cannot
+finish a run at all. The temporary repository is removed whatever
+happens, and the command exits 0 **only** on a `DONE` checkpoint from a
+session that exited on its own — a CLI that writes `DONE` and then has
+to be stopped at the timeout would hang every dev run, so it fails the
+check, and the report still shows the checkpoint it wrote.
+
+`--timeout` defaults to 300 seconds and must be at least 1. `--json` prints the same report as
+one object, including on the failure paths, so a proof script does not
+have to read prose; under `--json` the structured log moves to stderr, so
+stdout is exactly that one line. An unknown type exits non-zero naming
+every type enrolled on the node.
+
+This is an operator tool run by somebody who already holds the config, so
+it may select any **enrolled** backend and does not require an entry in
+`agent.assignable_types`. That allowlist governs what an assignment
+arriving from outside the machine may ask for, which is a different
+question — and a proof that needed an entry would push operators to widen
+the one list that exists to stay narrow.
+
 ### Per-repo opt-in
 
 `agent.type` is the default for every repo. A single repo opts into
@@ -244,6 +298,9 @@ timeout/cancellation, and dispatch-health reporting. Generic plugins honestly
 report **no live transcript events, usage measurement, or sandbox**. The CLI
 must be able to write the normal `DONE`, `BLOCKED_NEEDS_INPUT`, or `FAILED`
 checkpoint to `CTRLRELAY_STATE_FILE`; merely exiting zero is not success.
+Run `ctrlrelay agent check <type>` once after enrolling a manifest — it
+answers exactly that question in under a minute, without a dev run; see
+[proving a backend works](#proving-a-backend-works-ctrlrelay-agent-check).
 
 Standalone selection is unchanged: `repos[].agent_type`, then `agent.type`.
 For a future registered assignment, an explicit override must be enrolled and

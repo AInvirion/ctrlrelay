@@ -21,10 +21,12 @@ Typical usage:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import sys
+from collections.abc import Iterator
 from typing import Any
 
 _CONFIGURED = False
@@ -94,6 +96,36 @@ def configure_logging(level: int = logging.INFO) -> None:
     handler.setFormatter(JSONFormatter())
     logger.addHandler(handler)
     _CONFIGURED = True
+
+
+@contextlib.contextmanager
+def logs_to_stderr() -> Iterator[None]:
+    """Send the structured log to stderr for the duration of the block.
+
+    The handler writes to stdout, which is right for the daemon: launchd
+    captures stdout into the log file. It is wrong for a command whose
+    stdout is one JSON object a caller pipes into a parser — five INFO
+    lines ahead of the object make it unparseable, and the caller's error
+    is about JSON rather than about the log.
+
+    The stream is moved rather than the level raised, so every line is
+    still there to read, on the channel that is not carrying the answer.
+    """
+    configure_logging()
+    logger = logging.getLogger("ctrlrelay")
+    moved = [
+        handler
+        for handler in logger.handlers
+        if isinstance(handler, logging.StreamHandler)
+        and getattr(handler, "stream", None) is sys.stdout
+    ]
+    for handler in moved:
+        handler.setStream(sys.stderr)
+    try:
+        yield
+    finally:
+        for handler in moved:
+            handler.setStream(sys.stdout)
 
 
 def get_logger(name: str) -> logging.Logger:

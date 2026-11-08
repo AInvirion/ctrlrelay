@@ -1785,6 +1785,67 @@ def select_agent(
     return AgentSelection(dispatcher, identity)
 
 
+def enrolled_agent_types(dispatcher: AgentAdapter) -> list[str]:
+    """Every agent type this node could build for a run, sorted.
+
+    Built backends and ones that are only buildable on demand both count.
+    Enrolment is a compatibility promise, which is a different question
+    from ``agent.assignable_types`` — that governs what an assignment
+    arriving from outside this machine may ask for.
+    """
+    types: set[str] = set(getattr(dispatcher, "by_type", None) or {})
+    types |= set(getattr(dispatcher, "resume_factories", None) or {})
+    own = getattr(dispatcher, "agent_type", None)
+    if isinstance(own, str) and own:
+        types.add(own)
+    return sorted(types)
+
+
+def select_enrolled_agent(
+    dispatcher: AgentAdapter, agent_type: str
+) -> AgentSelection:
+    """One enrolled backend by type, ignoring ``agent.assignable_types`` (#381).
+
+    :func:`select_agent` is the *assignment* seam: a requested type must
+    also be allowlisted, because the request can come from an issue or a
+    control plane rather than from this machine. This is the *operator*
+    seam, for a command run on the box by somebody who already holds its
+    config, so it asks only whether the type is enrolled here. Keeping the
+    two apart is the point: an operator proof that quietly needed an
+    allowlist entry would push operators to widen the allowlist, which is
+    the one thing it exists to keep narrow.
+
+    Raises :class:`AgentSelectionError` naming the enrolled types when
+    ``agent_type`` is not one of them, and when an enrolled backend cannot
+    be built on this node.
+    """
+    backend: AgentAdapter | None = (
+        getattr(dispatcher, "by_type", None) or {}
+    ).get(agent_type)
+    if backend is None and getattr(dispatcher, "agent_type", None) == agent_type:
+        # A single-backend deployment keeps its bare-adapter shape, so the
+        # default backend is not in any `by_type` mapping.
+        backend = dispatcher
+    if backend is None:
+        factory = (getattr(dispatcher, "resume_factories", None) or {}).get(
+            agent_type,
+        )
+        if factory is not None:
+            # Not cached into `by_type`, unlike `RepoAgentRouter.select`:
+            # that caches so a long-lived daemon shares one adapter's
+            # session counters, and an operator command makes exactly one
+            # selection per process. Caching here would instead enrol a
+            # backend on a running daemon's router that nothing routed to.
+            backend = _build_lazily(agent_type, factory)
+    if backend is None:
+        enrolled = enrolled_agent_types(dispatcher)
+        raise AgentSelectionError(
+            f"agent {agent_type!r} is not enrolled on this node; enrolled: "
+            + (", ".join(enrolled) if enrolled else "none")
+        )
+    return AgentSelection(backend, agent_identity_for(backend))
+
+
 def _elapsed_ms(started: float) -> int:
     """Milliseconds since ``started`` (a :func:`time.monotonic` reading)."""
     return int((time.monotonic() - started) * 1000)

@@ -1,10 +1,12 @@
 """CLI entry point for ctrlrelay."""
 
 import asyncio
+import json
 import os
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn
 
 import typer
 from rich.console import Console
@@ -12,6 +14,9 @@ from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from ctrlrelay import __version__
+from ctrlrelay.core.agent_check import (
+    DEFAULT_TIMEOUT_SECONDS as DEFAULT_AGENT_CHECK_TIMEOUT,
+)
 from ctrlrelay.core.blockers import hold_if_blocked
 from ctrlrelay.core.config import ConfigError, load_config, resolve_config_path
 from ctrlrelay.core.events import EventKind, emit_event
@@ -2264,6 +2269,120 @@ def bridge_test(
         asyncio.run(send_test())
     except Exception as e:
         console.print(f"[red]Failed to send message:[/red] {e}")
+        raise typer.Exit(1)
+
+
+agent_app = typer.Typer(help="One-shot checks against an agent backend (#381).")
+app.add_typer(agent_app, name="agent")
+
+
+@agent_app.command("check")
+def agent_check(
+    agent_type: str = typer.Argument(
+        ...,
+        help="An enrolled agent type: 'claude', 'opencode' or a key under agent.plugins.",
+    ),
+    config_path: str | None = typer.Option(
+        None, "--config", "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+    timeout: int = typer.Option(
+        DEFAULT_AGENT_CHECK_TIMEOUT, "--timeout",
+        help="Seconds the agent gets before the relay stops it.",
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Print the same report as one JSON object.",
+    ),
+) -> None:
+    """Prove one backend writes its checkpoint, on a throwaway repository.
+
+    Runs the backend once in a temporary git repo with a prompt that is
+    only the DONE checkpoint snippet, then reports the exit code, the
+    checkpoint, the native session id, the identity and the elapsed time.
+    Exits 0 only on a DONE checkpoint: a CLI that exits zero and writes
+    nothing is the failure this command exists to find.
+
+    An operator tool, so it may select any backend enrolled on this node
+    and does not require the type to be in `agent.assignable_types` —
+    that allowlist governs what an assignment arriving from outside the
+    machine may ask for, which is a different question from what the
+    person holding the config may test.
+    """
+    from contextlib import nullcontext
+
+    from ctrlrelay.core.agent_check import AgentCheckError, run_agent_check
+    from ctrlrelay.core.obs import logs_to_stderr
+
+    def fail(message: str, *, prefix: str = "") -> NoReturn:
+        """One failure shape, on whichever channel was asked for.
+
+        A caller that asked for JSON gets JSON on every exit, or it has to
+        parse prose to find out what broke — which is the moment it stops
+        checking and starts assuming the command worked.
+        """
+        if json_output:
+            typer.echo(json.dumps({
+                "ok": False, "agent_type": agent_type, "error": message,
+            }))
+        else:
+            console.print(
+                f"[red]\u2717[/red] {prefix}{rich_escape(message)}"
+            )
+        raise typer.Exit(1)
+
+    # Checked here rather than with Typer's `min=`, which rejects the value
+    # with a usage message before `--json` can answer as an object.
+    if timeout < 1:
+        fail(f"--timeout must be at least 1 second, got {timeout}")
+
+    # Resolved here rather than through `_resolve_config_or_exit`, which
+    # prints prose: a failed auto-discovery is still a failure the caller
+    # asked to receive as JSON.
+    try:
+        config = load_config(resolve_config_path(config_path))
+    except ConfigError as e:
+        fail(str(e), prefix="config: ")
+
+    # The structured log writes to stdout, which would put five INFO lines
+    # in front of the object `--json` promises.
+    quiet = logs_to_stderr() if json_output else nullcontext()
+    try:
+        with quiet:
+            report = asyncio.run(
+                run_agent_check(config, agent_type, timeout=timeout)
+            )
+    except AgentCheckError as e:
+        fail(str(e))
+    except OSError as e:
+        # A temporary directory, git or the spawn itself failing on this
+        # machine. Not a verdict on the backend, but still an answer.
+        fail(f"{type(e).__name__}: {e}")
+
+    if json_output:
+        typer.echo(json.dumps(report.as_dict()))
+    else:
+        for line in report.lines():
+            console.print(line, highlight=False)
+        if report.ok:
+            console.print(
+                f"[green]\u2713[/green] {agent_type} wrote the DONE checkpoint"
+            )
+        elif report.timed_out:
+            console.print(
+                f"[red]\u2717[/red] {agent_type} did not exit within {timeout}s"
+            )
+        else:
+            console.print(
+                f"[red]\u2717[/red] {agent_type} did not write a DONE checkpoint"
+            )
+            if report.stderr_tail:
+                # Only on the failure path, and only the tail. The next
+                # question after "it did not write the checkpoint" is
+                # always "what did it say instead", and without this the
+                # operator has to go and find the log to read it.
+                console.print("[dim]last stderr:[/dim]", highlight=False)
+                console.print(rich_escape(report.stderr_tail), highlight=False)
+    if not report.ok:
         raise typer.Exit(1)
 
 
