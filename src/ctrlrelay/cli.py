@@ -2272,6 +2272,37 @@ def bridge_test(
         raise typer.Exit(1)
 
 
+def _print_resume_report(report, agent_type: str) -> None:
+    """The two-round report (#382): the rounds, then every reason it failed.
+
+    Each failure and each warning gets its own line, because the three
+    ways resume breaks have three different fixes and a single verdict
+    would send the operator looking for the wrong one. Warnings are
+    printed on the pass path too — that is the only time anybody sees
+    them.
+    """
+    for line in report.lines():
+        # `soft_wrap` so a round line goes out whole: a native session id
+        # is a 36-character UUID, which puts the line past most terminal
+        # widths, and rich would otherwise break it mid-value — including
+        # in a log somebody greps for the id later.
+        console.print(line, highlight=False, soft_wrap=True)
+    for warning in report.warnings:
+        console.print(f"[yellow]![/yellow] {rich_escape(warning)}")
+    if report.ok:
+        console.print(
+            f"[green]\u2713[/green] {agent_type} resumed its session and "
+            "answered the question"
+        )
+        return
+    for failure in report.failures:
+        console.print(f"[red]\u2717[/red] {rich_escape(failure)}")
+    last = report.round2 or report.round1
+    if last.stderr_tail:
+        console.print("[dim]last stderr:[/dim]", highlight=False)
+        console.print(rich_escape(last.stderr_tail), highlight=False)
+
+
 agent_app = typer.Typer(help="One-shot checks against an agent backend (#381).")
 app.add_typer(agent_app, name="agent")
 
@@ -2288,7 +2319,11 @@ def agent_check(
     ),
     timeout: int = typer.Option(
         DEFAULT_AGENT_CHECK_TIMEOUT, "--timeout",
-        help="Seconds the agent gets before the relay stops it.",
+        help="Seconds the agent gets before the relay stops it, per round.",
+    ),
+    resume: bool = typer.Option(
+        False, "--resume",
+        help="Two rounds: block on a question, then resume and answer it.",
     ),
     json_output: bool = typer.Option(
         False, "--json", help="Print the same report as one JSON object.",
@@ -2302,6 +2337,12 @@ def agent_check(
     Exits 0 only on a DONE checkpoint: a CLI that exits zero and writes
     nothing is the failure this command exists to find.
 
+    With `--resume` it runs two rounds instead of one: the first is told a
+    random token and must write BLOCKED_NEEDS_INPUT, the second resumes
+    that native session and must write DONE whose summary is the token.
+    That is the half of the contract every blocked run depends on, and a
+    backend that cannot resume fails every run that has to ask something.
+
     An operator tool, so it may select any backend enrolled on this node
     and does not require the type to be in `agent.assignable_types` —
     that allowlist governs what an assignment arriving from outside the
@@ -2310,7 +2351,11 @@ def agent_check(
     """
     from contextlib import nullcontext
 
-    from ctrlrelay.core.agent_check import AgentCheckError, run_agent_check
+    from ctrlrelay.core.agent_check import (
+        AgentCheckError,
+        run_agent_check,
+        run_agent_resume_check,
+    )
     from ctrlrelay.core.obs import logs_to_stderr
 
     def fail(message: str, *, prefix: str = "") -> NoReturn:
@@ -2348,9 +2393,14 @@ def agent_check(
     quiet = logs_to_stderr() if json_output else nullcontext()
     try:
         with quiet:
-            report = asyncio.run(
-                run_agent_check(config, agent_type, timeout=timeout)
-            )
+            if resume:
+                report = asyncio.run(
+                    run_agent_resume_check(config, agent_type, timeout=timeout)
+                )
+            else:
+                report = asyncio.run(
+                    run_agent_check(config, agent_type, timeout=timeout)
+                )
     except AgentCheckError as e:
         fail(str(e))
     except OSError as e:
@@ -2360,6 +2410,8 @@ def agent_check(
 
     if json_output:
         typer.echo(json.dumps(report.as_dict()))
+    elif resume:
+        _print_resume_report(report, agent_type)
     else:
         for line in report.lines():
             console.print(line, highlight=False)
