@@ -102,9 +102,13 @@ ctrlrelay agent check opencode --json
 ```
 
 It creates a throwaway git repository in a temporary directory — one
-commit and a `README.md`, so no repository of yours is touched — spawns
-one session there with GitHub credentials stripped, and hands it a prompt
-whose entire content is that checkpoint snippet. Then it reports, one
+commit and a `README.md` — spawns one session there with GitHub
+credentials stripped, and hands it a prompt whose entire content is that
+checkpoint snippet. The throwaway repository is the agent's working
+directory, not a sandbox: with `agent.sandbox: none`, which is the only
+mode a generic plugin has today, the CLI runs as you and can reach
+anything you can, exactly as it does on a dev run. Check only a backend
+you would let run on this machine anyway. Then it reports, one
 line each:
 
 ```
@@ -119,9 +123,12 @@ Each line is a separate observation because they fail separately. A CLI
 that writes the checkpoint but reports no native session id looks
 resumable and is not; one that reports an id and writes nothing cannot
 finish a run at all. The temporary repository is removed whatever
-happens, and the command exits 0 **only** on a `DONE` checkpoint.
+happens, and the command exits 0 **only** on a `DONE` checkpoint from a
+session that exited on its own — a CLI that writes `DONE` and then has
+to be stopped at the timeout would hang every dev run, so it fails the
+check, and the report still shows the checkpoint it wrote.
 
-`--timeout` defaults to 300 seconds. `--json` prints the same report as
+`--timeout` defaults to 300 seconds and must be at least 1. `--json` prints the same report as
 one object, including on the failure paths, so a proof script does not
 have to read prose; under `--json` the structured log moves to stderr, so
 stdout is exactly that one line. An unknown type exits non-zero naming

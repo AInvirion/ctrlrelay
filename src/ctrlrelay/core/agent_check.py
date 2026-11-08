@@ -25,6 +25,7 @@ import os
 import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -32,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ctrlrelay.core.checkpoint import CheckpointError, read_checkpoint
 from ctrlrelay.core.dispatcher import (
     SessionResult,
     make_repo_agent_dispatcher,
@@ -59,6 +61,10 @@ FINGERPRINT_PREFIX_CHARS = 12
 # wrote; an absent file is a bug in whether it wrote at all.
 NO_CHECKPOINT = "none"
 UNREADABLE_CHECKPOINT = "unreadable"
+
+# A checkpoint is a few hundred bytes. Anything far larger is not one, and
+# reading it whole is how a hostile backend would exhaust the check's memory.
+_MAX_LEFTOVER_CHECKPOINT_BYTES = 64 * 1024
 
 _INSTRUCTION = "Run this exact shell command, then stop."
 
@@ -147,12 +153,15 @@ class AgentCheckReport:
 
     @property
     def ok(self) -> bool:
-        """Only ``DONE`` counts.
+        """Only ``DONE`` from a session that ended on its own counts.
 
         Not ``exit_code == 0``: the whole reason this command exists is
-        that a CLI can exit 0 having written nothing.
+        that a CLI can exit 0 having written nothing. And not a ``DONE``
+        the relay had to kill the CLI after: a dev run waits for the
+        process, so a backend that writes the checkpoint and never exits
+        still never finishes a run.
         """
-        return self.checkpoint == "DONE"
+        return self.checkpoint == "DONE" and not self.timed_out
 
     @property
     def fingerprint_prefix(self) -> str | None:
@@ -246,8 +255,10 @@ def make_throwaway_repo(root: Path) -> Path:
     A real repository rather than a bare directory, because a coding CLI
     may refuse to run outside one, and because the relay always hands the
     agent a worktree. A throwaway one rather than the repo the operator
-    happens to be standing in: the agent runs unconfined on most generic
-    plugins today, and a check must not be able to touch work in progress.
+    happens to be standing in, so a backend that follows the prompt has
+    nothing of theirs in its working directory. That is a choice of
+    working directory, not confinement: without a sandbox the agent runs
+    as the operator and can reach anything they can.
     """
     repo = root / "repo"
     repo.mkdir()
@@ -276,18 +287,17 @@ def _report(
 ) -> AgentCheckReport:
     """Read one :class:`SessionResult` into a report.
 
-    ``result.state`` is ``None`` both when nothing was written and when
-    what was written would not parse — the dispatcher logs the difference
-    and collapses it. The file itself tells them apart, because a
-    checkpoint that parsed was deleted as it was read, and one that did
-    not is still on disk.
+    ``result.state`` is ``None`` when nothing was written, when what was
+    written would not parse, and on a timeout — where the dispatcher
+    returns before reading the checkpoint at all. A checkpoint that parsed
+    was deleted as it was read, so whatever is left on disk is parsed here:
+    a backend that wrote a good ``DONE`` and then hung is a different
+    defect from one that wrote rubbish, and the report has to say which.
     """
     if result.state is not None:
         checkpoint = result.state.status.value
-    elif state_file.exists():
-        checkpoint = UNREADABLE_CHECKPOINT
     else:
-        checkpoint = NO_CHECKPOINT
+        checkpoint = _leftover_checkpoint(state_file)
     return AgentCheckReport(
         agent_type=identity.agent_type,
         plugin_id=identity.plugin_id,
@@ -302,6 +312,27 @@ def _report(
         timed_out=result.timed_out,
         stderr_tail=(result.stderr or "")[-500:],
     )
+
+
+def _leftover_checkpoint(state_file: Path) -> str:
+    """The status in a checkpoint still on disk, or why there is none.
+
+    Only a small regular file is opened. The agent controls that path, and
+    a FIFO there would block this read forever, past the timeout the
+    operator asked for and past the cleanup that removes the repository.
+    """
+    try:
+        st = os.lstat(state_file)
+    except FileNotFoundError:
+        return NO_CHECKPOINT
+    except OSError:
+        return UNREADABLE_CHECKPOINT
+    if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_LEFTOVER_CHECKPOINT_BYTES:
+        return UNREADABLE_CHECKPOINT
+    try:
+        return read_checkpoint(state_file).status.value
+    except (CheckpointError, OSError, UnicodeDecodeError):
+        return UNREADABLE_CHECKPOINT
 
 
 async def run_agent_check(

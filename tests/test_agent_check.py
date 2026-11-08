@@ -649,3 +649,110 @@ class TestTheCliCommand:
         from ctrlrelay.core.agent_check import DEFAULT_TIMEOUT_SECONDS
 
         assert DEFAULT_TIMEOUT_SECONDS == 300
+
+
+# Writes a valid DONE checkpoint, then never exits.
+_WRITES_DONE_THEN_HANGS = _with_prelude("").replace(
+    "exit 0\n", "exec sleep 600\n",
+)
+
+
+class TestABackendThatWritesThenHangs:
+    def test_it_is_reported_as_timed_out_with_the_checkpoint_it_wrote(
+        self, tmp_path: Path
+    ) -> None:
+        """The dispatcher returns before reading the checkpoint on its
+        timeout path, so the file is still on disk and valid. Calling it
+        unparseable sends the operator after the wrong defect: the
+        checkpoint is fine, and the CLI's failure is that it never exits."""
+        from ctrlrelay.core.agent_check import UNREADABLE_CHECKPOINT
+
+        config = _config(
+            tmp_path, fake=_plugin(_script(tmp_path, _WRITES_DONE_THEN_HANGS)),
+        )
+        report = _run(config, "fake", timeout=2)
+
+        assert report.timed_out
+        assert report.checkpoint != UNREADABLE_CHECKPOINT
+        assert report.checkpoint == "DONE"
+        assert not report.ok
+        assert "stopped it" in report.lines()[0]
+
+
+class TestTheCliRefusesWhatItCannotRun:
+    @pytest.mark.parametrize("value", ["0", "-5"])
+    def test_a_timeout_that_is_not_positive_is_refused(
+        self, tmp_path: Path, value: str
+    ) -> None:
+        """Zero would not mean "no time": the adapters read `timeout or
+        default`, so `--timeout 0` quietly became the configured session
+        timeout, which can be half an hour."""
+        result = TestTheCliCommand()._invoke(
+            tmp_path, ["fake", "--timeout", value],
+            {"fake": _plugin(_script(tmp_path, _WRITES_DONE))},
+        )
+
+        assert result.exit_code != 0
+        assert "status DONE" not in result.output
+
+    def test_json_reports_an_undiscoverable_config_as_an_object(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Auto-discovery fails before the config is loaded, on a path that
+        printed prose whatever the caller had asked for."""
+        from typer.testing import CliRunner
+
+        import ctrlrelay.core.config as config_module
+        from ctrlrelay.cli import app
+
+        monkeypatch.setattr(
+            config_module, "default_config_search_paths",
+            lambda: [tmp_path / "nowhere.yaml"],
+        )
+        result = CliRunner().invoke(app, ["agent", "check", "fake", "--json"])
+
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["ok"] is False
+        assert payload["error"]
+
+    def test_json_reports_a_temp_dir_failure_as_an_object(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OSError preparing the run is not an agent verdict, but a
+        caller that asked for JSON still has to be able to read it."""
+        import ctrlrelay.core.agent_check as agent_check
+
+        def no_space(*_a, **_k):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(agent_check.tempfile, "mkdtemp", no_space)
+        result = TestTheCliCommand()._invoke(
+            tmp_path, ["fake", "--json"],
+            {"fake": _plugin(_script(tmp_path, _WRITES_DONE))},
+        )
+
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["ok"] is False
+        assert "No space left" in payload["error"]
+
+
+class TestALeftoverStateFileIsReadSafely:
+    def test_a_fifo_left_at_the_state_path_does_not_hang_the_report(
+        self, tmp_path: Path
+    ) -> None:
+        """The agent controls that path. Opening a FIFO there would block
+        forever — past the timeout and past the cleanup of the repository."""
+        from ctrlrelay.core.agent_check import UNREADABLE_CHECKPOINT
+
+        script = _script(tmp_path, """#!/bin/sh
+mkdir -p -- "$(dirname "$CTRLRELAY_STATE_FILE")"
+mkfifo "$CTRLRELAY_STATE_FILE"
+exec sleep 600
+""")
+        report = _run(_config(tmp_path, fake=_plugin(script)), "fake", timeout=2)
+
+        assert report.timed_out
+        assert report.checkpoint == UNREADABLE_CHECKPOINT
+        assert not report.ok

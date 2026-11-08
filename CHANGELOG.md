@@ -16,9 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoint snippet, then reports the exit code, the checkpoint and its
   status, the native session id the adapter captured, the selected identity
   and the elapsed time — one line each, because they fail separately. Exits
-  0 only on a `DONE` checkpoint: a CLI that exits zero having written
-  nothing is the failure the command exists to find. `--timeout` defaults
-  to 300 seconds, `--json` prints the same report as one object including on
+  0 only on a `DONE` checkpoint from a session that exited on its own: a
+  CLI that exits zero having written nothing is the failure the command
+  exists to find, and one that writes `DONE` and then has to be stopped
+  would hang every dev run. The throwaway repository is a working
+  directory, not a sandbox. `--timeout` defaults to 300 seconds and must
+  be at least 1, `--json` prints the same report as one object including on
   the failure paths — with the structured log moved to stderr so stdout is
   exactly that object — and an unknown type exits non-zero naming every type
   enrolled on the node. As an operator tool it may select any enrolled

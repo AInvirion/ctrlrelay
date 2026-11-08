@@ -2287,7 +2287,7 @@ def agent_check(
         help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
     timeout: int = typer.Option(
-        DEFAULT_AGENT_CHECK_TIMEOUT, "--timeout",
+        DEFAULT_AGENT_CHECK_TIMEOUT, "--timeout", min=1,
         help="Seconds the agent gets before the relay stops it.",
     ),
     json_output: bool = typer.Option(
@@ -2330,9 +2330,11 @@ def agent_check(
             )
         raise typer.Exit(1)
 
-    path = _resolve_config_or_exit(config_path)
+    # Resolved here rather than through `_resolve_config_or_exit`, which
+    # prints prose: a failed auto-discovery is still a failure the caller
+    # asked to receive as JSON.
     try:
-        config = load_config(path)
+        config = load_config(resolve_config_path(config_path))
     except ConfigError as e:
         fail(str(e), prefix="config: ")
 
@@ -2346,6 +2348,10 @@ def agent_check(
             )
     except AgentCheckError as e:
         fail(str(e))
+    except OSError as e:
+        # A temporary directory, git or the spawn itself failing on this
+        # machine. Not a verdict on the backend, but still an answer.
+        fail(f"{type(e).__name__}: {e}")
 
     if json_output:
         typer.echo(json.dumps(report.as_dict()))
@@ -2355,6 +2361,10 @@ def agent_check(
         if report.ok:
             console.print(
                 f"[green]\u2713[/green] {agent_type} wrote the DONE checkpoint"
+            )
+        elif report.timed_out:
+            console.print(
+                f"[red]\u2717[/red] {agent_type} did not exit within {timeout}s"
             )
         else:
             console.print(
