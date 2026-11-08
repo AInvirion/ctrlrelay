@@ -561,6 +561,8 @@ class AgentResumeCheckReport:
     @property
     def elapsed_seconds(self) -> float:
         total = self.round1.elapsed_seconds
+        if self.decoy is not None:
+            total += self.decoy.elapsed_seconds
         if self.round2 is not None:
             total += self.round2.elapsed_seconds
         return total
@@ -860,8 +862,9 @@ async def run_agent_resume_check(
             token,
             round1,
             round2,
-            _round2_failures(round2, token, timeout, decoy_token=decoy_token),
-            _round2_warnings(round1, round2, decoy),
+            _decoy_failures(round1, decoy)
+            + _round2_failures(round2, token, timeout, decoy_token=decoy_token),
+            _round2_warnings(round1, round2),
             session_id,
             decoy=decoy,
             decoy_token=decoy_token,
@@ -885,6 +888,28 @@ def _round1_failures(round1: AgentCheckReport, timeout: int) -> tuple[str, ...]:
             "resume: the adapter reads it from the CLI's own output"
         )
     return tuple(failures)
+
+
+def _decoy_failures(
+    round1: AgentCheckReport, decoy: AgentCheckReport
+) -> tuple[str, ...]:
+    """Why the decoy could not do its one job, if it could not.
+
+    Its checkpoint is not judged. What it has to be is another session:
+    one with a native id of its own. Without that, "the most recent
+    session" is round 1's again, a backend that resumes by recency passes,
+    and the check cannot tell — which is an inconclusive result, not a pass.
+    """
+    if decoy.agent_session_id is None:
+        why = "reported no native session id"
+    elif decoy.agent_session_id == round1.agent_session_id:
+        why = "reported the same native session id as round 1"
+    else:
+        return ()
+    return (
+        f"the decoy session {why}, so resuming by recency could not be "
+        "ruled out: inconclusive",
+    )
 
 
 def _round2_failures(
@@ -922,7 +947,6 @@ def _round2_failures(
 def _round2_warnings(
     round1: AgentCheckReport,
     round2: AgentCheckReport,
-    decoy: AgentCheckReport | None = None,
 ) -> tuple[str, ...]:
     """What to say about the native session id without failing the backend.
 
@@ -930,21 +954,7 @@ def _round2_warnings(
     still resumed if the token came back. The pipelines store whatever the
     adapter reports, so the operator does want to know — as a warning.
     """
-    warnings: list[str] = []
-    if decoy is not None and (
-        decoy.agent_session_id is None
-        or decoy.agent_session_id == round1.agent_session_id
-    ):
-        # The decoy only separates "latest" from "this id" when it really
-        # is another session. It did not report one, so the pass rests on
-        # the token alone.
-        warnings.append(
-            "the decoy session reported "
-            + ("no native session id" if decoy.agent_session_id is None
-               else "the same native session id as round 1")
-            + ", so resuming by recency could not be ruled out"
-        )
-    return tuple(warnings) + _session_id_warnings(round1, round2)
+    return _session_id_warnings(round1, round2)
 
 
 def _session_id_warnings(

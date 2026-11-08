@@ -836,6 +836,8 @@ native=fake-native-7f3a
 if [ -e "$FAKE_AGENT_MEMORY/round1-prompt" ]; then
   native=fake-native-decoy
   printf '%s' "$1" > "$FAKE_AGENT_MEMORY/decoy-prompt"
+  # A decoy that never establishes a session: nothing remembered, no id.
+  [ -n "$FAKE_AGENT_DECOY_NO_ID" ] && exit 0
 else
   printf '%s' "$1" > "$FAKE_AGENT_MEMORY/round1-prompt"
 fi
@@ -1323,3 +1325,38 @@ class TestResumeIsByIdNotByRecency:
         assert report.token not in decoy
         assert report.token not in (memory / "round2-prompt").read_text()
         assert report.decoy_token not in (memory / "round2-prompt").read_text()
+
+    def test_a_decoy_that_reports_no_session_makes_the_check_inconclusive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a distinct decoy session, "latest" and "the id round 2
+        was given" are the same session again, and a recency backend
+        passes. That is not a pass."""
+        _memory(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_AGENT_RESUME_LAST", "1")
+        monkeypatch.setenv("FAKE_AGENT_DECOY_NO_ID", "1")
+        script = _script(tmp_path, _REMEMBERS_THE_TOKEN)
+
+        report = _run_resume(
+            _config(tmp_path, fake=_resumable_plugin(script)), "fake",
+        )
+
+        assert not report.ok
+        assert any("decoy" in f for f in report.failures), report.failures
+
+    def test_elapsed_includes_the_decoy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _memory(tmp_path, monkeypatch)
+        script = _script(tmp_path, _REMEMBERS_THE_TOKEN)
+
+        report = _run_resume(
+            _config(tmp_path, fake=_resumable_plugin(script)), "fake",
+        )
+
+        assert report.decoy is not None
+        assert report.elapsed_seconds == pytest.approx(
+            report.round1.elapsed_seconds
+            + report.decoy.elapsed_seconds
+            + report.round2.elapsed_seconds
+        )

@@ -178,9 +178,10 @@ manifest that resumes by recency (`--continue`, `resume --last`) instead
 of passing `{resume_session_id}` would otherwise pass, since the only
 session to resume is the right one, and then resume somebody else's
 session on a node where runs interleave. Round 2 answering with the
-decoy's token fails with exactly that diagnosis. The decoy's own outcome
-is not judged; if it reports no native id, or round 1's, the result is a
-warning that recency could not be ruled out.
+decoy's token fails with exactly that diagnosis. The decoy's checkpoint
+is not judged, but it must report a native session id of its own: if it
+reports none, or round 1's, recency cannot be ruled out and the check
+fails as inconclusive.
 
 Round 1 must report both the blocked checkpoint and a native session id,
 or the command stops there and says which was missing — there is nothing
