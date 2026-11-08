@@ -52,6 +52,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An agent no longer inherits the daemon's stdin; it gets `/dev/null`
+  unless its prompt is sent on stdin. `codex exec` appends piped stdin to
+  its prompt and waits for end-of-file, so with the daemon's stdin an open
+  pipe every Codex run sat until the timeout without starting (#379).
+- A repository's own instruction link that points outside the checkout,
+  such as `AGENTS.md -> /opt/shared/AGENTS.md`, was taken for the relay's
+  context link: it was replaced while the agent ran and deleted at cleanup.
+  Only links to the repo's context file are now replaced or removed (#379).
+- When the daemon's `PATH` held a relative entry (`.`, an empty entry,
+  `bin`), a file committed to the repository could run in place of a bare
+  agent `binary`, of an `#!/usr/bin/env` interpreter, or of a command the
+  agent ran, because the agent starts inside the worktree. Agents now start
+  with relative `PATH` entries removed, sandboxed or not. This predates the
+  plugin runtime.
+- Context-link cleanup walks the worktree without following symlinks, so a
+  directory swapped for a link during a run cannot redirect it outside the
+  checkout (#379).
 - The relay no longer replaces a repository's own `CLAUDE.md` with its repo
   context link. The tracked file became a type change while the agent ran
   and a deletion after cleanup, so an agent that staged everything could put

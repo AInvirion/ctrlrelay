@@ -218,9 +218,27 @@ no captured native id fails closed rather than invoking fresh `args`.
 `instructions_files` names where the CLI reads repository instructions; the
 relay links the repo context under each one (for example `AGENTS.md`, or
 `.github/copilot-instructions.md` for Copilot). Each name must stay inside the
-worktree. A name the repository already has, as a file or its own link, is left
-untouched, so the agent reads the repo's instructions there and the checkout
-stays clean.
+worktree. A name the repository already has, as a file or its own link (relative
+or absolute), is left untouched, so the agent reads the repo's instructions there
+and the checkout stays clean. Only links pointing at the repo's context file are
+ever replaced or removed, and they are reached by walking the worktree without
+following any symlink, so a directory swapped for a link cannot redirect the
+cleanup outside the checkout. A link left behind by a run the daemon restarted
+during stays until the next run on that worktree replaces it; it is listed in the
+worktree's `info/exclude` meanwhile, so `git add -A` does not pick it up.
+
+Every agent is started with relative entries (`.`, an empty entry, `bin`)
+removed from its `PATH`. The agent runs inside the repository worktree, so a
+relative entry would let a file committed to the repository run in place of the
+agent, of an `#!/usr/bin/env` interpreter its launcher names, or of any command
+the agent runs. A bare `binary` that exists only through such an entry fails as a
+missing binary.
+
+Known limit: the cleanup walk starts at the worktree directory itself. An agent
+that renames the whole worktree and puts a symlink in its place can point the
+cleanup at another directory, where only a link to this repo's context file
+could be removed. An unconfined agent already runs as the same user, so this
+needs no new access; confinement (#352) is what closes it.
 
 Each manifest gets a SHA-256 fingerprint over its resolved binary, argv,
 prompt/session mapping, model/provider and environment. Built-in adapters
@@ -232,6 +250,11 @@ a built-in binary path cannot silently hand an old native session to a
 different executable. Generic manifests remain resumable when they are removed
 from `assignable_types`; assignment permission and resume compatibility are
 separate decisions.
+
+The pin is a **compatibility check, not tamper protection**. It stops a
+configuration change from resuming a run on a different backend; it does not
+stop someone who can write the launcher file itself, and an unconfined agent
+runs as the same user that owns it. Confinement is #352's job.
 
 #### Example: GitHub Copilot CLI
 

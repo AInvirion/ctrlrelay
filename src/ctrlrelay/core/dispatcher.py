@@ -116,6 +116,25 @@ def _normalise_builtin_binary(binary: str, *, label: str) -> str:
     return str(Path(found).absolute()) if found else binary
 
 
+def _absolute_path_only(env: dict[str, str]) -> dict[str, str]:
+    """``env`` with every relative ``PATH`` entry removed.
+
+    An agent starts in the run's worktree, which is repository content.
+    Any lookup through a relative entry (``.``, an empty entry, ``bin``)
+    is a lookup inside the repository: ``exec`` finding a bare agent name,
+    bwrap's own search inside the sandbox, an ``#!/usr/bin/env node``
+    launcher finding its interpreter, and every command the agent runs
+    after that. Dropping those entries from the child's environment covers
+    all of them at once; a name found nowhere else fails as a missing
+    binary always did.
+    """
+    entries = env.get("PATH", "").split(os.pathsep)
+    kept = [entry for entry in entries if os.path.isabs(entry)]
+    if kept == entries:
+        return env
+    return {**env, "PATH": os.pathsep.join(kept)}
+
+
 @dataclass(frozen=True)
 class DispatchOutcome:
     """What one spawn did, handed to the outcome hook (#204).
@@ -555,13 +574,18 @@ class CliAgentAdapter:
                 proc = await asyncio.create_subprocess_exec(
                     *short, *cmd[sandbox_prefix_len:],
                     cwd=working_dir,
-                    env=env,
+                    env=_absolute_path_only(env),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     pass_fds=pass_fds,
-                    **({} if stdin_text is None else {
-                        "stdin": asyncio.subprocess.PIPE
-                    }),
+                    # Never the daemon's own stdin. A CLI that appends
+                    # piped stdin to its prompt (codex exec does) waits
+                    # for an end-of-file that an inherited pipe never
+                    # sends, and the run sits until the timeout.
+                    stdin=(
+                        asyncio.subprocess.DEVNULL if stdin_text is None
+                        else asyncio.subprocess.PIPE
+                    ),
                 )
             finally:
                 # The child has its own copy now; bwrap reads it at start.

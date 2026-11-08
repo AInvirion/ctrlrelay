@@ -11,8 +11,8 @@ import shutil
 import stat
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -402,27 +402,65 @@ def _safe_context_target(worktree_path: Path, name: str) -> Path:
     return worktree_path.joinpath(*path.parts)
 
 
-def _is_relay_context_link(worktree_path: Path, target: Path) -> bool:
-    """Whether ``target`` is a context link the relay itself made.
+_PARENT_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
 
-    The relay always links to the absolute, resolved context file, which
-    lives outside the worktree. A repository's own instruction file is a
-    regular file or, when it is a link (``AGENTS.md -> CLAUDE.md`` is a
-    common pattern), a relative one inside the checkout. Only the first
-    kind may be replaced or removed: touching the second would change a
-    tracked file, and an agent that stages everything would put the
-    host-path link, or the deletion, into the pull request.
+
+@contextlib.contextmanager
+def _context_parent(
+    worktree_path: Path, name: str, *, create: bool,
+) -> Iterator[tuple[int, str]]:
+    """The directory holding ``name``, opened without following any link.
+
+    Yields ``(dir_fd, basename)``. Each component below the worktree is
+    opened relative to the one before with ``O_NOFOLLOW``, so a directory
+    the agent swaps for a symlink, before or during cleanup, makes the
+    walk fail instead of redirecting a check or an unlink outside the
+    checkout. Everything done to ``basename`` then goes through ``dir_fd``.
+    A missing parent raises ``FileNotFoundError`` unless ``create`` is set;
+    a parent that is a link or not a directory raises ``ValueError``.
     """
-    if not target.is_symlink():
-        return False
+    parts = _safe_context_target(worktree_path, name).relative_to(
+        worktree_path
+    ).parts
+    fd = os.open(worktree_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        dest = Path(os.readlink(target))
+        for part in parts[:-1]:
+            if create:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, dir_fd=fd)
+            try:
+                child = os.open(part, _PARENT_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                raise
+            except OSError as e:
+                raise ValueError(
+                    f"context directory {part!r} under {worktree_path} is a "
+                    "symlink or not a directory"
+                ) from e
+            os.close(fd)
+            fd = child
+        yield fd, parts[-1]
+    finally:
+        os.close(fd)
+
+
+def _link_points_to(dir_fd: int, name: str, destination: str) -> bool:
+    """Whether ``name`` in ``dir_fd`` is a symlink storing ``destination``.
+
+    The relay's context links store the absolute, resolved path of the
+    repo's context file, and nothing in a checkout has a reason to point
+    there. Matching that exact string is what tells a relay link from a
+    repository's own instruction file or link (relative, or absolute to
+    somewhere else such as ``/opt/shared/AGENTS.md``): those are tracked,
+    and replacing or removing them would put a type change or a deletion
+    in front of an agent that stages everything.
+    """
+    try:
+        return os.readlink(name, dir_fd=dir_fd) == destination
     except OSError:
         return False
-    if not dest.is_absolute():
-        return False
-    root = worktree_path.resolve()
-    return dest != root and root not in dest.parents
 
 
 def _add_exclude_line(admin_fd: int, where: Path, line: str) -> None:
@@ -523,6 +561,13 @@ class WorktreeManager:
     # repo and where the old clone went. Best-effort: a failure is
     # logged and never fails the run.
     on_reclone: Callable[[str, Path], Awaitable[None]] | None = None
+    # The context file each worktree's links point at, recorded by
+    # symlink_context so remove_context_symlink deletes only those links.
+    # Every pipeline links before it cleans up, in the same process; a
+    # worktree this process never linked has nothing it may remove.
+    _context_targets: dict[Path, str] = field(
+        default_factory=dict, init=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.worktrees_dir = Path(self.worktrees_dir)
@@ -2406,29 +2451,26 @@ class WorktreeManager:
         context still goes under every name that is free. Returns the names
         that were linked.
         """
+        destination = str(context_path.resolve())
+        self._context_targets[Path(worktree_path)] = destination
         linked: list[str] = []
         for name in filenames:
-            target = _safe_context_target(worktree_path, name)
-            cursor = worktree_path
-            for part in target.parent.relative_to(worktree_path).parts:
-                cursor = cursor / part
-                if cursor.is_symlink():
-                    raise ValueError(
-                        f"context directory {cursor} is a symlink"
-                    )
-                cursor.mkdir(exist_ok=True)
-
-            if _is_relay_context_link(worktree_path, target):
-                # Ours, from an earlier round on a reused worktree.
-                target.unlink()
-            elif target.exists() or target.is_symlink():
-                log_event(
-                    _logger, "worktree.context.kept_repo_file",
-                    worktree=str(worktree_path), context_name=name,
-                )
-                continue
-
-            target.symlink_to(context_path.resolve())
+            with _context_parent(worktree_path, name, create=True) as (fd, base):
+                if _link_points_to(fd, base, destination):
+                    # Ours, from an earlier round on a reused worktree.
+                    os.unlink(base, dir_fd=fd)
+                else:
+                    try:
+                        os.stat(base, dir_fd=fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        log_event(
+                            _logger, "worktree.context.kept_repo_file",
+                            worktree=str(worktree_path), context_name=name,
+                        )
+                        continue
+                os.symlink(destination, base, dir_fd=fd)
             linked.append(name)
 
         if not linked:
@@ -2540,10 +2582,29 @@ class WorktreeManager:
     ) -> None:
         """Remove the context links before git operations.
 
-        Only links the relay made are removed; a repository's own file or
-        link under the same name is part of the checkout and stays.
+        Only links pointing at the context file this manager linked into
+        ``worktree_path`` are removed; a repository's own file or link under
+        the same name is part of the checkout and stays.
         """
+        key = Path(worktree_path)
+        destination = self._context_targets.get(key)
+        if destination is None:
+            return
+        complete = True
         for name in filenames:
-            target = _safe_context_target(worktree_path, name)
-            if _is_relay_context_link(worktree_path, target):
-                target.unlink()
+            try:
+                with _context_parent(
+                    worktree_path, name, create=False,
+                ) as (fd, base):
+                    if _link_points_to(fd, base, destination):
+                        os.unlink(base, dir_fd=fd)
+            except FileNotFoundError:
+                # No parent directory: nothing of ours can be there.
+                continue
+            except (OSError, ValueError):
+                # A parent the agent replaced or locked. Nothing outside
+                # the checkout is touched, and the target is kept so a
+                # later cleanup of this worktree can still finish.
+                complete = False
+        if complete:
+            del self._context_targets[key]
