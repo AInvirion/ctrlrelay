@@ -799,3 +799,564 @@ def test_json_reports_a_non_positive_timeout_as_an_object(tmp_path: Path) -> Non
     payload = json.loads(result.output.strip())
     assert payload["ok"] is False
     assert "timeout" in payload["error"]
+
+
+# --- the resume round (#382) ------------------------------------------------
+#
+# The fake below is the whole point of these tests: it has no memory of its
+# own, so it stands in for a CLI that really does carry context across a
+# resume. Round 1 reads the token out of its prompt and files it under the
+# native session id it prints; round 2 is handed that id on the command line
+# and can only answer by looking the token up. A fake that echoed the token
+# straight back would pass while `--resume <id>` went nowhere.
+
+_REMEMBERS_THE_TOKEN = """#!/bin/sh
+mkdir -p -- "$FAKE_AGENT_MEMORY"
+printf 'ran\\n' >> "$FAKE_AGENT_MEMORY/calls"
+mkdir -p -- "$(dirname "$CTRLRELAY_STATE_FILE")"
+if [ "$1" = "--resume" ]; then
+  native="$2"
+  printf '%s' "$3" > "$FAKE_AGENT_MEMORY/round2-prompt"
+  token=$(cat "$FAKE_AGENT_MEMORY/$native" 2>/dev/null)
+  if [ -n "$FAKE_AGENT_RESUME_LAST" ]; then
+    token=$(cat "$FAKE_AGENT_MEMORY/last" 2>/dev/null)
+  fi
+  if [ -n "$FAKE_AGENT_ROUND2_SILENT" ]; then
+    printf '{"sessionId":"%s"}\\n' "$native"
+    exit 0
+  fi
+  printf '{"version":"1","status":"DONE","session_id":"%s",' \\
+    "$CTRLRELAY_SESSION_ID" > "$CTRLRELAY_STATE_FILE"
+  printf '"timestamp":"2026-11-07T00:00:00Z","summary":"%s"}' \\
+    "${FAKE_AGENT_SUMMARY-$token}" >> "$CTRLRELAY_STATE_FILE"
+  printf '{"sessionId":"%s"}\\n' "${FAKE_AGENT_ROUND2_NATIVE-$native}"
+  exit 0
+fi
+native=fake-native-7f3a
+if [ -e "$FAKE_AGENT_MEMORY/round1-prompt" ]; then
+  native=fake-native-decoy
+  printf '%s' "$1" > "$FAKE_AGENT_MEMORY/decoy-prompt"
+  # A decoy that never establishes a session: nothing remembered, no id.
+  [ -n "$FAKE_AGENT_DECOY_NO_ID" ] && exit 0
+else
+  printf '%s' "$1" > "$FAKE_AGENT_MEMORY/round1-prompt"
+fi
+token=$(printf '%s' "$1" | sed -n 's/^TOKEN: \\([0-9a-f]*\\)$/\\1/p' | head -1)
+printf '%s' "$token" > "$FAKE_AGENT_MEMORY/$native"
+printf '%s' "$token" > "$FAKE_AGENT_MEMORY/last"
+printf '{"version":"1","status":"%s","session_id":"%s",' \\
+  "${FAKE_AGENT_ROUND1_STATUS-BLOCKED_NEEDS_INPUT}" \\
+  "$CTRLRELAY_SESSION_ID" > "$CTRLRELAY_STATE_FILE"
+printf '"timestamp":"2026-11-07T00:00:00Z","question":"What is the token?",' \\
+  >> "$CTRLRELAY_STATE_FILE"
+printf '"summary":"round one"}' >> "$CTRLRELAY_STATE_FILE"
+if [ -z "$FAKE_AGENT_HIDE_NATIVE_ID" ]; then
+  printf '{"sessionId":"%s"}\\n' "$native"
+fi
+exit 0
+"""
+
+_RESUMABLE = {
+    "resume_args": ["--resume", "{resume_session_id}"],
+    "session_id_path": "sessionId",
+}
+
+
+def _resumable_plugin(script: Path, **extra) -> dict:
+    return _plugin(script, **{**_RESUMABLE, **extra})
+
+
+def _memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Where the fake keeps the token, its call log and the prompts it saw."""
+    where = tmp_path / "fake-memory"
+    monkeypatch.setenv("FAKE_AGENT_MEMORY", str(where))
+    return where
+
+
+def _run_resume(config, agent_type: str, *, timeout: int = 60):
+    from ctrlrelay.core.agent_check import run_agent_resume_check
+
+    return asyncio.run(
+        run_agent_resume_check(config, agent_type, timeout=timeout)
+    )
+
+
+def _calls(memory: Path) -> int:
+    log = memory / "calls"
+    return len(log.read_text().splitlines()) if log.exists() else 0
+
+
+class TestABackendThatResumes:
+    def test_both_rounds_pass_and_the_token_comes_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        memory = _memory(tmp_path, monkeypatch)
+        config = _config(
+            tmp_path,
+            fake=_resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        report = _run_resume(config, "fake")
+
+        assert report.ok is True, report.failures
+        assert report.failures == ()
+        assert report.warnings == ()
+        assert report.rounds_run == 2
+        assert report.round1.checkpoint == "BLOCKED_NEEDS_INPUT"
+        assert report.round1.agent_session_id == "fake-native-7f3a"
+        assert report.round2 is not None
+        assert report.round2.checkpoint == "DONE"
+        assert report.round2.checkpoint_summary == report.token
+        assert report.round2.agent_session_id == "fake-native-7f3a"
+        assert len(report.token) == 8
+        # Round 1, the decoy, round 2.
+        assert _calls(memory) == 3
+
+    def test_round_two_is_handed_the_native_id_round_one_captured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The resume argv is what is actually under test here.
+
+        Without this, a pass would be consistent with round 2 starting a
+        fresh session that happened to know the token — which is the one
+        thing the token was introduced to rule out."""
+        memory = _memory(tmp_path, monkeypatch)
+        argv_sink = tmp_path / "argv.txt"
+        monkeypatch.setenv("FAKE_AGENT_ARGV_SINK", str(argv_sink))
+        body = _REMEMBERS_THE_TOKEN.replace(
+            'if [ "$1" = "--resume" ]; then',
+            'printf "%s\\n" "$@" > "$FAKE_AGENT_ARGV_SINK"\n'
+            'if [ "$1" = "--resume" ]; then',
+        )
+        config = _config(
+            tmp_path, fake=_resumable_plugin(_script(tmp_path, body)),
+        )
+
+        report = _run_resume(config, "fake")
+
+        assert report.ok is True, report.failures
+        seen = argv_sink.read_text().splitlines()
+        assert seen[0] == "--resume"
+        assert seen[1] == "fake-native-7f3a"
+        # Round 1, the decoy, round 2.
+        assert _calls(memory) == 3
+
+    def test_the_token_is_only_in_the_first_prompt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Asserted on the prompts the child actually received.
+
+        If the token reached round 2 in its prompt, round 2 could answer
+        without remembering anything and the check would prove nothing."""
+        memory = _memory(tmp_path, monkeypatch)
+        config = _config(
+            tmp_path,
+            fake=_resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        report = _run_resume(config, "fake")
+
+        assert report.ok is True, report.failures
+        first = (memory / "round1-prompt").read_text()
+        second = (memory / "round2-prompt").read_text()
+        assert f"TOKEN: {report.token}" in first
+        assert report.token not in second
+
+    def test_the_report_has_a_line_per_round(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _memory(tmp_path, monkeypatch)
+        config = _config(
+            tmp_path,
+            fake=_resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        report = _run_resume(config, "fake")
+        lines = report.lines()
+
+        assert lines[0].startswith("round 1 (fresh):")
+        assert "checkpoint BLOCKED_NEEDS_INPUT" in lines[0]
+        assert "fake-native-7f3a" in lines[0]
+        assert lines[1].startswith("decoy (fresh):")
+        assert "fake-native-decoy" in lines[1]
+        assert lines[2].startswith("round 2 (resume):")
+        assert "checkpoint DONE" in lines[2]
+        assert report.token in lines[3]
+        assert "type=fake" in lines[4]
+        assert lines[5].startswith("elapsed: ")
+
+    def test_the_json_report_carries_both_rounds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _memory(tmp_path, monkeypatch)
+        config = _config(
+            tmp_path,
+            fake=_resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        payload = json.loads(json.dumps(_run_resume(config, "fake").as_dict()))
+
+        assert payload["ok"] is True
+        assert payload["resume"] is True
+        assert payload["token"]
+        assert payload["rounds_run"] == 2
+        assert payload["round1"]["checkpoint"] == "BLOCKED_NEEDS_INPUT"
+        assert payload["round1"]["agent_session_id"] == "fake-native-7f3a"
+        assert payload["round2"]["checkpoint"] == "DONE"
+        assert payload["round2"]["checkpoint_summary"] == payload["token"]
+        assert payload["failures"] == []
+        assert payload["warnings"] == []
+
+    def test_a_new_native_id_on_resume_is_a_warning_not_a_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Some CLIs mint a new id per turn. The context came back, which
+        is what was being proved; the id changing is worth saying and is
+        not a failure."""
+        _memory(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_AGENT_ROUND2_NATIVE", "fake-native-99zz")
+        config = _config(
+            tmp_path,
+            fake=_resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        report = _run_resume(config, "fake")
+
+        assert report.ok is True, report.failures
+        assert report.failures == ()
+        assert any("fake-native-99zz" in w for w in report.warnings)
+        assert any("new native session id" in w for w in report.warnings)
+
+
+class TestABackendThatDoesNotResume:
+    def test_no_native_id_in_round_one_stops_before_round_two(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing to resume from is a failure of round 1, and the relay
+        must not paper over it by starting a second fresh session — which
+        is exactly what a pipeline resume without a stored id used to do."""
+        memory = _memory(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_AGENT_HIDE_NATIVE_ID", "1")
+        config = _config(
+            tmp_path,
+            fake=_resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        report = _run_resume(config, "fake")
+
+        assert report.ok is False
+        assert report.rounds_run == 1
+        assert report.round2 is None
+        assert report.round1.checkpoint == "BLOCKED_NEEDS_INPUT"
+        assert any("native session id" in f for f in report.failures)
+        assert _calls(memory) == 1, "round 2 must not have been spawned"
+
+    def test_round_one_writing_done_instead_of_blocked_says_which_part(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        memory = _memory(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_AGENT_ROUND1_STATUS", "DONE")
+        config = _config(
+            tmp_path,
+            fake=_resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        report = _run_resume(config, "fake")
+
+        assert report.ok is False
+        assert report.rounds_run == 1
+        assert report.round1.checkpoint == "DONE"
+        assert any(
+            "BLOCKED_NEEDS_INPUT" in f and "DONE" in f for f in report.failures
+        )
+        assert _calls(memory) == 1
+
+    def test_round_two_without_the_token_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A DONE checkpoint is not the answer. The run that this check
+        exists to predict is one where the agent is asked a question and
+        comes back knowing what it was doing."""
+        memory = _memory(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_AGENT_SUMMARY", "I forgot the token")
+        config = _config(
+            tmp_path,
+            fake=_resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        report = _run_resume(config, "fake")
+
+        assert report.ok is False
+        assert report.rounds_run == 2
+        assert report.round2 is not None
+        assert report.round2.checkpoint == "DONE"
+        assert report.round2.checkpoint_summary == "I forgot the token"
+        assert any("token" in f for f in report.failures)
+        # Round 1, the decoy, round 2.
+        assert _calls(memory) == 3
+
+    def test_round_two_writing_nothing_fails_naming_the_round(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exiting zero with no checkpoint is the original #381 failure,
+        and it has to be reported against the round it happened in."""
+        _memory(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_AGENT_ROUND2_SILENT", "1")
+        config = _config(
+            tmp_path,
+            fake=_resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        report = _run_resume(config, "fake")
+
+        assert report.ok is False
+        assert report.round2 is not None
+        assert report.round2.checkpoint == "none"
+        assert any("round 2" in f for f in report.failures)
+
+
+class TestABackendWithNoResumeConfigured:
+    def test_it_fails_fast_without_spawning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No `resume_args` means the first round could never be resumed,
+        so running it would burn a session to learn what the manifest
+        already says."""
+        from ctrlrelay.core.agent_check import AgentCheckError
+
+        memory = _memory(tmp_path, monkeypatch)
+        config = _config(
+            tmp_path, fake=_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        with pytest.raises(AgentCheckError) as excinfo:
+            _run_resume(config, "fake")
+
+        assert "resume not configured for fake" in str(excinfo.value)
+        assert _calls(memory) == 0, "nothing may be spawned"
+
+    def test_a_manifest_with_resume_args_is_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The paired half. If the capability flag were hard-coded false
+        the test above would pass and `--resume` would be unusable."""
+        _memory(tmp_path, monkeypatch)
+        config = _config(
+            tmp_path,
+            fake=_resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN)),
+        )
+
+        assert _run_resume(config, "fake").rounds_run == 2
+
+
+class TestTheResumePrompts:
+    def test_round_one_carries_the_token_and_the_blocked_snippet(self) -> None:
+        from ctrlrelay.core.agent_check import resume_round1_prompt
+
+        prompt = resume_round1_prompt(
+            "/tmp/w/.ctrlrelay/state.json", "check-fake-abcd", "1a2b3c4d",
+        )
+
+        assert "TOKEN: 1a2b3c4d" in prompt
+        assert "STATE_FILE: /tmp/w/.ctrlrelay/state.json" in prompt
+        assert "SESSION_ID: check-fake-abcd" in prompt
+        assert "mkdir -p -- /tmp/w/.ctrlrelay" in prompt
+        assert '"status":"BLOCKED_NEEDS_INPUT"' in prompt
+        assert '"question":"What is the token?"' in prompt
+        assert "> /tmp/w/.ctrlrelay/state.json" in prompt
+
+    def test_round_two_asks_for_the_token_without_containing_it(self) -> None:
+        """The prompt cannot carry the answer it is checking for."""
+        from ctrlrelay.core.agent_check import resume_round2_prompt
+
+        prompt = resume_round2_prompt(
+            "/tmp/w/.ctrlrelay/state.json", "check-fake-abcd",
+        )
+
+        # The phrase as the prompt wraps it: asserting across the line
+        # break would fail on a reflow that changed nothing.
+        assert "summary is the token you were asked to" in prompt
+        assert '"status": "DONE"' in prompt
+        assert '"summary": "<TOKEN>"' in prompt
+        assert "python3 - /tmp/w/.ctrlrelay/state.json <<'CTRLRELAY_DONE'" in prompt
+
+    def test_both_prompts_quote_a_path_with_an_apostrophe(self) -> None:
+        """#191 again: the resume rounds build their own snippets, so the
+        quoting that fixed it has to be in each of them."""
+        from ctrlrelay.core.agent_check import (
+            resume_round1_prompt,
+            resume_round2_prompt,
+        )
+
+        path = "/tmp/a'b'c/.ctrlrelay/state.json"
+        quoted = "'/tmp/a'\"'\"'b'\"'\"'c/.ctrlrelay/state.json'"
+
+        assert quoted in resume_round1_prompt(path, "s1", "1a2b3c4d")
+        assert quoted in resume_round2_prompt(path, "s1")
+        assert "/tmp/abc" not in resume_round1_prompt(path, "s1", "1a2b3c4d")
+        assert "/tmp/abc" not in resume_round2_prompt(path, "s1")
+
+
+class TestTheResumeCliCommand:
+    def test_it_exits_zero_and_prints_both_rounds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _memory(tmp_path, monkeypatch)
+        result = TestTheCliCommand()._invoke(
+            tmp_path, ["fake", "--resume"],
+            {"fake": _resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN))},
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "round 1 (fresh):" in result.output
+        assert "round 2 (resume):" in result.output
+        assert "checkpoint BLOCKED_NEEDS_INPUT" in result.output
+        assert "checkpoint DONE" in result.output
+        assert "fake resumed" in result.output
+
+    def test_a_round_two_that_forgot_exits_non_zero_saying_why(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _memory(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_AGENT_SUMMARY", "no idea")
+        result = TestTheCliCommand()._invoke(
+            tmp_path, ["fake", "--resume"],
+            {"fake": _resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN))},
+        )
+
+        assert result.exit_code == 1, result.output
+        assert "round 2 (resume):" in result.output
+        assert "token" in result.output
+
+    def test_no_resume_configured_exits_non_zero_with_the_reason(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        memory = _memory(tmp_path, monkeypatch)
+        result = TestTheCliCommand()._invoke(
+            tmp_path, ["fake", "--resume"],
+            {"fake": _plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN))},
+        )
+
+        assert result.exit_code == 1, result.output
+        assert "resume not configured for fake" in result.output
+        assert _calls(memory) == 0
+
+    def test_json_prints_one_object_with_both_rounds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _memory(tmp_path, monkeypatch)
+        result = TestTheCliCommand()._invoke(
+            tmp_path, ["fake", "--resume", "--json"],
+            {"fake": _resumable_plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN))},
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["ok"] is True
+        assert payload["resume"] is True
+        assert payload["round1"]["checkpoint"] == "BLOCKED_NEEDS_INPUT"
+        assert payload["round2"]["checkpoint"] == "DONE"
+
+    def test_json_reports_no_resume_configured_as_an_object(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _memory(tmp_path, monkeypatch)
+        result = TestTheCliCommand()._invoke(
+            tmp_path, ["fake", "--resume", "--json"],
+            {"fake": _plugin(_script(tmp_path, _REMEMBERS_THE_TOKEN))},
+        )
+
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["ok"] is False
+        assert "resume not configured for fake" in payload["error"]
+
+    def test_without_the_flag_one_round_runs_and_resume_is_not_claimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The single-round check is unchanged by this option existing."""
+        _memory(tmp_path, monkeypatch)
+        result = TestTheCliCommand()._invoke(
+            tmp_path, ["fake", "--json"],
+            {"fake": _resumable_plugin(_script(tmp_path, _WRITES_DONE))},
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["checkpoint"] == "DONE"
+        assert "round1" not in payload
+        assert "resume" not in payload
+
+
+class TestResumeIsByIdNotByRecency:
+    def test_a_backend_that_resumes_the_latest_session_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A manifest built on `--continue` or `resume --last` carries
+        context, just not the context it was asked for. On a node where
+        runs interleave it resumes somebody else's session, so a check that
+        only ever ran one session would pass it."""
+        memory = _memory(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_AGENT_RESUME_LAST", "1")
+        script = _script(tmp_path, _REMEMBERS_THE_TOKEN)
+
+        report = _run_resume(
+            _config(tmp_path, fake=_resumable_plugin(script)), "fake",
+        )
+
+        assert not report.ok
+        assert any("most recent" in f for f in report.failures), report.failures
+        assert (memory / "decoy-prompt").exists()
+
+    def test_the_decoy_is_a_separate_fresh_session_with_its_own_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        memory = _memory(tmp_path, monkeypatch)
+        script = _script(tmp_path, _REMEMBERS_THE_TOKEN)
+
+        report = _run_resume(
+            _config(tmp_path, fake=_resumable_plugin(script)), "fake",
+        )
+
+        assert report.ok, report.failures
+        decoy = (memory / "decoy-prompt").read_text()
+        assert report.decoy_token and report.decoy_token != report.token
+        assert report.decoy_token in decoy
+        assert report.token not in decoy
+        assert report.token not in (memory / "round2-prompt").read_text()
+        assert report.decoy_token not in (memory / "round2-prompt").read_text()
+
+    def test_a_decoy_that_reports_no_session_makes_the_check_inconclusive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a distinct decoy session, "latest" and "the id round 2
+        was given" are the same session again, and a recency backend
+        passes. That is not a pass."""
+        _memory(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_AGENT_RESUME_LAST", "1")
+        monkeypatch.setenv("FAKE_AGENT_DECOY_NO_ID", "1")
+        script = _script(tmp_path, _REMEMBERS_THE_TOKEN)
+
+        report = _run_resume(
+            _config(tmp_path, fake=_resumable_plugin(script)), "fake",
+        )
+
+        assert not report.ok
+        assert any("decoy" in f for f in report.failures), report.failures
+
+    def test_elapsed_includes_the_decoy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _memory(tmp_path, monkeypatch)
+        script = _script(tmp_path, _REMEMBERS_THE_TOKEN)
+
+        report = _run_resume(
+            _config(tmp_path, fake=_resumable_plugin(script)), "fake",
+        )
+
+        assert report.decoy is not None
+        assert report.elapsed_seconds == pytest.approx(
+            report.round1.elapsed_seconds
+            + report.decoy.elapsed_seconds
+            + report.round2.elapsed_seconds
+        )

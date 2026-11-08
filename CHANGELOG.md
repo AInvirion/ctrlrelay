@@ -27,6 +27,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enrolled on the node. As an operator tool it may select any enrolled
   backend and does not consult `agent.assignable_types`, which governs what
   an assignment arriving from outside the machine may ask for.
+- `ctrlrelay agent check <agent_type> --resume` proves the other half of the
+  contract: that the backend comes back knowing what it was doing (#382). A
+  backend that cannot resume fails every run that has to ask a question, and
+  the only way to exercise it before this was a real dev run that blocked and
+  waited for a chat answer. Round 1 is told a freshly generated 8-character
+  token and must write `BLOCKED_NEEDS_INPUT`; round 2 spawns with
+  `resume_session_id` set to the native id round 1 reported — the same argv a
+  pipeline resume builds — and must write `DONE` whose summary is that token.
+  The token is not in the second prompt, so a round that answered from its
+  own prompt could not pass, and a decoy fresh session with a different token
+  runs between the rounds, so a manifest that resumes the most recent session
+  instead of the id it is given fails rather than passing by luck. Round 1 must report both the blocked checkpoint
+  and a native session id or the command stops and says which was missing,
+  rather than spending a second fresh session that could only report a pass
+  for a backend that never resumed. A backend reporting no `resume`
+  capability fails with `resume not configured for <type>` without spawning.
+  A native session id that changes between rounds is a warning, not a
+  failure. Each round gets its own report line, each failure its own, and
+  `--json` carries both rounds plus `resume: true`.
 - A plugin identity and capability contract for coding-agent CLIs (#379).
   Claude and OpenCode now expose the same identity metadata, and local
   `agent.plugins` manifests can enroll simple non-interactive CLIs with fixed
