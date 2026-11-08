@@ -97,7 +97,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process that leaves it on purpose — one that calls `setsid` or
   `setpgid` survives without a sandbox. Under `sandbox: "bwrap"` the PID
   namespace ends it with the sandbox; full containment for the other
-  backends is #352.
+  backends is #352. A narrow race also remains: if the agent's group id is
+  recycled for another group during a session and that group's leader has
+  exited too, the relay cannot tell the two apart and may signal it.
 - An agent no longer inherits the daemon's stdin; it gets `/dev/null`
   unless its prompt is sent on stdin. `codex exec` appends piped stdin to
   its prompt and waits for end-of-file, so with the daemon's stdin an open
