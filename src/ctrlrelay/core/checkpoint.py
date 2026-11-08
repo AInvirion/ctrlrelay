@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -121,27 +122,81 @@ def failed(error: str, recoverable: bool = True) -> None:
     _write_checkpoint(state)
 
 
+# A checkpoint is a few hundred bytes; a DONE with a long pull-request
+# description is a few kilobytes. Anything past this is not a checkpoint,
+# and reading it whole is how an agent would exhaust the relay's memory.
+MAX_CHECKPOINT_BYTES = 256 * 1024
+
+
 def read_checkpoint(path: Path, delete_after: bool = False) -> CheckpointState:
     """Read and parse a checkpoint file.
 
-    Used by the orchestrator to read skill results.
+    Used by the orchestrator to read skill results. The agent controls the
+    state path, so only a small regular file is read (#394): it is opened
+    with ``O_NOFOLLOW`` (a symlink is refused, not followed) and
+    ``O_NONBLOCK`` (a FIFO opens at once instead of waiting for a writer
+    that never comes), checked with ``fstat`` on that same descriptor, and
+    read up to :data:`MAX_CHECKPOINT_BYTES`. Before this a FIFO there
+    blocked the read forever — after the session timeout had stopped
+    applying — and stalled every other run on the event loop with it.
 
     Args:
         path: Path to the checkpoint file.
-        delete_after: If True, delete the file after reading.
+        delete_after: If True, delete the file after reading. A file that
+            was refused is left where it is.
 
     Returns:
         Parsed CheckpointState.
 
     Raises:
-        CheckpointError: If file not found or invalid.
+        CheckpointError: If the file is missing, is not a small regular
+            file, or does not parse as a checkpoint.
     """
-    if not path.exists():
-        raise CheckpointError(f"Checkpoint file not found: {path}")
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError as e:
+        raise CheckpointError(f"Checkpoint file not found: {path}") from e
+    except OSError as e:
+        # ELOOP is how O_NOFOLLOW says "that was a symlink".
+        raise CheckpointError(
+            f"Checkpoint file could not be opened as a regular file: {e}"
+        ) from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise CheckpointError(
+                f"Checkpoint is not a regular file: {path}"
+            )
+        if st.st_size > MAX_CHECKPOINT_BYTES:
+            raise CheckpointError(
+                f"Checkpoint is larger than {MAX_CHECKPOINT_BYTES} bytes: {path}"
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_CHECKPOINT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError as e:
+        raise CheckpointError(f"Failed to read checkpoint file: {e}") from e
+    finally:
+        os.close(fd)
+    raw = b"".join(chunks)
+    if len(raw) > MAX_CHECKPOINT_BYTES:
+        # Grew between the fstat and the read.
+        raise CheckpointError(
+            f"Checkpoint is larger than {MAX_CHECKPOINT_BYTES} bytes: {path}"
+        )
 
     try:
-        data = json.loads(path.read_text())
-    except json.JSONDecodeError as e:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError) as e:
+        # `ValueError` covers JSONDecodeError, UnicodeDecodeError and an
+        # integer past the int-string limit; `RecursionError` deep nesting.
         raise CheckpointError(f"Failed to parse checkpoint file: {e}") from e
 
     try:

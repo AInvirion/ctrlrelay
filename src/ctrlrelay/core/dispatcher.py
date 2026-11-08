@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -74,6 +75,100 @@ _logger = get_logger("core.dispatcher")
 # Enough of the child's stderr to name the failure without dumping agent
 # output into the log stream.
 _STDERR_TAIL_CHARS = 500
+
+# How long an agent's process group gets between SIGTERM and SIGKILL when
+# the relay ends it: long enough for a CLI to flush its transcript, short
+# enough that a timeout still means roughly what it says.
+_GROUP_GRACE_SECONDS = 3.0
+
+
+def _agent_group(proc: Any) -> int | None:
+    """The process group the agent leads, or ``None`` to signal it alone.
+
+    Every agent is spawned with ``start_new_session=True``, so its group id
+    is its own pid and nothing of the relay's is in it (#394). Signalling
+    that group is what reaches a background job the agent left behind.
+
+    The guard is the point of this function. Signalling a group the relay
+    is itself in would stop the relay — and every run it holds — which is
+    exactly what an agent that shared the relay's group could do to it
+    before this. So a group is only ever returned when it provably is not
+    the relay's: a real subprocess, leading its own group, and not this
+    process's group. Anything else (a test double, a child that somehow
+    did not get its own session) falls back to signalling the child alone.
+    """
+    if not isinstance(proc, asyncio.subprocess.Process):
+        return None
+    pid = proc.pid
+    own = os.getpgrp()
+    if not isinstance(pid, int) or pid <= 1 or pid == own:
+        return None
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        # Already reaped. It was spawned as the leader of its own session,
+        # and the kernel does not reuse a pid that still names a live
+        # group, so the group — if anything of it is left — is still `pid`.
+        return pid
+    except OSError:
+        return None
+    if pgid != pid or pgid == own:
+        return None
+    return pgid
+
+
+def _signal_group(pgid: int, sig: int) -> bool:
+    """Signal the group; ``False`` once nothing in it is left to signal."""
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _kill_agent_now(proc: Any) -> None:
+    """SIGKILL the agent's whole group at once, or the child alone."""
+    pgid = _agent_group(proc)
+    if pgid is not None:
+        _signal_group(pgid, signal.SIGKILL)
+        return
+    try:
+        if proc.returncode is None:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+
+
+async def _end_agent(
+    proc: Any, *, running: bool, grace: float = _GROUP_GRACE_SECONDS,
+) -> None:
+    """Stop the agent and everything left in its group, then reap the child.
+
+    SIGTERM, up to ``grace`` seconds for the group to empty, then SIGKILL.
+    Called after a normal exit too (``running=False``): the child is gone by
+    then, but a job it put in the background is not, and nothing else would
+    ever stop it. Without a group of its own there is nothing left to reap
+    after a normal exit, and on a timeout (``running=True``) the child is
+    killed alone, as before.
+    """
+    pgid = _agent_group(proc)
+    if pgid is None:
+        if running:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+        return
+    if _signal_group(pgid, signal.SIGTERM):
+        deadline = time.monotonic() + grace
+        while _signal_group(pgid, 0):
+            if time.monotonic() >= deadline:
+                _signal_group(pgid, signal.SIGKILL)
+                break
+            await asyncio.sleep(0.05)
+    if proc.returncode is None:
+        await proc.wait()
 
 
 def _find_claude() -> str:
@@ -396,11 +491,7 @@ class CliAgentAdapter:
                 else f"dispatcher.session.stopped_{kind}",
                 extra={**ident, "reason": reason},
             )
-            try:
-                if proc.returncode is None:
-                    proc.kill()
-            except ProcessLookupError:
-                pass
+            _kill_agent_now(proc)
 
         watchers = [asyncio.create_task(_watch(k, w)) for k, w in watches]
         try:
@@ -578,6 +669,10 @@ class CliAgentAdapter:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     pass_fds=pass_fds,
+                    # Its own session, so its own process group: the relay
+                    # can then stop everything the agent started without
+                    # the agent being able to stop the relay (#394).
+                    start_new_session=True,
                     # Never the daemon's own stdin. A CLI that appends
                     # piped stdin to its prompt (codex exec does) waits
                     # for an end-of-file that an inherited pipe never
@@ -632,8 +727,7 @@ class CliAgentAdapter:
                 timeout=timeout,
             )
         except asyncio.TimeoutError as e:
-            proc.kill()
-            await proc.wait()
+            await _end_agent(proc, running=True)
             _logger.error(
                 "dispatcher.session.timeout",
                 extra={
@@ -671,8 +765,8 @@ class CliAgentAdapter:
                 error_type=type(e).__name__,
                 elapsed_ms=_elapsed_ms(started),
             )
+            _kill_agent_now(proc)
             if proc.returncode is None:
-                proc.kill()
                 try:
                     await asyncio.shield(proc.wait())
                 except asyncio.CancelledError:
@@ -698,8 +792,8 @@ class CliAgentAdapter:
             # `communicate()` failure and skip the outcome report
             # below — losing both the cause and the count.
             try:
+                _kill_agent_now(proc)
                 if proc.returncode is None:
-                    proc.kill()
                     await proc.wait()
             except Exception:
                 pass
@@ -721,6 +815,11 @@ class CliAgentAdapter:
                 stderr=f"{type(e).__name__}: {e}",
             )
             raise
+
+        # The child exited on its own. Anything it left running in the
+        # background is still in its group; stop it before the run is
+        # reported done, or it keeps running as the relay user afterwards.
+        await _end_agent(proc, running=False)
 
         elapsed_ms = _elapsed_ms(started)
         # `or 0` is kept for `SessionResult`, whose `exit_code` is typed

@@ -38,7 +38,6 @@ import os
 import secrets
 import shlex
 import shutil
-import stat
 import subprocess
 import tempfile
 import time
@@ -82,10 +81,6 @@ FINGERPRINT_PREFIX_CHARS = 12
 # wrote; an absent file is a bug in whether it wrote at all.
 NO_CHECKPOINT = "none"
 UNREADABLE_CHECKPOINT = "unreadable"
-
-# A checkpoint is a few hundred bytes. Anything far larger is not one, and
-# reading it whole is how a hostile backend would exhaust the check's memory.
-_MAX_LEFTOVER_CHECKPOINT_BYTES = 64 * 1024
 
 _INSTRUCTION = "Run this exact shell command, then stop."
 
@@ -496,25 +491,20 @@ def _report(
 def _leftover_checkpoint(state_file: Path) -> tuple[str, str | None]:
     """The status and text of a checkpoint still on disk, or why there is none.
 
-    Only a small regular file is opened. The agent controls that path, and
-    a FIFO there would block this read forever, past the timeout the
-    operator asked for and past the cleanup that removes the repository.
+    :func:`read_checkpoint` opens only a small regular file (#394), so a
+    FIFO or a huge file the agent left there is refused rather than read.
+    ``lstat`` first only to tell "nothing there" from "something there that
+    is not a checkpoint", which the report names differently.
     """
     try:
-        st = os.lstat(state_file)
+        os.lstat(state_file)
     except FileNotFoundError:
         return NO_CHECKPOINT, None
     except OSError:
         return UNREADABLE_CHECKPOINT, None
-    if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_LEFTOVER_CHECKPOINT_BYTES:
-        return UNREADABLE_CHECKPOINT, None
     try:
         state = read_checkpoint(state_file)
-    except (CheckpointError, OSError, ValueError, RecursionError):
-        # `ValueError` covers what `json.loads` raises that is not a
-        # `JSONDecodeError` — an integer past the int-string limit, a bad
-        # encoding — and `RecursionError` covers deep nesting. The file is
-        # the agent's to write, so any of them is just an unreadable one.
+    except CheckpointError:
         return UNREADABLE_CHECKPOINT, None
     return state.status.value, _said(state)
 
