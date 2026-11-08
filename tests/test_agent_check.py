@@ -818,6 +818,9 @@ if [ "$1" = "--resume" ]; then
   native="$2"
   printf '%s' "$3" > "$FAKE_AGENT_MEMORY/round2-prompt"
   token=$(cat "$FAKE_AGENT_MEMORY/$native" 2>/dev/null)
+  if [ -n "$FAKE_AGENT_RESUME_LAST" ]; then
+    token=$(cat "$FAKE_AGENT_MEMORY/last" 2>/dev/null)
+  fi
   if [ -n "$FAKE_AGENT_ROUND2_SILENT" ]; then
     printf '{"sessionId":"%s"}\\n' "$native"
     exit 0
@@ -829,9 +832,16 @@ if [ "$1" = "--resume" ]; then
   printf '{"sessionId":"%s"}\\n' "${FAKE_AGENT_ROUND2_NATIVE-$native}"
   exit 0
 fi
-printf '%s' "$1" > "$FAKE_AGENT_MEMORY/round1-prompt"
+native=fake-native-7f3a
+if [ -e "$FAKE_AGENT_MEMORY/round1-prompt" ]; then
+  native=fake-native-decoy
+  printf '%s' "$1" > "$FAKE_AGENT_MEMORY/decoy-prompt"
+else
+  printf '%s' "$1" > "$FAKE_AGENT_MEMORY/round1-prompt"
+fi
 token=$(printf '%s' "$1" | sed -n 's/^TOKEN: \\([0-9a-f]*\\)$/\\1/p' | head -1)
-printf '%s' "$token" > "$FAKE_AGENT_MEMORY/fake-native-7f3a"
+printf '%s' "$token" > "$FAKE_AGENT_MEMORY/$native"
+printf '%s' "$token" > "$FAKE_AGENT_MEMORY/last"
 printf '{"version":"1","status":"%s","session_id":"%s",' \\
   "${FAKE_AGENT_ROUND1_STATUS-BLOCKED_NEEDS_INPUT}" \\
   "$CTRLRELAY_SESSION_ID" > "$CTRLRELAY_STATE_FILE"
@@ -839,7 +849,7 @@ printf '"timestamp":"2026-11-07T00:00:00Z","question":"What is the token?",' \\
   >> "$CTRLRELAY_STATE_FILE"
 printf '"summary":"round one"}' >> "$CTRLRELAY_STATE_FILE"
 if [ -z "$FAKE_AGENT_HIDE_NATIVE_ID" ]; then
-  printf '{"sessionId":"fake-native-7f3a"}\\n'
+  printf '{"sessionId":"%s"}\\n' "$native"
 fi
 exit 0
 """
@@ -897,7 +907,8 @@ class TestABackendThatResumes:
         assert report.round2.checkpoint_summary == report.token
         assert report.round2.agent_session_id == "fake-native-7f3a"
         assert len(report.token) == 8
-        assert _calls(memory) == 2
+        # Round 1, the decoy, round 2.
+        assert _calls(memory) == 3
 
     def test_round_two_is_handed_the_native_id_round_one_captured(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -925,7 +936,8 @@ class TestABackendThatResumes:
         seen = argv_sink.read_text().splitlines()
         assert seen[0] == "--resume"
         assert seen[1] == "fake-native-7f3a"
-        assert _calls(memory) == 2
+        # Round 1, the decoy, round 2.
+        assert _calls(memory) == 3
 
     def test_the_token_is_only_in_the_first_prompt(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -963,11 +975,13 @@ class TestABackendThatResumes:
         assert lines[0].startswith("round 1 (fresh):")
         assert "checkpoint BLOCKED_NEEDS_INPUT" in lines[0]
         assert "fake-native-7f3a" in lines[0]
-        assert lines[1].startswith("round 2 (resume):")
-        assert "checkpoint DONE" in lines[1]
-        assert report.token in lines[2]
-        assert "type=fake" in lines[3]
-        assert lines[4].startswith("elapsed: ")
+        assert lines[1].startswith("decoy (fresh):")
+        assert "fake-native-decoy" in lines[1]
+        assert lines[2].startswith("round 2 (resume):")
+        assert "checkpoint DONE" in lines[2]
+        assert report.token in lines[3]
+        assert "type=fake" in lines[4]
+        assert lines[5].startswith("elapsed: ")
 
     def test_the_json_report_carries_both_rounds(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1076,7 +1090,8 @@ class TestABackendThatDoesNotResume:
         assert report.round2.checkpoint == "DONE"
         assert report.round2.checkpoint_summary == "I forgot the token"
         assert any("token" in f for f in report.failures)
-        assert _calls(memory) == 2
+        # Round 1, the decoy, round 2.
+        assert _calls(memory) == 3
 
     def test_round_two_writing_nothing_fails_naming_the_round(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1269,3 +1284,42 @@ class TestTheResumeCliCommand:
         assert payload["checkpoint"] == "DONE"
         assert "round1" not in payload
         assert "resume" not in payload
+
+
+class TestResumeIsByIdNotByRecency:
+    def test_a_backend_that_resumes_the_latest_session_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A manifest built on `--continue` or `resume --last` carries
+        context, just not the context it was asked for. On a node where
+        runs interleave it resumes somebody else's session, so a check that
+        only ever ran one session would pass it."""
+        memory = _memory(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_AGENT_RESUME_LAST", "1")
+        script = _script(tmp_path, _REMEMBERS_THE_TOKEN)
+
+        report = _run_resume(
+            _config(tmp_path, fake=_resumable_plugin(script)), "fake",
+        )
+
+        assert not report.ok
+        assert any("most recent" in f for f in report.failures), report.failures
+        assert (memory / "decoy-prompt").exists()
+
+    def test_the_decoy_is_a_separate_fresh_session_with_its_own_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        memory = _memory(tmp_path, monkeypatch)
+        script = _script(tmp_path, _REMEMBERS_THE_TOKEN)
+
+        report = _run_resume(
+            _config(tmp_path, fake=_resumable_plugin(script)), "fake",
+        )
+
+        assert report.ok, report.failures
+        decoy = (memory / "decoy-prompt").read_text()
+        assert report.decoy_token and report.decoy_token != report.token
+        assert report.decoy_token in decoy
+        assert report.token not in decoy
+        assert report.token not in (memory / "round2-prompt").read_text()
+        assert report.decoy_token not in (memory / "round2-prompt").read_text()

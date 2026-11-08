@@ -543,6 +543,12 @@ class AgentResumeCheckReport:
     round2: AgentCheckReport | None
     failures: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    # The fresh session spawned between the rounds with a different token,
+    # so a backend that resumes "the latest session" rather than the id it
+    # was handed answers with the wrong one. ``None`` when round 1 failed
+    # and nothing after it ran.
+    decoy: AgentCheckReport | None = None
+    decoy_token: str | None = None
 
     @property
     def rounds_run(self) -> int:
@@ -576,6 +582,8 @@ class AgentResumeCheckReport:
     def lines(self) -> list[str]:
         """The report an operator reads: one line per round, then the rest."""
         out = [self.round1.round_line("round 1 (fresh)")]
+        if self.decoy is not None:
+            out.append(self.decoy.round_line("decoy (fresh)"))
         if self.round2 is None:
             out.append("round 2 (resume): not run")
         else:
@@ -620,6 +628,8 @@ class AgentResumeCheckReport:
             "rounds_run": self.rounds_run,
             "round1": self.round1.as_dict(),
             "round2": self.round2.as_dict() if self.round2 else None,
+            "decoy": self.decoy.as_dict() if self.decoy else None,
+            "decoy_token": self.decoy_token,
             "failures": list(self.failures),
             "warnings": list(self.warnings),
             "elapsed_seconds": round(self.elapsed_seconds, 3),
@@ -798,6 +808,31 @@ async def run_agent_resume_check(
                 agent_type, token, round1, None, failures, (), session_id,
             )
 
+        # A decoy: a second fresh session in the same directory, told a
+        # different token. Without it a backend that resumes "the most
+        # recent session" — a manifest built on `--continue` or
+        # `resume --last` — passes, because the only session there is to
+        # resume is the right one. On a node where runs interleave that
+        # backend resumes somebody else's session. Its own outcome is not
+        # judged: it only has to have run, so that "latest" and "the id
+        # round 2 is given" are different sessions.
+        state_file.unlink(missing_ok=True)
+        decoy_token = token
+        while decoy_token == token:
+            decoy_token = secrets.token_hex(RESUME_TOKEN_BYTES)
+        decoy_session_id = f"{session_id}-decoy"
+        decoy = await _spawn_round(
+            selection,
+            session_id=decoy_session_id,
+            prompt=resume_round1_prompt(
+                str(state_file), decoy_session_id, decoy_token,
+            ),
+            repo=repo,
+            state_file=state_file,
+            timeout=timeout,
+            expected=ROUND1_EXPECTED,
+        )
+
         # The dispatcher deletes a checkpoint as it reads it, so round 2
         # starts with nothing at that path. Removed again anyway: round 1's
         # file surviving would be read as round 2's answer, which is the
@@ -825,9 +860,11 @@ async def run_agent_resume_check(
             token,
             round1,
             round2,
-            _round2_failures(round2, token, timeout),
-            _round2_warnings(round1, round2),
+            _round2_failures(round2, token, timeout, decoy_token=decoy_token),
+            _round2_warnings(round1, round2, decoy),
             session_id,
+            decoy=decoy,
+            decoy_token=decoy_token,
         )
         return report
 
@@ -851,7 +888,11 @@ def _round1_failures(round1: AgentCheckReport, timeout: int) -> tuple[str, ...]:
 
 
 def _round2_failures(
-    round2: AgentCheckReport, token: str, timeout: int
+    round2: AgentCheckReport,
+    token: str,
+    timeout: int,
+    *,
+    decoy_token: str | None = None,
 ) -> tuple[str, ...]:
     """Why the resumed round did not answer. Each is a separate defect."""
     failures: list[str] = []
@@ -863,7 +904,13 @@ def _round2_failures(
         )
         return tuple(failures)
     said = round2.checkpoint_summary or ""
-    if token.lower() not in said.lower():
+    if decoy_token and decoy_token.lower() in said.lower():
+        failures.append(
+            "round 2 answered with the decoy session's token: the backend "
+            "resumed the most recent session, not the native id it was "
+            "given — check that resume_args pass {resume_session_id}"
+        )
+    elif token.lower() not in said.lower():
         failures.append(
             "round 2 did not have the token: its summary said "
             + (f"{said!r}" if said else "nothing")
@@ -873,7 +920,9 @@ def _round2_failures(
 
 
 def _round2_warnings(
-    round1: AgentCheckReport, round2: AgentCheckReport
+    round1: AgentCheckReport,
+    round2: AgentCheckReport,
+    decoy: AgentCheckReport | None = None,
 ) -> tuple[str, ...]:
     """What to say about the native session id without failing the backend.
 
@@ -881,6 +930,27 @@ def _round2_warnings(
     still resumed if the token came back. The pipelines store whatever the
     adapter reports, so the operator does want to know — as a warning.
     """
+    warnings: list[str] = []
+    if decoy is not None and (
+        decoy.agent_session_id is None
+        or decoy.agent_session_id == round1.agent_session_id
+    ):
+        # The decoy only separates "latest" from "this id" when it really
+        # is another session. It did not report one, so the pass rests on
+        # the token alone.
+        warnings.append(
+            "the decoy session reported "
+            + ("no native session id" if decoy.agent_session_id is None
+               else "the same native session id as round 1")
+            + ", so resuming by recency could not be ruled out"
+        )
+    return tuple(warnings) + _session_id_warnings(round1, round2)
+
+
+def _session_id_warnings(
+    round1: AgentCheckReport, round2: AgentCheckReport
+) -> tuple[str, ...]:
+    """Round 2's native id against round 1's."""
     if round2.agent_session_id is None:
         return (
             "round 2 reported no native session id; the relay would keep "
@@ -903,6 +973,9 @@ def _finish_resume(
     failures: tuple[str, ...],
     warnings: tuple[str, ...],
     session_id: str,
+    *,
+    decoy: AgentCheckReport | None = None,
+    decoy_token: str | None = None,
 ) -> AgentResumeCheckReport:
     """Build the pair report and log it, on both the stop and pass paths."""
     report = AgentResumeCheckReport(
@@ -912,6 +985,8 @@ def _finish_resume(
         round2=round2,
         failures=failures,
         warnings=warnings,
+        decoy=decoy,
+        decoy_token=decoy_token,
     )
     log_event(
         _logger,

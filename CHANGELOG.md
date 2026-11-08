@@ -36,7 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resume_session_id` set to the native id round 1 reported — the same argv a
   pipeline resume builds — and must write `DONE` whose summary is that token.
   The token is not in the second prompt, so a round that answered from its
-  own prompt could not pass. Round 1 must report both the blocked checkpoint
+  own prompt could not pass, and a decoy fresh session with a different token
+  runs between the rounds, so a manifest that resumes the most recent session
+  instead of the id it is given fails rather than passing by luck. Round 1 must report both the blocked checkpoint
   and a native session id or the command stops and says which was missing,
   rather than spending a second fresh session that could only report a pass
   for a backend that never resumed. A backend reporting no `resume`
