@@ -331,7 +331,11 @@ def _leftover_checkpoint(state_file: Path) -> str:
         return UNREADABLE_CHECKPOINT
     try:
         return read_checkpoint(state_file).status.value
-    except (CheckpointError, OSError, UnicodeDecodeError):
+    except (CheckpointError, OSError, ValueError, RecursionError):
+        # `ValueError` covers what `json.loads` raises that is not a
+        # `JSONDecodeError` — an integer past the int-string limit, a bad
+        # encoding — and `RecursionError` covers deep nesting. The file is
+        # the agent's to write, so any of them is just an unreadable one.
         return UNREADABLE_CHECKPOINT
 
 

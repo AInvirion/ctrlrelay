@@ -756,3 +756,46 @@ exec sleep 600
         assert report.timed_out
         assert report.checkpoint == UNREADABLE_CHECKPOINT
         assert not report.ok
+
+
+class TestALeftoverCheckpointThatBreaksTheParser:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            # Over CPython's int-string limit: a bare ValueError, not a
+            # JSONDecodeError, out of json.loads.
+            '{"version":"1","status":"DONE","n":' + "9" * 5000 + "}",
+            # Deep enough to raise RecursionError in the decoder, and under the
+            # size cap so it reaches the parser.
+            "[" * 20000 + "]" * 20000,
+        ],
+        ids=["huge-int", "deep-nesting"],
+    )
+    def test_it_is_reported_as_unreadable_not_raised(
+        self, tmp_path: Path, payload: str
+    ) -> None:
+        from ctrlrelay.core.agent_check import UNREADABLE_CHECKPOINT
+
+        data = tmp_path / "payload.json"
+        data.write_text(payload)
+        script = _script(tmp_path, f"""#!/bin/sh
+mkdir -p -- "$(dirname "$CTRLRELAY_STATE_FILE")"
+cp {data} "$CTRLRELAY_STATE_FILE"
+exec sleep 600
+""")
+        report = _run(_config(tmp_path, fake=_plugin(script)), "fake", timeout=2)
+
+        assert report.checkpoint == UNREADABLE_CHECKPOINT
+        assert not report.ok
+
+
+def test_json_reports_a_non_positive_timeout_as_an_object(tmp_path: Path) -> None:
+    result = TestTheCliCommand()._invoke(
+        tmp_path, ["fake", "--json", "--timeout", "0"],
+        {"fake": _plugin(_script(tmp_path, _WRITES_DONE))},
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output.strip())
+    assert payload["ok"] is False
+    assert "timeout" in payload["error"]

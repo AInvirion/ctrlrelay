@@ -2287,7 +2287,7 @@ def agent_check(
         help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
     ),
     timeout: int = typer.Option(
-        DEFAULT_AGENT_CHECK_TIMEOUT, "--timeout", min=1,
+        DEFAULT_AGENT_CHECK_TIMEOUT, "--timeout",
         help="Seconds the agent gets before the relay stops it.",
     ),
     json_output: bool = typer.Option(
@@ -2329,6 +2329,11 @@ def agent_check(
                 f"[red]\u2717[/red] {prefix}{rich_escape(message)}"
             )
         raise typer.Exit(1)
+
+    # Checked here rather than with Typer's `min=`, which rejects the value
+    # with a usage message before `--json` can answer as an object.
+    if timeout < 1:
+        fail(f"--timeout must be at least 1 second, got {timeout}")
 
     # Resolved here rather than through `_resolve_config_or_exit`, which
     # prints prose: a failed auto-discovery is still a failure the caller
