@@ -358,3 +358,35 @@ class TestTheGraceEndsInAKill:
         assert result["status"] == "DONE"
         background = int((probe / "background.pid").read_text())
         assert _wait_dead(background), "a TERM-ignoring job outlived the grace"
+
+
+class TestAReusedGroupIdIsNotSignalled:
+    def test_after_reaping_a_live_process_at_that_pid_is_not_ours(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Once the relay has reaped its child, the group the child led has
+        no leader. A process that answers at that pid is somebody else's,
+        which took the number after it was freed — possibly half an hour
+        later, when a descendant held the pipes open until the timeout. It
+        must not be signalled."""
+        import asyncio
+
+        from ctrlrelay.core import dispatcher
+
+        async def reaped() -> asyncio.subprocess.Process:
+            p = await asyncio.create_subprocess_exec(
+                "true", start_new_session=True,
+            )
+            await p.wait()
+            return p
+
+        proc = asyncio.run(reaped())
+        assert dispatcher._agent_group(proc) == proc.pid  # leaderless: ours
+
+        # Now pretend the number was reused by a new group leader.
+        real_getpgid = os.getpgid
+        monkeypatch.setattr(
+            dispatcher.os, "getpgid",
+            lambda pid: pid if pid == proc.pid else real_getpgid(pid),
+        )
+        assert dispatcher._agent_group(proc) is None

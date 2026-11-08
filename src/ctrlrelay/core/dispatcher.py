@@ -82,6 +82,28 @@ _STDERR_TAIL_CHARS = 500
 _GROUP_GRACE_SECONDS = 3.0
 
 
+def _still_ours(proc: Any, pgid: int) -> bool:
+    """Is ``pgid`` still the group this agent's child led?
+
+    While the relay has not reaped the child, it holds its pid — a zombie
+    included — so the number cannot have been reused. Once it is reaped the
+    group it led has no leader any more: if a process answers at that pid,
+    the number was freed and taken by somebody else, possibly much later (a
+    descendant holding the output pipes keeps ``communicate()`` waiting
+    until the timeout). A new group is always created by a live leader, so
+    a leaderless group under that id is the one the child left behind.
+    """
+    if proc.returncode is None:
+        return True
+    try:
+        os.getpgid(pgid)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _agent_group(proc: Any) -> int | None:
     """The process group the agent leads, or ``None`` to signal it alone.
 
@@ -93,9 +115,11 @@ def _agent_group(proc: Any) -> int | None:
     is itself in would stop the relay — and every run it holds — which is
     exactly what an agent that shared the relay's group could do to it
     before this. So a group is only ever returned when it provably is not
-    the relay's: a real subprocess, leading its own group, and not this
-    process's group. Anything else (a test double, a child that somehow
-    did not get its own session) falls back to signalling the child alone.
+    the relay's and is still the agent's: a real subprocess, leading its
+    own group, not this process's group, and — once reaped — with no other
+    process holding the number (:func:`_still_ours`). Anything else (a
+    test double, a child that somehow did not get its own session, a
+    reused id) falls back to signalling the child alone.
     """
     if not isinstance(proc, asyncio.subprocess.Process):
         return None
@@ -103,18 +127,10 @@ def _agent_group(proc: Any) -> int | None:
     own = os.getpgrp()
     if not isinstance(pid, int) or pid <= 1 or pid == own:
         return None
+    if proc.returncode is not None:
+        return pid if _still_ours(proc, pid) else None
     try:
         pgid = os.getpgid(pid)
-    except ProcessLookupError:
-        # Already reaped. It was spawned as the leader of its own session,
-        # and the kernel does not reuse a pid that still names a live
-        # group, so the group — if anything of it is left — is still `pid`.
-        # Once that group is empty the number is free again, and a new
-        # group could in principle take it between here and the signal.
-        # Pids are allocated in sequence, so that needs a full wrap of the
-        # pid space inside a window of at most the grace period — accepted,
-        # and the price of reaching leftovers at all.
-        return pid
     except OSError:
         return None
     if pgid != pid or pgid == own:
@@ -122,8 +138,14 @@ def _agent_group(proc: Any) -> int | None:
     return pgid
 
 
-def _signal_group(pgid: int, sig: int) -> bool:
-    """Signal the group; ``False`` once nothing in it is left to signal."""
+def _signal_group(proc: Any, pgid: int, sig: int) -> bool:
+    """Signal the group; ``False`` once nothing of the agent's is left in it.
+
+    Re-checked before every signal, not once: the group can empty and its
+    id be taken between two signals of the same grace period.
+    """
+    if not _still_ours(proc, pgid):
+        return False
     try:
         os.killpg(pgid, sig)
     except (ProcessLookupError, PermissionError):
@@ -135,7 +157,7 @@ def _kill_agent_now(proc: Any) -> None:
     """SIGKILL the agent's whole group at once, or the child alone."""
     pgid = _agent_group(proc)
     if pgid is not None:
-        _signal_group(pgid, signal.SIGKILL)
+        _signal_group(proc, pgid, signal.SIGKILL)
         return
     try:
         if proc.returncode is None:
@@ -165,11 +187,11 @@ async def _end_agent(
                 pass
             await proc.wait()
         return
-    if _signal_group(pgid, signal.SIGTERM):
+    if _signal_group(proc, pgid, signal.SIGTERM):
         deadline = time.monotonic() + grace
-        while _signal_group(pgid, 0):
+        while _signal_group(proc, pgid, 0):
             if time.monotonic() >= deadline:
-                _signal_group(pgid, signal.SIGKILL)
+                _signal_group(proc, pgid, signal.SIGKILL)
                 break
             await asyncio.sleep(0.05)
     if proc.returncode is None:
