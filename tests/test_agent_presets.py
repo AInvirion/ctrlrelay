@@ -209,9 +209,10 @@ class TestIdentity:
         assert identity.plugin_version == preset_manifest("copilot").plugin_version
 
     def test_the_arguments_are_pinned_to_the_version(self) -> None:
-        """Changing the preset's arguments fails here until the version
-        is bumped too: update both together, so a run pinned to the old
-        arguments is refused rather than resumed with new ones."""
+        """A tripwire: changing the preset's arguments fails here. When it
+        does, bump the preset's version and update both expected values
+        together, so a run pinned to the old arguments is refused rather
+        than resumed with new ones."""
         m = preset_manifest("copilot")
         assert (m.plugin_version, m.args, m.resume_args) == (
             "1",
@@ -220,6 +221,20 @@ class TestIdentity:
             ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps",
              "--output-format", "json", "--resume", "{resume_session_id}"],
         )
+
+    def test_the_factory_carries_the_preset_version_into_the_identity(
+        self, monkeypatch,
+    ) -> None:
+        """"1" is also the adapter's default version, so read a version
+        no default could supply."""
+        import dataclasses
+
+        from ctrlrelay.core import agent_presets
+
+        bumped = dataclasses.replace(agent_presets._PRESETS["copilot"], version="7")
+        monkeypatch.setitem(agent_presets._PRESETS, "copilot", bumped)
+
+        assert _copilot().agent_identity.plugin_version == "7"
 
     def test_a_version_bump_changes_the_fingerprint(self) -> None:
         """So a run pinned to old arguments is refused, not resumed."""
