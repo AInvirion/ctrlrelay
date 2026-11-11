@@ -235,7 +235,8 @@ class _InlineScripts(HTMLParser):
         self._inside = False
 
     def handle_starttag(self, tag: str, attrs: list) -> None:
-        if tag == "script":
+        # A <script src=...> runs the file, never its body text.
+        if tag == "script" and not any(name == "src" for name, _ in attrs):
             self._inside = True
             self.blocks.append("")
 
