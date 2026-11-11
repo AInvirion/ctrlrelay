@@ -166,6 +166,12 @@ async def test_a_resumed_run_that_blocks_again_names_its_issue(
          identity.agent_type, identity.plugin_id),
     )
     db.commit()
+    # The earlier question, answered: the re-block rewrites this row.
+    db.add_pending_resume(
+        session_id="dev-again", pipeline="dev", repo=REPO,
+        question="an earlier question", issue_number=13,
+    )
+    assert db.answer_pending_resume("dev-again", "continue")
     agent = AsyncMock()
     agent.agent_type = "claude"
     agent.agent_identity = identity
@@ -182,6 +188,7 @@ async def test_a_resumed_run_that_blocks_again_names_its_issue(
     assert result.blocked
     row = db.get_pending_resume("dev-again")
     assert row is not None and row["answered_at"] is None
+    assert row["question"] == QUESTION
     assert row["issue_comment_id"] is None
     assert row["issue_number"] == 13
     db.close()
