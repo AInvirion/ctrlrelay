@@ -850,8 +850,11 @@ class TestResolutionTargets:
     async def test_pr_written_without_a_space_is_not_guessed(
         self, db: StateDB
     ) -> None:
-        """``PR#12`` could name a repository called ``PR``."""
+        """``PR#12`` could name a repository called ``PR``. The question's
+        own issue is closed, so only the refused reference can keep it,
+        which tells refusing it apart from silently dropping it."""
         _add(db, "q", "Merge PR#12 first?", 60)
+        _on_issue(db, "q", 290)
         github = AsyncMock()
         github.get_issue_or_pr_state.return_value = _state(closed=True)
 
@@ -891,3 +894,28 @@ class TestResolutionTargets:
         assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
         probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
         assert ("other/thing", 12) in probed
+
+    @pytest.mark.asyncio
+    async def test_a_deeper_path_is_not_read_as_its_last_two_parts(
+        self, db: StateDB
+    ) -> None:
+        _add(db, "q", "Blocked on group/sub/repo#12.", 60)
+        _on_issue(db, "q", 290)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
+        github.get_issue_or_pr_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_link_to_another_host_is_not_a_github_reference(
+        self, db: StateDB
+    ) -> None:
+        _add(db, "q", "See https://notgithub.com/other/thing/issues/12 and #3", 60)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert probed == [("owner/repo", 3)]

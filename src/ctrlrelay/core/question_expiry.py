@@ -89,10 +89,13 @@ def extract_referenced_numbers(question: str) -> list[str]:
 # an unrelated, long-closed issue of the same number and retired a live
 # question as resolved 33 minutes after it was asked (#400). A ``#12a`` is
 # not a reference.
-_REF_WITH_PREFIX_RE = re.compile(r"([\w.-]+(?:/[\w.-]+)?)?#(\d+)(?!\w)")
+# The prefix takes every slash-joined part, so ``group/sub/repo#12`` is
+# read whole (and refused) rather than as ``sub/repo#12``.
+_REF_WITH_PREFIX_RE = re.compile(r"([\w.-]+(?:/[\w.-]+)*)?#(\d+)(?!\w)")
 # A link to an issue or PR names its repository outright.
 _REF_URL_RE = re.compile(
-    r"github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/(\d+)(?!\w)",
+    r"(?<![\w.-])(?:www\.)?github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/"
+    r"(\d+)(?!\w)",
     re.IGNORECASE,
 )
 
@@ -120,7 +123,7 @@ def resolution_targets(row: dict[str, Any]) -> list[tuple[str, int]] | None:
     for prefix, number in _REF_WITH_PREFIX_RE.findall(question):
         if not prefix:
             found.append((repo, int(number)))
-        elif "/" in prefix:
+        elif prefix.count("/") == 1:
             found.append((prefix, int(number)))
         else:
             # ``PR#12`` included: ``PR`` could as well be a repository's

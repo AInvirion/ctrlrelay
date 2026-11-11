@@ -183,7 +183,7 @@ Step-by-step:
   the scheduled sweeper drives the resume. An unanswered question stays
   routable for `question_ttl_seconds` (default 48 hours), then expires.
   When it was asked on an issue, the expiry is said there and the issue is
-  labelled `ctrlrelay:unanswered`: the run has stopped, and someone has to
+  labelled `ctrlrelay:unanswered` (when the label can be added): the run has stopped, and someone has to
   decide the question and start the issue again. Nothing removes the label.
 - **A question is retired early only when everything it rests on is
   closed:** each `#N` it cites (in the question's repository), each
