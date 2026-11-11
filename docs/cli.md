@@ -203,7 +203,8 @@ ctrlrelay run dev -i ISSUE [-r REPO] [-c PATH] [--from-step STEP]
 | `--from-step` | no | — | Start again from `plan`, `code` or `publish`, taking the earlier steps from the issue's newest run that saved them and moving the branch back. See [A run whose process died](operations.md#a-run-whose-process-died). |
 
 Acquires the per-repo lock, creates the worktree, spawns the repo's agent
-(Claude Code or OpenCode, per `agent.type` / `repos[].agent_type`) with the
+(Claude Code, OpenCode, Copilot, Codex or a plugin, per `agent.type` /
+`repos[].agent_type`) with the
 issue's title/body in the prompt, and reports the result. If the agent blocks
 and a chat transport (Telegram or Mattermost) is configured, posts the question
 to your chat and waits for a reply (up to `DEFAULT_MAX_BLOCKED_ROUNDS` rounds).
