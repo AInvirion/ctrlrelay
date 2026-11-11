@@ -755,9 +755,9 @@ class CliAgentAdapter:
 
         if budget is not None and self._reads_usage_at_exit():
             # A backend measured only at exit: nothing in the round itself
-            # can stop it, and a quick round can end before the watch's
-            # first poll. So a session already at its hard limit is refused
-            # here, before the round starts and spends anything (#387).
+            # can stop it, and no watch polls it while it runs. So a session
+            # already at its hard limit is refused here, before the round
+            # starts and spends anything (#387).
             refused = await budget.check(RunUsage())
             if refused is not None:
                 log_event(
@@ -1110,7 +1110,12 @@ class CliAgentAdapter:
                     _logger, "dispatcher.budget.measured_at_exit", **ident,
                     agent_type=self.agent_type, soft=limits.soft,
                     hard=limits.hard,
-                    has_session_total=scope.on_usage is not None,
+                    # The pre-start check only bites when earlier rounds can
+                    # be counted: a session scope that records them, or a
+                    # total handed in.
+                    applies_between_rounds=(
+                        scope.on_usage is not None or scope.before != RunUsage()
+                    ),
                 )
             return BudgetWatch(
                 ExitReadingMeter(),

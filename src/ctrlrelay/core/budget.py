@@ -595,8 +595,15 @@ class BudgetWatch:
     async def finish_with(self, spawn: RunUsage) -> RunUsage:
         """The final reading when it comes from the CLI's own output at exit
         (#387) rather than from a transcript. Recorded and checked like any
-        other poll; returns ``spawn``."""
-        await self.check(spawn)
+        other poll; returns ``spawn``. A hard limit passed by this round is
+        logged: the round has already ended, so nothing is stopped, and the
+        next round of the session is refused before it starts."""
+        reason = await self.check(spawn)
+        if reason is not None:
+            log_event(
+                _logger, "budget.hard_limit_passed_at_exit", **self.ident,
+                reason=reason, source=self.limits.source,
+            )
         return spawn
 
     async def finish(self, cost_usd: float | None) -> RunUsage | None:

@@ -120,6 +120,10 @@ def read_usage_events(stdout_text: str, spec: GenericUsageConfig) -> RunUsage:
             continue
         for name, value in counts.items():
             totals[name] += value
+    if any(v > MAX_TOKEN_COUNT for v in totals.values()):
+        # Each line passed the ceiling and their sum did not: as implausible
+        # as one line past it, and charged as nothing for the same reason.
+        return RunUsage(unreadable=unreadable + 1)
     return RunUsage(**totals, unreadable=unreadable)
 
 
@@ -298,9 +302,9 @@ class GenericCliDispatcher(CliAgentAdapter):
     ) -> RunUsage | None:
         """This spawn's usage, from the CLI's output (#387).
 
-        A run that did not exit cleanly (killed, timed out, non-zero exit)
-        may have used more than its last report said, so its reading is
-        only a floor and is marked unknown.
+        A run that did not exit cleanly (stopped by the relay, or a
+        non-zero exit) may have used more than its last report said, so its
+        reading is only a floor and is marked unknown.
 
         A reading that ``covers`` the native session is a running total for
         that session. Its last total is remembered per relay session (and
@@ -320,13 +324,22 @@ class GenericCliDispatcher(CliAgentAdapter):
           nothing says which part of the running total is new: no remembered
           total (the relay restarted, it was evicted, or the native session
           is older than this relay session), or a total that moved
-          backwards. The remembered total is left as it was, so whatever
-          that round used is charged by the next round that can be measured
-          against it; when there was none, an exact reading becomes it.
+          backwards. With no remembered total, that round is never charged
+          (a restart or eviction forgives one round against the hard
+          limit), and an exact reading becomes the remembered total. After
+          a total moved backwards, the higher total stays remembered, so no
+          round is charged until the CLI's total passes it again: the sum
+          charged never exceeds the CLI's own final total.
 
-        A fresh native session's total is all its own round's: it is charged
-        in full (a floor when inexact) and becomes the remembered total,
-        replacing any older one under the same id.
+        A fresh round is charged its whole reading (a floor when inexact),
+        unless this relay session already remembers a total under the id it
+        reported and the reading is not below it; then the CLI carried that
+        session on and only the difference is charged. Either way the
+        reading becomes the remembered total.
+
+        A round that timed out never reaches here: its output is discarded
+        with the cancelled read, so it is charged nothing and marked unknown
+        (``CliAgentAdapter._round_unmeasured``).
         """
         spec = self.usage
         if spec is None:
@@ -338,11 +351,22 @@ class GenericCliDispatcher(CliAgentAdapter):
             return reading
 
         if resume_session_id is None:
-            if agent_session_id is not None:
-                # Remembered even when inexact: it is what this round was
-                # charged, so the next round charged from it adds up to the
-                # CLI's own total, never more.
-                self._remember(self._native_key(ident, agent_session_id), reading)
+            if agent_session_id is None:
+                return reading
+            key = self._native_key(ident, agent_session_id)
+            earlier = self._native_readings.get(key)
+            # Remembered even when inexact: it is what this round was
+            # charged up to, so the next round charged from it adds up to
+            # the CLI's own total, never more.
+            self._remember(key, reading)
+            if earlier is not None:
+                # A fresh round reporting an id this relay session already
+                # measured: the CLI carried that session on, so only the
+                # difference is new. A total below the remembered one is a
+                # new session reusing the id, and all of it is new.
+                spawn, went_back = _minus(reading, earlier)
+                if not went_back:
+                    return spawn
             return reading
 
         keys = [self._native_key(ident, resume_session_id)]
@@ -362,7 +386,12 @@ class GenericCliDispatcher(CliAgentAdapter):
                         agent_type=self.agent_type,
                     )
                 return spawn
-        elif earlier is None and reading.complete:
+            # Moved backwards: the higher total stays the baseline, also
+            # under a new id the round reported. Lowering it would let the
+            # rounds after charge more than the CLI's own final total.
+            for key in keys[1:]:
+                self._remember(key, earlier)
+        elif reading.complete:
             for key in keys:
                 self._remember(key, reading)
         log_event(

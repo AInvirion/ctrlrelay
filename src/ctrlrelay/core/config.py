@@ -170,8 +170,8 @@ class GenericUsageConfig(BaseModel):
     @field_validator("event_type")
     @classmethod
     def _usage_not_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("must not be empty")
+        if not v.strip() or v != v.strip():
+            raise ValueError("must not be empty or carry surrounding whitespace")
         return v
 
     @field_validator("event_type_path")
@@ -204,6 +204,17 @@ class GenericUsageConfig(BaseModel):
             raise ValueError(
                 f"usage.fields must map {' and '.join(sorted(missing))}"
             )
+        # Two paths where one is the other, or holds the other, can never
+        # both be counts: the same count charged twice, or one that never
+        # matches. The event type's path counts too.
+        named = [(f"fields.{k}", p) for k, p in self.fields.items()]
+        named.append(("event_type_path", self.event_type_path))
+        for i, (a, pa) in enumerate(named):
+            for b, pb in named[i + 1:]:
+                if pa == pb or pa.startswith(pb + ".") or pb.startswith(pa + "."):
+                    raise ValueError(
+                        f"usage {a} ({pa!r}) and {b} ({pb!r}) overlap"
+                    )
         if self.input_includes_cache_read and not {
             "input_tokens", "cache_read_tokens",
         } <= self.fields.keys():

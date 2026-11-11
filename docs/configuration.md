@@ -414,20 +414,28 @@ output when it exits:
 - `fields` maps `input_tokens` and `output_tokens` (both required) and,
   optionally, `cache_creation_tokens` and `cache_read_tokens` to a dotted path
   in the usage line (keys joined by `.`, none empty or containing whitespace;
-  `event_type_path` follows the same rule). A cache count left out counts as zero, for a CLI with no
+  `event_type_path` follows the same rule). No two of these paths may be the
+  same or contain one another. A cache count left out counts as zero, for a CLI with no
   cache. The budget counts input, cache creation and output, as for Claude;
   cache reads are recorded and not counted.
 - `covers: native_session` says the reading is the CLI's running total for its
   own session, so a resumed run repeats what earlier rounds used. The relay
   remembers that session's last total (per relay session, under the id it
-  resumed and the id it reported) and charges a resumed round only the
-  difference. A round that ended badly (non-zero exit, a cut-off line) is
-  charged that difference as a floor and marked unknown. If the relay does not
-  have the total (it restarted between rounds, or the native session is older
-  than the relay session), or the total moved backwards, it charges that round
-  nothing and shows the session's total as unknown; the next round it can
-  measure picks up what that one used. Needs `reading: last` to be set (the
-  default is `sum`).
+  resumed and the id it reported) and charges a round only the difference
+  from it. That includes a fresh round that reports an id the relay session
+  already measured. A round that ended badly (non-zero exit, a cut-off line)
+  is charged that difference as a floor and marked unknown. The sum charged
+  never exceeds the CLI's own final total, which leaves two gaps, both marked
+  unknown:
+  - **No remembered total** (the relay restarted between rounds, or the native
+    session is older than the relay session): that round is never charged,
+    so a restart forgives one round against the hard limit. The next round is
+    charged from its reading.
+  - **The total moved backwards:** that round is charged nothing and the
+    higher total stays remembered, so later rounds are charged only once the
+    CLI's total passes it again.
+
+  Needs `reading: last` to be set (the default is `sum`).
 - `input_includes_cache_read: true` is for CLIs whose input count already
   contains the cache reads (OpenAI's convention); they are taken out of it.
   Cache writes are not taken out: the mapping assumes the input count does not
@@ -436,10 +444,14 @@ output when it exits:
   33,000-token prompt.
 - These are recorded as **unknown**, never as zero, with what could be read
   kept as a floor: no usage line; a usage line with a count that is missing,
-  not an integer, negative or above 10^12 (that line adds nothing); any line
-  that starts as a JSON object and is cut off; a run that was killed, timed
-  out or exited non-zero, whose last report may not be its final one; and a
-  round cancelled by a shutdown, or whose output could not be read at all.
+  not an integer, negative or above 10^12 (that line adds nothing, and a
+  `sum` past 10^12 counts as nothing too); any line that starts as a JSON
+  object and is cut off; and a run that the relay stopped or that exited
+  non-zero, whose last report may not be its final one.
+- A round that **timed out**, was cancelled by a shutdown, or whose output
+  could not be read at all has no reading: its output is discarded, so it is
+  charged nothing and the session's total becomes unknown. Rounds that keep
+  timing out are therefore never charged, and the hard limit cannot stop them.
 
 The reading arrives when the CLI exits, so a hard limit cannot stop a plugin
 in the middle of a round, as it can for Claude. In the lanes that keep a
