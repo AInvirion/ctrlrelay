@@ -153,12 +153,18 @@ class TestGenericPluginGetsOnlyWhatItsManifestAllows:
             extra_env={"OPENAI_API_KEY": "set-by-adapter", "GH_TOKEN": "x"},
         )
 
-        env, _ = await _spawned_env(
+        env, event = await _spawned_env(
             adapter, tmp_path, github_access=False, log_target=_GENERIC_LOG,
         )
 
+        # The pair is the proof: the filter is running (an undeclared,
+        # inherited ANTHROPIC key is gone and logged), and the OPENAI key it
+        # would otherwise remove survives because the adapter set it.
+        # Without the exemption the first assertion goes red.
         assert env["OPENAI_API_KEY"] == "set-by-adapter"
+        assert "OPENAI_API_KEY" not in event["stripped_env"]
         assert "ANTHROPIC_API_KEY" not in env
+        assert "ANTHROPIC_API_KEY" in event["stripped_env"]
         assert "GH_TOKEN" not in env
 
 

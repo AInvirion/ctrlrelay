@@ -726,7 +726,6 @@ then run the check again. On a single-user laptop this is the whole setup.
 | `sandbox_readonly_paths` | list of strings | `~/.claude/settings.json`, `settings.local.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `hooks`, `plugins`, `output-styles`, `scripts`, `rules`, `chrome`, `local`, `projects` (all under `~/.claude`) | Read-only again inside a writable path. One `*` part matches the directories there at the start of each run; a missing path under a writable one is created first. The run's own transcript folder under `projects` is made writable again by the relay. Before 0.25.0 the default had `projects/*/memory`, one mount per project folder; on a home with thousands of them bwrap could not start (#362). A config that still lists that glob has the same problem, so drop it. |
 | `sandbox_cache_dir` | string | `~/.ctrlrelay/agent-cache` | The agent's own package cache under `sandbox: bwrap`. |
 
-
 ### Provider credentials: each backend gets its own (#390)
 
 A node can run more than one agent backend, so a model provider's key is
@@ -739,16 +738,19 @@ agent's environment unless that agent's backend declares them:
 `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`,
 `XAI_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY`, `COHERE_API_KEY`.
 
-| Backend | Receives |
+| Backend | Receives, of the keys above |
 |---|---|
 | `claude` | `ANTHROPIC_*` and `CLAUDE_*` |
 | `opencode` | what `agent.opencode.env_allow` lists (default: none) |
 | a plugin under `agent.plugins` | what its `env_allow` lists (default: none) |
 
 `env_allow` entries are exact names or a prefix ending in `*`
-(`OPENAI_*`). A bare `*`, lowercase names, and anything naming the GitHub,
-git, ssh or relay variables are refused at load: those are removed whatever
-a backend allows. Variables that are not on the list above (`JAVA_HOME`, a
+(`OPENAI_*`). They are matched only against the list above, so they can
+never hand an agent anything else: the GitHub, git, ssh and relay variables
+are removed whatever a backend allows. To make that mistake visible, a bare
+`*`, lowercase names, and entries starting with `GH_`, `GITHUB_` or
+`CTRLRELAY_` (or naming a GitHub token or `SSH_AUTH_SOCK`-style variable
+exactly) are refused at load. Variables that are not on the list above (`JAVA_HOME`, a
 proxy setting, a build token of your own) pass through as before. A backend
 that logs in from its own files (Claude Code under `~/.claude`, Codex under
 `~/.codex`, Copilot under `~/.copilot`) needs no entry at all.
