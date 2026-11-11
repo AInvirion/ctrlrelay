@@ -43,6 +43,9 @@ class _Preset:
     # Codex takes it right after its subcommand (``exec``, ``exec resume``),
     # as an option of that subcommand ahead of its positionals, which is
     # where `codex exec --help` and `codex exec resume --help` list it.
+    # How the CLI reports token usage (#387), as the fields of a
+    # GenericUsageConfig. Measured against real output on #383 and #387.
+    usage: dict | None = None
     model_flag: str = "--model"
     model_after: int | None = None
     resume_model_after: int | None = None
@@ -56,6 +59,35 @@ _COPILOT_ARGS = (
 )
 
 _CODEX_SAFETY = "--dangerously-bypass-approvals-and-sandbox"
+
+# Both CLIs report a running total for the whole native session, so the
+# last reading of a round is taken and resumes are charged the difference.
+# Codex's input_tokens already includes its cached reads; whether it also
+# includes cache writes is unverified (every run measured reported 0).
+_CODEX_USAGE = {
+    "event_type": "turn.completed",
+    "reading": "last",
+    "covers": "native_session",
+    "input_includes_cache_read": True,
+    "fields": {
+        "input_tokens": "usage.input_tokens",
+        "cache_read_tokens": "usage.cached_input_tokens",
+        "cache_creation_tokens": "usage.cache_write_input_tokens",
+        "output_tokens": "usage.output_tokens",
+    },
+}
+_COPILOT_TOKENS = "data.accountingSnapshot.tokenDetails"
+_COPILOT_USAGE = {
+    "event_type": "session.usage_checkpoint",
+    "reading": "last",
+    "covers": "native_session",
+    "fields": {
+        "input_tokens": f"{_COPILOT_TOKENS}.input.tokenCount",
+        "cache_read_tokens": f"{_COPILOT_TOKENS}.cache_read.tokenCount",
+        "cache_creation_tokens": f"{_COPILOT_TOKENS}.cache_write.tokenCount",
+        "output_tokens": f"{_COPILOT_TOKENS}.output.tokenCount",
+    },
+}
 
 _PRESETS: dict[str, _Preset] = {
     # Checked against Copilot CLI 1.0.107 and 1.0.109 (#383): the final
@@ -71,6 +103,7 @@ _PRESETS: dict[str, _Preset] = {
         # ~/.copilot needs no entry; this is for a node that sets the token
         # in the daemon's environment instead (#383).
         env_allow=("COPILOT_GITHUB_TOKEN",),
+        usage=_COPILOT_USAGE,
         version="1",
     ),
     # Checked against Codex CLI 0.166 and 0.167 (#383): the first event is
@@ -93,6 +126,7 @@ _PRESETS: dict[str, _Preset] = {
         # Codex reads its own login from ~/.codex; these are for a node
         # that authenticates it with an API key instead.
         env_allow=("OPENAI_API_KEY", "CODEX_API_KEY"),
+        usage=_CODEX_USAGE,
         version="1",
         model_flag="-m",
         model_after=1,
@@ -132,6 +166,7 @@ def preset_manifest(
         plugin_version=preset.version,
         instructions_files=list(preset.instructions_files),
         env_allow=list(preset.env_allow),
+        usage=preset.usage,
     )
 
 

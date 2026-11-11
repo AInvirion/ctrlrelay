@@ -447,3 +447,36 @@ class TestTheCodexPresetGetsOnlyItsOwnProviderKeys:
         assert env["CODEX_API_KEY"] == "codex-value"
         for gone in ("COPILOT_GITHUB_TOKEN", "ANTHROPIC_API_KEY", "GH_TOKEN"):
             assert gone not in env
+
+
+class TestPresetsMeasureUsage:
+    """#387: both presets carry the usage maps tested against real output,
+    so their runs are counted and the token budget applies."""
+
+    @pytest.mark.parametrize("name,expected", [
+        ("copilot", "COPILOT_USAGE"),
+        ("codex", "CODEX_USAGE"),
+    ])
+    def test_the_preset_carries_the_tested_map(self, name, expected) -> None:
+        import tests.test_generic_cli_usage as measured
+
+        assert preset_manifest(name).usage.model_dump(exclude_unset=True) == (
+            getattr(measured, expected)
+        )
+
+    @pytest.mark.parametrize("make", [_copilot, _codex])
+    def test_the_adapter_reports_usage(self, make) -> None:
+        assert make().capabilities.usage is True
+
+    @pytest.mark.parametrize("name,output", [
+        ("copilot", "COPILOT_FRESH"),
+        ("codex", "CODEX_FRESH"),
+    ])
+    def test_real_output_is_read_as_an_exact_count(self, name, output) -> None:
+        import tests.test_generic_cli_usage as measured
+        from ctrlrelay.core.generic_cli import read_usage_events
+
+        got = read_usage_events(
+            getattr(measured, output), preset_manifest(name).usage,
+        )
+        assert got.complete and got.counted > 0
