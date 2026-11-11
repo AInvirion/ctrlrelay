@@ -74,14 +74,37 @@ paths:
 ## agent backends
 
 `agent.type` picks the adapter ctrlrelay uses to talk to a coding-agent
-CLI. Claude and OpenCode are built in; additional non-interactive CLIs can be
-enrolled through a local manifest:
+CLI, and `repos[].agent_type` overrides it for one repo. Claude and OpenCode
+are built-in adapters; Copilot and Codex are built-in presets (fixed
+manifests, see [built-in presets](#built-in-presets-copilot-and-codex)); any
+other simple non-interactive CLI can be enrolled through a local manifest
+under `agent.plugins`.
 
-| `agent.type` | CLI it runs | notes |
-|---|---|---|
-| `claude` (default) | `claude -p --output-format stream-json --verbose --dangerously-skip-permissions` | Reads the subscription usage; supports `sandbox: "bwrap"`. |
-| `opencode` | `opencode run --format json --dangerously-skip-permissions` | Can target a self-hosted OpenAI-compatible endpoint. No usage reading; no bwrap yet. |
-| a key under `agent.plugins` | The manifest's binary and fixed argv | Generic checkpoint and optional native-session mapping. Token usage is measured at exit when the manifest has a [`usage`](#measuring-a-plugins-token-usage) mapping. No live transcript or bwrap. |
+| type | how to enable it | resume after a question | usage measured for the budget | stuck detection | sandbox |
+|---|---|---|---|---|---|
+| `claude` | the default | yes | yes | yes | yes, `sandbox: "bwrap"` |
+| `opencode` | `agent_type: opencode` | yes | no ([#387](https://github.com/AInvirion/ctrlrelay/issues/387) covers generic plugins only) | no | no ([#296](https://github.com/AInvirion/ctrlrelay/issues/296)) |
+| `copilot` | `agent_type: copilot` | yes | yes, read at exit and applied between rounds ([how](#measuring-a-plugins-token-usage)) | no ([#388](https://github.com/AInvirion/ctrlrelay/issues/388)) | no ([#352](https://github.com/AInvirion/ctrlrelay/issues/352)) |
+| `codex` | `agent_type: codex` | yes | yes, read at exit and applied between rounds ([how](#measuring-a-plugins-token-usage)) | no ([#388](https://github.com/AInvirion/ctrlrelay/issues/388)) | no ([#352](https://github.com/AInvirion/ctrlrelay/issues/352)) |
+| a key under `agent.plugins` | a manifest, then `agent_type: <key>` | if the manifest maps `resume_args` and `session_id_path` | if the manifest maps [`usage`](#measuring-a-plugins-token-usage) | no ([#388](https://github.com/AInvirion/ctrlrelay/issues/388)) | no ([#352](https://github.com/AInvirion/ctrlrelay/issues/352)) |
+
+What each column means:
+
+- **resume after a question**: a run that asks something (`BLOCKED_NEEDS_INPUT`)
+  continues the same agent conversation once it is answered, rather than
+  starting over.
+- **usage measured**: the token budget (`agent.budget`) applies. Without it a
+  run is not counted and no limit stops it.
+- **stuck detection**: the relay reads the agent's live events and stops a run
+  going in circles ([stuck runs](operations.md#stuck-runs)). Without it only
+  the timeout stops a run.
+- **sandbox**: the agent runs inside bubblewrap. A backend without one refuses
+  to start on a node with `sandbox: "bwrap"` rather than run unconfined, so it
+  needs `sandbox: "none"`.
+
+Every backend, sandboxed or not, gets the same credential stripping
+([what the agent can reach](#what-the-agent-can-reach-219)) and only its own
+provider keys ([provider credentials](#provider-credentials-each-backend-gets-its-own-390)).
 
 Anything else raises at startup with a message naming the type. That is
 deliberate: a typo must stop the daemon rather than silently fall back
@@ -331,43 +354,71 @@ configuration change from resuming a run on a different backend; it does not
 stop someone who can write the launcher file itself, and an unconfined agent
 runs as the same user that owns it. Confinement is #352's job.
 
-#### Example: GitHub Copilot CLI
+#### Built-in presets: Copilot and Codex
 
-Codex has a built-in preset too (`codex`, #385). This manifest is now built in as the `copilot` preset: set
-`repos[].agent_type: copilot` (or `agent.type: copilot`) and leave
-`agent.plugins` alone. `agent.presets.copilot` may change only `binary`,
-`model` (passed as `--model`) and `default_timeout_seconds`; the arguments
-are fixed, and a hand-written `agent.plugins.copilot` is refused. The
-manifest below is what the preset runs; it is shown for reference and is
-refused if copied into `agent.plugins`.
-
-Checked against Copilot CLI 1.0.107: it starts and answers with GitHub
-credentials stripped (it uses its own stored login), its JSONL output ends with
-a `result` event carrying a top-level `sessionId`, and `--resume` continues
-that conversation.
+`copilot` and `codex` are manifests built into ctrlrelay. Name one and leave
+`agent.plugins` alone:
 
 ```yaml
 agent:
-  sandbox: "none"
-  plugins:
-    copilot:
-      binary: "copilot"
-      args: ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps",
-             "--output-format", "json"]
-      resume_args: ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps",
-                    "--output-format", "json", "--resume", "{resume_session_id}"]
-      session_id_path: "sessionId"
-      instructions_files: [".github/copilot-instructions.md", "AGENTS.md"]
+  sandbox: "none"          # neither preset runs under bwrap
+  presets:                 # optional; only these three keys are accepted
+    codex:
+      model: "gpt-5.1-codex"
+      default_timeout_seconds: 3600
+repos:
+  - name: "owner/low-stakes"
+    agent_type: "copilot"
+  - name: "owner/other"
+    agent_type: "codex"
 ```
 
-`--disable-builtin-mcps` matters. Without it Copilot connects its built-in
-GitHub MCP server with **its own** GitHub login, which hands the agent GitHub
-access that credential stripping (#219) exists to withhold. MCP servers you add
-in `~/.copilot/mcp-config.json` still load; keep that file empty on a relay
-node. `--allow-all-tools` lets the agent run any command unconfined, which is
-true of every generic plugin until the container runner (#352) lands. Copilot's
-`result` event also reports premium requests used, but the relay does not read
-it yet, so the token budget does not apply.
+`agent.presets.<name>` may change only `binary` (default `copilot` /
+`codex`), `model` and `default_timeout_seconds`. Copilot gets the model as
+`--model <m>` at the end; Codex as `-m <m>` right after `exec`. A model
+containing `{`, `}` or starting with `-` is refused, and so is any other key.
+The arguments themselves are fixed, because some of them are what make the
+backend safe unattended, and a hand-written `agent.plugins.copilot` or
+`agent.plugins.codex` is refused at load.
+
+What each preset runs:
+
+| preset | fresh run | resume | session id |
+|---|---|---|---|
+| `copilot` | `copilot -p <prompt> --allow-all-tools --disable-builtin-mcps --output-format json` | the same plus `--resume <id>` | `sessionId` on the final `result` event |
+| `codex` | `codex exec --json --dangerously-bypass-approvals-and-sandbox <prompt>` | `codex exec resume --json --dangerously-bypass-approvals-and-sandbox <id> <prompt>` | `thread_id` on the first `thread.started` event |
+
+Why the flags:
+
+- **`--disable-builtin-mcps` (Copilot).** Without it Copilot connects its
+  built-in GitHub MCP server with **its own** GitHub login, which hands the
+  agent GitHub access that credential stripping (#219) exists to withhold. MCP
+  servers you add in `~/.copilot/mcp-config.json` still load; keep that file
+  empty on a relay node.
+- **`--allow-all-tools` (Copilot) and `--dangerously-bypass-approvals-and-sandbox`
+  (Codex).** Nobody is there to approve a command. Both agents therefore run
+  unconfined, like every generic plugin until the container runner (#352)
+  lands, which is why neither starts on a `sandbox: "bwrap"` node. Codex's own
+  `--sandbox workspace-write` was tried and cannot commit: a linked worktree's
+  git directory lives outside the workspace it may write (#383).
+
+Logging the CLIs in for relay use:
+
+- **Copilot.** The relay strips `GH_*` and blocks the desktop keyring, so
+  neither `gh`'s login nor a keyring-stored Copilot login reaches it. Log in
+  once with the keyring out of reach, so the token is stored in
+  `~/.copilot/config.json` instead:
+  `DBUS_SESSION_BUS_ADDRESS=disabled: copilot`, then `/login`. Or set
+  `COPILOT_GITHUB_TOKEN` in the daemon's environment; the preset is allowed to
+  receive that one variable.
+- **Codex.** `codex login` stores its login under `~/.codex`, which the relay
+  leaves in place. Or set `OPENAI_API_KEY` / `CODEX_API_KEY`; the preset may
+  receive those.
+
+Check a preset with `ctrlrelay agent check copilot --resume` (or `codex`)
+before pointing a repo at it.
+
+#### Plugins you enroll yourself
 
 The shared runtime still supplies checkpoint reading, credential stripping,
 timeout/cancellation, and dispatch-health reporting. Generic plugins honestly
@@ -393,10 +444,12 @@ no native id can start a fresh session under the current local defaults.
 
 A manifest with a `usage` mapping has its runs measured, so the token budget
 ([`agent.budget`](#agentbudget)) applies to them. The relay reads the CLI's JSON-lines
-output when it exits:
+output when it exits. The `copilot` and `codex` presets already carry the
+mappings below; this is for a plugin you enroll yourself, here one that
+reports usage the way Codex does:
 
 ```yaml
-    codex:
+    mycli:
       # ... binary, args, resume_args, session_id_path ...
       usage:
         event_type: "turn.completed"   # lines whose `type` is this carry usage
@@ -564,8 +617,9 @@ agent:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `type` | string | `"claude"` | Default backend for every repo: `"claude"`, `"opencode"`, or a key under `agent.plugins`. See [agent backends](#agent-backends). |
-| `plugins` | object | `{}` | Locally trusted generic CLI manifests. Keys use lowercase letters, digits, `_` and `-`, start with a letter, and cannot replace `claude` or `opencode`. See [Generic CLI plugins and assignment policy](#generic-cli-plugins-and-assignment-policy). |
+| `type` | string | `"claude"` | Default backend for every repo: `"claude"`, `"opencode"`, a built-in preset (`"copilot"`, `"codex"`), or a key under `agent.plugins`. See [agent backends](#agent-backends). |
+| `plugins` | object | `{}` | Locally trusted generic CLI manifests. Keys use lowercase letters, digits, `_` and `-`, start with a letter, and cannot replace `claude`, `opencode` or a preset name (`copilot`, `codex`). See [Generic CLI plugins and assignment policy](#generic-cli-plugins-and-assignment-policy). |
+| `presets` | object | `{}` | Overrides for the built-in presets, keyed `copilot` or `codex`: only `binary`, `model` and `default_timeout_seconds`. A preset works without an entry here. See [built-in presets](#built-in-presets-copilot-and-codex). |
 | `assignable_types` | list[string] | `[]` | Enrolled agent types a future control-plane assignment may explicitly select. Empty permits no assignment override. It does not change standalone defaults or block a previously pinned resume. |
 | `binary` | string | `"claude"` | Path to the `claude` executable. The bare name `"claude"` is auto-resolved at startup using `shutil.which("claude")`, then `~/.local/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude`. Set an absolute path to skip lookup (useful under launchd/systemd where PATH is minimal). A relative path is refused because the child would resolve it inside the worktree. |
 | `default_timeout_seconds` | int | `1800` | Per-session timeout passed to `asyncio.wait_for`. Sessions that exceed this are killed and reported as failed. A session going in circles is stopped before this; see [stuck runs](operations.md#stuck-runs). |
@@ -1166,7 +1220,7 @@ repos:
 | `name` | string | **yes** | — | GitHub `owner/repo` slug. Used for `gh` calls and bare-repo / worktree naming. |
 | `local_path` | path | conditional | derived | Where the repo is checked out on disk for human use. Optional when `paths.repo_root` is set (then derived as `${repo_root}/${owner.lower()}/${repo}`, since v0.4.0); required otherwise. An explicit value always wins as override. ctrlrelay itself uses bare mirrors under `paths.bare_repos`. |
 | `dev_branch_template` | string | no | `"fix/issue-{n}"` | Branch-name template for dev-pipeline runs. `{n}` is replaced by the issue number. |
-| `agent_type` | string | no | `null` | Which agent backend runs this repo's sessions. `null` means `agent.type`. See [agent backends](#agent-backends). A value no adapter answers to stops the daemon at startup, naming this repo. |
+| `agent_type` | string | no | `null` | Which agent backend runs this repo's sessions: `claude`, `opencode`, `copilot`, `codex` or a key under `agent.plugins`. `null` means `agent.type`. See [agent backends](#agent-backends). A value no adapter answers to stops the daemon at startup, naming this repo. |
 | `automation` | object | no | (defaults) | See [automation](#repos-automation). |
 | `code_review` | object | no | (defaults) | Review run over an agent branch before its PR is handed over. See [code_review](#code_review). |
 | `steps` | object | no | (all unset) | How strict each dev pipeline work step is. See [steps](#repossteps). |

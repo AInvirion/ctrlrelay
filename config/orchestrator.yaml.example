@@ -87,13 +87,16 @@ agent:
   #     plugin_version: "1"
   #     instructions_files: ["AGENTS.md"]  # names the CLI reads for context
   #     default_timeout_seconds: 1800
-  #   # GitHub Copilot CLI; see docs/configuration.md for why each flag is there.
+  # Copilot and Codex are built-in presets: set repos[].agent_type to
+  # "copilot" or "codex" with no entry here. Only these three keys can be
+  # changed; the arguments are fixed. See docs/configuration.md.
+  # presets:
   #   copilot:
   #     binary: "copilot"
-  #     args: ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps", "--output-format", "json"]
-  #     resume_args: ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps", "--output-format", "json", "--resume", "{resume_session_id}"]
-  #     session_id_path: "sessionId"
-  #     instructions_files: [".github/copilot-instructions.md", "AGENTS.md"]
+  #     model: "claude-sonnet-4.5"
+  #     default_timeout_seconds: 3600
+  #   codex:
+  #     model: "gpt-5.1-codex"
 
 # EXACTLY ONE transport is active, and it is the one named by `type`.
 # The other blocks below are inert: they may stay in the file, but nothing
