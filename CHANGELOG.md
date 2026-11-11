@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-11-11
+
 ### Added
 
 - `ctrlrelay agent check <agent_type>` proves one backend writes its
@@ -72,6 +74,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   otherwise gives the agent GitHub access under Copilot's own login,
   bypassing credential stripping (#379).
 
+- Copilot and Codex as built-in agent presets (#384, #385). Set
+  `repos[].agent_type: copilot` or `codex` (or `agent.type`) with no
+  `agent.plugins` entry. Their arguments are fixed in code, because some of them
+  are what make the backend safe unattended: Copilot's `--disable-builtin-mcps`
+  keeps its own GitHub login away from the agent. `agent.presets.<name>` may
+  change only `binary`, `model` and `default_timeout_seconds`. Both presets
+  run unconfined and refuse to start on a `sandbox: "bwrap"` node.
+- Generic plugins can have their token usage measured, so the token budget
+  applies to them (#387). A manifest's `usage` mapping says which JSON-lines
+  event carries usage and where each count is. The reading is taken when the
+  CLI exits, a resumed round is charged only the difference from the
+  session's last total, and anything unreadable is recorded as unknown, never
+  zero. Both presets carry mappings measured against real output.
+- Each agent backend receives only its own model-provider keys (#390). A
+  well-known provider variable such as `OPENAI_API_KEY` or
+  `ANTHROPIC_API_KEY` reaches an agent only if its backend allows it:
+  Claude gets `ANTHROPIC_*` and `CLAUDE_*`, the presets their own, and
+  `opencode` and plugins what `env_allow` lists (default none). The security
+  sweep keeps GitHub access but loses the relay's secrets and other backends'
+  keys.
+- One agent backends table in the docs, with resume, usage, stuck detection
+  and sandbox for each backend, and how to log the Copilot and Codex CLIs in
+  for relay use (#386).
+
 ### Fixed
 
 - An agent can no longer outlive its session or stall the relay through
@@ -131,6 +157,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- `agent.plugins.copilot` and `agent.plugins.codex` are now refused at load,
+  because those names are built-in presets (#384, #385). Remove the entry and
+  set `agent.presets.<name>` if you changed its binary, model or timeout.
+- An `opencode` setup, or a plugin, that reads a model-provider key from the
+  environment now needs that key listed in its `env_allow` (#390).
+- On Linux, log the Copilot CLI in with the keyring out of reach
+  (`DBUS_SESSION_BUS_ADDRESS=disabled: copilot`, then `/login`) or set
+  `COPILOT_GITHUB_TOKEN`: the relay blocks the desktop keyring, so a
+  keyring-stored login cannot be read.
 - A run waiting on a question from before this release has no recorded
   agent identity. If its agent session had already started, it is refused
   with `agent_identity_unknown` instead of being resumed on whatever backend
@@ -2784,7 +2819,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.24.0...v0.25.0
