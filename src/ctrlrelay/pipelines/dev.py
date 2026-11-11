@@ -2899,6 +2899,7 @@ def _park_question(run: _DevRun, question: str) -> bool:
     try:
         run.state_db.park_blocked_question(
             run.session_id, "dev", run.repo, question,
+            issue_number=run.issue_number,
         )
         return True
     except Exception as e:
@@ -4959,6 +4960,7 @@ async def run_dev_issue(
                         pipeline="dev",
                         repo=repo,
                         question=question,
+                        issue_number=issue_number,
                     )
             except Exception as e:
                 log_event(
@@ -5570,6 +5572,7 @@ async def resume_dev_from_pending(
                         pipeline="dev",
                         repo=repo,
                         question=question,
+                        issue_number=issue_number,
                     )
             except Exception as e:
                 log_event(

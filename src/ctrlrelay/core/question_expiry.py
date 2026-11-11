@@ -109,8 +109,8 @@ def resolution_targets(row: dict[str, Any]) -> list[tuple[str, int]] | None:
 
     Each ``#N`` the question cites, in its own repository, or in
     ``owner/repo`` when written ``owner/repo#N`` or as a link to the
-    issue; plus the issue the question was asked on, when it was asked on
-    one. A markdown link ``[#12](…/other/thing/issues/12)`` yields both
+    issue; plus the issue the run belongs to, whether or not the question
+    was posted there (#412). A markdown link ``[#12](…/other/thing/issues/12)`` yields both
     targets, so both must be closed. A run paused on an open issue is still waiting for
     its answer whatever else the question mentions, so that issue being
     open keeps the question.
