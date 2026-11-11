@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- A sandboxed agent can no longer read other projects' transcripts or
+  memory under `~/.claude/projects` (#364). Since #362 that folder was
+  read-only in the sandbox but still readable, and session transcripts can
+  hold anything pasted into a session. It is now an empty tmpfs, with only
+  the run's own transcript folder bound back on top, writable. The hide is
+  added by the relay itself, so a custom `agent.sandbox_hide_paths` cannot
+  drop it. What the agent writes elsewhere in that folder is discarded with
+  the run. The number of bwrap mounts does not grow with the number of
+  projects.
+
 ## [0.28.1] - 2026-11-11
 
 ### Fixed
