@@ -603,9 +603,9 @@ def _with_gh_credential(base: Mapping[str, str]) -> dict[str, str]:
     helper is added: the relay runs unattended, so a missing credential
     fails at once instead of waiting on a prompt nobody will answer.
     No helper is added when gh cannot be found, when
-    ``GIT_CONFIG_COUNT`` is not at most six plain digits (left for git to read or
+    ``GIT_CONFIG_COUNT`` is set and is not at most six plain digits (left for git to read or
     refuse as it does), or when the slot it would take is already set: an
-    entry is never overwritten.
+    entry is never overwritten. An empty count reads as zero.
     """
     from ctrlrelay.core.github import _find_gh
 

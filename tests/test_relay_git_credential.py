@@ -67,7 +67,7 @@ def test_a_gh_that_cannot_be_found_adds_no_helper_but_still_no_prompt() -> None:
 
 
 @pytest.mark.parametrize("count", ["two", "-1", "+1", "1_0", "\u0661", "0" * 5000])
-def test_a_count_that_is_not_a_plain_number_is_left_as_it_is(
+def test_a_count_that_is_not_short_plain_digits_is_left_as_it_is(
     fake_gh: Path, count: str,
 ) -> None:
     with _gh_at(fake_gh):
