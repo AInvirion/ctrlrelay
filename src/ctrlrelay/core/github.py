@@ -894,6 +894,18 @@ class GitHubCLI:
                 f"posting a comment returned no id: {output.strip()[:200]!r}"
             ) from None
 
+    async def add_issue_label(
+        self, repo: str, issue_number: int, label: str,
+    ) -> None:
+        """Add one label to an issue or PR. GitHub creates a label the
+        repository does not have yet."""
+        await self._run_gh(
+            "api", "-X", "POST",
+            f"repos/{repo}/issues/{issue_number}/labels",
+            "-f", f"labels[]={label}",
+            "--jq", ".[].name",
+        )
+
     async def edit_issue_comment(
         self, repo: str, comment_id: int, body: str,
     ) -> None:

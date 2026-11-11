@@ -771,3 +771,174 @@ class TestRetention:
 
         assert TelegramConfig().question_retention_days == 90
         assert MattermostConfig(url="https://x").question_retention_days == 90
+
+
+def _on_issue(db: StateDB, session_id: str, issue_number: int) -> None:
+    """The question was also posted on the run's issue (#328)."""
+    assert db.record_issue_question(session_id, issue_number, 9000, 1)
+
+
+class TestResolutionTargets:
+    """What the resolved-elsewhere pass probes (#400)."""
+
+    @pytest.mark.asyncio
+    async def test_a_reference_to_another_repo_by_bare_name_is_not_probed_here(
+        self, db: StateDB
+    ) -> None:
+        """The incident: a question citing ``oaf-kernel#118`` was probed as
+        this repo's #118, an unrelated issue closed days earlier, and was
+        retired as resolved at the next hourly sweep. The question's own
+        issue reads closed here, so only the refused reference can keep
+        it."""
+        _add(db, "q", "Wait for oaf-kernel#118 (S1) plus a pin bump?", 60)
+        _on_issue(db, "q", 290)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
+        assert len(db.list_unanswered_pending_resumes()) == 1
+        github.get_issue_or_pr_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_owner_repo_reference_is_probed_in_that_repo(
+        self, db: StateDB
+    ) -> None:
+        _add(db, "q", "Is other/thing#7 merged yet, and #8?", 60)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        expired = await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        assert [r["session_id"] for r in expired] == ["q"]
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert probed == [("other/thing", 7), ("owner/repo", 8)]
+
+    @pytest.mark.asyncio
+    async def test_an_open_issue_the_question_was_asked_on_keeps_it(
+        self, db: StateDB
+    ) -> None:
+        """Everything the question cites is closed, but the run it pauses
+        is on an issue that is still open: that run is still waiting."""
+        _add(db, "q", "Approve #12?", 60)
+        _on_issue(db, "q", 290)
+        github = AsyncMock()
+
+        async def state(repo: str, number: int, **_kw: object) -> dict:
+            return _state(closed=number != 290)
+
+        github.get_issue_or_pr_state.side_effect = state
+
+        assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
+        assert len(db.list_unanswered_pending_resumes()) == 1
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert ("owner/repo", 290) in probed
+
+    @pytest.mark.asyncio
+    async def test_closing_the_issue_the_question_was_asked_on_retires_it(
+        self, db: StateDB
+    ) -> None:
+        """The issue was closed by hand: the question is meaningless, even
+        when it cites no number of its own."""
+        _add(db, "q", "Which of the two designs?", 60)
+        _on_issue(db, "q", 290)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        expired = await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        assert [r["session_id"] for r in expired] == ["q"]
+        assert expired[0]["expired_reason"] == EXPIRY_REASON_RESOLVED
+
+    @pytest.mark.asyncio
+    async def test_pr_written_without_a_space_is_not_guessed(
+        self, db: StateDB
+    ) -> None:
+        """``PR#12`` could name a repository called ``PR``. The question's
+        own issue is closed, so only the refused reference can keep it,
+        which tells refusing it apart from silently dropping it."""
+        _add(db, "q", "Merge PR#12 first?", 60)
+        _on_issue(db, "q", 290)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
+        github.get_issue_or_pr_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_number_run_into_letters_is_not_a_reference(
+        self, db: StateDB
+    ) -> None:
+        _add(db, "q", "Use colour #12a or #3?", 60)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert probed == [("owner/repo", 3)]
+
+    @pytest.mark.asyncio
+    async def test_a_linked_issue_is_probed_in_its_repo_as_well(
+        self, db: StateDB
+    ) -> None:
+        """``[#12](…/other/thing/issues/12)``: the link names the repo, so
+        that issue must be closed too, whatever this repo's #12 is."""
+        _add(
+            db, "q",
+            "Blocked on [#12](https://github.com/other/thing/issues/12).", 60,
+        )
+        github = AsyncMock()
+
+        async def state(repo: str, number: int, **_kw: object) -> dict:
+            return _state(closed=repo == "owner/repo")
+
+        github.get_issue_or_pr_state.side_effect = state
+
+        assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert ("other/thing", 12) in probed
+
+    @pytest.mark.asyncio
+    async def test_a_deeper_path_is_not_read_as_its_last_two_parts(
+        self, db: StateDB
+    ) -> None:
+        _add(db, "q", "Blocked on group/sub/repo#12.", 60)
+        _on_issue(db, "q", 290)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
+        github.get_issue_or_pr_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_link_to_another_host_is_not_a_github_reference(
+        self, db: StateDB
+    ) -> None:
+        _add(
+            db, "q",
+            "See https://notgithub.com/other/thing/issues/12, "
+            "https://example.com/github.com/other/thing/issues/13 and #3",
+            60,
+        )
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert probed == [("owner/repo", 3)]
+
+    @pytest.mark.asyncio
+    async def test_a_bare_or_www_github_link_is_read(self, db: StateDB) -> None:
+        _add(
+            db, "q",
+            "See github.com/a/b/pull/4 and https://www.github.com/c/d/issues/5",
+            60,
+        )
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert probed == [("a/b", 4), ("c/d", 5)]

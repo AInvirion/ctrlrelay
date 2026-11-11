@@ -98,13 +98,42 @@ def chat_answer_comment(session_id: str, answer: str, full: bool) -> str:
     return f"{body}\n{_marker('answer', session_id)}"
 
 
-def expired_comment(session_id: str, reason: str | None) -> str:
-    why = f" ({reason})" if reason else ""
-    return (
-        f"**The question above expired unanswered{why}.** An answer to it "
-        "is no longer applied, here or in chat.\n"
-        f"{_marker('expired', session_id)}"
-    )
+# Put on an issue whose question expired unanswered (#400), so a run that
+# stopped for want of an answer is findable work rather than a comment
+# nobody re-reads. Nothing removes it: a person does, once they have
+# decided the question and started the issue again.
+UNANSWERED_LABEL = "ctrlrelay:unanswered"
+
+
+def expired_comment(
+    session_id: str, reason: str | None, *, labelled: bool = False,
+) -> str:
+    if reason == "ttl":
+        found = (
+            f" The issue is labelled `{UNANSWERED_LABEL}` so it can be found."
+            if labelled else ""
+        )
+        body = (
+            "**The question above expired unanswered.** This issue's run "
+            "has stopped and will not continue on its own, and an answer "
+            f"to that question is no longer applied, here or in chat.{found} "
+            "To go on, decide the question in a comment, then remove the "
+            "issue number from seen_issues in poller_state.json so the "
+            "relay runs it again."
+        )
+    elif reason == "resolved_elsewhere":
+        body = (
+            "**The question above was retired:** this issue is closed, "
+            "along with any issue or pull request the question cites. An "
+            "answer to it is no longer applied, here or in chat."
+        )
+    else:
+        why = f" ({reason})" if reason else ""
+        body = (
+            f"**The question above expired unanswered{why}.** An answer "
+            "to it is no longer applied, here or in chat."
+        )
+    return f"{body}\n{_marker('expired', session_id)}"
 
 
 def already_answered_comment(session_id: str, login: str) -> str:
@@ -429,14 +458,33 @@ async def note_chat_answer_on_issue(
 
 
 async def note_expiry_on_issue(github: Any, row: dict[str, Any]) -> bool:
-    """Say on the issue that its question expired. Returns whether a
-    comment was posted."""
+    """Say on the issue that its question expired, and label an issue
+    whose question aged out unanswered. Returns whether a comment was
+    posted."""
     if row.get("issue_comment_id") is None or row.get("issue_number") is None:
         return False
+    labelled = False
+    if row.get("expired_reason") == "ttl":
+        # Before the comment, so the comment says whether it worked; a
+        # label that cannot be added still leaves the comment.
+        try:
+            await github.add_issue_label(
+                row["repo"], int(row["issue_number"]), UNANSWERED_LABEL,
+            )
+            labelled = True
+        except Exception as e:
+            log_event(
+                _logger, "issue_question.unanswered_label_failed",
+                session_id=row["session_id"], repo=row["repo"],
+                error_type=type(e).__name__, error=str(e)[:200],
+            )
     try:
         await github.post_issue_comment(
             row["repo"], int(row["issue_number"]),
-            expired_comment(row["session_id"], row.get("expired_reason")),
+            expired_comment(
+                row["session_id"], row.get("expired_reason"),
+                labelled=labelled,
+            ),
         )
     except Exception as e:
         log_event(
@@ -451,6 +499,7 @@ async def note_expiry_on_issue(github: Any, row: dict[str, Any]) -> bool:
 __all__ = [
     "QUESTION_ON_ISSUE_MODES",
     "RELAY_MARKER_PREFIX",
+    "UNANSWERED_LABEL",
     "ask_on_issue",
     "check_issue_answer",
     "note_chat_answer_on_issue",

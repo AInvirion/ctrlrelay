@@ -480,3 +480,62 @@ async def test_a_chat_answer_copy_that_fails_can_be_tried_again(
     row = state_db.get_pending_resume("s-1")
     assert await note_chat_answer_on_issue(github.mock, state_db, row, mode="full")
     assert len(github.bodies("ctrlrelay:answer")) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_question_that_ages_out_labels_the_issue(tmp_path: Path) -> None:
+    """#400: a run paused on its issue, nobody answers, the sweep retires
+    the question on age. The issue must carry something findable, and the
+    comment must say the run stopped and how to go on."""
+    from ctrlrelay.core.issue_questions import UNANSWERED_LABEL
+    from ctrlrelay.core.question_expiry import expire_stale_questions
+
+    state_db = StateDB(tmp_path / "state.db")
+    _watched_row(state_db)
+    state_db.execute(
+        "UPDATE pending_resumes SET created_at = created_at - 200000"
+    )
+    state_db.commit()
+    github = _GitHub()
+    github.mock.get_issue_or_pr_state.return_value = {"state": "open"}
+
+    (row,) = await expire_stale_questions(state_db, github.mock, ttl_seconds=172800)
+    assert await note_expiry_on_issue(github.mock, row)
+
+    github.mock.add_issue_label.assert_awaited_once_with(REPO, 13, UNANSWERED_LABEL)
+    (body,) = github.bodies("ctrlrelay:expired")
+    assert "has stopped" in body
+    assert UNANSWERED_LABEL in body
+    assert "seen_issues" in body
+
+
+@pytest.mark.asyncio
+async def test_a_question_retired_as_resolved_does_not_label(
+    tmp_path: Path,
+) -> None:
+    state_db = StateDB(tmp_path / "state.db")
+    _watched_row(state_db)
+    assert state_db.expire_pending_resume("s-1", "resolved_elsewhere")
+    github = _GitHub()
+
+    assert await note_expiry_on_issue(github.mock, state_db.get_pending_resume("s-1"))
+
+    github.mock.add_issue_label.assert_not_awaited()
+    (body,) = github.bodies("ctrlrelay:expired")
+    assert "this issue is closed" in body
+
+
+@pytest.mark.asyncio
+async def test_a_label_that_cannot_be_added_still_leaves_the_comment(
+    tmp_path: Path,
+) -> None:
+    state_db = StateDB(tmp_path / "state.db")
+    _watched_row(state_db)
+    assert state_db.expire_pending_resume("s-1", "ttl")
+    github = _GitHub()
+    github.mock.add_issue_label.side_effect = RuntimeError("no permission")
+
+    assert await note_expiry_on_issue(github.mock, state_db.get_pending_resume("s-1"))
+    (body,) = github.bodies("ctrlrelay:expired")
+    assert "has stopped" in body
+    assert "labelled" not in body
