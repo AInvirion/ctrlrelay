@@ -33,7 +33,8 @@ from tests.test_resume_prompt_contract import PIPELINES, _pipeline
 # - a newline put a raw control character in the JSON;
 # - an apostrophe is what agents re-quote;
 # - `$HOME` and a backtick would expand if the heredoc were unquoted;
-# - `%s` is a printf directive;
+# - `%s` would be a directive had an agent folded its text into the
+#   format string, which is one of the ways the old snippet was rewritten;
 # - a trailing backslash would escape the closing quotes of a raw string
 #   written on one line.
 HOSTILE_TEXT = (

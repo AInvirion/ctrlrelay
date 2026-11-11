@@ -127,12 +127,15 @@ def failed(error: str, recoverable: bool = True) -> None:
 # and reading it whole is how an agent would exhaust the relay's memory.
 # What an agent is told about free text it puts in a checkpoint written
 # by :func:`shell_checkpoint`. The text sits on its own lines inside a
-# Python raw triple-quoted string, so quotes, backslashes, `$`, backticks
-# and newlines all arrive as written; only three single quotes in a row
-# would end the string early.
+# Python raw triple-quoted string in a quoted heredoc, so quotes,
+# backslashes, `$`, backticks and newlines all arrive as written (a
+# carriage return arrives as a newline). Two things end it early: three
+# single quotes in a row close the string, and a line that is exactly the
+# heredoc's delimiter closes the heredoc.
 CHECKPOINT_TEXT_RULE = (
     "Put your text on the line between the triple quotes. It may span "
-    "lines and contain any quotes, but not three single quotes in a row."
+    "lines and contain any quotes, but not three single quotes in a row "
+    "and no line that is exactly CTRLRELAY_STATE."
 )
 
 
