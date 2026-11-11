@@ -332,6 +332,13 @@ runs as the same user that owns it. Confinement is #352's job.
 
 #### Example: GitHub Copilot CLI
 
+This manifest is now built in as the `copilot` preset: set
+`repos[].agent_type: copilot` (or `agent.type: copilot`) and leave
+`agent.plugins` alone. `agent.presets.copilot` may change only `binary`,
+`model` (passed as `--model`) and `default_timeout_seconds`; the arguments
+are fixed, and a hand-written `agent.plugins.copilot` is refused. The
+manifest below is what the preset runs.
+
 Checked against Copilot CLI 1.0.107: it starts and answers with GitHub
 credentials stripped (it uses its own stored login), its JSONL output ends with
 a `result` event carrying a top-level `sessionId`, and `--resume` continues

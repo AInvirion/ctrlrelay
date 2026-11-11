@@ -2311,7 +2311,10 @@ app.add_typer(agent_app, name="agent")
 def agent_check(
     agent_type: str = typer.Argument(
         ...,
-        help="An enrolled agent type: 'claude', 'opencode' or a key under agent.plugins.",
+        help=(
+            "An enrolled agent type: 'claude', 'opencode', a built-in "
+            "preset such as 'copilot', or a key under agent.plugins."
+        ),
     ),
     config_path: str | None = typer.Option(
         None, "--config", "-c",
