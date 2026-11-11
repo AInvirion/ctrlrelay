@@ -306,6 +306,98 @@ class TestTheCopilotPresetGetsOnlyItsOwnProviderKey:
 
 
 def test_unknown_names_have_no_preset() -> None:
-    assert "copilot" in PRESET_NAMES
+    assert {"copilot", "codex"} <= PRESET_NAMES
     assert preset_manifest("copilot") is not None
     assert preset_manifest("nope") is None
+
+
+CODEX_THREAD = "01a1c827-b87a-7f20-b0cb-eeb5318361b3"
+
+
+def _codex(**overrides) -> GenericCliDispatcher:
+    overrides.setdefault("binary", "/opt/codex")
+    cfg = AgentConfig(type="codex", presets={"codex": overrides})
+    adapter = make_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
+    assert isinstance(adapter, GenericCliDispatcher)
+    return adapter
+
+
+class TestCodexPreset:
+    """The `codex` preset (#385), from the runs recorded on #383."""
+
+    def test_repo_agent_type_codex_runs_codex_with_no_plugin_entry(self) -> None:
+        cfg = _config(
+            {"type": "claude", "presets": {"codex": {"binary": "/opt/codex"}}},
+            [{"name": "owner/plain"}, {"name": "owner/cx", "agent_type": "codex"}],
+        )
+        assert cfg.agent.plugins == {}
+        router = make_repo_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
+
+        selected = select_agent(router, repo="owner/cx", requested_type=None)
+
+        assert selected.identity.plugin_id == "generic:codex"
+        assert selected.dispatcher.binary == "/opt/codex"
+
+    def test_fresh_and_resume_argv(self, tmp_path) -> None:
+        fresh, resumed = _argvs(_codex(), tmp_path)
+
+        assert fresh == [
+            "/opt/codex", "exec", "--json",
+            "--dangerously-bypass-approvals-and-sandbox", "do it",
+        ]
+        assert resumed == [
+            "/opt/codex", "exec", "resume", "--json",
+            "--dangerously-bypass-approvals-and-sandbox", SESSION, "answer",
+        ]
+
+    def test_a_model_goes_right_after_the_subcommand(self, tmp_path) -> None:
+        """Not at the end, where Codex would read it after the positionals."""
+        fresh, resumed = _argvs(_codex(model="gpt-5.1-codex"), tmp_path)
+
+        assert fresh[:4] == ["/opt/codex", "exec", "-m", "gpt-5.1-codex"]
+        assert resumed[:5] == [
+            "/opt/codex", "exec", "resume", "-m", "gpt-5.1-codex",
+        ]
+        assert fresh[-1] == "do it"
+        assert resumed[-2:] == [SESSION, "answer"]
+
+    def test_the_session_id_is_the_thread_id_from_codex_output(self) -> None:
+        # Event shapes recorded from Codex CLI 0.167.0 on #383; the token
+        # counts are illustrative.
+        stdout = "\n".join([
+            f'{{"type":"thread.started","thread_id":"{CODEX_THREAD}"}}',
+            '{"type":"turn.started"}',
+            '{"type":"turn.completed","usage":{"input_tokens":5120,'
+            '"cached_input_tokens":4096,"cache_write_input_tokens":0,'
+            '"output_tokens":210,"reasoning_output_tokens":64}}',
+        ])
+        assert _codex()._parse_agent_session_id(stdout) == CODEX_THREAD
+
+    def test_a_hand_written_codex_plugin_is_refused(self) -> None:
+        with pytest.raises(
+            ValidationError,
+            match=(
+                "codex is a built-in preset; set agent.presets.codex "
+                "to change binary, model or timeout"
+            ),
+        ):
+            AgentConfig(plugins={"codex": {"binary": "/opt/codex"}})
+
+    def test_the_arguments_are_pinned_to_the_version(self) -> None:
+        """A tripwire, as for copilot: bump the version with the arguments."""
+        m = preset_manifest("codex")
+        assert (m.plugin_version, m.args, m.resume_args, m.session_id_path) == (
+            "1",
+            ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
+             "{prompt}"],
+            ["exec", "resume", "--json",
+             "--dangerously-bypass-approvals-and-sandbox",
+             "{resume_session_id}", "{prompt}"],
+            "thread_id",
+        )
+        assert m.instructions_files == ["AGENTS.md"]
+
+    def test_identity(self) -> None:
+        identity = _codex().agent_identity
+        assert identity.plugin_id == "generic:codex"
+        assert identity.plugin_version == "1"

@@ -38,6 +38,13 @@ class _Preset:
     # Bumped whenever ``args`` or ``resume_args`` change, so a run pinned
     # to the old arguments is refused instead of resumed with new ones.
     version: str
+    # How a model override is passed: the flag, and how many leading
+    # arguments it goes after in each list (``None`` appends it at the end).
+    # Codex wants it right after its subcommand, so a later positional
+    # (the session id, the prompt) cannot be read as the model.
+    model_flag: str = "--model"
+    model_after: int | None = None
+    resume_model_after: int | None = None
 
 
 _COPILOT_ARGS = (
@@ -46,6 +53,8 @@ _COPILOT_ARGS = (
     "--disable-builtin-mcps",
     "--output-format", "json",
 )
+
+_CODEX_SAFETY = "--dangerously-bypass-approvals-and-sandbox"
 
 _PRESETS: dict[str, _Preset] = {
     # Checked against Copilot CLI 1.0.107 and 1.0.109 (#383): the final
@@ -63,6 +72,28 @@ _PRESETS: dict[str, _Preset] = {
         env_allow=("COPILOT_GITHUB_TOKEN",),
         version="1",
     ),
+    # Checked against Codex CLI 0.166 and 0.167 (#383): the first event is
+    # `{"type":"thread.started","thread_id":...}`, and `exec resume <id>`
+    # continues that thread. Bypass mode, not `--sandbox workspace-write`:
+    # Codex's own sandbox cannot write the linked worktree's git directory,
+    # which lives outside the worktree, so a dev run can never commit
+    # (#383). Codex is therefore unconfined, like every generic plugin
+    # until the container runner (#352). The flag also stops Codex waiting
+    # for an approval nobody is there to give.
+    "codex": _Preset(
+        binary="codex",
+        args=("exec", "--json", _CODEX_SAFETY, "{prompt}"),
+        resume_args=(
+            "exec", "resume", "--json", _CODEX_SAFETY,
+            "{resume_session_id}", "{prompt}",
+        ),
+        session_id_path="thread_id",
+        instructions_files=("AGENTS.md",),
+        version="1",
+        model_flag="-m",
+        model_after=1,
+        resume_model_after=2,
+    ),
 }
 
 PRESET_NAMES: frozenset[str] = frozenset(_PRESETS)
@@ -74,7 +105,9 @@ def preset_manifest(
     """The manifest for preset ``name``, or ``None`` if there is no such preset.
 
     ``overrides`` may set the binary, the model and the timeout. A model
-    is passed as ``--model <model>`` at the end of both argument lists.
+    is passed with the preset's own flag and at its own position in both
+    argument lists (Copilot: ``--model <m>`` at the end; Codex: ``-m <m>``
+    right after ``exec`` and ``exec resume``).
     """
     from ctrlrelay.core.config import GenericCliConfig, PresetOverrides
 
@@ -82,11 +115,13 @@ def preset_manifest(
     if preset is None:
         return None
     o = overrides if overrides is not None else PresetOverrides()
-    model_args: tuple[str, ...] = ("--model", o.model) if o.model else ()
     return GenericCliConfig(
         binary=o.binary or preset.binary,
-        args=[*preset.args, *model_args],
-        resume_args=[*preset.resume_args, *model_args],
+        args=_with_model(preset.args, preset.model_flag, o.model, preset.model_after),
+        resume_args=_with_model(
+            preset.resume_args, preset.model_flag, o.model,
+            preset.resume_model_after,
+        ),
         session_id_path=preset.session_id_path,
         default_timeout_seconds=o.default_timeout_seconds,
         model=o.model,
@@ -94,3 +129,12 @@ def preset_manifest(
         instructions_files=list(preset.instructions_files),
         env_allow=list(preset.env_allow),
     )
+
+
+def _with_model(
+    args: tuple[str, ...], flag: str, model: str | None, after: int | None,
+) -> list[str]:
+    if not model:
+        return list(args)
+    at = len(args) if after is None else after
+    return [*args[:at], flag, model, *args[at:]]
