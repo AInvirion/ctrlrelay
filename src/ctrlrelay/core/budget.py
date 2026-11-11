@@ -341,6 +341,21 @@ class TranscriptMeter:
         self._offsets[path] = start + end + 1
 
 
+class ExitReadingMeter:
+    """The meter of a CLI that reports its usage only in its output (#387).
+
+    While the run goes it has read nothing, so it says so: nothing counted
+    for this spawn. That still lets the watch stop a resumed spawn at once
+    when earlier rounds of the session already reached the hard limit. The
+    real reading is handed to :meth:`BudgetWatch.finish_with` at exit.
+    """
+
+    bytes_read = 0
+
+    def read(self) -> RunUsage:
+        return RunUsage()
+
+
 # --- the limit --------------------------------------------------------------------
 
 
@@ -490,7 +505,7 @@ class BudgetWatch:
 
     def __init__(
         self,
-        meter: TranscriptMeter,
+        meter: TranscriptMeter | ExitReadingMeter,
         *,
         limits: BudgetLimits,
         scope: BudgetScope,
@@ -576,6 +591,13 @@ class BudgetWatch:
             if reason is not None:
                 return reason
             await asyncio.sleep(self.poll_seconds)
+
+    async def finish_with(self, spawn: RunUsage) -> RunUsage:
+        """The final reading when it comes from the CLI's own output at exit
+        (#387) rather than from a transcript. Recorded and checked like any
+        other poll; returns ``spawn``."""
+        await self.check(spawn)
+        return spawn
 
     async def finish(self, cost_usd: float | None) -> RunUsage | None:
         """The final reading after the agent exited, with the cost its

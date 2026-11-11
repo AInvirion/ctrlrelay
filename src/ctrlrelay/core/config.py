@@ -123,6 +123,88 @@ class OpenCodeConfig(BaseModel):
         return check_env_allow(v)
 
 
+USAGE_FIELD_NAMES: tuple[str, ...] = (
+    "input_tokens",
+    "cache_creation_tokens",
+    "cache_read_tokens",
+    "output_tokens",
+)
+
+
+class GenericUsageConfig(BaseModel):
+    """How a generic CLI reports the tokens a run used (#387).
+
+    The CLI's stdout is read as JSON lines once it exits. Lines whose
+    ``event_type_path`` equals ``event_type`` carry the usage; ``fields``
+    maps each token count the budget knows to a dotted path in such a line.
+
+    ``reading``: ``sum`` adds every matching line (each line is one step's
+    usage), ``last`` takes the last one (each line is a running total).
+
+    ``covers``: ``process`` when the reading counts this process only;
+    ``native_session`` when it is the native session's running total, so a
+    resumed run repeats what earlier rounds of the same session used.
+
+    ``input_includes_cache_read``: the CLI's input count already contains
+    the cache reads (OpenAI's convention), so they are taken out of it to
+    match how the budget counts.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    event_type: str
+    event_type_path: str = "type"
+    reading: Literal["sum", "last"] = "sum"
+    covers: Literal["process", "native_session"] = "process"
+    input_includes_cache_read: bool = False
+    fields: dict[str, str]
+
+    @field_validator("event_type", "event_type_path")
+    @classmethod
+    def _usage_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("fields")
+    @classmethod
+    def _known_fields(cls, v: dict[str, str]) -> dict[str, str]:
+        if not v:
+            raise ValueError("must map at least one token count")
+        for name, path in v.items():
+            if name not in USAGE_FIELD_NAMES:
+                raise ValueError(
+                    f"unknown usage field {name!r}; use one of "
+                    f"{', '.join(USAGE_FIELD_NAMES)}"
+                )
+            if not path.strip() or any(not p for p in path.split(".")):
+                raise ValueError(f"usage field {name!r}: {path!r} is not a dotted path")
+        return v
+
+    @model_validator(mode="after")
+    def _cache_read_is_mapped(self) -> GenericUsageConfig:
+        # Input and output are what every run spends. Leaving either out
+        # would report a total that omits it as exact. Cache counts may be
+        # left out by a CLI that has no cache; they then count as zero.
+        missing = {"input_tokens", "output_tokens"} - self.fields.keys()
+        if missing:
+            raise ValueError(
+                f"usage.fields must map {' and '.join(sorted(missing))}"
+            )
+        if self.input_includes_cache_read and not {
+            "input_tokens", "cache_read_tokens",
+        } <= self.fields.keys():
+            raise ValueError(
+                "input_includes_cache_read needs both input_tokens and "
+                "cache_read_tokens mapped"
+            )
+        if self.covers == "native_session" and self.reading != "last":
+            raise ValueError(
+                "covers: native_session is a running total, so reading must be 'last'"
+            )
+        return self
+
+
 class GenericCliConfig(BaseModel):
     """A locally trusted manifest for a simple non-interactive CLI (#379).
 
@@ -152,6 +234,9 @@ class GenericCliConfig(BaseModel):
     @classmethod
     def _env_allow_is_safe(cls, v: list[str]) -> list[str]:
         return check_env_allow(v)
+
+    # #387. Unset: the CLI's runs are not measured and no budget applies.
+    usage: GenericUsageConfig | None = None
 
     @field_validator("binary", "plugin_version")
     @classmethod

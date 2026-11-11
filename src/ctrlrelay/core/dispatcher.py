@@ -55,6 +55,7 @@ from ctrlrelay.core.budget import (
 from ctrlrelay.core.budget import (
     BudgetScope,
     BudgetWatch,
+    ExitReadingMeter,
     RunUsage,
     TranscriptMeter,
     is_budget_reason,
@@ -605,6 +606,27 @@ class CliAgentAdapter:
                 session_id=session_id, error=str(e)[:200],
             )
 
+    def _reads_usage_at_exit(self) -> bool:
+        """True when this backend reports its token usage in its own output
+        (#387) rather than in a transcript the relay can watch live."""
+        return False
+
+    def _usage_at_exit(
+        self,
+        stdout_text: str,
+        *,
+        resume_session_id: str | None,
+        agent_session_id: str | None,
+        before: RunUsage,
+        ident: dict[str, Any],
+        exited_cleanly: bool = True,
+    ) -> RunUsage | None:
+        """This spawn's usage read from the CLI's output, or None when the
+        backend does not report it there (the transcript meter is used).
+        ``exited_cleanly`` is False for a run that was killed, timed out or
+        exited non-zero, whose last report may not be its final usage."""
+        return None
+
     def _record_usage(self, stdout_text: str, ident: dict) -> None:
         """Keep this run's usage reading, if the backend reports one.
 
@@ -717,6 +739,36 @@ class CliAgentAdapter:
         if budget is not None:
             watches.append(("budget", budget.run))
 
+        if budget is not None and self._reads_usage_at_exit():
+            # A backend measured only at exit: nothing in the round itself
+            # can stop it, and a quick round can end before the watch's
+            # first poll. So a session already at its hard limit is refused
+            # here, before the round starts and spends anything (#387).
+            refused = await budget.check(RunUsage())
+            if refused is not None:
+                log_event(
+                    _logger, "dispatcher.session.stopped_budget", **ident,
+                    reason=refused, before_start=True,
+                )
+                stderr_text = f"Session stopped: {refused}\n"
+                await self._report_outcome(
+                    session_id=session_id,
+                    repo=repo,
+                    issue_number=issue_number,
+                    exit_code=-1,
+                    stdout="",
+                    stderr=stderr_text,
+                )
+                return SessionResult(
+                    session_id=session_id,
+                    exit_code=-1,
+                    state=None,
+                    stderr=stderr_text,
+                    stuck_reason=refused,
+                    usage=budget.total(RunUsage()),
+                    agent=self.agent_identity,
+                )
+
         try:
             # The sandbox's options go through a file descriptor, not the
             # command line, so no number of mounts can pass ARG_MAX (#362).
@@ -806,12 +858,21 @@ class CliAgentAdapter:
                 stdout="",
                 stderr=f"Session timed out after {timeout}s",
             )
+            timed_out_usage: RunUsage | None = None
+            if budget is not None and self._reads_usage_at_exit():
+                # Its output is lost with the kill, and the round used
+                # something: the session's total becomes unknown (#387),
+                # rather than staying at a number that leaves it out.
+                timed_out_usage = budget.total(
+                    await budget.finish_with(RunUsage(unreadable=1))
+                )
             return SessionResult(
                 session_id=session_id,
                 exit_code=-1,
                 state=None,
                 stderr="Session timed out",
                 timed_out=True,
+                usage=timed_out_usage,
                 agent=self.agent_identity,
             )
         except asyncio.CancelledError as e:
@@ -945,7 +1006,18 @@ class CliAgentAdapter:
         self._record_usage(stdout_text, ident)
         usage: RunUsage | None = None
         if budget is not None:
-            spawn_usage = await budget.finish(parse_result_cost(stdout_text))
+            exit_reading = self._usage_at_exit(
+                stdout_text,
+                resume_session_id=resume_session_id,
+                agent_session_id=agent_session_id,
+                before=budget.scope.before,
+                ident=ident,
+                exited_cleanly=exit_code == 0 and not stops,
+            )
+            if exit_reading is not None:
+                spawn_usage: RunUsage | None = await budget.finish_with(exit_reading)
+            else:
+                spawn_usage = await budget.finish(parse_result_cost(stdout_text))
             if spawn_usage is not None:
                 usage = budget.total(spawn_usage)
 
@@ -1015,6 +1087,20 @@ class CliAgentAdapter:
         measured. A limit that cannot be enforced is said in the log."""
         scope = scope or BudgetScope()
         limits = resolve_limits(self.budget, scope.labels)
+        if not folders and self._reads_usage_at_exit():
+            if limits.any:
+                # Said once per spawn: the limit is applied, but only
+                # between rounds, never in the middle of one.
+                log_event(
+                    _logger, "dispatcher.budget.measured_at_exit", **ident,
+                    agent_type=self.agent_type, soft=limits.soft,
+                    hard=limits.hard,
+                )
+            return BudgetWatch(
+                ExitReadingMeter(),
+                limits=limits, scope=scope, ident=ident,
+                poll_seconds=self.budget_poll_seconds,
+            )
         if not folders:
             if limits.any:
                 log_event(
@@ -2167,6 +2253,7 @@ def _make_adapter(
             plugin_version=manifest.plugin_version,
             instructions_files=tuple(manifest.instructions_files),
             env_allow=tuple(manifest.env_allow),
+            usage=manifest.usage,
             outcome_hook=outcome_hook,
             sandbox=agent_config.sandbox,
             usage_store=usage_store,
