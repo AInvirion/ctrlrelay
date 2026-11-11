@@ -90,6 +90,9 @@ _PRESETS: dict[str, _Preset] = {
         ),
         session_id_path="thread_id",
         instructions_files=("AGENTS.md",),
+        # Codex reads its own login from ~/.codex; these are for a node
+        # that authenticates it with an API key instead.
+        env_allow=("OPENAI_API_KEY", "CODEX_API_KEY"),
         version="1",
         model_flag="-m",
         model_after=1,

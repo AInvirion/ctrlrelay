@@ -415,3 +415,35 @@ def test_a_preset_refuses_a_node_that_asks_for_a_sandbox(name) -> None:
     )
     with pytest.raises(ValueError, match="Refusing to run unconfined"):
         make_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
+
+
+class TestTheCodexPresetGetsOnlyItsOwnProviderKeys:
+    @pytest.mark.asyncio
+    async def test_keeps_openai_keys_and_drops_the_rest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        for name, value in {
+            "OPENAI_API_KEY": "openai-value",
+            "CODEX_API_KEY": "codex-value",
+            "COPILOT_GITHUB_TOKEN": "copilot-value",
+            "ANTHROPIC_API_KEY": "anthropic-value",
+            "GH_TOKEN": "gh-value",
+        }.items():
+            monkeypatch.setenv(name, value)
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"", b"")
+        proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as ex:
+            await _codex().spawn_session(
+                session_id="s1", prompt="p", working_dir=tmp_path,
+                state_file=tmp_path / "state.json", github_access=False,
+            )
+
+        env = ex.call_args.kwargs["env"]
+        assert env["OPENAI_API_KEY"] == "openai-value"
+        assert env["CODEX_API_KEY"] == "codex-value"
+        for gone in ("COPILOT_GITHUB_TOKEN", "ANTHROPIC_API_KEY", "GH_TOKEN"):
+            assert gone not in env
