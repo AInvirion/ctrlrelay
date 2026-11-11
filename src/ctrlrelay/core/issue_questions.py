@@ -98,13 +98,37 @@ def chat_answer_comment(session_id: str, answer: str, full: bool) -> str:
     return f"{body}\n{_marker('answer', session_id)}"
 
 
+# Put on an issue whose question expired unanswered (#400), so a run that
+# stopped for want of an answer is findable work rather than a comment
+# nobody re-reads. Nothing removes it: a person does, once they have
+# decided the question and started the issue again.
+UNANSWERED_LABEL = "ctrlrelay:unanswered"
+
+
 def expired_comment(session_id: str, reason: str | None) -> str:
-    why = f" ({reason})" if reason else ""
-    return (
-        f"**The question above expired unanswered{why}.** An answer to it "
-        "is no longer applied, here or in chat.\n"
-        f"{_marker('expired', session_id)}"
-    )
+    if reason == "ttl":
+        body = (
+            "**The question above expired unanswered.** This issue's run "
+            "has stopped and will not continue on its own, and an answer "
+            "to that question is no longer applied, here or in chat. The "
+            f"issue is labelled `{UNANSWERED_LABEL}` so it can be found. "
+            "To go on, decide the question in a comment, then remove the "
+            "issue number from seen_issues in poller_state.json so the "
+            "relay runs it again."
+        )
+    elif reason == "resolved_elsewhere":
+        body = (
+            "**The question above was retired:** this issue and everything "
+            "the question cites are closed or merged. An answer to it is "
+            "no longer applied, here or in chat."
+        )
+    else:
+        why = f" ({reason})" if reason else ""
+        body = (
+            f"**The question above expired unanswered{why}.** An answer "
+            "to it is no longer applied, here or in chat."
+        )
+    return f"{body}\n{_marker('expired', session_id)}"
 
 
 def already_answered_comment(session_id: str, login: str) -> str:
@@ -445,12 +469,26 @@ async def note_expiry_on_issue(github: Any, row: dict[str, Any]) -> bool:
             error_type=type(e).__name__, error=str(e)[:200],
         )
         return False
+    if row.get("expired_reason") == "ttl":
+        # Separate from the comment, so a label that cannot be added (no
+        # permission to create one) still leaves the comment saying so.
+        try:
+            await github.add_issue_label(
+                row["repo"], int(row["issue_number"]), UNANSWERED_LABEL,
+            )
+        except Exception as e:
+            log_event(
+                _logger, "issue_question.unanswered_label_failed",
+                session_id=row["session_id"], repo=row["repo"],
+                error_type=type(e).__name__, error=str(e)[:200],
+            )
     return True
 
 
 __all__ = [
     "QUESTION_ON_ISSUE_MODES",
     "RELAY_MARKER_PREFIX",
+    "UNANSWERED_LABEL",
     "ask_on_issue",
     "check_issue_answer",
     "note_chat_answer_on_issue",

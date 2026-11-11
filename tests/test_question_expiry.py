@@ -771,3 +771,77 @@ class TestRetention:
 
         assert TelegramConfig().question_retention_days == 90
         assert MattermostConfig(url="https://x").question_retention_days == 90
+
+
+def _on_issue(db: StateDB, session_id: str, issue_number: int) -> None:
+    """The question was also posted on the run's issue (#328)."""
+    assert db.record_issue_question(session_id, issue_number, 9000, 1)
+
+
+class TestResolutionTargets:
+    """What the resolved-elsewhere pass probes (#400)."""
+
+    @pytest.mark.asyncio
+    async def test_a_reference_to_another_repo_by_bare_name_is_not_probed_here(
+        self, db: StateDB
+    ) -> None:
+        """The incident: a question citing ``oaf-kernel#118`` was probed as
+        this repo's #118, an unrelated issue closed days earlier, and was
+        retired as resolved at the next hourly sweep."""
+        _add(db, "q", "Wait for oaf-kernel#118 (S1) plus a pin bump?", 60)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
+        assert len(db.list_unanswered_pending_resumes()) == 1
+        github.get_issue_or_pr_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_owner_repo_reference_is_probed_in_that_repo(
+        self, db: StateDB
+    ) -> None:
+        _add(db, "q", "Is other/thing#7 merged yet, and #8?", 60)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        expired = await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        assert [r["session_id"] for r in expired] == ["q"]
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert probed == [("other/thing", 7), ("owner/repo", 8)]
+
+    @pytest.mark.asyncio
+    async def test_an_open_issue_the_question_was_asked_on_keeps_it(
+        self, db: StateDB
+    ) -> None:
+        """Everything the question cites is closed, but the run it pauses
+        is on an issue that is still open: that run is still waiting."""
+        _add(db, "q", "Approve #12?", 60)
+        _on_issue(db, "q", 290)
+        github = AsyncMock()
+
+        async def state(repo: str, number: int, **_kw: object) -> dict:
+            return _state(closed=number != 290)
+
+        github.get_issue_or_pr_state.side_effect = state
+
+        assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
+        assert len(db.list_unanswered_pending_resumes()) == 1
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert ("owner/repo", 290) in probed
+
+    @pytest.mark.asyncio
+    async def test_closing_the_issue_the_question_was_asked_on_retires_it(
+        self, db: StateDB
+    ) -> None:
+        """The issue was closed by hand: the question is meaningless, even
+        when it cites no number of its own."""
+        _add(db, "q", "Which of the two designs?", 60)
+        _on_issue(db, "q", 290)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        expired = await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        assert [r["session_id"] for r in expired] == ["q"]
+        assert expired[0]["expired_reason"] == EXPIRY_REASON_RESOLVED

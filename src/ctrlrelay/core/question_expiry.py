@@ -82,6 +82,48 @@ def extract_referenced_numbers(question: str) -> list[str]:
     return out
 
 
+# A ``#N`` and whatever word sits right before it. ``#118`` is in the
+# question's own repository; ``owner/repo#118`` names another one; and
+# ``oaf-kernel#118`` names another one without saying whose, so it cannot
+# be looked up at all. Reading every one of those as ``#118`` here probed
+# an unrelated, long-closed issue of the same number and retired a live
+# question as resolved 33 minutes after it was asked (#400).
+_REF_WITH_PREFIX_RE = re.compile(r"([\w.-]+(?:/[\w.-]+)?)?#(\d+)(?!\d)")
+_SAME_REPO_PREFIXES = frozenset({"pr", "issue"})
+
+
+def resolution_targets(row: dict[str, Any]) -> list[tuple[str, int]] | None:
+    """The issues and PRs that must ALL be closed before ``row``'s
+    question counts as resolved elsewhere, as ``(repo, number)``.
+
+    Each ``#N`` the question cites, in its own repository unless written
+    ``owner/repo#N``; plus the issue the question was asked on, when it
+    was asked on one. A run paused on an open issue is still waiting for
+    its answer whatever else the question mentions, so that issue being
+    open keeps the question.
+
+    None when the question cites something that cannot be looked up
+    (``name#N`` with no owner): that reference can never be shown
+    closed, so the question cannot be resolved this way. An empty list
+    means there is nothing to check.
+    """
+    repo = row["repo"]
+    targets: list[tuple[str, int]] = []
+    for prefix, number in _REF_WITH_PREFIX_RE.findall(row.get("question") or ""):
+        if not prefix or prefix.lower() in _SAME_REPO_PREFIXES:
+            target = (repo, int(number))
+        elif "/" in prefix:
+            target = (prefix, int(number))
+        else:
+            return None
+        if target not in targets:
+            targets.append(target)
+    issue_number = row.get("issue_number")
+    if issue_number is not None and (repo, int(issue_number)) not in targets:
+        targets.append((repo, int(issue_number)))
+    return targets
+
+
 def _normalise(question: str) -> str:
     return re.sub(r"\s+", " ", (question or "").lower()).strip(" .?!")
 
@@ -358,10 +400,9 @@ def prune_finished_questions(
 async def _all_references_resolved(
     github: GitHubCLI,
     *,
-    repo: str,
-    numbers: list[str],
+    targets: list[tuple[str, int]],
 ) -> bool:
-    """True when every cited number is closed or merged.
+    """True when every target is closed or merged.
 
     Conservative on purpose. One still-open reference means the question
     retains something to decide, so the row stays. Any probe error at
@@ -370,14 +411,14 @@ async def _all_references_resolved(
     one, since the operator can ignore noise but cannot recover a
     question that was never posted.
     """
-    if not numbers:
+    if not targets:
         return False
 
-    for number in numbers:
+    for repo, number in targets:
         try:
             state = await github.get_issue_or_pr_state(
                 repo,
-                int(number),
+                number,
                 timeout=_STATE_PROBE_TIMEOUT_SECONDS,
             )
         except (GitHubError, TimeoutError, OSError, ValueError):
@@ -442,11 +483,13 @@ async def expire_stale_questions(
 
     probes_used = 0
     for row in state_db.list_unanswered_pending_resumes():
-        numbers = extract_referenced_numbers(row["question"])
-        # Rows citing nothing are skipped without spending budget —
-        # they can never be resolution-expired anyway.
-        if not numbers:
+        targets = resolution_targets(row)
+        # Rows with nothing to check, or citing something that cannot be
+        # looked up, are skipped without spending budget: they can never
+        # be resolution-expired. The TTL pass still retires them on age.
+        if not targets:
             continue
+        numbers = [f"{r}#{n}" for r, n in targets]
 
         # Check the budget against what this row will actually COST,
         # before spending any of it. Testing `probes_used` alone lets a
@@ -477,9 +520,7 @@ async def expire_stale_questions(
             )
             break
         probes_used += len(numbers)
-        if not await _all_references_resolved(
-            github, repo=row["repo"], numbers=numbers
-        ):
+        if not await _all_references_resolved(github, targets=targets):
             continue
         if state_db.expire_pending_resume(
             row["session_id"], EXPIRY_REASON_RESOLVED
