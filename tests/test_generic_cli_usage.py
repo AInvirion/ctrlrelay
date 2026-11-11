@@ -13,8 +13,8 @@ Both are running totals for the native session: the resumed run reports
 the first run's tokens again, plus its own.
 """
 
+import asyncio
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -76,7 +76,9 @@ COPILOT_RESUMED = "\n".join([
 ])
 COPILOT_SESSION = "2a00a77c-51f5-490a-a5d4-78e54368b685"
 
-# The mappings the Codex and Copilot presets use.
+# The tested usage mappings for Codex and Copilot, checked against the real
+# output above. A preset that measures either CLI should use these values
+# (copy them, or import them from this module).
 CODEX_USAGE = {
     "event_type": "turn.completed",
     "reading": "last",
@@ -128,12 +130,28 @@ class TestUsageConfig:
             _spec(event_type="e", fields={"reasoning": "a.b"})
 
     def test_no_fields_is_refused(self) -> None:
-        with pytest.raises(ValueError, match="at least one"):
+        with pytest.raises(ValueError, match="must map input_tokens and output_tokens"):
             _spec(event_type="e", fields={})
 
-    def test_a_broken_path_is_refused(self) -> None:
+    @pytest.mark.parametrize("path", ["a..b", ".a", "a.", "a. b", "a.b ", " a", "a\tb"])
+    def test_a_broken_path_is_refused(self, path: str) -> None:
         with pytest.raises(ValueError, match="not a dotted path"):
-            _spec(event_type="e", fields={"output_tokens": "a..b"})
+            _spec(event_type="e", fields={"input_tokens": "i", "output_tokens": path})
+
+    @pytest.mark.parametrize("path", ["", "a..b", "type ", "data. type"])
+    def test_a_broken_event_type_path_is_refused(self, path: str) -> None:
+        with pytest.raises(ValueError, match="not a dotted path"):
+            _spec(
+                event_type="e", event_type_path=path,
+                fields={"input_tokens": "i", "output_tokens": "o"},
+            )
+
+    def test_a_good_nested_path_is_accepted(self) -> None:
+        # The control for the two above.
+        _spec(
+            event_type="e", event_type_path="msg.kind",
+            fields={"input_tokens": "a.b_c.d-1", "output_tokens": "o"},
+        )
 
     def test_an_extra_key_is_refused(self) -> None:
         with pytest.raises(ValueError, match="units"):
@@ -150,7 +168,12 @@ class TestUsageConfig:
             )
 
     def test_a_session_running_total_must_be_read_last(self) -> None:
-        with pytest.raises(ValueError, match="reading must be 'last'"):
+        with pytest.raises(ValueError, match="set reading: 'last'"):
+            _spec(
+                event_type="e", covers="native_session",
+                fields={"input_tokens": "i", "output_tokens": "o"},
+            )
+        with pytest.raises(ValueError, match="set reading: 'last'"):
             _spec(
                 event_type="e", covers="native_session", reading="sum",
                 fields={"input_tokens": "i", "output_tokens": "o"},
@@ -193,6 +216,24 @@ class TestReadUsageEvents:
         broken = CODEX_FRESH.replace('"output_tokens":5,', "")
         got = read_usage_events(broken, _spec(**CODEX_USAGE))
         assert not got.complete
+
+    @pytest.mark.parametrize("bad", ["-1", "true", "5.0", str(10**15), '"7"', "null"])
+    def test_a_count_that_is_not_a_plausible_token_count_is_unknown(
+        self, bad: str
+    ) -> None:
+        from ctrlrelay.core.generic_cli import read_usage_events
+
+        line = CODEX_FRESH.replace('"output_tokens":5', f'"output_tokens":{bad}')
+        got = read_usage_events(line, _spec(**CODEX_USAGE))
+        assert not got.complete and got.counted == 0
+
+    def test_the_largest_plausible_count_is_kept(self) -> None:
+        # The control: the ceiling itself is a count.
+        from ctrlrelay.core.generic_cli import MAX_TOKEN_COUNT, read_usage_events
+
+        line = CODEX_FRESH.replace('"output_tokens":5', f'"output_tokens":{MAX_TOKEN_COUNT}')
+        got = read_usage_events(line, _spec(**CODEX_USAGE))
+        assert got.complete and got.output_tokens == MAX_TOKEN_COUNT
 
     def test_cache_reads_above_input_are_unknown(self) -> None:
         from ctrlrelay.core.generic_cli import read_usage_events
@@ -413,8 +454,10 @@ class TestSpawnMeasuresTheRun:
         r2 = await _spawn(
             adapter, tmp_path, scope=BudgetScope(before=r1.usage), resume=CODEX_THREAD,
         )
-        # Unknown stays unknown for the session, but this round added 9.
-        assert r2.usage.output_tokens == 9
+        # Unknown stays unknown for the session, but this round is charged
+        # exactly what it added: 9 output, nothing else.
+        assert r1.usage == RunUsage(unreadable=1)
+        assert r2.usage == RunUsage(output_tokens=9, unreadable=1)
 
     @pytest.mark.asyncio
     async def test_two_native_sessions_keep_their_own_totals(
@@ -478,23 +521,25 @@ class TestSpawnMeasuresTheRun:
         assert not r.usage.complete and r.usage.counted == 0
 
     @pytest.mark.asyncio
-    async def test_an_inexact_fresh_run_drops_the_old_total_for_its_id(
+    async def test_an_inexact_fresh_run_replaces_the_old_total_for_its_id(
         self, tmp_path: Path
     ) -> None:
         # A fresh run under an id that already has a remembered total is
-        # charged a floor; that floor must not leave the older total as the
-        # baseline, or the next resume charges part of the floor again.
+        # charged its reading as a floor, and that reading replaces the
+        # older total: the next resume is charged from what this round was
+        # charged, so nothing is charged twice.
         adapter = _adapter(_printing(tmp_path, "a1", CODEX_FRESH), CODEX_USAGE)
         r1 = await _spawn(adapter, tmp_path)
         adapter.binary = str(_printing(tmp_path, "a2", CODEX_RESUMED, "exit 1\n"))
         r2 = await _spawn(adapter, tmp_path, scope=BudgetScope(before=r1.usage))
         assert not r2.usage.complete
+        assert r2.usage.counted == 3242 + (30812 - 27392) + 11
         more = CODEX_RESUMED.replace('"output_tokens":11', '"output_tokens":20')
         adapter.binary = str(_printing(tmp_path, "a3", more))
         r3 = await _spawn(
             adapter, tmp_path, scope=BudgetScope(before=r2.usage), resume=CODEX_THREAD,
         )
-        assert r3.usage.counted == r2.usage.counted
+        assert r3.usage.counted == r2.usage.counted + 9
 
     @pytest.mark.asyncio
     async def test_a_running_total_that_went_backwards_charges_nothing(
@@ -521,36 +566,72 @@ class TestSpawnMeasuresTheRun:
         assert r3.usage.counted == r1.usage.counted + 4
 
     @pytest.mark.asyncio
-    async def test_no_remembered_total_and_an_inexact_before_charges_nothing(
+    async def test_an_unclean_resumed_round_is_charged_its_difference_as_a_floor(
         self, tmp_path: Path
     ) -> None:
-        before = RunUsage(input_tokens=100, unreadable=1)
-        adapter = _adapter(_printing(tmp_path, "a2", CODEX_RESUMED), CODEX_USAGE)
-        r2 = await _spawn(
-            adapter, tmp_path, scope=BudgetScope(before=before), resume=CODEX_THREAD,
-        )
-        assert not r2.usage.complete and r2.usage.counted == 100
-
-    @pytest.mark.asyncio
-    async def test_an_unreadable_resumed_round_charges_nothing(
-        self, tmp_path: Path
-    ) -> None:
-        # Its running total cannot be split into old and new, and charging
-        # the whole of it would count the earlier rounds twice.
+        # Exited non-zero after reporting: its last report is at most what
+        # it used, so the difference from the exact baseline is a floor.
         adapter = _adapter(_printing(tmp_path, "a1", CODEX_FRESH), CODEX_USAGE)
         r1 = await _spawn(adapter, tmp_path)
         adapter.binary = str(_printing(tmp_path, "a2", CODEX_RESUMED, "exit 3\n"))
         r2 = await _spawn(
             adapter, tmp_path, scope=BudgetScope(before=r1.usage), resume=CODEX_THREAD,
         )
-        assert not r2.usage.complete and r2.usage.counted == r1.usage.counted
-        # The next exact round is charged from the first round's total, so
-        # what the unreadable round used is charged once, there.
+        assert not r2.usage.complete
+        assert r2.usage.counted == (30812 - 27392) + 11
+        # The next exact round is charged from that report, so the session
+        # adds up to the CLI's own total: nothing charged twice.
         more = CODEX_RESUMED.replace('"output_tokens":11', '"output_tokens":20')
         adapter.binary = str(_printing(tmp_path, "a3", more))
         r3 = await _spawn(
             adapter, tmp_path, scope=BudgetScope(before=r2.usage), resume=CODEX_THREAD,
         )
+        assert r3.usage.counted == (30812 - 27392) + 20
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_resumed_round_charges_nothing_and_keeps_the_baseline(
+        self, tmp_path: Path
+    ) -> None:
+        # No usage line at all: nothing to take a difference of. The next
+        # exact round, charged from the first round's total, picks up
+        # whatever this one used.
+        adapter = _adapter(_printing(tmp_path, "a1", CODEX_FRESH), CODEX_USAGE)
+        r1 = await _spawn(adapter, tmp_path)
+        adapter.binary = str(_printing(tmp_path, "a2", '{"type":"turn.started"}'))
+        r2 = await _spawn(
+            adapter, tmp_path, scope=BudgetScope(before=r1.usage), resume=CODEX_THREAD,
+        )
+        assert not r2.usage.complete and r2.usage.counted == r1.usage.counted
+        adapter.binary = str(_printing(tmp_path, "a3", CODEX_RESUMED))
+        r3 = await _spawn(
+            adapter, tmp_path, scope=BudgetScope(before=r2.usage), resume=CODEX_THREAD,
+        )
+        assert r3.usage.counted == (30812 - 27392) + 11
+
+    @pytest.mark.asyncio
+    async def test_a_cli_that_renames_its_session_on_resume_keeps_its_baseline(
+        self, tmp_path: Path
+    ) -> None:
+        # The resumed round reports a new id; the next round resumes that
+        # id and must be measured against the total reported under it.
+        renamed = "01a1c8bd-1111-7030-9970-5e39f8b5be48"
+        adapter = _adapter(_printing(tmp_path, "a1", CODEX_FRESH), CODEX_USAGE)
+        r1 = await _spawn(adapter, tmp_path)
+        adapter.binary = str(_printing(
+            tmp_path, "a2", CODEX_RESUMED.replace(CODEX_THREAD, renamed),
+        ))
+        r2 = await _spawn(
+            adapter, tmp_path, scope=BudgetScope(before=r1.usage), resume=CODEX_THREAD,
+        )
+        assert r2.agent_session_id == renamed and r2.usage.complete
+        more = CODEX_RESUMED.replace(CODEX_THREAD, renamed).replace(
+            '"output_tokens":11', '"output_tokens":20'
+        )
+        adapter.binary = str(_printing(tmp_path, "a3", more))
+        r3 = await _spawn(
+            adapter, tmp_path, scope=BudgetScope(before=r2.usage), resume=renamed,
+        )
+        assert r3.usage.complete
         assert r3.usage.counted == (30812 - 27392) + 20
 
     @pytest.mark.asyncio
@@ -599,15 +680,17 @@ class TestSpawnMeasuresTheRun:
         assert r1.usage.counted == 3242
         assert r1.stuck_reason is None
 
-        adapter.binary = str(_printing(tmp_path, "codex2", CODEX_RESUMED, "exec sleep 60\n"))
-        started = time.monotonic()
+        marker = tmp_path / "ran"
+        adapter.binary = str(_printing(
+            tmp_path, "codex2", CODEX_RESUMED, f"touch '{marker}'\n",
+        ))
         r2 = await _spawn(
             adapter, tmp_path,
             scope=BudgetScope(labels=["size:S"], before=r1.usage), resume=CODEX_THREAD,
         )
-        assert time.monotonic() - started < 15
         assert is_budget_reason(r2.stuck_reason)
         assert "hard limit 1,000" in r2.stuck_reason
+        assert not marker.exists()
 
     @pytest.mark.asyncio
     async def test_a_quick_round_over_the_limit_is_refused_before_it_starts(
@@ -630,16 +713,69 @@ class TestSpawnMeasuresTheRun:
 
     @pytest.mark.asyncio
     async def test_under_the_limit_the_next_round_runs(self, tmp_path: Path) -> None:
-        # The control for the test above: the same two rounds with room.
+        # The control for the two tests above: the same rounds and the same
+        # marker with room, so the marker's absence there means not run.
+        marker = tmp_path / "ran"
         budget = BudgetConfig(hard_tokens=1_000_000)
         adapter = _adapter(_printing(tmp_path, "codex1", CODEX_FRESH), CODEX_USAGE, budget)
         r1 = await _spawn(adapter, tmp_path)
-        adapter.binary = str(_printing(tmp_path, "codex2", CODEX_RESUMED))
+        adapter.binary = str(_printing(
+            tmp_path, "codex2", CODEX_RESUMED, f"touch '{marker}'\n",
+        ))
         r2 = await _spawn(
             adapter, tmp_path, scope=BudgetScope(before=r1.usage), resume=CODEX_THREAD,
         )
         assert r2.stuck_reason is None and r2.exit_code == 0
         assert r2.usage.output_tokens == 11
+        assert marker.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_round_leaves_the_total_unknown(self, tmp_path: Path) -> None:
+        seen: list[RunUsage] = []
+
+        async def on_usage(total, limits):
+            seen.append(total)
+
+        started = tmp_path / "started"
+        adapter = _adapter(
+            _fake_cli(tmp_path, "codex", f"touch '{started}'\nexec sleep 60\n"),
+            CODEX_USAGE,
+        )
+        before = RunUsage(input_tokens=3237, output_tokens=5)
+        task = asyncio.create_task(_spawn(
+            adapter, tmp_path, scope=BudgetScope(before=before, on_usage=on_usage),
+        ))
+        for _ in range(200):
+            if started.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert started.exists()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert seen and not seen[-1].complete
+        assert seen[-1].counted == before.counted
+
+    @pytest.mark.asyncio
+    async def test_unreadable_pipes_leave_the_total_unknown(self, tmp_path: Path) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        seen: list[RunUsage] = []
+
+        async def on_usage(total, limits):
+            seen.append(total)
+
+        proc = AsyncMock()
+        proc.communicate.side_effect = OSError("pipe went away")
+        proc.returncode = 0
+        adapter = _adapter(_printing(tmp_path, "codex", CODEX_FRESH), CODEX_USAGE)
+        before = RunUsage(input_tokens=3237, output_tokens=5)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(OSError):
+                await _spawn(
+                    adapter, tmp_path, scope=BudgetScope(before=before, on_usage=on_usage),
+                )
+        assert seen and not seen[-1].complete
 
     @pytest.mark.asyncio
     async def test_the_session_row_hook_gets_the_total(self, tmp_path: Path) -> None:

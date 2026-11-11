@@ -413,28 +413,42 @@ output when it exits:
 
 - `fields` maps `input_tokens` and `output_tokens` (both required) and,
   optionally, `cache_creation_tokens` and `cache_read_tokens` to a dotted path
-  in the usage line. A cache count left out counts as zero, for a CLI with no
+  in the usage line (keys joined by `.`, none empty or containing whitespace;
+  `event_type_path` follows the same rule). A cache count left out counts as zero, for a CLI with no
   cache. The budget counts input, cache creation and output, as for Claude;
   cache reads are recorded and not counted.
 - `covers: native_session` says the reading is the CLI's running total for its
   own session, so a resumed run repeats what earlier rounds used. The relay
-  charges a resumed round only the difference from that session's last total.
-  If it does not have that total (it restarted between rounds, or the native
-  session is older than the relay session), or the total moved backwards, it
-  charges that round nothing and shows the session's total as unknown. Needs
-  `reading: last`.
+  remembers that session's last total (per relay session, under the id it
+  resumed and the id it reported) and charges a resumed round only the
+  difference. A round that ended badly (non-zero exit, a cut-off line) is
+  charged that difference as a floor and marked unknown. If the relay does not
+  have the total (it restarted between rounds, or the native session is older
+  than the relay session), or the total moved backwards, it charges that round
+  nothing and shows the session's total as unknown; the next round it can
+  measure picks up what that one used. Needs `reading: last` to be set (the
+  default is `sum`).
 - `input_includes_cache_read: true` is for CLIs whose input count already
   contains the cache reads (OpenAI's convention); they are taken out of it.
+  Cache writes are not taken out: the mapping assumes the input count does not
+  include them. That is unverified for Codex, which reported
+  `cache_write_input_tokens: 0` on every run measured, including one with a
+  33,000-token prompt.
 - These are recorded as **unknown**, never as zero, with what could be read
-  kept as a floor: no usage line; a usage line with a missing or invalid count
-  (that line adds nothing); any line that starts as a JSON object and is cut
-  off; and a run that was killed, timed out or exited non-zero, whose last
-  report may not be its final one.
+  kept as a floor: no usage line; a usage line with a count that is missing,
+  not an integer, negative or above 10^12 (that line adds nothing); any line
+  that starts as a JSON object and is cut off; a run that was killed, timed
+  out or exited non-zero, whose last report may not be its final one; and a
+  round cancelled by a shutdown, or whose output could not be read at all.
 
 The reading arrives when the CLI exits, so a hard limit cannot stop a plugin
-in the middle of a round, as it can for Claude. It applies between rounds: a
-session already at its hard limit is refused before its next round (a resume
-or a CI fix) starts. Measured mappings, from real output:
+in the middle of a round, as it can for Claude. In the lanes that keep a
+session total (dev and task runs) it applies between rounds: a session already
+at its hard limit is refused before its next round (a resume or a CI fix)
+starts. A lane that keeps no session total, such as the security sweep, gets
+the limit per spawn, and a spawn measured only at exit cannot be held to it:
+its usage is recorded and the soft-limit warning still fires, but nothing is
+stopped. Measured mappings, from real output:
 
 | CLI | `event_type` | token fields |
 |---|---|---|

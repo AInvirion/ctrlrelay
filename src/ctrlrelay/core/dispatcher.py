@@ -606,6 +606,19 @@ class CliAgentAdapter:
                 session_id=session_id, error=str(e)[:200],
             )
 
+    async def _round_unmeasured(self, budget: BudgetWatch | None) -> RunUsage | None:
+        """Record a round whose output was lost (timed out, cancelled, or
+        unreadable pipes) as unknown, for a backend measured at exit (#387).
+
+        The round used something, so the session's total becomes unknown
+        rather than staying at a number that leaves it out. Returns the
+        session total, or None for a backend that is not measured at exit
+        (the transcript meter already recorded what it saw).
+        """
+        if budget is None or not self._reads_usage_at_exit():
+            return None
+        return budget.total(await budget.finish_with(RunUsage(unreadable=1)))
+
     def _reads_usage_at_exit(self) -> bool:
         """True when this backend reports its token usage in its own output
         (#387) rather than in a transcript the relay can watch live."""
@@ -617,7 +630,6 @@ class CliAgentAdapter:
         *,
         resume_session_id: str | None,
         agent_session_id: str | None,
-        before: RunUsage,
         ident: dict[str, Any],
         exited_cleanly: bool = True,
     ) -> RunUsage | None:
@@ -858,14 +870,7 @@ class CliAgentAdapter:
                 stdout="",
                 stderr=f"Session timed out after {timeout}s",
             )
-            timed_out_usage: RunUsage | None = None
-            if budget is not None and self._reads_usage_at_exit():
-                # Its output is lost with the kill, and the round used
-                # something: the session's total becomes unknown (#387),
-                # rather than staying at a number that leaves it out.
-                timed_out_usage = budget.total(
-                    await budget.finish_with(RunUsage(unreadable=1))
-                )
+            timed_out_usage = await self._round_unmeasured(budget)
             return SessionResult(
                 session_id=session_id,
                 exit_code=-1,
@@ -893,6 +898,10 @@ class CliAgentAdapter:
                     await asyncio.shield(proc.wait())
                 except asyncio.CancelledError:
                     pass
+            try:
+                await asyncio.shield(self._round_unmeasured(budget))
+            except BaseException:  # noqa: BLE001 - the cancel must still propagate
+                pass
             raise
 
         except Exception as e:
@@ -936,6 +945,10 @@ class CliAgentAdapter:
                 stdout="",
                 stderr=f"{type(e).__name__}: {e}",
             )
+            try:
+                await self._round_unmeasured(budget)
+            except Exception:  # noqa: BLE001 - keep the original failure
+                pass
             raise
 
         # The child exited on its own. Anything it left running in the
@@ -1010,7 +1023,6 @@ class CliAgentAdapter:
                 stdout_text,
                 resume_session_id=resume_session_id,
                 agent_session_id=agent_session_id,
-                before=budget.scope.before,
                 ident=ident,
                 exited_cleanly=exit_code == 0 and not stops,
             )

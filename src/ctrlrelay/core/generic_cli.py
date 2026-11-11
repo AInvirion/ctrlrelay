@@ -53,8 +53,18 @@ def _dotted(value: Any, path: str) -> Any:
     return current
 
 
+# No real run reports anywhere near this in one count; a number past it is
+# a malformed report, and charging it would stop the session for nothing.
+MAX_TOKEN_COUNT = 10**12
+
+
 def _token_count(value: Any) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > MAX_TOKEN_COUNT
+    ):
         return None
     return value
 
@@ -64,10 +74,12 @@ def read_usage_events(stdout_text: str, spec: GenericUsageConfig) -> RunUsage:
 
     Unknown is never zero. The result is counted as unreadable, so the
     total shows as unknown and what was read is a floor, when there is no
-    matching line at all; when a line that names ``event_type`` is not
-    valid JSON (cut off, so a usage line may have been lost); or when a
-    matching line that counts has missing or invalid counts. With
-    ``reading: last`` only the last matching line counts.
+    matching line at all; when any line that starts as a JSON object is not
+    valid JSON (it may be a usage line cut off before its type was written);
+    or when a matching line that counts has a count that is missing, not an
+    integer, negative or above ``MAX_TOKEN_COUNT``, in which case that line
+    contributes nothing. With ``reading: last`` only the last matching line
+    counts.
     """
     readings: list[dict[str, int] | None] = []
     lost = 0
@@ -281,7 +293,6 @@ class GenericCliDispatcher(CliAgentAdapter):
         *,
         resume_session_id: str | None,
         agent_session_id: str | None,
-        before: RunUsage,
         ident: dict[str, Any],
         exited_cleanly: bool = True,
     ) -> RunUsage | None:
@@ -292,18 +303,30 @@ class GenericCliDispatcher(CliAgentAdapter):
         only a floor and is marked unknown.
 
         A reading that ``covers`` the native session is a running total for
-        that session. Its last exact total is remembered per relay session
-        (and repo), so a resumed round of the same relay session is charged
-        only what it added. Every other case charges the round nothing and
-        marks it unknown, because nothing says which part of the running
-        total is new: no remembered total (the relay restarted, it was
-        evicted, or the native session is older than this relay session), an
-        unreadable or unclean reading, or a total that moved backwards. The
-        remembered total is then left as it was, so whatever that round used
-        is charged by the next exact round instead, never twice; when there
-        was none, an exact reading becomes it. A fresh native session's
-        total is all its own round's: it is charged in full, remembered when
-        exact, and any older total under the same id is dropped when not.
+        that session. Its last total is remembered per relay session (and
+        repo), under the id the round resumed and under the id it reported,
+        so a resumed round of the same relay session is charged only what it
+        added:
+
+        - exact reading, remembered total, nothing moved backwards: the
+          difference, exact; the reading becomes the remembered total.
+        - inexact reading (unclean exit, a cut-off line) that still moved
+          nothing backwards: the difference, as a floor marked unknown. A
+          reading is never above what the CLI really used, so the difference
+          is not either. The reading becomes the remembered total, so the
+          next round is charged from it and this round's part is not charged
+          again.
+        - anything else charges nothing and is marked unknown, because
+          nothing says which part of the running total is new: no remembered
+          total (the relay restarted, it was evicted, or the native session
+          is older than this relay session), or a total that moved
+          backwards. The remembered total is left as it was, so whatever
+          that round used is charged by the next round that can be measured
+          against it; when there was none, an exact reading becomes it.
+
+        A fresh native session's total is all its own round's: it is charged
+        in full (a floor when inexact) and becomes the remembered total,
+        replacing any older one under the same id.
         """
         spec = self.usage
         if spec is None:
@@ -316,22 +339,32 @@ class GenericCliDispatcher(CliAgentAdapter):
 
         if resume_session_id is None:
             if agent_session_id is not None:
-                key = self._native_key(ident, agent_session_id)
-                if reading.complete:
-                    self._remember(key, reading)
-                else:
-                    self._native_readings.pop(key, None)
+                # Remembered even when inexact: it is what this round was
+                # charged, so the next round charged from it adds up to the
+                # CLI's own total, never more.
+                self._remember(self._native_key(ident, agent_session_id), reading)
             return reading
 
-        key = self._native_key(ident, resume_session_id)
-        earlier = self._native_readings.get(key)
-        if reading.complete and earlier is not None:
+        keys = [self._native_key(ident, resume_session_id)]
+        if agent_session_id is not None and agent_session_id != resume_session_id:
+            # A CLI that names a resumed session anew: the next round
+            # resumes under the new id, so its baseline must be there too.
+            keys.append(self._native_key(ident, agent_session_id))
+        earlier = self._native_readings.get(keys[0])
+        if earlier is not None:
             spawn, went_back = _minus(reading, earlier)
             if not went_back:
-                self._remember(key, reading)
+                for key in keys:
+                    self._remember(key, reading)
+                if not reading.complete:
+                    log_event(
+                        _logger, "dispatcher.usage.resume_floor", **ident,
+                        agent_type=self.agent_type,
+                    )
                 return spawn
-        elif reading.complete:
-            self._remember(key, reading)
+        elif earlier is None and reading.complete:
+            for key in keys:
+                self._remember(key, reading)
         log_event(
             _logger, "dispatcher.usage.resume_unmeasured", **ident,
             agent_type=self.agent_type,

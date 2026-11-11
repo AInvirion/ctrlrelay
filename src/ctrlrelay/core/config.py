@@ -131,6 +131,14 @@ USAGE_FIELD_NAMES: tuple[str, ...] = (
 )
 
 
+def _is_dotted_path(path: str) -> bool:
+    """Keys joined by dots, none empty and none containing whitespace,
+    which no JSON key a CLI writes for usage carries."""
+    return all(
+        part and not any(c.isspace() for c in part) for part in path.split(".")
+    )
+
+
 class GenericUsageConfig(BaseModel):
     """How a generic CLI reports the tokens a run used (#387).
 
@@ -159,25 +167,30 @@ class GenericUsageConfig(BaseModel):
     input_includes_cache_read: bool = False
     fields: dict[str, str]
 
-    @field_validator("event_type", "event_type_path")
+    @field_validator("event_type")
     @classmethod
     def _usage_not_blank(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("must not be empty")
         return v
 
+    @field_validator("event_type_path")
+    @classmethod
+    def _event_path_is_dotted(cls, v: str) -> str:
+        if not _is_dotted_path(v):
+            raise ValueError(f"{v!r} is not a dotted path")
+        return v
+
     @field_validator("fields")
     @classmethod
     def _known_fields(cls, v: dict[str, str]) -> dict[str, str]:
-        if not v:
-            raise ValueError("must map at least one token count")
         for name, path in v.items():
             if name not in USAGE_FIELD_NAMES:
                 raise ValueError(
                     f"unknown usage field {name!r}; use one of "
                     f"{', '.join(USAGE_FIELD_NAMES)}"
                 )
-            if not path.strip() or any(not p for p in path.split(".")):
+            if not _is_dotted_path(path):
                 raise ValueError(f"usage field {name!r}: {path!r} is not a dotted path")
         return v
 
@@ -198,9 +211,10 @@ class GenericUsageConfig(BaseModel):
                 "input_includes_cache_read needs both input_tokens and "
                 "cache_read_tokens mapped"
             )
+        # `reading` defaults to "sum", so a running total has to say "last".
         if self.covers == "native_session" and self.reading != "last":
             raise ValueError(
-                "covers: native_session is a running total, so reading must be 'last'"
+                "covers: native_session is a running total, so set reading: 'last'"
             )
         return self
 
