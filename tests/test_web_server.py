@@ -21,6 +21,7 @@ import threading
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from importlib import resources
 from pathlib import Path
 
@@ -223,14 +224,40 @@ def _js_function(script: str, name: str) -> str:
     return script[m.end(): i - 1]
 
 
+class _InlineScripts(HTMLParser):
+    """Collects the text of every inline <script> element. A real HTML
+    parser, not a regex: tag case, attributes (quoted `>` included),
+    `</script >` and comments are all handled the way a browser would."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.blocks: list[str] = []
+        self._inside = False
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag == "script":
+            self._inside = True
+            self.blocks.append("")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script":
+            self._inside = False
+
+    def handle_data(self, data: str) -> None:
+        if self._inside:
+            self.blocks[-1] += data
+
+
 def _scripts_of(html: str) -> str:
-    """Every inline script block of the page, joined. Case-insensitive and
-    tolerant of attributes, so a `<script type="module">` or `</SCRIPT >`
-    cannot make every absence check below scan an empty string. Refuses a
-    page with no script at all for the same reason."""
-    blocks = re.findall(r"<script\b[^>]*>(.*?)</script\s*>", html, re.S | re.I)
-    assert blocks, "no <script> block found in the page"
-    return "\n".join(blocks)
+    """Every inline script of the page, joined. Refuses a page whose inline
+    scripts are all empty, so a changed tag or a move to an external file
+    cannot leave every absence check below scanning an empty string."""
+    parser = _InlineScripts()
+    parser.feed(html)
+    parser.close()
+    script = "\n".join(parser.blocks)
+    assert script.strip(), "no inline <script> code found in the page"
+    return script
 
 
 def _script() -> str:
