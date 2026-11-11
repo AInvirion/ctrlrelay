@@ -81,7 +81,7 @@ enrolled through a local manifest:
 |---|---|---|
 | `claude` (default) | `claude -p --output-format stream-json --verbose --dangerously-skip-permissions` | Reads the subscription usage; supports `sandbox: "bwrap"`. |
 | `opencode` | `opencode run --format json --dangerously-skip-permissions` | Can target a self-hosted OpenAI-compatible endpoint. No usage reading; no bwrap yet. |
-| a key under `agent.plugins` | The manifest's binary and fixed argv | Generic checkpoint and optional native-session mapping. No live transcript, usage reading, or bwrap. |
+| a key under `agent.plugins` | The manifest's binary and fixed argv | Generic checkpoint and optional native-session mapping. Token usage is measured at exit when the manifest has a [`usage`](#measuring-a-plugins-token-usage) mapping. No live transcript or bwrap. |
 
 Anything else raises at startup with a message naming the type. That is
 deliberate: a typo must stop the daemon rather than silently fall back
@@ -371,7 +371,8 @@ it yet, so the token budget does not apply.
 
 The shared runtime still supplies checkpoint reading, credential stripping,
 timeout/cancellation, and dispatch-health reporting. Generic plugins honestly
-report **no live transcript events, usage measurement, or sandbox**. The CLI
+report **no live transcript events or sandbox**, and no usage measurement unless
+the manifest has a `usage` mapping (below). The CLI
 must be able to write the normal `DONE`, `BLOCKED_NEEDS_INPUT`, or `FAILED`
 checkpoint to `CTRLRELAY_STATE_FILE`; merely exiting zero is not success.
 Run `ctrlrelay agent check <type>` once after enrolling a manifest — it
@@ -387,6 +388,86 @@ stay on that identity. Pre-#379 rows are not backfilled during migration. A
 legacy row with a native session id but no identity is refused as
 `agent_identity_unknown` rather than risking a cross-backend resume; a row with
 no native id can start a fresh session under the current local defaults.
+
+### Measuring a plugin's token usage
+
+A manifest with a `usage` mapping has its runs measured, so the token budget
+([`agent.budget`](#agentbudget)) applies to them. The relay reads the CLI's JSON-lines
+output when it exits:
+
+```yaml
+    codex:
+      # ... binary, args, resume_args, session_id_path ...
+      usage:
+        event_type: "turn.completed"   # lines whose `type` is this carry usage
+        event_type_path: "type"        # default
+        reading: "last"                # "sum": add every such line; "last": take the last
+        covers: "native_session"       # "process" (default) or "native_session"
+        input_includes_cache_read: true
+        fields:
+          input_tokens: "usage.input_tokens"
+          cache_read_tokens: "usage.cached_input_tokens"
+          cache_creation_tokens: "usage.cache_write_input_tokens"
+          output_tokens: "usage.output_tokens"
+```
+
+- `fields` maps `input_tokens` and `output_tokens` (both required) and,
+  optionally, `cache_creation_tokens` and `cache_read_tokens` to a dotted path
+  in the usage line (keys joined by `.`, none empty or containing whitespace;
+  `event_type_path` follows the same rule). No two of these paths may be the
+  same or contain one another. A cache count left out counts as zero, for a CLI with no
+  cache. The budget counts input, cache creation and output, as for Claude;
+  cache reads are recorded and not counted.
+- `covers: native_session` says the reading is the CLI's running total for its
+  own session, so a resumed run repeats what earlier rounds used. The relay
+  remembers that session's last total (per relay session, under the id it
+  resumed and the id it reported) and charges a round only the difference
+  from it. That includes a fresh round that reports an id the relay session
+  already measured. A round that ended badly (non-zero exit, a cut-off line)
+  is charged that difference as a floor and marked unknown. The sum charged
+  never exceeds the CLI's own final total, which leaves two gaps, both marked
+  unknown:
+  - **No remembered total** (the relay restarted between rounds, or the native
+    session is older than the relay session): that round is never charged,
+    so a restart forgives one round against the hard limit. If that round's
+    reading was exact it becomes the remembered total and the next round is
+    charged from it; if not, nothing is remembered and the next round is in
+    the same position.
+  - **The total moved backwards:** that round is charged nothing and the
+    higher total stays remembered, so later rounds are charged only once the
+    CLI's total passes it again.
+
+  Needs `reading: last` to be set (the default is `sum`).
+- `input_includes_cache_read: true` is for CLIs whose input count already
+  contains the cache reads (OpenAI's convention); they are taken out of it.
+  Cache writes are not taken out: the mapping assumes the input count does not
+  include them. That is unverified for Codex, which reported
+  `cache_write_input_tokens: 0` on every run measured, including one with a
+  33,000-token prompt.
+- These are recorded as **unknown**, never as zero, with what could be read
+  kept as a floor: no usage line; a usage line with a count that is missing,
+  not an integer, negative or above 10^12 (that line adds nothing, and a
+  `sum` past 10^12 counts as nothing too); any line that starts as a JSON
+  object and is cut off; and a run that exited non-zero, whose last report may
+  not be its final one.
+- A round that **timed out**, was cancelled by a shutdown, or whose output
+  could not be read at all has no reading: its output is discarded, so it is
+  charged nothing and the session's total becomes unknown. Rounds that keep
+  timing out are therefore never charged, and the hard limit cannot stop them.
+
+The reading arrives when the CLI exits, so a hard limit cannot stop a plugin
+in the middle of a round, as it can for Claude. In the lanes that keep a
+session total (dev and task runs) it applies between rounds: a session already
+at its hard limit is refused before its next round (a resume or a CI fix)
+starts. A lane that keeps no session total, such as the security sweep, gets
+the limit per spawn, and a spawn measured only at exit cannot be held to it:
+its usage is returned with the run and a passed soft limit is logged, but
+nothing is stopped. Measured mappings, from real output:
+
+| CLI | `event_type` | token fields |
+|---|---|---|
+| Codex 0.166 | `turn.completed` | `usage.input_tokens` (includes `usage.cached_input_tokens`), `usage.cache_write_input_tokens`, `usage.output_tokens`; running total per thread |
+| Copilot 1.0.109 | `session.usage_checkpoint` | `data.accountingSnapshot.tokenDetails.{input,cache_read,cache_write,output}.tokenCount`; running total per session |
 
 ### agent.opencode
 

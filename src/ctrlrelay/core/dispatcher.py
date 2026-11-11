@@ -55,6 +55,7 @@ from ctrlrelay.core.budget import (
 from ctrlrelay.core.budget import (
     BudgetScope,
     BudgetWatch,
+    ExitReadingMeter,
     RunUsage,
     TranscriptMeter,
     is_budget_reason,
@@ -605,6 +606,39 @@ class CliAgentAdapter:
                 session_id=session_id, error=str(e)[:200],
             )
 
+    async def _round_unmeasured(self, budget: BudgetWatch | None) -> RunUsage | None:
+        """Record a round whose output was lost (timed out, cancelled, or
+        unreadable pipes) as unknown, for a backend measured at exit (#387).
+
+        The round used something, so the session's total becomes unknown
+        rather than staying at a number that leaves it out. Returns the
+        session total, or None for a backend that is not measured at exit
+        (the transcript meter already recorded what it saw).
+        """
+        if budget is None or not self._reads_usage_at_exit():
+            return None
+        return budget.total(await budget.finish_with(RunUsage(unreadable=1)))
+
+    def _reads_usage_at_exit(self) -> bool:
+        """True when this backend reports its token usage in its own output
+        (#387) rather than in a transcript the relay can watch live."""
+        return False
+
+    def _usage_at_exit(
+        self,
+        stdout_text: str,
+        *,
+        resume_session_id: str | None,
+        agent_session_id: str | None,
+        ident: dict[str, Any],
+        exited_cleanly: bool = True,
+    ) -> RunUsage | None:
+        """This spawn's usage read from the CLI's output, or None when the
+        backend does not report it there (the transcript meter is used).
+        ``exited_cleanly`` is False for a run that was killed, timed out or
+        exited non-zero, whose last report may not be its final usage."""
+        return None
+
     def _record_usage(self, stdout_text: str, ident: dict) -> None:
         """Keep this run's usage reading, if the backend reports one.
 
@@ -714,8 +748,40 @@ class CliAgentAdapter:
             watches.append(("stuck", lambda: watch_transcript(
                 folders, since=wall_started, policy=policy, ident=ident,
             )))
-        if budget is not None:
+        if budget is not None and not self._reads_usage_at_exit():
+            # A backend measured at exit has nothing to poll while it runs;
+            # its limit is checked before it starts, below.
             watches.append(("budget", budget.run))
+
+        if budget is not None and self._reads_usage_at_exit():
+            # A backend measured only at exit: nothing in the round itself
+            # can stop it, and no watch polls it while it runs. So a session
+            # already at its hard limit is refused here, before the round
+            # starts and spends anything (#387).
+            refused = await budget.check(RunUsage())
+            if refused is not None:
+                log_event(
+                    _logger, "dispatcher.session.stopped_budget", **ident,
+                    reason=refused, before_start=True,
+                )
+                stderr_text = f"Session stopped: {refused}\n"
+                await self._report_outcome(
+                    session_id=session_id,
+                    repo=repo,
+                    issue_number=issue_number,
+                    exit_code=-1,
+                    stdout="",
+                    stderr=stderr_text,
+                )
+                return SessionResult(
+                    session_id=session_id,
+                    exit_code=-1,
+                    state=None,
+                    stderr=stderr_text,
+                    stuck_reason=refused,
+                    usage=budget.total(RunUsage()),
+                    agent=self.agent_identity,
+                )
 
         try:
             # The sandbox's options go through a file descriptor, not the
@@ -806,12 +872,14 @@ class CliAgentAdapter:
                 stdout="",
                 stderr=f"Session timed out after {timeout}s",
             )
+            timed_out_usage = await self._round_unmeasured(budget)
             return SessionResult(
                 session_id=session_id,
                 exit_code=-1,
                 state=None,
                 stderr="Session timed out",
                 timed_out=True,
+                usage=timed_out_usage,
                 agent=self.agent_identity,
             )
         except asyncio.CancelledError as e:
@@ -832,6 +900,10 @@ class CliAgentAdapter:
                     await asyncio.shield(proc.wait())
                 except asyncio.CancelledError:
                     pass
+            try:
+                await asyncio.shield(self._round_unmeasured(budget))
+            except BaseException:  # noqa: BLE001 - the cancel must still propagate
+                pass
             raise
 
         except Exception as e:
@@ -875,6 +947,10 @@ class CliAgentAdapter:
                 stdout="",
                 stderr=f"{type(e).__name__}: {e}",
             )
+            try:
+                await self._round_unmeasured(budget)
+            except Exception:  # noqa: BLE001 - keep the original failure
+                pass
             raise
 
         # The child exited on its own. Anything it left running in the
@@ -945,7 +1021,17 @@ class CliAgentAdapter:
         self._record_usage(stdout_text, ident)
         usage: RunUsage | None = None
         if budget is not None:
-            spawn_usage = await budget.finish(parse_result_cost(stdout_text))
+            exit_reading = self._usage_at_exit(
+                stdout_text,
+                resume_session_id=resume_session_id,
+                agent_session_id=agent_session_id,
+                ident=ident,
+                exited_cleanly=exit_code == 0 and not stops,
+            )
+            if exit_reading is not None:
+                spawn_usage: RunUsage | None = await budget.finish_with(exit_reading)
+            else:
+                spawn_usage = await budget.finish(parse_result_cost(stdout_text))
             if spawn_usage is not None:
                 usage = budget.total(spawn_usage)
 
@@ -1015,6 +1101,27 @@ class CliAgentAdapter:
         measured. A limit that cannot be enforced is said in the log."""
         scope = scope or BudgetScope()
         limits = resolve_limits(self.budget, scope.labels)
+        if not folders and self._reads_usage_at_exit():
+            if limits.any:
+                # Said once per spawn: the limit is never applied in the
+                # middle of a round. With a session total (dev, task) it is
+                # applied before the next round; with none, never.
+                log_event(
+                    _logger, "dispatcher.budget.measured_at_exit", **ident,
+                    agent_type=self.agent_type, soft=limits.soft,
+                    hard=limits.hard,
+                    # The pre-start check only bites when earlier rounds can
+                    # be counted: a session scope that records them, or a
+                    # total handed in.
+                    applies_between_rounds=(
+                        scope.on_usage is not None or scope.before != RunUsage()
+                    ),
+                )
+            return BudgetWatch(
+                ExitReadingMeter(),
+                limits=limits, scope=scope, ident=ident,
+                poll_seconds=self.budget_poll_seconds,
+            )
         if not folders:
             if limits.any:
                 log_event(
@@ -2167,6 +2274,7 @@ def _make_adapter(
             plugin_version=manifest.plugin_version,
             instructions_files=tuple(manifest.instructions_files),
             env_allow=tuple(manifest.env_allow),
+            usage=manifest.usage,
             outcome_hook=outcome_hook,
             sandbox=agent_config.sandbox,
             usage_store=usage_store,

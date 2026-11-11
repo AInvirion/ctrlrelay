@@ -12,13 +12,15 @@ import json
 import os
 import re
 import shutil
-from dataclasses import dataclass, field
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from ctrlrelay.core.agent_plugins import AgentCapabilities, native_session_id_is_safe
 from ctrlrelay.core.binaries import resolve_binary
-from ctrlrelay.core.budget import BudgetScope
+from ctrlrelay.core.budget import BudgetScope, RunUsage
+from ctrlrelay.core.config import USAGE_FIELD_NAMES, GenericUsageConfig
 from ctrlrelay.core.dispatcher import (
     CliAgentAdapter,
     DispatchOutcomeHook,
@@ -35,6 +37,112 @@ _PLACEHOLDER_RE = re.compile(
     r"\{(prompt|session_id|state_file|resume_session_id|model|provider)\}"
 )
 _ANY_PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
+# Native sessions whose last running total is remembered, so a resumed
+# round is charged only what it added (#387). Bounded so a long-lived node
+# does not grow it without limit; a resume whose total was evicted is
+# charged nothing and shown as unknown.
+_NATIVE_READINGS_KEPT = 256
+
+
+def _dotted(value: Any, path: str) -> Any:
+    current = value
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+# No real run reports anywhere near this in one count; a number past it is
+# a malformed report, and charging it would stop the session for nothing.
+MAX_TOKEN_COUNT = 10**12
+
+
+def _token_count(value: Any) -> int | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > MAX_TOKEN_COUNT
+    ):
+        return None
+    return value
+
+
+def read_usage_events(stdout_text: str, spec: GenericUsageConfig) -> RunUsage:
+    """The usage a CLI reported in its JSON-lines output, per ``spec``.
+
+    Unknown is never zero. The result is counted as unreadable, so the
+    total shows as unknown and what was read is a floor, when there is no
+    matching line at all; when any line that starts as a JSON object is not
+    valid JSON (it may be a usage line cut off before its type was written);
+    or when a matching line that counts has a count that is missing, not an
+    integer, negative or above ``MAX_TOKEN_COUNT``, in which case that line
+    contributes nothing. With ``reading: last`` only the last matching line
+    counts.
+    """
+    readings: list[dict[str, int] | None] = []
+    lost = 0
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            lost += 1
+            continue
+        if not isinstance(event, dict):
+            continue
+        if _dotted(event, spec.event_type_path) != spec.event_type:
+            continue
+        counts: dict[str, int] | None = {}
+        for name, path in spec.fields.items():
+            got = _token_count(_dotted(event, path))
+            if got is None:
+                counts = None
+                break
+            counts[name] = got
+        if counts is not None and spec.input_includes_cache_read:
+            uncached = counts["input_tokens"] - counts["cache_read_tokens"]
+            counts = None if uncached < 0 else {**counts, "input_tokens": uncached}
+        readings.append(counts)
+
+    if not readings:
+        return RunUsage(unreadable=1)
+    if spec.reading == "last":
+        readings = readings[-1:]
+    totals = dict.fromkeys(USAGE_FIELD_NAMES, 0)
+    unreadable = lost
+    for counts in readings:
+        if counts is None:
+            unreadable += 1
+            continue
+        for name, value in counts.items():
+            totals[name] += value
+    if (
+        any(v > MAX_TOKEN_COUNT for v in totals.values())
+        or sum(totals.values()) > MAX_TOKEN_COUNT
+    ):
+        # Each count passed the ceiling and their sum, or the counts added
+        # together, did not: as implausible as one count past it, and
+        # charged as nothing for the same reason.
+        return RunUsage(unreadable=unreadable + 1)
+    return RunUsage(**totals, unreadable=unreadable)
+
+
+def _minus(total: RunUsage, earlier: RunUsage) -> tuple[RunUsage, bool]:
+    """``total - earlier`` per count, clamped at zero, and whether any
+    count went below zero (the running total moved backwards)."""
+    diffs = {
+        name: getattr(total, name) - getattr(earlier, name)
+        for name in USAGE_FIELD_NAMES
+    }
+    went_back = any(v < 0 for v in diffs.values())
+    return RunUsage(
+        **{name: max(0, v) for name, v in diffs.items()},
+        unreadable=total.unreadable,
+    ), went_back
 
 
 @dataclass
@@ -56,11 +164,15 @@ class GenericCliDispatcher(CliAgentAdapter):
     # ``env_allow``. Empty: no well-known provider key reaches it.
     env_allow: tuple[str, ...] = ()
     instructions_files: tuple[str, ...] = ("AGENTS.md",)
+    usage: GenericUsageConfig | None = None
     outcome_hook: DispatchOutcomeHook | None = None
     sandbox: str = "none"
     usage_store: UsageStore | None = field(kw_only=True)
     active: int = field(default=0, init=False)
     started: int = field(default=0, init=False)
+    _native_readings: OrderedDict[str, RunUsage] = field(
+        default_factory=OrderedDict, init=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.binary or not self.binary.strip():
@@ -172,13 +284,144 @@ class GenericCliDispatcher(CliAgentAdapter):
         return AgentCapabilities(
             resume=bool(self.resume_args and self.session_id_path),
             structured_events=False,
-            usage=False,
+            usage=self.usage is not None,
             sandbox=False,
         )
 
     @property
     def agent_binary(self) -> str:
         return self.binary
+
+    def _reads_usage_at_exit(self) -> bool:
+        return self.usage is not None
+
+    def _usage_at_exit(
+        self,
+        stdout_text: str,
+        *,
+        resume_session_id: str | None,
+        agent_session_id: str | None,
+        ident: dict[str, Any],
+        exited_cleanly: bool = True,
+    ) -> RunUsage | None:
+        """This spawn's usage, from the CLI's output (#387).
+
+        A run that did not exit cleanly (a non-zero exit, or one a watch
+        stopped) may have used more than its last report said, so its
+        reading is only a floor and is marked unknown.
+
+        A reading that ``covers`` the native session is a running total for
+        that session. Its last total is remembered per relay session (and
+        repo), under the id the round resumed and under the id it reported,
+        so a resumed round of the same relay session is charged only what it
+        added:
+
+        - exact reading, remembered total, nothing moved backwards: the
+          difference, exact; the reading becomes the remembered total.
+        - inexact reading (unclean exit, a cut-off line) that still moved
+          nothing backwards: the difference, as a floor marked unknown. A
+          reading is never above what the CLI really used, so the difference
+          is not either. The reading becomes the remembered total, so the
+          next round is charged from it and this round's part is not charged
+          again.
+        - anything else charges nothing and is marked unknown, because
+          nothing says which part of the running total is new: no remembered
+          total (the relay restarted, it was evicted, or the native session
+          is older than this relay session), or a total that moved
+          backwards. With no remembered total, that round is never charged
+          (a restart or eviction forgives one round against the hard
+          limit), and an exact reading becomes the remembered total. After
+          a total moved backwards, the higher total stays remembered, so no
+          round is charged until the CLI's total passes it again: the sum
+          charged never exceeds the CLI's own final total.
+
+        A fresh round is charged its whole reading (a floor when inexact),
+        unless this relay session already remembers a total under the id it
+        reported and the reading is not below it; then the CLI carried that
+        session on and only the difference is charged. Either way the
+        reading becomes the remembered total.
+
+        A round that timed out never reaches here: its output is discarded
+        with the cancelled read, so it is charged nothing and marked unknown
+        (``CliAgentAdapter._round_unmeasured``).
+        """
+        spec = self.usage
+        if spec is None:
+            return None
+        reading = read_usage_events(stdout_text, spec)
+        if not exited_cleanly:
+            reading = replace(reading, unreadable=reading.unreadable + 1)
+        if spec.covers != "native_session":
+            return reading
+
+        if resume_session_id is None:
+            if agent_session_id is None:
+                return reading
+            key = self._native_key(ident, agent_session_id)
+            earlier = self._native_readings.get(key)
+            # Remembered even when inexact: it is what this round was
+            # charged up to, so the next round charged from it adds up to
+            # the CLI's own total, never more.
+            self._remember(key, reading)
+            if earlier is not None:
+                # A fresh round reporting an id this relay session already
+                # measured: the CLI carried that session on, so only the
+                # difference is new. A total below the remembered one is a
+                # new session reusing the id, and all of it is new.
+                spawn, went_back = _minus(reading, earlier)
+                if not went_back:
+                    return spawn
+            return reading
+
+        keys = [self._native_key(ident, resume_session_id)]
+        if agent_session_id is not None and agent_session_id != resume_session_id:
+            # A CLI that names a resumed session anew: the next round
+            # resumes under the new id, so its baseline must be there too.
+            keys.append(self._native_key(ident, agent_session_id))
+        earlier = self._native_readings.get(keys[0])
+        if earlier is not None:
+            spawn, went_back = _minus(reading, earlier)
+            if not went_back:
+                for key in keys:
+                    self._remember(key, reading)
+                if not reading.complete:
+                    log_event(
+                        _logger, "dispatcher.usage.resume_floor", **ident,
+                        agent_type=self.agent_type,
+                    )
+                return spawn
+            # Moved backwards: the higher total stays the baseline, also
+            # under a new id the round reported. Lowering it would let the
+            # rounds after charge more than the CLI's own final total.
+            for key in keys[1:]:
+                self._remember(key, earlier)
+        elif reading.complete:
+            for key in keys:
+                self._remember(key, reading)
+        log_event(
+            _logger, "dispatcher.usage.resume_unmeasured", **ident,
+            agent_type=self.agent_type,
+            remembered=earlier is not None,
+            reading_complete=reading.complete,
+        )
+        return RunUsage(unreadable=max(1, reading.unreadable))
+
+    def _remember(self, key: str, reading: RunUsage) -> None:
+        self._native_readings[key] = reading
+        self._native_readings.move_to_end(key)
+        while len(self._native_readings) > _NATIVE_READINGS_KEPT:
+            self._native_readings.popitem(last=False)
+
+    def _native_key(self, ident: dict[str, Any], native_id: str) -> str:
+        """Where a native session's running total is remembered: per relay
+        session and repo, so a total seen by one relay session is never the
+        baseline of another (whose ``before`` does not include it), and two
+        repositories sharing this adapter cannot overwrite each other's."""
+        return "\x00".join((
+            str(ident.get("session_id") or ""),
+            str(ident.get("repo") or ""),
+            native_id,
+        ))
 
     def _build_argv(
         self,
