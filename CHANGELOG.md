@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-11-11
+
 ### Fixed
 
 - The relay's own clone, fetch and `ls-remote` now use gh's login on a node
@@ -2862,7 +2864,8 @@ pipeline).
   per-phase implementation plans (Phase 0 through Phase 4).
 - `docs/Claude_Code_Project_Guide.md` — project development guide.
 
-[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/AInvirion/ctrlrelay/compare/v0.28.1...HEAD
+[0.28.1]: https://github.com/AInvirion/ctrlrelay/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/AInvirion/ctrlrelay/compare/v0.25.0...v0.26.0
