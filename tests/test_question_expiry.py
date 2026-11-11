@@ -787,8 +787,11 @@ class TestResolutionTargets:
     ) -> None:
         """The incident: a question citing ``oaf-kernel#118`` was probed as
         this repo's #118, an unrelated issue closed days earlier, and was
-        retired as resolved at the next hourly sweep."""
+        retired as resolved at the next hourly sweep. The question's own
+        issue reads closed here, so only the refused reference can keep
+        it."""
         _add(db, "q", "Wait for oaf-kernel#118 (S1) plus a pin bump?", 60)
+        _on_issue(db, "q", 290)
         github = AsyncMock()
         github.get_issue_or_pr_state.return_value = _state(closed=True)
 
