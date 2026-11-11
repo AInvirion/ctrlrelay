@@ -8,7 +8,7 @@ permalink: /feedback-loop/
 
 # Feedback loop
 
-Every agent session that ctrlrelay spawns — Claude Code or OpenCode, per the
+Every agent session that ctrlrelay spawns — Claude Code, OpenCode, Copilot, Codex or a plugin, per the
 repo's `agent_type` — ends with a single JSON checkpoint file. The orchestrator
 reads that file, decides what to do, and (if the session asked a question)
 routes a human's answer back to a resumed session.
