@@ -17,6 +17,7 @@ from ctrlrelay.core.agent_env import (
     DEFAULT_SANDBOX_HIDE_PATHS,
     DEFAULT_SANDBOX_READONLY_PATHS,
     DEFAULT_SANDBOX_WRITABLE_PATHS,
+    check_env_allow,
 )
 from ctrlrelay.core.agent_presets import PRESET_NAMES
 
@@ -111,6 +112,15 @@ class OpenCodeConfig(BaseModel):
     # model is usually slower per token than a hosted one, so this is
     # here to be raised — see the throughput figures on #286.
     default_timeout_seconds: int | None = Field(default=None, ge=1)
+    # #390: the provider variables opencode may receive, exact names or
+    # ``PREFIX*``. Empty: no well-known provider key (``OPENAI_API_KEY``,
+    # ``DEEPSEEK_API_KEY``, ...) reaches it; list the ones opencode.json reads.
+    env_allow: list[str] = Field(default_factory=list)
+
+    @field_validator("env_allow")
+    @classmethod
+    def _env_allow_is_safe(cls, v: list[str]) -> list[str]:
+        return check_env_allow(v)
 
 
 class GenericCliConfig(BaseModel):
@@ -134,6 +144,14 @@ class GenericCliConfig(BaseModel):
     provider: str | None = None
     plugin_version: str = "1"
     instructions_files: list[str] = Field(default_factory=lambda: ["AGENTS.md"])
+    # #390: the provider variables this CLI may receive, exact names or
+    # ``PREFIX*``. Empty: no well-known provider key reaches it.
+    env_allow: list[str] = Field(default_factory=list)
+
+    @field_validator("env_allow")
+    @classmethod
+    def _env_allow_is_safe(cls, v: list[str]) -> list[str]:
+        return check_env_allow(v)
 
     @field_validator("binary", "plugin_version")
     @classmethod

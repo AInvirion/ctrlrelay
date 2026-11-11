@@ -32,6 +32,9 @@ class _Preset:
     resume_args: tuple[str, ...]
     session_id_path: str
     instructions_files: tuple[str, ...]
+    # The provider variables this CLI may receive (#390). Fixed here, like
+    # the arguments: ``agent.presets.<name>`` cannot widen it.
+    env_allow: tuple[str, ...]
     # Bumped whenever ``args`` or ``resume_args`` change, so a run pinned
     # to the old arguments is refused instead of resumed with new ones.
     version: str
@@ -54,6 +57,10 @@ _PRESETS: dict[str, _Preset] = {
         resume_args=(*_COPILOT_ARGS, "--resume", "{resume_session_id}"),
         session_id_path="sessionId",
         instructions_files=(".github/copilot-instructions.md", "AGENTS.md"),
+        # Copilot's documented token variable. Its file login under
+        # ~/.copilot needs no entry; this is for a node that sets the token
+        # in the daemon's environment instead (#383).
+        env_allow=("COPILOT_GITHUB_TOKEN",),
         version="1",
     ),
 }
@@ -85,4 +92,5 @@ def preset_manifest(
         model=o.model,
         plugin_version=preset.version,
         instructions_files=list(preset.instructions_files),
+        env_allow=list(preset.env_allow),
     )

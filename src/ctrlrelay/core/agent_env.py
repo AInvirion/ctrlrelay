@@ -57,6 +57,7 @@ import os
 import re
 import shutil
 from collections.abc import Mapping, Sequence
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 # Named explicitly as well as caught by the prefix rule below, so the
@@ -108,6 +109,100 @@ _GIT_CONFIG_OVERRIDES: tuple[tuple[str, str], ...] = (
 )
 
 
+# Model-provider credentials, by well-known name (#390). With more than
+# one backend on a node, each would otherwise inherit every key the
+# daemon holds: Claude's ANTHROPIC_API_KEY reaching a Codex run, Codex's
+# OPENAI_API_KEY reaching a Claude run. A name here reaches an agent only
+# when that agent's backend declares it (``provider_env_allow``). Names
+# not in this list pass through as before: the list is a fixed set of
+# provider secrets, not an allowlist of the whole environment, so a
+# build that needs JAVA_HOME or a proxy setting still gets it.
+PROVIDER_KEY_VARS: frozenset[str] = frozenset({
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "COPILOT_GITHUB_TOKEN",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "MISTRAL_API_KEY",
+    "GROQ_API_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+    "TOGETHER_API_KEY",
+    "FIREWORKS_API_KEY",
+    "COHERE_API_KEY",
+})
+
+# What the claude backend may receive: its own provider's variables.
+CLAUDE_PROVIDER_ENV: tuple[str, ...] = ("ANTHROPIC_*", "CLAUDE_*")
+
+# An ``env_allow`` entry: an exact variable name, or a prefix ending in
+# one ``*``. Nothing broader, so "*" cannot hand an agent every key.
+ENV_ALLOW_PATTERN = re.compile(r"[A-Z_][A-Z0-9_]*\*?")
+# Families removed whatever a backend allows. An ``env_allow`` entry that
+# names one is refused at config load rather than silently doing nothing.
+_NEVER_ALLOWED_PREFIXES: tuple[str, ...] = (*_STRIPPED_PREFIXES, _RELAY_PREFIX)
+
+
+def check_env_allow(entries: Sequence[str]) -> list[str]:
+    """Validate an ``env_allow`` list; raise ``ValueError`` naming the entry.
+
+    Shared by every config block that carries one, so the generic
+    manifests and the opencode block refuse the same things.
+    """
+    for entry in entries:
+        if not ENV_ALLOW_PATTERN.fullmatch(entry):
+            raise ValueError(
+                f"env_allow entry {entry!r}: use an exact variable name or "
+                "a prefix ending in '*', e.g. OPENAI_API_KEY or OPENAI_*"
+            )
+        head = entry.rstrip("*")
+        if (
+            head.startswith(_NEVER_ALLOWED_PREFIXES)
+            or entry in GITHUB_TOKEN_VARS
+            or entry in _STRIPPED_EXACT
+        ):
+            raise ValueError(
+                f"env_allow entry {entry!r} names GitHub, git, ssh or relay "
+                "credentials, which no agent receives this way"
+            )
+    return list(entries)
+
+
+def _is_foreign_provider_key(name: str, allow: Sequence[str]) -> bool:
+    if name not in PROVIDER_KEY_VARS:
+        return False
+    return not any(fnmatchcase(name, pattern) for pattern in allow)
+
+
+def strip_relay_and_foreign_provider_vars(
+    base: Mapping[str, str],
+    *,
+    provider_env_allow: Sequence[str],
+) -> tuple[dict[str, str], list[str]]:
+    """Return ``(env, stripped_names)`` for an agent WITH GitHub access.
+
+    The secops lane hands its agent the operator's GitHub login on
+    purpose; it still never needs the relay's own secrets (every
+    ``CTRLRELAY_*``, the dispatcher sets the two checkpoint variables
+    afterwards) nor another backend's provider key (#390).
+    """
+    env: dict[str, str] = {}
+    stripped: list[str] = []
+    for name, value in base.items():
+        if name.startswith(_RELAY_PREFIX) or _is_foreign_provider_key(
+            name, provider_env_allow,
+        ):
+            stripped.append(name)
+            continue
+        env[name] = value
+    return env, sorted(stripped)
+
+
 def _is_stripped(name: str) -> bool:
     if name in GITHUB_TOKEN_VARS or name in _STRIPPED_EXACT:
         return True
@@ -121,6 +216,7 @@ def build_agent_env(
     *,
     gh_config_dir: Path,
     runtime_dir: Path,
+    provider_env_allow: Sequence[str] | None,
 ) -> tuple[dict[str, str], list[str]]:
     """Return ``(env, stripped_names)`` for an agent with no GitHub access.
 
@@ -130,11 +226,22 @@ def build_agent_env(
     for the session bus under it finds nothing there. ``stripped_names`` is
     the sorted list of variable NAMES removed, for the log. Values
     are never returned or logged.
+
+    ``provider_env_allow`` is the backend's own provider variables
+    (#390): every name in :data:`PROVIDER_KEY_VARS` it does not match is
+    removed, whoever set it. It is
+    required so no agent caller opts out by leaving it off; ``None``
+    keeps every provider key and is for a caller that is not an agent
+    backend at all (the proof commands, which run the repository's own
+    tests).
     """
     env: dict[str, str] = {}
     stripped: list[str] = []
     for name, value in base.items():
-        if _is_stripped(name):
+        if _is_stripped(name) or (
+            provider_env_allow is not None
+            and _is_foreign_provider_key(name, provider_env_allow)
+        ):
             stripped.append(name)
             continue
         env[name] = value

@@ -578,8 +578,12 @@ async def run_proof_command(
     try:
         (private / "gh").mkdir()
         (private / "run").mkdir(mode=0o700)
+        # Not an agent backend: the repository's own checks, which may
+        # need whatever provider key its tests read. #390's provider
+        # rule is for agents; the GitHub rule above still applies.
         env, _ = build_agent_env(
             os.environ, gh_config_dir=private / "gh", runtime_dir=private / "run",
+            provider_env_allow=None,
         )
         if confinement.mode == "bwrap" and confinement.cache_dir is not None:
             env.update(agent_cache_env(confinement.cache_dir))

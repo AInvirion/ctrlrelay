@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 from ctrlrelay.core.agent_env import (
+    CLAUDE_PROVIDER_ENV,
     DEFAULT_SANDBOX_CACHE_DIR,
     DEFAULT_SANDBOX_HIDE_PATHS,
     DEFAULT_SANDBOX_READONLY_PATHS,
@@ -36,6 +37,7 @@ from ctrlrelay.core.agent_env import (
     bwrap_prefix,
     git_dirs,
     resolve_bwrap,
+    strip_relay_and_foreign_provider_vars,
 )
 from ctrlrelay.core.agent_plugins import (
     AgentCapabilities,
@@ -393,6 +395,42 @@ class CliAgentAdapter:
     instructions_files: ClassVar[tuple[str, ...]] = ("CLAUDE.md",)
 
     @property
+    def provider_env_allow(self) -> tuple[str, ...]:
+        """The model-provider variables this backend may receive (#390).
+
+        Exact names or ``PREFIX*`` patterns, matched against
+        :data:`ctrlrelay.core.agent_env.PROVIDER_KEY_VARS`; every other
+        provider key is removed from the agent's environment. The base
+        answer is the backend's ``env_allow`` field, which the opencode
+        and generic adapters carry from config; claude overrides it.
+        """
+        return tuple(getattr(self, "env_allow", ()))
+
+    def _agent_env_for_run(
+        self, base_env: dict[str, str], github_access: bool,
+        private_root: Path | None,
+    ) -> tuple[dict[str, str], list[str]]:
+        """The one place the credential rules are applied to an agent.
+
+        Without GitHub access: :func:`build_agent_env` (#219) plus the
+        provider rule. With it (secops): only the relay's own secrets and
+        other backends' provider keys go (#390); GitHub stays, on purpose.
+        ``extra_env`` gets no exemption: a provider key reaches the agent
+        only through ``provider_env_allow``, whoever put it in the env.
+        """
+        if github_access:
+            return strip_relay_and_foreign_provider_vars(
+                base_env, provider_env_allow=self.provider_env_allow,
+            )
+        assert private_root is not None
+        return build_agent_env(
+            base_env,
+            gh_config_dir=private_root / "gh",
+            runtime_dir=private_root / "run",
+            provider_env_allow=self.provider_env_allow,
+        )
+
+    @property
     def manifest_fingerprint(self) -> str:
         """Built-in invocation identity: adapter contract plus launcher."""
         payload = {
@@ -461,18 +499,13 @@ class CliAgentAdapter:
         base_env = os.environ.copy()
         base_env.update(getattr(self, "extra_env", {}))
         private_root: Path | None = None
-        if github_access:
-            env = base_env
-            stripped: list[str] = []
-        else:
+        if not github_access:
             private_root = Path(tempfile.mkdtemp(prefix="ctrlrelay-agent-"))
-            gh_config_dir = private_root / "gh"
-            runtime_dir = private_root / "run"
-            gh_config_dir.mkdir()
-            runtime_dir.mkdir(mode=0o700)
-            env, stripped = build_agent_env(
-                base_env, gh_config_dir=gh_config_dir, runtime_dir=runtime_dir,
-            )
+            (private_root / "gh").mkdir()
+            (private_root / "run").mkdir(mode=0o700)
+        env, stripped = self._agent_env_for_run(
+            base_env, github_access, private_root,
+        )
         env["CTRLRELAY_SESSION_ID"] = session_id
         env["CTRLRELAY_STATE_FILE"] = str(state_file)
         return env, stripped, private_root
@@ -1001,6 +1034,11 @@ class CliAgentAdapter:
 class ClaudeDispatcher(CliAgentAdapter):
     """Spawns and manages Claude subprocess sessions."""
 
+    @property
+    def provider_env_allow(self) -> tuple[str, ...]:
+        """Anthropic's variables only; a Codex or Gemini key stays out (#390)."""
+        return CLAUDE_PROVIDER_ENV
+
     agent_type: ClassVar[str] = "claude"
     plugin_id: ClassVar[str] = "claude"
     capabilities: ClassVar[AgentCapabilities] = AgentCapabilities(
@@ -1265,16 +1303,13 @@ class ClaudeDispatcher(CliAgentAdapter):
         private_root: Path | None = None
         prefix: list[str] = []
         if github_access:
-            env = base_env
-            stripped: list[str] = []
+            env, stripped = self._agent_env_for_run(base_env, True, None)
         else:
             private_root = Path(tempfile.mkdtemp(prefix="ctrlrelay-agent-"))
-            gh_config_dir = private_root / "gh"
-            runtime_dir = private_root / "run"
-            gh_config_dir.mkdir()
-            runtime_dir.mkdir(mode=0o700)
-            env, stripped = build_agent_env(
-                base_env, gh_config_dir=gh_config_dir, runtime_dir=runtime_dir,
+            (private_root / "gh").mkdir()
+            (private_root / "run").mkdir(mode=0o700)
+            env, stripped = self._agent_env_for_run(
+                base_env, False, private_root,
             )
             if self._bwrap is not None:
                 try:
@@ -1463,6 +1498,9 @@ class OpenCodeDispatcher(CliAgentAdapter):
     # default: the endpoint and its credentials live there, not here.
     model: str | None = None
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Provider variables this backend may receive (#390), from
+    # ``agent.opencode.env_allow``: whatever its opencode.json reads.
+    env_allow: tuple[str, ...] = ()
     outcome_hook: DispatchOutcomeHook | None = None
     # Accepted so the shape matches `agent.sandbox`, and validated to
     # "none". See the class docstring: silently ignoring "bwrap" is the
@@ -2086,6 +2124,7 @@ def _make_adapter(
                 oc.binary if oc is not None else "opencode"
             ),
             model=oc.model if oc is not None else None,
+            env_allow=tuple(oc.env_allow) if oc is not None else (),
             default_timeout=(
                 oc.default_timeout_seconds
                 if oc is not None and oc.default_timeout_seconds is not None
@@ -2127,6 +2166,7 @@ def _make_adapter(
             provider=manifest.provider,
             plugin_version=manifest.plugin_version,
             instructions_files=tuple(manifest.instructions_files),
+            env_allow=tuple(manifest.env_allow),
             outcome_hook=outcome_hook,
             sandbox=agent_config.sandbox,
             usage_store=usage_store,

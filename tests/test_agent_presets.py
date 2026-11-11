@@ -151,6 +151,12 @@ class TestTheSafeFlagsCannotBeDropped:
         with pytest.raises(ValidationError, match=key):
             AgentConfig(presets={"copilot": {key: ["--yolo"]}})
 
+    def test_overrides_cannot_widen_the_provider_allowance(self) -> None:
+        """A well-formed entry, so the refusal is the override rule and not
+        the env_allow pattern check (#390)."""
+        with pytest.raises(ValidationError, match="env_allow"):
+            AgentConfig(presets={"copilot": {"env_allow": ["OPENAI_API_KEY"]}})
+
     def test_the_timeout_override_reaches_the_adapter(self) -> None:
         assert _copilot(default_timeout_seconds=99).default_timeout == 99
 
@@ -260,6 +266,43 @@ class TestIdentity:
             '"usage":{"premiumRequests":1}}',
         ])
         assert _copilot()._parse_agent_session_id(stdout) == SESSION
+
+
+class TestTheCopilotPresetGetsOnlyItsOwnProviderKey:
+    """#390: through a real spawn, so the env checked is the one
+    ``build_agent_env`` hands ``create_subprocess_exec``."""
+
+    @pytest.mark.asyncio
+    async def test_keeps_its_token_and_drops_other_providers_keys(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        for name, value in {
+            "COPILOT_GITHUB_TOKEN": "copilot-value",
+            "OPENAI_API_KEY": "openai-value",
+            "ANTHROPIC_API_KEY": "anthropic-value",
+            "GH_TOKEN": "gh-value",
+        }.items():
+            monkeypatch.setenv(name, value)
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"", b"")
+        proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as ex:
+            await _copilot().spawn_session(
+                session_id="s1", prompt="p", working_dir=tmp_path,
+                state_file=tmp_path / "state.json", github_access=False,
+            )
+
+        env = ex.call_args.kwargs["env"]
+        assert env["COPILOT_GITHUB_TOKEN"] == "copilot-value"
+        assert "OPENAI_API_KEY" not in env
+        assert "ANTHROPIC_API_KEY" not in env
+        assert "GH_TOKEN" not in env
+
+    def test_the_allowance_is_fixed_in_the_preset(self) -> None:
+        assert preset_manifest("copilot").env_allow == ["COPILOT_GITHUB_TOKEN"]
 
 
 def test_unknown_names_have_no_preset() -> None:
