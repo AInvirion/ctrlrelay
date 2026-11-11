@@ -41,8 +41,8 @@ class _Preset:
     # How a model override is passed: the flag, and how many leading
     # arguments it goes after in each list (``None`` appends it at the end).
     # Codex takes it right after its subcommand (``exec``, ``exec resume``),
-    # as an option of that subcommand ahead of its positionals, the form
-    # checked on #383.
+    # as an option of that subcommand ahead of its positionals, which is
+    # where `codex exec --help` and `codex exec resume --help` list it.
     model_flag: str = "--model"
     model_after: int | None = None
     resume_model_after: int | None = None
