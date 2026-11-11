@@ -782,7 +782,7 @@ login, does not):
 - read-only again, over those: `sandbox_readonly_paths` (the agent CLI's
   settings, rules, hooks, plugins, skills, browser host and install, and the
   whole `~/.claude/projects` folder with every project's memory, which your
-  own sessions load; only the run's own transcript folder in it is writable)
+  own sessions load)
   and, in the repository, `config`, `config.worktree`,
   `hooks`, `modules`, the other runs' worktree directories, a linked
   worktree's `commondir` and `gitdir`, and the worktree's `.git` pointer,
@@ -795,7 +795,14 @@ login, does not):
   JSON file; an empty file for a Markdown file or git's `config`,
   `config.worktree`, `commondir` and `gitdir`; otherwise an empty directory); if it cannot be created, the run does
   not start. Every directory between a writable path and one of these is
-  pinned too, so it cannot be renamed away and recreated.
+  pinned too, so it cannot be renamed away and recreated;
+- last, `~/.claude/projects` is replaced by an empty folder, whatever
+  `sandbox_hide_paths` says, and only the run's own transcript folder is
+  shown in it, writable. Other projects' transcripts and memory, which can
+  hold anything pasted into a session, are not visible through that folder
+  (a hard link to one of them elsewhere is a second way in, as below).
+  Anything the agent writes elsewhere in that folder is thrown away with
+  the run.
 
 Package caches (`XDG_CACHE_HOME`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`,
 `npm_config_cache`, `GOMODCACHE`, `GRADLE_USER_HOME` and `CARGO_HOME`) point at
@@ -812,9 +819,9 @@ run) and anything readable that is not hidden. The login file is opened as a
 file, so a refresh that replaces it by renaming fails inside the sandbox; a
 long-lived token from `claude setup-token`, in the environment, avoids
 refreshes there. It writes objects and refs in its repository's git
-directory, which the relay's push already treats as untrusted, and session
-transcripts under `~/.claude/projects`, which a later `--resume` of that
-session reads. A read-only path that is a link, in a directory the agent
+directory, which the relay's push already treats as untrusted, and its own
+session transcript under `~/.claude/projects`, which a later `--resume` of
+that session reads. A read-only path that is a link, in a directory the agent
 can write, could be swapped for a file of the agent's, so a run with one
 does not start; the error names it.
 `~/.claude/*` opens every entry not listed as read-only or hidden, so an

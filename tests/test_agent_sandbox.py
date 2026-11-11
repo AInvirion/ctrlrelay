@@ -94,6 +94,9 @@ try write_shell_snapshot "echo planted >> $HOME/.claude/shell-snapshots/snapshot
 try write_agent_state "touch $OWNPROJECT/run-log"
 try write_other_project "touch $HOME/.claude/projects/-other/run-log"
 try new_project_folder "mkdir $HOME/.claude/projects/-planted"
+try read_other_transcript "cat $HOME/.claude/projects/-other/s1.jsonl"
+try read_other_memory "cat $HOME/.claude/projects/-other/memory/MEMORY.md"
+try list_projects "ls $HOME/.claude/projects | grep -q other"
 try write_hooks "touch $GITCOMMON/hooks/pre-push"
 try write_git_config "git config --file $GITCOMMON/config core.fsmonitor /bin/evil"
 try write_tmp "touch /tmp/scratch"
@@ -118,6 +121,7 @@ def home(monkeypatch):
     (h / ".claude" / "projects" / "-other" / "memory").mkdir(parents=True)
     (h / ".claude" / "projects" / "-other" / "memory" / "MEMORY.md").write_text("mine\n")
     (h / ".claude" / "projects" / "-bare").mkdir()
+    (h / ".claude" / "projects" / "-other" / "s1.jsonl").write_text('{"pasted": "x"}\n')
     (h / ".claude" / "settings.json").write_text("{}")
     (h / ".claude.json").write_text('{"mcpServers": {}}')
     (h / ".claude" / "shell-snapshots").mkdir()
@@ -194,7 +198,9 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         "hardlink_settings": "no",
         "hardlink_git_config": "no",
         "write_project_memory": "no",
-        "create_project_memory": "no",
+        # Into the sandbox's empty tmpfs over the projects folder (#364);
+        # the real folder is checked below.
+        "create_project_memory": "yes",
         "repoint_dot_git": "no",
         "worktree_config": "no",
         "read_hidden_in_writable": "no",
@@ -208,11 +214,16 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         "read_shell_snapshot": "no",
         # Into the sandbox's own empty copy; the real one is checked below.
         "write_shell_snapshot": "yes",
-        # Its own transcript folder only (#362): the projects folder is
-        # read-only as a whole.
+        # Its own transcript folder only (#362), bound over an empty tmpfs
+        # that hides every other project (#364).
         "write_agent_state": "yes",
+        # Fails because `-other` is not there at all in the sandbox, which
+        # is the point of #364; the host copy is checked below.
         "write_other_project": "no",
-        "new_project_folder": "no",
+        "new_project_folder": "yes",
+        "read_other_transcript": "no",
+        "read_other_memory": "no",
+        "list_projects": "no",
         "write_hooks": "no",
         "write_git_config": "no",
         "write_tmp": "yes",
@@ -227,7 +238,15 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
     assert (h / ".claude.json").read_text() == '{"mcpServers": {}}'
     snap = h / ".claude" / "shell-snapshots" / "snapshot-bash.sh"
     assert snap.read_text() == "export MINE=1\n"
-    assert (h / ".claude" / "projects" / "-other" / "memory" / "MEMORY.md").exists()
+    assert (h / ".claude" / "projects" / "-other" / "memory" / "MEMORY.md").read_text() == "mine\n"
+    # The control: what the agent could not read is there on the host.
+    other = h / ".claude" / "projects" / "-other"
+    assert (other / "s1.jsonl").read_text() == '{"pasted": "x"}\n'
+    assert not (other / "run-log").exists()
+    assert not (h / ".claude" / "projects" / "-planted").exists()
+    assert not (h / ".claude" / "projects" / "-bare" / "memory").exists()
+    own = h / ".claude" / "projects" / re.sub(r"[/._]", "-", str(wt))
+    assert (own / "run-log").exists()
     assert (gitdir / "commondir").read_text().strip() != "/elsewhere"
     assert (h / ".claude" / "CLAUDE.md").is_symlink()
     assert (home / "shared" / "CLAUDE.md").read_text() == "shared\n"
@@ -694,3 +713,60 @@ def test_a_linked_transcript_folder_is_refused(home: Path) -> None:
     with pytest.raises(SandboxUnavailableError, match="is a link or is not directly"):
         d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", private)
     assert (h / ".bashrc").read_text() == "# mine\n"
+
+
+def test_a_reopened_folder_is_bound_after_the_hides(tmp_path) -> None:
+    """#364: the projects folder is an empty tmpfs and the run's own
+    transcript folder is bound on top of it, so it must come after."""
+    from ctrlrelay.core.agent_env import bwrap_prefix
+
+    projects = tmp_path / "projects"
+    own = projects / "-own"
+    own.mkdir(parents=True)
+    argv = bwrap_prefix("/usr/bin/bwrap", [str(projects)], reopened=[own])
+    assert argv[-6:] == [
+        "--tmpfs", str(projects), "--bind", str(own), str(own), "--",
+    ]
+
+
+def test_a_reopened_link_is_refused(tmp_path) -> None:
+    from ctrlrelay.core.agent_env import SandboxUnavailableError, bwrap_prefix
+
+    (tmp_path / "target").mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "target")
+    with pytest.raises(SandboxUnavailableError, match="link"):
+        bwrap_prefix("/usr/bin/bwrap", [], reopened=[link])
+
+
+def test_the_dispatcher_hides_projects_even_with_a_custom_hide_list(
+    home: Path, monkeypatch,
+) -> None:
+    """A configured hide list without the projects folder must not bring
+    every other project's transcripts back (#364)."""
+    from ctrlrelay.core import dispatcher as dmod
+    from ctrlrelay.core.dispatcher import ClaudeDispatcher
+
+    monkeypatch.setattr(dmod, "resolve_bwrap", lambda: "/usr/bin/bwrap")
+    h = home / "home"
+    bare = home / "repo.git"
+    _git("init", "-q", "--bare", str(bare), cwd=home)
+    seed = home / "seed"
+    _git("init", "-q", "-b", "main", str(seed), cwd=home)
+    _git("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q",
+         "--allow-empty", "-m", "init", cwd=seed)
+    _git("push", "-q", str(bare), "main", cwd=seed)
+    wt = home / "wt"
+    _git("worktree", "add", "-q", "-b", "run", str(wt), "main", cwd=bare)
+    d = ClaudeDispatcher(
+        usage_store=None, claude_binary="/bin/true", sandbox="bwrap",
+        sandbox_cache_dir=str(home / "agent-cache"), sandbox_hide_paths=(),
+    )
+    private = home / "private"
+    private.mkdir()
+    argv = d._sandbox_prefix({}, wt, wt / ".ctrlrelay" / "state.json", private)
+    projects = str((h / ".claude" / "projects").resolve())
+    own = str((h / ".claude" / "projects" / re.sub(r"[/._]", "-", str(wt))).resolve())
+    i = argv.index(projects, argv.index("--tmpfs", argv.index("--die-with-parent")))
+    assert argv[i - 1] == "--tmpfs"
+    assert argv.index(own, i) > i and argv[argv.index(own, i) - 1] == "--bind"
