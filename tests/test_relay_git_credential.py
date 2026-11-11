@@ -66,14 +66,39 @@ def test_a_gh_that_cannot_be_found_adds_no_helper_but_still_no_prompt() -> None:
     assert env == {"PATH": "/usr/bin", "GIT_TERMINAL_PROMPT": "0"}
 
 
-@pytest.mark.parametrize("count", ["two", "-1"])
-def test_a_malformed_count_is_left_for_git_to_refuse(
+@pytest.mark.parametrize("count", ["two", "-1", "+1", "1_0", "\u0661"])
+def test_a_count_that_is_not_a_plain_number_is_left_as_it_is(
     fake_gh: Path, count: str,
 ) -> None:
     with _gh_at(fake_gh):
         env = _with_gh_credential({"GIT_CONFIG_COUNT": count})
     assert env["GIT_CONFIG_COUNT"] == count
     assert not any(k.startswith("GIT_CONFIG_KEY_") for k in env)
+
+
+@pytest.mark.parametrize(
+    "base",
+    [
+        {"GIT_CONFIG_KEY_0": "a.b", "GIT_CONFIG_VALUE_0": "1"},
+        {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_1": "a.b"},
+    ],
+)
+def test_an_entry_already_in_the_slot_is_never_overwritten(
+    fake_gh: Path, base: dict[str, str],
+) -> None:
+    with _gh_at(fake_gh):
+        env = _with_gh_credential(base)
+    assert env == {**base, "GIT_TERMINAL_PROMPT": "0"}
+
+
+def test_a_count_with_spaces_is_read_as_git_reads_it(fake_gh: Path) -> None:
+    with _gh_at(fake_gh):
+        env = _with_gh_credential({
+            "GIT_CONFIG_COUNT": " 1",
+            "GIT_CONFIG_KEY_0": "a.b", "GIT_CONFIG_VALUE_0": "1",
+        })
+    assert env["GIT_CONFIG_COUNT"] == "2"
+    assert env["GIT_CONFIG_KEY_1"] == KEY
 
 
 @pytest.mark.parametrize(

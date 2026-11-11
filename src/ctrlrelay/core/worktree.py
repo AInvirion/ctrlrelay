@@ -596,15 +596,16 @@ def _with_gh_credential(base: Mapping[str, str]) -> dict[str, str]:
     after any entries already there (a unit's ``insteadOf`` rewrite
     keeps working). Config from the environment is read after every
     config file, so this helper comes last in git's list: an operator's
-    own helper is asked first and wins when it answers. When gh is not
-    logged in, the helper answers nothing and git fails as before.
+    own helper is asked first and wins when it answers. When gh has no
+    login, the helper answers nothing and git fails as before.
 
     ``GIT_TERMINAL_PROMPT=0`` is set in every case, including when no
     helper is added: the relay runs unattended, so a missing credential
     fails at once instead of waiting on a prompt nobody will answer.
-    No helper is added when gh cannot be found, or when
-    ``GIT_CONFIG_COUNT`` is malformed (git refuses that with its own
-    error).
+    No helper is added when gh cannot be found, when
+    ``GIT_CONFIG_COUNT`` is not plain digits (left for git to read or
+    refuse as it does), or when the slot it would take is already set: an
+    entry is never overwritten.
     """
     from ctrlrelay.core.github import _find_gh
 
@@ -613,12 +614,11 @@ def _with_gh_credential(base: Mapping[str, str]) -> dict[str, str]:
     gh = shutil.which(_find_gh())
     if gh is None:
         return env
-    raw = env.get("GIT_CONFIG_COUNT", "")
-    try:
-        count = int(raw) if raw else 0
-    except ValueError:
+    raw = env.get("GIT_CONFIG_COUNT", "").strip()
+    if raw and not (raw.isascii() and raw.isdigit()):
         return env
-    if count < 0:
+    count = int(raw) if raw else 0
+    if f"GIT_CONFIG_KEY_{count}" in env or f"GIT_CONFIG_VALUE_{count}" in env:
         return env
     env[f"GIT_CONFIG_KEY_{count}"] = _GH_CREDENTIAL_KEY
     env[f"GIT_CONFIG_VALUE_{count}"] = f"!{shlex.quote(gh)} auth git-credential"
