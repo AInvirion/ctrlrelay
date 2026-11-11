@@ -260,6 +260,7 @@ agent:
       provider: "provider-y"      # optional; used by {provider}
       plugin_version: "1"         # manifest/adapter compatibility version
       instructions_files: ["AGENTS.md"]  # names this CLI reads for context
+      env_allow: ["OPENAI_API_KEY"]      # provider keys it may receive; see below
       default_timeout_seconds: 1800
 
 repos:
@@ -403,6 +404,7 @@ agent:
 | `binary` | string | `"opencode"` | The `opencode` executable. The bare name is resolved like every other tool (PATH, then `~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`), which matters under systemd where the unit's PATH is minimal. A custom bare name is anchored through PATH at startup. An absolute path is used as written; a relative path is refused because the child would resolve it inside the worktree. |
 | `model` | string | `null` | `provider/model` as opencode spells it, passed as `--model`. Unset leaves the choice to opencode's own config, which is usually right. |
 | `default_timeout_seconds` | int | `null` | Falls back to `agent.default_timeout_seconds`. A local model is usually slower per token than a hosted one. |
+| `env_allow` | list of strings | `[]` | Provider keys opencode may receive, as exact names or `PREFIX*` (for example `["DEEPSEEK_API_KEY"]`). Empty: none of the well-known provider keys reach it, so list the ones your `opencode.json` reads from the environment. See [Provider credentials](#provider-credentials-each-backend-gets-its-own-390). |
 
 This block is its own rather than a reuse of `agent.binary`: that field
 is claude's, most deployed configs set it to the literal `"claude"`, and
@@ -545,7 +547,8 @@ with:
 - `credential.helper` reset to empty (through `GIT_CONFIG_COUNT`),
   `GIT_SSH_COMMAND=false` and `SSH_AUTH_SOCK` removed, so git cannot
   authenticate over HTTPS or SSH, including through an `insteadOf` rewrite;
-- `GIT_TERMINAL_PROMPT=0`, so nothing waits on a prompt.
+- `GIT_TERMINAL_PROMPT=0`, so nothing waits on a prompt;
+- every other backend's provider key removed (next section).
 
 Everything else is inherited unchanged, so the model CLI and the project's
 toolchain behave as before. ctrlrelay then does the GitHub side itself, with
@@ -561,6 +564,9 @@ its own credentials, after the agent exits:
   reads Dependabot alerts and pull requests and merges what the policy
   allows during the run. Moving it would mean ctrlrelay doing those reads
   up front and the merges afterwards from a decision the agent returns.
+  It still loses every `CTRLRELAY_*` variable except the two the checkpoint
+  needs, and every other backend's provider key (#390): GitHub access is
+  not a reason to hold the relay's chat token.
 
 Pushes are refused, and logged as `publish.push.refused`, for `main`,
 `master`, the repository's default branch (read from the GitHub API, not
@@ -719,6 +725,38 @@ then run the check again. On a single-user laptop this is the whole setup.
 | `sandbox_writable_paths` | list of strings | `~/.claude/*` | Writable under `sandbox: bwrap`, besides the run's own paths. A last part of `*` opens each entry in the directory now (not links), not the directory itself. |
 | `sandbox_readonly_paths` | list of strings | `~/.claude/settings.json`, `settings.local.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `hooks`, `plugins`, `output-styles`, `scripts`, `rules`, `chrome`, `local`, `projects` (all under `~/.claude`) | Read-only again inside a writable path. One `*` part matches the directories there at the start of each run; a missing path under a writable one is created first. The run's own transcript folder under `projects` is made writable again by the relay. Before 0.25.0 the default had `projects/*/memory`, one mount per project folder; on a home with thousands of them bwrap could not start (#362). A config that still lists that glob has the same problem, so drop it. |
 | `sandbox_cache_dir` | string | `~/.ctrlrelay/agent-cache` | The agent's own package cache under `sandbox: bwrap`. |
+
+
+### Provider credentials: each backend gets its own (#390)
+
+A node can run more than one agent backend, so a model provider's key is
+handed only to the backend that uses it. These names are removed from every
+agent's environment unless that agent's backend declares them:
+
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+`OPENAI_API_KEY`, `CODEX_API_KEY`, `AZURE_OPENAI_API_KEY`,
+`COPILOT_GITHUB_TOKEN`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
+`DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`,
+`XAI_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY`, `COHERE_API_KEY`.
+
+| Backend | Receives |
+|---|---|
+| `claude` | `ANTHROPIC_*` and `CLAUDE_*` |
+| `opencode` | what `agent.opencode.env_allow` lists (default: none) |
+| a plugin under `agent.plugins` | what its `env_allow` lists (default: none) |
+
+`env_allow` entries are exact names or a prefix ending in `*`
+(`OPENAI_*`). A bare `*`, lowercase names, and anything naming the GitHub,
+git, ssh or relay variables are refused at load: those are removed whatever
+a backend allows. Variables that are not on the list above (`JAVA_HOME`, a
+proxy setting, a build token of your own) pass through as before. A backend
+that logs in from its own files (Claude Code under `~/.claude`, Codex under
+`~/.codex`, Copilot under `~/.copilot`) needs no entry at all.
+
+The names removed are logged, never their values, in the
+`dispatcher.session.credentials` event's `stripped_env`. The repository's
+proof commands (`require_proof`) are not an agent backend and keep these
+keys; they lose only the GitHub credentials above.
 
 ## transport
 
