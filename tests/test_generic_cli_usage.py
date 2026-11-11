@@ -905,7 +905,8 @@ def test_the_config_mapping_reaches_the_adapter(tmp_path: Path) -> None:
     from ctrlrelay.core.dispatcher import _make_adapter
 
     binary = _printing(tmp_path, "codex", "")
-    agent = AgentConfig(type="codex", plugins={"codex": {
+    # Not "codex": that name is a built-in preset (#385).
+    agent = AgentConfig(type="cx", plugins={"cx": {
         "binary": str(binary), "args": ["exec", "--json", "{prompt}"],
         "session_id_path": "thread_id", "usage": CODEX_USAGE,
     }})

@@ -406,9 +406,9 @@ class AgentConfig(BaseModel):
     """Headless coding-agent configuration.
 
     ``type`` selects which adapter the dispatcher uses to talk to the
-    agent CLI. ``claude`` and ``opencode`` are implemented; the field
-    exists so further adapters (e.g. ``codex``, ``hermes``) can be
-    plugged in without a config schema change. The common fields
+    agent CLI. ``claude`` and ``opencode`` are adapters, ``copilot`` and
+    ``codex`` are built-in presets (``agent.presets``), and any other
+    simple CLI can be enrolled under ``agent.plugins``. The common fields
     (``binary``, ``default_timeout_seconds``, ``output_format``) belong
     to the ``claude`` adapter and predate there being a second one; a
     backend with its own knobs gets its own nested block, as

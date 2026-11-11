@@ -297,11 +297,11 @@ class TestMakeAgentDispatcher:
         from ctrlrelay.core.config import AgentConfig
         from ctrlrelay.core.dispatcher import make_agent_dispatcher
 
-        cfg = AgentConfig(type="codex")
+        cfg = AgentConfig(type="hermes")
         with pytest.raises(NotImplementedError) as excinfo:
             make_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
         msg = str(excinfo.value).lower()
-        assert "codex" in msg
+        assert "hermes" in msg
         assert "agentadapter" in msg or "adapter" in msg
 
 
