@@ -120,9 +120,13 @@ def read_usage_events(stdout_text: str, spec: GenericUsageConfig) -> RunUsage:
             continue
         for name, value in counts.items():
             totals[name] += value
-    if any(v > MAX_TOKEN_COUNT for v in totals.values()):
-        # Each line passed the ceiling and their sum did not: as implausible
-        # as one line past it, and charged as nothing for the same reason.
+    if (
+        any(v > MAX_TOKEN_COUNT for v in totals.values())
+        or sum(totals.values()) > MAX_TOKEN_COUNT
+    ):
+        # Each count passed the ceiling and their sum, or the counts added
+        # together, did not: as implausible as one count past it, and
+        # charged as nothing for the same reason.
         return RunUsage(unreadable=unreadable + 1)
     return RunUsage(**totals, unreadable=unreadable)
 

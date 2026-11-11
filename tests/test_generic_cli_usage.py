@@ -265,9 +265,25 @@ class TestReadUsageEvents:
         # The control: the ceiling itself is a count.
         from ctrlrelay.core.generic_cli import MAX_TOKEN_COUNT, read_usage_events
 
-        line = CODEX_FRESH.replace('"output_tokens":5', f'"output_tokens":{MAX_TOKEN_COUNT}')
-        got = read_usage_events(line, _spec(**CODEX_USAGE))
+        line = f'{{"t":"u","i":0,"n":{MAX_TOKEN_COUNT}}}'
+        spec = _spec(
+            event_type="u", event_type_path="t", reading="last",
+            fields={"input_tokens": "i", "output_tokens": "n"},
+        )
+        got = read_usage_events(line, spec)
         assert got.complete and got.output_tokens == MAX_TOKEN_COUNT
+
+    def test_counts_that_add_up_past_the_ceiling_are_unknown(self) -> None:
+        """Each count is plausible on its own; together they are not."""
+        from ctrlrelay.core.generic_cli import MAX_TOKEN_COUNT, read_usage_events
+
+        half = MAX_TOKEN_COUNT // 2 + 1
+        line = f'{{"t":"u","i":{half},"n":{half}}}'
+        spec = _spec(
+            event_type="u", event_type_path="t", reading="last",
+            fields={"input_tokens": "i", "output_tokens": "n"},
+        )
+        assert read_usage_events(line, spec) == RunUsage(unreadable=1)
 
     def test_cache_reads_above_input_are_unknown(self) -> None:
         from ctrlrelay.core.generic_cli import read_usage_events

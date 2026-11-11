@@ -429,8 +429,10 @@ output when it exits:
   unknown:
   - **No remembered total** (the relay restarted between rounds, or the native
     session is older than the relay session): that round is never charged,
-    so a restart forgives one round against the hard limit. The next round is
-    charged from its reading.
+    so a restart forgives one round against the hard limit. If that round's
+    reading was exact it becomes the remembered total and the next round is
+    charged from it; if not, nothing is remembered and the next round is in
+    the same position.
   - **The total moved backwards:** that round is charged nothing and the
     higher total stays remembered, so later rounds are charged only once the
     CLI's total passes it again.
