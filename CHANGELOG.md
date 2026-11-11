@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The relay's own clone, fetch and `ls-remote` now use gh's login on a node
+  where git has no credential for github.com (#398). The first dev run on
+  such a node failed before the agent started with `could not read
+  Username for 'https://github.com'`. `gh auth git-credential` is appended
+  as a helper for `https://github.com` through `GIT_CONFIG_COUNT`, after
+  any entries already in the environment, so a unit's `insteadOf` rewrite
+  keeps working and an operator's own helper is still asked first. These
+  calls also set `GIT_TERMINAL_PROMPT=0`, so a missing credential fails at
+  once. Pushes already used gh's login; the agent's environment is
+  unchanged.
+
 ## [0.28.0] - 2026-11-11
 
 ### Added
