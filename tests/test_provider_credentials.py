@@ -140,32 +140,32 @@ class TestGenericPluginGetsOnlyWhatItsManifestAllows:
         assert "ANTHROPIC_API_KEY" not in event["stripped_env"]
 
     @pytest.mark.asyncio
-    async def test_a_key_the_adapter_sets_itself_is_not_stripped(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("github_access", [False, True])
+    async def test_a_key_set_through_extra_env_gets_no_exemption(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        github_access: bool,
     ) -> None:
-        """``extra_env`` is the adapter's own choice for itself, so the
-        provider rule does not undo it. The GitHub rule still does."""
+        """The only way a provider key reaches an agent is its backend's
+        allowance: an adapter's ``extra_env`` cannot route around it."""
         from ctrlrelay.core.generic_cli import GenericCliDispatcher
 
         _seed(monkeypatch)
         adapter = GenericCliDispatcher(
             agent_type="example", binary="/bin/true", usage_store=None,
-            extra_env={"OPENAI_API_KEY": "set-by-adapter", "GH_TOKEN": "x"},
+            extra_env={"OPENAI_API_KEY": "set-by-adapter", "EXAMPLE": "kept"},
+            env_allow=("DEEPSEEK_API_KEY",),
         )
 
         env, event = await _spawned_env(
-            adapter, tmp_path, github_access=False, log_target=_GENERIC_LOG,
+            adapter, tmp_path, github_access=github_access,
+            log_target=_GENERIC_LOG,
         )
 
-        # The pair is the proof: the filter is running (an undeclared,
-        # inherited ANTHROPIC key is gone and logged), and the OPENAI key it
-        # would otherwise remove survives because the adapter set it.
-        # Without the exemption the first assertion goes red.
-        assert env["OPENAI_API_KEY"] == "set-by-adapter"
-        assert "OPENAI_API_KEY" not in event["stripped_env"]
-        assert "ANTHROPIC_API_KEY" not in env
-        assert "ANTHROPIC_API_KEY" in event["stripped_env"]
-        assert "GH_TOKEN" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert "OPENAI_API_KEY" in event["stripped_env"]
+        # The filter ran and the allowance works on this same adapter.
+        assert env["DEEPSEEK_API_KEY"] == "deepseek-value-390"
+        assert env["EXAMPLE"] == "kept"
 
 
 class TestOpencodeGetsWhatItsBlockAllows:

@@ -415,13 +415,12 @@ class CliAgentAdapter:
         Without GitHub access: :func:`build_agent_env` (#219) plus the
         provider rule. With it (secops): only the relay's own secrets and
         other backends' provider keys go (#390); GitHub stays, on purpose.
-        Variables the adapter set itself (``extra_env``) are exempt from
-        the provider rule, not from the GitHub one.
+        ``extra_env`` gets no exemption: a provider key reaches the agent
+        only through ``provider_env_allow``, whoever put it in the env.
         """
-        keep = frozenset(getattr(self, "extra_env", {}))
         if github_access:
             return strip_relay_and_provider_secrets(
-                base_env, provider_env_allow=self.provider_env_allow, keep=keep,
+                base_env, provider_env_allow=self.provider_env_allow,
             )
         assert private_root is not None
         return build_agent_env(
@@ -429,7 +428,6 @@ class CliAgentAdapter:
             gh_config_dir=private_root / "gh",
             runtime_dir=private_root / "run",
             provider_env_allow=self.provider_env_allow,
-            keep=keep,
         )
 
     @property

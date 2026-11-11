@@ -56,7 +56,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from fnmatch import fnmatchcase
 from pathlib import Path
 
@@ -183,23 +183,19 @@ def strip_relay_and_provider_secrets(
     base: Mapping[str, str],
     *,
     provider_env_allow: Sequence[str],
-    keep: Collection[str] = (),
 ) -> tuple[dict[str, str], list[str]]:
     """Return ``(env, stripped_names)`` for an agent WITH GitHub access.
 
     The secops lane hands its agent the operator's GitHub login on
     purpose; it still never needs the relay's own secrets (every
     ``CTRLRELAY_*``, the dispatcher sets the two checkpoint variables
-    afterwards) nor another backend's provider key (#390). ``keep``
-    names variables the adapter set itself, which are exempt from the
-    provider rule.
+    afterwards) nor another backend's provider key (#390).
     """
     env: dict[str, str] = {}
     stripped: list[str] = []
     for name, value in base.items():
-        if name.startswith(_RELAY_PREFIX) or (
-            name not in keep
-            and _is_foreign_provider_key(name, provider_env_allow)
+        if name.startswith(_RELAY_PREFIX) or _is_foreign_provider_key(
+            name, provider_env_allow,
         ):
             stripped.append(name)
             continue
@@ -221,7 +217,6 @@ def build_agent_env(
     gh_config_dir: Path,
     runtime_dir: Path,
     provider_env_allow: Sequence[str] | None,
-    keep: Collection[str] = (),
 ) -> tuple[dict[str, str], list[str]]:
     """Return ``(env, stripped_names)`` for an agent with no GitHub access.
 
@@ -234,7 +229,7 @@ def build_agent_env(
 
     ``provider_env_allow`` is the backend's own provider variables
     (#390): every name in :data:`PROVIDER_KEY_VARS` it does not match is
-    removed, except names in ``keep`` (set by the adapter itself). It is
+    removed, whoever set it. It is
     required so no agent caller opts out by leaving it off; ``None``
     keeps every provider key and is for a caller that is not an agent
     backend at all (the proof commands, which run the repository's own
@@ -245,7 +240,6 @@ def build_agent_env(
     for name, value in base.items():
         if _is_stripped(name) or (
             provider_env_allow is not None
-            and name not in keep
             and _is_foreign_provider_key(name, provider_env_allow)
         ):
             stripped.append(name)

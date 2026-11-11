@@ -146,12 +146,16 @@ class TestTheSafeFlagsCannotBeDropped:
         assert "--model" not in fresh
         assert "--model" not in resumed
 
-    @pytest.mark.parametrize(
-        "key", ["args", "resume_args", "session_id_path", "env_allow", "extra"],
-    )
+    @pytest.mark.parametrize("key", ["args", "resume_args", "session_id_path", "extra"])
     def test_overrides_cannot_reach_the_arguments(self, key) -> None:
         with pytest.raises(ValidationError, match=key):
             AgentConfig(presets={"copilot": {key: ["--yolo"]}})
+
+    def test_overrides_cannot_widen_the_provider_allowance(self) -> None:
+        """A well-formed entry, so the refusal is the override rule and not
+        the env_allow pattern check (#390)."""
+        with pytest.raises(ValidationError, match="env_allow"):
+            AgentConfig(presets={"copilot": {"env_allow": ["OPENAI_API_KEY"]}})
 
     def test_the_timeout_override_reaches_the_adapter(self) -> None:
         assert _copilot(default_timeout_seconds=99).default_timeout == 99

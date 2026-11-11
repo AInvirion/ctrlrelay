@@ -746,14 +746,19 @@ agent's environment unless that agent's backend declares them:
 
 `env_allow` entries are exact names or a prefix ending in `*`
 (`OPENAI_*`). They are matched only against the list above, so they can
-never hand an agent anything else: the GitHub, git, ssh and relay variables
-are removed whatever a backend allows. To make that mistake visible, a bare
+never hand an agent anything else. The relay variables are removed from
+every agent whatever a backend allows, and the GitHub, git and ssh ones from
+every agent that runs without GitHub access; the secops agent keeps those on
+purpose (see above). To make that mistake visible, a bare
 `*`, lowercase names, and entries starting with `GH_`, `GITHUB_` or
 `CTRLRELAY_` (or naming a GitHub token or `SSH_AUTH_SOCK`-style variable
 exactly) are refused at load. Variables that are not on the list above (`JAVA_HOME`, a
 proxy setting, a build token of your own) pass through as before. A backend
 that logs in from its own files (Claude Code under `~/.claude`, Codex under
 `~/.codex`, Copilot under `~/.copilot`) needs no entry at all.
+
+A key set any other way, including an adapter's own extra environment, gets
+no exemption: the backend's allowance is the only way in.
 
 The names removed are logged, never their values, in the
 `dispatcher.session.credentials` event's `stripped_env`. The repository's
