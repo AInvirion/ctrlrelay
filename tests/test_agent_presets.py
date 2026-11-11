@@ -225,4 +225,5 @@ class TestIdentity:
 
 def test_unknown_names_have_no_preset() -> None:
     assert "copilot" in PRESET_NAMES
+    assert preset_manifest("copilot") is not None
     assert preset_manifest("nope") is None
