@@ -15,14 +15,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from ctrlrelay.core.agent_plugins import AgentIdentity
+from ctrlrelay.core.dispatcher import RepoAgentRouter
 from ctrlrelay.core.issue_questions import ask_on_issue, note_expiry_on_issue
 from ctrlrelay.core.question_expiry import (
     EXPIRY_REASON_RESOLVED,
     expire_stale_questions,
 )
 from ctrlrelay.core.state import StateDB
-from ctrlrelay.pipelines.dev import run_dev_issue
+from ctrlrelay.pipelines.dev import resume_dev_from_pending, run_dev_issue
 from tests.test_question_survives_restart import (
+    AGENT_UUID,
     QUESTION,
     REPO,
     _blocked,
@@ -116,17 +119,21 @@ async def test_a_question_saved_before_the_wait_names_its_issue(
     tmp_path: Path,
 ) -> None:
     """The row written before the in-process wait (#324) carries the issue
-    too, so a poller stopped during the wait leaves a retirable question."""
+    too, so a poller stopped during the wait leaves a retirable question.
+    Posting on the issue fails here, so the number cannot have come from
+    the post."""
     db = StateDB(tmp_path / "state.db")
     dispatcher = AsyncMock()
     dispatcher.spawn_session.side_effect = (
         lambda **kw: _blocked(kw["session_id"])
     )
+    github = _github()
+    github.post_issue_comment.side_effect = RuntimeError("502")
     transport = _HangingTransport()
     task = asyncio.create_task(run_dev_issue(
         claims=None, repo=REPO, issue_number=13,
         branch_template="fix/issue-{n}", dispatcher=dispatcher,
-        github=_github(), worktree=_worktree(tmp_path / "wt"),
+        github=github, worktree=_worktree(tmp_path / "wt"),
         dashboard=None, state_db=db, transport=transport,
         contexts_dir=tmp_path / "contexts",
     ))
@@ -136,6 +143,46 @@ async def test_a_question_saved_before_the_wait_names_its_issue(
         await task
 
     (row,) = db.list_unanswered_pending_resumes()
+    assert row["issue_comment_id"] is None
+    assert row["issue_number"] == 13
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_run_that_blocks_again_names_its_issue(
+    tmp_path: Path,
+) -> None:
+    """The re-block path: a resume from a saved answer ends BLOCKED again
+    with nobody to ask, and its new question is persisted unposted."""
+    db = StateDB(tmp_path / "state.db")
+    identity = AgentIdentity(agent_type="claude", plugin_id="claude")
+    worktree_path = tmp_path / "wt"
+    wt = _worktree(worktree_path)
+    db.execute(
+        "INSERT INTO sessions (id, pipeline, repo, issue_number, worktree_path, "
+        "status, started_at, agent_session_id, agent_type, agent_plugin_id, "
+        "agent_plugin_version) VALUES (?, 'dev', ?, 13, ?, 'blocked', 1, ?, ?, ?, '1')",
+        ("dev-again", REPO, str(worktree_path), AGENT_UUID,
+         identity.agent_type, identity.plugin_id),
+    )
+    db.commit()
+    agent = AsyncMock()
+    agent.agent_type = "claude"
+    agent.agent_identity = identity
+    agent.spawn_session.side_effect = lambda **kw: _blocked(kw["session_id"])
+    router = RepoAgentRouter(default=agent, by_type={"claude": agent})
+
+    result = await resume_dev_from_pending(
+        session_id="dev-again", repo=REPO, answer="continue",
+        branch_template="fix/issue-{n}", dispatcher=router,
+        github=_github(), worktree=wt, dashboard=None, state_db=db,
+        transport=None, contexts_dir=tmp_path / "contexts",
+    )
+
+    assert result.blocked
+    row = db.get_pending_resume("dev-again")
+    assert row is not None and row["answered_at"] is None
+    assert row["issue_comment_id"] is None
     assert row["issue_number"] == 13
     db.close()
 
