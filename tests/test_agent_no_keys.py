@@ -143,7 +143,11 @@ class TestTheAgentEnvironmentCarriesNoGitHubCredentials:
         env, _, _, _ = await _spawn_and_capture_env(
             tmp_path, monkeypatch, github_access=True
         )
-        assert set(_SECRET_ENV) <= set(env)
+        # The relay's own chat token is the one exception (#390): secops
+        # gets the operator's GitHub login, never the relay's secrets.
+        github_side = set(_SECRET_ENV) - {"CTRLRELAY_TELEGRAM_TOKEN"}
+        assert github_side <= set(env)
+        assert "CTRLRELAY_TELEGRAM_TOKEN" not in env
         assert "GH_CONFIG_DIR" not in env or env["GH_CONFIG_DIR"] != ""
 
     def test_spawn_session_has_no_default_for_github_access(self) -> None:
@@ -236,7 +240,10 @@ class TestRealGitAndGhFindNothingUnderTheAgentEnv:
         empty.mkdir()
         run = tmp_path / "empty-run"
         run.mkdir()
-        agent, _ = build_agent_env(operator, gh_config_dir=empty, runtime_dir=run)
+        agent, _ = build_agent_env(
+            operator, gh_config_dir=empty, runtime_dir=run,
+            provider_env_allow=(),
+        )
         return operator, agent
 
     def test_git_credential_helpers_are_not_consulted(
@@ -399,7 +406,8 @@ class TestRealGitAndGhFindNothingUnderTheAgentEnv:
                 gh_dir.mkdir()
                 run_dir.mkdir()
                 agent, _ = build_agent_env(
-                    operator, gh_config_dir=gh_dir, runtime_dir=run_dir
+                    operator, gh_config_dir=gh_dir, runtime_dir=run_dir,
+                    provider_env_allow=(),
                 )
                 agent_results.append(dial(agent))
         finally:

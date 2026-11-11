@@ -52,6 +52,9 @@ class GenericCliDispatcher(CliAgentAdapter):
     provider: str | None = None
     plugin_version: str = "1"
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Provider variables this CLI may receive (#390), from the manifest's
+    # ``env_allow``. Empty: no well-known provider key reaches it.
+    env_allow: tuple[str, ...] = ()
     instructions_files: tuple[str, ...] = ("AGENTS.md",)
     outcome_hook: DispatchOutcomeHook | None = None
     sandbox: str = "none"
