@@ -446,8 +446,8 @@ output when it exits:
   kept as a floor: no usage line; a usage line with a count that is missing,
   not an integer, negative or above 10^12 (that line adds nothing, and a
   `sum` past 10^12 counts as nothing too); any line that starts as a JSON
-  object and is cut off; and a run that the relay stopped or that exited
-  non-zero, whose last report may not be its final one.
+  object and is cut off; and a run that exited non-zero, whose last report may
+  not be its final one.
 - A round that **timed out**, was cancelled by a shutdown, or whose output
   could not be read at all has no reading: its output is discarded, so it is
   charged nothing and the session's total becomes unknown. Rounds that keep

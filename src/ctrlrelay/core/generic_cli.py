@@ -302,8 +302,8 @@ class GenericCliDispatcher(CliAgentAdapter):
     ) -> RunUsage | None:
         """This spawn's usage, from the CLI's output (#387).
 
-        A run that did not exit cleanly (stopped by the relay, or a
-        non-zero exit) may have used more than its last report said, so its
+        A run that did not exit cleanly (a non-zero exit, or one a watch
+        stopped) may have used more than its last report said, so its
         reading is only a floor and is marked unknown.
 
         A reading that ``covers`` the native session is a running total for
