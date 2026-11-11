@@ -133,7 +133,7 @@ class TestClaudeIsUntouched:
         from ctrlrelay.core.config import AgentConfig
         from ctrlrelay.core.dispatcher import make_agent_dispatcher
 
-        for unknown in ("codex", "hermes", "aider", "clade"):
+        for unknown in ("hermes", "aider", "clade", "gemini"):
             with pytest.raises(NotImplementedError) as excinfo:
                 make_agent_dispatcher(
                     AgentConfig(type=unknown), outcome_hook=None, usage_store=None

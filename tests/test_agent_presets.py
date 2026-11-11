@@ -306,6 +306,188 @@ class TestTheCopilotPresetGetsOnlyItsOwnProviderKey:
 
 
 def test_unknown_names_have_no_preset() -> None:
-    assert "copilot" in PRESET_NAMES
+    assert {"copilot", "codex"} <= PRESET_NAMES
     assert preset_manifest("copilot") is not None
     assert preset_manifest("nope") is None
+
+
+CODEX_THREAD = "01a1c827-b87a-7f20-b0cb-eeb5318361b3"
+
+
+def _codex(**overrides) -> GenericCliDispatcher:
+    overrides.setdefault("binary", "/opt/codex")
+    cfg = AgentConfig(type="codex", presets={"codex": overrides})
+    adapter = make_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
+    assert isinstance(adapter, GenericCliDispatcher)
+    return adapter
+
+
+class TestCodexPreset:
+    """The `codex` preset (#385), from the runs recorded on #383."""
+
+    def test_repo_agent_type_codex_runs_codex_with_no_plugin_entry(self) -> None:
+        cfg = _config(
+            {"type": "claude", "presets": {"codex": {"binary": "/opt/codex"}}},
+            [{"name": "owner/plain"}, {"name": "owner/cx", "agent_type": "codex"}],
+        )
+        assert cfg.agent.plugins == {}
+        router = make_repo_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
+
+        selected = select_agent(router, repo="owner/cx", requested_type=None)
+
+        assert selected.identity.plugin_id == "generic:codex"
+        assert selected.dispatcher.binary == "/opt/codex"
+
+    def test_fresh_and_resume_argv(self, tmp_path) -> None:
+        fresh, resumed = _argvs(_codex(), tmp_path)
+
+        assert fresh == [
+            "/opt/codex", "exec", "--json",
+            "--dangerously-bypass-approvals-and-sandbox", "do it",
+        ]
+        assert resumed == [
+            "/opt/codex", "exec", "resume", "--json",
+            "--dangerously-bypass-approvals-and-sandbox", SESSION, "answer",
+        ]
+
+    def test_a_model_goes_right_after_the_subcommand(self, tmp_path) -> None:
+        """Not at the end, where Codex would read it after the positionals."""
+        fresh, resumed = _argvs(_codex(model="gpt-5.1-codex"), tmp_path)
+
+        assert fresh == [
+            "/opt/codex", "exec", "-m", "gpt-5.1-codex", "--json",
+            "--dangerously-bypass-approvals-and-sandbox", "do it",
+        ]
+        assert resumed == [
+            "/opt/codex", "exec", "resume", "-m", "gpt-5.1-codex", "--json",
+            "--dangerously-bypass-approvals-and-sandbox", SESSION, "answer",
+        ]
+
+    def test_the_session_id_is_the_thread_id_from_codex_output(self) -> None:
+        # Event shapes recorded from Codex CLI 0.167.0 on #383; the token
+        # counts are illustrative.
+        stdout = "\n".join([
+            f'{{"type":"thread.started","thread_id":"{CODEX_THREAD}"}}',
+            '{"type":"turn.started"}',
+            '{"type":"turn.completed","usage":{"input_tokens":5120,'
+            '"cached_input_tokens":4096,"cache_write_input_tokens":0,'
+            '"output_tokens":210,"reasoning_output_tokens":64}}',
+        ])
+        assert _codex()._parse_agent_session_id(stdout) == CODEX_THREAD
+
+    def test_a_hand_written_codex_plugin_is_refused(self) -> None:
+        with pytest.raises(
+            ValidationError,
+            match=(
+                "codex is a built-in preset; set agent.presets.codex "
+                "to change binary, model or timeout"
+            ),
+        ):
+            AgentConfig(plugins={"codex": {"binary": "/opt/codex"}})
+
+    def test_the_arguments_are_pinned_to_the_version(self) -> None:
+        """A tripwire, as for copilot: bump the version with the arguments."""
+        m = preset_manifest("codex")
+        assert (m.plugin_version, m.args, m.resume_args, m.session_id_path) == (
+            "1",
+            ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
+             "{prompt}"],
+            ["exec", "resume", "--json",
+             "--dangerously-bypass-approvals-and-sandbox",
+             "{resume_session_id}", "{prompt}"],
+            "thread_id",
+        )
+        assert m.instructions_files == ["AGENTS.md"]
+
+    def test_identity(self) -> None:
+        identity = _codex().agent_identity
+        assert identity.plugin_id == "generic:codex"
+        assert identity.plugin_version == "1"
+
+
+@pytest.mark.parametrize("name", sorted(PRESET_NAMES))
+def test_a_preset_refuses_a_node_that_asks_for_a_sandbox(name) -> None:
+    """Both presets run their CLI unconfined (Codex in bypass mode, because
+    its own sandbox cannot commit in a linked worktree, #383). That is
+    acceptable only where the operator chose `agent.sandbox: none`; on a
+    bwrap node the adapter must refuse rather than run unconfined."""
+    cfg = AgentConfig(
+        type=name, sandbox="bwrap",
+        presets={name: {"binary": f"/opt/{name}"}},
+    )
+    with pytest.raises(ValueError, match="Refusing to run unconfined"):
+        make_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
+
+
+class TestTheCodexPresetGetsOnlyItsOwnProviderKeys:
+    @pytest.mark.asyncio
+    async def test_keeps_openai_keys_and_drops_the_rest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        for name, value in {
+            "OPENAI_API_KEY": "openai-value",
+            "CODEX_API_KEY": "codex-value",
+            "COPILOT_GITHUB_TOKEN": "copilot-value",
+            "ANTHROPIC_API_KEY": "anthropic-value",
+            "GH_TOKEN": "gh-value",
+        }.items():
+            monkeypatch.setenv(name, value)
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"", b"")
+        proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as ex:
+            await _codex().spawn_session(
+                session_id="s1", prompt="p", working_dir=tmp_path,
+                state_file=tmp_path / "state.json", github_access=False,
+            )
+
+        env = ex.call_args.kwargs["env"]
+        assert env["OPENAI_API_KEY"] == "openai-value"
+        assert env["CODEX_API_KEY"] == "codex-value"
+        for gone in ("COPILOT_GITHUB_TOKEN", "ANTHROPIC_API_KEY", "GH_TOKEN"):
+            assert gone not in env
+
+
+class TestPresetsMeasureUsage:
+    """#387: both presets carry the usage maps tested against real output,
+    so their runs are counted and the token budget applies."""
+
+    @pytest.mark.parametrize("name,expected", [
+        ("copilot", "COPILOT_USAGE"),
+        ("codex", "CODEX_USAGE"),
+    ])
+    def test_the_preset_carries_the_tested_map(self, name, expected) -> None:
+        import tests.test_generic_cli_usage as measured
+
+        assert preset_manifest(name).usage.model_dump(exclude_unset=True) == (
+            getattr(measured, expected)
+        )
+
+    @pytest.mark.parametrize("make", [_copilot, _codex])
+    def test_the_adapter_reports_usage(self, make) -> None:
+        assert make().capabilities.usage is True
+
+    @pytest.mark.parametrize("name,output,expected", [
+        # Copilot reports input without its cache reads.
+        ("copilot", "COPILOT_FRESH", (5197, 7168, 0, 5)),
+        # Codex's input_tokens (15397) includes its 12160 cached reads.
+        ("codex", "CODEX_FRESH", (15397 - 12160, 12160, 0, 5)),
+    ])
+    def test_real_output_is_read_as_an_exact_count(
+        self, name, output, expected,
+    ) -> None:
+        import tests.test_generic_cli_usage as measured
+        from ctrlrelay.core.budget import RunUsage
+        from ctrlrelay.core.generic_cli import read_usage_events
+
+        got = read_usage_events(
+            getattr(measured, output), preset_manifest(name).usage,
+        )
+        inp, read, write, out = expected
+        assert got == RunUsage(
+            input_tokens=inp, cache_read_tokens=read,
+            cache_creation_tokens=write, output_tokens=out,
+        )

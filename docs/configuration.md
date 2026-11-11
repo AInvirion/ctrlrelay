@@ -333,7 +333,7 @@ runs as the same user that owns it. Confinement is #352's job.
 
 #### Example: GitHub Copilot CLI
 
-This manifest is now built in as the `copilot` preset: set
+Codex has a built-in preset too (`codex`, #385). This manifest is now built in as the `copilot` preset: set
 `repos[].agent_type: copilot` (or `agent.type: copilot`) and leave
 `agent.plugins` alone. `agent.presets.copilot` may change only `binary`,
 `model` (passed as `--model`) and `default_timeout_seconds`; the arguments

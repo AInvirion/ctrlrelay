@@ -77,7 +77,8 @@ COPILOT_RESUMED = "\n".join([
 COPILOT_SESSION = "2a00a77c-51f5-490a-a5d4-78e54368b685"
 
 # The tested usage mappings for Codex and Copilot, checked against the real
-# output above. A preset that measures either CLI should copy these values.
+# output above. The built-in presets carry copies (agent_presets.py), and
+# tests/test_agent_presets.py fails if the two drift apart.
 CODEX_USAGE = {
     "event_type": "turn.completed",
     "reading": "last",
@@ -904,7 +905,8 @@ def test_the_config_mapping_reaches_the_adapter(tmp_path: Path) -> None:
     from ctrlrelay.core.dispatcher import _make_adapter
 
     binary = _printing(tmp_path, "codex", "")
-    agent = AgentConfig(type="codex", plugins={"codex": {
+    # Not "codex": that name is a built-in preset (#385).
+    agent = AgentConfig(type="cx", plugins={"cx": {
         "binary": str(binary), "args": ["exec", "--json", "{prompt}"],
         "session_id_path": "thread_id", "usage": CODEX_USAGE,
     }})
