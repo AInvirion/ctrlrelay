@@ -1161,9 +1161,9 @@ class TestTheResumePrompts:
         assert "STATE_FILE: /tmp/w/.ctrlrelay/state.json" in prompt
         assert "SESSION_ID: check-fake-abcd" in prompt
         assert "mkdir -p -- /tmp/w/.ctrlrelay" in prompt
-        assert '"status":"BLOCKED_NEEDS_INPUT"' in prompt
-        assert '"question":"What is the token?"' in prompt
-        assert "> /tmp/w/.ctrlrelay/state.json" in prompt
+        assert '"status": "BLOCKED_NEEDS_INPUT"' in prompt
+        assert "\nWhat is the token?\n" in prompt
+        assert "python3 - /tmp/w/.ctrlrelay/state.json <<'CTRLRELAY_STATE'" in prompt
 
     def test_round_two_asks_for_the_token_without_containing_it(self) -> None:
         """The prompt cannot carry the answer it is checking for."""

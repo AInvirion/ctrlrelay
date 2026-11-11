@@ -38,7 +38,11 @@ from ctrlrelay.core.agent_plugins import (
     agent_identity_from_mapping,
 )
 from ctrlrelay.core.budget import is_budget_reason, label_names, session_scope
-from ctrlrelay.core.checkpoint import CheckpointStatus
+from ctrlrelay.core.checkpoint import (
+    CHECKPOINT_TEXT_RULE,
+    CheckpointStatus,
+    shell_checkpoint,
+)
 from ctrlrelay.core.claims import (
     PROCESS_RUN,
     ClaimKeeper,
@@ -361,20 +365,20 @@ with open(sys.argv[1], "w") as f:
 CTRLRELAY_DONE
 ```
 
-**BLOCKED** (need operator input):
+**BLOCKED** (need operator input). {CHECKPOINT_TEXT_RULE}
 ```bash
-mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\\
-'"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > {quoted_path}
+{shell_checkpoint(
+    quoted_dir, quoted_path, session_id=session_id,
+    status="BLOCKED_NEEDS_INPUT", field="question", text="<QUESTION>",
+)}
 ```
 
-**FAILED** (genuine failure, no way forward):
+**FAILED** (genuine failure, no way forward). {CHECKPOINT_TEXT_RULE}
 ```bash
-mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"FAILED",'\\
-'"session_id":"{session_id}","timestamp":"%s","error":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > {quoted_path}
+{shell_checkpoint(
+    quoted_dir, quoted_path, session_id=session_id,
+    status="FAILED", field="error", text="<ERROR>",
+)}
 ```
 """
 

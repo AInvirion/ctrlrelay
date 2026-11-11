@@ -22,7 +22,11 @@ from ctrlrelay.core.agent_plugins import (
     agent_identity_from_mapping,
 )
 from ctrlrelay.core.budget import is_budget_reason, label_names, session_scope
-from ctrlrelay.core.checkpoint import CheckpointStatus
+from ctrlrelay.core.checkpoint import (
+    CHECKPOINT_TEXT_RULE,
+    CheckpointStatus,
+    shell_checkpoint,
+)
 from ctrlrelay.core.claims import (
     CLAIM_MARKER_PREFIX,
     DISPATCH_FAILED_MARKER,
@@ -943,20 +947,22 @@ def _blocked_and_failed_blocks(
 ) -> str:
     """The BLOCKED and FAILED checkpoint snippets, shared by the code and
     plan contracts (#220). Their DONE blocks differ; these do not."""
-    return f"""**BLOCKED** (need input):
+    blocked = shell_checkpoint(
+        quoted_dir, quoted_path, session_id=session_id,
+        status="BLOCKED_NEEDS_INPUT", field="question", text="<QUESTION>",
+    )
+    failed = shell_checkpoint(
+        quoted_dir, quoted_path, session_id=session_id,
+        status="FAILED", field="error", text="<ERROR>",
+    )
+    return f"""**BLOCKED** (need input). {CHECKPOINT_TEXT_RULE}
 ```bash
-mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
-'"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > {quoted_path}
+{blocked}
 ```
 
-**FAILED**:
+**FAILED**. {CHECKPOINT_TEXT_RULE}
 ```bash
-mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
-'"timestamp":"%s","error":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > {quoted_path}
+{failed}
 ```"""
 
 

@@ -139,7 +139,9 @@ async def test_the_resume_prompt_carries_the_checkpoint_contract(
     )
     assert "BLOCKED_NEEDS_INPUT" in prompt
     assert "FAILED" in prompt
-    assert '"status":"DONE"' in prompt
+    # Spacing differs between the hand-written DONE blocks and the ones
+    # `shell_checkpoint` renders (#397); the status is what matters.
+    assert re.search(r'"status":\s*"DONE"', prompt)
 
 
 @pytest.mark.parametrize("mod", PIPELINES)
@@ -253,9 +255,9 @@ def test_every_checkpoint_snippet_creates_its_own_directory(mod: str) -> None:
     )
 
     for i, block in enumerate(blocks):
-        # The writer is `printf` for one-line states and `python3` for a
-        # DONE that carries multi-line text (#219: a PR description or
-        # a task report), which printf cannot JSON-encode.
+        # Every block writes with `python3` (#397 retired `printf`, whose
+        # quoting agents mangled); the `printf` branch keeps this test
+        # meaningful if a block in the old shape is ever added back.
         writer = "printf " if "printf " in block else "python3 "
         assert writer in block, f"{mod}: block {i} writes nothing"
         mk = block.find("mkdir -p -- ")

@@ -193,17 +193,33 @@ Step-by-step:
 ## Implementing your own BLOCKED in an agent session
 
 If you write a custom prompt or skill that runs under ctrlrelay, signal a
-question from inside the agent session using a shell `printf`:
+question from inside the agent session by writing the checkpoint with
+`python3`, so the question is JSON-escaped for you and the shell has
+nothing to re-quote:
 
 ```bash
 # Inside an agent session — both vars are set by the dispatcher.
-printf '{"version":"1","status":"BLOCKED_NEEDS_INPUT","session_id":"%s","timestamp":"%s","question":"%s"}' \
-  "$CTRLRELAY_SESSION_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  "Should I migrate the schema in this PR or split it?" \
-  > "$CTRLRELAY_STATE_FILE"
+python3 - "$CTRLRELAY_STATE_FILE" <<'CTRLRELAY_STATE'
+import datetime, json, os, sys
+text = r'''
+Should I migrate the schema in this PR or split it?
+'''.strip()
+state = {
+    "version": "1",
+    "status": "BLOCKED_NEEDS_INPUT",
+    "session_id": os.environ["CTRLRELAY_SESSION_ID"],
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    ),
+    "question": text,
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(state, f)
+CTRLRELAY_STATE
 exit 0
 ```
 
-The dev-pipeline prompt template embeds this exact pattern — see the
-`_build_prompt` method in
-[`src/ctrlrelay/pipelines/dev.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/pipelines/dev.py).
+The question may span lines and hold any quotes, but not three single
+quotes in a row. The pipelines' prompts build the same shape with
+`shell_checkpoint` in
+[`src/ctrlrelay/core/checkpoint.py`](https://github.com/AInvirion/ctrlrelay/blob/main/src/ctrlrelay/core/checkpoint.py).
