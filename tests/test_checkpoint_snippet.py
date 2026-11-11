@@ -108,7 +108,10 @@ def test_no_snippet_has_a_line_continuation_or_printf(mod: str) -> None:
 
 
 def test_agent_check_round1_runs_the_pipelines_snippet() -> None:
-    """``agent check`` proves the shell real runs use, byte for byte.
+    """``agent check`` uses the shell real runs use, byte for byte.
+
+    A string comparison, not a run: running the snippet is covered by the
+    tests either side of this one, for the dev block and the check's own.
 
     The dev contract's BLOCKED block with its placeholder filled by the
     check's fixed question must be exactly the check's round-1 block. If
