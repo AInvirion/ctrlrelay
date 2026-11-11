@@ -51,6 +51,7 @@ from ctrlrelay.core.checkpoint import (
     CheckpointState,
     CheckpointStatus,
     read_checkpoint,
+    shell_checkpoint,
 )
 from ctrlrelay.core.dispatcher import (
     SessionResult,
@@ -162,12 +163,13 @@ def resume_round1_prompt(
 ) -> str:
     """Round 1: remember ``token``, then write ``BLOCKED_NEEDS_INPUT``.
 
-    The ``printf`` snippet is the shape of
-    :func:`ctrlrelay.pipelines.dev._blocked_and_failed_blocks` rather than
-    a shared block with it, for the same reason :func:`check_prompt` gives:
-    what is under test is the *mechanics* a real run uses — the quoted
-    path, the ``date`` substitution, the single line of shell — and the
-    dev contract's own blocks carry placeholders a check must not leave in.
+    The snippet comes from
+    :func:`ctrlrelay.core.checkpoint.shell_checkpoint`, the same function
+    the pipelines' BLOCKED and FAILED blocks use (#397), so the check
+    proves the exact shell a real run depends on — the quoted path, the
+    quoted heredoc, ``json.dump`` — and cannot drift from it. Only the
+    text differs: the dev contract's blocks carry a placeholder a check
+    must not leave in.
 
     The question is fixed rather than a ``<QUESTION>`` placeholder because
     the relay only has to see that a question arrived; what it says is the
@@ -182,11 +184,10 @@ SESSION_ID: {session_id}
 TOKEN: {token}
 
 ```bash
-mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"{ROUND1_EXPECTED}",'\
-'"session_id":"{session_id}","timestamp":"%s",'\
-'"question":"{RESUME_QUESTION}"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > {quoted_path}
+{shell_checkpoint(
+    quoted_dir, quoted_path, session_id=session_id,
+    status=ROUND1_EXPECTED, field="question", text=RESUME_QUESTION,
+)}
 ```
 
 Do nothing else. There is no repository to read and nothing to change.

@@ -17,7 +17,11 @@ from ctrlrelay.core.agent_plugins import (
     agent_identity_from_mapping,
 )
 from ctrlrelay.core.archived import ArchivedRepoTracker
-from ctrlrelay.core.checkpoint import CheckpointStatus
+from ctrlrelay.core.checkpoint import (
+    CHECKPOINT_TEXT_RULE,
+    CheckpointStatus,
+    shell_checkpoint,
+)
 from ctrlrelay.core.claims import PROCESS_RUN
 from ctrlrelay.core.dispatcher import AgentAdapter, SessionResult, select_agent
 from ctrlrelay.core.events import EventKind, emit_event, emit_outcome
@@ -600,28 +604,30 @@ speak to the author-filtered results.
 STATE_FILE: {state_file_path}
 SESSION_ID: {session_id}
 
+{CHECKPOINT_TEXT_RULE}
+
 **DONE** (completed):
 ```bash
-mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"DONE","session_id":"{session_id}",'\
-'"timestamp":"%s","summary":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<SUMMARY>" > {quoted_path}
+{shell_checkpoint(
+    quoted_dir, quoted_path, session_id=session_id,
+    status="DONE", field="summary", text="<SUMMARY>",
+)}
 ```
 
 **BLOCKED** (need input):
 ```bash
-mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"BLOCKED_NEEDS_INPUT",'\
-'"session_id":"{session_id}","timestamp":"%s","question":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<QUESTION>" > {quoted_path}
+{shell_checkpoint(
+    quoted_dir, quoted_path, session_id=session_id,
+    status="BLOCKED_NEEDS_INPUT", field="question", text="<QUESTION>",
+)}
 ```
 
 **FAILED**:
 ```bash
-mkdir -p -- {quoted_dir}
-printf '{{"version":"1","status":"FAILED","session_id":"{session_id}",'\
-'"timestamp":"%s","error":"%s"}}' \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<ERROR>" > {quoted_path}
+{shell_checkpoint(
+    quoted_dir, quoted_path, session_id=session_id,
+    status="FAILED", field="error", text="<ERROR>",
+)}
 ```"""
 
     def _session_to_result(self, result: SessionResult) -> PipelineResult:

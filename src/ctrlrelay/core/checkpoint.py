@@ -125,6 +125,67 @@ def failed(error: str, recoverable: bool = True) -> None:
 # A checkpoint is a few hundred bytes; a DONE with a long pull-request
 # description is a few kilobytes. Anything past this is not a checkpoint,
 # and reading it whole is how an agent would exhaust the relay's memory.
+# What an agent is told about free text it puts in a checkpoint written
+# by :func:`shell_checkpoint`. The text sits on its own lines inside a
+# Python raw triple-quoted string in a quoted heredoc, so quotes,
+# backslashes, `$`, backticks and newlines all arrive as written (a
+# carriage return arrives as a newline). Two things end it early: three
+# single quotes in a row close the string, and a line that is exactly the
+# heredoc's delimiter closes the heredoc.
+CHECKPOINT_TEXT_RULE = (
+    "Put your text on the line between the triple quotes. It may span "
+    "lines and contain any quotes, but not three single quotes in a row "
+    "and no line that is exactly CTRLRELAY_STATE."
+)
+
+
+def shell_checkpoint(
+    quoted_dir: str,
+    quoted_path: str,
+    *,
+    session_id: str,
+    status: str,
+    field: str,
+    text: str,
+) -> str:
+    """The shell an agent runs to write a one-text-field checkpoint (#397).
+
+    ``quoted_dir`` and ``quoted_path`` must already be shell-quoted
+    (#191). ``text`` is a placeholder such as ``<QUESTION>`` for the agent
+    to replace, or fixed text when the caller knows it.
+
+    The earlier snippet was a ``printf`` whose format string was several
+    single-quoted pieces joined by backslash continuations. Agents
+    re-quoted it (``'…''…'``) or dropped a continuation, and the round
+    ended with no checkpoint after the work was done. It also could not
+    carry a question holding a double quote or a newline: ``%s`` pasted it
+    into the JSON unescaped. Here the shell sees one plain command and a
+    heredoc whose delimiter is quoted, so nothing is expanded and nothing
+    needs re-quoting, and ``json.dump`` does the escaping.
+
+    The text goes on its own lines and is stripped, so a backslash at its
+    end cannot escape the closing quotes.
+    """
+    return f"""mkdir -p -- {quoted_dir}
+python3 - {quoted_path} <<'CTRLRELAY_STATE'
+import datetime, json, sys
+text = r'''
+{text}
+'''.strip()
+state = {{
+    "version": "1",
+    "status": "{status}",
+    "session_id": "{session_id}",
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    ),
+    "{field}": text,
+}}
+with open(sys.argv[1], "w") as f:
+    json.dump(state, f)
+CTRLRELAY_STATE"""
+
+
 MAX_CHECKPOINT_BYTES = 256 * 1024
 
 
