@@ -87,35 +87,51 @@ def extract_referenced_numbers(question: str) -> list[str]:
 # ``oaf-kernel#118`` names another one without saying whose, so it cannot
 # be looked up at all. Reading every one of those as ``#118`` here probed
 # an unrelated, long-closed issue of the same number and retired a live
-# question as resolved 33 minutes after it was asked (#400).
-_REF_WITH_PREFIX_RE = re.compile(r"([\w.-]+(?:/[\w.-]+)?)?#(\d+)(?!\d)")
-_SAME_REPO_PREFIXES = frozenset({"pr", "issue"})
+# question as resolved 33 minutes after it was asked (#400). A ``#12a`` is
+# not a reference.
+_REF_WITH_PREFIX_RE = re.compile(r"([\w.-]+(?:/[\w.-]+)?)?#(\d+)(?!\w)")
+# A link to an issue or PR names its repository outright.
+_REF_URL_RE = re.compile(
+    r"github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/(\d+)(?!\w)",
+    re.IGNORECASE,
+)
 
 
 def resolution_targets(row: dict[str, Any]) -> list[tuple[str, int]] | None:
     """The issues and PRs that must ALL be closed before ``row``'s
     question counts as resolved elsewhere, as ``(repo, number)``.
 
-    Each ``#N`` the question cites, in its own repository unless written
-    ``owner/repo#N``; plus the issue the question was asked on, when it
-    was asked on one. A run paused on an open issue is still waiting for
+    Each ``#N`` the question cites, in its own repository, or in
+    ``owner/repo`` when written ``owner/repo#N`` or as a link to the
+    issue; plus the issue the question was asked on, when it was asked on
+    one. A markdown link ``[#12](…/other/thing/issues/12)`` yields both
+    targets, so both must be closed. A run paused on an open issue is still waiting for
     its answer whatever else the question mentions, so that issue being
     open keeps the question.
 
     None when the question cites something that cannot be looked up
-    (``name#N`` with no owner): that reference can never be shown
+    (``name#N`` with no owner, ``PR#N`` written without a space): that reference can never be shown
     closed, so the question cannot be resolved this way. An empty list
     means there is nothing to check.
     """
     repo = row["repo"]
-    targets: list[tuple[str, int]] = []
-    for prefix, number in _REF_WITH_PREFIX_RE.findall(row.get("question") or ""):
-        if not prefix or prefix.lower() in _SAME_REPO_PREFIXES:
-            target = (repo, int(number))
+    question = row.get("question") or ""
+    found: list[tuple[str, int]] = []
+    for prefix, number in _REF_WITH_PREFIX_RE.findall(question):
+        if not prefix:
+            found.append((repo, int(number)))
         elif "/" in prefix:
-            target = (prefix, int(number))
+            found.append((prefix, int(number)))
         else:
+            # ``PR#12`` included: ``PR`` could as well be a repository's
+            # name, and guessing wrong retires a live question.
             return None
+    found.extend(
+        (owner_repo, int(number))
+        for owner_repo, number in _REF_URL_RE.findall(question)
+    )
+    targets: list[tuple[str, int]] = []
+    for target in found:
         if target not in targets:
             targets.append(target)
     issue_number = row.get("issue_number")

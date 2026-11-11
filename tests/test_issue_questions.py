@@ -536,4 +536,6 @@ async def test_a_label_that_cannot_be_added_still_leaves_the_comment(
     github.mock.add_issue_label.side_effect = RuntimeError("no permission")
 
     assert await note_expiry_on_issue(github.mock, state_db.get_pending_resume("s-1"))
-    assert len(github.bodies("ctrlrelay:expired")) == 1
+    (body,) = github.bodies("ctrlrelay:expired")
+    assert "has stopped" in body
+    assert "labelled" not in body

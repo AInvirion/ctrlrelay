@@ -845,3 +845,49 @@ class TestResolutionTargets:
 
         assert [r["session_id"] for r in expired] == ["q"]
         assert expired[0]["expired_reason"] == EXPIRY_REASON_RESOLVED
+
+    @pytest.mark.asyncio
+    async def test_pr_written_without_a_space_is_not_guessed(
+        self, db: StateDB
+    ) -> None:
+        """``PR#12`` could name a repository called ``PR``."""
+        _add(db, "q", "Merge PR#12 first?", 60)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
+        github.get_issue_or_pr_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_number_run_into_letters_is_not_a_reference(
+        self, db: StateDB
+    ) -> None:
+        _add(db, "q", "Use colour #12a or #3?", 60)
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert probed == [("owner/repo", 3)]
+
+    @pytest.mark.asyncio
+    async def test_a_linked_issue_is_probed_in_its_repo_as_well(
+        self, db: StateDB
+    ) -> None:
+        """``[#12](…/other/thing/issues/12)``: the link names the repo, so
+        that issue must be closed too, whatever this repo's #12 is."""
+        _add(
+            db, "q",
+            "Blocked on [#12](https://github.com/other/thing/issues/12).", 60,
+        )
+        github = AsyncMock()
+
+        async def state(repo: str, number: int, **_kw: object) -> dict:
+            return _state(closed=repo == "owner/repo")
+
+        github.get_issue_or_pr_state.side_effect = state
+
+        assert await expire_stale_questions(db, github, ttl_seconds=TTL) == []
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert ("other/thing", 12) in probed

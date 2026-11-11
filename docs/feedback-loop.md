@@ -186,10 +186,11 @@ Step-by-step:
   labelled `ctrlrelay:unanswered`: the run has stopped, and someone has to
   decide the question and start the issue again. Nothing removes the label.
 - **A question is retired early only when everything it rests on is
-  closed:** each `#N` it cites, in its own repository unless written
-  `owner/repo#N`, and the issue it was asked on. A question citing
-  `name#N` without an owner cannot be checked that way, so it lasts its
-  full TTL.
+  closed:** each `#N` it cites (in the question's repository), each
+  `owner/repo#N` or link to an issue or pull request (in that
+  repository), and the issue it was asked on. A question citing a
+  reference whose repository cannot be told, such as `name#N` or
+  `PR#N`, is never retired early and lasts its full TTL.
 - **Maximum 5 BLOCKED rounds per session.** This bounds the chat noise from a
   pathological loop. After 5 rounds the pipeline gives up.
 - **State is durable.** The checkpoint file and the SQLite state DB persist
