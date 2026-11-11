@@ -354,8 +354,10 @@ DEFAULT_SANDBOX_READONLY_PATHS: tuple[str, ...] = (
     # Every project's folder, memory included, which the operator's
     # sessions in that project load. One mount for all of them (#362): a
     # mount per project folder ran past bwrap's argument limit on a home
-    # with thousands. The run's own transcript folder is opened again,
-    # deeper, by the dispatcher.
+    # with thousands. The dispatcher also hides the whole folder behind an
+    # empty tmpfs (#364) and opens only the run's own transcript folder in
+    # it; this entry keeps it read-only for any other caller of
+    # bwrap_prefix.
     "~/.claude/projects",
 )
 
@@ -439,6 +441,7 @@ def bwrap_prefix(
     writable: Sequence[str | Path] = (),
     readonly: Sequence[str | Path] = (),
     copies: Sequence[tuple[Path, Path]] = (),
+    reopened: Sequence[Path] = (),
 ) -> list[str]:
     """Argv prefix that runs a command in a read-only copy of this machine.
 
@@ -449,7 +452,9 @@ def bwrap_prefix(
     cannot be renamed away; each ``(copy, path)`` in ``copies`` shown
     writable at ``path``; ``readonly`` bound read-only again; and
     ``hide_paths`` made empty (a directory becomes an empty tmpfs, a file
-    or socket ``/dev/null``) wherever they are. Bind sources are
+    or socket ``/dev/null``) wherever they are; then each directory in
+    ``reopened`` bound writable again on top of a hidden one, so a single
+    folder inside an empty tmpfs is visible (#364). Bind sources are
     read from the host, so a path under ``/tmp`` binds normally. A
     hidden or writable path that does not exist is skipped (bwrap would
     otherwise have to create a mount point for it). A missing read-only
@@ -542,6 +547,18 @@ def bwrap_prefix(
             argv += ["--tmpfs", str(p)]
         else:
             argv += ["--ro-bind", "/dev/null", str(p)]
+    # After the hides, so a folder inside a hidden directory shows through
+    # it and nothing beside it does. Only existing, real directories: a
+    # link would open wherever it leads.
+    for raw in reopened:
+        p = Path(raw)
+        if p.is_symlink() or not p.is_dir():
+            raise SandboxUnavailableError(
+                f"agent.sandbox: {p} cannot be reopened in the sandbox: it "
+                "is a link or not a directory"
+            )
+        real = str(Path(os.path.realpath(p)))
+        argv += ["--bind", real, real]
     argv.append("--")
     return argv
 

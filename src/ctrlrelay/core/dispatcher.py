@@ -1335,8 +1335,10 @@ class ClaudeDispatcher(CliAgentAdapter):
             # At the real path: a bind on a link lands where it leads.
             copies.append((copy, Path(os.path.realpath(main_config))))
         # Where the agent CLI writes this run's transcript: the only part
-        # of the read-only projects folder the run may write (#362). Made
-        # here, since the sandbox cannot create it under a read-only one.
+        # of the projects folder the run may see or write. The folder is
+        # hidden behind an empty tmpfs, so other projects' transcripts and
+        # memory are not readable at all (#364), and this run's own is bound
+        # back on top. Made here, since the sandbox cannot create it.
         transcript_dirs = self._transcript_dirs(working_dir, env)
         projects = Path(os.path.realpath(Path.home() / ".claude" / "projects"))
         for folder in transcript_dirs:
@@ -1353,13 +1355,16 @@ class ClaudeDispatcher(CliAgentAdapter):
                 )
         return bwrap_prefix(
             self._bwrap,
-            self.sandbox_hide_paths,
+            # Not left to configuration: a custom hide list must not bring
+            # every other project's transcripts back into view.
+            [*self.sandbox_hide_paths, str(projects)],
             writable=[
                 working_dir, *repo_dirs, private_root, cache_dir,
-                *self.sandbox_writable_paths, *transcript_dirs,
+                *self.sandbox_writable_paths,
             ],
             readonly=[*self.sandbox_readonly_paths, *git_protected],
             copies=copies,
+            reopened=transcript_dirs,
         )
 
     async def spawn_session(
