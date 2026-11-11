@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls also set `GIT_TERMINAL_PROMPT=0`, so a missing credential fails at
   once. Pushes already used gh's login; the agent's environment is
   unchanged.
+- The checkpoint snippets in the dev, task and secops prompts, and in
+  `ctrlrelay agent check --resume`, no longer give an agent anything to
+  re-quote (#397). The BLOCKED and FAILED snippets (and secops' DONE) were a
+  `printf` built from single-quoted pieces joined by backslash
+  continuations. Agents sometimes rewrote the quoting or dropped a
+  continuation, and the round ended with a malformed or missing checkpoint
+  after the work was done. They now write the file with `python3` from a
+  quoted heredoc, the shape the DONE snippets already used. The text goes on
+  its own lines in a raw string and `json.dump` escapes it, so a question or
+  error may hold double quotes, newlines and backslashes; the old `%s`
+  pasted those into the JSON unescaped. One function renders the snippet for
+  every pipeline and for `agent check`, so the check runs exactly the shell
+  a real run uses.
 
 ## [0.28.0] - 2026-11-11
 
