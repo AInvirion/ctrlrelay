@@ -7,11 +7,12 @@ import contextlib
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -550,6 +551,81 @@ def _relay_git_env(global_config: Path) -> dict[str, str]:
     return env
 
 
+# The git subcommands that talk to origin. The relay runs them on the
+# operator's own config (their helpers, rewrites and proxies apply), so
+# these get only an extra credential helper appended, never a
+# replacement config.
+_NETWORK_SUBCOMMANDS = frozenset({"clone", "fetch", "ls-remote"})
+
+_GH_CREDENTIAL_KEY = "credential.https://github.com.helper"
+
+
+# Global options whose value is the next argument.
+_GIT_OPTIONS_WITH_VALUE = frozenset({
+    "-c", "-C", "--git-dir", "--work-tree", "--namespace",
+    "--config-env", "--super-prefix",
+})
+
+
+def _git_subcommand(args: tuple[str, ...]) -> str | None:
+    """The subcommand in ``git <args>``, skipping global options and the
+    values of those that take one as the next argument."""
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in _GIT_OPTIONS_WITH_VALUE:
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        return arg
+    return None
+
+
+def _with_gh_credential(base: Mapping[str, str]) -> dict[str, str]:
+    """``base`` with gh's login appended as a credential helper for
+    https://github.com, for the relay's own fetch, clone and ls-remote
+    (#398).
+
+    The relay clones over https. On a node where gh is logged in but
+    ``gh auth setup-git`` was never run, git has no credential for a
+    private repository and the first run failed before the agent
+    started. The helper goes in through ``GIT_CONFIG_COUNT``, appended
+    after any entries already there (a unit's ``insteadOf`` rewrite
+    keeps working). Config from the environment is read after every
+    config file, so this helper comes last in git's list: an operator's
+    own helper is asked first and wins when it answers. When gh has no
+    login and no token, the helper answers nothing and git fails as before.
+
+    ``GIT_TERMINAL_PROMPT=0`` is set in every case, including when no
+    helper is added: the relay runs unattended, so a missing credential
+    fails at once instead of waiting on a prompt nobody will answer.
+    No helper is added when gh cannot be found, when
+    ``GIT_CONFIG_COUNT`` is set and is not at most six plain digits (left for git to read or
+    refuse as it does), or when the slot it would take is already set: an
+    entry is never overwritten. An empty count reads as zero.
+    """
+    from ctrlrelay.core.github import _find_gh
+
+    env = dict(base)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    gh = shutil.which(_find_gh())
+    if gh is None:
+        return env
+    raw = env.get("GIT_CONFIG_COUNT", "").strip()
+    if raw and not (raw.isascii() and raw.isdigit() and len(raw) <= 6):
+        return env
+    count = int(raw) if raw else 0
+    if f"GIT_CONFIG_KEY_{count}" in env or f"GIT_CONFIG_VALUE_{count}" in env:
+        return env
+    env[f"GIT_CONFIG_KEY_{count}"] = _GH_CREDENTIAL_KEY
+    env[f"GIT_CONFIG_VALUE_{count}"] = f"!{shlex.quote(gh)} auth git-credential"
+    env["GIT_CONFIG_COUNT"] = str(count + 1)
+    return env
+
+
 @dataclass
 class WorktreeManager:
     """Manages git worktrees for session isolation."""
@@ -599,6 +675,8 @@ class WorktreeManager:
         would run against a tree origin no longer has.
         """
         cmd = ["git", *args]
+        if env is None and _git_subcommand(args) in _NETWORK_SUBCOMMANDS:
+            env = _with_gh_credential(os.environ)
         effective_timeout = timeout if timeout is not None else self.timeout
         proc = await asyncio.create_subprocess_exec(
             *cmd,
