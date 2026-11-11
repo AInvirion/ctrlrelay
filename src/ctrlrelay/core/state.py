@@ -501,6 +501,7 @@ class StateDB:
                 self._conn.execute(
                     f"ALTER TABLE pending_resumes ADD COLUMN {col} {kind}"
                 )
+        self._backfill_question_issue_numbers()
 
         health_cols = {
             row[1]
@@ -520,6 +521,48 @@ class StateDB:
 
         self._ensure_issue_finishes()
         self._ensure_dispatch_health_row()
+
+    def _backfill_question_issue_numbers(self) -> None:
+        """#412: an open dev question saved before its issue number was
+        stored with it. The dev session row names the issue, so closing
+        that issue can retire the question.
+
+        Only open dev rows missing the number. It writes only when such a
+        row exists, so an ordinary start takes no write lock here (a start
+        must not wait on another process's read), and it is a no-op once
+        every row has the number. A database too old to have the columns
+        is skipped."""
+        session_cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(sessions)")
+        }
+        pending_cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(pending_resumes)"
+            )
+        }
+        if "issue_number" not in session_cols or not {
+            "issue_number", "expired_at",
+        } <= pending_cols:
+            return
+        where = """WHERE pipeline = 'dev' AND issue_number IS NULL
+                     AND answered_at IS NULL AND expired_at IS NULL
+                     AND EXISTS (
+                       SELECT 1 FROM sessions s
+                       WHERE s.id = pending_resumes.session_id
+                         AND s.issue_number IS NOT NULL)"""
+        needed = self._conn.execute(
+            f"SELECT 1 FROM pending_resumes {where} LIMIT 1"
+        ).fetchone()
+        if needed is None:
+            return
+        self._conn.execute(
+            f"""UPDATE pending_resumes SET issue_number = (
+                    SELECT s.issue_number FROM sessions s
+                    WHERE s.id = pending_resumes.session_id)
+                {where}"""
+        )
 
     def _ensure_issue_finishes(self) -> None:
         """Create ``issue_finishes`` (#230), filling it from the ``merged``
@@ -1328,6 +1371,7 @@ class StateDB:
         question: str,
         held_until: int | None = None,
         posted: bool | None = None,
+        issue_number: int | None = None,
     ) -> None:
         """Record that a session exited BLOCKED_NEEDS_INPUT and can be
         resumed if an operator reply arrives later. Idempotent: re-inserting
@@ -1345,14 +1389,21 @@ class StateDB:
         used to leave the table with it. Its time is kept in
         ``last_answered_at``: repeat counting and backoff both reset at
         the latest answer, and losing it made a question the operator
-        had just answered look like one nobody ever answered."""
+        had just answered look like one nobody ever answered.
+
+        ``issue_number`` is the issue the run belongs to (#412), set when
+        the row is written whether or not the question is ever posted
+        there, so closing that issue retires the question. Whether it
+        was asked on the issue is ``issue_comment_id``, set only by
+        ``record_issue_question``."""
         self._conn.execute(
             """INSERT INTO pending_resumes
                (session_id, pipeline, repo, question, created_at,
                 answer, answered_at, resumed_at, expired_at,
-                expired_reason, held_until, posted, last_answered_at)
+                expired_reason, held_until, posted, last_answered_at,
+                issue_number)
                VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?,
-                       NULL)
+                       NULL, ?)
                ON CONFLICT(session_id) DO UPDATE SET
                  pipeline = excluded.pipeline,
                  repo = excluded.repo,
@@ -1365,7 +1416,7 @@ class StateDB:
                  expired_reason = NULL,
                  held_until = excluded.held_until,
                  posted = excluded.posted,
-                 issue_number = NULL,
+                 issue_number = excluded.issue_number,
                  issue_comment_id = NULL,
                  issue_asked_at = NULL,
                  answer_source = NULL,
@@ -1377,12 +1428,14 @@ class StateDB:
                      pending_resumes.last_answered_at
                  )""",
             (session_id, pipeline, repo, question, int(time.time()),
-             held_until, None if posted is None else int(posted)),
+             held_until, None if posted is None else int(posted),
+             None if issue_number is None else int(issue_number)),
         )
         self._conn.commit()
 
     def park_blocked_question(
         self, session_id: str, pipeline: str, repo: str, question: str,
+        issue_number: int | None = None,
     ) -> None:
         """Record a question BEFORE the run waits on the chat answer (#324).
 
@@ -1403,7 +1456,7 @@ class StateDB:
             # Commits both statements.
             self.add_pending_resume(
                 session_id=session_id, pipeline=pipeline, repo=repo,
-                question=question,
+                question=question, issue_number=issue_number,
             )
         except BaseException:
             # Never leave the half-done write open through the wait: it

@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   projects. As before, a hard link to one of those files from somewhere the
   agent can read is a second way in that the sandbox does not close.
 
+### Fixed
+
+- A dev run's question is retired when its issue is closed even if it was
+  never posted on the issue (#412). The issue number was stored only after
+  the question comment was posted, so a question saved with nobody to ask
+  (no chat transport, blocked rounds used up) or whose comment failed to
+  post had none. If it cited no `#N`, closing the issue did nothing and
+  only the 48-hour TTL retired it. The dev pipeline now stores the run's
+  issue number when it saves the question; whether it was asked on the
+  issue is still recorded separately, so only posted questions are
+  watched for a `/answer` and only those get the expiry comment and
+  label. Open dev questions saved by an older version take their issue
+  number from the session row the first time the database is opened.
+
 ## [0.28.1] - 2026-11-11
 
 ### Fixed
