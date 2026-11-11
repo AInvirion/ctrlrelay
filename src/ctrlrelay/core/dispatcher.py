@@ -748,7 +748,9 @@ class CliAgentAdapter:
             watches.append(("stuck", lambda: watch_transcript(
                 folders, since=wall_started, policy=policy, ident=ident,
             )))
-        if budget is not None:
+        if budget is not None and not self._reads_usage_at_exit():
+            # A backend measured at exit has nothing to poll while it runs;
+            # its limit is checked before it starts, below.
             watches.append(("budget", budget.run))
 
         if budget is not None and self._reads_usage_at_exit():
@@ -1101,12 +1103,14 @@ class CliAgentAdapter:
         limits = resolve_limits(self.budget, scope.labels)
         if not folders and self._reads_usage_at_exit():
             if limits.any:
-                # Said once per spawn: the limit is applied, but only
-                # between rounds, never in the middle of one.
+                # Said once per spawn: the limit is never applied in the
+                # middle of a round. With a session total (dev, task) it is
+                # applied before the next round; with none, never.
                 log_event(
                     _logger, "dispatcher.budget.measured_at_exit", **ident,
                     agent_type=self.agent_type, soft=limits.soft,
                     hard=limits.hard,
+                    has_session_total=scope.on_usage is not None,
                 )
             return BudgetWatch(
                 ExitReadingMeter(),

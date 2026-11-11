@@ -344,10 +344,10 @@ class TranscriptMeter:
 class ExitReadingMeter:
     """The meter of a CLI that reports its usage only in its output (#387).
 
-    While the run goes it has read nothing, so it says so: nothing counted
-    for this spawn. That still lets the watch stop a resumed spawn at once
-    when earlier rounds of the session already reached the hard limit. The
-    real reading is handed to :meth:`BudgetWatch.finish_with` at exit.
+    It is never polled while the run goes: the dispatcher checks the limit
+    once before the round starts, and hands the real reading to
+    :meth:`BudgetWatch.finish_with` at exit. :meth:`read` says what it has
+    read, which is nothing.
     """
 
     bytes_read = 0

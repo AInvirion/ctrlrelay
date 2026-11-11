@@ -40,7 +40,7 @@ _ANY_PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
 # Native sessions whose last running total is remembered, so a resumed
 # round is charged only what it added (#387). Bounded so a long-lived node
 # does not grow it without limit; a resume whose total was evicted is
-# charged a floor and shown as unknown.
+# charged nothing and shown as unknown.
 _NATIVE_READINGS_KEPT = 256
 
 
