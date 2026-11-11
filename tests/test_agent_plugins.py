@@ -197,11 +197,12 @@ class TestGenericManifestRegistration:
         assert adapter.instructions_files == ("AGENTS.md",)
 
     def test_factory_passes_the_manifest_instruction_filenames(self) -> None:
+        # Not "copilot": that name is a built-in preset now (#384).
         cfg = AgentConfig(
-            type="copilot",
+            type="pilot",
             plugins={
-                "copilot": {
-                    "binary": "/opt/copilot",
+                "pilot": {
+                    "binary": "/opt/pilot",
                     "instructions_files": [
                         ".github/copilot-instructions.md",
                         "AGENTS.md",
