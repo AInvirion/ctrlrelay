@@ -597,13 +597,13 @@ def _with_gh_credential(base: Mapping[str, str]) -> dict[str, str]:
     keeps working). Config from the environment is read after every
     config file, so this helper comes last in git's list: an operator's
     own helper is asked first and wins when it answers. When gh has no
-    login, the helper answers nothing and git fails as before.
+    login and no token, the helper answers nothing and git fails as before.
 
     ``GIT_TERMINAL_PROMPT=0`` is set in every case, including when no
     helper is added: the relay runs unattended, so a missing credential
     fails at once instead of waiting on a prompt nobody will answer.
     No helper is added when gh cannot be found, when
-    ``GIT_CONFIG_COUNT`` is not plain digits (left for git to read or
+    ``GIT_CONFIG_COUNT`` is not at most six plain digits (left for git to read or
     refuse as it does), or when the slot it would take is already set: an
     entry is never overwritten.
     """
@@ -615,7 +615,7 @@ def _with_gh_credential(base: Mapping[str, str]) -> dict[str, str]:
     if gh is None:
         return env
     raw = env.get("GIT_CONFIG_COUNT", "").strip()
-    if raw and not (raw.isascii() and raw.isdigit()):
+    if raw and not (raw.isascii() and raw.isdigit() and len(raw) <= 6):
         return env
     count = int(raw) if raw else 0
     if f"GIT_CONFIG_KEY_{count}" in env or f"GIT_CONFIG_VALUE_{count}" in env:

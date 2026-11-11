@@ -66,7 +66,7 @@ def test_a_gh_that_cannot_be_found_adds_no_helper_but_still_no_prompt() -> None:
     assert env == {"PATH": "/usr/bin", "GIT_TERMINAL_PROMPT": "0"}
 
 
-@pytest.mark.parametrize("count", ["two", "-1", "+1", "1_0", "\u0661"])
+@pytest.mark.parametrize("count", ["two", "-1", "+1", "1_0", "\u0661", "0" * 5000])
 def test_a_count_that_is_not_a_plain_number_is_left_as_it_is(
     fake_gh: Path, count: str,
 ) -> None:
@@ -91,7 +91,7 @@ def test_an_entry_already_in_the_slot_is_never_overwritten(
     assert env == {**base, "GIT_TERMINAL_PROMPT": "0"}
 
 
-def test_a_count_with_spaces_is_read_as_git_reads_it(fake_gh: Path) -> None:
+def test_spaces_around_the_count_are_stripped(fake_gh: Path) -> None:
     with _gh_at(fake_gh):
         env = _with_gh_credential({
             "GIT_CONFIG_COUNT": " 1",
