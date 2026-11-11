@@ -522,7 +522,7 @@ async def test_a_question_retired_as_resolved_does_not_label(
 
     github.mock.add_issue_label.assert_not_awaited()
     (body,) = github.bodies("ctrlrelay:expired")
-    assert "closed or merged" in body
+    assert "this issue is closed" in body
 
 
 @pytest.mark.asyncio

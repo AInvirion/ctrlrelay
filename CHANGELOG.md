@@ -39,7 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and retired a live question 33 minutes after it was asked. A reference
   written `owner/repo#N`, or linked, is now looked up in that repository;
   one whose repository cannot be told (`name#N`, `PR#N`) keeps the
-  question; and the issue the question was asked on must be closed too. The 48-hour
+  question; and the issue the question was asked on must be closed too.
+  Closing that issue now retires its question even when the question
+  cites nothing else. The 48-hour
   `question_ttl_seconds` was never the cause.
 - A question asked on an issue that expires unanswered now says on the
   issue that the run has stopped and how to go on, and labels the issue

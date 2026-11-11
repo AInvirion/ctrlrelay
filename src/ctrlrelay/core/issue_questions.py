@@ -123,9 +123,9 @@ def expired_comment(
         )
     elif reason == "resolved_elsewhere":
         body = (
-            "**The question above was retired:** this issue and everything "
-            "the question cites are closed or merged. An answer to it is "
-            "no longer applied, here or in chat."
+            "**The question above was retired:** this issue is closed, "
+            "along with any issue or pull request the question cites. An "
+            "answer to it is no longer applied, here or in chat."
         )
     else:
         why = f" ({reason})" if reason else ""
