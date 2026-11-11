@@ -560,15 +560,22 @@ _NETWORK_SUBCOMMANDS = frozenset({"clone", "fetch", "ls-remote"})
 _GH_CREDENTIAL_KEY = "credential.https://github.com.helper"
 
 
+# Global options whose value is the next argument.
+_GIT_OPTIONS_WITH_VALUE = frozenset({
+    "-c", "-C", "--git-dir", "--work-tree", "--namespace",
+    "--config-env", "--super-prefix",
+})
+
+
 def _git_subcommand(args: tuple[str, ...]) -> str | None:
     """The subcommand in ``git <args>``, skipping global options and the
-    values of ``-c`` and ``-C``."""
+    values of those that take one as the next argument."""
     skip_next = False
     for arg in args:
         if skip_next:
             skip_next = False
             continue
-        if arg in ("-c", "-C"):
+        if arg in _GIT_OPTIONS_WITH_VALUE:
             skip_next = True
             continue
         if arg.startswith("-"):
@@ -592,10 +599,12 @@ def _with_gh_credential(base: Mapping[str, str]) -> dict[str, str]:
     own helper is asked first and wins when it answers. When gh is not
     logged in, the helper answers nothing and git fails as before.
 
-    ``GIT_TERMINAL_PROMPT=0`` is set either way, so a missing credential
-    fails at once instead of waiting on a prompt nobody will see. A
-    malformed ``GIT_CONFIG_COUNT`` is left alone (git refuses it with
-    its own error), and so is a node with no gh binary.
+    ``GIT_TERMINAL_PROMPT=0`` is set in every case, including when no
+    helper is added: the relay runs unattended, so a missing credential
+    fails at once instead of waiting on a prompt nobody will answer.
+    No helper is added when gh cannot be found, or when
+    ``GIT_CONFIG_COUNT`` is malformed (git refuses that with its own
+    error).
     """
     from ctrlrelay.core.github import _find_gh
 

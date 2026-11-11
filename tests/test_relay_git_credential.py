@@ -60,7 +60,7 @@ def test_appends_after_existing_entries(fake_gh: Path) -> None:
     assert base["GIT_CONFIG_COUNT"] == "1", "the input must not be mutated"
 
 
-def test_no_gh_adds_no_helper_but_still_no_prompt() -> None:
+def test_a_gh_that_cannot_be_found_adds_no_helper_but_still_no_prompt() -> None:
     with _gh_at(None):
         env = _with_gh_credential({"PATH": "/usr/bin"})
     assert env == {"PATH": "/usr/bin", "GIT_TERMINAL_PROMPT": "0"}
@@ -83,6 +83,7 @@ def test_a_malformed_count_is_left_for_git_to_refuse(
         (("-c", "core.hooksPath=/dev/null", "clone", "u"), "clone"),
         (("-C", "/x", "ls-remote", "origin"), "ls-remote"),
         (("--no-pager", "worktree", "list"), "worktree"),
+        (("--git-dir", "/repo", "fetch", "origin"), "fetch"),
         ((), None),
     ],
 )
