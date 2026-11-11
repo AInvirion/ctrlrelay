@@ -179,6 +179,17 @@ class TestConfigRefusals:
         with pytest.raises(ValidationError, match=r"agent.presets\['nope'\]"):
             AgentConfig(presets={"nope": {}})
 
+    @pytest.mark.parametrize(
+        "model", ["{prompt}", "{resume_session_id}", "x}", "--allow-all-paths"],
+    )
+    def test_a_model_cannot_carry_a_placeholder_or_a_flag(self, model) -> None:
+        with pytest.raises(ValidationError, match="must be a model name"):
+            AgentConfig(presets={"copilot": {"model": model}})
+
+    def test_an_ordinary_model_name_is_accepted(self) -> None:
+        cfg = AgentConfig(presets={"copilot": {"model": "claude-sonnet-4.5"}})
+        assert cfg.presets["copilot"].model == "claude-sonnet-4.5"
+
     @pytest.mark.parametrize("field", ["binary", "model"])
     def test_a_blank_override_is_refused(self, field) -> None:
         with pytest.raises(ValidationError, match="must not be empty"):
@@ -197,6 +208,19 @@ class TestIdentity:
         assert identity.plugin_version == "1"
         assert identity.plugin_version == preset_manifest("copilot").plugin_version
 
+    def test_the_arguments_are_pinned_to_the_version(self) -> None:
+        """Changing the preset's arguments fails here until the version
+        is bumped too: update both together, so a run pinned to the old
+        arguments is refused rather than resumed with new ones."""
+        m = preset_manifest("copilot")
+        assert (m.plugin_version, m.args, m.resume_args) == (
+            "1",
+            ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps",
+             "--output-format", "json"],
+            ["-p", "{prompt}", "--allow-all-tools", "--disable-builtin-mcps",
+             "--output-format", "json", "--resume", "{resume_session_id}"],
+        )
+
     def test_a_version_bump_changes_the_fingerprint(self) -> None:
         """So a run pinned to old arguments is refused, not resumed."""
         base = preset_manifest("copilot", PresetOverrides(binary="/opt/copilot"))
@@ -212,7 +236,7 @@ class TestIdentity:
 
         assert fingerprint(base) != fingerprint(bumped)
 
-    def test_the_session_id_comes_from_the_result_event(self) -> None:
+    def test_the_session_id_is_read_from_copilot_output(self) -> None:
         stdout = "\n".join([
             '{"type":"assistant.message","data":{"content":"OK"},'
             '"id":"0eddbbb8-b1f6-45bd-a578-7ab4fa608fd1"}',

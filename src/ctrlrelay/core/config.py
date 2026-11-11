@@ -190,6 +190,19 @@ class PresetOverrides(BaseModel):
             raise ValueError("must not be empty")
         return v
 
+    @field_validator("model")
+    @classmethod
+    def _model_is_only_a_value(cls, v: str | None) -> str | None:
+        # The model is placed in the argument list, where the adapter
+        # fills placeholders: "{prompt}" would become the task text. A
+        # leading "-" would read as a flag. Either way the override would
+        # reach the arguments it is not allowed to change.
+        if v is not None and ("{" in v or "}" in v or v.startswith("-")):
+            raise ValueError(
+                "must be a model name, without '{', '}' or a leading '-'"
+            )
+        return v
+
 
 class BudgetRule(BaseModel):
     """Limits for runs on issues carrying any of ``labels`` (#223).
