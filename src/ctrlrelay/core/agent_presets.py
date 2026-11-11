@@ -40,8 +40,9 @@ class _Preset:
     version: str
     # How a model override is passed: the flag, and how many leading
     # arguments it goes after in each list (``None`` appends it at the end).
-    # Codex wants it right after its subcommand, so a later positional
-    # (the session id, the prompt) cannot be read as the model.
+    # Codex takes it right after its subcommand (``exec``, ``exec resume``),
+    # as an option of that subcommand ahead of its positionals, the form
+    # checked on #383.
     model_flag: str = "--model"
     model_after: int | None = None
     resume_model_after: int | None = None
