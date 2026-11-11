@@ -1338,7 +1338,8 @@ class ClaudeDispatcher(CliAgentAdapter):
         # of the projects folder the run may see or write. The folder is
         # hidden behind an empty tmpfs, so other projects' transcripts and
         # memory are not visible through it (#364; a hard link elsewhere is
-        # not closed), and this run's own is bound back on top. Made here, since the sandbox cannot create it.
+        # not closed), and this run's own is bound back on top. Made here,
+        # since the sandbox cannot create it.
         transcript_dirs = self._transcript_dirs(working_dir, env)
         projects = Path(os.path.realpath(Path.home() / ".claude" / "projects"))
         for folder in transcript_dirs:
