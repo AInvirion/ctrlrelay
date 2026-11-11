@@ -182,6 +182,14 @@ Step-by-step:
   that arrives later still lands on the session's `pending_resumes` row and
   the scheduled sweeper drives the resume. An unanswered question stays
   routable for `question_ttl_seconds` (default 48 hours), then expires.
+  When it was asked on an issue, the expiry is said there and the issue is
+  labelled `ctrlrelay:unanswered`: the run has stopped, and someone has to
+  decide the question and start the issue again. Nothing removes the label.
+- **A question is retired early only when everything it rests on is
+  closed:** each `#N` it cites, in its own repository unless written
+  `owner/repo#N`, and the issue it was asked on. A question citing
+  `name#N` without an owner cannot be checked that way, so it lasts its
+  full TTL.
 - **Maximum 5 BLOCKED rounds per session.** This bounds the chat noise from a
   pathological loop. After 5 rounds the pipeline gives up.
 - **State is durable.** The checkpoint file and the SQLite state DB persist
