@@ -45,6 +45,7 @@ from ctrlrelay.core.agent_plugins import (
     AgentSelectionError,
     native_session_id_is_safe,
 )
+from ctrlrelay.core.agent_presets import PRESET_NAMES, preset_manifest
 from ctrlrelay.core.binaries import resolve_binary
 from ctrlrelay.core.budget import (
     DEFAULT_POLL_SECONDS as BUDGET_POLL_SECONDS,
@@ -2098,6 +2099,12 @@ def _make_adapter(
             usage_store=usage_store,
         )
     manifest = getattr(agent_config, "plugins", {}).get(t)
+    if manifest is None and t in PRESET_NAMES:
+        # A built-in preset (#384): a manifest built in code, so its safe
+        # arguments cannot be dropped by a hand-written config.
+        manifest = preset_manifest(
+            t, getattr(agent_config, "presets", {}).get(t),
+        )
     if manifest is not None:
         from ctrlrelay.core.generic_cli import GenericCliDispatcher
 
@@ -2124,7 +2131,10 @@ def _make_adapter(
             sandbox=agent_config.sandbox,
             usage_store=usage_store,
         )
-    supported = ["claude", "opencode", *sorted(getattr(agent_config, "plugins", {}))]
+    supported = [
+        "claude", "opencode",
+        *sorted({*PRESET_NAMES, *getattr(agent_config, "plugins", {})}),
+    ]
     raise NotImplementedError(
         f"agent.type={t!r} has no adapter yet. Implement one that "
         "satisfies the AgentAdapter protocol in "
@@ -2197,7 +2207,7 @@ def make_repo_agent_dispatcher(
     # a compatibility promise, not a routing one, so a listed plugin that
     # cannot run under this node's sandbox must not stop the daemon.
     resume_factories: dict[str, Callable[[], AgentAdapter]] = {}
-    for wanted in ("claude", "opencode", *config.agent.plugins):
+    for wanted in ("claude", "opencode", *sorted(PRESET_NAMES), *config.agent.plugins):
         if wanted in by_type:
             continue
 

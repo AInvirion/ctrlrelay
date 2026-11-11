@@ -18,6 +18,7 @@ from ctrlrelay.core.agent_env import (
     DEFAULT_SANDBOX_READONLY_PATHS,
     DEFAULT_SANDBOX_WRITABLE_PATHS,
 )
+from ctrlrelay.core.agent_presets import PRESET_NAMES
 
 CONFIG_FILENAME = "orchestrator.yaml"
 CONFIG_SUBDIR = "config"
@@ -166,6 +167,30 @@ class GenericCliConfig(BaseModel):
         return self
 
 
+class PresetOverrides(BaseModel):
+    """What ``agent.presets.<name>`` may change about a built-in preset (#384).
+
+    Only the binary, the model and the timeout. The arguments are fixed in
+    :mod:`ctrlrelay.core.agent_presets`, so an override cannot add a flag
+    or drop one that keeps the backend safe; an unknown key such as
+    ``args`` fails validation.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    # ``None`` keeps the preset's own binary name.
+    binary: str | None = None
+    model: str | None = None
+    default_timeout_seconds: int | None = Field(default=None, ge=1)
+
+    @field_validator("binary", "model")
+    @classmethod
+    def _not_blank(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError("must not be empty")
+        return v
+
+
 class BudgetRule(BaseModel):
     """Limits for runs on issues carrying any of ``labels`` (#223).
 
@@ -285,6 +310,10 @@ class AgentConfig(BaseModel):
     # Locally enrolled generic CLI manifests, keyed by the agent_type used in
     # repo defaults or an assignment. Reserved built-in names cannot be replaced.
     plugins: dict[str, GenericCliConfig] = Field(default_factory=dict)
+    # Overrides for built-in presets (#384), keyed by preset name. A preset
+    # is usable without an entry here; this only changes its binary, model
+    # or timeout.
+    presets: dict[str, PresetOverrides] = Field(default_factory=dict)
     # Agent types a future control-plane assignment may explicitly select.
     # Empty preserves standalone-only behavior. The type must still be locally
     # enrolled as a built-in or a generic manifest.
@@ -307,7 +336,18 @@ class AgentConfig(BaseModel):
                 )
             if name in ("claude", "opencode"):
                 raise ValueError(f"agent.plugins[{name!r}] replaces a built-in adapter")
-        known = {"claude", "opencode", *self.plugins}
+            if name in PRESET_NAMES:
+                raise ValueError(
+                    f"{name} is a built-in preset; set agent.presets.{name} "
+                    "to change binary, model or timeout"
+                )
+        for name in self.presets:
+            if name not in PRESET_NAMES:
+                raise ValueError(
+                    f"agent.presets[{name!r}]: no such built-in preset; "
+                    f"known presets: {', '.join(sorted(PRESET_NAMES))}"
+                )
+        known = {"claude", "opencode", *PRESET_NAMES, *self.plugins}
         for wanted in self.assignable_types:
             if wanted not in known:
                 raise ValueError(
