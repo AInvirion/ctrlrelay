@@ -337,7 +337,8 @@ This manifest is now built in as the `copilot` preset: set
 `agent.plugins` alone. `agent.presets.copilot` may change only `binary`,
 `model` (passed as `--model`) and `default_timeout_seconds`; the arguments
 are fixed, and a hand-written `agent.plugins.copilot` is refused. The
-manifest below is what the preset runs.
+manifest below is what the preset runs; it is shown for reference and is
+refused if copied into `agent.plugins`.
 
 Checked against Copilot CLI 1.0.107: it starts and answers with GitHub
 credentials stripped (it uses its own stored login), its JSONL output ends with
