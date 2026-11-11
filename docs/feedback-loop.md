@@ -190,7 +190,8 @@ Step-by-step:
   `owner/repo#N` or link to an issue or pull request (in that
   repository), and the issue it was asked on. A question citing a
   reference whose repository cannot be told, such as `name#N` or
-  `PR#N`, is never retired early and lasts its full TTL.
+  `PR#N`, is never retired early: it stays open until it is answered or
+  its TTL ends.
 - **Maximum 5 BLOCKED rounds per session.** This bounds the chat noise from a
   pathological loop. After 5 rounds the pipeline gives up.
 - **State is durable.** The checkpoint file and the SQLite state DB persist

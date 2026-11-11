@@ -92,9 +92,12 @@ def extract_referenced_numbers(question: str) -> list[str]:
 # The prefix takes every slash-joined part, so ``group/sub/repo#12`` is
 # read whole (and refused) rather than as ``sub/repo#12``.
 _REF_WITH_PREFIX_RE = re.compile(r"([\w.-]+(?:/[\w.-]+)*)?#(\d+)(?!\w)")
-# A link to an issue or PR names its repository outright.
+# A link to an issue or PR names its repository outright. The host must
+# start the link (after a scheme, or standing alone), so neither
+# ``notgithub.com/…`` nor ``example.com/github.com/…`` is read as one.
 _REF_URL_RE = re.compile(
-    r"(?<![\w.-])(?:www\.)?github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/"
+    r"(?:https?://|(?<![\w./-]))(?:www\.)?github\.com/"
+    r"([\w.-]+/[\w.-]+)/(?:issues|pull)/"
     r"(\d+)(?!\w)",
     re.IGNORECASE,
 )

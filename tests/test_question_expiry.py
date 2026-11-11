@@ -914,7 +914,12 @@ class TestResolutionTargets:
     async def test_a_link_to_another_host_is_not_a_github_reference(
         self, db: StateDB
     ) -> None:
-        _add(db, "q", "See https://notgithub.com/other/thing/issues/12 and #3", 60)
+        _add(
+            db, "q",
+            "See https://notgithub.com/other/thing/issues/12, "
+            "https://example.com/github.com/other/thing/issues/13 and #3",
+            60,
+        )
         github = AsyncMock()
         github.get_issue_or_pr_state.return_value = _state(closed=True)
 
@@ -922,3 +927,18 @@ class TestResolutionTargets:
 
         probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
         assert probed == [("owner/repo", 3)]
+
+    @pytest.mark.asyncio
+    async def test_a_bare_or_www_github_link_is_read(self, db: StateDB) -> None:
+        _add(
+            db, "q",
+            "See github.com/a/b/pull/4 and https://www.github.com/c/d/issues/5",
+            60,
+        )
+        github = AsyncMock()
+        github.get_issue_or_pr_state.return_value = _state(closed=True)
+
+        await expire_stale_questions(db, github, ttl_seconds=TTL)
+
+        probed = [c.args for c in github.get_issue_or_pr_state.await_args_list]
+        assert probed == [("a/b", 4), ("c/d", 5)]
