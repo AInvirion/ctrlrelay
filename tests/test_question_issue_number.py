@@ -171,6 +171,8 @@ async def test_a_resumed_run_that_blocks_again_names_its_issue(
         session_id="dev-again", pipeline="dev", repo=REPO,
         question="an earlier question", issue_number=13,
     )
+    # It had been posted on the issue; the new question has not been.
+    assert db.record_issue_question("dev-again", 13, 9000, 1)
     assert db.answer_pending_resume("dev-again", "continue")
     agent = AsyncMock()
     agent.agent_type = "claude"
@@ -222,7 +224,8 @@ def test_an_open_dev_row_from_before_is_backfilled(tmp_path: Path) -> None:
     it in; answered, expired and non-dev rows are left as they are."""
     db = StateDB(tmp_path / "state.db")
     now = int(time.time())
-    for sid, pipeline in (("open", "dev"), ("done", "dev"), ("sec", "secops")):
+    rows = (("open", "dev"), ("done", "dev"), ("said", "dev"), ("sec", "secops"))
+    for sid, pipeline in rows:
         db.execute(
             "INSERT INTO sessions (id, pipeline, repo, issue_number, status, "
             "started_at) VALUES (?, ?, ?, 13, 'blocked', ?)",
@@ -231,7 +234,8 @@ def test_an_open_dev_row_from_before_is_backfilled(tmp_path: Path) -> None:
         db.add_pending_resume(
             session_id=sid, pipeline=pipeline, repo=REPO, question=QUESTION,
         )
-    db.expire_pending_resume("done", "ttl")
+    assert db.expire_pending_resume("done", "ttl")
+    assert db.answer_pending_resume("said", "go")
     db.close()
 
     again = StateDB(tmp_path / "state.db")
@@ -241,5 +245,5 @@ def test_an_open_dev_row_from_before_is_backfilled(tmp_path: Path) -> None:
             "SELECT session_id, issue_number FROM pending_resumes"
         ).fetchall()
     }
-    assert numbers == {"open": 13, "done": None, "sec": None}
+    assert numbers == {"open": 13, "done": None, "said": None, "sec": None}
     again.close()

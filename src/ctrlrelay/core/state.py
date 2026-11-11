@@ -501,23 +501,7 @@ class StateDB:
                 self._conn.execute(
                     f"ALTER TABLE pending_resumes ADD COLUMN {col} {kind}"
                 )
-        if pending_cols:
-            # #412: an open dev question saved before its issue number was
-            # stored with it. The dev session row names the issue, so
-            # closing that issue can retire the question. Only open rows,
-            # only where the number is missing, so this is a no-op once
-            # every row has it.
-            self._conn.execute(
-                """UPDATE pending_resumes SET issue_number = (
-                       SELECT s.issue_number FROM sessions s
-                       WHERE s.id = pending_resumes.session_id)
-                   WHERE pipeline = 'dev' AND issue_number IS NULL
-                     AND answered_at IS NULL AND expired_at IS NULL
-                     AND EXISTS (
-                       SELECT 1 FROM sessions s
-                       WHERE s.id = pending_resumes.session_id
-                         AND s.issue_number IS NOT NULL)"""
-            )
+        self._backfill_question_issue_numbers()
 
         health_cols = {
             row[1]
@@ -537,6 +521,48 @@ class StateDB:
 
         self._ensure_issue_finishes()
         self._ensure_dispatch_health_row()
+
+    def _backfill_question_issue_numbers(self) -> None:
+        """#412: an open dev question saved before its issue number was
+        stored with it. The dev session row names the issue, so closing
+        that issue can retire the question.
+
+        Only open dev rows missing the number. It writes only when such a
+        row exists, so an ordinary start takes no write lock here (a start
+        must not wait on another process's read), and it is a no-op once
+        every row has the number. A database too old to have the columns
+        is skipped."""
+        session_cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(sessions)")
+        }
+        pending_cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(pending_resumes)"
+            )
+        }
+        if "issue_number" not in session_cols or not {
+            "issue_number", "expired_at",
+        } <= pending_cols:
+            return
+        where = """WHERE pipeline = 'dev' AND issue_number IS NULL
+                     AND answered_at IS NULL AND expired_at IS NULL
+                     AND EXISTS (
+                       SELECT 1 FROM sessions s
+                       WHERE s.id = pending_resumes.session_id
+                         AND s.issue_number IS NOT NULL)"""
+        needed = self._conn.execute(
+            f"SELECT 1 FROM pending_resumes {where} LIMIT 1"
+        ).fetchone()
+        if needed is None:
+            return
+        self._conn.execute(
+            f"""UPDATE pending_resumes SET issue_number = (
+                    SELECT s.issue_number FROM sessions s
+                    WHERE s.id = pending_resumes.session_id)
+                {where}"""
+        )
 
     def _ensure_issue_finishes(self) -> None:
         """Create ``issue_finishes`` (#230), filling it from the ``merged``
