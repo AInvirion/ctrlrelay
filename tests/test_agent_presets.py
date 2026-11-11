@@ -354,12 +354,14 @@ class TestCodexPreset:
         """Not at the end, where Codex would read it after the positionals."""
         fresh, resumed = _argvs(_codex(model="gpt-5.1-codex"), tmp_path)
 
-        assert fresh[:4] == ["/opt/codex", "exec", "-m", "gpt-5.1-codex"]
-        assert resumed[:5] == [
-            "/opt/codex", "exec", "resume", "-m", "gpt-5.1-codex",
+        assert fresh == [
+            "/opt/codex", "exec", "-m", "gpt-5.1-codex", "--json",
+            "--dangerously-bypass-approvals-and-sandbox", "do it",
         ]
-        assert fresh[-1] == "do it"
-        assert resumed[-2:] == [SESSION, "answer"]
+        assert resumed == [
+            "/opt/codex", "exec", "resume", "-m", "gpt-5.1-codex", "--json",
+            "--dangerously-bypass-approvals-and-sandbox", SESSION, "answer",
+        ]
 
     def test_the_session_id_is_the_thread_id_from_codex_output(self) -> None:
         # Event shapes recorded from Codex CLI 0.167.0 on #383; the token
@@ -468,15 +470,24 @@ class TestPresetsMeasureUsage:
     def test_the_adapter_reports_usage(self, make) -> None:
         assert make().capabilities.usage is True
 
-    @pytest.mark.parametrize("name,output", [
-        ("copilot", "COPILOT_FRESH"),
-        ("codex", "CODEX_FRESH"),
+    @pytest.mark.parametrize("name,output,expected", [
+        # Copilot reports input without its cache reads.
+        ("copilot", "COPILOT_FRESH", (5197, 7168, 0, 5)),
+        # Codex's input_tokens (15397) includes its 12160 cached reads.
+        ("codex", "CODEX_FRESH", (15397 - 12160, 12160, 0, 5)),
     ])
-    def test_real_output_is_read_as_an_exact_count(self, name, output) -> None:
+    def test_real_output_is_read_as_an_exact_count(
+        self, name, output, expected,
+    ) -> None:
         import tests.test_generic_cli_usage as measured
+        from ctrlrelay.core.budget import RunUsage
         from ctrlrelay.core.generic_cli import read_usage_events
 
         got = read_usage_events(
             getattr(measured, output), preset_manifest(name).usage,
         )
-        assert got.complete and got.counted > 0
+        inp, read, write, out = expected
+        assert got == RunUsage(
+            input_tokens=inp, cache_read_tokens=read,
+            cache_creation_tokens=write, output_tokens=out,
+        )
