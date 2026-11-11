@@ -217,6 +217,8 @@ async def test_a_sandboxed_agent_reaches_only_its_worktree_tmp_state_and_cache(
         # Its own transcript folder only (#362), bound over an empty tmpfs
         # that hides every other project (#364).
         "write_agent_state": "yes",
+        # Fails because `-other` is not there at all in the sandbox, which
+        # is the point of #364; the host copy is checked below.
         "write_other_project": "no",
         "new_project_folder": "yes",
         "read_other_transcript": "no",

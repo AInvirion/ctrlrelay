@@ -799,8 +799,10 @@ login, does not):
 - last, `~/.claude/projects` is replaced by an empty folder, whatever
   `sandbox_hide_paths` says, and only the run's own transcript folder is
   shown in it, writable. Other projects' transcripts and memory, which can
-  hold anything pasted into a session, are not readable at all. Anything
-  the agent writes elsewhere in that folder is thrown away with the run.
+  hold anything pasted into a session, are not visible through that folder
+  (a hard link to one of them elsewhere is a second way in, as below).
+  Anything the agent writes elsewhere in that folder is thrown away with
+  the run.
 
 Package caches (`XDG_CACHE_HOME`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`,
 `npm_config_cache`, `GOMODCACHE`, `GRADLE_USER_HOME` and `CARGO_HOME`) point at
