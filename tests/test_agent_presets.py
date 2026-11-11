@@ -401,3 +401,17 @@ class TestCodexPreset:
         identity = _codex().agent_identity
         assert identity.plugin_id == "generic:codex"
         assert identity.plugin_version == "1"
+
+
+@pytest.mark.parametrize("name", sorted(PRESET_NAMES))
+def test_a_preset_refuses_a_node_that_asks_for_a_sandbox(name) -> None:
+    """Both presets run their CLI unconfined (Codex in bypass mode, because
+    its own sandbox cannot commit in a linked worktree, #383). That is
+    acceptable only where the operator chose `agent.sandbox: none`; on a
+    bwrap node the adapter must refuse rather than run unconfined."""
+    cfg = AgentConfig(
+        type=name, sandbox="bwrap",
+        presets={name: {"binary": f"/opt/{name}"}},
+    )
+    with pytest.raises(ValueError, match="Refusing to run unconfined"):
+        make_agent_dispatcher(cfg, outcome_hook=None, usage_store=None)
