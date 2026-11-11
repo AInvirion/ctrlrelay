@@ -223,8 +223,18 @@ def _js_function(script: str, name: str) -> str:
     return script[m.end(): i - 1]
 
 
+def _scripts_of(html: str) -> str:
+    """Every inline script block of the page, joined. Case-insensitive and
+    tolerant of attributes, so a `<script type="module">` or `</SCRIPT >`
+    cannot make every absence check below scan an empty string. Refuses a
+    page with no script at all for the same reason."""
+    blocks = re.findall(r"<script\b[^>]*>(.*?)</script\s*>", html, re.S | re.I)
+    assert blocks, "no <script> block found in the page"
+    return "\n".join(blocks)
+
+
 def _script() -> str:
-    return "\n".join(re.findall(r"<script>(.*?)</script>", _page_source(), re.S))
+    return _scripts_of(_page_source())
 
 
 def test_null_section_counts_read_unknown() -> None:
@@ -316,7 +326,7 @@ def test_page_source_has_no_html_parsing_dom_sinks() -> None:
     textContent/createElement. That the hostile values reach the JSON as
     plain strings is test_api_status_contract."""
     html = _page_source()
-    script = "\n".join(re.findall(r"<script>(.*?)</script>", html, re.S))
+    script = _scripts_of(html)
     # Present case: the page really does build its DOM in this script.
     assert "textContent" in script and "createElement" in script
     for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
