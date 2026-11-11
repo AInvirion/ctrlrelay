@@ -447,8 +447,8 @@ session total (dev and task runs) it applies between rounds: a session already
 at its hard limit is refused before its next round (a resume or a CI fix)
 starts. A lane that keeps no session total, such as the security sweep, gets
 the limit per spawn, and a spawn measured only at exit cannot be held to it:
-its usage is recorded and the soft-limit warning still fires, but nothing is
-stopped. Measured mappings, from real output:
+its usage is returned with the run and a passed soft limit is logged, but
+nothing is stopped. Measured mappings, from real output:
 
 | CLI | `event_type` | token fields |
 |---|---|---|
