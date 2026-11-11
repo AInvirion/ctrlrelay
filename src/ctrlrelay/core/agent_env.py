@@ -179,7 +179,7 @@ def _is_foreign_provider_key(name: str, allow: Sequence[str]) -> bool:
     return not any(fnmatchcase(name, pattern) for pattern in allow)
 
 
-def strip_relay_and_provider_secrets(
+def strip_relay_and_foreign_provider_vars(
     base: Mapping[str, str],
     *,
     provider_env_allow: Sequence[str],

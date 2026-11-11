@@ -25,19 +25,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 from ctrlrelay.core.agent_env import (
+    CLAUDE_PROVIDER_ENV,
     DEFAULT_SANDBOX_CACHE_DIR,
     DEFAULT_SANDBOX_HIDE_PATHS,
     DEFAULT_SANDBOX_READONLY_PATHS,
     DEFAULT_SANDBOX_WRITABLE_PATHS,
     SandboxUnavailableError,
     agent_cache_env,
-    CLAUDE_PROVIDER_ENV,
     build_agent_env,
-    strip_relay_and_provider_secrets,
     bwrap_args_via_fd,
     bwrap_prefix,
     git_dirs,
     resolve_bwrap,
+    strip_relay_and_foreign_provider_vars,
 )
 from ctrlrelay.core.agent_plugins import (
     AgentCapabilities,
@@ -406,7 +406,7 @@ class CliAgentAdapter:
         """
         return tuple(getattr(self, "env_allow", ()))
 
-    def _agent_secret_env(
+    def _agent_env_for_run(
         self, base_env: dict[str, str], github_access: bool,
         private_root: Path | None,
     ) -> tuple[dict[str, str], list[str]]:
@@ -419,7 +419,7 @@ class CliAgentAdapter:
         only through ``provider_env_allow``, whoever put it in the env.
         """
         if github_access:
-            return strip_relay_and_provider_secrets(
+            return strip_relay_and_foreign_provider_vars(
                 base_env, provider_env_allow=self.provider_env_allow,
             )
         assert private_root is not None
@@ -503,7 +503,7 @@ class CliAgentAdapter:
             private_root = Path(tempfile.mkdtemp(prefix="ctrlrelay-agent-"))
             (private_root / "gh").mkdir()
             (private_root / "run").mkdir(mode=0o700)
-        env, stripped = self._agent_secret_env(
+        env, stripped = self._agent_env_for_run(
             base_env, github_access, private_root,
         )
         env["CTRLRELAY_SESSION_ID"] = session_id
@@ -1303,12 +1303,12 @@ class ClaudeDispatcher(CliAgentAdapter):
         private_root: Path | None = None
         prefix: list[str] = []
         if github_access:
-            env, stripped = self._agent_secret_env(base_env, True, None)
+            env, stripped = self._agent_env_for_run(base_env, True, None)
         else:
             private_root = Path(tempfile.mkdtemp(prefix="ctrlrelay-agent-"))
             (private_root / "gh").mkdir()
             (private_root / "run").mkdir(mode=0o700)
-            env, stripped = self._agent_secret_env(
+            env, stripped = self._agent_env_for_run(
                 base_env, False, private_root,
             )
             if self._bwrap is not None:
