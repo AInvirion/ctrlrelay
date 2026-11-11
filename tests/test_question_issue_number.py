@@ -166,13 +166,14 @@ async def test_a_resumed_run_that_blocks_again_names_its_issue(
          identity.agent_type, identity.plugin_id),
     )
     db.commit()
-    # The earlier question, answered: the re-block rewrites this row.
+    # The earlier question, answered: the re-block rewrites this row. It
+    # carries a different issue number and a posted comment, so the rewrite
+    # is seen replacing both rather than leaving them as they were.
     db.add_pending_resume(
         session_id="dev-again", pipeline="dev", repo=REPO,
-        question="an earlier question", issue_number=13,
+        question="an earlier question", issue_number=99,
     )
-    # It had been posted on the issue; the new question has not been.
-    assert db.record_issue_question("dev-again", 13, 9000, 1)
+    assert db.record_issue_question("dev-again", 99, 9000, 1)
     assert db.answer_pending_resume("dev-again", "continue")
     agent = AsyncMock()
     agent.agent_type = "claude"
