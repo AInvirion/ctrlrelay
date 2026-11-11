@@ -21,6 +21,7 @@ import threading
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from importlib import resources
 from pathlib import Path
 
@@ -223,8 +224,45 @@ def _js_function(script: str, name: str) -> str:
     return script[m.end(): i - 1]
 
 
+class _InlineScripts(HTMLParser):
+    """Collects the text of every inline <script> element. A real HTML
+    parser, not a regex: tag case, attributes (quoted `>` included),
+    `</script >` and comments are all handled the way a browser would."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.blocks: list[str] = []
+        self._inside = False
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        # A <script src=...> runs the file, never its body text.
+        if tag == "script" and not any(name == "src" for name, _ in attrs):
+            self._inside = True
+            self.blocks.append("")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script":
+            self._inside = False
+
+    def handle_data(self, data: str) -> None:
+        if self._inside:
+            self.blocks[-1] += data
+
+
+def _scripts_of(html: str) -> str:
+    """Every inline script of the page, joined. Refuses a page whose inline
+    scripts are all empty, so a changed tag or a move to an external file
+    cannot leave every absence check below scanning an empty string."""
+    parser = _InlineScripts()
+    parser.feed(html)
+    parser.close()
+    script = "\n".join(parser.blocks)
+    assert script.strip(), "no inline <script> code found in the page"
+    return script
+
+
 def _script() -> str:
-    return "\n".join(re.findall(r"<script>(.*?)</script>", _page_source(), re.S))
+    return _scripts_of(_page_source())
 
 
 def test_null_section_counts_read_unknown() -> None:
@@ -316,7 +354,7 @@ def test_page_source_has_no_html_parsing_dom_sinks() -> None:
     textContent/createElement. That the hostile values reach the JSON as
     plain strings is test_api_status_contract."""
     html = _page_source()
-    script = "\n".join(re.findall(r"<script>(.*?)</script>", html, re.S))
+    script = _scripts_of(html)
     # Present case: the page really does build its DOM in this script.
     assert "textContent" in script and "createElement" in script
     for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
