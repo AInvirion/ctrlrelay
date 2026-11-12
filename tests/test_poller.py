@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -389,6 +391,46 @@ class TestIssuePoller:
 
         assert len(handled_issues) == 1
         assert handled_issues[0] == ("owner/repo", 123)
+
+    @pytest.mark.asyncio
+    async def test_a_batch_skipped_entirely_does_not_stop_the_loop(self) -> None:
+        """#417's leading hypothesis, and it is FALSE -- kept as the record.
+
+        The last poll before 33 minutes of silence returned five issues and
+        skipped all five as claimed elsewhere, so an all-skipped batch looked
+        like the thing that stopped pickup. It is not: the dispatch loop
+        ``continue``s past each skip, increments, sleeps and polls again. This
+        asserts that, so nobody spends another evening on it.
+        """
+        from ctrlrelay.core.poller import run_poll_loop
+
+        class AllSkipped:
+            def __init__(self) -> None:
+                self.polls = 0
+
+            async def poll(self):
+                self.polls += 1
+                if self.polls > 1:
+                    return []
+                return [
+                    {"repo": "owner/repo", "issue": {"number": n}}
+                    for n in (787, 900, 901, 903, 904)
+                ]
+
+            async def recheck_before_dispatch(self, repo, issue):
+                return None  # every one of the five is claimed elsewhere
+
+        poller = AllSkipped()
+        handled: list[int] = []
+
+        async def handler(repo: str, issue: dict) -> None:
+            handled.append(issue["number"])
+
+        await run_poll_loop(
+            poller=poller, handler=handler, interval=0, max_iterations=3,
+        )
+        assert poller.polls == 3, "an all-skipped batch stopped the loop"
+        assert handled == []
 
     @pytest.mark.asyncio
     async def test_poll_propagates_cancellation(self, tmp_path: Path) -> None:
@@ -789,9 +831,13 @@ class TestForeignAssignmentFilter:
             results = await poller.poll()
 
         assert results == []
-        # Must still be marked seen so we don't re-check the same issue every poll
-        assert 1 in poller.seen_issues["owner/repo-a"]
-        assert 1 in poller.seen_issues["owner/repo-b"]
+        # PARKED, not recorded as handled (#417). The events endpoint is still
+        # not re-hit every poll -- that cost guarantee is kept by the recheck
+        # window -- but the refusal expires, so correcting the reason for it
+        # (an account missing from allowed_accounts) takes effect by itself.
+        for repo in ("owner/repo-a", "owner/repo-b"):
+            assert 1 not in poller.seen_issues.get(repo, set())
+            assert poller.recheck_after[repo][1] > time.time()
 
         # Emits a foreign_assignment log event with identifying fields
         foreign_records = [
@@ -1134,6 +1180,9 @@ class TestIncludeLabelsFilter:
         results = await poller.poll()
 
         assert results == []
+        # Marked seen: this is the EXCLUDE path, which #417 left alone on
+        # purpose -- an exclusion outliving its config keeps an operator-only
+        # issue away from the pipeline, which is the safe direction.
         assert 5 in poller.seen_issues["owner/repo-a"]
 
     @pytest.mark.asyncio
@@ -1269,14 +1318,18 @@ class TestIncludeLabelsFilter:
         assert 42 in poller.seen_issues["owner/repo-a"]
 
     @pytest.mark.asyncio
-    async def test_pre_80_repos_still_mark_foreign_assigned_seen(
+    async def test_pre_80_repos_park_foreign_assigned_rather_than_marking_it_seen(
         self, mock_github: MagicMock, state_file: Path
     ) -> None:
-        """Migration guard: repos WITHOUT include_labels keep the
-        pre-#80 foreign-assignment dedup. Otherwise we'd re-check the
-        assignment-events endpoint every poll for every foreign
-        assignment in every repo, which is unnecessary traffic when
-        the operator hasn't opted into label triggers at all."""
+        """Migration guard: repos WITHOUT include_labels keep the pre-#80
+        foreign-assignment dedup -- otherwise we would re-check the
+        assignment-events endpoint every poll for every foreign assignment in
+        every repo, which is unnecessary traffic when the operator has not
+        opted into label triggers at all.
+
+        It keeps it as a recheck WINDOW rather than a permanent record (#417):
+        the traffic is still bounded, and a refusal no longer outlives the
+        reason for it."""
         mock_github.list_assigned_issues.return_value = [
             make_issue(7, "foreign-assigned", assignees=["alice"]),
         ]
@@ -1292,8 +1345,62 @@ class TestIncludeLabelsFilter:
         )
 
         await poller.poll()
-        # Foreign-assigned IS marked seen on pre-#80 repos.
-        assert 7 in poller.seen_issues["owner/repo-a"]
+        # Foreign-assigned is PARKED on pre-#80 repos, not marked seen (#417):
+        # `seen_issues` is monotonic and survives restarts, so a refusal left
+        # there outlived the reason for it and no correction could undo it.
+        assert 7 not in poller.seen_issues.get("owner/repo-a", set())
+        assert poller.recheck_after["owner/repo-a"][7] > time.time()
+
+    @pytest.mark.asyncio
+    async def test_correcting_allowed_accounts_recovers_a_refused_issue(
+        self, mock_github: MagicMock, state_file: Path
+    ) -> None:
+        """#417, in one test: a refusal must not outlive its reason.
+
+        The whole incident was this. Every issue a teammate had assigned was
+        refused as a foreign assignment because that account was not yet in
+        ``allowed_accounts``. Adding the account fixed the gate and could not
+        undo the refusals, because the refusal had been written into
+        ``seen_issues`` -- which is monotonic, persists across restarts, and is
+        consulted before anything else. Twenty-two issues on one repo became
+        permanently invisible, with no log line once they were in there, and the
+        only cure was editing the state file by hand.
+
+        Before the fix this test cannot pass: the first poll marks the issue
+        seen, and no later poll offers it again whatever the config says.
+        """
+        mock_github.list_assigned_issues.return_value = [
+            make_issue(523, "handed over by a teammate", assignees=["alice"]),
+        ]
+        # dantoac assigned alice: the first argument is the account that MADE
+        # the assignment, so this is a teammate handing work over -- exactly
+        # what `allowed_accounts` exists to permit, and what was refused.
+        mock_github.list_assignment_events.return_value = [
+            make_assigned_event("dantoac", "alice"),
+        ]
+        poller = IssuePoller(
+            github=mock_github,
+            username="alice",
+            repos=["owner/repo-a"],
+            state_file=state_file,
+            # The config gap: dantoac may hand over work, and nothing says so.
+        )
+
+        assert await poller.poll() == [], "a foreign assignment was dispatched"
+        assert 523 not in poller.seen_issues.get("owner/repo-a", set()), (
+            "the refusal was recorded as handled, so no correction can undo it"
+        )
+
+        # The operator corrects the config, exactly as happened.
+        poller.allowed_accounts_by_repo = {"owner/repo-a": {"dantoac"}}
+        # ... and the recheck window elapses. Nothing else: no restart, no
+        # edit of poller_state.json, which is the point.
+        poller.recheck_after["owner/repo-a"][523] = time.time() - 1
+
+        results = await poller.poll()
+        assert [r["issue"]["number"] for r in results] == [523]
+        # Accepted now, so recorded as handled -- which is what seen_issues is for.
+        assert 523 in poller.seen_issues["owner/repo-a"]
 
     @pytest.mark.asyncio
     async def test_seed_only_currently_eligible_in_include_labels_mode(
@@ -1342,7 +1449,7 @@ class TestIncludeLabelsFilter:
         assert 100 not in seen
 
     @pytest.mark.asyncio
-    async def test_events_check_failure_marks_seen_even_in_include_labels_mode(
+    async def test_events_check_failure_parks_the_issue_even_in_include_labels_mode(
         self, mock_github: MagicMock, state_file: Path
     ) -> None:
         """Codex P2 round-4 on #115: an events-API exception during
@@ -1370,10 +1477,12 @@ class TestIncludeLabelsFilter:
 
         results = await poller.poll()
         assert results == []
-        # Despite include_labels being configured, the transient
-        # failure marks the issue seen — otherwise every poll during
-        # the outage would retry the same /events call.
-        assert 66 in poller.seen_issues["owner/repo-a"]
+        # Despite include_labels being configured, the transient failure parks
+        # the issue (#417) rather than recording it as handled: the retry churn
+        # the old behaviour avoided is still avoided, divided by the window,
+        # and the issue returns on its own when the API does.
+        assert 66 not in poller.seen_issues.get("owner/repo-a", set())
+        assert poller.recheck_after["owner/repo-a"][66] > time.time()
 
     @pytest.mark.asyncio
     async def test_label_query_failure_does_not_starve_assignee_path(
