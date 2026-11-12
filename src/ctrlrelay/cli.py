@@ -4854,6 +4854,34 @@ def poller_stop(
         pid_file.unlink(missing_ok=True)
 
 
+def _live_poller_pid(config_path: str | None) -> int | None:
+    """The pid of a RUNNING poller, or ``None``.
+
+    Signal 0, not the existence of the pid file: a file left behind by a killed
+    daemon would refuse a safe edit, and that is the lesser of the two wrong
+    answers -- the worse one is treating a running daemon as absent because its
+    file was removed. An unreadable or malformed file is treated as no poller,
+    because it tells us nothing and `poller stop` already handles that case.
+    """
+    import os
+
+    pid_file = _get_poller_pid_file(config_path)
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        # It exists and belongs to someone else: still a running process.
+        return pid
+    return pid
+
+
 @poller_app.command("forget")
 def poller_forget(
     target: str = typer.Argument(
@@ -4877,14 +4905,17 @@ def poller_forget(
 
     This removes the record so the next poll considers the issue from scratch.
     It does not assign, label or claim anything: if the issue still fails
-    whatever gate recorded it, it is recorded again, which is the honest
-    outcome rather than a forced run.
+    whatever gate recorded it, it is refused again -- parked for a recheck on
+    the authorization path, recorded again on the exclude path -- which is the
+    honest outcome rather than a forced run.
 
-    **A running poller will undo this.** It holds ``seen_issues`` in memory and
-    writes the whole set back at the end of every poll, so an edit made from
-    outside is overwritten within one interval. The command says so and names
-    the restart when it finds a poller running; there is no IPC to reach the
-    live set with.
+    **It refuses to run while a poller is live, and that is not caution.** The
+    daemon holds ``seen_issues`` in memory and writes the whole set back after
+    every poll, so an edit from outside is both undone AND unsafe: this command
+    reads the file, edits its own copy and writes it back, so a record the
+    daemon accepted between that read and that write is **lost**, and a lost
+    acceptance means the issue is handled twice. There is no IPC and no lock to
+    make that safe, so the contract is that the daemon is stopped first.
     """
     from ctrlrelay.core.poller import IssuePoller
 
@@ -4898,6 +4929,24 @@ def poller_forget(
     number = int(number_text)
 
     config = _load_config_or_exit(config_path)
+
+    # Before reading or writing anything: a live daemon makes this unsafe, not
+    # merely ineffective. Liveness is signal 0 to the recorded pid, not the
+    # existence of the file -- a stale pid file would otherwise refuse a safe
+    # edit, and a running daemon whose file was removed would get the
+    # dangerous answer.
+    live = _live_poller_pid(config_path)
+    if live is not None:
+        console.print(
+            f"[red]A poller is running (PID {live}).[/red] Stop it first: this "
+            "edits the state file the daemon rewrites from memory after every "
+            "poll, so the edit would be undone and a record it accepted in the "
+            "meantime would be lost.\n"
+            "  ctrlrelay poller stop && ctrlrelay poller forget "
+            f"{repo}#{number} && ctrlrelay poller start"
+        )
+        raise typer.Exit(1)
+
     state_file = config.paths.state_db.parent / "poller_state.json"
     if not state_file.exists():
         console.print(f"[yellow]No poller state at {state_file}[/yellow]")
@@ -4922,18 +4971,10 @@ def poller_forget(
         raise typer.Exit(1)
 
     poller.unmark_seen(repo, number)
-    console.print(f"[green]{repo}#{number} forgotten[/green] in {state_file}.")
-
-    pid_file = _get_poller_pid_file(config_path)
-    if pid_file.exists():
-        console.print(
-            "[yellow]A poller is running and will overwrite this[/yellow] — it "
-            "keeps the record in memory and rewrites the file after every poll. "
-            "Restart it for this to take effect:\n"
-            "  ctrlrelay poller stop && ctrlrelay poller start"
-        )
-    else:
-        console.print("The next poll will consider it again.")
+    console.print(
+        f"[green]{repo}#{number} forgotten[/green] in {state_file}. "
+        "The next poll will consider it again."
+    )
 
 
 @poller_app.command("status")

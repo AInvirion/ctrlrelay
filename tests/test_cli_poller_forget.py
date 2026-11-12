@@ -25,8 +25,17 @@ runner = CliRunner()
 
 
 @pytest.fixture
-def config_and_state(sample_config_dict: dict, tmp_path: Path) -> tuple[Path, Path]:
-    """A config whose state lives under ``tmp_path``, and its state file."""
+def config_and_state(
+    sample_config_dict: dict, tmp_path: Path, monkeypatch
+) -> tuple[Path, Path]:
+    """A config whose state lives under ``tmp_path``, and its state file.
+
+    ``_live_poller_pid`` is stubbed to "no poller" by default. Without it these
+    tests would pass or fail on whether the machine running them happens to
+    have a poller pid file, which is not what any of them is about; the two
+    that ARE about liveness override it.
+    """
+    monkeypatch.setattr("ctrlrelay.cli._live_poller_pid", lambda _c: None)
     sample_config_dict["paths"] = dict(sample_config_dict.get("paths") or {})
     sample_config_dict["paths"]["state_db"] = str(tmp_path / "state.db")
     config_path = tmp_path / "orchestrator.yaml"
@@ -62,47 +71,73 @@ def test_forget_removes_the_seen_record(config_and_state) -> None:
     assert saved["seen_issues"]["AInvirion/task-orchestrator"] == [547]
 
 
-def test_forget_warns_that_a_running_poller_will_undo_it(
-    config_and_state, tmp_path: Path, monkeypatch
+def test_forget_refuses_while_a_poller_is_live_and_changes_nothing(
+    config_and_state, monkeypatch
 ) -> None:
-    """Measured, not assumed: `_save_state` writes the whole in-memory
-    ``seen_issues`` at the end of every poll, so an edit from outside is gone
-    within one interval. Saying "forgotten" without saying that would send an
-    operator away believing a thing that unwinds itself."""
+    """Refused BEFORE any read or write, and the state file is untouched.
+
+    Not caution: this command reads the file, edits its own copy and writes it
+    back, so a record the daemon accepted between that read and that write is
+    lost -- and a lost acceptance means the issue is handled twice. There is no
+    IPC and no lock, so the contract is that the daemon is stopped.
+
+    Liveness is the real mechanism, not the pid file's existence: this uses a
+    pid that IS alive (our own), so the test cannot pass merely because a file
+    was created.
+    """
+    import os
+
     config_path, state_file = config_and_state
-    _write_state(state_file, {"owner/repo": [1]})
-    pid_file = tmp_path / "poller.pid"
-    pid_file.write_text("4242")
+    before = json.dumps({"seen_issues": {"owner/repo": [1]},
+                         "last_poll": "2026-11-12T22:28:10+00:00"})
+    state_file.write_text(before)
     monkeypatch.setattr(
-        "ctrlrelay.cli._get_poller_pid_file", lambda _c: pid_file,
+        "ctrlrelay.cli._live_poller_pid", lambda _c: os.getpid(),
     )
 
     result = runner.invoke(
         app, ["poller", "forget", "owner/repo#1", "--config", str(config_path)],
     )
 
-    assert result.exit_code == 0, result.output
-    assert "will overwrite this" in result.output
+    assert result.exit_code == 1, result.output
+    assert "Stop it first" in result.output
     assert "poller stop" in result.output
+    # The state file is byte-identical: nothing was read-modify-written.
+    assert state_file.read_text() == before
 
 
-def test_forget_does_not_warn_when_no_poller_is_running(
-    config_and_state, tmp_path: Path, monkeypatch
+def test_liveness_is_signal_zero_not_the_pid_files_existence(
+    tmp_path: Path, monkeypatch
 ) -> None:
-    config_path, state_file = config_and_state
-    _write_state(state_file, {"owner/repo": [1]})
-    monkeypatch.setattr(
-        "ctrlrelay.cli._get_poller_pid_file",
-        lambda _c: tmp_path / "absent.pid",
-    )
+    """A stale pid file must not read as a running poller.
 
-    result = runner.invoke(
-        app, ["poller", "forget", "owner/repo#1", "--config", str(config_path)],
-    )
+    Both directions, because only one of them is safe to get wrong: a stale
+    file refusing a safe edit is an annoyance, a running daemon read as absent
+    is the lost-update this command exists to avoid.
+    """
+    import os
 
-    assert result.exit_code == 0, result.output
-    assert "will overwrite" not in result.output
-    assert "next poll will consider it again" in result.output
+    from ctrlrelay.cli import _live_poller_pid
+
+    pid_file = tmp_path / "poller.pid"
+    monkeypatch.setattr("ctrlrelay.cli._get_poller_pid_file", lambda _c: pid_file)
+
+    # Alive: our own process.
+    pid_file.write_text(str(os.getpid()))
+    assert _live_poller_pid(None) == os.getpid()
+
+    # Stale: a pid that cannot be running. PID 0 and negatives are refused
+    # outright because os.kill(0, 0) signals the whole process group.
+    pid_file.write_text("0")
+    assert _live_poller_pid(None) is None
+    pid_file.write_text("-1")
+    assert _live_poller_pid(None) is None
+
+    # Unreadable or absent tells us nothing, which is not a poller.
+    pid_file.write_text("not a pid")
+    assert _live_poller_pid(None) is None
+    pid_file.unlink()
+    assert _live_poller_pid(None) is None
 
 
 def test_forget_says_so_when_there_was_nothing_to_forget(config_and_state) -> None:
