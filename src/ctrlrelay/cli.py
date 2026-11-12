@@ -4854,6 +4854,88 @@ def poller_stop(
         pid_file.unlink(missing_ok=True)
 
 
+@poller_app.command("forget")
+def poller_forget(
+    target: str = typer.Argument(
+        ..., metavar="OWNER/REPO#NUMBER",
+        help="The issue to offer again, e.g. AInvirion/task-orchestrator#523.",
+    ),
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to orchestrator.yaml (default: auto-discover; see $CTRLRELAY_CONFIG).",
+    ),
+) -> None:
+    """Offer an issue to the poller again (#417).
+
+    The poller records an issue it has handled so it is not picked up twice,
+    and that record is deliberately permanent. There was no way to undo one,
+    so an issue recorded for a reason that no longer applies was invisible for
+    ever and the only cure was editing ``poller_state.json`` by hand -- which
+    two of this tool's own error messages told operators to do.
+
+    This removes the record so the next poll considers the issue from scratch.
+    It does not assign, label or claim anything: if the issue still fails
+    whatever gate recorded it, it is recorded again, which is the honest
+    outcome rather than a forced run.
+
+    **A running poller will undo this.** It holds ``seen_issues`` in memory and
+    writes the whole set back at the end of every poll, so an edit made from
+    outside is overwritten within one interval. The command says so and names
+    the restart when it finds a poller running; there is no IPC to reach the
+    live set with.
+    """
+    from ctrlrelay.core.poller import IssuePoller
+
+    repo, _, number_text = target.partition("#")
+    if not _ or repo.count("/") != 1 or not number_text.isdigit():
+        console.print(
+            f"[red]Not an issue reference:[/red] {target!r}. "
+            "Expected OWNER/REPO#NUMBER, e.g. AInvirion/ctrlrelay#417."
+        )
+        raise typer.Exit(2)
+    number = int(number_text)
+
+    config = _load_config_or_exit(config_path)
+    state_file = config.paths.state_db.parent / "poller_state.json"
+    if not state_file.exists():
+        console.print(f"[yellow]No poller state at {state_file}[/yellow]")
+        raise typer.Exit(1)
+
+    # `github=None` is safe here: nothing below makes a call, and the
+    # constructor only stores it. Reusing IssuePoller rather than editing the
+    # JSON means this writes the state in exactly the format the poller reads.
+    poller = IssuePoller(
+        github=None, username="", repos=[], state_file=state_file,
+    )
+    # Only `seen_issues`: `recheck_after` is in-memory and is not written to
+    # the state file at all, so there is never a park here to clear -- which is
+    # also why a parked refusal cannot outlive a restart.
+    was_seen = number in poller.seen_issues.get(repo, set())
+    if not was_seen:
+        console.print(
+            f"[yellow]{repo}#{number} is not recorded[/yellow] — the poller "
+            "already considers it, so nothing changed. If it is not being "
+            "picked up, the reason is a gate rather than this record."
+        )
+        raise typer.Exit(1)
+
+    poller.unmark_seen(repo, number)
+    console.print(f"[green]{repo}#{number} forgotten[/green] in {state_file}.")
+
+    pid_file = _get_poller_pid_file(config_path)
+    if pid_file.exists():
+        console.print(
+            "[yellow]A poller is running and will overwrite this[/yellow] — it "
+            "keeps the record in memory and rewrites the file after every poll. "
+            "Restart it for this to take effect:\n"
+            "  ctrlrelay poller stop && ctrlrelay poller start"
+        )
+    else:
+        console.print("The next poll will consider it again.")
+
+
 @poller_app.command("status")
 def poller_status(
     config_path: str | None = typer.Option(
