@@ -39,6 +39,17 @@ _TRANSIENT_POLL_ERRORS = (TimeoutError, GitHubError, OSError)
 # the existing per-label isolation (log + continue), so assignee-
 # triggered backlog and other labels still seed cleanly.
 _SEED_LABEL_RETRY_ATTEMPTS = 3
+# How long a transient events-API failure parks an issue before it is offered
+# again (#417): short enough that an outage heals with no operator action,
+# long enough that the retry is not once per poll.
+_EVENTS_FAILURE_RECHECK_SECONDS = 900.0
+
+# How long a CONFIRMED refusal (a foreign assignment) parks one. Longer,
+# because the answer rarely changes -- short enough that correcting
+# ``allowed_accounts`` takes effect without touching the state file, which
+# was the whole of #417.
+_REFUSAL_RECHECK_SECONDS = 1800.0
+
 _SEED_LABEL_RETRY_SLEEP_SECONDS = 2.0
 
 # After this many consecutive per-repo failures, escalate log level to
@@ -841,20 +852,40 @@ class IssuePoller:
                     # else since it was first held.
                     pass
                 elif events_check_failed:
-                    # Transient events-API failure (codex P2 round-4).
-                    # Mark seen regardless of include_labels to avoid
-                    # retry churn during an outage — would otherwise
-                    # hit /issues/{n}/events every poll until the API
-                    # recovers. Tradeoff: if a teammate later adds an
-                    # opt-in label while this issue is in seen_for_repo,
-                    # the label won't re-trigger this specific issue.
-                    # That's narrow enough to accept; re-applying the
-                    # label after the API recovers is the workaround.
-                    seen_for_repo.add(number)
+                    # A transient events-API failure used to be marked seen, to avoid
+                    # hitting /issues/{n}/events every poll during an outage. The
+                    # churn is worth avoiding; recording it as handled for ever is not
+                    # (#417) -- one failed call lost the issue permanently, which the
+                    # old comment named as a tradeoff, and it is the same monotonic
+                    # sink as the refusal below.
+                    #
+                    # A recheck time does both: the churn is divided by the window,
+                    # and the issue comes back on its own when the API does.
+                    self.recheck_at(
+                        repo, number, time.time() + _EVENTS_FAILURE_RECHECK_SECONDS,
+                    )
+                # Parked, NOT marked seen (#417). ``seen_issues`` is monotonic and
+                # survives restarts, so a refusal written there outlived the reason
+                # for it: when the reason was a config gap since corrected -- an
+                # account missing from ``allowed_accounts`` -- every issue refused
+                # before the correction stayed refused for ever, with no log line
+                # once it was in there, and only a hand-edit of the state file could
+                # undo it. That is the whole of #417.
+                #
+                # Not left wholly unmarked either: test_filter_runs_once_per_new_issue
+                # asserts the events endpoint is not hit again for a refused issue,
+                # and #282's org-wide search offers ~49 candidates, so one call per
+                # poll each is not the small number the note below assumed. A window
+                # keeps that cost bounded AND expires.
+                #
+                # Still only where it used to mark: a repo WITH include_labels is
+                # left wholly unmarked on purpose -- an earlier review round
+                # established that -- so a later label addition surfaces it on
+                # the very next poll.
                 elif not include_lowered:
-                    # Confirmed foreign-assigned on a pre-#80 repo:
-                    # mark seen to avoid re-checking events every poll.
-                    seen_for_repo.add(number)
+                    self.recheck_at(
+                        repo, number, time.time() + _REFUSAL_RECHECK_SECONDS,
+                    )
                 if not accepted and not events_check_failed:
                     # No longer ours to start, so no longer held (#310).
                     self.clear_blocked(repo, number)
